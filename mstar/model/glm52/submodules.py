@@ -80,8 +80,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._capture_block_warned = False
         # an MTP decode step is one captured graph; the uncaptured fallback runs eager
         self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
-        # dsa_long_context: requests whose prefill starts past a cached prefix, which no
-        # prefill bucket's capture can hold (cg_key_info runs their step eager)
+        # dsa_long_context: handles whose prefill starts past a cached prefix; their step runs
+        # eager (_cg_key), since a bucket's capture scores only its own rows
         self._prefix_hits: set[int] = set()
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
@@ -603,10 +603,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self, input_ids: torch.Tensor, position_ids: torch.Tensor,
         dsa_ctx: DSAContext, rows: list[int],
     ) -> torch.Tensor:
-        """The trunk's final hidden state at ``rows`` (ascending) of a paged-DSA prefill longer
-        than ``prefill_chunk_tokens``: the trunk runs over row chunks in turn, each writing its
-        keys and latents (at its own slots: ``token_window``) before the next one selects over
-        them, so only a chunk's activations are ever live."""
+        """The trunk's final hidden state at ``rows`` (ascending) of a prefill longer than
+        ``prefill_chunk_tokens``, run over row chunks in turn: each writes its keys and latents
+        (``token_window``) before the next selects over them."""
         chunk, kv = self.config.prefill_chunk_tokens, self._kv()
         picked = []
         for c0 in range(0, input_ids.shape[0], chunk):

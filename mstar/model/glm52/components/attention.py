@@ -66,7 +66,7 @@ class Glm52MLAAttention(MLAAttention):
         # And only under dsa_long_context, the one mode that declares the DSA
         # resource: off it, a FULL layer's indexer (replicated, not TP-sharded)
         # would be read and held for nothing; the loader skips its keys to match
-        # (Glm52ForCausalLM.load_weights). layer_idx is the selection's provenance.
+        # (Glm52ForCausalLM.load_weights).
         self.dsa_long_context = config.dsa_long_context
         self.indexer = (
             Glm52Indexer(config)
@@ -144,8 +144,7 @@ class Glm52MLAAttention(MLAAttention):
             return None
         return self._dsa_update(hidden_states, q_c, position_ids)
 
-    # Host-side per-step work (python lists, launches sized on the host): keep dynamo out of
-    # it, same as the cache-manager plan/run methods.
+    # host work per step (python lists, launches sized on the host): kept out of dynamo
     @torch.compiler.disable
     def _dsa_update(
         self,

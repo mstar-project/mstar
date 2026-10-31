@@ -3504,7 +3504,7 @@ class KVManager(AttentionResource):
         return float(self.reclaimable(rid))
 
     def stored_len(self, rid: str, label: str = "main") -> int:
-        """Tokens the stream holds (GLM-5.2's DSA checks its index store against its latents)."""
+        """Tokens the stream holds."""
         with self._lock:
             return self._streams[rid][label].stored_len
 

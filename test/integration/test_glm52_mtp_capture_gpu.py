@@ -154,10 +154,9 @@ def test_compiled_capture_matches_compiled_plain_decode(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("k", [1, 3])
 def test_captured_mtp_on_paged_dsa_matches_plain_decode(tmp_path, monkeypatch, eager_capture, k):
-    """MTP over paged DSA at a small index_topk, so the prefill, every verify row and the
-    seed pass select: captured MTP == eager MTP == plain paged decode, token for token. Under
-    the reference: kernels: auto's plain prefill runs the last layer on the sampled rows only
-    and MTP's prefill doesn't, and under auto their first tokens differed here (H200)."""
+    """Captured MTP == eager MTP == plain decode on paged DSA, the prefill, every verify row
+    and the seed pass selecting. Under the reference kernels: auto's plain prefill runs the
+    last layer on the sampled rows alone and MTP's prefill doesn't, which can move a token."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
     # the indexer ropes its first 64 dims

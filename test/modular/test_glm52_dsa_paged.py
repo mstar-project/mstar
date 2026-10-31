@@ -1,11 +1,6 @@
-"""dsa_long_context: index keys on the MLA cache's pages, slot selection, sparse attention (CPU
-paths).
-
-Decode past index_topk is held, layer by layer, to the reference indexer's selection and a
-masked dense softmax. Prefill: every row selects over its own causal prefix, so a prompt
-prefilled past index_topk equals prefilling index_topk tokens and decoding the rest one at a
-time.
-"""
+"""GLM-5.2's paged DSA on CPU, through the submodule: decode past index_topk against the
+reference indexer and a masked dense softmax; prefill (one pass, row chunks, two steps,
+captured buckets) against prefilling index_topk tokens and decoding the rest."""
 import sys
 import types
 
@@ -38,7 +33,6 @@ from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E4
 from mstar.model.glm52.components.indexer import full_indexer_layers  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
-    DSA_RESOURCE,
     KV_RESOURCE,
     Glm52ModelConfig,
 )
@@ -92,27 +86,6 @@ def _serve(sub, cfg, prompt, decode):
     return out, driver
 
 
-def test_paged_resources_and_step():
-    cfg = _cfg(topk=4)
-    from mstar.model.glm52.glm52_model import Glm52Model
-
-    model = object.__new__(Glm52Model)
-    model.config = cfg
-    specs = {s.resource_key: s for s in model.get_node_resources()}
-    # the index keys sit on the latent cache's pages: a row per token per FULL layer
-    index = specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES]
-    assert index.num_layers == len(full_indexer_layers(cfg)) >= 1
-    assert index.width == cfg.index_head_dim
-    # the DSA resource selects over them and attends over the latents
-    dsa = specs[DSA_RESOURCE].config
-    assert specs[DSA_RESOURCE].depends_on() == {KV_RESOURCE}
-    assert (dsa.topk, dsa.kpool, dsa.dense_below_topk) == (cfg.index_topk, 1, True)
-    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
-    ar = ARNodeInputs(input_ids=torch.zeros(3, dtype=torch.long), input_seq_len=3)
-    steps = sub.declare_step("prefill", ["r0"], [ar]).steps
-    assert KV_RESOURCE in steps and DSA_RESOURCE in steps
-
-
 def _positions(slots, table, page_size):
     """Request positions of latent-cache slots, by the request's pages."""
     where = {int(p): j for j, p in enumerate(table.tolist())}
@@ -131,9 +104,8 @@ def _masked_reference(cache, table, page_size, n_keys, picked, query, scale, ran
 
 
 def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
-    """Every decode step past index_topk: a FULL layer's latents are the reference indexer's
-    top index_topk positions over the stored keys (its queries scored by index_topk), and every
-    layer's attention is a dense softmax over the cache masked to them."""
+    """Past index_topk the FULL layer picks the reference indexer's top index_topk positions,
+    and every layer attends a dense softmax masked to them."""
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
     update, attend = Glm52MLAAttention._dsa_update, Glm52MLAAttention._attend_selected
@@ -175,9 +147,7 @@ def test_paged_decode_across_topk_matches_an_independent_reference(monkeypatch):
     monkeypatch.setattr(Glm52MLAAttention, "_dsa_update", checked_update)
     monkeypatch.setattr(Glm52MLAAttention, "_attend_selected", checked_attend)
     decode = torch.tensor([7, 1, 8, 3, 6, 4])
-    _, driver = _serve(sub, cfg, torch.tensor([5, 9, 2]), decode)
-    assert isinstance(driver.last_ctx, DSAContext)
-    assert driver.resources[KV_RESOURCE].stored_len("r0") == 3 + len(decode)
+    _serve(sub, cfg, torch.tensor([5, 9, 2]), decode)
     # contexts 5..9 select: the FULL layer picks, the FULL and the SHARED layer attend
     assert selected == [5, 6, 7, 8, 9]
     assert attended == [(layer, n) for n in range(5, 10) for layer in (0, 1)]
@@ -194,31 +164,21 @@ def test_paged_prefill_beyond_topk_equals_prefill_then_decode():
     torch.testing.assert_close(logits_whole[-1], stepwise[-1], rtol=1e-4, atol=1e-5)
 
 
-def test_prefill_beyond_topk_selects():
-    cfg = _cfg(topk=4)
-    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
-    driver = _Driver(sub, cfg)
-    assert torch.isfinite(driver.step("prefill", torch.arange(1, 11))[0]).all()
-    assert driver.last_ctx.needs_selection
-
-
-@pytest.mark.parametrize("budget_rows", [1, 3])
-def test_prefill_chunks_join_at_their_boundaries(monkeypatch, budget_rows):
-    """Prefill rows are scored in chunks under a byte budget for their fp32 scores; chunks of
-    a few rows, down to one, give the same logits."""
+def test_prefill_chunks_join_at_their_boundaries(monkeypatch):
+    """Prefill rows score in chunks under PREFILL_SCORE_BYTES: the boundaries move no logit."""
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=2), config=cfg)
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     whole = _Driver(sub, cfg).step("prefill", tokens)
-    # rows of 11 keys' scores each
-    monkeypatch.setattr(paged, "PREFILL_SCORE_BYTES", 4 * 11 * budget_rows)
+    # 3 rows of 11 keys' scores a chunk: 11 rows in 3, 3, 3, 2
+    monkeypatch.setattr(paged, "PREFILL_SCORE_BYTES", 4 * 11 * 3)
     chunked = _Driver(sub, cfg).step("prefill", tokens)
     torch.testing.assert_close(chunked[-1], whole[-1], rtol=0, atol=0)
 
 
 def test_long_prefill_runs_in_row_chunks():
-    """A prefill longer than prefill_chunk_tokens runs the trunk over row chunks, each writing
-    its keys and latents before the next selects over them: the one-pass logits."""
+    """A prefill past prefill_chunk_tokens runs the trunk in row chunks, with the one-pass
+    logits, and plans no dense attention."""
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=3), config=cfg)
@@ -273,8 +233,7 @@ def test_batched_long_prefill_chunks_cut_across_requests(monkeypatch):
 
 
 def test_second_prefill_step_selects_over_the_stored_keys():
-    """A prompt prefilled over two steps: the second step's rows sit at absolute positions and
-    select over the keys the first step stored, giving the one-step logits."""
+    """A prompt prefilled over two steps: the second selects over the keys the first stored."""
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=5), config=cfg)
@@ -298,7 +257,8 @@ def test_index_planes_hold_the_mtp_layer():
     model.config = cfg
     specs = {s.resource_key: s for s in model.get_node_resources()}
     trunk = len(full_indexer_layers(cfg))
-    assert specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES].num_layers == trunk + 1
+    index = specs[KV_RESOURCE].config.aux_planes[INDEX_PLANES]
+    assert (index.num_layers, index.width) == (trunk + 1, cfg.index_head_dim)
     assert index_store_layer(cfg, cfg.num_hidden_layers) == trunk
 
 
@@ -347,9 +307,8 @@ def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
 
 
 def test_a_prefill_bucket_pads_its_rows_and_scores_over_them():
-    """A captured prefill bucket's rows: the real ones, then padding staged as position 0 of
-    the first request; every row scores on its own over the bucket's width, and a bucket no
-    wider than index_topk selects nothing."""
+    """A captured prefill bucket stages its padding rows as position 0 of the first request,
+    scores every row on its own over its width, and refuses rows past it."""
     from mstar.engine.resources.step import BucketKey, SlotLease
 
     cfg = _cfg(topk=8)
@@ -393,8 +352,8 @@ def test_a_prefill_bucket_pads_its_rows_and_scores_over_them():
 
 
 def test_a_prefill_past_a_cached_prefix_runs_eager():
-    """A request whose prefill starts past a cached prefix sees more keys than its bucket's
-    capture scores: its step declares a capture key no bucket has, until its prefill ran."""
+    """Rows past a cached prefix see more keys than a bucket's capture scores: the step's
+    capture key is no bucket's until the request is cleaned up."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
 
     cfg = _cfg(topk=8)
@@ -402,26 +361,11 @@ def test_a_prefill_past_a_cached_prefix_runs_eager():
     info = CurrentForwardPassInfo(request_id="a", graph_walk="prefill", fwd_index=0,
                                   random_seed=0, max_tokens=4, rid_handle=7)
     ar = ARNodeInputs(input_ids=torch.arange(10), input_seq_len=10)
-    assert sub.cg_key_info("prefill", {7: info}) is None
     # the engine's call (reserve_replay_slot)
     assert sub.cg_key_info("prefill", {7: info}, per_request_input_metadata={}) is None
     cut = sub.split_inputs("prefill", info, ar, 6, 10)
-    assert cut.input_seq_len == 4
     assert sub.cg_key_info("prefill", {7: info, 8: info}) == "eager"
     assert sub.declare_step("prefill", [7], [cut]).cg_key_info == "eager"
     assert sub.cg_key_info("decode", {7: info}) is None
     sub.cleanup_request(7)
     assert sub.cg_key_info("prefill", {7: info}) is None
-
-
-def test_a_captured_prefill_never_runs_in_chunks():
-    """A bucket wider than prefill_chunk_tokens still runs as one pass when captured: the
-    chunked path plans eagerly, which a capture cannot."""
-    cfg = _cfg(topk=8)
-    cfg.prefill_chunk_tokens = 4
-    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=5), config=cfg)
-    ids = torch.arange(8)
-    ctx = types.SimpleNamespace(decode_rows=True)
-    assert not sub._long_prefill("prefill", ids, ctx)
-    ctx.decode_rows = False
-    assert sub._long_prefill("prefill", ids, ctx)

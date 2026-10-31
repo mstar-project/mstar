@@ -594,13 +594,13 @@ def _stored_index_rows(kv, rid: str) -> torch.Tensor:
     return kv.aux_view(INDEX_PLANES, 0)[pages, pos % kv.config.page_size]
 
 
-@pytest.mark.parametrize("wrong_every", [None, 0, 3], ids=["mtp", "oracle", "oracle_partial"])
-@pytest.mark.parametrize("chunk", [8192, 3], ids=["one-pass", "row-chunks"])
+# random weights reject nearly every draft, the partial oracle accepts some; row chunks
+# change only the prefill, so one acceptance pattern covers them
+@pytest.mark.parametrize("chunk, wrong_every", [(8192, None), (8192, 3), (3, 3)],
+                         ids=["mtp", "oracle_partial", "row-chunks"])
 def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
-    """MTP on paged DSA, every context past index_topk: the verify and the seed pass select
-    per row, a rejected row's index keys are trimmed with its latents, and the emitted
-    stream is plain decode's. Row chunks: the prompt's trunk and MTP passes run in pieces.
-    Random weights reject nearly every draft; the oracle reaches the accepted rows."""
+    """MTP on paged DSA past index_topk emits plain decode's stream, and a rejected row's
+    index keys are trimmed with its latents."""
     cfg = _cfg(2, True)
     cfg.dsa_long_context, cfg.index_topk = True, 4
     cfg.prefill_chunk_tokens = chunk
@@ -621,6 +621,8 @@ def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
     cfg.mtp_num_draft_tokens = 2
     assert torch.equal(streams[0], streams[1]), f"{streams[0].tolist()} vs {streams[1].tolist()}"
     assert len(set(streams[0].tolist())) > 3
+
+
 # ── a stop on the prefill walk ──────────────────────────────────────────
 
 

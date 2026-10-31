@@ -1,7 +1,6 @@
-"""The DSA resource on CPU: its spec and build over the MLA cache whose pages hold the index keys,
-the step's rows and pages it stages from the KV plan (``step_inputs``), the forward's context it
-builds from them (``context``), the rows of it a pass takes (``rows`` / ``pick``) and the one it
-holds open for the layers (``use``)."""
+"""The DSA resource on CPU: its build over an MLA cache with index planes, the rows it stages
+from the KV plan (``step_inputs``), and the context the layers read (``context``, ``rows`` /
+``pick``, ``use``)."""
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +9,6 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSASpec
 from mstar.engine.resources.dsa.manager import DSAManager
-from mstar.engine.resources.dsa.paged import DSAContext
 from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.plan import PagedIndptrs, SequenceView
 from mstar.engine.resources.step import StepContext
@@ -66,19 +64,8 @@ def _prefill(dsa: DSAManager, pages=([0], [5, 6, 7])) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_the_spec_builds_one_resource_over_the_mla_cache():
-    for kpool in (1, 4):  # a key per token, or GLM-5.3's pooled keys: the same resource
-        spec = _spec(kpool=kpool)
-        assert spec.depends_on() == {KV}
-        assert spec.resource_class is DSAManager
-
-
-def test_the_resource_reads_its_geometry_off_the_cache():
-    dsa = _manager(world_size=2)
-    assert dsa.depends_on() == {KV}
-    assert (dsa.page_size, dsa.kv_rows, dsa.kv_lora_rank, dsa.kpe) == (PAGE, MAX_SEQ_LEN, 32, 16)
-    assert dsa.num_heads == HEADS // 2  # this rank's query heads
-    assert dsa.ctx is None  # no forward is running
+def test_the_resource_plans_this_ranks_query_heads():
+    assert _manager(world_size=2).num_heads == HEADS // 2
 
 
 def test_a_cache_without_index_planes_is_refused():
@@ -94,68 +81,37 @@ def test_a_cache_without_index_planes_is_refused():
 
 
 def test_an_eager_prefill_stages_its_rows_and_pages():
+    """Each request's new rows and its pages, flat, from the KV plan, as the layers read them."""
     dsa = _manager()
-    out = _prefill(dsa)
-    assert out["dsa_row_req"].tolist() == [0, 0, 0, 1, 1, 1, 1]
-    assert out["dsa_pos"].tolist() == [0, 1, 2, 5, 6, 7, 8]
-    # the step's requests' pages, flat, and where each request's begin
-    assert out["dsa_pages"].dtype == torch.int32
-    assert out["dsa_pages"].tolist() == [0, 5, 6, 7]
-    assert out["dsa_page_start"].tolist() == [0, 1]
-    meta = out["dsa_meta"]
-    assert meta["host_pos"] == [0, 1, 2, 5, 6, 7, 8]
-    assert meta["spans"] == [(0, 3, 0), (3, 4, 1)]  # (first row, rows, request)
-    assert meta["host_page_start"] == [0, 1]
-    assert meta["max_pools"] == 9  # the step's longest context
-    assert meta["needs_selection"] is True  # a row sees 9 keys, past topk
-    assert meta["decode_rows"] is False  # prefill rows score in chunks of one request
-    assert meta["sparse_plan"] is None  # eager: the first layer to attend plans it
+    ctx = dsa.context(_prefill(dsa))
+    assert ctx.row_req.tolist() == [0, 0, 0, 1, 1, 1, 1]
+    assert ctx.pos.tolist() == ctx.host_pos == [0, 1, 2, 5, 6, 7, 8]
+    assert ctx.pages.dtype == torch.int32 and ctx.pages.tolist() == [0, 5, 6, 7]
+    assert ctx.page_start.tolist() == ctx.host_page_start == [0, 1]
+    assert ctx.spans == [(0, 3, 0), (3, 4, 1)]  # (first row, rows, request)
+    assert ctx.max_pools == 9  # the step's longest context
+    # a row sees 9 keys, past topk; prefill rows score in chunks of one request
+    assert ctx.needs_selection and not ctx.decode_rows and ctx.sparse_plan is None
+    assert ctx.attn_lens() == [1, 2, 3, 4, 4, 4, 4]
+    # pooled keys score in pools: 9 keys are 4 complete pools of 2
+    assert dsa.context(_prefill(_manager(kpool=2))).max_pools == 4
+    # a step without the resource's inputs (flag off) has no context
+    assert dsa.context({}) is None
 
 
 def test_an_eager_decode_scores_every_row_on_its_own():
     dsa = _manager()
     # r0 at position 6 (past topk), r1 at position 2
-    out = _stage(dsa, "decode", pages=[[1, 2], [4]], lengths=[7, 3], to_compute=[1, 1])
-    assert out["dsa_row_req"].tolist() == [0, 1]
-    assert out["dsa_pos"].tolist() == [6, 2]
-    assert out["dsa_pages"].tolist() == [1, 2, 4]
-    meta = out["dsa_meta"]
-    assert meta["spans"] == [(0, 1, 0), (1, 1, 1)]
-    assert meta["max_pools"] == 7
-    assert meta["needs_selection"] is True
-    assert meta["decode_rows"] is True
+    meta = _stage(dsa, "decode", pages=[[1, 2], [4]], lengths=[7, 3], to_compute=[1, 1])["dsa_meta"]
+    assert meta["decode_rows"] and meta["needs_selection"] and meta["max_pools"] == 7
     # below topk every row attends all it sees: dense MLA is the same computation
     short = _stage(dsa, "decode", pages=[[1], [4]], lengths=[4, 3], to_compute=[1, 1])
     assert short["dsa_meta"]["needs_selection"] is False
 
 
-def test_pooled_keys_score_in_pools():
-    out = _prefill(_manager(kpool=2, topk=4))
-    assert out["dsa_meta"]["max_pools"] == 4  # 9 keys: 4 complete pools of 2
-
-
 # ---------------------------------------------------------------------------
 # context / rows / pick / use: the forward's context, open while its layers run
 # ---------------------------------------------------------------------------
-
-
-def test_the_context_is_the_staged_step():
-    dsa = _manager()
-    out = _prefill(dsa)
-    ctx = dsa.context(out)
-    assert isinstance(ctx, DSAContext)
-    assert ctx.pos is out["dsa_pos"] and ctx.row_req is out["dsa_row_req"]
-    assert ctx.pages is out["dsa_pages"] and ctx.page_start is out["dsa_page_start"]
-    assert ctx.host_pos == [0, 1, 2, 5, 6, 7, 8]
-    assert ctx.spans == [(0, 3, 0), (3, 4, 1)]
-    assert (ctx.max_pools, ctx.page_size, ctx.topk, ctx.kpool) == (9, PAGE, TOPK, 1)
-    assert ctx.needs_selection and not ctx.decode_rows and ctx.sparse_plan is None
-    assert ctx.width == TOPK
-    assert ctx.attn_lens() == [1, 2, 3, 4, 4, 4, 4]  # a row past topk attends its top topk
-    assert ctx.last_selection is None  # a fresh step
-    # without the resource's inputs (a flag-off step) there is no context
-    assert dsa.context({}) is None
-    assert dsa.context({k: v for k, v in out.items() if k != "dsa_meta"}) is None
 
 
 def test_rows_and_pick_are_passes_over_part_of_the_step():

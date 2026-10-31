@@ -82,17 +82,14 @@ class Glm52ModelConfig:
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
-    # the exact DSA computation. On: the guard checks max_seq_len instead;
-    # FULL layers write their index keys to a KV resource and the DSA resource
-    # (mstar/engine/resources/dsa) has every row past index_topk attend its top
-    # index_topk latents, prefill rows included, with selection and sparse
-    # attention on device.
+    # the exact DSA computation. On: the guard checks max_seq_len instead, and
+    # every row past index_topk, prefill rows included, attends its indexer's
+    # top index_topk latents (the DSA resource, mstar/engine/resources/dsa).
     dsa_long_context: bool = False
-    # a prefill step longer than this runs the trunk over row chunks of it in turn,
-    # so its activations are a chunk's, whatever the prompt's length
+    # dsa_long_context: a prefill step longer than this runs the trunk in row chunks
+    # of it, which bound its activations
     prefill_chunk_tokens: int = 8192
-    # under TP: each rank selects a block of a long prefill's rows and the blocks are
-    # all-gathered, instead of every rank selecting every row
+    # under TP, each rank selects a block of a long prefill's rows, all-gathered after
     dsa_shard_prefill: bool = False
 
     # --- MoE ---

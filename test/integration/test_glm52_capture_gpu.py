@@ -289,15 +289,13 @@ def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeyp
         assert stream == streams[False][rid], (rid, stream, streams[False][rid])
 
 
-# compiled, the dense arm's last token flips at a 0.0117-logit near tie: Inductor's arithmetic,
-# since the eager forward captured matches token for token
+# the dense arm runs uncompiled: compiled, Inductor's arithmetic flips its last token at a
+# near tie (its eager forward, captured, matches token for token)
 @pytest.mark.parametrize("topk,compiled", [(8, True), (16, False)],
                          ids=["bucket-selects", "bucket-dense"])
 def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
-    """DSA at a small index_topk, so decode selects: the captured steps emit the
-    eager tokens. Prefill replays its 16-row bucket, padded, with every row selecting on its
-    own when the bucket is wider than index_topk and dense attention when not; decode is sparse
-    for every row over the serving window, through the slot's re-planned sparse wrapper."""
+    """Captured DSA steps emit the eager tokens: a padded prefill bucket that selects (wider
+    than index_topk) or attends densely, and sparse decode on the slot's re-planned plan."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     overrides = dict(dsa_long_context=True, index_topk=topk, index_n_heads=16,
                      index_head_dim=64, max_seq_len=64,  # the indexer ropes its first 64 dims
@@ -319,9 +317,8 @@ def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager-forward", "compiled"])
 def test_paged_dsa_with_fused_mla_prep_matches_the_unfused_path(tmp_path, monkeypatch, compiled):
-    """The fused MLA prep on the selecting path: DSA at index_topk 8, so decode selects,
-    captured with the fused prep emits the op-by-op path's tokens (q_lora_rank 256, a width
-    the fused norms take)."""
+    """Captured with the fused MLA prep, the selecting path emits the op-by-op path's tokens
+    (q_lora_rank 256: a width the fused norms take)."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     streams = {}
     for fused_prep in (False, True):
