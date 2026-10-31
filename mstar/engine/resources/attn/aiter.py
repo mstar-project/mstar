@@ -457,6 +457,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         self._preplan_delegated = False
         # FlashInfer manager for non-causal steps with multi-query rows
         self._fallback: AttentionManager | None = None
+        # [0, 1, ..., rows], for a step that attends one query a row off a plan
+        # staged with more (`attend_rows`); grown when planning, never in a graph
+        self._row_starts: torch.Tensor | None = None
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -575,6 +578,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         if row_queries is not None and not force_prefill:
             # every row declared the same query count (a verify step)
             max_q = row_queries
+            self._reserve_row_starts(num_rows)
             if num_rows and int(np.diff(rows.qo_indptr).max()) > row_queries:
                 raise RuntimeError(
                     f"AITER attention: bucket {lease.bucket} planned a row with "
@@ -592,8 +596,13 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             max_q, self._kv_config.max_seq_len,
         )
 
+    def _reserve_row_starts(self, rows: int) -> None:
+        if self._row_starts is None or self._row_starts.numel() <= rows:
+            self._row_starts = torch.arange(max(rows, 128) + 1, dtype=torch.int32, device=self._device)
+
     def _stage_eager(self, label: str, rows: _Rows, slot: int) -> _Staged:
         num_rows = rows.qo_indptr.shape[0] - 1
+        self._reserve_row_starts(num_rows)
         counts = np.diff(rows.kv_indptr)
         width = (int(counts.max()) if num_rows else 0) + self._pad_cols
         image = self._eager_image(label, slot, _image_numel(num_rows, width))
@@ -649,6 +658,19 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         if plan is _DELEGATED:
             return self._fallback.run(q, label, kv_cache_layer)
         return self._unified(q, plan, kv_cache_layer)
+
+    @torch.compiler.disable
+    def attend_rows(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, kv_lens: torch.Tensor,
+        label: str = "main",
+    ) -> torch.Tensor:
+        """One query a row over this step's block table, each row reading
+        ``kv_lens`` keys, whatever query count the step was planned for."""
+        rows = q.shape[0]
+        plan = self._current_plans[label]
+        return self._unified(q, plan._replace(
+            cu_seqlens_q=self._row_starts[: rows + 1], seqused_k=kv_lens, max_seqlen_q=1, num_tokens=rows,
+        ), kv_cache_layer)
 
 
 class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
