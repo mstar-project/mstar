@@ -1898,11 +1898,21 @@ The async worker plans step N+1 while N runs, so a verify step is planned agains
 length it would have if N accepted every draft, and its KV write slots, attention
 lengths, rotary positions and recurrent start slots are corrected from the registers
 on the device. That needs an attention backend whose plan reads per-row KV lengths and
-a block table on the device: AITER's unified attention on AMD GPUs. Verification is
-greedy, or with ``SpecDecodeConfig(sampling=True)`` a draw of the target's token at each
-position from the request's top-k/top-p distribution at its temperature, by the
-sampler's captured kernel (``draw_tokens``; with argmax drafts, accepting while the draw
-equals the next draft is rejection sampling). No ``repetition_penalty``.
+a block table on the device: AITER's unified attention on AMD GPUs. No
+``repetition_penalty``.
+
+Verification is greedy, or with ``SpecDecodeConfig(sampling=True, vocab_size=...)``
+speculative sampling (``spec_decode/sampled.py``). The forward takes each draft pass's
+token from ``draw_draft(j, logits)``, which draws it from the request's top-k/top-p
+distribution at its temperature and keeps that distribution per request, and ``accept``
+judges it by the target's next step: a draft ``d`` stays with probability
+``min(1, q(d) / p(d))``, and the first rejection draws from ``(q - p)+``. Emitted tokens
+then follow the plain sampler's distribution exactly, at an acceptance of
+``sum min(p, q)``. Each request reads its own Philox stream from device registers, so
+a replay equals the eager step, but the stream differs from a plain step's: the same
+seed does not give the plain path's tokens. A sampling node keeps ``k`` vocabulary-sized
+rows per request (``max_requests``), 1.3 GB at ``k = 2`` and the default 256 requests on
+Qwen3.5.
 
 Tuning resources per deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
