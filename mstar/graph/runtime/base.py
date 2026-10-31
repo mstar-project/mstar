@@ -488,6 +488,10 @@ class RouteInput(NamedTuple):
     # `supports_inline_emit` ignores both.
     inline_signal: str | None = None
     inline_values: tuple[int, ...] | list[int] = ()
+    # The log-prob of the token row i sampled (None without one): it rides
+    # with the row's client emits of this step, inline or in a tensor emit's
+    # metadata. Empty when no row has one.
+    logprobs: tuple[float | None, ...] | list[float | None] = ()
     # Rows of several walks in one call: wg_ids.keys[i] ran
     # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
     walks: list[str] | None = None

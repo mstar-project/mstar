@@ -39,6 +39,7 @@ from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
 )
+from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
@@ -209,7 +210,7 @@ def _tp_async_sched_setting(
         return _parse_tp_async_sched(",".join(config))
     if isinstance(config, bool):
         return config, None
-    return _parse_tp_async_sched(str(config or "0"))
+    return _parse_tp_async_sched(str(config if config is not None else "1"))
 
 
 def _wait_ms(raw: str) -> float:
@@ -3575,7 +3576,9 @@ class Worker:
         batch = batch_N.batch
         signals = batch.output_signals
         if (
-            host_rows is None or batch.request_walks or self.enable_prof
+            # log-probs ride the route input, which this path doesn't build
+            host_rows is None or SAMPLED_LOGPROB in host_rows.buffers
+            or batch.request_walks or self.enable_prof
             or batch_N.node_batch.stream_partition_done_rids
             or not getattr(rt, "supports_route_and_send_inline", False)
             or not self._all_on_device(
@@ -3657,6 +3660,7 @@ class Worker:
         inline_signal, inline_values = self._inline_emit_values(
             engine, batch_N, host_rows, rids, signals,
         )
+        logprobs = self._row_logprobs(host_rows, rids)
 
         def store(rids):
             stored = None
@@ -3742,6 +3746,7 @@ class Worker:
                 num_tensors=num_tensors,
                 inline_signal=inline_signal,
                 inline_values=inline_values,
+                logprobs=logprobs,
                 walks=walks if rid_walk_idx is not None else None,
                 rid_walk_idx=rid_walk_idx,
             ),
@@ -3981,6 +3986,18 @@ class Worker:
                     return None, []
             return signal, out
         return None, []
+
+    @staticmethod
+    def _row_logprobs(host_rows: "HostRows | None", rids: list[int]) -> list[float | None]:
+        """Each rid's sampled-token log-prob off the stop check's host copy,
+        None where the sampler left NaN (the row did not ask). Empty when no
+        rid has one."""
+        buf = None if host_rows is None else host_rows.buffers.get(SAMPLED_LOGPROB)
+        if buf is None:
+            return []
+        values = dict(zip(host_rows.request_ids, buf.tolist(), strict=False))
+        out = [None if math.isnan(v := values.get(rid, math.nan)) else v for rid in rids]
+        return out if any(v is not None for v in out) else []
 
     def _stage_host_rows(self, outputs: "BatchedModelOutput") -> None:
         """Start the device-to-host copy of the step's row-addressed stop

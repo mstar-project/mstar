@@ -102,7 +102,7 @@ See https://github.com/mstar-project/mstar/pull/368 for some sources of overhead
 
 By default the worker speculates step N+1 through the graph while step N is still running (`enable_async_scheduling`, [mstar/graph/base.py](mstar/graph/base.py#L240), default `True`). It pre-plans it on a separate thread and stream. The full stage order, thread by thread, is in [.claude/skills/async-worker/SKILL.md](.claude/skills/async-worker/SKILL.md) — **read it before changing the worker's main loop, the GPU thread, the plan thread, speculation or postprocess.**
 
-(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `0` and is expected to flip on later)
+(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
 
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 

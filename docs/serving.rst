@@ -331,8 +331,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
-     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+     - *(optional)* Async scheduling for the parallel nodes: ``true``
+       (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,

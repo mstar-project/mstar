@@ -106,6 +106,10 @@ fn w_u64(out: &mut Vec<u8>, v: u64) {
     enc::write_uint(out, v).expect("vec sink");
 }
 
+fn w_f64(out: &mut Vec<u8>, v: f64) {
+    enc::write_f64(out, v).expect("vec sink");
+}
+
 fn w_nil(out: &mut Vec<u8>) {
     enc::write_nil(out).expect("vec sink");
 }
@@ -413,6 +417,8 @@ pub struct ResultTensors<'a> {
     pub signal: &'a str,
     pub infos: Vec<TensorPointerInfo>,
     pub loop_indices: Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    /// The sampled token's log-prob, sent as `metadata["logprobs"] = [lp]`.
+    pub logprob: Option<f64>,
 }
 
 impl ResultTensors<'_> {
@@ -435,7 +441,15 @@ impl ResultTensors<'_> {
                 }
                 None => w_nil(m.key("loop_indices")),
             }
-            w_map(m.key("metadata"), 0);
+            match self.logprob {
+                Some(lp) => {
+                    w_map(m.key("metadata"), 1);
+                    w_str(m.buf(), "logprobs");
+                    w_arr(m.buf(), 1);
+                    w_f64(m.buf(), lp);
+                }
+                None => w_map(m.key("metadata"), 0),
+            }
         });
         out
     }
@@ -449,6 +463,9 @@ pub struct ResultTokens<'a> {
     pub loop_indices: &'a [Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>],
     pub signal: &'a str,
     pub modality: &'a str,
+    /// Per request, its log-prob or None; empty when no request of the
+    /// step has one.
+    pub logprobs: &'a [Option<f64>],
 }
 
 impl ResultTokens<'_> {
@@ -477,6 +494,16 @@ impl ResultTokens<'_> {
             w_str(m.key("signal"), self.signal);
             w_str(m.key("modality"), self.modality);
             w_map(m.key("metadata"), 0);
+            // left out, so a frame without log-probs is as it was
+            if !self.logprobs.is_empty() {
+                w_arr(m.key("logprobs"), self.logprobs.len() as u32);
+                for &lp in self.logprobs {
+                    match lp {
+                        Some(v) => w_f64(m.buf(), v),
+                        None => w_nil(m.buf()),
+                    }
+                }
+            }
         });
         out
     }
