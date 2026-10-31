@@ -1,6 +1,6 @@
 """The DiT components that swap in one-pass kernels inside a compiled region
-(``modulation.ada_layer_norm``, ``qk_norm_rope.rms_norm_rope``), against their
-eager formulations.
+(``modulation.ada_layer_norm``, ``qk_norm_rope.rms_norm_rope``, ``ffn.gelu_tanh_ffn``),
+against their eager formulations.
 
 The eager formulation is what the reference ports are held bit-exact in, so the
 CPU tests pin it to the expressions a DiT block writes inline. The kernels
@@ -16,6 +16,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion import modulation, qk_norm_rope
+from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
+from mstar.model.components.mlp import MLP
 from mstar.model.wan22.components.dit import Wan22RoPE3D
 from mstar.model.wan22.config import Wan22Config
 
@@ -144,3 +146,37 @@ def test_rms_norm_rope_kernel_matches_eager():
         )()
     for g_t, w_t in zip(got, want, strict=True):
         _assert_bf16_close(g_t, w_t, min_equal=0.99)
+
+
+def _ffn(device):
+    torch.manual_seed(0)
+    mlp = MLP(D, 4 * D, D, activation="gelu_tanh", bias=True).to(device, torch.bfloat16)
+    with torch.no_grad():
+        for param in mlp.parameters():
+            param.mul_(0.5)
+    return mlp
+
+
+def test_eager_ffn_is_the_module_bitwise():
+    x, *_ = _stream("cpu")
+    mlp = _ffn("cpu")
+    with torch.no_grad():
+        assert torch.equal(gelu_tanh_ffn(x, mlp), mlp(x))
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+def test_gelu_epilogue_matches_eager():
+    """The epilogue rounds once, after the GELU, where eager rounds the GEMM's
+    output and then the GELU's."""
+    x, *_ = _stream("cuda")
+    mlp = _ffn("cuda")
+    with torch.no_grad():
+        want = mlp(x)
+        hidden = torch._addmm_activation(mlp.linear_in.bias, x.flatten(0, -2), mlp.linear_in.weight.t(), use_gelu=True)
+        got = mlp.linear_out(hidden.unflatten(0, x.shape[:-1]))
+        compiled = torch.compile(lambda t: gelu_tanh_ffn(t, mlp), dynamic=False)(x)
+    # the same GEMM once compiled: the swap took effect and nothing else moved
+    assert torch.equal(compiled, got)
+    # the down-projection sums thousands of rounded activations, so fewer elements
+    # come out equal than for the single-pass kernels
+    _assert_bf16_close(got, want, min_equal=0.3)
