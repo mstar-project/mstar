@@ -154,7 +154,12 @@ decode_gemm --store <dir>`` from a store holding a search of ``decode_gemv``
 and ``decode_gemv_silu_mul``. An entry keeps every implementation's time and
 parameters beside the one chosen, so moving a shape is a one-word edit, and
 ``python -m mstar.kernels --probe`` counts the shapes each implementation
-serves.
+serves. A shape leaves what the searched tree serves only for a gain of the
+margin and of one graph node (a fused gate/up for the margin alone): a kernel
+timed in a loop cannot show what it costs its neighbours in a served step, such
+as a one-row GEMM moved off ``skinny_gemm_any``, whose free input layout lets
+inductor finish the norm before it in one kernel. ``--stat fastest`` keeps a
+candidate's fastest replay, for GPUs whose replays carry stalls.
 
 Measuring with the harness
 --------------------------
