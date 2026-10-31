@@ -39,6 +39,7 @@ from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
+from mstar.platforms import CudaPlatform, RocmPlatform, serving_config
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.containers import ParallelList
@@ -881,6 +882,21 @@ def _drop_stubbed_imports():
         for mod in set(sys.modules) - before:
             if mod.startswith("mstar.model.qwen3_omni"):
                 del sys.modules[mod]
+
+
+@pytest.mark.parametrize("platform, workers", [(RocmPlatform, 3), (CudaPlatform, 2)])
+def test_the_omni_2gpu_config_places_workers_per_platform(
+    platform, workers, tmp_path, monkeypatch, _drop_stubbed_imports,
+):
+    """The conductor, the model's worker graphs and the rank -> device map all
+    follow the platform's entry, so no reader is left on the base layout."""
+    monkeypatch.setattr(serving_config, "_built_for", platform)
+    config_path = ROOT / "configs" / "qwen3omni_2gpu.yaml"
+    model = _qwen3_omni("qwen3_omni", {}, tmp_path, monkeypatch)
+    conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
+
+    assert {rank for wg in conductor.worker_graphs.values() for rank in wg.ranks} == set(range(workers))
+    assert conductor.rank_devices == ({2: 0} if workers == 3 else {})
 
 
 @pytest.mark.parametrize("config_path", SHIPPED_CONFIGS, ids=lambda p: p.name)
