@@ -4,6 +4,9 @@ then the routed and shared experts, where the grouped-GEMM runner would mostly m
 Up to a per-GPU token count (``_Tuning.pair_max_tokens``) gate/up and down are GEMV kernels
 over (token, expert) pairs; above it experts repeat across the batch, and grouped kernels read
 each expert's weights once. ``swiglu_limit`` picks the clamped SwiGLU or the plain one.
+
+The launch tiles of a (GPU, shape) come from the kernel registry's ``moe_decode`` tables where
+one has the shape, else from the built-in table for the GPU (see ``_tuning``).
 """
 from __future__ import annotations
 
@@ -14,6 +17,9 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
+from mstar.kernels import Impl, KernelOp, TableEntry, Tolerance, register
+from mstar.kernels.registry import on_reset
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,12 +55,54 @@ _H100 = _Tuning(
 )
 
 
+# The sweep checks candidates against the kernels at their built-in tiles, within the tolerance
+# of the grouped kernels' other summation order.
+MOE_DECODE = register(KernelOp(
+    name="moe_decode", shape=("H", "E", "I", "K"), bucket="M",
+    impls=(Impl("triton", tolerance=Tolerance(2**-7, 1e-3)),),
+    doc="the small-batch fp8 MoE's launch tiles (fused_moe.decode): hidden H, E experts of per-rank "
+        "intermediate I, top-K; per-pair rows by token count, then the grouped '*' row",
+))
+
+
 @functools.cache
-def _tuning(device: torch.device) -> _Tuning:
-    """The H100 table on an H100, the H200 one everywhere else."""
+def _tuning(device: torch.device, shape: tuple[int, int, int, int] | None = None) -> _Tuning:
+    """The registry's ``moe_decode`` entry for ``shape`` (H, E, I, K) on this GPU if a table
+    has one, else the H100 table on an H100 and the H200 one everywhere else."""
+    if shape is not None and device.type == "cuda":
+        dims = dict(zip("HEIK", shape, strict=True))
+        entry = MOE_DECODE.lookup(torch.float8_e4m3fn, dims, device)
+        if entry is not None:
+            return _from_entry(entry)
     if device.type == "cuda" and "H100" in torch.cuda.get_device_name(device):
         return _H100
     return _H200
+
+
+on_reset(_tuning.cache_clear)
+
+
+def _from_entry(entry: TableEntry) -> _Tuning:
+    """A ``moe_decode`` entry as a ``_Tuning``. Its rows are per-pair ones keyed by token count,
+    ``{"path": "pair", "gate_up": ..., "down": ..., "router": ...}``, then the ``"*"`` row
+    ``{"path": "grouped", "router": ...}``: past the last per-pair row the experts run grouped.
+    The router's config is one per entry, repeated in every row."""
+    rows = [(tokens, choice.config) for tokens, choice in entry.rows]
+    routers = [None if config is None else config.get("router") for _, config in rows]
+    if routers[0] is None or any(router != routers[0] for router in routers):
+        raise ValueError(f"{entry.source}: every moe_decode row needs a config with the entry's one router config")
+    *pair, (last_key, last) = rows
+    if last_key is not None or last.get("path") != "grouped":
+        raise ValueError(f"{entry.source}: a moe_decode entry ends with the '*' row, {{\"path\": \"grouped\"}}")
+    if not pair or any(row.get("path") != "pair" for _, row in pair):
+        raise ValueError(f"{entry.source}: a moe_decode entry's rows before '*' are per-pair ones, at least one")
+    final = len(pair) - 1
+    return _Tuning(
+        pair_max_tokens=pair[-1][0],
+        gate_up=tuple((None if i == final else t, dict(row["gate_up"])) for i, (t, row) in enumerate(pair)),
+        down=tuple((None if i == final else t, dict(row["down"])) for i, (t, row) in enumerate(pair)),
+        router=dict(last["router"]),
+    )
 
 
 @triton.jit
@@ -678,7 +726,7 @@ def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,
     experts per token. ``swiglu_limit`` clamps gate from above and up to +-limit before the
     SwiGLU; None: no clamp. Above ``pair_max_tokens`` tokens ``x`` must be bf16."""
     _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size)
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, (x.shape[1], w13.shape[0], w13.shape[1] // 2, topk_ids.shape[1]))
     buf = _expert_buffers(x, topk_ids.shape[1], w13.shape[0], w13.shape[1] // 2,
                           tuning.pair_max_tokens)
     if x.shape[0]:
@@ -702,7 +750,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     assert gate_w.is_contiguous()
     T, H = x.shape
     _check_router_tokens(T)
-    tuning = _tuning(x.device)
+    tuning = _tuning(x.device, (H, w13.shape[0], w13.shape[1] // 2, top_k))
     part = torch.empty(_router_split(H, tuning)[0], T, gate_w.shape[0], dtype=torch.float32,
                        device=x.device)
     topk_w = torch.empty(T, top_k, dtype=torch.float32, device=x.device)
