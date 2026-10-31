@@ -108,7 +108,8 @@ def test_distilled_scheduler_and_sde_step(tmp_path) -> None:
     (timesteps = sigma x 1000, a trailing zero sigma), and one step is the
     reference SDE update drawn from the request's generator."""
     sub = _distilled_dit(tmp_path)
-    sched = sub._new_scheduler(4, torch.device("cpu"), flow_shift=12.0, use_karras_sigma=True)
+    sampler = sub._new_scheduler(4, torch.device("cpu"), flow_shift=12.0, use_karras_sigma=True)
+    sched = sampler.scheduler
     assert type(sched).__name__ == "FlowMatchEulerDiscreteScheduler"
     assert torch.allclose(sched.timesteps.float(), torch.tensor(SIGMAS) * 1000)
     assert torch.allclose(sched.sigmas.float(), torch.tensor(SIGMAS + [0.0]))
@@ -116,17 +117,18 @@ def test_distilled_scheduler_and_sde_step(tmp_path) -> None:
 
     gen = torch.Generator().manual_seed(7)
     st = sub.request_state("r")
-    st.add_all(scheduler=sched, sde_generator=gen)
+    st.add_all(scheduler=sampler, sde_generator=gen)
     x = torch.randn(16, 3, 4, 4)
     v = torch.randn_like(x)
-    out = sub._scheduler_step(st, v, sched.timesteps[0], x)
+    out, solver = sub._scheduler_step(st, v, x, 0, {})
+    assert solver == {}, "the distilled step carries nothing but the sample"
     eps = torch.randn((1, *x.shape), generator=torch.Generator().manual_seed(7))[0]
     ref = (1.0 - SIGMAS[1]) * (x - SIGMAS[0] * v) + SIGMAS[1] * eps
     assert torch.allclose(out, ref, atol=1e-6)
     # The last step lands on x0 exactly (sigma' = 0).
     for _ in range(2):
         sched.step(v.unsqueeze(0), sched.timesteps[sched.step_index], out.unsqueeze(0), generator=gen)
-    last = sub._scheduler_step(st, v, sched.timesteps[3], x)
+    last, _ = sub._scheduler_step(st, v, x, 3, {})
     assert torch.allclose(last, x - SIGMAS[3] * v, atol=1e-6)
 
 
@@ -154,18 +156,26 @@ def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
         return vel
 
     monkeypatch.setattr(sub, "_denoise", fake_denoise)
-    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=3, graph_walk="video_gen")
-    ei = SimpleNamespace(request_ids=["r"], per_request_states=None, resources={"attn": "paged"}, step=None)
+    counts = {"video_gen_loop": 0}
+    fwd = SimpleNamespace(
+        request_id="r", rid_handle="r", random_seed=3, graph_walk="video_gen", dynamic_loop_iter_counts=counts,
+    )
+    ei = SimpleNamespace(
+        request_ids=["r"], per_request_states=None, resources={"attn": "paged"}, step=None,
+        per_request_info={"r": fwd},
+    )
     inputs = {"cond_latents": [anchor]}
     for step in range(4):
+        counts["video_gen_loop"] = step
         ni = sub.prepare_inputs("video_gen", fwd, inputs)
         assert ni is not None and not ni.resource_step_info.cfg
         out = sub.forward("video_gen", ei, **sub.preprocess("video_gen", ei, [ni]))
         lat = out["latents"][0]
         assert torch.equal(lat[:, :, 0], anchor[:, :, 0].to(lat.dtype)), f"anchor drifted at step {step}"
         assert not torch.equal(lat[:, :, 1], anchor[:, :, 1])
-        inputs = {"latents": [lat], "time_index": [out["time_index"][0]]}
+        inputs = {"latents": [lat]}
     assert calls == [1000.0, 937.5, pytest.approx(833.333, abs=0.01), 625.0]
+    counts["video_gen_loop"] = 4
     assert sub.prepare_inputs("video_gen", fwd, inputs) is None  # the loop's extra dispatch is vetoed
     info = SimpleNamespace(graph_walk="video_gen", dynamic_loop_iter_counts={"video_gen_loop": 3})
     assert sub.check_stop("r", info, {}) == {"video_gen_loop"}
@@ -174,15 +184,26 @@ def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
     st2 = sub.request_state("r2")
     st2.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},
                 scheduler=sub._new_scheduler(4, torch.device("cpu")))
-    fwd2 = SimpleNamespace(request_id="r2", rid_handle="r2", random_seed=3, graph_walk="video_gen")
+    start = {"video_gen_loop": 0}
+    fwd2 = SimpleNamespace(
+        request_id="r2", rid_handle="r2", random_seed=3, graph_walk="video_gen", dynamic_loop_iter_counts=start,
+    )
     ni = sub.prepare_inputs("video_gen", fwd2, {"cond_latents": [anchor]})
-    ei2 = SimpleNamespace(request_ids=["r2"], per_request_states=None, resources={"attn": "paged"}, step=None)
+    ei2 = SimpleNamespace(
+        request_ids=["r2"], per_request_states=None, resources={"attn": "paged"}, step=None,
+        per_request_info={"r2": fwd2},
+    )
     first2 = sub.forward("video_gen", ei2, **sub.preprocess("video_gen", ei2, [ni]))["latents"][0]
     st3 = sub.request_state("r3")
     st3.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},
                 scheduler=sub._new_scheduler(4, torch.device("cpu")))
-    fwd3 = SimpleNamespace(request_id="r3", rid_handle="r3", random_seed=3, graph_walk="video_gen")
+    fwd3 = SimpleNamespace(
+        request_id="r3", rid_handle="r3", random_seed=3, graph_walk="video_gen", dynamic_loop_iter_counts=start,
+    )
     ni = sub.prepare_inputs("video_gen", fwd3, {"cond_latents": [anchor]})
-    ei3 = SimpleNamespace(request_ids=["r3"], per_request_states=None, resources={"attn": "paged"}, step=None)
+    ei3 = SimpleNamespace(
+        request_ids=["r3"], per_request_states=None, resources={"attn": "paged"}, step=None,
+        per_request_info={"r3": fwd3},
+    )
     first3 = sub.forward("video_gen", ei3, **sub.preprocess("video_gen", ei3, [ni]))["latents"][0]
     assert torch.equal(first2, first3)
