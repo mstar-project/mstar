@@ -271,9 +271,10 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     sees the tail behind ``chained_head_context_latents`` latents, the encode
     sees those frames quantized as served (``_to_uint8``), and the head's
     first latent is the encoder's clip-start latent."""
+    import mstar.model.cosmos3.submodules as cosmos3_submodules
     from mstar.model.cosmos3.submodules import ChainedWindowHead, Cosmos3VAEDecoderSubmodule
 
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
     cfg.chained_head_context_latents = ctx

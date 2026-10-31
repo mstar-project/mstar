@@ -1,5 +1,7 @@
 """VAE decode for the DiT scaffold: the compiled decode and the batch splitting
-that keeps it on shapes it was warmed with.
+that keeps it on shapes it was warmed with. Also the Wan-VAE decode's dtype and
+latent normalization (wan22, cosmos3, lingbot_world): the Cosmos3 encoder's CPU
+tests run them, and ``components/wan_vae.py`` needs diffusers.
 
 ``VAE_DECODE_BATCH_SIZES`` is the scaffold's default ladder; a model may pass its
 own to the decoder submodule.
@@ -14,6 +16,7 @@ import torch
 from torch import nn
 
 from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +100,25 @@ class WarmedDecode:
         if self._compiled and (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])) not in self._warmed:
             return self.vae.decode(latent)
         return self._decode_one(latent)
+
+
+def wan_vae_decode_dtype() -> torch.dtype:
+    """The Wan-VAE decode dtype: bf16 where the conv library has fast bf16
+    conv3d for it, else fp32. On CUDA that is cuDNN 9.16 on: before it, Hopper
+    bf16 is 2-10x slower than fp32/TF32 (measured via a single-variable cuDNN
+    swap), and the live version is read, so an upgrade flips it. On ROCm
+    ``cudnn.version()`` is MIOpen's, which this threshold doesn't apply to; bf16
+    is the fast one there."""
+    if current_platform.is_rocm():
+        return torch.bfloat16
+    return torch.bfloat16 if (torch.backends.cudnn.version() or 0) >= 91600 else torch.float32
+
+
+def latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pipeline-side latent normalization of ``vae`` as ``[1, C, 1, 1, 1]``
+    tensors in ``dtype`` (fp32 or bf16): raw latents ``z = latents / inv_std +
+    mean``, DiT latents ``(z - mean) * inv_std``."""
+    mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
+    return mean, inv_std
+

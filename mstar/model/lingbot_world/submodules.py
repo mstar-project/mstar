@@ -41,6 +41,8 @@ from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleS
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
+from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
+from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.lingbot_world.components.camera import plucker_embedding
 from mstar.model.lingbot_world.components.dit import (
     REFERENCE_ATTENTION,
@@ -155,8 +157,7 @@ def encode_condition_chunk(
         enc = vae.quant_conv(torch.cat(outs, dim=2))
         z = config.vae_z_dim
         latent = enc[:, :z].float()
-        mean = torch.tensor(vae.config.latents_mean).view(1, z, 1, 1, 1).to(latent)
-        inv_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, z, 1, 1, 1).to(latent)
+        mean, inv_std = latent_affine(vae, latent.dtype, latent.device)
         latent = ((latent - mean) * inv_std)[0]
         lat_h, lat_w = latent.shape[2:]
         if first_latent == 0:
@@ -208,21 +209,18 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
-            # cuDNN has fast bf16 conv3d from 9.16; before that bf16 is slower than fp32
-            cudnn = torch.backends.cudnn.version() or 0
-            if cudnn >= 91600:
-                self._decode_dtype = torch.bfloat16
+            self._decode_dtype = wan_vae_decode_dtype()
+            if self._decode_dtype == torch.bfloat16:
                 vae.to(torch.bfloat16)
             else:
-                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)", cudnn)
+                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)",
+                            torch.backends.cudnn.version())
             wan_vae.to_channels_last(vae)
         self._decode_step = wan_vae.DecoderStep(vae, compile=fast, deterministic=True) if vae is not None else None
         if vae is not None:
             # the de-normalize's constants, fp32 on the decoder's device
             device = next(vae.parameters()).device
-            shape = (1, config.vae_z_dim, 1, 1, 1)
-            self._latents_mean = torch.tensor(vae.config.latents_mean, device=device).view(shape)
-            self._latents_inv_std = 1.0 / torch.tensor(vae.config.latents_std, device=device).view(shape)
+            self._latents_mean, self._latents_inv_std = latent_affine(vae, torch.float32, device)
             if fast:
                 for lat_hw in warmup_latent_sizes:
                     self.warmup_decode(lat_hw)
@@ -371,7 +369,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if self.keep_chunk_outputs:
             state.add_all(chunk_latents=x0.clone(), chunk_pixels=pixels.clone(), chunk_condition=y.clone())
         # quantize from fp32; a bf16 decode's frames round once, here
-        frames_u8 = (pixels[0].float() / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
+        frames_u8 = truncate_to_uint8(pixels[0].float()).permute(1, 2, 3, 0).contiguous()
         return {
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],

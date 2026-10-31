@@ -59,6 +59,8 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
+from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
+from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -2690,7 +2692,7 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         if next(vae.parameters()).dtype != torch.float32:
             vae.float()
         device = vision.device
-        mean, inv_std = _latent_affine(vae, torch.float32, device)
+        mean, inv_std = latent_affine(vae, torch.float32, device)
         # fp32 outside autocast; pipeline-side latent normalization; the DiT
         # consumes the latents in its bf16 checkpoint dtype.
         with torch.autocast(device_type=device.type, enabled=False):
@@ -2759,27 +2761,6 @@ def _wan_vae():
     return wan_vae
 
 
-def _latent_affine(vae, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """The pipeline-side latent normalization of ``vae`` as ``[1, C, 1, 1, 1]``
-    tensors: raw latents ``z = latents / inv_std + mean``, DiT latents
-    ``(z - mean) * inv_std``."""
-    mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
-    inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
-    return mean, inv_std
-
-
-def _vae_decode_dtype() -> torch.dtype:
-    # cuDNN ships fast Hopper bf16 conv3d for the Wan-VAE decode only from
-    # 9.16; before that bf16 is 2-10x slower than fp32/TF32 (measured via a
-    # single-variable cuDNN swap), so gate on the live version — an upgrade
-    # flips it automatically. COSMOS3_VAE_DECODE_FP32 overrides.
-    override = os.environ.get("COSMOS3_VAE_DECODE_FP32")
-    if override is not None:
-        return torch.float32 if override.lower() not in ("0", "false", "no", "off") else torch.bfloat16
-    ver = torch.backends.cudnn.version() or 0
-    return torch.bfloat16 if ver >= 91600 else torch.float32
-
-
 class ChainedWindowHead:
     """The clean head of a window that continues earlier frames: a chained
     window's overlap, or a resumed session's first window.
@@ -2814,7 +2795,7 @@ class ChainedWindowHead:
         vae = self.encode_vae
         if next(vae.parameters()).dtype != torch.float32:
             vae.float()
-        mean, inv_std = _latent_affine(vae, torch.float32, z.device)
+        mean, inv_std = latent_affine(vae, torch.float32, z.device)
         with torch.autocast(device_type=z.device.type, enabled=False):
             raw_mu = vae.encode(pixels.to(torch.float32) / 127.5 - 1).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(window_latents.dtype)
@@ -2879,7 +2860,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     def _decode_dtype(self):
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
-        self._decode_dtype_cached = _vae_decode_dtype()
+        self._decode_dtype_cached = wan_vae_decode_dtype()
         logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
                     self._decode_dtype_cached, torch.backends.cudnn.version())
         return self._decode_dtype_cached
@@ -2890,7 +2871,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         vae_dtype = self._decode_dtype()
         if next(vae.parameters()).dtype != vae_dtype:
             vae = vae.to(vae_dtype)
-        mean, inv_std = _latent_affine(vae, vae_dtype, latents.device)
+        mean, inv_std = latent_affine(vae, vae_dtype, latents.device)
         # Force z to the VAE dtype: the engine's outer autocast promotes the
         # `1.0 / std` division to fp32, and a fp32 z into the autocast-off bf16
         # conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op
@@ -2903,11 +2884,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
 
     @staticmethod
     def _to_uint8(decoded: torch.Tensor) -> torch.Tensor:
-        # Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so
-        # only the uint8 frames cross the SHM edge to the data worker, not a 4x
-        # larger fp32 tensor — the decoded video transfer dominates the fixed cost
-        # at higher resolutions. Contiguous whatever layout the decoder ended in.
-        return (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).contiguous()
+        # contiguous whatever layout the decoder ended in
+        return truncate_to_uint8(decoded).contiguous()
 
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""

@@ -362,9 +362,9 @@ class Cosmos3Config:
     # it to bf16 rounding. Costs the cache per live stream, freed when the
     # stream's last window is decoded or the request goes away: 1.33 GiB of
     # tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame
-    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16,
-    # or COSMOS3_VAE_DECODE_FP32). Sessions still store only latents. False
-    # re-decodes the context ahead of every window.
+    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16).
+    # Sessions still store only latents. False re-decodes the context ahead
+    # of every window.
     windowed_decode_warm_cache: bool = True
     # At most this many streams per decoder copy hold a warm cache (0: no cap).
     # A stream that starts while the cap is reached takes the stateless
