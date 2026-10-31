@@ -1,0 +1,337 @@
+{
+ "kernel": "dit_linear",
+ "arch": "gfx942",
+ "product": "mi325x",
+ "classes": {
+  "rows16128-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198898,
+   "us": 1974.22,
+   "default_us": 2339.66
+  },
+  "rows16128-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205610,
+   "us": 3471.99,
+   "default_us": 3612.46
+  },
+  "rows16128-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198068,
+   "us": 1834.91,
+   "default_us": 1920.33
+  },
+  "rows16128-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198051,
+   "us": 676.74,
+   "default_us": 707.73
+  },
+  "rows16256-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198900,
+   "us": 1988.89,
+   "default_us": 2127.87
+  },
+  "rows16256-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198900,
+   "us": 3545.09,
+   "default_us": 3653.98
+  },
+  "rows16256-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198094,
+   "us": 1841.61,
+   "default_us": 1968.48
+  },
+  "rows16256-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205598,
+   "us": 693.79,
+   "default_us": 729.55
+  },
+  "rows16384-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198898,
+   "us": 1993.62,
+   "default_us": 2126.82
+  },
+  "rows16384-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198981,
+   "us": 1848.73,
+   "default_us": 1964.44
+  },
+  "rows16384-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198770,
+   "us": 696.62,
+   "default_us": 729.78
+  },
+  "rows16512-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198094,
+   "us": 1838.51,
+   "default_us": 1955.09
+  },
+  "rows16512-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198770,
+   "us": 695.96,
+   "default_us": 728.03
+  },
+  "rows16640-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198058,
+   "us": 5197.91,
+   "default_us": 5600.79
+  },
+  "rows16640-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 205598,
+   "us": 2123.06,
+   "default_us": 2358.08
+  },
+  "rows16640-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198770,
+   "us": 703.42,
+   "default_us": 732.77
+  },
+  "rows32256-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205570,
+   "us": 8594.45,
+   "default_us": 9541.0
+  },
+  "rows32512-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205555,
+   "us": 6910.99,
+   "default_us": 7137.62
+  },
+  "rows32768-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198058,
+   "us": 8424.49,
+   "default_us": 8836.14
+  },
+  "rows33024-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198058,
+   "us": 3656.52,
+   "default_us": 3888.9
+  },
+  "rows4032-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205551,
+   "us": 547.07,
+   "default_us": 570.09
+  },
+  "rows4032-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205556,
+   "us": 937.01,
+   "default_us": 973.67
+  },
+  "rows4032-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 485.56,
+   "default_us": 521.94
+  },
+  "rows4032-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 187.06,
+   "default_us": 200.12
+  },
+  "rows4064-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198881,
+   "us": 558.32,
+   "default_us": 607.79
+  },
+  "rows4064-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 486.36,
+   "default_us": 525.22
+  },
+  "rows4064-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 189.19,
+   "default_us": 205.71
+  },
+  "rows4096-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198881,
+   "us": 548.67,
+   "default_us": 570.67
+  },
+  "rows4096-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 496.04,
+   "default_us": 525.38
+  },
+  "rows4096-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 191.26,
+   "default_us": 205.72
+  },
+  "rows4128-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198883,
+   "us": 559.44,
+   "default_us": 755.53
+  },
+  "rows4128-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205610,
+   "us": 995.46,
+   "default_us": 1031.06
+  },
+  "rows4128-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205629,
+   "us": 198.13,
+   "default_us": 211.07
+  },
+  "rows4160-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198068,
+   "us": 552.68,
+   "default_us": 584.39
+  },
+  "rows4160-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205570,
+   "us": 958.59,
+   "default_us": 992.36
+  },
+  "rows4160-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198937,
+   "us": 504.88,
+   "default_us": 532.83
+  },
+  "rows4160-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205551,
+   "us": 195.62,
+   "default_us": 208.0
+  },
+  "rows8064-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205556,
+   "us": 1809.99,
+   "default_us": 1941.04
+  },
+  "rows8064-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 197994,
+   "us": 928.69,
+   "default_us": 980.36
+  },
+  "rows8064-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205497,
+   "us": 368.67,
+   "default_us": 382.73
+  },
+  "rows8128-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205610,
+   "us": 1828.45,
+   "default_us": 1944.14
+  },
+  "rows8128-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198112,
+   "us": 940.19,
+   "default_us": 995.51
+  },
+  "rows8128-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 197994,
+   "us": 375.25,
+   "default_us": 388.64
+  },
+  "rows8192-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198898,
+   "us": 1821.4,
+   "default_us": 1933.49
+  },
+  "rows8192-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 197994,
+   "us": 939.47,
+   "default_us": 993.74
+  },
+  "rows8192-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198112,
+   "us": 371.58,
+   "default_us": 387.2
+  },
+  "rows8256-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198906,
+   "us": 1032.03,
+   "default_us": 1083.19
+  },
+  "rows8256-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205556,
+   "us": 1802.22,
+   "default_us": 1937.22
+  },
+  "rows8256-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 197994,
+   "us": 929.0,
+   "default_us": 980.08
+  },
+  "rows8256-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 197994,
+   "us": 371.74,
+   "default_us": 392.03
+  },
+  "rows8320-n11520-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198906,
+   "us": 1048.56,
+   "default_us": 1102.29
+  },
+  "rows8320-n20480-k3840": {
+   "impl": "hipblaslt",
+   "solution": 205610,
+   "us": 1846.4,
+   "default_us": 1982.18
+  },
+  "rows8320-n3840-k10240": {
+   "impl": "hipblaslt",
+   "solution": 198112,
+   "us": 955.01,
+   "default_us": 993.94
+  },
+  "rows8320-n3840-k3840": {
+   "impl": "hipblaslt",
+   "solution": 198757,
+   "us": 377.24,
+   "default_us": 390.08
+  }
+ },
+ "provenance": {
+  "stack": "torch-2.12.1_rocm7.2-hip-7.2.53211-triton-3.7.1",
+  "job": "429",
+  "min_gain": 0.03,
+  "source": "benchmark/kernels/dit_linear.py, captured graphs, weights rotated past the MALL"
+ }
+}
