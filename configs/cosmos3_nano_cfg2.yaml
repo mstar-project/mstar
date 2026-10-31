@@ -3,7 +3,9 @@ model: "cosmos3"
 # rank each (cfg_size: 2) and exchanges the two velocities once per step, before the
 # scheduler. Everything but node_groups is cosmos3_nano.yaml's; see there for the
 # knobs. Both ranks hold both branches' text K/V, so the KV pool is the one-GPU size.
-# Denoise steps run eager here: a captured denoise graph holds both branches.
+# Denoise steps run eager here: a captured denoise graph holds both branches. A decode
+# holds its rank, and the DiT's next step needs both, so each rank has a decoder and
+# requests take them in turn: two concurrent clips decode side by side.
 max_seq_len: 8192
 resources:
   kv:
@@ -16,4 +18,5 @@ node_groups:
     ranks: [0, 1]
     cfg_size: 2
   - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
-    ranks: [0]
+    ranks: [0, 1]
+    replica_policy: round_robin
