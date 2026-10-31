@@ -65,6 +65,9 @@ class PinnedStager:
         self._numel = 0
         self._bufs: list[torch.Tensor] = []
         self._views: list[np.ndarray] = []
+        # per buffer, its prefix of each length copied so far: slicing a
+        # tensor is a dispatch per call, and the lengths repeat step to step
+        self._prefixes: list[dict[int, torch.Tensor]] = []
         self._events: list[torch.Event | None] = [None] * depth
         self._next = 0
         self._lock = threading.Lock()
@@ -82,6 +85,7 @@ class PinnedStager:
             for _ in range(self._depth)
         ]
         self._views = [b.numpy() for b in self._bufs]
+        self._prefixes = [{} for _ in self._bufs]
 
     def to_device(self, values: Sequence | np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
         """A new ``device`` tensor holding ``values`` (a sequence, an array or a CPU tensor, any
@@ -138,10 +142,19 @@ class PinnedStager:
             view[:n] = values
             if pad_value is not None:
                 view[n:total] = pad_value
-            dst.view(-1)[:total].copy_(self._bufs[i][:total], non_blocking=True)
+            flat = dst if dst.dim() == 1 else dst.view(-1)
+            if flat.shape[0] != total:
+                flat = flat[:total]
+            src = self._prefixes[i].get(total)
+            if src is None:
+                src = self._prefixes[i][total] = self._bufs[i][:total]
+            flat.copy_(src, non_blocking=True)
             if ev is None:
                 ev = self._events[i] = torch.Event(device=dst.device)
-            ev.record(torch.accelerator.current_stream(dst.device))
+            if dst.device.index == torch.accelerator.current_device_index():
+                ev.record()  # the current stream, without looking it up
+            else:
+                ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)
 
