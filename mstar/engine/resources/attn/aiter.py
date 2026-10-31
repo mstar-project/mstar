@@ -460,6 +460,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         # [0, 1, ..., rows], for a step that attends one query a row off a plan
         # staged with more (`attend_rows`); grown when planning, never in a graph
         self._row_starts: torch.Tensor | None = None
+        self._retired_row_starts: list[torch.Tensor | None] = []
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -598,6 +599,8 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
 
     def _reserve_row_starts(self, rows: int) -> None:
         if self._row_starts is None or self._row_starts.numel() <= rows:
+            # captured graphs keep reading the buffer they recorded
+            self._retired_row_starts.append(self._row_starts)
             self._row_starts = torch.arange(max(rows, 128) + 1, dtype=torch.int32, device=self._device)
 
     def _stage_eager(self, label: str, rows: _Rows, slot: int) -> _Staged:
