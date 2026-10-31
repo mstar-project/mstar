@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import http.client
 import logging
+import math
 import re
 import ssl
 import urllib.error
@@ -313,8 +314,10 @@ class OpenAIAdapter:
     # most sub-requests one input may split into; longer inputs get a 400
     speech_chunk_max_pieces: int = 32
 
-    def split_speech_text(self, text: str) -> list[str]:
-        """The sentence chunks of a ``/v1/audio/speech`` input that chunking applies to."""
+    def split_speech_text(self, text: str, req=None) -> list[str]:  # noqa: ARG002
+        """The sentence chunks of a ``/v1/audio/speech`` input that chunking
+        applies to; ``req`` is the speech request, for adapters whose split
+        depends on its fields."""
         return split_sentences(text, max_chars=self.speech_chunk_max_chars)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
@@ -811,6 +814,9 @@ class FishS2ProAdapter(OpenAIAdapter):
         )
 
 
+_CHINESE = re.compile(r"[\u4e00-\u9fff]")  # the reference's ``contains_chinese``
+
+
 class CosyVoice3Adapter(OpenAIAdapter):
     """Fun-CosyVoice3: TTS that always clones a voice.
 
@@ -820,8 +826,9 @@ class CosyVoice3Adapter(OpenAIAdapter):
     media, or bare base64 audio; never a server path), with its transcript in
     ``ref_text``. ``instructions`` becomes ``instruct``. ``temperature``,
     ``top_p`` and ``seed`` are the standard fields; ``top_k``, ``ras_window``,
-    ``ras_tau``, ``n_cfm_timesteps`` and ``max_new_tokens`` (25 Hz speech
-    tokens) pass through ``extra_body``. ``speed`` is dropped.
+    ``ras_tau``, ``n_cfm_timesteps``, ``max_new_tokens`` (25 Hz speech
+    tokens) and ``text_frontend`` pass through ``extra_body``. ``speed`` is
+    dropped.
 
     Long text is synthesized in sentence chunks, as the reference frontend
     (``text_normalize``) does: pieces of about 80 tokens, or 60 to 80
@@ -830,7 +837,12 @@ class CosyVoice3Adapter(OpenAIAdapter):
     A Chinese piece over 300 characters is cut again at its commas.
     In one request the LM ends long text early or garbles its end. Without Chinese, an estimate of the Qwen2 BPE token
     count stands in for the reference's real one, so Hangul, kana and
-    Cyrillic pieces stay near 80 tokens as English ones do.
+    Cyrillic pieces stay near 80 tokens as English ones do. The estimate is
+    taken on the text with its digits spelled out, the text the model
+    tokenizes, as the reference splits after normalizing.
+    The reference decides Chinese or English once for the whole text, so a
+    request with Chinese in it tells the model so (``text_has_chinese``) and
+    its English pieces keep their digits, as the reference's do.
     """
 
     supports_speech = True
@@ -838,6 +850,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
     speech_chunk_max_chars = 80 * _CHARS_PER_TOKEN
     # nothing shorter than the smallest piece (80 characters of Chinese) is split
     speech_chunk_min_chars = 81
+    _frontend = None
 
     # A sentence of the reference's ``split_paragraph(lang="zh")``: up to a CJK
     # sentence or clause mark (with a closing quote), or a Latin one before a
@@ -848,17 +861,30 @@ class CosyVoice3Adapter(OpenAIAdapter):
     # A Han character is one token of this tokenizer, and Latin text fewer per
     # character, so a piece's length bounds its tokens. The LM takes 512 tokens
     # of prompt text and text: 7 for the system prompt, at most about 200 for
-    # the transcript of a 30 s reference clip, and 300 for the piece.
+    # the transcript of a 30 s reference clip, and 300 for the piece. A digit
+    # counts twice: with the wetext extra the model spells a Chinese number in
+    # up to about twice its digits (98765432 is 15 characters).
     _ZH_MAX_PIECE_CHARS = 300
 
-    def split_speech_text(self, text: str) -> list[str]:
-        if re.search(r"[\u4e00-\u9fff]", text):  # the reference's ``contains_chinese``
+    def split_speech_text(self, text: str, req=None) -> list[str]:
+        if _CHINESE.search(text):
             return self._split_chinese(text)
         # The reference counts real tokens here; characters per token differ
         # by script (Hangul or kana about 1.5, Cyrillic about 2.7, English about 4.7).
         chars_per_token = len(text) / max(1.0, self._estimated_tokens(text))
         max_chars = min(self.speech_chunk_max_chars, max(80, int(80 * chars_per_token)))
-        return split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
+        pieces = split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
+        extra = getattr(req, "model_extra", None) or {}
+        if extra.get("text_frontend", getattr(req, "text_frontend", True)) is False:
+            return pieces  # the model tokenizes the text as written
+        if len(pieces) > self.speech_chunk_max_pieces:
+            return pieces  # refused for its piece count; re-splitting only adds pieces
+        fitted: list[str] = []
+        for i, piece in enumerate(pieces):
+            if len(fitted) > self.speech_chunk_max_pieces:
+                return fitted + pieces[i:]
+            fitted += self._fit_spoken(piece)
+        return fitted
 
     @classmethod
     def _split_chinese(cls, text: str) -> list[str]:
@@ -875,7 +901,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
         piece of that is under 160 characters."""
         pieces: list[str] = []
         for piece in cls._group_chinese(cls._ZH_SENTENCE.findall(text)):
-            if len(piece) <= cls._ZH_MAX_PIECE_CHARS:
+            if len(piece) + sum(ch.isdigit() for ch in piece) <= cls._ZH_MAX_PIECE_CHARS:
                 pieces.append(piece)
                 continue
             clauses = cls._ZH_CLAUSE.findall(piece)
@@ -906,6 +932,42 @@ class CosyVoice3Adapter(OpenAIAdapter):
             1 / cls._CHARS_PER_TOKEN if ord(ch) < 0x80 else 0.5 if ord(ch) < 0x800 else 1.0 for ch in text
         )
 
+    def _spoken_tokens(self, text: str) -> float:
+        """The token estimate of ``text`` with its digits spelled out, as the model reads it."""
+        if CosyVoice3Adapter._frontend is None:
+            from mstar.model.cosyvoice3.components.text_frontend import CosyVoice3TextFrontend
+
+            CosyVoice3Adapter._frontend = CosyVoice3TextFrontend()
+        return self._estimated_tokens(CosyVoice3Adapter._frontend.normalize(text))
+
+    def _fit_spoken(self, piece: str) -> list[str]:
+        """``piece`` in few, even parts whose spelled-out text is estimated at 80
+        tokens or fewer.
+
+        No cap drops below the piece's longest word, so a word is never cut;
+        words that spell out longer than that stay as cut at that cap.
+        """
+        if not any(c.isdecimal() for c in piece):
+            return [piece]
+        spoken = self._spoken_tokens(piece)
+        if spoken <= 80:
+            return [piece]
+        floor = max(map(len, piece.split()))
+        n = math.ceil(spoken / 80)
+        while True:
+            # the smallest cap that still cuts ``piece`` into at most n parts evens them out
+            lo, hi = floor, max(floor, len(piece) - 1)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if len(split_sentences(piece, max_chars=mid, min_chars=0)) <= n:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            parts = split_sentences(piece, max_chars=lo, min_chars=0)
+            if lo == floor or all(self._spoken_tokens(p) <= 80 for p in parts):
+                return parts
+            n = max(n, len(parts)) + 1
+
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         if getattr(req, "voice", None):
@@ -913,6 +975,10 @@ class CosyVoice3Adapter(OpenAIAdapter):
         instructions = mk.pop("instructions", None)
         if instructions:
             mk.setdefault("instruct", instructions)
+        # set from the whole input, never taken from the client
+        mk.pop("text_has_chinese", None)
+        if _CHINESE.search(req.input):
+            mk["text_has_chinese"] = True
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
         file_paths = None
         input_modalities = ["text"]

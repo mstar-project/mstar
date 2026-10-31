@@ -75,6 +75,7 @@ from mstar.model.chatterbox.chatterbox_model import (
 )
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.loader import resolve_snapshot
+from mstar.model.cosyvoice3.components.text_frontend import CosyVoice3TextFrontend
 from mstar.model.cosyvoice3.config import (
     END_OF_PROMPT,
     END_OF_PROMPT_ID,
@@ -190,6 +191,7 @@ class CosyVoice3Model(Model):
         self.voices_dir = Path(voices_dir) if voices_dir else None
         self.local_dir = resolve_snapshot(model_path_hf, cache_dir)
         self.tokenizer = self._build_text_tokenizer()
+        self.text_frontend = CosyVoice3TextFrontend()
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self._shared: dict[str, Any] = {}
 
@@ -197,6 +199,9 @@ class CosyVoice3Model(Model):
         from mstar.model.cosyvoice3.components.text import CosyVoice3TextTokenizer
 
         return CosyVoice3TextTokenizer(Path(self.local_dir) / self.config.text_tokenizer_dir)
+
+    def warmup_preprocess(self) -> None:
+        self.text_frontend.warmup()
 
     # -----------------------------------------------------------------------
     # Resources
@@ -269,6 +274,8 @@ class CosyVoice3Model(Model):
             "ras_window": _integer("ras_window", mk.get("ras_window", s.ras_window), low=0, high=MAX_RAS_WINDOW),
             "ras_tau": _number("ras_tau", mk.get("ras_tau", s.ras_tau), low=0.0, high=1.0),
             "ignore_eos": _flag("ignore_eos", mk.get("ignore_eos", False)),
+            "text_frontend": _flag("text_frontend", mk.get("text_frontend", True)),
+            "text_has_chinese": _flag("text_has_chinese", mk.get("text_has_chinese", False)),
             "n_cfm_timesteps": _integer(
                 "n_cfm_timesteps",
                 mk.get("n_cfm_timesteps", self.config.flow.cfm.n_timesteps),
@@ -532,8 +539,18 @@ class CosyVoice3Model(Model):
         wav = self._prepare_reference(wav)
 
         mode, transcript = self.resolve_mode(kwargs, uploaded=bool(uploaded))
-        prompt_ids = self.tokenizer(self.prompt_text(mode, transcript, kwargs.get("instruct"), prompt))
-        text_ids = self.tokenizer(prompt)
+        # the transcript and instruction stay as written: the reference's callers
+        # write <|endofprompt|> into them, which turns its frontend off
+        # the API server splits long text into pieces and says when the whole text has Chinese
+        text = (
+            self.text_frontend.normalize(prompt, chinese=knobs["text_has_chinese"])
+            if knobs["text_frontend"]
+            else prompt
+        )
+        if not text.strip():
+            raise ValueError("CosyVoice3 has no text to speak once the text is normalized")
+        prompt_ids = self.tokenizer(self.prompt_text(mode, transcript, kwargs.get("instruct"), text))
+        text_ids = self.tokenizer(text)
         ids = torch.cat([prompt_ids, text_ids])
         if ids.numel() > self.config.max_text_tokens:
             raise ValueError(
