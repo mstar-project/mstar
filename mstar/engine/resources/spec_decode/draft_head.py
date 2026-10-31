@@ -8,12 +8,12 @@ stream, so one byte a weight in place of two halves that kernel.
 ``Fp8DraftHead`` keeps a copy of the head at one scale. Its logits are only
 good for an argmax over a row: each row carries its own scale.
 
-``mstar::fp8_skinny_gemm`` quantises each row of ``x`` and runs ``x @ weight.T`` in
-fp8 on AITER's split-K kernel, which reads the weight once across every CU. It
-is 1.7-1.9x the bf16 kernel at one or two rows of a 248k x 4K head on MI325X,
-and from three rows on an order of magnitude slower, so wider steps read the
-bf16 head. The quantisation is inside the op because inductor does not get
-through compiling an fp8 cast over a whole row.
+``mstar::fp8_head`` quantises each row of ``x`` and reads the head in fp8. At one
+or two rows AITER's split-K kernel reads the weight once across every CU, 1.7-1.9x
+the bf16 kernel on a 248k x 4K head on MI325X; from three rows on that kernel is
+an order of magnitude slower and hipBLASLt's fp8 GEMM takes over, 1.2-1.6x. The
+quantisation is inside the op because inductor does not get through compiling
+an fp8 cast over a whole row.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from mstar.kernels import KernelOp, ShapePolicy, Tolerance
 from mstar.kernels.fp8_gemm import quantize_rows
 from mstar.platforms import current_platform
 
-# where AITER's fp8 split-K kernel beats the bf16 one
-FP8_SKINNY_MAX_ROWS = 2
+# where AITER's fp8 split-K kernel beats hipBLASLt's
+SKINNY_MAX_ROWS = 2
 
 
 @functools.cache
@@ -37,24 +37,31 @@ def _cu_count(device_index: int) -> int:
 
 
 @functools.cache
-def _unit_scale(device: torch.device) -> torch.Tensor:
-    return torch.ones(1, dtype=torch.float32, device=device)
+def _unit_scales(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """Scales of 1, for GEMMs that take them. Cached, so the first call of a
+    shape, an eager warmup's, allocates them outside any captured graph."""
+    return torch.ones(shape, dtype=torch.float32, device=device)
 
 
-def _aiter_skinny():
+def _aiter_impl():
     from aiter.ops.custom import wvSplitKQ
     from aiter.ops.triton.quant import dynamic_per_token_quant_fp8_i8
 
-    def fp8_skinny_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        rows, device = x.shape[0], x.device
+    def fp8_head(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        rows, vocab, device = x.shape[0], weight.shape[0], x.device
         xq = torch.empty(x.shape, dtype=weight.dtype, device=device)
         dynamic_per_token_quant_fp8_i8(xq, x, torch.empty(rows, dtype=torch.float32, device=device))
-        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=device)
-        one = _unit_scale(device)
+        if rows > SKINNY_MAX_ROWS:
+            return torch._scaled_mm(
+                xq, weight.T, scale_a=_unit_scales((rows, 1), device),
+                scale_b=_unit_scales((1, vocab), device), out_dtype=x.dtype,
+            )
+        out = torch.empty((rows, vocab), dtype=x.dtype, device=device)
+        one = _unit_scales((1,), device)
         wvSplitKQ(weight, xq, out, one, one, _cu_count(device.index or 0))
         return out
 
-    return fp8_skinny_gemm
+    return fp8_head
 
 
 def _reference(x, weight):
@@ -77,17 +84,18 @@ def _inputs(shape, dtype, device, generator=None):
     return x, quantize_rows(weight, fp8)[0]
 
 
-FP8_SKINNY_GEMM = KernelOp(
-    "fp8_skinny_gemm",
+FP8_HEAD = KernelOp(
+    "fp8_head",
     "(Tensor x, Tensor weight) -> Tensor",
     fake=_fake,
     reference=_reference,
-    impls={f"rocm:{arch}": _aiter_skinny for arch in ("gfx942", "gfx950")},
+    impls={f"rocm:{arch}": _aiter_impl for arch in ("gfx942", "gfx950")},
     shapes=ShapePolicy(
         dims=("rows", "n", "k"),
         key=_shape,
         inputs=_inputs,
-        warm=({"rows": 1, "n": 2048, "k": 1024}, {"rows": 2, "n": 2048, "k": 1024}),
+        warm=({"rows": 1, "n": 2048, "k": 1024}, {"rows": 2, "n": 2048, "k": 1024},
+              {"rows": 8, "n": 2048, "k": 1024}),
     ),
     # one rounding of a long fp32 sum of exact fp8 products, plus summation order
     tolerance=Tolerance.accumulated(),
@@ -106,4 +114,4 @@ class Fp8DraftHead(nn.Module):
         self.register_buffer("weight", (weight.float() / scale).to(fp8), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return FP8_SKINNY_GEMM(x, self.weight)
+        return FP8_HEAD(x, self.weight)
