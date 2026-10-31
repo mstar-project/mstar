@@ -20,10 +20,10 @@ import torch
 from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -68,7 +68,7 @@ class _HostPoolStub(CPUPagePool):
     succeeds, so ``offload`` is gated only by the manager's own claim."""
 
     def __init__(self):
-        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(64))
+        self.arena = new_page_arena(64)
         self.index = PrefixIndex(self.arena)
         self.offloaded = {}
         self._refused_logged_at = None

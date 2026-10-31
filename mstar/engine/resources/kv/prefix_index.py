@@ -16,12 +16,12 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.manager import PageArena
+    from mstar.engine.resources.kv.arena import PageArena
 
 
 class PrefixIndex:
     def __init__(self, arena: "PageArena") -> None:
-        num_pages = arena.allocator.max_num_pages
+        num_pages = arena.max_num_pages
         self._arena = arena
         self._by_key: dict[bytes, int] = {}
         self._key: list[bytes | None] = [None] * num_pages
@@ -68,7 +68,7 @@ class PrefixIndex:
             f"indexed under {self._key[page].hex()[:16]}; evicting one entry "
             "would free a page the other still names"
         )
-        if parent is not None and self._arena.index is self and self._arena.num_owners[parent] == 1:
+        if parent is not None and self._arena.index is self and self._arena.owners(parent) == 1:
             parent = None
         self._clock += 1
         self.filed += 1
@@ -80,7 +80,7 @@ class PrefixIndex:
         self._stamp[page] = self._clock
         self._arena.seal([page])
         self._arena.retain([page])
-        if self._arena.index is self and self._arena.num_owners[page] > 2:
+        if self._arena.index is self and self._arena.owners(page) > 2:
             # `PageArena.retain` calls `set_shared` only when a page goes from one owner to two, so a page
             # that was already shared before the index named it is marked here
             self.set_shared(page, True)
@@ -153,7 +153,7 @@ class PrefixIndex:
         parent = self._parent[page]
         while parent is not None:
             self._held_below[parent] += 1
-            if self._held_below[parent] > 1 or self._arena.num_owners[parent] > 1:
+            if self._held_below[parent] > 1 or self._arena.owners(parent) > 1:
                 return
             self._evictable.discard(parent)
             parent = self._parent[parent]
@@ -163,7 +163,7 @@ class PrefixIndex:
         parent = self._parent[page]
         while parent is not None:
             self._held_below[parent] -= 1
-            if self._held_below[parent] or self._arena.num_owners[parent] > 1:
+            if self._held_below[parent] or self._arena.owners(parent) > 1:
                 return
             self._evictable.add(parent)
             parent = self._parent[parent]
@@ -174,7 +174,7 @@ class PrefixIndex:
         index = copy.copy(self)
         for name in ("_by_key", "_key", "_parent", "_children", "_stamp", "_leaves", "_evictable"):
             setattr(index, name, copy.copy(getattr(self, name)))
-        index._arena = _Owners(self._arena.num_owners)
+        index._arena = _Owners(self._arena.owners_of(range(len(self._key))))
         freed = len(index.evict(len(self._evictable)))
         assert freed == len(self._evictable), (
             f"eviction reaches {freed} of the {len(self._evictable)} pages the evictable set counts"
@@ -207,7 +207,7 @@ class PrefixIndex:
             if entry is None:
                 break
             stamp, page = entry
-            if self._arena.num_owners[page] > 1:
+            if self._arena.owners(page) > 1:
                 passed_over.append(entry)
                 continue
             if not last and spare is not None and spare(self._key[page]):
@@ -248,6 +248,9 @@ class _Owners:
 
     def __init__(self, num_owners: list[int]) -> None:
         self.num_owners = list(num_owners)
+
+    def owners(self, page: int) -> int:
+        return self.num_owners[page]
 
     def release(self, pages: list[int]) -> None:
         for page in pages:

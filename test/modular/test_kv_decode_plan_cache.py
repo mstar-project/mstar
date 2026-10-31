@@ -13,6 +13,8 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.resources.kv import arena as arena_mod  # noqa: E402
+from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
@@ -306,14 +308,17 @@ def test_a_step_with_sink_rows_is_planned_from_the_streams():
     assert _flat(got) == _flat(_decode(ref, ("a", "b"), slot=0, sink=sink, commit=False)[0])
 
 
-def test_sink_pages_grow_under_the_managers_lock():
-    """The sink run is an extent of the pool the main thread allocates from
-    under the lock, and a plan may run on the plan thread: growing it takes
-    the lock too. Capture sizes it for the longest captured step."""
+def test_sink_pages_grow_under_the_managers_lock(monkeypatch):
+    """The sink run is a page list the main thread changes under the lock, and
+    a plan may run on the plan thread: growing it takes the lock too. Capture
+    sizes it for the longest captured step. On the Python arena, whose
+    extents are what a growth moves."""
+    monkeypatch.setattr(manager_mod, "new_page_arena", lambda n: arena_mod.new_page_arena(n, "python"))
     kv = _manager(0)
     owned = []
-    alloc = kv._page_table._alloc
-    kv._page_table._alloc = lambda capacity: owned.append(kv._lock._is_owned()) or alloc(capacity)
+    table = kv._arena._table
+    alloc = table._alloc
+    table._alloc = lambda capacity: owned.append(kv._lock._is_owned()) or alloc(capacity)
     kv.ingest_request("b", KVReqConfig())
     step = KVStep(segments=(Segment("b", "main", 200),), sink=frozenset({("b", "main")}))
     ctx = StepContext(request_ids=("b",), graph_walk="prefill", slot=0, capture=False)

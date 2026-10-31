@@ -11,11 +11,11 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import chain
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
@@ -37,7 +37,7 @@ class _Event:
 
 class _HostPool(CPUPagePool):
     def __init__(self, max_cpu_pages: int):
-        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(max_cpu_pages))
+        self.arena = new_page_arena(max_cpu_pages)
         self.index = PrefixIndex(self.arena)
         self.offloaded = {}
         self._refused_logged_at = None
@@ -191,7 +191,7 @@ def test_a_full_host_evicts_cached_pages_and_never_an_offloaded_requests():
 
     assert kv.offload("c") == 0, "c fit on a host that b fills"
     assert _host_pages(kv, "b") == held
-    assert all(kv._cpu_pool.arena.num_owners[page] for page in held), (
+    assert all(kv._cpu_pool.arena.owners(page) for page in held), (
         "making room for c freed a page b is still offloaded on"
     )
 
@@ -309,7 +309,7 @@ def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
 
     kv.remove_request("b")
 
-    assert all(kv._arena.num_owners[page] for page in arriving), (
+    assert all(kv._arena.owners(page) for page in arriving), (
         "a page still being copied into went back to the free list"
     )
     _land(kv)

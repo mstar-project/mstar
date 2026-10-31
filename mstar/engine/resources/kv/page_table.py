@@ -1,4 +1,6 @@
-"""Every cache stream's page list, as extents of one int32 pool.
+"""The Python page arena's page lists (`arena.PythonPageArena`): every cache
+stream's pages, as extents of one int32 pool. The Rust arena keeps a list per
+stream instead (`rust/src/page_arena.rs`).
 
 A plan reads the pages of every row of a step. Held as one Python list per
 stream, that is a slice and a list walk per row; held as extents of one array,
@@ -37,6 +39,20 @@ class PlanColumns(NamedTuple):
     all_have_pages: bool
 
 
+def columns_from_raw(raw: tuple, n: int) -> PlanColumns:
+    """The columns of ``n`` rows from a Rust plan call's ``(bytearray, total,
+    all_have_pages)``, as views of its one buffer."""
+    raw, _, all_have_pages = raw
+    buf = np.frombuffer(raw, np.int32)
+    a, b = n + 1, 2 * (n + 1)
+    return PlanColumns(
+        qo_indptr=buf[:a], kv_indptr=buf[a:b], indices=buf[b + 4 * n:],
+        last_page_len=buf[b:b + n], kv_lens=buf[b + n:b + 2 * n],
+        decode_pages=buf[b + 2 * n:b + 3 * n], decode_offsets=buf[b + 3 * n:b + 4 * n],
+        all_have_pages=all_have_pages,
+    )
+
+
 def _capacity_for(n: int) -> int:
     return max(_MIN_CAPACITY, 1 << max(n - 1, 0).bit_length())
 
@@ -57,9 +73,15 @@ class PageTable:
         self.pool = np.empty(capacity, np.int32)
         self._top = 0
         self._free: dict[int, list[int]] = {}
+        # sid -> stream, so a plan can name its rows' streams by id
+        self.streams: dict[int, StreamPages] = {}
+        self._next_sid = 0
 
     def new(self) -> StreamPages:
-        return StreamPages(self)
+        pages = StreamPages(self, self._next_sid)
+        self.streams[self._next_sid] = pages
+        self._next_sid += 1
+        return pages
 
     def _alloc(self, capacity: int) -> int:
         free = self._free.get(capacity)
@@ -89,16 +111,7 @@ class PageTable:
         the numpy version is the same arithmetic in about 30 small calls, which
         cost more than a few dozen rows of per-row Python do."""
         if _rust_plan_columns is not None:
-            raw, total, all_have_pages = _rust_plan_columns(self.pool, offs, held, lens, spans, page_size)
-            buf = np.frombuffer(raw, np.int32)
-            n = len(offs)
-            a, b = n + 1, 2 * (n + 1)
-            return PlanColumns(
-                qo_indptr=buf[:a], kv_indptr=buf[a:b], indices=buf[b + 4 * n:],
-                last_page_len=buf[b:b + n], kv_lens=buf[b + n:b + 2 * n],
-                decode_pages=buf[b + 2 * n:b + 3 * n], decode_offsets=buf[b + 3 * n:b + 4 * n],
-                all_have_pages=all_have_pages,
-            )
+            return columns_from_raw(_rust_plan_columns(self.pool, offs, held, lens, spans, page_size), len(offs))
         return self._plan_columns_numpy(offs, held, lens, spans, page_size)
 
     def _plan_columns_numpy(self, offs, held, lens, spans, page_size) -> PlanColumns:
@@ -141,10 +154,11 @@ class StreamPages:
     Slices and iteration hand out Python lists; ``tolist`` is the whole list.
     """
 
-    __slots__ = ("_table", "off", "cap", "n")
+    __slots__ = ("_table", "sid", "off", "cap", "n")
 
-    def __init__(self, table: PageTable):
+    def __init__(self, table: PageTable, sid: int):
         self._table = table
+        self.sid = sid
         self.off = 0
         self.cap = 0
         self.n = 0
@@ -230,6 +244,8 @@ class StreamPages:
         self.n -= k
 
     def free(self) -> None:
-        """Return the extent to the table; the list is empty after."""
+        """Return the extent to the table; the list is empty after, and the
+        table no longer names it."""
         self._table._release(self.off, self.cap)
         self.off = self.cap = self.n = 0
+        self._table.streams.pop(self.sid, None)

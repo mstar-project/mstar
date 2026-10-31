@@ -37,7 +37,34 @@ pub fn plan_columns(
     page_size: i64,
 ) -> Result<PlanColumns, String> {
     let n = offs.len();
-    if held.len() != n || lens.len() != n || spans.len() != n {
+    if held.len() != n {
+        return Err("plan columns of different lengths".into());
+    }
+    plan_columns_with(
+        |i| {
+            let (off, held) = (offs[i], held[i]);
+            if off < 0 || held < 0 || (off + held) as usize > pool.len() {
+                return Err(format!("row {i}: extent {off}+{held} is outside the page pool"));
+            }
+            Ok(&pool[off as usize..(off + held) as usize])
+        },
+        lens,
+        spans,
+        page_size,
+    )
+}
+
+/// `plan_columns` over any source of each row's held pages: `pages(i)` is
+/// row `i`'s page list (`PageArena`'s per-stream lists, or an extent of the
+/// pool above).
+pub fn plan_columns_with<'a>(
+    pages: impl Fn(usize) -> Result<&'a [i32], String>,
+    lens: &[i64],
+    spans: &[i64],
+    page_size: i64,
+) -> Result<PlanColumns, String> {
+    let n = lens.len();
+    if spans.len() != n {
         return Err("plan columns of different lengths".into());
     }
     if page_size <= 0 {
@@ -45,21 +72,18 @@ pub fn plan_columns(
     }
     // a stream can hold more pages than its length needs (a high-water mark),
     // and never more is read than it holds
-    let mut npages = Vec::with_capacity(n);
-    let mut total: i64 = 0;
+    let mut rows = Vec::with_capacity(n);
+    let mut total = 0usize;
     for i in 0..n {
-        let p = (lens[i] + page_size - 1).div_euclid(page_size).min(held[i]);
-        if p < 0 {
+        let held = pages(i)?;
+        let want = (lens[i] + page_size - 1).div_euclid(page_size);
+        if want < 0 {
             return Err(format!("row {i}: negative page count"));
         }
-        let off = offs[i];
-        if off < 0 || (off + p) as usize > pool.len() {
-            return Err(format!("row {i}: extent {off}+{p} is outside the page pool"));
-        }
-        npages.push(p);
+        let p = (want as usize).min(held.len());
+        rows.push(&held[..p]);
         total += p;
     }
-    let total = total as usize;
     let mut out = vec![0i32; 2 * (n + 1) + 4 * n + total];
     let (qo, rest) = out.split_at_mut(n + 1);
     let (kv_indptr, rest) = rest.split_at_mut(n + 1);
@@ -69,15 +93,14 @@ pub fn plan_columns(
     let (decode_offsets, indices) = rest.split_at_mut(n);
     let (mut q, mut k) = (0i64, 0usize);
     let mut all_have_pages = true;
-    for i in 0..n {
-        let p = npages[i] as usize;
-        let off = offs[i] as usize;
-        indices[k..k + p].copy_from_slice(&pool[off..off + p]);
+    for (i, row) in rows.iter().enumerate() {
+        let p = row.len();
+        indices[k..k + p].copy_from_slice(row);
         // `SequenceView.last_page_len(page_size) or page_size`
         let l = (lens[i] - 1).rem_euclid(page_size) + 1;
         last[i] = l as i32;
         // FlashInfer's `get_seq_lens`
-        kv_lens[i] = ((npages[i].max(1) - 1) * page_size + l) as i32;
+        kv_lens[i] = (((p as i64).max(1) - 1) * page_size + l) as i32;
         if p > 0 {
             decode_pages[i] = indices[k + p - 1];
         } else {

@@ -20,7 +20,8 @@ from mstar.engine.resources.base import (
     KeyedWalks,
     PublishedInfo,
 )
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.arena import PageArena, new_page_arena, plan_columns
+from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import (
     KVLayout,
     KVReqConfig,
@@ -34,7 +35,7 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.host_writes import HostWrites
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
-from mstar.engine.resources.kv.page_table import PageTable, StreamPages
+from mstar.engine.resources.kv.page_table import StreamPages
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -87,72 +88,6 @@ class RoomMark(NamedTuple):
     room: int
     filed: int
     taken: int
-
-
-@dataclass
-class PageArena:
-    """physical storage, free list, and per-page ownership
-
-    A page goes back to the allocator when its last owner releases it, not its
-    first. A sealed page is never written again, so a second owner may read it;
-    freeing clears the seal. Every caller holds the manager's `_lock`, so the
-    counts and seals need none of their own.
-    """
-    kv_cache: KVCache | None
-    allocator: PageAllocator
-    num_owners: list[int] = field(init=False, repr=False)
-    sealed: list[bool] = field(init=False, repr=False)
-    index: PrefixIndex | None = field(default=None, init=False, repr=False)
-    trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
-    # queues each page a release leaves to the index alone, for a copy to the host
-    writes: HostWrites | None = field(default=None, init=False, repr=False)
-
-    def __post_init__(self):
-        self.num_owners = [0] * self.allocator.max_num_pages
-        self.sealed = [False] * self.allocator.max_num_pages
-
-    def acquire(self, n: int) -> list[int] | None:
-        pages = self.allocator.try_allocate(n)
-        if pages is not None:
-            for page in pages:
-                self.num_owners[page] = 1
-            if self.trail is not None:
-                self.trail = (self.trail[0] + 1, hash((self.trail, *pages)))
-        return pages
-
-    def retain(self, pages: list[int]) -> None:
-        for page in pages:
-            self.num_owners[page] += 1
-            if self.num_owners[page] == 2 and self.index is not None:
-                self.index.set_shared(page, True)
-
-    def seal(self, pages: list[int]) -> None:
-        for page in pages:
-            self.sealed[page] = True
-
-    def any_sealed(self, pages: list[int]) -> bool:
-        return any(self.sealed[page] for page in pages)
-
-    def release(self, pages: list[int]) -> None:
-        freed = []
-        for page in pages:
-            assert self.num_owners[page] > 0, f"page {page} released with no owner"
-            self.num_owners[page] -= 1
-            if self.num_owners[page] == 0:
-                self.sealed[page] = False
-                freed.append(page)
-            elif self.num_owners[page] == 1 and self.index is not None:
-                self.index.set_shared(page, False)
-                if self.writes is not None:
-                    self.writes.queue(self.index.key_of(page))
-        self.allocator.free(freed)
-
-    def copy_pages(self, src: list[int], dst: list[int]) -> None:
-        self.kv_cache.copy_pages(src, dst)
-
-    @property
-    def num_free(self):
-        return self.allocator.num_free
 
 
 @dataclass
@@ -251,9 +186,9 @@ class SpanCursor:
 @dataclass
 class CacheStream:
     """(request, label) cache stream metadata"""
-    # an extent of the manager's `PageTable` (no default: a plan reads its
-    # offset against that pool), read like a list; replace it with
-    # `.assign`, never by assigning a list
+    # its list in the manager's `PageArena` (no default: a plan reads it from
+    # there by id), read like a list; replace it with `.assign`, never by
+    # assigning a list
     page_indices: StreamPages
     stored_len: int = 0
     position: int = 0
@@ -573,10 +508,7 @@ class KVManager(AttentionResource):
         )
         self.name = name
 
-        self._arena = PageArena(
-            kv_cache=self.kv_cache,
-            allocator=PageAllocator(cfg.max_num_pages)
-        )
+        self._arena = new_page_arena(cfg.max_num_pages)
         # take SINK_PAGE out of circulation; the allocator is FIFO from 0
         sink = self._arena.acquire(1)
         assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
@@ -600,7 +532,7 @@ class KVManager(AttentionResource):
         if cfg.cpu_offload_pages > 0:
             self._cpu_pool = CPUPagePool(
                 config=cfg, kv_cache=self.kv_cache,
-                arena=PageArena(kv_cache=None, allocator=PageAllocator(cfg.cpu_offload_pages)),
+                arena=new_page_arena(cfg.cpu_offload_pages),
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
@@ -660,10 +592,8 @@ class KVManager(AttentionResource):
         # copy-only H2D into those, see `_stage_decode_plan_state`
         self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
-        # every stream's page list (`StreamPages`), and the SINK_PAGE run a
-        # plan points its sink rows at
-        self._page_table = PageTable()
-        self._sink_pages = self._page_table.new()
+        # the SINK_PAGE run a plan points its sink rows at
+        self._sink_pages = self._arena.new_stream()
         # the plan cache (`_fast_decode_plan`): bumped by everything that
         # changes a stream's pages or length other than a step's commit
         self._plan_epoch = 0
@@ -746,8 +676,7 @@ class KVManager(AttentionResource):
         self._extend_sink_pages(-(-max_seq_len // self.kv_cache.page_size))
 
     def _extend_sink_pages(self, need: int) -> None:
-        # the sink run is an extent of the shared pool, which a plan on the
-        # plan thread must not grow while the main thread allocates from it
+        # a plan on the plan thread reads the sink run, so it grows under the lock
         with self._lock:
             sink_pages = self._sink_pages
             if len(sink_pages) < need:
@@ -2450,9 +2379,9 @@ class KVManager(AttentionResource):
         sink: frozenset[tuple[str, str]], ring: PinnedIndexRing | None,
     ) -> KVPlanOutput:
         """One plan label's output: ``_plan_output(_sequence_views(...))``,
-        built from columns. One pass over the rows reads each stream's extent,
+        built from columns. One pass over the rows reads each stream's id,
         length and generation; the arrays then come from one call
-        (`PageTable.plan_columns`), and the views are built only if a consumer
+        (`arena.plan_columns`), and the views are built only if a consumer
         asks. A step whose pre-forks are pending plans from the views."""
         if pending:
             return self._plan_output(self._sequence_views(segments, pending, ctx, sink), ring)
@@ -2460,7 +2389,7 @@ class KVManager(AttentionResource):
         streams = self._streams
         capture = ctx.capture
         is_pad = ctx.is_padding_row
-        offs, held, lens, spans, gens = [], [], [], [], []
+        sids, lens, spans, gens = [], [], [], []
         sink_rows = []
         decode = bool(segments)
         for i, s in enumerate(segments):
@@ -2472,15 +2401,12 @@ class KVManager(AttentionResource):
                 # a padding row reads and writes SINK_PAGE, a page per page of
                 # span; see `_sequence_views`
                 sink_rows.append(i)
-                offs.append(0)
-                held.append(0)
+                sids.append(0)
                 lens.append(span)
                 gens.append(0)
                 continue
             stream = streams[s.request_id][s.label]
-            pages = stream.page_indices
-            offs.append(pages.off)
-            held.append(pages.n)
+            sids.append(stream.page_indices.sid)
             lens.append(span + stream.stored_len)
             gens.append(stream.generation)
         if sink_rows:
@@ -2488,10 +2414,10 @@ class KVManager(AttentionResource):
             need = -(-max(spans[i] for i in sink_rows) // page_size)
             if len(sink_pages) < need:
                 self._extend_sink_pages(need)
+            # a row reads no more pages than its length needs
             for i in sink_rows:
-                offs[i] = sink_pages.off
-                held[i] = need
-        cols = self._page_table.plan_columns(offs, held, lens, spans, page_size)
+                sids[i] = sink_pages.sid
+        cols = plan_columns(self._arena, sids, lens, spans, page_size)
         indices, kv_indptr, last = cols.indices, cols.kv_indptr, cols.last_page_len
         make = ring.take if ring is not None else torch.from_numpy
         # a decode row writes the token after its last: the last page, at its
@@ -3467,7 +3393,7 @@ class KVManager(AttentionResource):
     def _reusable(self, page: int) -> bool:
         """Whether ``page`` reaches the free list, or is left to the index alone,
         once the request releases it."""
-        owners = self._arena.num_owners[page]
+        owners = self._arena.owners(page)
         return owners == 1 or (owners == 2 and self._index is not None and self._index.holds(page))
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
@@ -3931,7 +3857,7 @@ class KVManager(AttentionResource):
             for page, n in copying.items():
                 refs[page] = refs.get(page, 0) + n
 
-            counts = {page: arena.num_owners[page] for page in owned}
+            counts = dict(zip(owned, arena.owners_of(owned), strict=True))
             assert counts == refs, (
                 "owner counts disagree with the streams naming the pages: "
                 + ", ".join(
@@ -3945,12 +3871,12 @@ class KVManager(AttentionResource):
             # a copy from the host holds its pages without reading them, so its references don't make a page shared
             unsealed = [
                 page for page in owned
-                if arena.num_owners[page] - copying[page] > 1 and not arena.sealed[page]
+                if counts[page] - copying[page] > 1 and not arena.is_sealed(page)
             ]
             assert not unsealed, f"pages shared before they were sealed: {unsealed}"
 
             crowded = sorted(
-                page for page in frontier if arena.num_owners[page] != 1
+                page for page in frontier if arena.owners(page) != 1
             )
             assert not crowded, (
                 f"pages still being written into, but not owned alone: {crowded}"
@@ -3981,9 +3907,9 @@ class KVManager(AttentionResource):
     @staticmethod
     def _owned_pages(arena: PageArena, pool: str) -> list[int]:
         """The pages ``arena`` holds, checked against its free list."""
-        total = arena.allocator.max_num_pages
-        free = list(arena.allocator.free_pages.queue)
-        owned = [page for page in range(total) if arena.num_owners[page] > 0]
+        total = arena.max_num_pages
+        free = arena.free_pages()
+        owned = [page for page, owners in enumerate(arena.owners_of(range(total))) if owners > 0]
         both = sorted(set(free) & set(owned))
         assert not both, f"pages both free and owned in the {pool} pool: {both}"
         assert len(free) + len(owned) == total, (
@@ -4003,7 +3929,7 @@ class KVManager(AttentionResource):
             refs.update(copy.host_pages)
         if self._host_writes is not None:
             refs.update(self._host_writes.host_pages_held())
-        counts = {page: host.num_owners[page] for page in owned}
+        counts = dict(zip(owned, host.owners_of(owned), strict=True))
         assert counts == dict(refs), (
             "host owner counts disagree with the index and requests naming the pages: "
             + ", ".join(
@@ -4039,7 +3965,7 @@ class KVManager(AttentionResource):
         self._transfer.cleanup()
 
     def _new_stream(self) -> CacheStream:
-        return CacheStream(page_indices=self._page_table.new())
+        return CacheStream(page_indices=self._arena.new_stream())
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
@@ -4220,10 +4146,9 @@ class KVManager(AttentionResource):
         allotment = self._allotments.get(rid)
         if allotment is not None:
             evictable = () if self._index is None else self._index.evictable()
-            owners = self._arena.num_owners
             gone = sum(
-                1 for page in pages
-                if page not in stream.lent and (not refund or (owners[page] and page not in evictable))
+                1 for page, owners in zip(pages, self._arena.owners_of(pages), strict=True)
+                if page not in stream.lent and (not refund or (owners and page not in evictable))
             )
             allotment.pages = max(0, allotment.pages - gone)
         if stream.lent:
@@ -4338,16 +4263,14 @@ class KVManager(AttentionResource):
                 f"{len(to_stream.page_indices)} pages but its source "
                 f"{from_label} needs {n}; _reserve_fork under-reserved"
             )
-            shared = [
-                page for page in to_stream.page_indices[:n]
-                if self._arena.num_owners[page] > 1
-            ]
+            fork = to_stream.page_indices[:n]
+            shared = [page for page, owners in zip(fork, self._arena.owners_of(fork), strict=True) if owners > 1]
             assert not shared, (
                 f"fork target {rid}/{to_label} would be written over pages "
                 f"{shared}, which another owner still reads; a fork target "
                 "cannot be a stream the index holds"
             )
-            self._arena.copy_pages(
+            self.kv_cache.copy_pages(
                 from_stream.page_indices[:n], to_stream.page_indices[:n],
             )
             to_stream.stored_len = from_stream.stored_len
