@@ -2905,14 +2905,15 @@ class Worker:
 
     def _tp_async_default_nodes(self) -> frozenset[str]:
         """The parallel nodes TP async scheduling covers when nothing sets it:
-        those with tp_size > 1 on a platform that turns it on
-        (``Platform.tp_async_sched_default``). Every rank of an instance reads
+        those with tp_size > 1 and no guidance group on a platform that turns it
+        on (``Platform.tp_async_sched_default``). Every rank of an instance reads
         the same group sizes, so the ranks agree."""
         if not current_platform.tp_async_sched_default():
             return frozenset()
         return frozenset(
             node for node in self.parallel_nodes
             if self.parallel_groups.get_tp_config_for_node(node).world_size > 1
+            and self.parallel_groups.get_cfg_config_for_node(node).world_size == 1
         )
 
     def _tp_async_for(self, node_name: str) -> bool:
