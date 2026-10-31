@@ -32,16 +32,13 @@ model_kwargs:
   # captured graph falls back to the eager batched path.
   #
   # The capture budget per size is len(capture_caption_lengths) x len(capture_batch_sizes),
-  # so all 16 lengths would be 128 graphs. Spend the budget on caption lengths
-  # instead of batch sizes: a captured bucket already serves SHORTER batches by
-  # padding them with dummy rows (CudaGraphRunner.DummyRowPool), so 1/2/4/8 covers
-  # every batch up to 8, where extra cap_lens cover nothing but themselves.
-  # 4 x 4 = 16 graphs, the same count as the [32, 64] x [1..8] this replaced, with
-  # twice the caption coverage. Widen if the measured startup and VRAM allow.
+  # so all 16 lengths would be 128 graphs. Spend it on batch sizes before caption lengths: a
+  # captured bucket serves a shorter batch by padding it with dummy rows (CudaGraphRunner.DummyRowPool),
+  # and at 16 concurrent requests steps average 5.7 rows, so with only 1/2/4/8 captured about 30% of a
+  # step's rows would be dummies. The 32 + 32 graphs of the two sizes cost 10 GiB of VRAM.
   capture_caption_lengths: [32, 64, 96, 128]
-  # The scaffold default; 3/5/6/7 replay the next captured size with dummy rows.
-  # Costs some padded compute at those sizes, buys half the graphs.
-  capture_batch_sizes: [1, 2, 4, 8]
+  # every batch size up to max_batch_size
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
