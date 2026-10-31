@@ -100,6 +100,9 @@ def _tunableop():
 
 # solutions chosen by `hipblaslt_best`, by (rows, n, k): (index, quick us, default us, solutions tried)
 HIPBLASLT_CHOICES: dict[tuple[int, int, int], tuple[int, float, float, int]] = {}
+# traffic a solution's second look reads, past the memory-side cache, and how many solutions get one
+RERANK_BYTES = 600 << 20
+RERANK_SOLUTIONS = 16
 
 
 def _graph_us(fn, x, weights, calls: int = 8) -> float:
@@ -124,37 +127,57 @@ def _graph_us(fn, x, weights, calls: int = 8) -> float:
     return start.elapsed_time(end) * 1e3 / (3 * calls)
 
 
-def _hipblaslt_best():
-    """hipBLASLt at the fastest of all its solutions for a shape (AITER's ``hipb_findallsols``), each timed
-    on the first call per shape in a captured graph over weight copies that outgrow the MALL; the harness
-    then times that solution like any other candidate. The choice is kept in ``HIPBLASLT_CHOICES``."""
+def _weights(w, nbytes: int, max_copies: int) -> list[torch.Tensor]:
+    """``w`` and enough clones of it to read ``nbytes`` in one pass, at most ``max_copies``."""
+    copies = max(1, min(max_copies, -(-nbytes // (w.numel() * w.element_size()))))
+    return [w] + [w.clone() for _ in range(copies - 1)]
+
+
+def hipblaslt_best():
+    """hipBLASLt at the fastest of all its solutions for a shape (AITER's ``hipb_findallsols``), chosen on the first
+    call per shape: every solution timed in a short captured graph, then the fastest few again over weight copies
+    that outgrow the MALL, since a small weight's short graph stays in cache and ranks solutions on the wrong
+    memory. The harness then times the choice like any other candidate; the chosen solutions are in ``chosen`` by
+    (rows, n, k), and in ``HIPBLASLT_CHOICES``."""
     import aiter
 
     aiter.hipb_create_extension()
     chosen: dict[tuple[int, int, int], int] = {}
 
+    def timed(x, weights, sols, calls):
+        found = []
+        for sol in sols:
+            try:
+                found.append((_graph_us(lambda a, b, sol=sol: aiter.hipb_mm(a, b.t(), sol), x, weights, calls), sol))
+            except Exception:  # noqa: BLE001  a solution that cannot run this shape
+                torch.cuda.synchronize()
+        return found
+
     def linear(x, w):
         key = (x.shape[0], w.shape[0], w.shape[1])
         if key not in chosen:
-            copies = max(1, min(8, -(-(600 << 20) // (w.numel() * w.element_size()))))
-            weights = [w] + [w.clone() for _ in range(copies - 1)]
             sols = aiter.hipb_findallsols(x, w.t())
-            timed = []
-            for sol in sols:
-                try:
-                    timed.append((_graph_us(lambda a, b, sol=sol: aiter.hipb_mm(a, b.t(), sol), x, weights), sol))
-                except Exception:  # noqa: BLE001  a solution that cannot run this shape
-                    torch.cuda.synchronize()
-            best_us, best = min(timed)
-            default_us = _graph_us(F.linear, x, weights)
+            weights = _weights(w, RERANK_BYTES, 8)
+            quick = sorted(timed(x, weights, sols, 8))
+            del weights
+            weights = _weights(w, RERANK_BYTES, 64)
+            best_us, best = min(timed(x, weights, [sol for _, sol in quick[:RERANK_SOLUTIONS]], len(weights)))
+            default_us = _graph_us(F.linear, x, weights, len(weights))
             chosen[key] = best
             HIPBLASLT_CHOICES[key] = (best, best_us, default_us, len(sols))
             print(f"hipblaslt_best rows={key[0]} n={key[1]} k={key[2]}: solution {best} {best_us:.2f} us "
-                  f"(default {default_us:.2f} us, {len(timed)} of {len(sols)} solutions ran)", flush=True)
+                  f"(default {default_us:.2f} us, {len(quick)} of {len(sols)} solutions ran)", flush=True)
             del weights
         return aiter.hipb_mm(x, w.t(), chosen[key])
 
+    linear.chosen = chosen
     return linear
+
+
+def chosen_solution(fn, args) -> dict[str, int]:
+    """A ``hipblaslt_best`` callable's solution for ``args``' shape, as a candidate's ``shape_knobs``."""
+    x, w = args[:2]
+    return {"solution": fn.chosen[(x.shape[0], w.shape[0], w.shape[1])]}
 
 
 def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> list[Candidate]:
@@ -165,7 +188,7 @@ def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> lis
         # AITER's bf16 asm GEMMs are left out: one (32x64 split-K "clean") faulted on a 4096x4096 weight on
         # MI325X, which takes the whole search down
         found.append(Candidate("tunableop", {}, _tunableop))
-        found.append(Candidate("hipblaslt_best", {}, _hipblaslt_best))
+        found.append(Candidate("hipblaslt_best", {}, hipblaslt_best, shape_knobs=chosen_solution))
     return found
 
 

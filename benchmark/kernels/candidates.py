@@ -130,11 +130,14 @@ def label(family: str, knobs: Mapping[str, Any]) -> str:
 class Candidate:
     """One way to compute an op. ``build()`` returns a callable with the op's
     signature (compiling, if it must); ``isa(fn, args)`` returns register and
-    LDS statistics once ``fn`` has run, where the family can read them."""
+    LDS statistics once ``fn`` has run, where the family can read them;
+    ``shape_knobs(fn, args)`` returns what the candidate settled on for this
+    shape (a tuned solution), recorded with its knobs."""
     family: str
     knobs: Mapping[str, Any]
     build: Callable[[], Callable[..., Any]]
     isa: Callable[[Callable[..., Any], tuple], dict] | None = None
+    shape_knobs: Callable[[Callable[..., Any], tuple], dict] | None = None
 
     @property
     def name(self) -> str:

@@ -136,6 +136,8 @@ def search_shape(
                      copies=timing.copies, note=timing.note, pct_of_floor=line.pct_of_floor(timing.us),
                      gbps=line.bytes_moved / timing.us / 1e3, tflops=line.flops / timing.us / 1e6)
         cand, fn = built[name].candidate, built[name].fn
+        if cand.shape_knobs is not None:
+            entry["knobs"] = {**entry["knobs"], **cand.shape_knobs(fn, arg_sets[0])}
         if cand.isa is not None:
             try:
                 entry["isa"] = cand.isa(fn, arg_sets[0])
@@ -185,16 +187,17 @@ def table(rows: Sequence[dict[str, Any]], title: str) -> str:
 def run(
     spec: KernelSpec, *, families: Sequence[str] | None = None, budget: int | None = None,
     store: ResultsStore | None = None, bench: Bench | None = None, facts: DeviceFacts | None = None,
-    meta: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None, seed_store: ResultsStore | None = None,
 ) -> list[dict[str, Any]]:
-    """The search; returns the records written (or that would be, without a store)."""
+    """The search; returns the records written (or that would be, without a store).
+    Earlier winners seed it from ``seed_store``, else from ``store``."""
     facts = facts or current_platform.device_facts()
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     bench = bench or Bench(device, rotate_bytes=2 * facts.mall_bytes if facts.mall_bytes else None)
     seeds = {}
-    if store is not None:
+    if (source := seed_store or store) is not None:
         for family in ("triton", "triton_fma", "triton_dot", "hip"):
-            seeds[family] = store.seeds(facts, spec.name, family)
+            seeds[family] = source.seeds(facts, spec.name, family)
     cands = [c for c in spec.candidates(facts, budget=budget, seeds=seeds)
              if families is None or c.family in families]
     built = build(cands)
@@ -227,6 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calls", type=int, default=256, help="calls per captured graph")
     parser.add_argument("--rounds", type=int, default=3, help="interleaved replays per candidate")
     parser.add_argument("--store", default=str(DEFAULT_ROOT), help="results store root ('' to write none)")
+    parser.add_argument("--seed-store", help="take earlier winners from this store, not --store, so a new store "
+                                             "compares only what one run timed")
     parser.add_argument("--table", help="also write the markdown table here")
     parser.add_argument("--json", help="also write the records here")
     parser.add_argument("--job", default=os.environ.get("SLURM_JOB_ID"), help="recorded with every result")
@@ -257,7 +262,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     bench = Bench(device, calls=args.calls, rounds=args.rounds,
                   rotate_bytes=2 * facts.mall_bytes if facts.mall_bytes else None)
     meta = {"job": args.job, "sha": git_sha()}
-    records = run(spec, families=families, budget=args.budget, store=store, bench=bench, facts=facts, meta=meta)
+    seed_store = ResultsStore(args.seed_store) if args.seed_store else None
+    records = run(spec, families=families, budget=args.budget, store=store, bench=bench, facts=facts, meta=meta,
+                  seed_store=seed_store)
     title = (f"{spec.name} on {facts.name} ({facts.arch}, {facts.product}), {stack_key()}, "
              f"job {args.job}, sha {meta['sha']}")
     text = table([summarize(r) for r in records], title)
