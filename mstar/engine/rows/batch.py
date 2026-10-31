@@ -162,30 +162,42 @@ class PersistentBatch:
         gone = set(rids) | self._forgotten
         return self.propose([rid for rid in self._order if rid not in gone])
 
-    def commit(self, diff: RowDiff) -> np.ndarray:
-        """Make ``diff`` the committed state. Returns the slots that requests
-        removed while holding a row left, including any forgotten after the
-        diff was taken. Slots, not handles: a handle may name a new request."""
+    def check_commit(self, diff: RowDiff) -> np.ndarray:
+        """Raise if ``diff`` can't commit; else the slots that requests
+        removed while holding a row leave by it, including any forgotten after
+        the diff was taken. Slots, not handles: a handle may name a new
+        request. Changes nothing."""
         if diff.base_version != self._version:
             raise RuntimeError(
                 f"a diff taken at version {diff.base_version} committed at {self._version}"
             )
         if diff.empty():
             return _EMPTY
-        released = []
-        for rid, slot in zip(diff.leave_rids, diff.leave_slots.tolist(), strict=True):
+        forgotten = self._forgotten
+        if not forgotten:
+            return _EMPTY
+        joined = set(diff.join_rids)
+        stale = [rid for rid in diff.order if rid in forgotten and rid not in joined]
+        if stale:
+            # the worker never removes a request a step it has planned still runs
+            raise RuntimeError(f"a step keeps rows of removed requests {stale}")
+        return np.asarray([
+            slot for rid, slot in zip(diff.leave_rids, diff.leave_slots.tolist(), strict=True)
+            if rid in forgotten
+        ], dtype=np.int64)
+
+    def commit(self, diff: RowDiff) -> np.ndarray:
+        """Make ``diff`` the committed state; returns ``check_commit``'s
+        slots. Checks before changing anything, so a refused diff leaves the
+        committed state as it was."""
+        released = self.check_commit(diff)
+        if diff.empty():
+            return released
+        for rid in diff.leave_rids:
             del self._slot_of[rid]
-            if rid in self._forgotten:
-                self._forgotten.discard(rid)
-                released.append(slot)
-        if self._forgotten:
-            joined = set(diff.join_rids)
-            stale = [rid for rid in diff.order if rid in self._forgotten and rid not in joined]
-            if stale:
-                # the worker never removes a request a step it has planned still runs
-                raise RuntimeError(f"a step keeps rows of removed requests {stale}")
+            self._forgotten.discard(rid)
         self._order = list(diff.order)
         for slot, rid in enumerate(self._order):
             self._slot_of[rid] = slot
         self._version += 1
-        return np.asarray(released, dtype=np.int64)
+        return released

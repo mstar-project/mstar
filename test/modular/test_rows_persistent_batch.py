@@ -139,3 +139,17 @@ def test_a_step_that_keeps_a_forgotten_row_is_refused():
     pb.forget(2)
     with pytest.raises(RuntimeError, match="removed requests"):
         pb.commit(diff)
+
+
+def test_a_refused_commit_changes_nothing():
+    pb = PersistentBatch(8)
+    pb.commit(pb.propose([1, 2]))
+    diff = pb.propose([2, 3])
+    pb.forget(2)
+    with pytest.raises(RuntimeError, match="removed requests"):
+        pb.commit(diff)
+    assert list(pb.order) == [1, 2] and pb.version == 1
+    assert pb.slot_of(1) == 0 and pb.slot_of(2) == 1
+    # the forgotten row still leaves, and is still reported, at the next commit
+    assert pb.commit(pb.propose([3])).tolist() == [1]
+    assert list(pb.order) == [3] and pb.slot_of(1) is None and pb.slot_of(2) is None

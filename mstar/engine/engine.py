@@ -2032,7 +2032,6 @@ class Engine:
             # which may then remove a request this step checked in
             rows.stage()
             self._rows[batch.node_name].commit(ctx.graph_walk, rows)
-            rows.apply()
             phase_end("engine.rows", t0)
 
         if self._enable_profile and batch.exec_timings.fwd_start is None:
