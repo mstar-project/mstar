@@ -340,7 +340,6 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
@@ -1694,9 +1693,9 @@ within itself and matches the offline mask. <code class="docutils literal notran
 <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>). A per-query window takes no sink, and its right context is 0.
 <code class="docutils literal notranslate"><span class="pre">retention</span></code> may be a single <code class="docutils literal notranslate"><span class="pre">SinkWindow</span></code> when it does not depend on the source length.
 <code class="docutils literal notranslate"><span class="pre">BoundedKVConfig(dtype=None)</span></code> stores the cache in the engine’s KV dtype, for layers that
-compute in it. Nemotron VoiceChat’s streaming encoder (<code class="docutils literal notranslate"><span class="pre">ENCODER_KV</span></code>,
-<code class="docutils literal notranslate"><span class="pre">encoder_kv_config</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/model/nemotron_duplex/components/conformer.py</span></code>) is the
-per-query example.</p>
+compute in it. The streaming FastConformer (<code class="docutils literal notranslate"><span class="pre">encoder_kv_config</span></code> in
+<code class="docutils literal notranslate"><span class="pre">mstar/model/components/fastconformer_stream.py</span></code>, Nemotron VoiceChat’s <code class="docutils literal notranslate"><span class="pre">ENCODER_KV</span></code>) is
+the per-query example.</p>
 </section>
 </section>
 </section>

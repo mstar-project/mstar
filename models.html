@@ -341,7 +341,6 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.config.html">mstar.model.nemotron_duplex.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
 </ul>
 </details></li>
@@ -1048,6 +1047,11 @@ fairseq2).</p></li>
 <li><p>Install with <code class="docutils literal notranslate"><span class="pre">.[asr]</span></code>. Uploads that libsndfile can’t read (M4A, WebM) are decoded by
 torchcodec, which needs FFmpeg.</p></li>
 <li><p>One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.</p></li>
+<li><p>All four run the FastConformer encoder <code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code> streams
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/components/fastconformer.py</span></code>), over the whole clip. Canary, Parakeet and
+Nemotron ASR read its dimensions from the HF <code class="docutils literal notranslate"><span class="pre">encoder_config</span></code>; Canary-Qwen from NeMo’s
+<code class="docutils literal notranslate"><span class="pre">perception.encoder</span></code> (<code class="docutils literal notranslate"><span class="pre">FastConformerConfig.from_nemo</span></code>), which refuses an encoder
+whose parts NeMo configures as partly causal.</p></li>
 <li><p>Request fields, the same on <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> and in <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>:</p>
 <ul>
@@ -1439,7 +1443,11 @@ user’s audio a client stream (<code class="docutils literal notranslate"><span
 streamed: each chunk runs the layers over its new frames only, against the
 call’s cached last 70 frames, so a step costs the same however long the call
 is; it emits the frames no later audio can change, the last ones at the end
-of input)
+of input. It is the shared FastConformer, Canary’s encoder, as a stream node
+(<code class="docutils literal notranslate"><span class="pre">FastConformerStreamSubmodule</span></code>), with the featurizer of the VoiceChat
+reference, which predates NeMo 2.5: reflected clip edges and
+<code class="docutils literal notranslate"><span class="pre">samples</span> <span class="pre">//</span> <span class="pre">160</span> <span class="pre">+</span> <span class="pre">1</span></code> mel frames. The checkpoint’s RNN-T transcription head
+is not loaded)
 → <code class="docutils literal notranslate"><span class="pre">nano_llm</span></code> (frame-synchronous decode loop: each step fuses one audio frame
 with the previous agent-text and tool-call tokens, emits one agent-text token)
 → <code class="docutils literal notranslate"><span class="pre">eartts_talker</span></code> (one text token → 31 RVQ codes, decoded by the RVQ codec
@@ -1548,14 +1556,23 @@ Send appends of 80 ms or more: the encoder takes one append per step, so
 shorter appends need several steps per frame and fall behind once a step
 takes longer than an append.</p></li>
 <li><p>Encoder numerics, measured on CPU at the checkpoint’s dimensions with random
-weights: an upload is one encoder pass, bit for bit the offline encoder’s in
-fp32 and under bf16 autocast, save the last frame when the end of input
-reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
-the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
-autocast. So live and one-shot text should agree token for token in fp32
-(inferred from those frames, not measured on served text); under the served
-bf16 a different chunking can flip a knife-edge frame such as the agent’s
-turn start.</p></li>
+weights on the duplex encoder the shared FastConformer replaced, and not
+since: an upload was one encoder pass, bit for bit that encoder’s offline
+pass in fp32 and under bf16 autocast, save the last frame when the end of
+input reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends
+put the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
+autocast. The shared encoder’s stream attention adds the relative-position
+term before scaling and its offline attention after, so an upload is no
+longer expected to match the offline pass bit for bit. From those figures,
+live and one-shot text should agree token for token in fp32 (inferred, not
+measured on served text); under the served bf16 a different chunking can flip
+a knife-edge frame such as the agent’s turn start. Under bf16 autocast the
+stream node keeps the blocks’ residual in fp32, as the replaced encoder did
+from its second layer on; the offline FastConformer encoders keep theirs in
+bf16. Against an fp32 run on 13 clips (one H200, real checkpoint,
+2026-10-29), live frames have a mean per-frame relative error of 1.35%,
+level with the replaced encoder’s 1.39%, where a bf16 residual gave 1.63%;
+uploads and offline passes are as close as the replaced encoder’s too.</p></li>
 <li><p>The encoder keeps each call’s state in a slot per session of three
 resources: its attention keys and values in a bounded KV (<code class="docutils literal notranslate"><span class="pre">encoder_kv</span></code>),
 which keeps a call’s last 70 frames per layer and runs the attention, each new
