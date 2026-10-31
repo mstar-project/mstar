@@ -1,0 +1,19 @@
+model: "cosmos3"
+# cosmos3_nano.yaml on two GPUs: the DiT runs each request's guidance branches on a
+# rank each (cfg_size: 2) and exchanges the two velocities once per step, before the
+# scheduler. Everything but node_groups is cosmos3_nano.yaml's; see there for the
+# knobs. Both ranks hold both branches' text K/V, so the KV pool is the one-GPU size.
+# Denoise steps run eager here: a captured denoise graph holds both branches.
+max_seq_len: 8192
+resources:
+  kv:
+    max_num_pages: 1024
+model_kwargs:
+  accelerator_graph: true
+  graph_max_latent_area: 2000
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    cfg_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0]
