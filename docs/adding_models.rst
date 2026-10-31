@@ -1882,8 +1882,10 @@ module docstring. What a model declares and calls:
   ``Fp8DraftHead`` (``mstar/engine/resources/spec_decode/draft_head.py``) can hold an fp8
   copy of the vocabulary head for the draft alone: half the bytes of the pass's largest
   kernel, for a little acceptance and no correctness. Verification always reads the
-  checkpoint's head. A vocabulary subset is not offered: it saves as much on Latin-script
-  text and loses a third to a half of the accepted drafts on other scripts.
+  checkpoint's head, and so does a sampled draft: ``draw_draft`` needs real logits, and
+  each row of the fp8 head's is on a scale of its own. A vocabulary subset is not
+  offered: it saves as much on Latin-script text and loses a third to a half of the
+  accepted drafts on other scripts.
 - **The prompt's last step.** It declares ``SpecDecodeStep(phase=SEED)`` (budgets
   and ``ignore_eos`` rows) and ``KVStep.commit_adjust`` of ``seed_lookahead`` tokens,
   runs the draft head over the prompt, and calls ``seed(first_token, first_draft)``.
@@ -1901,10 +1903,11 @@ on the device. That needs an attention backend whose plan reads per-row KV lengt
 a block table on the device: AITER's unified attention on AMD GPUs. No
 ``repetition_penalty``.
 
-Verification is greedy, or with ``SpecDecodeConfig(sampling=True)`` speculative sampling (``spec_decode/sampled.py``). The forward takes each draft pass's
-token from ``draw_draft(j, logits)``, which draws it from the request's top-k/top-p
-distribution at its temperature and keeps that distribution per request, and ``accept``
-judges it by the target's next step: a draft ``d`` stays with probability
+Verification is greedy, or with ``SpecDecodeConfig(sampling=True)`` speculative sampling (``spec_decode/sampled.py``). On a sampled step the forward calls
+``draw_draft(j, logits)`` in place of ``record_draft``: it draws each draft pass's token
+from the request's top-k/top-p distribution at its temperature, writes it to the next
+step's register and keeps that distribution per request, and ``accept`` judges it by
+the target's next step: a draft ``d`` stays with probability
 ``min(1, q(d) / p(d))``, and the first rejection draws from ``(q - p)+``. Emitted tokens
 then follow the plain sampler's distribution exactly, at an acceptance of
 ``sum min(p, q)``. Each request reads its own Philox stream from device registers, so

@@ -9,7 +9,7 @@ model_kwargs:
   # Speculative decoding: the checkpoint's MTP head drafts 2 tokens a step
   # and each decode step verifies them (see SpecDecodeResource).
   num_draft_tokens: 2
-  # drafts read an fp8 copy of lm_head (see Fp8DraftHead), the verify the checkpoint's
+  # greedy drafts read an fp8 copy of lm_head (see Fp8DraftHead), sampled ones and the verify the checkpoint's
   draft_head: fp8
   # verify steps may sample the target too (a second decode capture)
   spec_sampling: true

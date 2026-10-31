@@ -146,6 +146,7 @@ def _accept_kernel(
     mask = slot < T
     target = tl.load(targets_ptr + r * T + slot, mask=mask, other=-1)
     if KEPT:
+        # a sampler has judged the drafts
         last = tl.load(kept_ptr + r)
     else:
         drafted = tl.load(ids_ptr + r * T + slot + 1, mask=slot + 1 < T, other=-2)
