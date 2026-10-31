@@ -75,7 +75,7 @@ def test_downcast_during_capture_names_the_node(monkeypatch, caplog, static_outp
 
     backend = types.SimpleNamespace(
         device_type="cpu", current_stream=lambda: None, create_graph=lambda keep_graph=False: object(),
-        capture=lambda graph, pool: nullcontext(), synchronize=lambda: None,
+        capture=lambda graph, pool, stream=None: nullcontext(), synchronize=lambda: None,
         recover_failed_capture=lambda pool, stream: None,
     )
     monkeypatch.setattr(DeviceCapability, "of", lambda device: types.SimpleNamespace(graph_backend=backend))
