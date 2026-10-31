@@ -11,9 +11,7 @@ good for an argmax over a row: each row carries its own scale.
 ``mstar::fp8_head`` quantises each row of ``x`` and reads the head in fp8. At one
 or two rows AITER's split-K kernel reads the weight once across every CU, 1.7-1.9x
 the bf16 kernel on a 248k x 4K head on MI325X; from three rows on that kernel is
-an order of magnitude slower and hipBLASLt's fp8 GEMM takes over, 1.2-1.6x. The
-quantisation is inside the op because inductor does not get through compiling
-an fp8 cast over a whole row.
+an order of magnitude slower and hipBLASLt's fp8 GEMM takes over, 1.2-1.6x.
 """
 
 from __future__ import annotations
