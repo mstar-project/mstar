@@ -237,27 +237,35 @@ def test_irfft_as_a_matmul_is_torch_irfft(n):
     assert (got - exact).abs().max() <= fp32_fft + 1e-7 * exact.abs().max()
 
 
-def test_ffmpeg_check_reads_torchcodecs_flag(monkeypatch):
-    """Since FFmpeg became optional, torchcodec's decoders import without it and
-    torchcodec records whether its FFmpeg ops loaded. The check reads that flag,
-    so a missing FFmpeg stays the server's error; an older torchcodec, which has
-    no flag, fails the import instead."""
+@pytest.mark.parametrize("ffmpeg, error", [
+    ("import fails", RuntimeError),  # older torchcodec without FFmpeg
+    ("ops flag down", RuntimeError),  # newer torchcodec without FFmpeg
+    ("ops flag up", ValueError),
+    ("no flag", ValueError),  # older torchcodec that imports
+])
+def test_a_decode_failure_blames_the_upload_only_where_ffmpeg_loads(monkeypatch, ffmpeg, error):
+    import functools
     import sys
     import types
 
     from mstar.model.components import audio_features
 
+    def refuse(*args, **kwargs):
+        raise RuntimeError("Invalid data found")
+
     decoders = types.SimpleNamespace(AudioDecoder=object)
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
-    for flag, expected in ((False, False), (True, True), (None, True)):
-        if flag is None:
-            monkeypatch.delitem(sys.modules, "torchcodec._core.ops", raising=False)
-        else:
-            monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=flag))
-        audio_features._ffmpeg_decoder_loads.cache_clear()
-        assert audio_features._ffmpeg_decoder_loads() is expected
-    audio_features._ffmpeg_decoder_loads.cache_clear()
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None if ffmpeg == "import fails" else decoders)
+    monkeypatch.delitem(sys.modules, "torchcodec._core.ops", raising=False)
+    if ffmpeg.startswith("ops flag"):
+        ops = types.SimpleNamespace(_FFMPEG_AVAILABLE=ffmpeg == "ops flag up")
+        monkeypatch.setitem(sys.modules, "torchcodec._core.ops", ops)
+    # a fresh cache, so this host's torchcodec and the fake don't answer for each other
+    check = audio_features._ffmpeg_decoder_loads
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", functools.cache(check.__wrapped__))
+    monkeypatch.setattr(audio_features, "_decode", refuse)
+    with pytest.raises(error):
+        load_speech_file("x.m4a", 16_000, 10.0)
 
 
 def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
