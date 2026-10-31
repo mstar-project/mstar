@@ -25,10 +25,9 @@ TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
 
 
 def template_messages(messages) -> list[dict]:
-    """The messages with their roles, tool calls and tool results. The template
-    iterates an assistant call's ``arguments``, which OpenAI clients send as a
-    JSON string. A null field is left out: GLM-5.2's template prints ``None``.
-    ``developer`` turns are ``system`` turns; the templates know only the latter."""
+    """The messages as the templates read them: a call's ``arguments`` as the
+    object the template iterates (clients send a JSON string), no null fields
+    (GLM-5.2's template prints ``None``), and ``developer`` turns as ``system``."""
     out = []
     for m in messages:
         msg = m.model_dump() if hasattr(m, "model_dump") else dict(m)

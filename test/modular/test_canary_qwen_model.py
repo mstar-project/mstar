@@ -307,9 +307,8 @@ def _qwen_tokenizer():
 
 
 def test_a_transcript_passes_the_data_worker_with_its_stop_ids(tmp_path, monkeypatch):
-    """The data worker reads the stop ids the model's ``text_output`` declares and tags each
-    text chunk with whether it ends the reply. An ``__init__`` attribute named like the hook
-    it called before (``stop_token_ids``) failed every transcript there."""
+    """The data worker drops the stop ids Canary-Qwen's ``text_output`` declares from the
+    transcript, and tags the chunk that ends it."""
     pytest.importorskip("tokenizers")
     transformers = pytest.importorskip("transformers")
     import queue

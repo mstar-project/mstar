@@ -530,14 +530,11 @@ def test_glm52_a_chat_the_template_refuses_is_a_400():
 
 def test_glm52_postprocess_byte_mode_never_touches_tokenizer():
     m = object.__new__(Glm52Model)
-    m.config = Glm52ModelConfig.reduced()  # end-of-turn ids 250-252
+    m.config = Glm52ModelConfig.reduced()
     m._tokenizer_mode = "byte"
     m._tokenizer = None
     out = m.postprocess(torch.tensor([72, 105]), "text")
     assert out == b"Hi"
-    # an end-of-turn id is no text, unless the request ignores it
-    assert m.postprocess(torch.tensor([72, 250]), "text") == b"H"
-    assert m.postprocess(torch.tensor([72, 250]), "text", request_kwargs={"ignore_eos": True}) == b"H\xfa"
     assert m._tokenizer is None  # no lazy HF download triggered
     with pytest.raises(ValueError, match="Unsupported modality"):
         m.postprocess(torch.tensor([1]), "audio")

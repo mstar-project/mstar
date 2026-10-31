@@ -448,8 +448,7 @@ class Glm5NextModel(Model):
             vocab = self.config.vocab_size
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        # The checkpoint's chat template over the chat API's messages, tools and
-        # template switches (GlmChatAdapter); a bare prompt is one user turn.
+        # the checkpoint's chat template over the chat API's messages, else the prompt as one user turn
         elif getattr(self.tokenizer, "chat_template", None):
             messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
             if not isinstance(messages, list):
@@ -529,11 +528,7 @@ class Glm5NextModel(Model):
 
     def text_output(self) -> TextOutput:
         if self._text_output is None:
-            # Synthetic reduced models emit byte ids, which never touch the HF
-            # tokenizer. Otherwise the tokens' raw bytes (byte-level BPE), so a
-            # character split across tokens reaches the client whole, where decoding
-            # each token alone gives U+FFFD; special tokens drop, as with
-            # skip_special_tokens.
+            # a reduced model's byte ids never touch the HF tokenizer
             detokenizer = (
                 ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
             )

@@ -447,9 +447,8 @@ class Glm52Model(Model):
 
     def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None, kwargs: dict) -> torch.Tensor:
         """The chat through the checkpoint's template, which adds ``[gMASK]<sop>`` and opens
-        the assistant turn: the chat API's messages, tools and template switches
-        (GlmChatAdapter), else the prompt's turns, each in its own role. An entrypoint with
-        no messages sends the prompt as one user turn."""
+        the assistant turn: the chat API's ``messages``, else the prompt's turns, each in its
+        own role, else the prompt as one user turn."""
         messages = kwargs.get("messages")
         if messages and not isinstance(messages, list):
             raise ValueError("messages must be a list of chat messages")
@@ -531,11 +530,7 @@ class Glm52Model(Model):
 
     def text_output(self) -> TextOutput:
         if self._text_output is None:
-            # Synthetic reduced models emit byte ids, which never touch the HF
-            # tokenizer. Otherwise the tokens' raw bytes (byte-level BPE), so a
-            # character split across tokens reaches the client whole, where decoding
-            # each token alone gives U+FFFD; special tokens drop, as with
-            # skip_special_tokens.
+            # a reduced model's byte ids never touch the HF tokenizer
             detokenizer = (
                 ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
             )

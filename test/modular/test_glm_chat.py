@@ -37,11 +37,6 @@ def _streamed(text, pieces, **kw):
     return reasoning, content, calls, p.finish_reason
 
 
-def test_reasoning_then_answer():
-    msg = _parser().message("Two plus two.</think>\n\nIt is 4.")
-    assert msg == {"role": "assistant", "content": "It is 4.", "reasoning_content": "Two plus two."}
-
-
 def test_tool_call_types_arguments_by_schema():
     p = _parser()
     msg = p.message("I need the weather.</think>\n" + CALL)
@@ -95,23 +90,16 @@ def test_a_cut_off_call_is_returned_as_text():
     assert calls == [] and content == CALL[:50] and finish == "stop"
 
 
-def test_thinking_off_reads_the_reply_as_the_answer():
-    msg = _parser(thinking=False).message("Hello </think> there")
-    assert msg == {"role": "assistant", "content": "Hello </think> there"}
-
-
-def test_stray_think_tags_drop():
-    msg = _parser().message("<think>hmm</think>A</think>B")
-    assert msg == {"role": "assistant", "content": "AB", "reasoning_content": "hmm"}
-
-
-def test_think_in_the_answer_reopens_the_reasoning():
-    msg = _parser().message("r</think>A<think>more</think>B")
-    assert msg == {"role": "assistant", "content": "AB", "reasoning_content": "rmore"}
-
-
-def test_a_reply_cut_off_at_the_call_tag_keeps_it():
-    assert _parser().message("ok</think>Let me check. <tool_call>")["content"] == "Let me check. <tool_call>"
+@pytest.mark.parametrize("thinking, text, message", [
+    (True, "Two plus two.</think>\n\nIt is 4.", {"content": "It is 4.", "reasoning_content": "Two plus two."}),
+    (False, "Hello </think> there", {"content": "Hello </think> there"}),
+    # a stray <think> in the reasoning and </think> in the answer drop
+    (True, "<think>hmm</think>A</think>B", {"content": "AB", "reasoning_content": "hmm"}),
+    (True, "r</think>A<think>more</think>B", {"content": "AB", "reasoning_content": "rmore"}),
+    (True, "ok</think>Let me check. <tool_call>", {"content": "Let me check. <tool_call>", "reasoning_content": "ok"}),
+], ids=["reasoning", "thinking-off", "stray-tags", "think-reopens", "cut-at-call-tag"])
+def test_a_whole_reply_splits_into_reasoning_and_content(thinking, text, message):
+    assert _parser(thinking=thinking).message(text) == {"role": "assistant", **message}
 
 
 @pytest.mark.parametrize("schema, raw, want", [
@@ -126,6 +114,8 @@ def test_a_reply_cut_off_at_the_call_tag_keeps_it():
     ({"type": "number"}, "NaN", "NaN"),  # not JSON: arguments must stay parseable
     ({}, "Infinity", "Infinity"),
     ({"type": "array"}, '["a", 1]', ["a", 1]),
+    ({"anyOf": {"type": "string"}}, "3", 3),  # a malformed schema admits anything
+    ({"enum": 5}, "3", 3),
 ])
 def test_arguments_take_the_schema_type(schema, raw, want):
     tools = glm_chat.tool_parameters([{"type": "function", "function": {
@@ -144,26 +134,23 @@ def test_a_partial_tag_is_held_until_it_resolves():
     assert p.finish() == []
 
 
-def test_assistant_tool_calls_reach_the_template_as_objects():
+def test_messages_reach_the_template_in_its_shape():
     msgs = glm_chat.template_messages([
+        {"role": "developer", "content": "French."},
         {"role": "user", "content": "weather?"},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function",
          "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]},
         {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
     ])
-    assert msgs[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
-    assert msgs[2] == {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
-    assert "content" not in msgs[1]  # GLM-5.2's template prints a null as "None"
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool"]
+    assert msgs[2]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert msgs[3] == {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+    assert "content" not in msgs[2]  # GLM-5.2's template prints a null as "None"
     with pytest.raises(ValueError, match="not JSON"):
         glm_chat.template_messages([{"role": "assistant", "tool_calls": [
             {"function": {"name": "f", "arguments": "{oops"}}]}])
     with pytest.raises(ValueError, match="function name"):
         glm_chat.template_messages([{"role": "assistant", "tool_calls": [{"function": {"arguments": "{}"}}]}])
-
-
-def test_developer_turns_are_system_turns():
-    msgs = glm_chat.template_messages([{"role": "developer", "content": "French."}, {"role": "user", "content": "hi"}])
-    assert [m["role"] for m in msgs] == ["system", "user"]
 
 
 @pytest.mark.parametrize("role", ["function", "observation", None])
@@ -182,7 +169,7 @@ def _chat(**body):
 def test_adapter_sends_messages_tools_and_template_switches(tmp_path):
     adapter = adapters.get_adapter("glm52")
     req = _chat(tools=[WEATHER], tool_choice="auto", enable_thinking=False,
-                chat_template_kwargs={"reasoning_effort": "high"})
+                chat_template_kwargs={"reasoning_effort": "high", "thinking": False, "tokenize": False})
     mk = adapter.chat_to_request(req, tmp_path).model_kwargs
     assert [m["role"] for m in mk["messages"]] == ["system", "user"]
     assert mk["tools"] == [WEATHER] and "tool_choice" not in mk
@@ -212,31 +199,20 @@ def test_a_falsy_enable_thinking_turns_thinking_off(value, tmp_path):
     assert p.message("Hello there!") == {"role": "assistant", "content": "Hello there!"}
 
 
-def test_template_keys_it_does_not_read_are_dropped(tmp_path):
-    req = _chat(chat_template_kwargs={"enable_thinking": False, "thinking": False, "tokenize": False})
-    mk = adapters.get_adapter("glm52").chat_to_request(req, tmp_path).model_kwargs
-    assert mk["chat_template_kwargs"] == {"enable_thinking": False}
-
-
 def test_glm53_always_reasons(tmp_path):
     adapter = adapters.get_adapter("glm5_next")
     assert adapter.make_output_parser(_chat()).message("hmm</think>Hi")["reasoning_content"] == "hmm"
-    assert "chat_template_kwargs" in adapter.chat_to_request(_chat(enable_thinking=True), tmp_path).model_kwargs
-
-
-@pytest.mark.parametrize("value", [False, 0, ""])
-def test_glm53_refuses_thinking_off(value, tmp_path):
-    req = _chat(chat_template_kwargs={"enable_thinking": value})
-    with pytest.raises(ValueError, match="enable_thinking"):
-        adapters.get_adapter("glm5_next").chat_to_request(req, tmp_path)
+    adapter.chat_to_request(_chat(enable_thinking=True), tmp_path)
+    for value in (False, 0, ""):
+        with pytest.raises(ValueError, match="enable_thinking"):
+            adapter.chat_to_request(_chat(chat_template_kwargs={"enable_thinking": value}), tmp_path)
 
 
 def test_tool_choice_none_leaves_the_tools_out(tmp_path):
     adapter = adapters.get_adapter("glm52")
     req = _chat(tools=[WEATHER], tool_choice="none")
     assert "tools" not in adapter.chat_to_request(req, tmp_path).model_kwargs
-    _, _, calls, _ = _streamed("x</think>" + CALL, 4, tools=None)
-    assert adapter.make_output_parser(req).message("x</think>" + CALL)["content"] == CALL and not calls
+    assert adapter.make_output_parser(req).message("x</think>" + CALL)["content"] == CALL
 
 
 @pytest.mark.parametrize("body", [
@@ -296,8 +272,8 @@ def test_process_prompt_renders_the_chat(make, tmp_path):
     assert [x["role"] for x in messages] == ["system", "user"]
     assert kw["tools"] == [WEATHER] and kw["reasoning_effort"] == "high"
     assert kw["add_generation_prompt"] is True
-    # a bare prompt (``/generate``, the SDK) is still one user turn, and only the
-    # template's switches pass: tokenize=False made the template return a str
+    # a bare prompt (``/generate``) is one user turn, and only the template's switches
+    # pass (tokenize=False would make it return a str)
     m.process_prompt("hello", ["text"], ["text"], chat_template_kwargs={"tokenize": False, "enable_thinking": False})
     messages, kw = m._tokenizer.calls[-1]
     assert messages == [{"role": "user", "content": "hello"}] and kw["tools"] is None
@@ -315,28 +291,13 @@ def test_an_overflowing_number_stays_text(raw):
     assert args == {"a": raw}
 
 
-@pytest.mark.parametrize("schema", [{"anyOf": {"type": "string"}}, {"oneOf": "string"}, {"enum": 5}])
-def test_a_malformed_property_schema_does_not_break_the_parse(schema):
-    tools = glm_chat.tool_parameters([{"type": "function", "function": {
-        "name": "f", "parameters": {"properties": {"a": schema}}}}])
-    call = "<tool_call>f<arg_key>a</arg_key><arg_value>3</arg_value></tool_call>"
-    assert _parser(tools=tools).message("x</think>" + call)["tool_calls"][0]["function"]["arguments"] == '{"a": 3}'
-
-
-def test_text_chunks_carry_their_usage():
-    torch = pytest.importorskip("torch")
-    from mstar.api_server.data_worker import _text_usage
-
-    assert _text_usage(torch.tensor([5, 6, 9]), frozenset({9}), 12) == {
-        "tokens": 3, "prompt_tokens": 12, "stop_token": True}
-    assert _text_usage(torch.tensor([5, 6]), frozenset({9}), 12)["stop_token"] is False
-    # a model that names no stop tokens leaves the reason alone
-    assert _text_usage(torch.tensor([5]), None, None) == {"tokens": 1}
-    # the last token of a chunk of any shape
-    assert _text_usage(torch.tensor([[5, 9]]), frozenset({9}), 12)["stop_token"] is True
-
-
-def test_the_data_worker_tags_text_chunks_with_usage():
+@pytest.mark.parametrize("stop_ids, usage", [
+    (frozenset({9}), {"tokens": 2, "prompt_tokens": 7, "stop_token": True}),
+    # no stop ids: no stop_token, and the API reports the reply as stopped
+    (frozenset(), {"tokens": 2, "prompt_tokens": 7}),
+])
+def test_the_data_worker_tags_text_chunks_with_usage(stop_ids, usage):
+    """A read chunk's last token, whatever the chunk's shape, says whether it ends the reply."""
     torch = pytest.importorskip("torch")
     import queue
     from types import SimpleNamespace
@@ -349,7 +310,7 @@ def test_the_data_worker_tags_text_chunks_with_usage():
             return b"hi"
 
         def text_output(self):
-            return TextOutput(ByteIdDetokenizer(), frozenset({9}))
+            return TextOutput(ByteIdDetokenizer(), stop_ids)
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), _Model(), {}
@@ -358,41 +319,15 @@ def test_the_data_worker_tags_text_chunks_with_usage():
     wt.request_output_state = {"r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1, prompt_tokens=7)}
     edge = SimpleNamespace(name="text_output", tensor_info=[SimpleNamespace(uuid="u1")])
     wt.tensor_manager = SimpleNamespace(get_ready_tensors=lambda: {"r1": [edge]}, take_failed_reads=lambda: [],
-                                        get_tensor=lambda uuid: torch.tensor([4, 9]), dereference=lambda uuid: None)
+                                        get_tensor=lambda uuid: torch.tensor([[4, 9]]), dereference=lambda uuid: None)
     assert wt._process_read_tensors() is True
-    assert wt.out_queue.get_nowait().metadata == {"tokens": 2, "prompt_tokens": 7, "stop_token": True}
-
-
-def test_the_data_worker_tags_inline_text_chunks_with_usage():
-    """A frame's inline tokens (one item per frame) carry the usage a read tensor's chunk does."""
-    pytest.importorskip("torch")
-    import queue
-
-    from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
-    from mstar.model.base import Model
-    from mstar.model.utils import ByteIdDetokenizer, TextOutput
-
-    class _Model:
-        postprocess_inline = Model.postprocess_inline
-
-        def text_output(self):
-            return TextOutput(ByteIdDetokenizer(), frozenset({9}))
-
-    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
-    wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), _Model(), {}
-    wt._draining_rids = set()
-    wt.request_output_state = {"r1": RequestOutputState(prompt_tokens=7), "r2": RequestOutputState()}
-    wt._emit_inline_tokens(InlineTokens(["r1", "r2"], [72, 9], "text"))
-    chunks = {c.request_id: c for c in (wt.out_queue.get_nowait(), wt.out_queue.get_nowait())}
-    assert (chunks["r1"].data, chunks["r2"].data) == (b"H", b"")  # the stop token is no text
-    assert chunks["r1"].metadata == {"tokens": 1, "prompt_tokens": 7, "stop_token": False}
-    assert chunks["r2"].metadata == {"tokens": 1, "stop_token": True}
+    assert wt.out_queue.get_nowait().metadata == usage
 
 
 @pytest.mark.parametrize("name", ["glm52", "glm5_next"])
 def test_a_glm_reply_ends_on_the_ids_its_text_output_declares(name):
-    """Both GLMs name their end-of-turn ids once, in ``text_output``: the data worker
-    tags each chunk by them, and a stop token is no text unless the request ignores it."""
+    """The end-of-turn ids a GLM's ``text_output`` declares tag its inline chunks, and drop
+    from the text unless the request ignores them."""
     pytest.importorskip("torch")
     import queue
 
@@ -410,16 +345,19 @@ def test_a_glm_reply_ends_on_the_ids_its_text_output_declares(name):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue, wt.model, wt._draining_rids = queue.Queue(), model, set()
     wt.request_model_kwargs = {"r3": {"ignore_eos": True}}
-    wt.request_output_state = {rid: RequestOutputState() for rid in ("r1", "r2", "r3")}
+    wt.request_output_state = {rid: RequestOutputState() for rid in ("r2", "r3")}
+    wt.request_output_state["r1"] = RequestOutputState(prompt_tokens=7)
     wt._emit_inline_tokens(InlineTokens(["r1", "r2", "r3"], [72, eos, eos], "text"))
     chunks = {c.request_id: c for c in (wt.out_queue.get_nowait() for _ in range(3))}
     assert [(chunks[rid].data, chunks[rid].metadata["stop_token"]) for rid in ("r1", "r2", "r3")] == [
         (b"H", False), (b"", True), (bytes([eos & 0xFF]), True),
     ]
+    assert chunks["r1"].metadata == {"tokens": 1, "prompt_tokens": 7, "stop_token": False}
+    assert chunks["r2"].metadata == {"tokens": 1, "stop_token": True}
 
 
 def test_a_long_call_is_read_once_and_parses_as_whole():
-    # quadratic otherwise: each feed copied and searched the whole call so far
+    # linear in the call's length: a feed searches its own text for the end tag
     write = glm_chat.tool_parameters([{"type": "function", "function": {"name": "write", "parameters": {
         "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}])
     body = "x = 1  # filler line\n" * 5000

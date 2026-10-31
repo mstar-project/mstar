@@ -529,8 +529,7 @@ def _chat_through_bridge(server, fields, model="qwen3_omni"):
 @pytest.mark.parametrize("model", ["qwen3_omni", "glm52"])
 def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields, model):
     """Stripped before the adapter, the fields left a chat that ran and answered in plain text.
-    A model whose adapter serves tool calls (GLM) is refused too: the bridge parses none, so
-    the client would get the raw call markup as the answer.
+    The bridge parses no call out of a reply, so GLM's adapter, which serves them, is refused too.
 
     Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
     """
