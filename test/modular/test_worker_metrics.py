@@ -9,6 +9,7 @@ API server's message thread (``test_serving_metrics``).
 """
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 from types import SimpleNamespace
@@ -337,7 +338,8 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.wakeup_event = SimpleNamespace(register_future=stub)
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
     w.scheduler = SimpleNamespace(
-        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub,
+        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
+        remember_ready=contextlib.nullcontext,
     )
     for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
@@ -530,8 +532,9 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     message on the socket that carries every submission, ahead of the next."""
     from test_serving_metrics import TEXT, _StubTensorManager
 
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
+    from mstar.communication.event import EventWakeup
 
     class _Model:
         def process_prompt(self, *args, **kwargs):
@@ -546,8 +549,8 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     facade.wakeup = None
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
-        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
         # codec / try_send_bytes: the thread's outbox sends through them

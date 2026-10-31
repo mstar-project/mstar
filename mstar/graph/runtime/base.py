@@ -490,6 +490,10 @@ class RouteInput(NamedTuple):
     # `supports_inline_emit` ignores both.
     inline_signal: str | None = None
     inline_values: tuple[int, ...] | list[int] = ()
+    # The log-prob of the token row i sampled (None without one): it rides
+    # with the row's client emits of this step, inline or in a tensor emit's
+    # metadata. Empty when no row has one.
+    logprobs: tuple[float | None, ...] | list[float | None] = ()
     # Rows of several walks in one call: wg_ids.keys[i] ran
     # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
     walks: list[str] | None = None
@@ -609,9 +613,8 @@ class GraphRuntime(ABC):
         gets that handle next, which reads as one request inheriting another's
         state. Known handle-keyed maps: MicroScheduler.{failed_rids,
         admit_errors, held_until, backlog, pending_tp_follow_count} (purged by
-        clear_rid), Worker.{_last_active, _pending_removes}, the runtime's
-        pending loop stops and do-not-speculate marks, and the tensor
-        manager's per-request maps.
+        clear_rid), Worker._pending_removes, the runtime's pending loop stops
+        and do-not-speculate marks, and the tensor manager's per-request maps.
         """
         pass
 

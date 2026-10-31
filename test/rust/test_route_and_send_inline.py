@@ -83,11 +83,12 @@ def _start(rt, n):
     return rids
 
 
-def _general_step(rt, rids, values):
+def _general_step(rt, rids, values, loop_strides=None):
     out = rt.complete_and_route_batch(RouteInput(
         partition=PART, graph_walk=WALK, node_name=NODE, output_signals=[SIG],
         wg_ids=ParallelList(rids, [0] * len(rids)), tensors=[],
         num_tensors=[0] * len(rids), inline_signal=SIG, inline_values=values,
+        loop_strides=loop_strides,
     ))
     info = sorted(out.rids_needing_request_info)
     return rt.send_outputs(SendInput(
@@ -97,9 +98,9 @@ def _general_step(rt, rids, values):
     ))
 
 
-def _fused_step(rt, rids, column, row_rids):
+def _fused_step(rt, rids, column, row_rids, loop_strides=None):
     status, _cid, sent, route = rt.route_and_send_inline(
-        PART, WALK, NODE, [SIG], rids, SIG, column, row_rids,
+        PART, WALK, NODE, [SIG], rids, SIG, column, row_rids, loop_strides,
     )
     assert status in (InlineRouteStatus.SENT, InlineRouteStatus.ROUTED)
     if status is InlineRouteStatus.SENT:
@@ -152,6 +153,38 @@ def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
         assert got["g"], peer
     for rt in rts.values():
         assert rt._rust.num_parked_completions() == 0
+
+
+def test_fused_advances_the_loop_by_each_rows_stride(tmp_path):
+    """A chunk-Loop step counts tokens: a row's stride moves its loop counter
+    by that much on the fused path, as on the general one."""
+    n = 3
+    rts, boxes = {}, {}
+    for k in ("g", "f"):
+        d = tmp_path / k
+        d.mkdir()
+        boxes[k] = {p: ZmqCommunicator(p, str(d)) for p in ("api_server", "conductor")}
+        rts[k] = _runtime(str(d))
+    rids = _start(rts["g"], n)
+    assert _start(rts["f"], n) == rids
+    iters = []
+    for step, strides in enumerate(([2, 1, 3], [1, 1, 1])):
+        for rt in rts.values():
+            assert rt.pop_rids(NODE, WALK, rids) is not None
+        values = [100 * step + i for i in range(n)]
+        column = torch.tensor(values, dtype=torch.int64)
+        assert (
+            _general_step(rts["g"], rids, values, strides)
+            == _fused_step(rts["f"], rids, column, rids, strides)
+        )
+        got = {k: rt.get_dynamic_loop_iters(rids, PART).values for k, rt in rts.items()}
+        assert got["g"] == got["f"]
+        iters.append([it[LOOP] for it in got["f"]])
+    # the last row's 3 + 1 reaches MAX_ITERS: its loop exits and resets
+    assert iters == [[2, 1, 3], [3, 2, 0]]
+    for peer in ("api_server", "conductor"):
+        got = {k: _collect(boxes[k][peer]) for k in boxes}
+        assert got["g"] == got["f"], peer
 
 
 def test_a_rid_without_a_row_does_nothing(tmp_path):

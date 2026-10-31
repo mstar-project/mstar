@@ -2,12 +2,14 @@
 
 The ``MicroScheduler`` picks the (node, walk) and owns the mechanics (popping
 ready queues, the backlog, holds, TP follow); a ``BaseBatchBuilder`` decides
-which of the popped rows go into the step, which stay parked in the backlog
-and which go back to their ready queues.
+which rows the step takes out of a speculation chain's own rows, the backlog
+and the ready queues (``pick``), and splits what was popped into the step, the
+rows that stay parked in the backlog and the ones that go back to their ready
+queues (``build_batch``).
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -16,32 +18,76 @@ if TYPE_CHECKING:
     from mstar.worker.micro_scheduler import ScheduledBatch
 
 
+class LineOrder(NamedTuple):
+    """How rows line up for a step that can't take them all."""
+    # sort key, lowest first
+    key: Callable[[int], Any]
+    # Whether a row of another capture group holds the rows behind it in line
+    # back (first come, first served), or lets them pass (it is first in line
+    # for the next step anyway).
+    strict: bool
+
+
 @dataclass
-class BatchBuildRequest:
-    node_name: str
+class StepCandidates:
+    """Every row that could run one step of a scheduling key, for ``pick``."""
+    # the key's walk: a combined walk's label where the key has one
     graph_walk: str
-    # Both popped: `backlog` out of the scheduler's backlog, `fresh` off the
-    # ready queues. Whatever the builder neither schedules nor returns must come
-    # back as `BatchBuildResult.backlog`.
-    backlog: "ScheduledBatch | None" = None
-    fresh: "ScheduledBatch | None" = None
-    # Rows of `backlog` that cannot run this step; they stay parked.
-    blocked_rids: set[int] = field(default_factory=set)
-    # The caller's rows whose current chunk is still in flight (not popped):
-    # first in line for their next chunk. One left out of the step is neither
-    # parked nor returned; it goes back to its queue when its chunk lands.
-    continuing: "ScheduledBatch | None" = None
-    # The rid whose capture group the step must share, else its first row's.
-    capture_group_of: int | None = None
+    # A speculation chain's own rows, all ready and of `own_walk`; empty off a chain.
+    continuing: Sequence[int] = ()
+    own_walk: str | None = None
+    # The live backlogged rows, then the rows on the ready queues, each in its own order.
+    backlog: Sequence[int] = ()
+    queued: Sequence[int] = ()
+    walk_of: Callable[[int], str] = lambda _: ""
+    # The walk of every row, when the caller knows they share one.
+    one_walk: str | None = None
+    # Engine readiness of a backlogged or queued row. Asked once per row, and
+    # only of the rows the step reaches.
+    ready: Callable[[int], bool] = lambda _: True
+    # `Engine.capture_group` for one rid of this key; None when the key's
+    # steps don't split by capture key. The chain's rows share one group.
+    capture_group: Callable[[int], Any] | None = None
     # Each real walk's cap (None or absent: uncapped); under `graph_walk`, the
     # cap of a step mixing walks.
     walk_caps: dict[str, int | None] = field(default_factory=dict)
     # Under a combined walk: how many rows of each real walk a step mixing
     # walks may hold (absent is uncapped). A step of one walk is not bound.
     walk_row_caps: dict[str, int] = field(default_factory=dict)
-    # The caller's own rows (a speculation merge's continuing ones) and their walk.
-    pre_existing_batch_size: int = 0
-    pre_existing_walk: str | None = None
+    # The node's `StepOrder` as a `LineOrder`, for when the rows don't all
+    # fit; not asked otherwise.
+    line_order: Callable[[], LineOrder] = lambda: LineOrder(lambda _: 0, False)
+
+
+class StepPick(NamedTuple):
+    # every row the step takes, the chain's included, in the order it took them
+    taken: list[int]
+    # the chain's rows, those that keep their place first, then the rest in line
+    continuing: list[int]
+    # how many of `continuing` keep their place; None when nothing caps the step
+    room: int | None
+    # backlogged or queued rows it passed over for a walk cap or another
+    # capture group, which can't run this step whoever holds it
+    held_back: set[int]
+    # True when the rows didn't all fit and went in the order key's order
+    ordered: bool
+
+
+@dataclass
+class BatchBuildRequest:
+    node_name: str
+    graph_walk: str
+    # Both popped: `backlog` out of the scheduler's backlog, `fresh` off the
+    # ready queues. Whatever the step doesn't take comes back as
+    # `BatchBuildResult.backlog` or `returned`.
+    backlog: "ScheduledBatch | None" = None
+    fresh: "ScheduledBatch | None" = None
+    # `pick`'s verdict over these rows.
+    pick: StepPick | None = None
+    # The caller's rows whose current chunk is still in flight (not popped):
+    # first in line for their next chunk. One left out of the step is neither
+    # parked nor returned; it goes back to its queue when its chunk lands.
+    continuing: "ScheduledBatch | None" = None
     # Token budget for the step; None for none. With it, each row's remaining
     # tokens, and the rows that may be cut into chunks.
     max_batch_tokens: int | None = None
@@ -55,8 +101,6 @@ class BatchBuildRequest:
     min_chunk_tokens: int = 1
     # Rows already mid-prefill -> when their first chunk was cut; lower is older.
     start_order: dict[int, int] = field(default_factory=dict)
-    # `Engine.capture_group` for one rid of this (node, walk).
-    capture_group: Callable[[int], Any] = lambda _: None
 
 
 class BatchBuildResult(NamedTuple):
@@ -100,31 +144,21 @@ def _merged(
 
 class BaseBatchBuilder(ABC):
     @abstractmethod
+    def pick(self, candidates: StepCandidates) -> StepPick:
+        """Who runs one step: the one place a capped step's rows are chosen,
+        for a speculation chain and for a step the scheduler builds fresh."""
+
+    @abstractmethod
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         """One step's rows out of ``request``'s backlog and entries."""
-
-    def room_for_continuing(
-        self, cap: int | None, backlog: "ScheduledBatch | None",
-    ) -> int | None:
-        """How many of a speculation chain's own rids fit in a step capped at
-        ``cap`` when ``backlog`` waits under the same (node, walk).
-
-        The chain only ever continues its own rids, so at the cap a backlogged
-        chunk would never be reached. Giving the backlog first claim costs the
-        displaced rids one step — their nodes go ready again when the in-flight
-        batch lands. None for an uncapped node: nothing is displaced.
-        """
-        if cap is None:
-            return None
-        return max(0, cap - (0 if backlog is None else len(backlog)))
 
     def chain_must_yield(
         self, backlog: "ScheduledBatch", live_rids: set[int], anchor: int,
         capture_group: Callable[[int], Any],
     ) -> bool:
         """Whether a speculation chain anchored at ``anchor`` has to stop so
-        ``backlog``'s live rows can run: the chain's merge (a build with
-        ``capture_group_of=anchor``) would never take them."""
+        ``backlog``'s live rows can run: a step sharing the chain's capture
+        group would never take them."""
         exclude = set(backlog.request_to_worker_graph) - live_rids
         return bool(off_group_rids(
             backlog, capture_group, exclude_rids=exclude, anchor=anchor,
@@ -132,46 +166,121 @@ class BaseBatchBuilder(ABC):
 
 
 class FIFOBatchBuilder(BaseBatchBuilder):
-    """The caller's continuing rows, then the backlog, then fresh rows, in
-    arrival order, up to the cap; one capture group per step. Under a token
-    budget, prompts are served in the order they started
-    (``fill_token_budget_in_start_order``).
+    """One capture group per step, up to the cap; who goes first when the
+    rows don't all fit is the node's `StepOrder`.
+
+    When every row fits, the step takes them in the order backlog, the chain's
+    own rows, then the queues: nothing is left out, so the order only decides
+    the capture group, which the chain's or else the first row's sets, and a
+    row of another group waits for a step of its own. When they don't all
+    fit, every row goes in the order's sort and the first sets the group. A
+    row of another group then waits for a step of its own: under TURNS the
+    rows behind it pass it, since it leads the next step; under ARRIVAL they
+    don't, or rows that came later would join the step's holders and keep it
+    from it.
 
     Under a combined walk a step of one walk takes that walk's cap and a mixed
     step the combined walk's own, or with none the smallest of the caps of the
-    walks present in it; a walk with no row in the step does not cap it. Rows join in
-    order; one whose walk would cap the step at or below the rows already in
-    it is left out, and is first in line next step.
+    walks present in it; a walk with no row in the step does not cap it. Rows
+    join in order; one whose walk would cap the step at or below the rows
+    already in it is left out.
 
-    Where this differs from the scheduler it replaces, and why. main had two
-    paths: with a backlog it drained that alone, never touching the ready
-    queues, so the backlog strictly shrank; with none it popped a fresh set,
-    capped it and parked the remainder. This builder always does both, which
-    is better -- a backlog one row short of the cap gets topped up instead of
-    running short -- but it means a step that drains a backlog also pops fresh
-    rows, and parking their overflow would refill the backlog from the queues
-    on every pass. It would then never drain, and since a key holding a
-    backlog is served before any other node, that node starves the rest: on
-    ``wan22.yaml`` with ``dit`` capped at 1 a fifth request's
-    ``text_encoder`` waited 48.7 s for its first step against 0.2 s on main.
+    Of the rows ``build_batch`` gets, a fresh row the cap pushed out goes back
+    to its ready queue **only on a step that served a backlog**. Parking it
+    would refill the backlog from the queues on every pass, so it would never
+    drain, and since a key holding a backlog is served before any other node,
+    that node starves the rest: on ``wan22.yaml`` with ``dit`` capped at 1 a
+    fifth request's ``text_encoder`` waited 48.7 s for its first step against
+    0.2 s before backlogs were topped up. With no backlog it parks, so a split
+    set drains before anything new starts. A row held back for any other
+    reason -- OOM backoff, pending remove, a foreign capture group, a walk the
+    combined cap left out -- always parks: it cannot run this step whoever
+    holds it.
 
-    So a fresh row the cap pushed out goes back to its ready queue **only on
-    a step that served a backlog**, which is the case main never created. With
-    no backlog it parks, exactly as main did, and the remainder keeps its
-    arrival order instead of being re-popped and reordered. A row held back
-    for any other reason -- OOM backoff, pending remove, a foreign capture
-    group, a walk the combined cap left out -- always parks: it cannot run
-    this step whoever holds it.
-
-    A row the token budget leaves out always parks too, ahead of the cap's
-    leftovers, because a budgeted walk's backlog is its line: the Rust
-    runtime scans ready rows in handle order, so a row sent back rejoins
-    behind rows that arrived after it. Under start order, which leaves out
-    most prompts every step, the first prompts of a burst then started last.
-    Such a backlog can stay non-empty under sustained load; the worker's
-    fairness peek still hands the step after a prompt step to other ready
-    work.
+    Under a token budget, of the rows the pick took, prompts are served in
+    the order they started (``fill_token_budget_in_start_order``), and the
+    caller's rows mid-prefill come first. A row the budget leaves out always
+    parks, ahead of the cap's leftovers, because a budgeted walk's backlog is
+    its line: the Rust runtime scans ready rows in handle order, so a row
+    sent back rejoins behind rows that arrived after it. Such a backlog can
+    stay non-empty under sustained load; the worker's fairness peek still
+    hands the step after a prompt step to other ready work.
     """
+
+    def pick(self, candidates: StepCandidates) -> StepPick:
+        c = candidates
+        chain = set(c.continuing)
+        rows = [*c.backlog, *c.continuing, *c.queued]
+        ordered = not _all_fit(rows, chain, c)
+        strict = False
+        if ordered:
+            line = c.line_order()
+            rows.sort(key=line.key)  # stable: ties keep the order above
+            strict = line.strict
+        group_of = c.capture_group
+        if not ordered and group_of is None and c.one_walk is not None:
+            # every row fits and nothing splits them: the chain keeps its rows
+            # as they are, and the others join if ready
+            ready = c.ready
+            taken = [rid for rid in c.backlog if ready(rid)]
+            taken += c.continuing
+            taken += (rid for rid in c.queued if rid not in chain and ready(rid))
+            cap = c.walk_caps.get(c.one_walk)
+            return StepPick(
+                taken=taken, continuing=list(c.continuing),
+                room=len(c.continuing) if cap is not None else None,
+                held_back=set(), ordered=False,
+            )
+        chain_group = _NO_GROUP
+        if group_of is not None and c.continuing:
+            chain_group = group_of(c.continuing[0])
+        # every row fits: the chain's group, else the first row's
+        group = _NO_GROUP if ordered else chain_group
+        step = None if c.one_walk is not None else _Composition(c)
+        cap = c.walk_caps.get(c.one_walk) if step is None else None
+        taken: list[int] = []
+        held_back: set[int] = set()
+        for rid in rows:
+            in_chain = rid in chain
+            if step is None:
+                if cap is not None and len(taken) >= cap:
+                    break
+            else:
+                if step.is_full():
+                    break
+                walk = c.own_walk if in_chain else c.walk_of(rid)
+                verdict = step.admits(walk)
+                if verdict is not _JOINS:
+                    if verdict is _WALK_LEFT_OUT:
+                        held_back.add(rid)
+                    continue
+            if not in_chain and not c.ready(rid):
+                continue
+            if group_of is not None:
+                rid_group = chain_group if in_chain else group_of(rid)
+                if group is _NO_GROUP:
+                    group = rid_group
+                elif rid_group != group:
+                    if strict:
+                        break
+                    held_back.add(rid)
+                    continue
+            if step is not None:
+                step.add(walk)
+            taken.append(rid)
+        kept = [rid for rid in taken if rid in chain] if chain else []
+        behind = []
+        if len(kept) < len(chain):
+            kept_set = set(kept)
+            behind = [rid for rid in rows if rid in chain and rid not in kept_set]
+        capped = cap is not None if step is None else step.capped()
+        return StepPick(
+            taken=taken,
+            continuing=kept + behind,
+            room=len(kept) if capped or behind else None,
+            held_back=held_back - chain if chain else held_back,
+            ordered=ordered,
+        )
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         # both read before `_merged`, which folds `fresh` into `backlog` in place
@@ -182,36 +291,22 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         batch = _merged(_merged(request.continuing, request.backlog), request.fresh)
         if batch is None:
             return BatchBuildResult(None)
-
-        exclude = request.blocked_rids | off_group_rids(
-            batch, request.capture_group,
-            exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
-        )
-        walk = _single_walk(batch, request)
-        if walk is None:
-            max_bs, left_out = _compose_walks(batch, exclude, request)
-            exclude = exclude | left_out
-        else:
-            cap = request.walk_caps.get(walk)
-            max_bs = None if cap is None else cap - request.pre_existing_batch_size
-        if max_bs is not None and max_bs <= 0:
-            return BatchBuildResult(None, backlog=batch)  # the caller's rows fill it
-        scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
-        # A fresh row the cap pushed out goes back to its ready queue only on
-        # a step that served a backlog; with none it parks, as main did.
+        pick = request.pick
+        rows = batch.request_to_worker_graph
+        taken = [rid for rid in pick.taken if rid in rows]
+        if not taken:
+            return BatchBuildResult(None, backlog=batch)
+        scheduled, remainder = batch.split_off_rids(taken)
         returned: dict[int, int] | None = None
         if remainder is not None and had_backlog:
             give_back = {
                 rid for rid in remainder.request_to_worker_graph
-                if rid in fresh_rids and rid not in exclude
+                if rid in fresh_rids and rid not in pick.held_back
             }
             if give_back:
-                remainder, back = remainder.split_off_first(
-                    None, exclude_rids=give_back,
-                )
+                remainder, back = remainder.split_off_first(None, exclude_rids=give_back)
                 returned = dict(back.request_to_worker_graph) if back else None
-
-        if scheduled is None or request.max_batch_tokens is None:
+        if request.max_batch_tokens is None:
             return BatchBuildResult(scheduled, backlog=remainder, returned=returned)
 
         take, dropped = self.share_token_budget(
@@ -404,64 +499,86 @@ def _cap_walks(
         dropped |= walk_dropped
 
 
-def _single_walk(batch: "ScheduledBatch", request: BatchBuildRequest) -> str | None:
-    """The one walk of every row, the caller's included, else None."""
-    if not batch.request_walks:
-        return request.graph_walk
-    walks = set(batch.request_walks.values())  # rows and request_walks share keys
-    if request.pre_existing_walk is not None:
-        walks.add(request.pre_existing_walk)
-    return walks.pop() if len(walks) == 1 else None
+_NO_GROUP = object()
+# `_Composition.admits` verdicts
+_JOINS, _FULL, _WALK_LEFT_OUT = object(), object(), object()
 
 
 def _min_cap(*caps: int | None) -> int | None:
     return min((cap for cap in caps if cap is not None), default=None)
 
 
-def _compose_walks(
-    batch: "ScheduledBatch", exclude: set[int], request: BatchBuildRequest,
-) -> tuple[int | None, set[int]]:
-    """Rows left for the step after the caller's, and the rows left out."""
-    caps = request.walk_caps
-    row_caps = request.walk_row_caps
-    n = request.pre_existing_batch_size
-    walks = {request.pre_existing_walk} if request.pre_existing_walk else set()
-    counts = {request.pre_existing_walk: n} if request.pre_existing_walk else {}
-    cap = _min_cap(*(caps.get(walk) for walk in walks))
-    left_out = set()
-    for rid in batch.request_to_worker_graph:
-        if rid in exclude:
-            continue
-        walk = batch.walk_of(rid)
-        new_cap = cap
-        if walk not in walks:
-            mixed_cap = caps.get(request.graph_walk) if walks else None
+def _all_fit(rows: list[int], chain: set[int], c: StepCandidates) -> bool:
+    """Whether a step taking ``rows`` in this order would hold them all."""
+    if c.one_walk is not None:
+        cap = c.walk_caps.get(c.one_walk)
+        return cap is None or len(rows) <= cap
+    step = _Composition(c)
+    for rid in rows:
+        walk = c.own_walk if rid in chain else c.walk_of(rid)
+        if step.admits(walk) is not _JOINS:
+            return False
+        step.add(walk)
+    return True
+
+
+class _Composition:
+    """The rows a step has taken so far, by walk, and whether a row of a
+    given walk can join them: the composition rules of ``FIFOBatchBuilder``."""
+
+    def __init__(self, c: StepCandidates):
+        self.caps = c.walk_caps
+        self.row_caps = c.walk_row_caps
+        self.label = c.graph_walk
+        self.walks: set[str] = set()
+        self.counts: dict[str, int] = {}
+        self.cap: int | None = None
+        self.n = 0
+        caps = list(self.caps.values())
+        # no step of any mix of walks holds more
+        self._most = None if not caps or None in caps else max(caps)
+        self._next_cap: int | None = None
+
+    def admits(self, walk: str) -> object:
+        """``_JOINS``; ``_FULL`` when the step is at its cap; or
+        ``_WALK_LEFT_OUT`` when the row's walk can't join a step like this one
+        (it would lower the cap to the rows already in it, or pass its row cap)."""
+        new_cap = self.cap
+        if walk not in self.walks:
+            mixed_cap = self.caps.get(self.label) if self.walks else None
             # a mixed step: the combined walk's own cap where it has one,
             # else the smallest of the walks present
-            new_cap = mixed_cap if mixed_cap is not None else _min_cap(cap, caps.get(walk))
-        if new_cap is not None and new_cap <= n:
-            left_out.add(rid)
-            continue
-        if row_caps and walks:
-            if walk not in walks:
+            new_cap = mixed_cap if mixed_cap is not None else _min_cap(self.cap, self.caps.get(walk))
+        if new_cap is not None and new_cap <= self.n:
+            return _FULL if walk in self.walks else _WALK_LEFT_OUT
+        if self.row_caps and self.walks:
+            if walk not in self.walks:
                 # the row makes the step mix walks: every walk's rows count
                 over = any(
-                    counts.get(w, 0) + (w == walk) > row_caps[w]
-                    for w in (*walks, walk) if w in row_caps
+                    self.counts.get(w, 0) + (w == walk) > self.row_caps[w]
+                    for w in (*self.walks, walk) if w in self.row_caps
                 )
             else:
                 # already mixed or not, only this walk's count moves
-                cap_w = row_caps.get(walk)
-                over = len(walks) > 1 and cap_w is not None and counts[walk] + 1 > cap_w
+                cap_w = self.row_caps.get(walk)
+                over = len(self.walks) > 1 and cap_w is not None and self.counts[walk] + 1 > cap_w
             if over:
-                # the step would mix walks past one's row cap
-                left_out.add(rid)
-                continue
-        walks.add(walk)
-        counts[walk] = counts.get(walk, 0) + 1
-        cap = new_cap
-        n += 1
-    return (None if cap is None else cap - request.pre_existing_batch_size), left_out
+                return _WALK_LEFT_OUT
+        self._next_cap = new_cap
+        return _JOINS
+
+    def add(self, walk: str) -> None:
+        """Take a row of ``walk``; ``admits(walk)`` came just before."""
+        self.walks.add(walk)
+        self.counts[walk] = self.counts.get(walk, 0) + 1
+        self.cap = self._next_cap
+        self.n += 1
+
+    def is_full(self) -> bool:
+        return self._most is not None and self.n >= self._most
+
+    def capped(self) -> bool:
+        return self.cap is not None
 
 
 class BatchBuilderType(Enum):

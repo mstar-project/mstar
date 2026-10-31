@@ -65,6 +65,9 @@ class Speculation:
     consumed_streaming_edges: dict[int, list[StreamingEdge]] = field(default_factory=dict)
     spec_id: int = 0
     is_yield_away: bool = False
+    # A yield-away the chain built from the rows waiting at its own target
+    # when it gave them the whole step; for fairness it is still the chain's.
+    gave_way: bool = False
     loop_name: str | None = None
     dropped: set[int] = field(default_factory=set)
     plan_future: Future | None = None

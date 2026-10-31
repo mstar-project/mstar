@@ -2,7 +2,7 @@
 
 A chunk is one iteration of the node's Loop, which counts the tokens its
 chunks ran and ends at the prompt's length. The worker hands each row's count
-to the runtime as its loop stride (``ChunkLoops.loop_strides``). Keyed on the
+to the runtime as its loop stride (``ScheduledBatch.loop_strides``). Keyed on the
 walk, not on the row having a chunk range: a walk with no token budget is
 never measured or cut, so its prompts run whole and carry no range, and a Loop
 left unended runs to ``max_iters`` while the request holds its KV. That showed
@@ -38,9 +38,10 @@ def _batch(rows, chunk_ranges=None):
 
 
 def _strides(rows, chunk_ranges=None, chunkable=("prefill",)):
-    # what the worker reads off its graphs at load
-    loops = ChunkLoops((NODE, w) for w in chunkable)
-    return loops.loop_strides(_batch(rows, chunk_ranges), list(rows))
+    batch = _batch(rows, chunk_ranges)
+    # what the worker reads off its graphs at load, and stamps at submit
+    batch.chunk_loop_walks = ChunkLoops((NODE, w) for w in chunkable).walks_by_node.get(NODE, frozenset())
+    return batch.loop_strides(list(rows))
 
 
 def test_a_row_that_ran_whole_ends_its_loop():
@@ -82,8 +83,9 @@ def test_a_decode_step_beside_a_chunk_loop_does_no_work_per_row():
     batch = _CountingBatch(
         node_name=NODE, graph_walk="decode",
         request_to_worker_graph=dict.fromkeys(range(1, 21), 0),
+        chunk_loop_walks=frozenset({"prefill"}),
     )
-    assert ChunkLoops({(NODE, "prefill")}).loop_strides(batch, list(range(1, 21))) is None
+    assert batch.loop_strides(list(range(1, 21))) is None
     assert _CountingBatch.looked_up == 0
 
 
@@ -218,3 +220,25 @@ def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tic
     target = w._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}))
 
     assert target.info.graph_walk == "decode" and target.walk_rids == [2]
+
+
+def test_a_submitted_step_carries_its_nodes_chunk_loop_walks():
+    """Every step reaches the GPU thread through ``_submit_gpu_step``, so the
+    stamp there is what the step's strides read, speculated or not."""
+    w = Worker.__new__(Worker)
+    w.chunk_loops = ChunkLoops({(NODE, "prefill")})
+    w._execute_on_gpu_thread = lambda *a: None
+    batch = _batch({1: "prefill"})
+    node_batch = type("_NodeBatch", (), {})()
+
+    class _Executor:
+        def submit(self, fn, *args):
+            from concurrent.futures import Future
+            f = Future()
+            f.set_result(fn(*args))
+            return f
+
+    w._submit_gpu_step(_Executor(), batch, node_batch, None)
+
+    assert batch.chunk_loop_walks == {"prefill"}
+    assert batch.loop_strides([1]) == [CHUNK_LOOP_END]

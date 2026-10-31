@@ -42,6 +42,8 @@ class _Recorder:
 def _conductor(rid="r"):
     c = object.__new__(Conductor)
     c.model = _StubModel()
+    c._stream_fed_partitions = {"B", "C"}
+    c._client_streams = {}
     rec = _Recorder()
     c._send_producer_done = lambda request_id, frm, to: rec.producer_done.append((request_id, frm, to))
     c._send_partition_inputs = lambda request_id, pname, fwd_args: rec.partition_inputs.append(pname)

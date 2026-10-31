@@ -292,9 +292,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
        chain on it merges ready rows of the other walks of its combined walk, so
-       decode steps take in new prompts as they arrive. Off (the default), a chain
+       decode steps take in new prompts, and their chunks, as they arrive. Off, a chain
        keeps to its own walk and yields to the others, and a step mixes walks only
-       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       when the scheduler builds one fresh. Defaults to on where the combined walk
+       has a token budget (``max_batch_tokens``), and off where it has none, since a
+       merged prompt then runs whole. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
    * - ``max_batch_tokens``
      - *(optional)* Per node, one token budget for every walk the model budgets, or a
@@ -356,15 +358,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
-     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+     - *(optional)* Async scheduling for the parallel nodes: ``true``
+       (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold`` and ``pre_plan``
-       (``true``/``false`` or an integer). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
+       (``true``/``false`` or an integer; ``step_thread_core`` takes
+       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -556,6 +559,15 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
+groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
+then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
+in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
+rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
+per node, riding on one node's next step, so two nodes on one pool could admit out of step on
+a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
+different workers.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank

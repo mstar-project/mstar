@@ -87,7 +87,9 @@ def test_a_chains_first_step_that_cannot_continue_keeps_the_worker_busy_alone():
 
 
 def test_a_chains_first_step_that_continues_does_not_peek():
-    worker, peeked, excluded = _worker(_PROMPT, speculation=SimpleNamespace(node_batch=None, tp_seq=-1))
+    worker, peeked, excluded = _worker(
+        _PROMPT, speculation=SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False),
+    )
 
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
 
@@ -97,7 +99,7 @@ def test_a_chains_first_step_that_continues_does_not_peek():
 def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_step():
     """Speculating a row's next chunk must not hold decode rows behind a second
     prompt step, so the peek runs before the chain's first speculation."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1)
+    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}),
     )
@@ -109,7 +111,7 @@ def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_ste
 
 
 def test_a_prompt_chain_alone_speculates_its_next_chunk():
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1)
+    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
     worker, _, excluded = _worker(
         _PROMPT, other_ready=False, speculation=chunk,
         mid_prefill_walks=frozenset({("LLM", "prefill")}),

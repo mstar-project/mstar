@@ -8,7 +8,6 @@ from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from mstar.model.submodule_base import chunk_loop_name
-from mstar.worker.micro_scheduler import ScheduledBatch, chunk_loop_stride
 
 if TYPE_CHECKING:
     from mstar.model.base import WorkerGraph
@@ -63,29 +62,6 @@ class ChunkLoops:
                 if chunk_loop_name(node, walk) in loops
             )
         return frozenset(found)
-
-    def loop_strides(
-        self, batch: ScheduledBatch, rids: Iterable[int],
-    ) -> list[int] | None:
-        """``RouteInput.loop_strides`` for ``rids`` of ``batch``, in that
-        order: a row of a chunk-Loop walk moves its Loop by its chunk
-        (``chunk_loop_stride``), and any other row its loop by one. None for a
-        step with no row in a chunk Loop, which is every decode step.
-
-        Keyed on the walk having a Loop rather than on the row having a chunk
-        range: a row with no range ran whole, which also ends the Loop -- a
-        walk with no token budget is never measured or cut.
-        """
-        walks = self.walks_by_node.get(batch.node_name)
-        # one lookup for a single-walk step outside a chunk Loop (decode)
-        if not walks or (not batch.request_walks and batch.graph_walk not in walks):
-            return None
-        ranges = batch.chunk_ranges
-        walk_of = batch.walk_of
-        return [
-            chunk_loop_stride(ranges.get(rid)) if walk_of(rid) in walks else 1
-            for rid in rids
-        ]
 
 
 def mid_prefill_speculation_off(

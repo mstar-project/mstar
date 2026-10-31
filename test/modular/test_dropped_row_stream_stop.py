@@ -121,7 +121,6 @@ def _worker(eng, runtime):
     w.enable_nvtx = False
     w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(
@@ -214,8 +213,11 @@ def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
     from mstar.model.submodule_base import CHUNK_LOOP_END
 
     batch, runtime, w = _postprocess(_Sub(skip={2}), cached={2}, chunk_loop=True)
-    served = ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={2: 0})
-    assert w.chunk_loops.loop_strides(served, [2]) == [CHUNK_LOOP_END], "the served row's loop still ends"
+    served = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, request_to_worker_graph={2: 0},
+        chunk_loop_walks=w.chunk_loops.walks_by_node[NODE],
+    )
+    assert served.loop_strides([2]) == [CHUNK_LOOP_END], "the served row's loop still ends"
     assert runtime.stopped == [1], "by its stride, not a stop"
     assert not w.reported
     assert 2 not in batch.resource_publish_info
