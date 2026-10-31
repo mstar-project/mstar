@@ -2017,6 +2017,16 @@ If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node
 types.
 
+A row-parallel projection followed by an RMSNorm can leave its all-reduce to the norm, which
+runs both in one fused kernel. Set the projection's ``reduce_results = False``, so it returns
+its partial sum, and hand the norm the comm group: ``RMSNorm.forward_residual(x, residual,
+comm_group)`` reduces, adds and norms, and ``RMSNorm.forward(x, comm_group)`` reduces and
+norms (a post-norm before the residual add). The two go together, since a norm called
+without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
+the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel`` and
+``MuseGlimmerTextModel`` do. ``MultimodalDecoderModel`` builds the kernel's workspace for its
+TP node.
+
 .. _Expert parallelism (MoE):
 
 Expert parallelism (MoE)
@@ -2519,8 +2529,13 @@ patch bucket (``BLOCK_LOOP_PATCH_BUCKETS``). Its ``prepare_inputs`` returns the
 tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
 ``SEGMENT_LABELS``' attending spans (frames, windows) over the same patches. The tower
 provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
-``project(encoded, **tensors)``. A prompt whose spans under some label exceed the
-ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
+``project(encoded, **tensors)``. The replay's input buffers are in the node's autocast
+dtype unless ``BLOCK_LOOP_DTYPE`` names what ``embed`` returns (Muse Glimmer's ends on a
+LayerNorm, which autocast returns in fp32). The runner refuses an ``embed`` output its
+buffers may round, and widens a narrower one, so a declaration wider than ``embed``'s
+output replays the loop in more precision than the eager loop runs. A prompt whose spans
+under some label exceed the ragged resource's ``max_segments_per_request`` takes no lease
+and runs eagerly.
 A tower builds on the pieces in ``mstar/model/components/vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
 ``AxialVisionRope`` and ``RaggedVisionAttention`` (attention over the packed patches

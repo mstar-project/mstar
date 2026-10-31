@@ -283,3 +283,48 @@ def test_glimmer_encoder_declares_windows_and_frames():
     assert [(seg.label, seg.span) for seg in step.segments] == [
         (VISION_WINDOW, 4), (VISION_WINDOW, 4), (VISION_FULL, 8),
     ]
+
+
+def _glimmer_encoder(max_segments: int):
+    from mstar.model.keys import VISION_ATTN
+    from mstar.model.muse.submodules import VisionEncoderSubmodule
+
+    encoder = object.__new__(VisionEncoderSubmodule)
+    encoder.config = SimpleNamespace(hidden_size=8, head_dim=4)
+    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_request=max_segments)}
+    return encoder
+
+
+def test_glimmer_leases_and_replays_both_layouts():
+    """A replay's plan holds the resource's ceiling under each label, frames
+    as well as windows, and plans both; the frames pick the bucket."""
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
+    from mstar.model.muse.config import VISION_FULL, VISION_WINDOW
+    from mstar.model.submodule_base import NodeInputs
+
+    encoder = _glimmer_encoder(max_segments=4)
+    region = encoder.get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.bfloat16,
+    )[VISION_BLOCK_LOOP]
+
+    def row(windows: int, frames: int) -> NodeInputs:
+        return NodeInputs(
+            input_seq_len=windows,
+            resource_step_info={VISION_WINDOW: (1,) * windows, VISION_FULL: (1,) * frames},
+        )
+
+    assert region.can_lease([row(4, 4)])
+    assert not region.can_lease([row(1, 5)])
+    assert not region.can_lease([row(5, 1)])
+
+    ran = {}
+    runner = SimpleNamespace(
+        can_run=lambda batch_size, total_tokens: True,
+        run=lambda **kwargs: ran.update(kwargs) or SimpleNamespace(get_view=lambda name: "replayed"),
+    )
+    hidden = torch.zeros(8, 8)
+    engine_inputs = SimpleNamespace(piecewise_runners={VISION_BLOCK_LOOP: runner}, request_ids=["r"], step=None)
+    lengths = {VISION_WINDOW: (4, 4), VISION_FULL: (8,)}
+    assert encoder._replay_block_loop(engine_inputs, hidden, hidden, hidden, lengths) == "replayed"
+    assert ran["seq_lens"] == [8]
+    assert ran["label_seq_lens"] == {VISION_WINDOW: [4, 4], VISION_FULL: [8]}

@@ -236,7 +236,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
     # -----------------------------------------------------------------------
 
     def _create_submodule(
-        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         from mstar.model.muse import weight_loader
         from mstar.model.muse.submodules import (
@@ -246,7 +246,6 @@ class MuseGlimmerModel(MultimodalDecoderModel):
 
         if node_name not in ("LLM", "vision_encoder"):
             return None
-        dtype = autocast_dtype or torch.bfloat16
         weights_dir = self._resolve_weights()
         if node_name == "vision_encoder":
             from mstar.model.muse.components.vision import MuseGlimmerVisionModel
