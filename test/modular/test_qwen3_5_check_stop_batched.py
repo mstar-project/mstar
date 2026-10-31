@@ -12,10 +12,9 @@ from mstar.model.submodule_base import HostRows
 EOS = 7
 
 
-def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=False):
+def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode"):
     return SimpleNamespace(
         graph_walk=walk,
-        step_metadata={"last_prefill": last_prefill},
         resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": done},
         max_tokens=max_tokens,
@@ -23,7 +22,9 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=
 
 
 def _sub():
-    return SimpleNamespace(config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})))
+    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub.stop_token_ids = frozenset({EOS, 9})
+    return sub
 
 
 @pytest.mark.parametrize("shape", ["flat", "column"])
@@ -59,8 +60,8 @@ def test_only_a_decode_rows_token_can_stop():
     """A prefill row is not in decode_loop yet, so neither stop path checks it."""
     tokens = torch.tensor([EOS, EOS, EOS])
     infos = {
-        "early": _info(walk="prefill_text"),                   # not the last prefill
-        "last": _info(walk="prefill_text", last_prefill=True),
+        "text": _info(walk="prefill_text"),
+        "media": _info(walk="prefill_vision"),
         "dec": _info(),
     }
     got = LLMSubmodule.check_stop_batched(
@@ -119,7 +120,7 @@ def test_rows_out_of_batch_order_still_map_by_request():
     from mstar.model.submodule_base import HostRows
 
     sub = LLMSubmodule.__new__(LLMSubmodule)
-    sub.config = SimpleNamespace(stop_token_ids={7})
+    sub.stop_token_ids = frozenset({7})
     rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
 
     def info(max_tokens, iters=0):

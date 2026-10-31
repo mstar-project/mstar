@@ -26,17 +26,15 @@ import torch
 from torch import nn
 
 from mstar.model.multimodal import (
+    MEDIA_LAYOUT,
     TEXT,
+    VIDEO,
     PromptPart,
     parts_from_modalities,
-    prefill_plan,
 )
 from mstar.model.qwen3_5.video import (
-    VIDEO,
     expand_video_pads,
-    expand_video_parts,
     ffmpeg_unavailable,
-    group_owners,
     group_timestamps,
 )
 
@@ -239,7 +237,7 @@ LAYOUTS = {
 
 def run_both(model, processor, layout: str):
     """mstar's `process_prompt` and the transformers processor on one prompt."""
-    from mstar.model.qwen3_5.qwen3_5_model import _as_hwc_uint8
+    from mstar.model.multimodal import as_uint8_chw
 
     modalities, video_names = LAYOUTS[layout]
     texts = [f"Question {i}: what happens?" for i in range(modalities.count(TEXT))]
@@ -265,7 +263,7 @@ def run_both(model, processor, layout: str):
     )
     ref = processor(
         text=[text],
-        images=[_as_hwc_uint8(i) for i in images] or None,
+        images=[as_uint8_chw(i).permute(1, 2, 0).numpy() for i in images] or None,
         videos=[v for v, _ in videos] or None,
         video_metadata=[{"total_num_frames": v.shape[0], "fps": fps} for v, fps in videos] or None,
         return_tensors="pt",
@@ -273,27 +271,22 @@ def run_both(model, processor, layout: str):
     return parts, out, ref
 
 
-def rebuild_ids(model, parts, tensors, groups) -> torch.Tensor:
-    """The full prompt from mstar's pieces: text spans, and each span's
-    sentinels around one pad per merged token, as transformers writes it."""
-    specs = model._placeholder_specs()
-    merge = model.vision_config.spatial_merge_size ** 2
-    owners = group_owners(groups)
-    texts = iter(tensors["text_inputs"])
-    image_grids = iter(tensors.get("image_grid_thw", []))
-    out = []
-    for step in prefill_plan(expand_video_parts(parts, groups)):
-        if step.modality == TEXT:
-            out.append(next(texts))
-            continue
-        start, pad, end = specs[step.modality]
-        if step.modality == VIDEO:
-            _, h, w = tensors["video_grid_thw"][owners[step.index]].tolist()
-            n = h * w // merge
-        else:
-            n = int(next(image_grids).prod()) // merge
-        out.append(torch.tensor([start] + [pad] * n + [end]))
-    return torch.cat(out)
+def by_modality(modalities, tensors, layout) -> dict[str, list]:
+    """The prompt-ordered tower inputs split back into images and videos, each
+    with its grid off the media layout's runs (a video's runs are its temporal
+    groups, each a one-frame grid)."""
+    split = {"image": ([], []), VIDEO: ([], [])}
+    pixels, runs = iter(tensors.get("pixel_values", [])), iter(layout["grid"])
+    for m in modalities:
+        if m != TEXT:
+            p = next(pixels)
+            t, h, w = next(runs)
+            for _ in range(p.shape[0] // (t * h * w) - 1):
+                assert next(runs) == [t, h, w]
+            split[m][0].append(p)
+            split[m][1].append(torch.tensor([p.shape[0] // (h * w), h, w]))
+    assert next(runs, None) is None
+    return split
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +303,30 @@ def test_group_timestamps_match_processor(n):
     assert group_timestamps(indices, 29.97, 2) == ref
 
 
+@pytest.mark.parametrize("grid", [[(1, 6, 10)], [(1, 4, 4), (2, 8, 2)], [(1, 2, 2)]], ids=str)
+def test_the_position_resample_matches_interpolate(grid):
+    """The learned table resampled onto each frame's grid, as upstream's
+    ``F.interpolate(align_corners=True)`` (edge reads, no zero padding),
+    in the merger's block order."""
+    import torch.nn.functional as F
+
+    from mstar.model.qwen3_5.components.vision import vision_interpolation
+
+    side, merge, dim = 4, 2, 3
+    table = torch.randn(side * side, dim, dtype=torch.float64)
+    idx, w = vision_interpolation(grid, side, merge, torch.device("cpu"))
+    ours = (table[idx] * w[:, :, None].double()).sum(1)
+    refs = []
+    for t, h, wd in grid:
+        img = F.interpolate(
+            table.T.reshape(1, dim, side, side), size=(h, wd), mode="bilinear", align_corners=True,
+        )[0]
+        # raster -> merge blocks: (block row, block col, row in block, col in block)
+        blocks = img.reshape(dim, h // merge, merge, wd // merge, merge).permute(1, 3, 2, 4, 0)
+        refs.append(blocks.reshape(-1, dim).repeat(t, 1))
+    assert torch.allclose(ours, torch.cat(refs), atol=1e-6)
+
+
 def test_expand_video_pads_writes_a_triple_per_group():
     text = "a<|vision_start|><|video_pad|><|vision_end|>b<|video_pad|>c"
     out = expand_video_pads(
@@ -324,18 +341,6 @@ def test_expand_video_pads_writes_a_triple_per_group():
         expand_video_pads(text, "<|video_pad|>", "<|vision_start|>", "<|vision_end|>", [[0.0]])
 
 
-def test_video_plan_puts_text_around_every_group():
-    """Timestamps and the outer sentinels are text, so a video's groups are
-    never adjacent to each other or to a neighbouring attachment."""
-    parts = parts_from_modalities(["video", "image", "video"], [])
-    plan = prefill_plan(expand_video_parts(parts, [2, 1]))
-    assert [(p.modality, p.index) for p in plan] == [
-        (TEXT, 0), (VIDEO, 0), (TEXT, 1), (VIDEO, 1), (TEXT, 2),
-        ("image", 0), (TEXT, 3), (VIDEO, 2), (TEXT, 4),
-    ]
-    assert group_owners([2, 1]) == [0, 0, 1]
-
-
 # ---------------------------------------------------------------------------
 # Against transformers
 # ---------------------------------------------------------------------------
@@ -344,17 +349,22 @@ def test_video_plan_puts_text_around_every_group():
 @needs_new_layout
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_prompt_ids_match_processor(model, processor, layout):
-    parts, out, ref = run_both(model, processor, layout)
-    tensors, groups = out.new_input_tensors, out.metadata["video_groups"]
-    assert groups == [int(g[0]) for g in tensors.get("video_grid_thw", [])]
-    assert torch.equal(rebuild_ids(model, parts, tensors, groups), ref["input_ids"][0])
+    _, out, ref = run_both(model, processor, layout)
+    (ids,) = out.new_input_tensors["text_inputs"]
+    assert torch.equal(ids, ref["input_ids"][0])
 
 
-def test_an_attachment_prompt_keys_nothing_for_the_prefix_cache(model, processor):
-    """An attachment prompt's one `prefill_vision` step carries tensor inputs, which the prefix
-    cache never cuts, and a keyed span in that walk makes the preprocess worker refuse the request."""
+def test_only_a_text_prompt_is_keyed_for_the_prefix_cache(model, processor):
+    """A text prompt's one span is keyed, so the prefix cache serves it. An attachment prompt's one
+    step carries tensor inputs, which the prefix cache never cuts, and a keyed span in that walk
+    makes the preprocess worker refuse the request."""
+    from mstar.model.base import keyed_labels
     from mstar.model.qwen3_5.config import KV_CACHE
 
+    assert keyed_labels(model) == {KV_CACHE: {"main": model.kv_labels()[KV_CACHE]["main"]}}
+    question = "Question 0: what happens?"
+    text = model.process_prompt(question, [TEXT], ["text"], prompt_parts=parts_from_modalities([TEXT], [question]))
+    assert text.metadata["kv_layout"][KV_CACHE]["main"].keyed_count() == 1
     _, out, _ = run_both(model, processor, "mixed")
     assert out.metadata["kv_layout"][KV_CACHE]["main"].keyed_count() == 0
 
@@ -363,25 +373,14 @@ def test_an_attachment_prompt_keys_nothing_for_the_prefix_cache(model, processor
 def test_patches_and_grids_match_processor(model, processor, layout):
     _, out, ref = run_both(model, processor, layout)
     tensors = out.new_input_tensors
-    assert torch.equal(torch.stack(tensors["video_grid_thw"]), ref["video_grid_thw"])
-    assert torch.equal(torch.cat(tensors["pixel_values_videos"]), ref["pixel_values_videos"])
-    if "image_grid_thw" in tensors:
-        assert torch.equal(torch.stack(tensors["image_grid_thw"]), ref["image_grid_thw"])
-        assert torch.equal(torch.cat(tensors["pixel_values"]), ref["pixel_values"])
+    split = by_modality(LAYOUTS[layout][0], tensors, out.metadata[MEDIA_LAYOUT])
+    assert torch.equal(torch.stack(split[VIDEO][1]), ref["video_grid_thw"])
+    assert torch.equal(torch.cat(split[VIDEO][0]), ref["pixel_values_videos"])
+    if split["image"][0]:
+        assert torch.equal(torch.stack(split["image"][1]), ref["image_grid_thw"])
+        assert torch.equal(torch.cat(split["image"][0]), ref["pixel_values"])
     # the raw frames are not kept past preprocessing
     assert tensors["video_inputs"] == []
-
-
-class _Embed(nn.Module):
-    """``embed_tokens`` that writes each id as its own value, so the spliced
-    row can be read back as ids."""
-
-    def __init__(self, vocab_size: int):
-        super().__init__()
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding(vocab_size, 1)
-        with torch.no_grad():
-            self.model.embed_tokens.weight.copy_(torch.arange(vocab_size).float()[:, None])
 
 
 IMAGE_MARK, VIDEO_MARK = -1.0, -2.0
@@ -390,52 +389,40 @@ IMAGE_MARK, VIDEO_MARK = -1.0, -2.0
 @needs_new_layout
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout):
-    """The schedule and the LLM's `prefill_vision` row, against transformers:
-    the row's token order and its 3D positions, plus where decode resumes."""
+    """The schedule and the LLM's media row, against transformers: the
+    spliced row's token order and its 3D positions, plus where decode
+    resumes."""
+    from mstar.model.multimodal import splice_media
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     _, out, ref = run_both(model, processor, layout)
     tensors = out.new_input_tensors
-    modalities, _ = LAYOUTS[layout]
-    (step,) = model._prefill_schedule(modalities, tensors, out.metadata["video_groups"])
+    step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     assert step.walk == "prefill_vision"
-
     # the encoder gets each image and video once, in prompt order
-    by_id = {id(t): i for i, t in enumerate(tensors.get("pixel_values", []))}
-    by_id.update({id(t): -1 - i for i, t in enumerate(tensors["pixel_values_videos"])})
-    order = [by_id[id(t)] for t in step.input_tensors["pixel_values"]]
-    image_count = len(tensors.get("pixel_values", []))
-    expected = []
-    images, videos = iter(range(image_count)), iter(range(len(tensors["pixel_values_videos"])))
-    for m in modalities:
-        if m == "image":
-            expected.append(next(images))
-        elif m == VIDEO:
-            expected.append(-1 - next(videos))
-    assert order == expected
+    assert all(a is b for a, b in zip(
+        step.input_tensors[("vision_encoder", "pixel_values")], tensors["pixel_values"], strict=True,
+    ))
 
-    merge = model.vision_config.spatial_merge_size ** 2
-    marks = [
-        torch.full((int(g.prod()) // merge, 1), VIDEO_MARK if by_id[id(p)] < 0 else IMAGE_MARK)
-        for g, p in zip(
-            step.input_tensors["image_grid_thw"], step.input_tensors["pixel_values"], strict=True,
-        )
-    ]
-    llm = LLMSubmodule(_Embed(len(model.tokenizer)), model.config, model.vision_config)
+    media = out.metadata[MEDIA_LAYOUT]
+    (prompt,) = tensors["text_inputs"]
+    marks = torch.cat([
+        torch.full((n, 1), VIDEO_MARK if int(prompt[offset]) == model.config.video_token_id else IMAGE_MARK)
+        for offset, n in zip(media["offset"], media["tokens"], strict=True)
+    ])
+    (encoder,) = model.encoders
+    llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
-    fwd_info = SimpleNamespace(request_id="r", step_metadata={"prefill_order": step.order})
-    row = llm._vision_inputs(fwd_info, {
-        "text_inputs": step.input_tensors["text_inputs"],
-        "image_grid_thw": step.input_tensors["image_grid_thw"],
-        "vision_embeds": [torch.cat(marks)],
-    })
+    fwd_info = SimpleNamespace(request_id="r", step_metadata=step.metadata)
+    (ids,) = step.input_tensors[("LLM", "text_inputs")]
+    row = llm._media_inputs(fwd_info, {"text_inputs": [ids], "vision_embeds": [marks]})
 
-    ids = ref["input_ids"][0]
-    expected_row = ids.float()
-    expected_row[ids == model.config.image_token_id] = IMAGE_MARK
-    expected_row[ids == model.config.video_token_id] = VIDEO_MARK
-    assert torch.equal(row.input_embeds[:, 0], expected_row)
+    expected_row = ref["input_ids"][0].float()
+    expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
+    expected_row[ref["input_ids"][0] == model.config.video_token_id] = VIDEO_MARK
+    spliced = splice_media(row.input_ids.float()[:, None], encoder.pads(row.input_ids), marks)
+    assert torch.equal(spliced[:, 0], expected_row)
 
     positions, _ = rope_model.get_rope_index(
         ref["input_ids"], ref["mm_token_type_ids"],
@@ -443,10 +430,10 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     )
     assert torch.equal(row.custom_pos_ids.long(), positions[:, 0])
     # decode resumes where transformers' rope delta puts it
-    assert row.tensor_inputs["mrope_advance"] == int(positions.max()) + 1
+    assert row.resource_step_info == int(positions.max()) + 1
     spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
     assert sum(span.length for span in spans) == row.input_seq_len
-    assert sum(span.advance for span in spans) == row.tensor_inputs["mrope_advance"]
+    assert sum(span.advance for span in spans) == row.resource_step_info
 
 
 def test_mp4_matches_processor(model, processor, tmp_path):
@@ -471,10 +458,11 @@ def test_mp4_matches_processor(model, processor, tmp_path):
         "What happens?", ["video", "text"], ["text"],
         tensors={"video_inputs": [loaded.data]},
         input_metadata={"video_inputs": [loaded.metadata]},
-    ).new_input_tensors
+    )
     ref = processor.video_processor(videos=[str(path)], return_tensors="pt")
-    assert torch.equal(out["video_grid_thw"][0], ref["video_grid_thw"][0])
-    assert torch.equal(out["pixel_values_videos"][0], ref["pixel_values_videos"])
+    t, h, w = ref["video_grid_thw"][0].tolist()
+    assert out.metadata[MEDIA_LAYOUT]["grid"] == [[1, h, w]] * t
+    assert torch.equal(out.new_input_tensors["pixel_values"][0], ref["pixel_values_videos"])
 
 
 # ---------------------------------------------------------------------------
@@ -497,13 +485,14 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
         tensors={"video_inputs": [frames]},
         input_metadata={"video_inputs": [metadata]},
     )
-    (grid,) = out.new_input_tensors["video_grid_thw"]
-    assert int(grid[0]) > limit
-    assert int(grid.prod()) <= VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
+    grids = out.metadata[MEDIA_LAYOUT]["grid"]
+    assert len(grids) > limit
+    assert sum(t * h * w for t, h, w in grids) <= VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
 
 
 def _encoder(max_segments: int):
     """A vision encoder bound to a ragged attention resource with this ceiling."""
+    from mstar.model.multimodal import vision_encoder
     from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
@@ -512,7 +501,7 @@ def _encoder(max_segments: int):
         patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
         num_position_embeddings=16, out_hidden_size=64,
     )
-    encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config)
+    encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, vision_encoder((0,)))
     encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_request=max_segments)}
     return encoder
 
@@ -520,7 +509,7 @@ def _encoder(max_segments: int):
 def test_vision_block_loop_leases_only_what_a_replay_holds():
     """The captured block loop declares `can_lease`: a request whose
     segments exceed a replay's plan gets no slot."""
-    from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
     from mstar.model.submodule_base import NodeInputs
 
     encoder = _encoder(max_segments=4)
@@ -529,7 +518,7 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
     )[VISION_BLOCK_LOOP]
 
     def request(segments: int) -> NodeInputs:
-        return NodeInputs(input_seq_len=16 * segments, tensor_inputs={"seq_lengths": (16,) * segments})
+        return NodeInputs(input_seq_len=16 * segments, resource_step_info={"main": (16,) * segments})
 
     assert config.lease_before_step
     assert config.can_lease([request(4)])
@@ -538,8 +527,9 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
 
 def test_vision_block_loop_replays_exactly_when_leased():
     """A leased step declares nothing of its own, so the forward replays
-    then and runs eagerly otherwise, whatever the runner's buckets allow."""
-    from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP
+    then and runs eagerly otherwise, whatever the runner's buckets allow; a
+    replay plans the frames under the one label."""
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 
     class Runner:
         has_bucket = True
@@ -558,7 +548,7 @@ def test_vision_block_loop_replays_exactly_when_leased():
         engine_inputs = SimpleNamespace(
             piecewise_runners={VISION_BLOCK_LOOP: runner}, request_ids=["r"], step=step,
         )
-        return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, (4, 4))
+        return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, {"main": (4, 4)})
 
     assert replay(step=object()) is None
     assert not hasattr(runner, "ran")
@@ -569,6 +559,37 @@ def test_vision_block_loop_replays_exactly_when_leased():
     runner.has_bucket = True
     assert replay(step=None) == "replayed"
     assert runner.ran["seq_lens"] == [4, 4]
+    assert runner.ran["label_seq_lens"] == {"main": [4, 4]}
+
+
+def test_the_replayed_region_declares_what_the_eager_step_would():
+    """One declaration serves the eager step and the region: at capture
+    (no labels) each label plans the bucket's span, at replay the frames."""
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
+    from mstar.model.qwen3_5.config import VISION_ATTN
+    from mstar.model.submodule_base import NodeInputs
+
+    encoder = _encoder(max_segments=4)
+    region = encoder.get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.bfloat16,
+    )[VISION_BLOCK_LOOP]
+
+    def spans(step):
+        return [(seg.request_id, seg.label, seg.span) for seg in step.segments]
+
+    eager = encoder.declare_step(
+        "prefill_vision", ["r"], [NodeInputs(input_seq_len=8, resource_step_info={"main": (4, 4)})],
+    )
+    replayed = region.declare_step(["r"], [8], label_seq_lens={"main": [4, 4]})
+    assert spans(eager) == spans(replayed) == [("r", "main", 4), ("r", "main", 4)]
+    assert set(eager.steps) == set(replayed.steps) == {VISION_ATTN}
+    assert spans(region.declare_step(["r"], [256])) == [("r", "main", 256)]
+    # leased, the region declares the node's whole step
+    leased = encoder.declare_step(
+        "prefill_vision", ["r"], [NodeInputs(input_seq_len=8, resource_step_info={"main": (4, 4)})],
+        piecewise_leases={VISION_BLOCK_LOOP: object()},
+    )
+    assert leased is None
 
 
 def test_a_bad_layout_is_refused_before_the_video_is_preprocessed(model, monkeypatch):
@@ -662,6 +683,28 @@ def test_a_video_with_no_frame_size_is_refused(model, tmp_path, monkeypatch):
     assert decoded == []
 
 
+def test_the_model_pickles_for_its_workers(model):
+    """The server pickles the Model into every worker process it spawns."""
+    import pickle
+
+    assert len(pickle.loads(pickle.dumps(model)).media) == len(model.media)
+
+
+def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
+    """The checkpoint's generation_config applies under the request, and its
+    min_p turns the sampler's min-p filter on."""
+    from mstar.model.qwen3_5.config import SAMPLER
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    ckpt = write_synthetic_checkpoint(tmp_path)
+    (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
+    model = Qwen3_5DenseModel(str(ckpt))
+    (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
+    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    cfg.validate(spec)
+    assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
+
+
 def test_still_refuses_audio(model):
     with pytest.raises(ValueError, match="no audio path"):
         model.process_prompt(
@@ -676,17 +719,20 @@ def test_video_needs_its_sampling_metadata(model):
         model.process_prompt("hi", ["video", "text"], ["text"], tensors={"video_inputs": [frames]})
 
 
-def test_schedule_and_prompt_share_the_plan(model, processor):
-    """`check_plan` on the prompt and the schedule's order agree for a
-    layout `process_prompt` accepted."""
-    parts, out, _ = run_both(model, processor, "two_videos_around_image")
-    groups = out.metadata["video_groups"]
-    plan = prefill_plan(expand_video_parts(parts, groups))
-    tensors = out.new_input_tensors
-    (step,) = model._prefill_schedule(["video", "image", "video", "text"], tensors, groups)
-    kinds = {TEXT: 0, "image": 1, VIDEO: 2}
-    assert step.order == tuple(kinds[p.modality] for p in plan)
-    assert len(step.input_tensors["text_inputs"]) == len(tensors["text_inputs"])
+def test_the_layout_places_every_pad(model, processor):
+    """Each laid-out run covers exactly its pads in the expanded prompt, and
+    the runs' tokens sum to the tower's merged tokens."""
+    _, out, _ = run_both(model, processor, "two_videos_around_image")
+    (ids,) = out.new_input_tensors["text_inputs"]
+    layout = out.metadata[MEDIA_LAYOUT]
+    pads = set(model.encoders[0].pad_ids)
+    covered = torch.zeros_like(ids, dtype=torch.bool)
+    for offset, n in zip(layout["offset"], layout["tokens"], strict=True):
+        assert all(int(t) in pads for t in ids[offset:offset + n])
+        covered[offset:offset + n] = True
+    assert torch.equal(covered, torch.isin(ids, torch.tensor(sorted(pads))))
+    merge = model.vision_config.spatial_merge_size ** 2
+    assert sum(layout["tokens"]) == sum(p.shape[0] for p in out.new_input_tensors["pixel_values"]) // merge
 
 
 # ---------------------------------------------------------------------------

@@ -65,13 +65,6 @@ class SeqParallel(NamedTuple):
         return attention_over_sharded_keys(self.group, q, k, v, run)
 
 
-def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """``diffusers.models.normalization.RMSNorm(elementwise_affine=False)``: the
-    variance in fp32, the product promoted to fp32, then back to the input dtype."""
-    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    return (x * torch.rsqrt(variance + eps)).to(x.dtype)
-
-
 def apply_split_rope(x: torch.Tensor, rope: RotaryTable) -> torch.Tensor:
     """``apply_split_rotary_emb`` for ``[B, T, H, D]``: each head's dims are two halves
     ``(x1, x2)`` rotated to ``(x1 cos - x2 sin, x2 cos + x1 sin)``, in fp32.

@@ -932,9 +932,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
-        allocate the hidden-state buffer in the dtype the captured region runs
-        under (avoids a copy-time upcast at replay).
+        ``disable_autocast``, passed so a config's ``make_static_inputs`` can
+        allocate each input buffer in the dtype the eager path hands the region,
+        often that one. The replay copies into the buffer and refuses a value the
+        buffer may round.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

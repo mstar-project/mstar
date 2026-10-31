@@ -780,6 +780,8 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     config = Qwen3_5Config(
@@ -790,7 +792,47 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
         linear_value_head_dim=128, linear_conv_kernel_dim=4,
         vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
     )
-    return _bare(Qwen3_5DenseModel, config=config, vision_config=None)
+    return _bare(
+        Qwen3_5DenseModel, config=config, vision_config=None,
+        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+    )
+
+
+def _muse_configs(text_cls, max_positions):
+    """Small Muse text and vision shapes: the resource rules read the layer
+    and head counts, not their sizes."""
+    from mstar.model.muse.config import (
+        FULL_ATTENTION,
+        SLIDING_ATTENTION,
+        WINDOW_ATTENTION,
+        MuseGlimmerVisionConfig,
+    )
+    text = text_cls(
+        num_hidden_layers=4, hidden_size=256, intermediate_size=512, num_attention_heads=8,
+        num_key_value_heads=2, head_dim=64, vocab_size=1024,
+        layer_types=[SLIDING_ATTENTION] * 3 + [FULL_ATTENTION], layer_rope_theta=[5e5] * 3 + [0.0],
+        sliding_window=1024, max_position_embeddings=max_positions, rms_norm_eps=1e-5,
+        post_norm_eps=1e-5, image_token_id=0,
+    )
+    vision = MuseGlimmerVisionConfig(
+        hidden_size=64, intermediate_size=128, num_attention_heads=2, num_hidden_layers=2,
+        patch_size=14, patch_temporal=2, merge_size=2, pos_emb_height=32, pos_emb_width=32,
+        layer_types=[WINDOW_ATTENTION, FULL_ATTENTION], out_hidden_size=256,
+        projector_hidden_size=256, text_hidden_size=256,
+    )
+    return text, vision
+
+
+def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.muse.config import MuseGlimmerConfig
+    from mstar.model.muse.glimmer_model import MuseGlimmerModel
+    config, vision_config = _muse_configs(MuseGlimmerConfig, 131072)
+    return _bare(
+        MuseGlimmerModel, config=config, vision_config=vision_config,
+        media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+    )
 
 
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
@@ -875,6 +917,7 @@ _FACTORIES = {
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
+    "MuseGlimmerModel": _muse_glimmer,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
