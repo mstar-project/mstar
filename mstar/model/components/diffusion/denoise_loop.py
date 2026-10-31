@@ -56,6 +56,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.guidance_parallel import GuidanceParallel
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
@@ -128,9 +129,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         capture_batch_sizes: Sequence[int] = (1, 2, 4, 8),
         replay_walks: Mapping[str, Sequence[str]] | None = None,
         max_uncaptured_layouts: int = 4,
+        guidance_parallel: GuidanceParallel | None = None,
     ):
         super().__init__()
         self.loop_name = loop_name
+        # One guidance branch per rank; None runs both in this rank's forward.
+        self.guidance_parallel = guidance_parallel
         self._max_batch_size = int(max_batch_size)
         self.attn_resource_key = attn_resource_key
         # (graph_walk, bucket_key) pairs to capture; the same key on another walk
@@ -307,6 +311,19 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
         return int(fwd_info.dynamic_loop_iter_counts.get(self.loop_name, 0))
+
+    def branch_rows(self, guided: bool) -> int:
+        """Transformer rows one request contributes to this rank's forward: one per
+        guidance branch, or the single branch :class:`GuidanceParallel` placed here."""
+        return 2 if guided and self.guidance_parallel is None else 1
+
+    def guidance_branches(self, out: torch.Tensor, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(cond, uncond)``, each ``[B, ...]``, from this rank's forward over a guided
+        step, whose rows are a request's two branches adjacent (cond first), or under
+        :class:`GuidanceParallel` this rank's branch alone."""
+        if self.guidance_parallel is not None:
+            return self.guidance_parallel.exchange(out)
+        return out.unflatten(0, (batch, 2)).unbind(1)
 
     def _ragged(self) -> RaggedAttentionCallable | None:
         """The attention callable for the ``"main"`` span, or None (SDPA)."""

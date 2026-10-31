@@ -860,8 +860,7 @@ class AcceleratorGraphRunner:
         for spec in self.prepare_for_capture():
             # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.barrier()
             free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
@@ -972,8 +971,7 @@ class AcceleratorGraphRunner:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.barrier()
 
             # Every rank enters this, pass or fail, since finishing a capture
             # can be collective (see GraphCaptureScope).
@@ -1854,8 +1852,7 @@ class PiecewiseAcceleratorGraphRunner:
         captured: list[CaptureCost] = []
         for shape in shapes:
             for slot in range(self._num_slots):
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.barrier()
                 free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
@@ -1977,8 +1974,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # rank still in pre-capture setup would mismatch one already in the
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.barrier()
                 with self._comm_group.tp_group.graph_capture() as capture:
                     try:
                         self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)

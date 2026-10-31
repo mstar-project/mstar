@@ -47,6 +47,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     NodeResourceSpec,
     RaggedAttentionConfig,
@@ -187,6 +188,13 @@ class Wan22Model(Model):
             RaggedAttentionSpec(resource_key=DIT_ATTN, nodes={"dit"}, config=attention_config()),
             RaggedCrossAttentionSpec(resource_key=DIT_XATTN, nodes={"dit"}, config=attention_config()),
         ]
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        # the scaffold's denoise loop can run one guidance branch per rank
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes=[], shard_dim={},
+            cfg_enabled_nodes={"dit"} if self.dit_loop == "scaffold" else set(),
+        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -744,20 +752,22 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None, guidance_parallel=None,
     ) -> torch.nn.Module | None:
         # ``autocast_dtype`` and ``sp_group`` exist for interface parity only.
         # Weights load in the checkpoint's own dtypes, and wan22 declares no
         # sp-enabled nodes.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, guidance_parallel)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str = "cpu", guidance_parallel=None,
+    ) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -799,7 +809,7 @@ class Wan22Model(Model):
             return Wan22DenoiseSubmodule(
                 transformer, self.config, use_ragged_attention=self.use_ragged_attention,
                 max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),
-                capture_batch_sizes=self.capture_batch_sizes,
+                capture_batch_sizes=self.capture_batch_sizes, guidance_parallel=guidance_parallel,
             )
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
