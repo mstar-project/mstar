@@ -80,7 +80,9 @@ class _Rank:
 
 class _Groups:
     def get_joint_group_for_node(self, node):
-        return type("_Joint", (), {"world_size": 1, "tp_group": _Rank(), "sp_group": _Rank()})()
+        return type("_Joint", (), {
+            "world_size": 1, "head_shards": 1, "tp_group": _Rank(), "sp_group": _Rank(), "barrier": _Rank.barrier,
+        })()
 
     def get_instance_world_size_for_node(self, node):
         return 1
