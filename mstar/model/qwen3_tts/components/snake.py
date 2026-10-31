@@ -34,6 +34,22 @@ if triton is not None:
         tl.store(out_ptr + offsets, (x + inv_beta * (s * s)).to(out_ptr.dtype.element_ty), mask=mask)
 
 
+    @triton.jit
+    def _snake_channels_last_kernel(
+        x_ptr, out_ptr, alpha_ptr, inv_beta_ptr, channels, numel, BLOCK: tl.constexpr,
+    ):
+        # the same pass over a contiguous channels-last [B, C, 1, T]: every
+        # element's position in memory says its channel
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < numel
+        channel = offsets % channels
+        alpha = tl.load(alpha_ptr + channel, mask=mask, other=0.0)
+        inv_beta = tl.load(inv_beta_ptr + channel, mask=mask, other=0.0)
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        s = tl.sin(x * alpha)
+        tl.store(out_ptr + offsets, (x + inv_beta * (s * s)).to(out_ptr.dtype.element_ty), mask=mask)
+
+
 class FusedSnakeBeta(nn.Module):
     """Drop-in for the reference ``SnakeBeta`` built from its loaded parameters."""
 
@@ -48,10 +64,20 @@ class FusedSnakeBeta(nn.Module):
         self.register_buffer("inv_beta", inv_beta, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``[B, C, T]``, or ``[B, C, 1, T]`` in channels-last memory."""
         if triton is None or not hidden_states.is_cuda:
-            alpha = self.alpha.to(hidden_states.dtype)[None, :, None]
-            inv_beta = self.inv_beta.to(hidden_states.dtype)[None, :, None]
+            shape = (1, -1) + (1,) * (hidden_states.dim() - 2)
+            alpha = self.alpha.to(hidden_states.dtype).view(shape)
+            inv_beta = self.inv_beta.to(hidden_states.dtype).view(shape)
             return hidden_states + inv_beta * torch.sin(hidden_states * alpha).pow(2)
+        if hidden_states.dim() == 4:
+            out = torch.empty_like(hidden_states)
+            numel = hidden_states.numel()
+            _snake_channels_last_kernel[(triton.cdiv(numel, self.BLOCK),)](
+                hidden_states, out, self.alpha, self.inv_beta, hidden_states.shape[1], numel,
+                BLOCK=self.BLOCK, num_warps=8,
+            )
+            return out
         x = hidden_states.contiguous()
         out = torch.empty_like(x)
         batch, channels, length = x.shape

@@ -1296,7 +1296,9 @@ rather than through ``write_kv``, asks the KV resource where the step's tokens g
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
 Tokens past that number are the plan's padding and must not be written. Qwen3-ASR's
-fused q/k norm, RoPE and KV-write kernel (``Qwen3Attention``) is the example.
+fused q/k norm, RoPE and KV-write kernel (``Qwen3Attention``) is the example. Qwen3-TTS's
+code predictor runs the same kernel over its dense frame-local cache, a batch row for the
+page and a depth position for the slot, where ``qk_norm_rope_kv_write_applies`` allows it.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/vjepa2/fake_resources.py`` shows how to stub
