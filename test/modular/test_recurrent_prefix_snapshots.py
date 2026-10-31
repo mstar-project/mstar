@@ -70,7 +70,7 @@ def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
     kv = _specs(0)["kv"]
     kv.config.prefix_cache = prefix_cache
-    group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
+    group = type("Group", (), {"world_size": world_size, "head_shards": world_size})() if world_size > 1 else None
     return RecurrentStatePool.build(
         RecurrentStateSpec(resource_key="state", nodes={NODE}, config=config),
         EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv}),
