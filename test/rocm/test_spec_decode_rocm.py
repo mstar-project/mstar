@@ -214,6 +214,27 @@ def _attention(rows: int, width: int, table: torch.Tensor) -> AiterPagedAttentio
     return manager
 
 
+def test_one_query_a_row_is_its_slot_of_a_verify_row():
+    """A draft pass attends one query a row off the verify's block table: what
+    the slot would read in a row of k + 1 queries, up to the kernel's rounding."""
+    t, rows, heads, kv_heads, dim, page = 3, 2, 16, 4, 256, 128
+    gen = torch.Generator(device=DEV).manual_seed(3)
+    base = torch.tensor([100, 201], dtype=torch.int32, device=DEV)
+    pages = 8
+    layer = torch.randn(pages * rows, 2, page, kv_heads, dim, device=DEV, generator=gen).to(torch.bfloat16)
+    table = torch.arange(pages * rows, dtype=torch.int32, device=DEV).view(rows, pages)
+    manager = _attention(rows, pages, table)
+    multi = _Staged(
+        torch.arange(rows + 1, dtype=torch.int32, device=DEV) * t, base + t, table, t, 1024, rows * t,
+    )
+    q = torch.randn(rows * t, heads, dim, device=DEV, generator=gen).to(torch.bfloat16)
+    full = manager._unified(q, multi, layer)
+    for n in range(t):
+        keep = torch.arange(rows, device=DEV) * t + n
+        one = manager.attend_rows(q[keep], layer, base + n + 1)
+        torch.testing.assert_close(one.float(), full[keep].float(), rtol=2e-2, atol=2e-2)
+
+
 def _spec(k: int, rows: int, width: int):
     """The speculative resource with a verify plan over fake attention and KV
     buffers: a block table of distinct pages per row."""
