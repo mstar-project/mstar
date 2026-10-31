@@ -111,6 +111,7 @@ from mstar.model.multimodal import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.platforms.serving_config import load_serving_config
 
 logger = logging.getLogger(__name__)
 
@@ -1009,9 +1010,7 @@ class BagelModel(Model):
         )
 
     def get_worker_graphs(self, config_path: str):
-        import yaml
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        config = load_serving_config(config_path)
         node_groups = config.get("node_groups", [])
         all_node_names = {
             name for g in node_groups for name in g["node_names"]
