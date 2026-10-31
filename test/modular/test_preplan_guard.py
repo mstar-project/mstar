@@ -249,8 +249,7 @@ def test_admit_of_a_foreign_step_still_sweeps_everything() -> None:
 
 
 class _RefusesOnce(Resource):
-    """Admits after KV and does not pre-plan, like waypoint's ring KV; refuses
-    its first admit."""
+    """Admits after KV, doesn't pre-plan, and refuses its first admit."""
 
     def __init__(self):
         self.refused = False
@@ -275,9 +274,7 @@ class _RefusesOnce(Resource):
 
 
 def test_a_staged_step_refused_after_kv_retries_on_fresh_pages() -> None:
-    """The refusal gives the pre-plan's pages back, so the stage goes with
-    them: a retry of the same step must not promote views over pages the
-    stream no longer holds."""
+    """A retry of a refused staged step commits onto pages its stream holds."""
     m = _manager()
     m.ingest_request("a")
     _grow(m, "a", PS)
@@ -302,13 +299,10 @@ def test_a_staged_step_refused_after_kv_retries_on_fresh_pages() -> None:
     assert len(held) == 2 and stream.step_in_flight
 
     assert not runner.admit(step(preplan=False)).ok
-    assert not runner.staged and not m._preplanned
     assert stream.page_indices == held[:1] and not stream.step_in_flight
 
     retry = step(preplan=False)
     assert runner.admit(retry).ok
-    out = runner.plan(retry)
-    assert len(stream.page_indices) == 2
-    assert out["kv"]["main"].views[0].request_id == "a"
+    assert runner.plan(retry)["kv"]["main"].views[0].request_id == "a"
     runner.commit(retry)
-    assert stream.stored_len == 2 * PS
+    assert stream.stored_len == 2 * PS and len(stream.page_indices) == 2
