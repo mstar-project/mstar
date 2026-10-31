@@ -23,11 +23,9 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine import recompile_limit
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
-from mstar.model.components.diffusion.compile_utils import (
-    compile_transformer_forward,
-    step_schedule_recompile_limit,
-)
+from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
@@ -145,8 +143,15 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
                 if module is not None:
                     compile_transformer_forward(
                         module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
-                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
+                        recompile_limit=self._recompile_limit(step_dtypes),
                     )
+
+    def _recompile_limit(self, step_dtypes) -> int:
+        # every block runs one code object, so dynamo's per-code limit counts its shapes over all three spans of every
+        # captured graph, at most two per graph; a step schedule compiles each dtype on its own
+        per_dtype = max(recompile_limit(), 2 * len(self.capture_buckets) * len(self.capture_batch_sizes))
+        dtypes = 1 if step_dtypes is None else len(step_dtypes.dtypes)
+        return min(per_dtype * dtypes, 256 * dtypes)
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
