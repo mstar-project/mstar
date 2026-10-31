@@ -649,8 +649,8 @@ Compilation
        searched before the package's ``mstar/kernels/tables`` (read by
        :func:`mstar.kernels.table.table_dirs`). ``python -m benchmark.kernels.sweep
        ... --out DIR`` writes one, so a sweep can be served and measured before it
-       is committed. Set it the same way on every node of a deployment, so the ranks
-       of a node pick the same configs.
+       is committed. Set it the same way on every node, so every rank of a lockstep
+       instance picks the same configs.
    * - ``MSTAR_COMPILE_LEVEL``
      - ``1``
      - How much a captured forward's compile tunes; ``mstar serve -O`` sets it

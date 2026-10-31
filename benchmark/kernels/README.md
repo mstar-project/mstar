@@ -78,5 +78,4 @@ gets faster on a GPU without a change to model code.
   count.
 - `moe_decode`: the small-batch fp8 MoE's per-pair kernels (`--dtype float8_e4m3fn --shape
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
-  per-pair tiles by token count, then the grouped `"*"` row. No model on this branch calls it
-  yet; GLM-5.2 (#388) does.
+  per-pair tiles by token count, then the grouped `"*"` row.

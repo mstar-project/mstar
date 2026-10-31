@@ -651,9 +651,8 @@ def _tile_rows(E: int, N: int, K: int, top_k: int, dtype: torch.dtype,
                device: torch.device | None) -> tuple | None:
     """The tuned rows for this shape as ``(bounds, configs)``: the rows' upper bounds (all but
     the last row's) and each row's ``(gate/up items, down items)``; None where no table has the
-    shape. Looked up once per shape and process, and a constant to dynamo, which can't trace the
-    table read or the GPU's name: traced, they would break the graph at every compiled MoE
-    layer."""
+    shape. A constant to dynamo: traced, the table read would break the graph at every compiled
+    MoE layer."""
     key = (E, N, K, top_k, dtype, device)
     if key not in _TILE_ROWS:
         entry = MOE_GEMM.lookup(dtype, {"E": E, "N": N, "K": K, "top_k": top_k}, device)
@@ -681,19 +680,14 @@ def get_config(
     M: int, E: int, N: int, K: int, top_k: int,
     dtype: torch.dtype = torch.bfloat16, device: torch.device | None = None, tuned: bool = True,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """Tile configs for the gate/up GEMM and the down GEMM.
-
-    The row that takes ``M`` tokens in the ``moe_gemm`` table entry for this shape on this GPU,
-    else :func:`get_default_config` for both. ``python -m benchmark.kernels.sweep moe_gemm``
-    tunes a shape.
+    """Tile configs for the gate/up GEMM and the down GEMM: the row that takes ``M`` tokens in
+    the ``moe_gemm`` table entry for this shape on this GPU, else :func:`get_default_config`.
 
     Under ``torch.compile`` the configs must reach the Triton launch as constants (dynamo
-    refuses a symbolic ``num_warps``). The rows are a constant keyed by the expert shapes and
-    ``top_k``, which a model's weights and router fix, and the row search below is traced, so a
-    symbolic ``M`` only adds guards. A graph break between this and the launch would make them
-    data again; a caller that can't rule one out passes ``tuned=False``. So would a symbolic
-    key, which the engine's compiles never produce (a module's ints vary only under
-    ``dynamic=True``, which no MoE node uses).
+    refuses a symbolic ``num_warps``): the rows are a constant per expert shape and ``top_k``
+    (static under the engine's compiles; a symbolic key would make them data again), and the
+    row search below is traced, so a symbolic ``M`` only adds guards. A caller that may break the
+    graph before the launch passes ``tuned=False``.
     """
     rows = _tile_rows(E, N, K, top_k, dtype, device) if tuned else None
     if rows is None:

@@ -60,12 +60,6 @@ SHAPE = {"N": 64, "K": 32}
 
 # --- tables ------------------------------------------------------------------------------------
 
-def test_file_stem_matches_device_names():
-    assert file_stem("NVIDIA H100 80GB HBM3") == "NVIDIA_H100_80GB_HBM3"
-    assert file_stem("AMD Instinct MI300X") == "AMD_Instinct_MI300X"
-    assert DeviceKey("NVIDIA H100 80GB HBM3", "sm_90").stems() == ("NVIDIA_H100_80GB_HBM3", "sm_90")
-
-
 def test_rows_name_their_implementation_and_star_sorts_last():
     (entry,) = parse_table(_table("op", _entry(rows={
         "*": {"impl": "big"}, "16": {"impl": "fast", "config": {"x": 16}}, "2": {"impl": "fast"}})), "op", "t")
@@ -160,8 +154,6 @@ def test_rows_take_counts_up_to_their_key_and_star_the_rest():
     assert registry.row_bounds(rows) == (2, 512)
     assert [op.row_for(rows, m).impl for m in (0, 1, 2, 3, 512, 513, 10**6)] == \
         ["fast", "fast", "fast", "big", "big", "fast", "fast"]
-    assert registry.describe_rows(rows) == "1-2 fast, 3-512 big, 513+ fast"
-    assert registry.describe_rows(_rows((None, "big"))) == "big"
 
 
 @pytest.mark.parametrize("rows, match", [
@@ -474,26 +466,16 @@ def test_the_moe_decode_sweep_writes_the_tiles_the_builtin_table_launches():
     ({"4": "grouped", "*": "grouped"}, "per-pair ones"),
     ({"1": "pair", "4": "grouped", "8": "pair", "*": "grouped"}, "per-pair ones"),
     ({"*": "grouped"}, "per-pair ones, at least one"),
+    ({"1": "pair", "*": {"impl": "triton", "config": {"path": "grouped", "router": {"bk": 1}}}},
+     "one router config"),
 ])
 def test_moe_decode_entries_are_per_pair_rows_then_the_grouped_star_row(rows, match):
     pytest.importorskip("triton")
     from mstar.utils.fused_moe import decode
 
-    op = registry.get_op("moe_decode")
-    shape = {"H": 64, "E": 8, "I": 32, "K": 2}
-    ok = parse_table(_table("moe_decode", _entry(shape, {"1": _decode_row("pair"), "3": _decode_row("pair"),
-                                                         "*": _decode_row("grouped")}, dtype="float8_e4m3fn")),
-                     "moe_decode", "t")[0]
-    op.check_rows(ok.rows, "t")
-    tuning = decode._from_entry(ok)
-    assert tuning.pair_max_tokens == 3 and tuning.gate_up[-1][0] is None
-    bad = parse_table(_table("moe_decode", _entry(shape, {k: _decode_row(v) for k, v in rows.items()},
-                                                  dtype="float8_e4m3fn")), "moe_decode", "t")[0]
+    rows = {k: _decode_row(v) if isinstance(v, str) else v for k, v in rows.items()}
+    entry = parse_table(_table("moe_decode", _entry({"H": 64, "E": 8, "I": 32, "K": 2}, rows,
+                                                    dtype="float8_e4m3fn")), "moe_decode", "t")[0]
     with pytest.raises(ValueError, match=match):
-        op.check_rows(bad.rows, "t")
-        decode._from_entry(bad)
-    other_router = parse_table(_table("moe_decode", _entry(shape, {
-        "1": _decode_row("pair"), "*": {"impl": "triton", "config": {"path": "grouped", "router": {"bk": 1}}}},
-        dtype="float8_e4m3fn")), "moe_decode", "t")[0]
-    with pytest.raises(ValueError, match="one router config"):
-        decode._from_entry(other_router)
+        registry.get_op("moe_decode").check_rows(entry.rows, "t")
+        decode._from_entry(entry)

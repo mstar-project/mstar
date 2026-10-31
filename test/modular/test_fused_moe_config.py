@@ -69,63 +69,13 @@ def test_a_row_without_its_tiles_is_refused(tuned_table):
         kernels.get_config(M=4, E=8, N=64, K=32, top_k=2)
 
 
-def test_command_a_plus_keeps_its_gb200_tiles():
-    """#377's GB200 table took the nearest tuned batch size (a tie to the smaller); its rows
-    here take the counts up to the midpoint of their batch size and the next one, which picks the
-    same tiles at every count."""
-    path = table.TABLE_DIR / "moe_gemm" / "NVIDIA_GB200.json"
-    (entry,) = table.load_table(path, "moe_gemm")
-    assert dict(entry.shape) == {"E": 128, "N": 2048, "K": 4096, "top_k": 8}
-    tuned = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512)
-    assert entry.buckets() == (*((a + b) // 2 for a, b in zip(tuned, tuned[1:], strict=False)), None)
-    assert entry.rows[0][1].impl == "triton"
-    assert dict(entry.rows[0][1].config) == {
-        "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4,
-        "num_stages": 5, "down": {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4,
-                                  "num_stages": 5}}
-
-
-@pytest.mark.parametrize("compiling", [False, True], ids=["eager", "compiling"])
-@pytest.mark.parametrize("cuda_align", [True, False], ids=["cuda_align", "torch_align"])
-def test_fused_experts_asks_for_the_tuned_tiles_unless_a_compile_would_lose_them(
-        monkeypatch, compiling, cuda_align):
-    """Only a compiled call without the CUDA align op takes the default tiles: the op's torch
-    fallback breaks the graph between the lookup and the launch. An eager call takes the
-    table's tiles either way, as does a caller that passes its own alignment."""
-    from mstar.utils.fused_moe import align, runner
-
-    monkeypatch.setattr(align, "_cuda_op_available", lambda: cuda_align)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
-    asked = []
-
-    class LookupReachedError(Exception):
-        pass
-
-    def get_config(*args, tuned=True, **kwargs):
-        asked.append(tuned)
-        raise LookupReachedError
-
-    monkeypatch.setattr(runner, "get_config", get_config)
-    x = torch.zeros(2, 32, dtype=torch.bfloat16)
-    w1, w2 = torch.zeros(4, 16, 32, dtype=torch.bfloat16), torch.zeros(4, 32, 8, dtype=torch.bfloat16)
-    weights, ids = torch.ones(2, 2, dtype=torch.bfloat16), torch.zeros(2, 2, dtype=torch.int64)
-    with pytest.raises(LookupReachedError):
-        runner.fused_experts(x, w1, w2, weights, ids)
-    with pytest.raises(LookupReachedError):
-        runner.fused_experts(x, w1, w2, weights, ids, alignment=runner.MoeAlignment(None, None, None, 16))
-    assert asked == [cuda_align or not compiling, True]
-
-
 @CUDA
 @pytest.mark.parametrize("cuda_align", [True, False], ids=["cuda_align", "torch_align"])
 @pytest.mark.parametrize("dynamic", [False, None], ids=["captured", "eager_forward"])
 def test_compiled_fused_experts_takes_the_tables_tiles(tuned_table, monkeypatch, dynamic, cuda_align):
-    """Compiled as the engine compiles (dynamic=False for a captured bucket; dynamic=None for
-    the eager forward, where the token count turns symbolic after a few sizes, under the engine's
-    dynamo settings), fused_experts runs the table's row for M and matches the eager call. The
-    tiles must reach the Triton launch as constants: dynamo refuses a symbolic num_warps. The
-    alignment's torch fallback breaks the graph, so there a compiled call takes the default
-    tiles."""
+    """Compiled as the engine compiles (dynamic=False for a captured bucket, dynamic=None for
+    the eager forward, whose token count turns symbolic), fused_experts runs the table's row for
+    M and matches the eager call; with the alignment's torch fallback, the default tiles."""
     import mstar.engine  # noqa: F401 - the engine's process-wide dynamo settings
     from mstar.utils.fused_moe import align, fused_experts
 

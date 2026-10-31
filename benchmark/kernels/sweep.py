@@ -5,18 +5,10 @@ reference output, time the ones that pass, and write the winners to the op's tab
     python -m benchmark.kernels.sweep moe_gemm --dtype bfloat16 \\
         --shape E=128,N=1536,K=2048,top_k=8 --note "Qwen3-Omni thinker" --out ~/kernel-tables
 
-A server logs the exact command for each shape it ran without a table ("kernel table: no
-moe_gemm ... To tune it: ..."). Each bucket prints what runs now (``current``: the table's row,
-or the built-in config), the built-in config, and the best candidate, in microseconds per call.
-A candidate whose output sits outside its implementation's tolerance of the reference output is
-never timed, so never written, and neither is a current row that fails the same check. A bucket
-keeps its current row unless the best candidate beats it by ``--min-gain``.
-
-``--out DIR`` writes ``DIR/<op>/<GPU>.json``, which a server reads with
-``MSTAR_KERNEL_TABLES=DIR``: the way to A/B a sweep end to end before committing it.
-``--write`` writes into the package's tables (``mstar/kernels/tables``), to commit.
-``--fresh`` decides from scratch: what runs now is taken to be the built-in config.
-``--list`` prints the ops and the shapes each table file covers.
+``--out DIR`` writes ``DIR/<op>/<GPU>.json`` for a server to read with
+``MSTAR_KERNEL_TABLES=DIR``; ``--write`` writes into the package's tables, to commit; ``--fresh``
+takes the built-in config, not the table, as what runs now; ``--list`` prints the ops and the
+shapes each table covers. README.md has the workflow.
 """
 from __future__ import annotations
 
