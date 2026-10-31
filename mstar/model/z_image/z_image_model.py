@@ -61,6 +61,7 @@ class ZImageModel(Model):
         compile: bool = True,
         compile_eager_rounding: bool = True,
         compile_exact_ops: bool | list[str] = False,
+        tuned_linears: bool = False,
         accelerator_graph: bool = True,
         capture_sizes: list[list[int]] | None = None,
         capture_caption_lengths: list[int] | None = None,
@@ -82,6 +83,8 @@ class ZImageModel(Model):
         self.compile_eager_rounding = bool(compile_eager_rounding)
         # True: every norm / activation class stays eager inside the compiled forward; a list picks classes
         self.compile_exact_ops = compile_exact_ops if isinstance(compile_exact_ops, list) else bool(compile_exact_ops)
+        # the platform's tuned kernels for the served GEMM shapes, where it has a table (see rocm_dit_gemm)
+        self.tuned_linears = bool(tuned_linears)
         self.accelerator_graph = bool(accelerator_graph)
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         # Captions round up to a multiple of 32 tokens; short prompts land in the first two buckets.
@@ -317,7 +320,7 @@ class ZImageModel(Model):
                 attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
-                max_batch_size=self.max_batch_size,
+                tuned_linears=self.tuned_linears, max_batch_size=self.max_batch_size,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("Z-Image has no submodule for node %r; running it dummy", node_name)

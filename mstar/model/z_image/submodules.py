@@ -167,7 +167,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
     def __init__(
         self, transformer: nn.Module, config: ZImageConfig, *, loop_name: str, attn_resource_key: str | None,
         compile_transformer: bool = True, compile_eager_rounding: bool = True,
-        compile_exact_ops: bool | Sequence[str] = False, max_batch_size: int = 8,
+        compile_exact_ops: bool | Sequence[str] = False, tuned_linears: bool = False, max_batch_size: int = 8,
         capture_buckets=(), capture_batch_sizes=(1, 2, 4, 8),
     ):
         super().__init__(
@@ -182,6 +182,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             compile_transformer_forward(
                 transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                tuned_linears=tuned_linears,
             )
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:

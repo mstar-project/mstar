@@ -102,6 +102,11 @@ class Platform:
         """
         return {}
 
+    def dit_inductor_overrides(self) -> dict[str, object]:
+        """``torch._inductor.config`` values to patch in while a flow transformer that opted in to tuned linears
+        compiles. Empty keeps inductor's GEMMs."""
+        return {}
+
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         """Environment variables for settings a runtime or library reads once
         at init. Workers apply them with ``os.environ.setdefault`` before their
@@ -272,6 +277,12 @@ class RocmPlatform(Platform):
         if post is not None:
             overrides["post_grad_custom_post_pass"] = post
         return overrides
+
+    def dit_inductor_overrides(self) -> dict[str, object]:
+        from mstar.platforms.rocm_dit_gemm import dit_linear_pass
+
+        graph_pass = dit_linear_pass()
+        return {} if graph_pass is None else {"post_grad_custom_post_pass": graph_pass}
 
     def process_env_defaults(self) -> dict[str, str]:
         return {

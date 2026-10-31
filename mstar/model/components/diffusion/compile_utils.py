@@ -14,6 +14,7 @@ from collections.abc import Iterable, Sequence
 import torch
 from torch import nn
 
+from mstar.platforms import current_platform
 from mstar.utils import knobs
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ def exclude_from_compile(transformer: nn.Module, types: Sequence[type] = EXACT_O
 
 
 def compile_transformer_forward(
-    transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False,
+    transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False, tuned_linears: bool = False,
 ) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
@@ -72,7 +73,9 @@ def compile_transformer_forward(
     graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%).
 
     The ``dit_exact_ops`` knob (off by default on AMD GPUs) drops ``exact_ops``, so a model
-    config can keep its CUDA setting while each platform decides whether it applies."""
+    config can keep its CUDA setting while each platform decides whether it applies. ``tuned_linears``
+    runs the GEMMs a platform has a tuned kernel for on it (``dit_inductor_overrides``): the same
+    math with another summation order, so it is opt-in per model."""
     if exact_ops and not knobs.dit_exact_ops():
         logger.info("compile_exact_ops %s not applied: the dit_exact_ops knob is off (`knobs: dit_exact_ops: "
                     "true` keeps those modules eager)", exact_ops)
@@ -85,17 +88,21 @@ def compile_transformer_forward(
     transformer.forward = with_inductor_rounding(
         torch.compile(transformer.forward, fullgraph=False, dynamic=False),
         eager_rounding=bool(eager_rounding),
+        overrides=current_platform.dit_inductor_overrides() if tuned_linears else None,
     )
 
 
-def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):
+def with_inductor_rounding(
+    compiled, *, eager_rounding: bool, deterministic: bool = False, overrides: dict[str, object] | None = None,
+):
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
     a global config change. ``deterministic`` also builds them with the engine's
     deterministic compile option (``accelerator_graph_runner.
     deterministic_inductor_options``): no on-device benchmarking that changes
-    numerics, so every process compiles the same kernels.
+    numerics, so every process compiles the same kernels. ``overrides`` are further
+    inductor config values for those traces.
     """
     import torch._inductor.config as inductor_config
 
@@ -104,6 +111,7 @@ def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: boo
         from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
 
         options.update(deterministic_inductor_options())
+    options.update(overrides or {})
 
     def forward(*args, **kwargs):
         with inductor_config.patch(**options):
