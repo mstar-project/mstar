@@ -271,9 +271,8 @@ def _ffmpeg_decoder_loads() -> bool:
         from torchcodec.decoders import AudioDecoder  # noqa: F401
     except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
         return False
-    # Since FFmpeg became optional that import succeeds without it, and
-    # torchcodec records whether its FFmpeg ops loaded; older releases fail the
-    # import instead
+    # newer torchcodec imports without FFmpeg and records whether its FFmpeg ops
+    # loaded; older releases fail the import above
     return getattr(sys.modules.get("torchcodec._core.ops"), "_FFMPEG_AVAILABLE", True)
 
 

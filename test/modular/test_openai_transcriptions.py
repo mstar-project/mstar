@@ -875,8 +875,7 @@ def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
     monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=True))
-    # the FFmpeg check is cached per process: a fresh one, so this machine's own
-    # torchcodec neither answers for the fake nor sees its answer
+    # a fresh FFmpeg check, so this host's torchcodec and the fake don't answer for each other
     from mstar.model.components import audio_features
 
     check = audio_features._ffmpeg_decoder_loads
