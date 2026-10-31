@@ -1910,8 +1910,9 @@ then follow the plain sampler's distribution exactly, at an acceptance of
 ``sum min(p, q)``. Each request reads its own Philox stream from device registers, so
 a replay equals the eager step, but the stream differs from a plain step's: the same
 seed does not give the plain path's tokens. Filters run on each row's top 64 tokens
-(``sampled.CANDIDATES``); a row whose kept set may run past them takes FlashInfer's
-vocabulary-wide renorms instead, so the target stays exact.
+(``sampled.CANDIDATES``, ``spec_decode/candidates.py``), from one read of the logits; a
+row whose kept set runs past them is filtered over its whole vocabulary, so the target
+stays exact.
 
 Tuning resources per deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

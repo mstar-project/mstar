@@ -48,6 +48,7 @@ DECLARING_MODULES = (
     "mstar.engine.resources.attn.prologue",
     "mstar.engine.resources.rms_norm.rms_norm",
     "mstar.engine.resources.sampler.unfiltered",
+    "mstar.engine.resources.spec_decode.candidates",
     "mstar.engine.resources.spec_decode.draft_head",
     "mstar.engine.resources.spec_decode.kernels",
     "mstar.kernels.fp8_gemm",
