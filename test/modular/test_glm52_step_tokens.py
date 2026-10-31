@@ -29,8 +29,9 @@ def test_longctx_config_window_fits_its_pages(name):
     assert model.config.dsa_long_context
     assert model.config.mtp_num_draft_tokens == (3 if "mtp" in name else 0)
     assert model.config.dsa_shard_prefill
-    # every captured prefill bucket runs in one pass, never in row chunks
-    assert max(cfg["model_kwargs"]["prefill_batched_token_buckets"]) <= model.config.prefill_chunk_tokens
+    # every captured prefill bucket runs in one pass, never in row chunks (MTP over DSA captures none)
+    buckets = cfg["model_kwargs"].get("prefill_batched_token_buckets", [])
+    assert max(buckets, default=0) <= model.config.prefill_chunk_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
