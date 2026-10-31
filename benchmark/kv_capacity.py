@@ -7,8 +7,9 @@ server does and grows each one: a prefill of L - 128 tokens in one step, then 12
 decode steps. It stops at the first request admission makes wait, or whose step is refused.
 At one rank a request waits until it can be allotted its pages (`ask` / `reserve`); above
 one rank no pool allots, so only a refused step stops it. Every request stays resident.
-A one-step prefill holds all of a prompt's sliding K/V until it commits, so a server that
-chunks a prompt's prefill can hold more requests of long prompts than this counts.
+A one-step prefill holds all of a prompt's sliding K/V until it commits, so above one rank
+a server that chunks a prompt's prefill can hold more requests of long prompts than this
+counts (at one rank the allotment is the prompt's, however it is chunked).
 "without" is the same pool keeping every layer's tokens, with the same max_num_pages, so
 the same bytes.
 
