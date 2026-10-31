@@ -171,11 +171,10 @@ class CommGroup:
 
         Collective: every member calls it at load, in the same order with the
         same arguments. The lockstep nodes of an instance share its group, so
-        it keeps one workspace per ``(dtype, hidden)``. A larger ``max_tokens``
-        builds another, leaving the old one allocated but unused. Workspaces
-        live outside torch's allocator: at TP2 on H200, with the MNNVL backend
-        that "auto" chose in FlashInfer 0.7.2, each took 512 MiB per rank for
-        hidden 2048, 4096 and 8192 and up to 4096 tokens. Other inputs take the
+        it uses one workspace per ``(dtype, hidden)``. A larger ``max_tokens``
+        builds another and leaves the old one allocated, outside torch's
+        allocator: 512 MiB per rank in each shape measured at TP2 on H200, with
+        the MNNVL backend FlashInfer 0.7.2's "auto" chose. Other inputs take the
         group's ``all_reduce`` and a separate norm.
         """
         if self.world_size == 1:
