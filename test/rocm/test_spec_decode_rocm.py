@@ -166,6 +166,41 @@ def test_verify_rows_resume_from_the_accepted_slot(k):
         starts = next_starts
 
 
+def test_the_verify_kernel_replays_in_a_graph():
+    """FlyDSL's chain kernel from a captured graph: a real row as in eager, a
+    padding row (slot -1) skipped, its pool slots and output left alone."""
+    k, rows, t = 2, 2, 3
+    pool, manager = build(k, rows)
+    rids = list(range(rows))
+    w = (torch.zeros(GEO.num_v_heads, device=DEV), torch.zeros(GEO.num_v_heads, device=DEV))
+    step(pool, manager, rids, 5)
+    run(manager, pool, inputs(rows * 5, seed=1), w)
+    accepted = torch.ones(rows, dtype=torch.int32, device=DEV)
+    step(pool, manager, rids, t, num_accepted=accepted)
+    state = pool.block("state", 0)
+    x = inputs(rows * t, seed=2)
+    # the second row is a padding row from here on
+    wrapper = manager._current["main"]
+    wrapper._plan_state.slot_map[1] = -1
+    groups = [pool._slots[r]["main"].group for r in rids]
+    before = state.clone()
+    eager = run(manager, pool, x, w).clone()
+    after = state[groups[0]].clone()
+    torch.cuda.synchronize()
+
+    state.copy_(before)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run(manager, pool, x, w)
+    state.copy_(before)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, eager, rtol=0, atol=0)
+    torch.testing.assert_close(state[groups[0]], after, rtol=0, atol=0)
+    assert torch.equal(state[groups[1]], before[groups[1]])
+    assert torch.isfinite(out[t:].float()).all()
+
+
 def _spec(k: int, rows: int, width: int):
     """The speculative resource with a verify plan over fake attention and KV
     buffers: a block table of distinct pages per row."""
@@ -188,7 +223,7 @@ def _spec(k: int, rows: int, width: int):
     )
     regs = slice(1, rows + 1)
     spec._seq_len[regs] = torch.tensor([30 + 17 * r for r in range(rows)], dtype=torch.int32, device=DEV)
-    spec._tokens[regs] = torch.arange(rows * t, device=DEV).view(rows, t) % 5
+    spec._tokens[:, regs] = torch.arange(rows * t, device=DEV).view(t, rows) % 5
     spec._num_acc[regs] = 1
     spec._budget[regs] = 1 << 20
     spec._stop_on[regs] = 1
@@ -202,10 +237,11 @@ def _verify_step(spec, logits_rows, vocab, k, sample=False):
     # a target that predicts each token's successor
     logits = logits_rows.scatter(1, ((ids + 1) % vocab)[:, None], 1.0)
     out = spec.accept(logits, sample=sample)
-    drafted = out.target.reshape(-1)
+    drafted = out.target.reshape(-1)[spec.draft_slots()]
+    rows = drafted.shape[0]
     for j in range(k):
-        spec.begin_draft_pass(j)
-        drafted = spec.record_draft(j, ((drafted + 1) % vocab)[spec.draft_slots()])
+        spec.draft_address(j)
+        drafted = spec.record_draft(j, logits_rows[:rows].scatter(1, ((drafted + 1) % vocab)[:, None], 1.0))
     return out
 
 
@@ -253,7 +289,7 @@ def test_a_captured_step_follows_the_registers():
     for base in ([100, 7], [129, 263]):
         spec._seq_len[1:rows + 1] = torch.tensor(base, dtype=torch.int32, device=DEV)
         spec._num_acc[1:rows + 1] = 1
-        spec._tokens[1:rows + 1] = torch.tensor([[5, 6, 7, 8], [1, 2, 9, 9]], device=DEV)
+        spec._tokens[:, 1:rows + 1] = torch.tensor([[5, 6, 7, 8], [1, 2, 9, 9]], device=DEV).T
         graph.replay()
         torch.cuda.synchronize()
         # The toy target predicts each token's successor: row 0's drafts are
@@ -263,14 +299,16 @@ def test_a_captured_step_follows_the_registers():
         assert out.tokens.tolist() == [[6, 7, -1, -1], [2, 3, -1, -1]]
         assert out.done.tolist() == [True, False]
         assert spec._seq_len[1:rows + 1].tolist() == [base[0] + 4, base[1] + 2]
-        # the last draft pass addressed slot n at P + n + (k - 1) through the table
-        for r in range(rows):
-            n = int(out.accepted[r]) - 1
-            pos = base[r] + n + (k - 1)
-            page = int(plan.block_table[r, pos // PAGE])
-            assert int(plan.write_pages[r * t + n]) == page
-            assert int(plan.write_offsets[r * t + n]) == pos % PAGE
-            assert int(plan.kv_lens[r]) == base[r] + t + (k - 1)
+        # draft pass j addressed slot n at P + n + j through the table
+        for j in range(k):
+            where = spec.draft_address(j)
+            for r in range(rows):
+                n = int(out.accepted[r]) - 1
+                pos = base[r] + n + j
+                assert int(where.kv_lens[r]) == pos + 1
+                if j:
+                    assert int(where.positions[r]) == pos
+                    assert int(where.slots[r]) == int(plan.block_table[r, pos // PAGE]) * PAGE + pos % PAGE
 
 
 def test_a_captured_sampled_step_draws_fresh_tokens_each_replay():
@@ -299,7 +337,7 @@ def test_a_captured_sampled_step_draws_fresh_tokens_each_replay():
     for _ in range(20):
         spec._seq_len[regs] = 50
         spec._num_acc[regs] = 1
-        spec._tokens[regs] = torch.tensor([[5, 6, 7], [1, 2, 3]], device=DEV)
+        spec._tokens[:, regs] = torch.tensor([[5, 6, 7], [1, 2, 3]], device=DEV).T
         graph.replay()
         torch.cuda.synchronize()
         drawn.add(int(out.target[0, 0]))

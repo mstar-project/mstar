@@ -5,13 +5,14 @@ P + k``: ``x_0`` is the last token the request emitted, the ``d_i`` the drafts,
 ``P`` the request's committed length. The target runs them as one causal
 extend, and greedy acceptance keeps the longest run of drafts that equal the
 target's own next token (``n`` of them), so the step emits ``n + 1`` tokens and
-the stream grows by as many. The draft then runs ``k`` passes over the same
-``(rows, k + 1)`` shape: pass 0 at the verify positions, fed the target's hidden
-state at ``P + i`` and the target's token after it; pass ``j > 0`` at ``P + j +
-i``, where only slot ``n`` is a real query (the draft's own output from the
-pass before, at the position after it). Slot ``n`` of pass ``j`` is draft ``j +
-1`` of the next step. Every pass has the shape of the verify, so one capture
-bucket, one attention plan and one KV write plan serve all of them.
+the stream grows by as many. The draft then runs ``k`` passes: pass 0 over the
+verify's ``(rows, k + 1)`` tokens, fed the target's hidden state at ``P + i`` and
+the target's token after it, which writes the draft's K/V for every position
+the step may have kept; pass ``j > 0`` one token a row at ``P + n + j``, the
+draft's own output from the pass before. Only slot ``n`` of pass 0 is a real
+query, so every pass attends one query a row, over the verify's block table,
+and its work after attention runs on ``rows`` rows. A pass's token is draft ``j
++ 1`` of the next step, written straight into that step's registers.
 
 ``P``, ``n`` and the next step's tokens live here, one register row per
 request, and the host never reads them before the next step runs: the async
@@ -39,22 +40,25 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
 import numpy as np
 import torch
 
+from mstar.engine.resources.attn.prologue import QKV_NORM_ROPE_CACHE
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
-from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.sampler import utils as sampling
+from mstar.engine.resources.sampler.unfiltered import SAMPLE_UNFILTERED
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.spec_decode.config import (
     AcceptedTokens,
+    DraftAddress,
     SpecDecodeSpec,
     SpecDecodeStep,
     SpecPhase,
 )
+from mstar.engine.resources.spec_decode.kernels import SPEC_ACCEPT, SPEC_VERIFY_INPUTS
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitOutcome,
@@ -147,10 +151,11 @@ class SpecDecodeResource(Resource):
         rows = max_requests + 1
         i32 = dict(dtype=torch.int32, device=device)
         # Per request: committed length, last accepted count, the next verify's
-        # tokens, decode tokens emitted, the budget, and whether stop ids apply.
+        # tokens (by slot, so a draft pass's token master is a plain column),
+        # decode tokens emitted, the budget, and whether stop ids apply.
         self._seq_len = torch.zeros(rows, **i32)
         self._num_acc = torch.ones(rows, **i32)
-        self._tokens = torch.zeros(rows, self.tokens_per_row, dtype=torch.long, device=device)
+        self._tokens = torch.zeros(self.tokens_per_row, rows, dtype=torch.long, device=device)
         self._emitted = torch.zeros(rows, **i32)
         self._budget = torch.zeros(rows, **i32)
         self._stop_on = torch.zeros(rows, **i32)
@@ -165,7 +170,13 @@ class SpecDecodeResource(Resource):
         self._stop_ids = torch.tensor(
             sorted(set(stop_token_ids)) or [-2], dtype=torch.long, device=device,
         )
-        self._slot_offsets = torch.arange(self.tokens_per_row, **i32)
+        # What an argmax through the unfiltered draw reads: temperature 0, and
+        # offsets it stores back unchanged. Never read for a token.
+        tokens = rows * self.tokens_per_row
+        self._zero_temperature = torch.zeros(tokens, dtype=torch.float32, device=device)
+        self._zero_seed = torch.zeros(tokens, dtype=torch.long, device=device)
+        self._zero_offset = torch.zeros(tokens, dtype=torch.long, device=device)
+        self._zero_master = torch.zeros(rows, dtype=torch.long, device=device)
 
         self._lock = threading.Lock()
         # rid -> register row; reversed so `pop` hands out ascending rows
@@ -185,19 +196,27 @@ class SpecDecodeResource(Resource):
         self._current: SpecDecodePlan | None = None
         self._preplanned = False
         self._staged: SpecDecodePlan | None = None
-        # set by `verify_inputs` / `accept` within one forward
+        # set by `verify_inputs` / `accept_tokens` within one forward
         self._ids: torch.Tensor | None = None
-        self._base: torch.Tensor | None = None
-        self._accepted: torch.Tensor | None = None
-        # draft passes 1 .. k-1: their KV write slots and attention lengths,
-        # computed together once the step knows what it accepted
-        self._draft_pages: torch.Tensor | None = None
-        self._draft_offsets: torch.Tensor | None = None
+        self._positions: torch.Tensor | None = None
+        self._slots: torch.Tensor | None = None
+        self._keep: torch.Tensor | None = None
+        # [k, rows]: each draft pass's KV slot, position and keys, computed
+        # together once the step knows what it accepted
+        self._draft_slots: torch.Tensor | None = None
+        self._draft_positions: torch.Tensor | None = None
         self._draft_lens: torch.Tensor | None = None
+        # bound by the engine; a draft pass writes and attends through them
+        self._kv = None
+        self._attn = None
 
     def depends_on(self) -> set[str]:
         # their plans are what this one rewrites on the device
         return {self._kv_key, self._attn_key}
+
+    def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        self._kv = resources.get(self._kv_key)
+        self._attn = resources.get(self._attn_key)
 
     # Request lifecycle
 
@@ -392,8 +411,8 @@ class SpecDecodeResource(Resource):
         self._eager_images.clear()
 
     # In-graph operations, called by the forward in this order: `seed` on a
-    # prompt's step; `verify_inputs`, `accept`, then `begin_draft_pass`,
-    # `draft_slots` and `record_draft` once per draft pass on a decode step.
+    # prompt's step; `verify_inputs`, `accept`, then `attend_draft` and
+    # `record_draft` once per draft pass on a decode step.
 
     def _plan_now(self, phase: SpecPhase) -> SpecDecodePlan:
         plan = self._current
@@ -404,24 +423,23 @@ class SpecDecodeResource(Resource):
             )
         return plan
 
-    def _rows(self, plan: SpecDecodePlan) -> tuple[torch.Tensor, torch.Tensor]:
-        image = plan.image
-        return image.rows[: plan.num_rows].long(), image.real[: plan.num_rows].bool()
+    def _rows(self, plan: SpecDecodePlan) -> torch.Tensor:
+        return plan.image.rows[: plan.num_rows].long()
 
     @torch.compiler.disable
     def seed(self, first_token: torch.Tensor, first_draft: torch.Tensor) -> None:
         """Start each prompt row's decode: its first token (sampled off the
         prompt), the draft head's guess after it, and its committed length."""
         plan = self._plan_now(SpecPhase.SEED)
-        rows, _ = self._rows(plan)
+        rows = self._rows(plan)
         b = plan.num_rows
         image = plan.image
         tokens = torch.cat(
-            (first_token.view(b, 1).long(),
-             first_draft.view(b, 1).long().expand(b, self.num_draft_tokens)),
-            dim=1,
+            (first_token.view(1, b).long(),
+             first_draft.view(1, b).long().expand(self.num_draft_tokens, b)),
+            dim=0,
         )
-        self._tokens.index_copy_(0, rows, tokens)
+        self._tokens.index_copy_(1, rows, tokens)
         self._seq_len.index_copy_(0, rows, image.base[:b])
         self._num_acc.index_fill_(0, rows, 1)
         self._emitted.index_fill_(0, rows, 0)
@@ -441,14 +459,18 @@ class SpecDecodeResource(Resource):
         points this step's KV writes, attention lengths and recurrent start
         slots at the request's real length."""
         plan = self._plan_now(SpecPhase.VERIFY)
-        rows, real = self._rows(plan)
-        base = torch.where(real, self._seq_len[rows], 0)
-        plan.num_accepted.copy_(torch.where(real, self._num_acc[rows], 1))
-        self._base = base
-        positions = base[:, None] + self._slot_offsets[None, :]
-        self._address(plan, positions, None, base + self.tokens_per_row)
-        self._ids = self._tokens[rows].reshape(-1)
-        return self._ids, positions.reshape(-1)
+        image = plan.image
+        b, n = plan.num_rows, plan.num_rows * self.tokens_per_row
+        long = dict(dtype=torch.long, device=self._device)
+        self._ids = torch.empty(n, **long)
+        self._positions = torch.empty(n, **long)
+        self._slots = torch.empty(n, **long)
+        SPEC_VERIFY_INPUTS(
+            image.rows[:b], image.real[:b], self._seq_len, self._num_acc, self._tokens,
+            plan.block_table, self._page_size, self._ids, self._positions, self._slots,
+            plan.write_pages, plan.write_offsets, plan.kv_lens, plan.num_accepted,
+        )
+        return self._ids, self._positions
 
     @torch.compiler.disable
     def accept(self, logits: torch.Tensor, sample: bool = False) -> AcceptedTokens:
@@ -467,10 +489,17 @@ class SpecDecodeResource(Resource):
         the draws a non-speculative step would make with that seed.
         """
         if not sample:
-            return self.accept_tokens(logits.argmax(dim=-1))
+            return self.accept_tokens(self._argmax(logits))
         if not self.sampling:
             raise RuntimeError("this speculative node was declared without sampling")
         return self.accept_tokens(self._sample(logits))
+
+    def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """Each row's argmax, through the unfiltered draw's two kernels."""
+        n = logits.shape[0]
+        out = torch.empty(n, dtype=torch.long, device=logits.device)
+        SAMPLE_UNFILTERED(logits, self._zero_temperature[:n], self._zero_seed[:n], self._zero_offset[:n], out, 0)
+        return out
 
     def _sample(self, logits: torch.Tensor) -> torch.Tensor:
         """One draw per row of ``logits``: top-k, then top-p over what is
@@ -480,7 +509,7 @@ class SpecDecodeResource(Resource):
         positions are independent; the offset advances once a step, so steps
         are too, and a request's draws repeat for its seed."""
         plan = self._plan_now(SpecPhase.VERIFY)
-        rows, _ = self._rows(plan)
+        rows = self._rows(plan)
         t, vocab = self.tokens_per_row, logits.shape[-1]
         temperature = self._temperature[rows].repeat_interleave(t)
         top_p = self._top_p[rows].repeat_interleave(t)
@@ -499,103 +528,68 @@ class SpecDecodeResource(Resource):
         """Verification against the target's own token at each verify position
         (``[rows * (k + 1)]``): its argmax, or what a sampler drew there."""
         plan = self._plan_now(SpecPhase.VERIFY)
-        rows, _ = self._rows(plan)
-        b, t = plan.num_rows, self.tokens_per_row
-        y = target.view(b, t).long()
-        x = self._ids.view(b, t)
-        accepted = (x[:, 1:] == y[:, :-1]).int().cumprod(dim=1).sum(dim=1) + 1
-        self._accepted = accepted
-        self._seq_len.index_copy_(0, rows, (self._base + accepted).int())
-        self._num_acc.index_copy_(0, rows, accepted.int())
-        last = y.gather(1, (accepted - 1)[:, None].long())
-        self._tokens[:, :1].index_copy_(0, rows, last)
-
-        slots = self._slot_offsets[None, :]
-        emit = slots < accepted[:, None]
-        stops = torch.isin(y, self._stop_ids) & emit & (self._stop_on[rows] > 0)[:, None]
-        hit = stops.any(dim=1)
-        first_stop = torch.where(hit, stops.int().argmax(dim=1), t)
-        emit &= slots <= first_stop[:, None]
-        emitted = self._emitted[rows]
-        emit &= slots < (self._budget[rows] - emitted)[:, None]
-        emitted = emitted + emit.sum(dim=1, dtype=torch.int32)
-        self._emitted.index_copy_(0, rows, emitted)
-        self._address_draft_passes(plan, accepted)
-        return AcceptedTokens(
-            tokens=torch.where(emit, y, -1),
-            accepted=accepted.int(),
-            done=hit | (emitted >= self._budget[rows]),
-            target=y,
+        image = plan.image
+        b, t, k = plan.num_rows, self.tokens_per_row, self.num_draft_tokens
+        device = self._device
+        long = dict(dtype=torch.long, device=device)
+        tokens = torch.empty(b, t, **long)
+        accepted = torch.empty(b, dtype=torch.int32, device=device)
+        done = torch.empty(b, dtype=torch.bool, device=device)
+        self._keep = torch.empty(b, **long)
+        self._draft_slots = torch.empty(k, b, **long)
+        self._draft_positions = torch.empty(k, b, **long)
+        self._draft_lens = torch.empty(k, b, dtype=torch.int32, device=device)
+        SPEC_ACCEPT(
+            image.rows[:b], self._ids, target, self._positions, plan.block_table, self._page_size,
+            self._stop_ids, self._seq_len, self._num_acc, self._tokens, self._emitted, self._budget,
+            self._stop_on, tokens, accepted, done, self._keep,
+            self._draft_slots, self._draft_positions, self._draft_lens,
         )
+        return AcceptedTokens(tokens=tokens, accepted=accepted, done=done, target=target.view(b, t))
 
-    def _address_draft_passes(self, plan: SpecDecodePlan, accepted: torch.Tensor) -> None:
-        """KV write slots and attention lengths of draft passes 1 .. k - 1.
-
-        Pass ``j`` sits at the verify positions plus ``j``; only slot ``n``
-        (the last accepted) is a real query, so the others write the sink page.
-        """
-        passes = self.num_draft_tokens - 1
-        if passes < 1:
-            return
-        b, t = plan.num_rows, self.tokens_per_row
-        shift = torch.arange(1, passes + 1, dtype=torch.int32, device=self._device)
-        positions = self._base[None, :, None] + shift[:, None, None] + self._slot_offsets[None, None, :]
-        page = torch.div(positions, self._page_size, rounding_mode="floor")
-        table = plan.block_table[None].expand(passes, *plan.block_table.shape)
-        pages = table.gather(2, page.long()).long()
-        mask = self._slot_offsets[None, None, :] == (accepted - 1)[None, :, None]
-        self._draft_pages = torch.where(mask, pages, SINK_PAGE).view(passes, b * t)
-        self._draft_offsets = torch.where(
-            mask, (positions - page * self._page_size).long(), 0,
-        ).view(passes, b * t)
-        self._draft_lens = (self._base[None, :] + t + shift[:, None]).int()
-
-    @torch.compiler.disable
-    def begin_draft_pass(self, j: int) -> None:
-        """Point the KV writes and attention lengths at draft pass ``j > 0``.
-        Pass 0 runs at the verify step's own positions, already in place; pass
-        ``j`` at those plus ``j``, writing only slot ``n``."""
-        if j < 1:
-            return
-        plan = self._plan_now(SpecPhase.VERIFY)
-        plan.write_pages.copy_(self._draft_pages[j - 1])
-        plan.write_offsets.copy_(self._draft_offsets[j - 1])
-        plan.kv_lens.copy_(self._draft_lens[j - 1])
+    def draft_address(self, j: int) -> DraftAddress:
+        """Where draft pass ``j`` writes and reads: pass 0 writes every verify
+        position, the others one position a row."""
+        if j == 0:
+            return DraftAddress(self._slots, self._positions, self._draft_lens[0])
+        return DraftAddress(self._draft_slots[j], self._draft_positions[j], self._draft_lens[j])
 
     @torch.compiler.disable
     def draft_slots(self) -> torch.Tensor:
-        """Each row's slot ``n``, the one real query of a draft pass, as flat
-        indices into ``[rows * (k + 1)]``: what a draft head reads its output
-        from, so its work after attention can run on these rows alone."""
-        plan = self._plan_now(SpecPhase.VERIFY)
-        t = self.tokens_per_row
-        base = torch.arange(plan.num_rows, device=self._device) * t
-        return base + (self._accepted - 1).long()
+        """Each row's slot ``n``, the one real query of draft pass 0, as flat
+        indices into ``[rows * (k + 1)]``."""
+        return self._keep
 
     @torch.compiler.disable
-    def record_draft(self, j: int, draft: torch.Tensor) -> torch.Tensor:
-        """Keep pass ``j``'s token of each row (``[rows]``, read at
-        `draft_slots`) as draft ``j + 1``; returns it in every slot,
-        ``[rows * (k + 1)]``, as pass ``j + 1``'s input."""
-        plan = self._plan_now(SpecPhase.VERIFY)
-        rows, _ = self._rows(plan)
-        b, t = plan.num_rows, self.tokens_per_row
-        chosen = draft.view(b, 1).long()
-        self._tokens[:, j + 1: j + 2].index_copy_(0, rows, chosen)
-        return chosen.expand(b, t).reshape(-1)
+    def attend_draft(
+        self, j: int, qkv: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
+        cos: torch.Tensor, sin: torch.Tensor, heads: int, kv_heads: int, head_dim: int,
+        eps: float, gated: bool, layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft pass ``j``'s attention over its packed ``[q | k | v]`` tokens:
+        split, q/k norm, rotation (``cos``/``sin`` are tables over positions) and
+        the KV write as one kernel, then one query a row. Returns the attention
+        output and the gate, ``[rows, heads, head_dim]`` each."""
+        where = self.draft_address(j)
+        layer = self._kv.layer_view(layer_idx)
+        q, gate, _, _ = QKV_NORM_ROPE_CACHE(
+            qkv, q_weight, k_weight, cos, sin, where.positions, layer[:, 0], layer[:, 1], where.slots,
+            heads, kv_heads, head_dim, eps, gated,
+        )
+        if j == 0:
+            q, gate = q.index_select(0, self._keep), gate.index_select(0, self._keep)
+        return self._attn.attend_rows(q, layer, where.kv_lens), gate
 
-    def _address(
-        self, plan: SpecDecodePlan, positions: torch.Tensor,
-        mask: torch.Tensor | None, kv_lens: torch.Tensor,
-    ) -> None:
-        """Point this pass's KV writes at ``positions`` (masked slots at the
-        sink page) and its attention at ``kv_lens`` keys per row."""
-        page = torch.div(positions, self._page_size, rounding_mode="floor")
-        pages = plan.block_table.gather(1, page.long()).long()
-        offsets = (positions - page * self._page_size).long()
-        if mask is not None:
-            pages = torch.where(mask, pages, SINK_PAGE)
-            offsets = torch.where(mask, offsets, 0)
-        plan.write_pages.copy_(pages.reshape(-1))
-        plan.write_offsets.copy_(offsets.reshape(-1))
-        plan.kv_lens.copy_(kv_lens)
+    @torch.compiler.disable
+    def record_draft(self, j: int, logits: torch.Tensor) -> torch.Tensor:
+        """Pass ``j``'s token of each row, the argmax of ``logits`` (``[rows,
+        vocab]``): draft ``j + 1`` of the next step, written to its register by
+        the same kernel, and the next pass's input."""
+        plan = self._plan_now(SpecPhase.VERIFY)
+        b = plan.num_rows
+        drafted = torch.empty(b, dtype=torch.long, device=logits.device)
+        SAMPLE_UNFILTERED(
+            logits, self._zero_temperature[:b], self._zero_seed[:b], self._zero_offset[:b], drafted, 0,
+            plan.image.rows[:b], self._zero_master, self._tokens[j + 1],
+        )
+        return drafted
