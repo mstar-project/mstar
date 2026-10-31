@@ -405,17 +405,43 @@ class _Spans(_Toy):
         return NodeInputs(tensor_inputs={}, input_seq_len=10 + fwd_info.rid_handle)
 
 
-def test_a_step_put_in_row_order_keeps_each_row_s_length():
+def test_a_step_in_another_order_than_its_slots_keeps_each_row_s_length():
     engine = _engine("cpu", sub=_Spans())
     for rid in range(4):
         engine.add_request(rid)
     _step(engine, ROWS_WALK, [0, 1, 2, 3])
-    # the rows keep their slots, so this step runs in the order above
+    # the rows keep their slots in the order above, and the step its own order
     batch = _batch(ROWS_WALK, [3, 2, 1, 0])
     engine.prepare_inputs(batch)
     engine.exec_and_postprocess(batch)
-    assert batch.request_ids == [0, 1, 2, 3]
     assert {rid: batch.seq_len_of(rid) for rid in range(4)} == {rid: 10 + rid for rid in range(4)}
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_a_discarded_pre_plan_leaves_every_row_as_the_steps_that_ran_made_it(monkeypatch, seed):
+    # pre-plans over a request set the step then doesn't run (rows joining,
+    # leaving, reordered), discarded as the engine discards them, between
+    # steps that do run; every row must hold what only the run steps did
+    monkeypatch.setattr(_Counter, "supports_preplan", True, raising=False)
+    rng = random.Random(seed)
+    engine = _engine("cpu")
+    space = engine._rows[NODE].space(ROWS_WALK)
+    live = list(range(1, 7))
+    for rid in live:
+        engine.add_request(rid)
+    ran = dict.fromkeys(live, 0)
+    for _ in range(30):
+        rids = rng.sample(live, rng.randint(1, len(live)))
+        if rng.random() < 0.7:
+            other = rng.sample(live, rng.randint(1, len(live)))
+            discarded = _pre_planned_step(engine, other)
+            engine.reset_pre_plan_for_batch(discarded)
+        _, seen = _step(engine, ROWS_WALK, rids)
+        for rid in rids:
+            # a step reads the state of the steps before it
+            assert seen[rid] == (ran[rid], float(ran[rid]))
+            ran[rid] += 1
+        space.check_mirrors()
 
 
 @pytest.mark.parametrize("device", DEVICES)
