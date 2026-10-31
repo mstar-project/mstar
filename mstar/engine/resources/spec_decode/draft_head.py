@@ -52,10 +52,12 @@ def _aiter_impl():
         xq = torch.empty(x.shape, dtype=weight.dtype, device=device)
         dynamic_per_token_quant_fp8_i8(xq, x, torch.empty(rows, dtype=torch.float32, device=device))
         if rows > SKINNY_MAX_ROWS:
-            return torch._scaled_mm(
-                xq, weight.T, scale_a=_unit_scales((rows, 1), device),
-                scale_b=_unit_scales((1, vocab), device), out_dtype=x.dtype,
-            )
+            # autocast would cast the fp8 operands back to the step's dtype
+            with torch.autocast(device.type, enabled=False):
+                return torch._scaled_mm(
+                    xq, weight.T, scale_a=_unit_scales((rows, 1), device),
+                    scale_b=_unit_scales((1, vocab), device), out_dtype=x.dtype,
+                )
         out = torch.empty((rows, vocab), dtype=x.dtype, device=device)
         one = _unit_scales((1,), device)
         wvSplitKQ(weight, xq, out, one, one, _cu_count(device.index or 0))
