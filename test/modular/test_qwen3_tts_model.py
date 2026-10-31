@@ -1316,7 +1316,8 @@ def test_qwen3_tts_code_predictor_projects_wider_talker_inputs():
         cp = wide.talker.code_predictor
         out = predictor.forward_depth_unrolled(
             inputs_embeds=torch.randn(2, 1, 32),
-            position_ids=torch.zeros(2, 1, dtype=torch.long),
+            position_ids=torch.zeros(2, dtype=torch.long),
+            batch_rows=torch.arange(2),
             kv_cache=torch.zeros(
                 cp.num_hidden_layers, 2, 2, wide.talker.num_code_groups,
                 cp.num_key_value_heads, cp.head_dim,
@@ -1366,7 +1367,8 @@ def test_qwen3_tts_code_predictor_uses_decode_attn_nhd(monkeypatch):
     )
     output = predictor.forward_depth_unrolled(
         inputs_embeds=torch.randn(1, 1, config.talker.hidden_size),
-        position_ids=torch.zeros(1, 1, dtype=torch.long),
+        position_ids=torch.zeros(1, dtype=torch.long),
+        batch_rows=torch.arange(1),
         kv_cache=torch.empty(
             config.talker.code_predictor.num_hidden_layers,
             1,

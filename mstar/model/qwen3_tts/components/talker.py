@@ -24,6 +24,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
+from mstar.model.components.qwen3_lm import Qwen3Attention
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
@@ -31,7 +32,12 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
-from mstar.utils.attention import apply_rope_pos_ids, decode_attn_nhd
+from mstar.utils.attention import (
+    apply_rope_pos_ids,
+    decode_attn_nhd,
+    qk_norm_rope_kv_write,
+    qk_norm_rope_kv_write_applies,
+)
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -61,7 +67,7 @@ class Qwen3TTSTalkerLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = ParallelAttention(
+        self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -271,24 +277,27 @@ class Qwen3TTSCodePredictor(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        batch_rows: torch.Tensor,
         kv_cache: torch.Tensor,
         cache_pos: int,
     ) -> torch.Tensor:
-        """Run all CodePredictor layers for one depth token.
+        """Run all CodePredictor layers for the next depth tokens.
 
         ``kv_cache`` layout is ``[layers, batch, K/V, groups, kv_heads,
         head_dim]``. Unlike Talker cache, it is frame-local scratch space:
         every generated frame starts at ``cache_pos=0`` and overwrites it.
 
-        ``inputs_embeds`` is ``[batch, 1, talker_hidden]``; the returned
-        hidden state is ``[batch, 1, predictor_hidden]``.
+        ``inputs_embeds`` is ``[batch, tokens, talker_hidden]``, whose tokens
+        take the cache positions from ``cache_pos``; it may be overwritten.
+        ``position_ids`` and ``batch_rows`` give each token's position and row,
+        ``[batch * tokens]`` in that order and contiguous, since the fused
+        kernel indexes them. The returned hidden state is ``[batch, tokens,
+        predictor_hidden]``, each token having attended its row's prefix.
         """
         hidden_states = self.small_to_mtp_projection(inputs_embeds)
-        batch_size, seq_len, _ = hidden_states.shape
-        if seq_len != 1:
-            raise ValueError("CodePredictor decode expects exactly one token")
+        batch_size, seq_len, hidden_size = hidden_states.shape
         end = cache_pos + seq_len
-        flat_position_ids = position_ids.reshape(-1).to(torch.int32)
+        hidden_states = hidden_states.reshape(-1, hidden_size)
 
         # Each residual add is deferred into the next norm: one fused add+norm
         # kernel per norm. These run on every layer of every pass.
@@ -300,43 +309,51 @@ class Qwen3TTSCodePredictor(nn.Module):
             else:
                 h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
             attn = layer.self_attn
-            qkv = attn.qkv_proj(h)
-            q_size = attn.num_heads * attn.head_dim
-            kv_size = attn.num_kv_heads * attn.head_dim
-            q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
-            q = q.view(batch_size, seq_len, attn.num_heads, attn.head_dim)
-            k = k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
-            v = v.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
-            q, k = attn._apply_qk_norm(q, k)
-            # A stride-aware Triton kernel fuses both half rotations. The
-            # previous tensor expression launched multiple elementwise and
-            # concatenation kernels in every one of the 5 layers × 16 groups.
-            q, k = apply_rope_pos_ids(
-                q.reshape(batch_size * seq_len, attn.num_heads, attn.head_dim),
-                k.reshape(
-                    batch_size * seq_len,
-                    attn.num_kv_heads,
-                    attn.head_dim,
-                ),
-                flat_position_ids,
-                float(attn.rope_theta),
+            q, k, v = attn._project_qkv(h)
+            attn_output = self._norm_rope_attend(
+                attn, q, k, v, position_ids, batch_rows, kv_cache[layer_idx], cache_pos, end,
             )
-            q = q.view(batch_size, seq_len, attn.num_heads, attn.head_dim)
-            k = k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
-
-            # Append this depth position, then attend over the prefix already
-            # generated within the same codec frame.
-            kv_cache[layer_idx, :, 0, cache_pos:end].copy_(k)
-            kv_cache[layer_idx, :, 1, cache_pos:end].copy_(v)
-            attn_output = decode_attn_nhd(
-                q,
-                kv_cache[layer_idx, :, 0],
-                kv_cache[layer_idx, :, 1],
-                end,
-            )
-            attn_output = attn_output.reshape(batch_size, seq_len, -1)
+            attn_output = attn_output.reshape(batch_size * seq_len, -1)
             h, residual = layer.post_attention_layernorm.forward_residual(attn.o_proj(attn_output), residual)
             hidden_states = layer.mlp(h)
 
         normed, _ = self.model.norm.forward_residual(hidden_states, residual)
-        return normed
+        return normed.view(batch_size, seq_len, hidden_size)
+
+    @torch.compiler.disable
+    def _norm_rope_attend(
+        self,
+        attn: ParallelAttention,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position_ids: torch.Tensor,
+        batch_rows: torch.Tensor,
+        kv_layer: torch.Tensor,
+        cache_pos: int,
+        end: int,
+    ) -> torch.Tensor:
+        """q/k norm, RoPE and this pass's write to the layer's ``[batch, K/V,
+        groups, kv_heads, head_dim]`` cache, then attention over the prefix
+        written so far. One kernel covers all but the attention where it
+        applies: a depth position is also the token's cache slot."""
+        seq_len = end - cache_pos
+        batch_size = q.shape[0] // seq_len
+        if qk_norm_rope_kv_write_applies(q, kv_layer):
+            qk_norm_rope_kv_write(
+                q, k, v, attn.q_norm.weight, attn.k_norm.weight, position_ids,
+                kv_layer, batch_rows, position_ids, q.shape[0],
+                float(attn.q_norm.variance_epsilon), float(attn.k_norm.variance_epsilon),
+                float(attn.rope_theta),
+            )
+        else:
+            q, k = attn._apply_qk_norm(q, k)
+            q, k = apply_rope_pos_ids(q, k, position_ids.to(torch.int32), float(attn.rope_theta))
+            kv_layer[:, 0, cache_pos:end].copy_(k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim))
+            kv_layer[:, 1, cache_pos:end].copy_(v.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim))
+        return decode_attn_nhd(
+            q.view(batch_size, seq_len, attn.num_heads, attn.head_dim),
+            kv_layer[:, 0],
+            kv_layer[:, 1],
+            end,
+        )

@@ -468,7 +468,7 @@ class Qwen3TTSModel(Model):
             ),
             PositionSpec(
                 resource_key=TALKER_POS, nodes={"Talker"},
-                config=PositionConfig(kv_cache=TALKER_KV),
+                config=PositionConfig(kv_cache=TALKER_KV, rope_theta=talker.rope_theta),
             ),
             SamplerSpec(
                 resource_key=TALKER_SAMPLER, nodes={"Talker"},
