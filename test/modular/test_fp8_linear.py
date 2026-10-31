@@ -345,6 +345,25 @@ def test_the_models_take_linear_dtype():
 # --- on a GPU with fp8 GEMMs -----------------------------------------------------------------------------------------
 
 
+def test_klein_takes_linear_dtype_steps_and_runs_the_dit_in_lockstep_under_it():
+    from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+
+    def dit_is_async(**kwargs) -> bool:
+        model = Flux2KleinModel(skip_weight_loading=True, **kwargs)
+        model.set_config(Flux2KleinConfig())
+        nodes = model.get_graph_walk_graphs()["image_gen"].get_nodes()
+        assert nodes["vae_decoder"].enable_async_scheduling
+        return nodes["dit"].enable_async_scheduling
+
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+
+    assert dit_is_async()
+    assert dit_is_async(linear_dtype="fp8")
+    assert not dit_is_async(linear_dtype="fp8", linear_dtype_steps=["bf16", "fp8", "fp8", "fp8"])
+    with pytest.raises(ValueError, match="needs linear_dtype: fp8"):
+        Flux2KleinModel(skip_weight_loading=True, linear_dtype_steps=["bf16", "fp8"])
+
+
 def _gpu_fp8_dtype():
     if not torch.cuda.is_available():
         return None
@@ -404,3 +423,55 @@ def test_a_compiled_fp8_flux_dit_tracks_the_bf16_one():
     rope = (torch.ones(288, 64, device="cuda"), torch.zeros(288, 64, device="cuda"))
     with torch.no_grad():
         assert _rel(fp8(img, txt, t, rope), dit(img, txt, t, rope)) < 0.08
+
+
+@gpu
+def test_a_compiled_stepped_flux_dit_serves_each_dtype_compiled_and_captured():
+    import copy
+
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+    from mstar.model.flux2_klein.components.transformer import Flux2DiT
+    from mstar.model.flux2_klein.config import Flux2TransformerConfig
+
+    config = Flux2TransformerConfig(
+        in_channels=64, out_channels=64, num_layers=1, num_single_layers=2, attention_head_dim=64,
+        num_attention_heads=4, joint_attention_dim=256, timestep_guidance_channels=256, axes_dims_rope=(16, 16, 16, 16),
+    )
+    torch.manual_seed(0)
+    plain = Flux2DiT(config).to("cuda", torch.bfloat16)
+    for p in plain.parameters():
+        nn.init.normal_(p, std=0.05)
+    fp8 = copy.deepcopy(plain)
+    stepped = copy.deepcopy(plain)
+    policy = StepDtypes(["bf16", "fp8"])
+    quantize_linears(fp8, Flux2DiT.FP8_LINEARS, _gpu_fp8_dtype())
+    assert len(quantize_linears(stepped, Flux2DiT.FP8_LINEARS, _gpu_fp8_dtype(), policy=policy)) == 8
+    for dit in (plain, fp8, stepped):
+        compile_transformer_forward(dit)
+    img = torch.randn(1, 256, 64, device="cuda", dtype=torch.bfloat16)
+    txt = torch.randn(1, 32, 256, device="cuda", dtype=torch.bfloat16)
+    t = torch.tensor([0.7], device="cuda", dtype=torch.bfloat16)
+    rope = (torch.ones(288, 64, device="cuda"), torch.zeros(288, 64, device="cuda"))
+
+    def step(active: str) -> torch.Tensor:
+        policy.active = active
+        return stepped(img, txt, t, rope)
+
+    with torch.no_grad():
+        want = {"bf16": plain(img, txt, t, rope), "fp8": fp8(img, txt, t, rope)}
+        assert _rel(want["fp8"], want["bf16"]) > 1e-4
+        for active in ("bf16", "fp8", "bf16", "fp8"):
+            assert torch.equal(step(active), want[active])
+        graphs = {}
+        for active in want:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graphs[active] = (graph, step(active))
+        for active, other in (("bf16", "fp8"), ("fp8", "bf16")):
+            # a replay runs the dtype it captured, whatever the policy says now
+            policy.active = other
+            graph, out = graphs[active]
+            out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, want[active])
