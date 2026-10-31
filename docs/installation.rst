@@ -302,8 +302,8 @@ mstar reads only the speech-tokenizer source files and runs them under transform
 lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and
 others) as unmet for ``qwen-tts``; that is expected.
 
-flash-attn (Qwen3-Omni, LingBot-World)
---------------------------------------
+flash-attn (LingBot-World)
+--------------------------
 
 ``flash-attn`` is only needed for **LingBot-World** with ``reference_numerics: true``, and it is **not** pulled in by
 ``.[lingbot_world]`` or ``.[all]`` — you install it as a separate step. The reason: flash-attn
