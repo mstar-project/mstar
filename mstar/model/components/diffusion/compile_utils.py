@@ -26,6 +26,9 @@ EXACT_OP_CLASSES: dict[str, tuple[type, ...]] = {
     "activations": (nn.SiLU,),
 }
 EXACT_OP_TYPES = tuple(t for types in EXACT_OP_CLASSES.values() for t in types)
+# A forward under a per-step dtype policy compiles per shape and per dtype, and a partial step
+# specializes a block's shared code per set of kept linears: klein-4B needs more than 84 entries.
+STEP_POLICY_RECOMPILE_LIMIT = 256
 ExactOps = bool | Sequence[str]
 
 
@@ -59,6 +62,7 @@ def exclude_from_compile(transformer: nn.Module, types: Sequence[type] = EXACT_O
 
 def compile_transformer_forward(
     transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False,
+    recompile_limit: int | None = None,
 ) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
@@ -72,7 +76,10 @@ def compile_transformer_forward(
     graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%).
 
     The ``dit_exact_ops`` knob (off by default on AMD GPUs) drops ``exact_ops``, so a model
-    config can keep its CUDA setting while each platform decides whether it applies."""
+    config can keep its CUDA setting while each platform decides whether it applies.
+
+    ``recompile_limit`` replaces the process-wide limit for this forward only. Past the limit a
+    frame silently runs uncompiled, inside the captured graphs too."""
     if exact_ops and not knobs.dit_exact_ops():
         logger.info("compile_exact_ops %s not applied: the dit_exact_ops knob is off (`knobs: dit_exact_ops: "
                     "true` keeps those modules eager)", exact_ops)
@@ -83,7 +90,7 @@ def compile_transformer_forward(
         logger.info("compiled transformer keeps %d modules (%s) on the eager kernels", excluded,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
     transformer.forward = with_inductor_rounding(
-        torch.compile(transformer.forward, fullgraph=False, dynamic=False),
+        torch.compile(transformer.forward, fullgraph=False, dynamic=False, recompile_limit=recompile_limit),
         eager_rounding=bool(eager_rounding),
     )
 
