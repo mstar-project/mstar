@@ -922,6 +922,16 @@ class Qwen3_5DenseModel(Model):
         self._submodule_cache[node_name] = submodule
         return submodule
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        kv = (config.get("resources") or {}).get(KV_CACHE) or {}
+        limit = self.config.max_position_embeddings
+        if self.num_draft_tokens and kv.get("max_seq_len", 0) > limit:
+            # a draft pass rotates from a table of the checkpoint's positions
+            raise ValueError(
+                f"{config_path}: resources.{KV_CACHE}.max_seq_len={kv['max_seq_len']} is past the "
+                f"{limit} positions speculative decoding can address"
+            )
+
     def _create_submodule(
         self, node_name: str, device: str,
         autocast_dtype: torch.dtype | None = None,
