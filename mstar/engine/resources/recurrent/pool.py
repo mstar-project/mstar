@@ -193,6 +193,8 @@ class RecurrentStatePool(Resource):
         # `KVManager._admit_reserved_pages`, and handle-keyed the same way, so a
         # released request's entries are purged with it.
         self._admit_taken: dict[tuple[str, str], tuple[int, bool]] = {}
+        # the part of it the pre-plan pass took: all `clear_preplan` gives back
+        self._preplan_taken: set[tuple[str, str]] = set()
         # Admission, as `KVManager` decides it: only at one rank, since a
         # reservation held on rank 0 alone would make the ranks refuse different
         # allocations. `_reserved` holds, per admitted request, the slots kept
@@ -406,6 +408,7 @@ class RecurrentStatePool(Resource):
         taken = self._admit_taken
         for key in [k for k in taken if is_mine(k[0])]:
             del taken[key]
+            self._preplan_taken.discard(key)
 
     # Admission: a slot for each declared label, for a request that holds none
 
@@ -444,7 +447,11 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
-        if self._admit_taken or self._admit_restores or self._admit_snaps:
+        # A pre-planned step was reserved on its pre-plan pass, and a refusal
+        # after this no-op must still find that reservation.
+        if (self._admit_taken or self._admit_restores or self._admit_snaps) and not (
+            self._preplanned and not ctx.is_preplan
+        ):
             with self._lock:
                 self._forget_taken(ctx.is_real_row)
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
@@ -471,6 +478,9 @@ class RecurrentStatePool(Resource):
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._refused(rid, to_label)
+        if ctx.is_preplan:
+            with self._lock:
+                self._preplan_taken = {k for k in self._admit_taken if ctx.is_real_row(k[0])}
         return ADMIT_OK
 
     def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
@@ -483,19 +493,26 @@ class RecurrentStatePool(Resource):
             return
         with self._lock:
             self._undo_prefix_admit(lambda key: ctx.is_real_row(key[0]))
-            taken = self._admit_taken
-            for rid, label in [k for k in taken if ctx.is_real_row(k[0])]:
-                index, reserved = taken.pop((rid, label))
-                labels = self._slots.get(rid)
-                slot = labels.get(label) if labels else None
-                if slot is None or slot.index != index:
-                    continue  # reset or removed under us; the slot went with it
-                del labels[label]
-                self._zero_slot(index)
-                self._free.append(index)
-                if reserved:
-                    self._reserved[rid] = self._reserved.get(rid, 0) + 1
-                    self._kept += 1
+            self._release([k for k in self._admit_taken if ctx.is_real_row(k[0])])
+
+    def _release(self, keys: list[tuple[str, str]]) -> None:
+        """Free the slots ``keys`` took, zeroed like every free slot, and give back the
+        reservation a slot took. Newest first, so the free list is back in its old order
+        and every rank of a TP group hands out the same slots next. Caller holds the
+        lock."""
+        for rid, label in reversed(keys):
+            index, reserved = self._admit_taken.pop((rid, label))
+            self._preplan_taken.discard((rid, label))
+            labels = self._slots.get(rid)
+            slot = labels.get(label) if labels else None
+            if slot is None or slot.index != index:
+                continue  # reset or removed under us; the slot went with it
+            del labels[label]
+            self._zero_slot(index)
+            self._free.append(index)
+            if reserved:
+                self._reserved[rid] = self._reserved.get(rid, 0) + 1
+                self._kept += 1
 
     def _refused(self, rid: str, label: str) -> AdmitOutcome:
         """Why `_alloc` gave ``rid`` no slot for ``label``."""
@@ -564,6 +581,7 @@ class RecurrentStatePool(Resource):
             self._current = self._cached_plan_output
             self._maybe_apply_forks(step, ctx)
             self._drop_stage()
+            self._preplan_taken = set()  # the live step's now: commit or roll back
             return self._current
 
         # Forks run ahead of the addressing, which records `has_state`; staging
@@ -586,8 +604,15 @@ class RecurrentStatePool(Resource):
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan; staging touched no live state, so nothing to rewind."""
+        """Drop the staged plan and give back the slots its pre-plan pass took.
+
+        Staging builds addressing only (forks apply at promotion); a live step's
+        reservation is the runner's to commit or roll back.
+        """
         self._drop_stage()
+        with self._lock:
+            # in the order the pre-plan pass took them, so `_release` goes newest first
+            self._release([k for k in self._admit_taken if k in self._preplan_taken])
 
     def _drop_stage(self) -> None:
         self._preplanned = False
