@@ -18,3 +18,20 @@ node_groups:
   
   - node_names: [Code2Wav]
     ranks: [0]
+# On AMD GPUs Code2Wav gets its own worker on the Talker's GPU (rank_devices),
+# the layout of qwen3omni_2gpu_split.yaml, so Talker steps no longer take turns
+# with Code2Wav steps on one worker loop. MI325X, text c=32: 168 audio-s/s
+# against 135 on one worker, the same at c=1. qwen3omni_2gpu_stock.yaml keeps
+# one worker on every platform.
+platform_overrides:
+  rocm:
+    node_groups:
+      - node_names: [audio_encoder, vision_encoder]
+        ranks: [1]
+      - node_names: [Thinker]
+        ranks: [1]
+      - node_names: [Talker]
+        ranks: [0]
+      - node_names: [Code2Wav]
+        ranks: [2]
+    rank_devices: {2: 0}

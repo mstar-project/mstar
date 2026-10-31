@@ -24,8 +24,6 @@ import shutil
 import signal
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
-import yaml
-
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.integrations.dynamo.bridges import (
     RealtimeBridge,
@@ -64,9 +62,9 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # an exported one must not reach the conductor and workers either.
     keep_api_key_from_children(None)
     from mstar.model.registry import get_model_class, model_init_kwargs
+    from mstar.platforms.serving_config import load_serving_config
 
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    config = load_serving_config(args.config)
     model_name = config.get("model", "dummy")
     yaml_model_kwargs = config.get("model_kwargs", {}) or {}
 
