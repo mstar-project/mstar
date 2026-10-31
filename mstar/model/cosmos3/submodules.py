@@ -349,10 +349,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
+    def __init__(
+        self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None,
+        guidance_parallel=None,
+    ):
         super().__init__()
         self.transformer = transformer
         self.config = config
+        # One guidance branch per rank (see ``_packs_guidance_branches``); None runs both here.
+        self.guidance_parallel = guidance_parallel
         # Re-encodes the frames a chained window (or a resumed session)
         # continues from; built only for deployments serving windowed video.
         self._window_head = (
@@ -1538,7 +1543,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 (COND_LABEL, UNCOND_LABEL) if infos[0].cfg else (COND_LABEL,)
             )
             return self._gen_step(
-                request_ids, spans, labels, combined=True, attn_key=attn_key,
+                request_ids, spans, labels, combined=self._packs_guidance_branches(graph_walk), attn_key=attn_key,
             )
 
         if not infos[0].cfg_active:
@@ -1552,8 +1557,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # plans each branch on its own label and runs two forwards.
         return self._gen_step(
             request_ids, spans, (COND_LABEL, UNCOND_LABEL),
-            combined=self.batched_cfg, attn_key=attn_key,
+            combined=self.batched_cfg and self._packs_guidance_branches(graph_walk), attn_key=attn_key,
         )
+
+    def _packs_guidance_branches(self, graph_walk: str) -> bool:
+        """Whether a guided step's branches share one plan and one forward. Under
+        ``GuidanceParallel`` the video and image walks don't, though every rank still
+        declares both labels: the pool's pages are replicated state, and a branch's page
+        count follows its own prompt's length, so a rank that reserved only its own label
+        could admit a step the other rank refuses. Each rank then runs its own label's
+        plan. The sound and action walks run both branches on every rank, as one GPU does."""
+        return self.guidance_parallel is None or graph_walk not in GEN_WALKS
 
     @staticmethod
     def _segments(
@@ -1811,6 +1825,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         if not cfg_active:
             velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL).to(latents.dtype)
+        elif self.guidance_parallel is not None:
+            placed = self.guidance_parallel
+            mine, label = ("cond", COND_LABEL) if placed.runs_cond else ("uncond", UNCOND_LABEL)
+            cond_v, uncond_v = placed.exchange(self._denoise(attn, st[mine], latents, vision_timesteps, label))
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
         elif self.batched_cfg:
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents,
@@ -2133,7 +2152,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             })
             meta.append((rid, st, lat, ti, t, step_index))
 
-        results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
+        placed = self.guidance_parallel
+        if placed is None:
+            results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
+        else:
+            # one exchange per row: rows of one batch may differ in shape
+            label = COND_LABEL if placed.runs_cond else UNCOND_LABEL
+            results = [
+                placed.exchange(velocity)
+                for velocity in self.transformer.denoise_step_batched(reqs, label, attn, cond_branch=placed.runs_cond)
+            ]
 
         out = {}
         for (rid, st, lat, ti, t, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
@@ -2334,6 +2362,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         tiers = [(h, w, 1, IMAGE_GEN_WALK, None) for h, w in resolutions] + [
             (h, w, f, VIDEO_GEN_WALK, [VIDEO_GEN_WALK, VIDEO_GEN_AR_WALK]) for h, w, f in video_tiers
         ]
+        if self.guidance_parallel is not None:
+            # a denoise graph runs both guidance branches, so under the placement
+            # every denoise step takes the eager path
+            tiers = []
         for height, width, frames, walk, replay_walks in tiers:
             latent_shape = self._latent_shape(height, width, num_frames=frames)
             latent_area = latent_shape[3] * latent_shape[4]
