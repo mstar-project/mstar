@@ -234,15 +234,6 @@ def _headerless_flac(path: Path, seconds: float, channels: int = 1, rate: int = 
     return str(path), torch.from_numpy(samples).float() / 32768
 
 
-@pytest.mark.parametrize("channels", [1, 2])
-def test_load_audio_decodes_a_clip_without_a_sample_count(tmp_path, channels):
-    path, samples = _headerless_flac(tmp_path / "piped.flac", 5, channels)
-    audio = tiny_model().load_audio(path, "cpu").data
-    # libsndfile cannot decode the last frame of such a FLAC (4096 samples from its own encoder)
-    assert 5 * 44_100 - 4096 <= audio.numel() <= 5 * 44_100
-    torch.testing.assert_close(audio, samples[: audio.numel()].mean(dim=1), atol=1e-6, rtol=0)
-
-
 @pytest.mark.parametrize("seconds, shown", [(45, r"30\.\d\d"), (0.3, r"0\.\d\d")])
 def test_load_audio_refuses_a_clip_without_a_sample_count_at_its_decoded_length(tmp_path, seconds, shown):
     path, _ = _headerless_flac(tmp_path / "piped.flac", seconds)

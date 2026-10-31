@@ -88,6 +88,9 @@ class OmniVoiceModel(Model):
         self.model_path_hf = os.environ.get("MSTAR_OMNIVOICE_MODEL_PATH") or model_path_hf
         self.cache_dir = cache_dir
         self.config = OmniVoiceConfig()
+        # Uploads decode at the Higgs-Audio-v2 codec's rate, not 16 kHz: a 16 kHz
+        # reference would not error, it would clone a voice pitched and paced wrong.
+        self.AUDIO_INPUT_RATE = self.config.sample_rate
         self.skip_weight_loading = skip_weight_loading
 
         # Loaded lazily on the data worker so construction never hits the
@@ -198,25 +201,6 @@ class OmniVoiceModel(Model):
     # ------------------------------------------------------------------
     # Model ABC: I/O
     # ------------------------------------------------------------------
-
-    def load_audio(self, filepath: str, device: str):
-        """Decode the cloning reference at the **codec's** rate, not the default.
-
-        ``Model.load_audio`` decodes at 16 kHz, which is right for the ASR
-        models in the tree and wrong here: the Higgs-Audio-v2 codec encodes at
-        24 kHz, and feeding it 16 kHz samples would not error — it would encode
-        a reference pitched and paced wrong, and clone that. Like the base
-        loader, libsndfile first: torchcodec needs an FFmpeg built with audio
-        decoders, which some deployment images lack (#639).
-        """
-        from mstar.model.base import TensorAndMetadata
-        from mstar.model.components.audio_features import load_audio_file
-
-        rate = self.config.sample_rate
-        audio = load_audio_file(filepath, rate)
-        return TensorAndMetadata(
-            data=audio, metadata=dict(sample_rate=rate, num_channels=1)
-        )
 
     def _ensure_data_worker_assets(self):
         """Load the tokenizer and duration estimator on first use.

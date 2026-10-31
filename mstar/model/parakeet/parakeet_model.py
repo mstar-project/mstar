@@ -31,8 +31,8 @@ from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
-from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
     NUM_FRAMES,
@@ -222,10 +222,6 @@ class ParakeetModel(Model):
         else:
             check_detected_language(kwargs.get("language"))
         return ProcessPromptOutput({"audio": [samples]}, metadata)
-
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality == "text":

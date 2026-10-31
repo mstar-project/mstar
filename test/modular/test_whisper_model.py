@@ -21,7 +21,6 @@ from mstar.engine.resources import KVSpec  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.components.audio_features import (  # noqa: E402
     LogMelSpectrogram,
-    load_audio_file,
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
@@ -199,21 +198,6 @@ def test_log_mel_frame_count_and_trim():
     assert mel.pad_or_trim(torch.ones(16_000)).shape[-1] == 480_000
     batched = mel(torch.stack([mel.pad_or_trim(torch.randn(16_000)), mel.pad_or_trim(torch.randn(32_000))]))
     assert batched.shape == (2, 128, 3000)
-
-
-def test_load_audio_file_decodes_and_resamples(tmp_path):
-    sf = pytest.importorskip("soundfile")
-    import numpy as np
-
-    t = np.arange(8000) / 8000.0
-    stereo = np.stack([np.sin(2 * np.pi * 440 * t), np.sin(2 * np.pi * 440 * t)], axis=1).astype(np.float32)
-    sf.write(tmp_path / "a.flac", stereo, 8000)
-    wave = load_audio_file(str(tmp_path / "a.flac"), 16_000)
-    assert wave.dtype == torch.float32 and wave.dim() == 1
-    assert abs(wave.numel() - 16_000) <= 16  # 1 s, resampled 8 -> 16 kHz, mono
-    model = _make_model()
-    loaded = model.load_audio(str(tmp_path / "a.flac"), "cpu")
-    assert loaded.metadata["sample_rate"] == 16_000 and loaded.data.shape == wave.shape
 
 
 def test_sinusoid_positions_match_hf():

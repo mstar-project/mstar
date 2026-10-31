@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple, Type
 import torch
 import yaml
 
+from mstar.api_server import media_io
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     DEFAULT_PARTITION,
@@ -450,6 +451,12 @@ class Model(ABC):
     # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
+    # The rate the default ``load_audio`` decodes an upload to, and the longest
+    # clip it decodes (default 30 min). The request's audio budget
+    # (``media_limits``) holds on top of that.
+    AUDIO_INPUT_RATE: int = 16_000
+    MAX_AUDIO_SECONDS: float = media_io.MAX_AUDIO_SECONDS
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,
@@ -762,11 +769,13 @@ class Model(ABC):
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
-        # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        # video-only one); torchcodec for the other containers. When FFmpeg
+        # loads, an upload neither decodes is the client's error (400).
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
+        rate = self.AUDIO_INPUT_RATE
+        audio = load_speech_file(filepath, rate, self.MAX_AUDIO_SECONDS)
+        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=rate, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder

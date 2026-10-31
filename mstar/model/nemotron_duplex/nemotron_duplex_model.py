@@ -857,9 +857,9 @@ class NemotronDuplexModel(Model):
         return wav
 
     def load_audio(self, filepath: str, device: str):
-        """Decode an uploaded audio file to 16 kHz mono via soundfile (the base uses
-        torchcodec, whose native libs aren't always available). Returns the same
-        ``TensorAndMetadata`` shape the data worker expects."""
+        """Decode an uploaded audio file to 16 kHz mono via soundfile, refused past
+        ``max_upload_channels`` channels or the longest session (with the session
+        error), with the file's own rate as ``source_sample_rate`` in the metadata."""
         import soundfile as sf
 
         from mstar.api_server.media_io import AudioTooLongError, check_resample_rate, read_soundfile_capped

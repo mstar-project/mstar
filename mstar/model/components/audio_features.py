@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -384,21 +385,6 @@ def _ffmpeg_decoder_loads() -> bool:
     return True
 
 
-def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:
-    """Decode an audio file to a float32 mono waveform at ``sample_rate``.
-
-    libsndfile (``soundfile``) first — it needs no FFmpeg and covers WAV,
-    FLAC, OGG and MP3 — then torchcodec for anything else (M4A, WebM, ...).
-    Resampling goes through torchaudio. Audio longer than ``max_seconds``
-    (default ``media_io.MAX_AUDIO_SECONDS``) is refused while it decodes.
-    """
-    from mstar.api_server.media_io import MAX_AUDIO_SECONDS
-
-    if max_seconds is None:
-        max_seconds = MAX_AUDIO_SECONDS
-    return _resample(*_decode(path, sample_rate, max_seconds), sample_rate)
-
-
 def _decode(path: str, sample_rate: int, max_seconds: float) -> tuple[torch.Tensor, int]:
     """The waveform and its rate: libsndfile at the file's own rate, else
     FFmpeg, which decodes straight to ``sample_rate``."""
@@ -423,11 +409,14 @@ def _resample(waveform: torch.Tensor, rate: int, sample_rate: int) -> torch.Tens
 
 
 def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.Tensor:
-    """:func:`load_audio_file` for request uploads, refused past the model's
-    ``max_seconds`` as it decodes, so a small file whose header understates
-    its length cannot expand past it. An undecodable file is the client's
-    error, so it surfaces as ``ValueError`` (HTTP 400). A missing decoder or
-    memory, and anything after the decode, is the server's, and stays as it is."""
+    """Decode a request's audio upload to a float32 mono waveform at
+    ``sample_rate``: libsndfile (``soundfile``) first, which needs no FFmpeg
+    and covers WAV, FLAC, OGG and MP3, then torchcodec for anything else, and
+    torchaudio to resample. Refused past ``max_seconds`` as it decodes, so a
+    small file whose header understates its length cannot expand past it. An
+    undecodable file is the client's error, so it surfaces as ``ValueError``
+    (HTTP 400). A missing decoder or memory, and anything after the decode, is
+    the server's, and stays as it is."""
     try:
         # decoded at its own rate, so a resampling failure isn't blamed on the file
         waveform, rate = _decode(path, sample_rate, max_seconds)
@@ -439,6 +428,38 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
         # FFmpeg's message (paths, internals) stays out of the response
         raise ValueError("could not decode the audio upload") from exc
     return _resample(waveform, rate, sample_rate)
+
+
+def load_reference_clip(
+    path: str, sample_rate: int, max_seconds: float, check_seconds: Callable[[float], None],
+) -> torch.Tensor:
+    """A voice-cloning reference clip as a float32 mono waveform at ``sample_rate``.
+
+    ``check_seconds`` (the model's length rule, which raises; the model reuses
+    it in ``process_prompt`` on the decoded clip) runs on the
+    length the header declares before anything decodes: a small compressed
+    file can hold hours of audio. The header can understate it, so the decode
+    stops past ``max_seconds`` too; a header with no length is checked on what
+    decodes.
+    """
+    import soundfile
+
+    from mstar.api_server.media_io import read_soundfile_capped
+    from mstar.model.media_limits import read_sound_file, sound_file_seconds
+
+    info = soundfile.info(path)
+    check_resample_rate(info.samplerate, sample_rate)
+    seconds = sound_file_seconds(info.frames, info.samplerate)
+    if seconds is not None:
+        check_seconds(seconds)
+        waveform, rate = read_soundfile_capped(path, max_seconds)
+        audio = torch.from_numpy(waveform)
+    else:
+        # no sample count in the header (a FLAC written to a pipe)
+        waveform, rate = read_sound_file(path, max_seconds)
+        check_seconds(len(waveform) / rate)
+        audio = torch.from_numpy(waveform).mean(dim=1)
+    return _resample(audio, rate, sample_rate)
 
 
 SAMPLE_RATE = 16_000

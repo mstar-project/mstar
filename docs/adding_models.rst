@@ -225,7 +225,10 @@ The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
-``load_video``, and the partition methods described at the end of this page.
+``load_video``, and the partition methods described at the end of this page. The default
+``load_audio`` decodes an upload to mono at the class attribute ``AUDIO_INPUT_RATE``
+(16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30 minutes); set those rather
+than overriding it.
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that

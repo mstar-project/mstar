@@ -63,8 +63,8 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
-from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput, check_kv_pools_fit, kv_pages
@@ -168,6 +168,7 @@ class WhisperModel(Model):
 
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
+        self.AUDIO_INPUT_RATE = self.config.sampling_rate
 
         from transformers import AutoTokenizer
 
@@ -550,16 +551,6 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: media loading + prompt processing
     # -------------------------------------------------------------------
-
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
-
-        del device  # decoded on the CPU; the mel front end runs there too
-        # the route windows long uploads; past one window process_prompt drops the rest
-        waveform = load_speech_file(filepath, self.config.sampling_rate, MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(
-            data=waveform, metadata=dict(sample_rate=self.config.sampling_rate, num_channels=1),
-        )
 
     def prompt_tokens(self, prompt: str | None) -> list[int]:
         """The ``<|startofprev|>`` context: prior transcript text, tokenized

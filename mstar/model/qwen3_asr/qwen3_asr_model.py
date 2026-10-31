@@ -51,8 +51,8 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
-from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
@@ -117,6 +117,8 @@ class Qwen3ASRModel(Model):
         self.model_path_hf = model_path_hf
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = Qwen3ASRModelConfig.from_pretrained(self.local_dir)
+        self.AUDIO_INPUT_RATE = self.config.sampling_rate
+        self.MAX_AUDIO_SECONDS = self.config.max_audio_seconds
 
         from transformers import AutoTokenizer
 
@@ -326,13 +328,6 @@ class Qwen3ASRModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: media loading + prompt processing
     # -------------------------------------------------------------------
-
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        del device
-        waveform = load_speech_file(filepath, self.config.sampling_rate, self.config.max_audio_seconds)
-        return TensorAndMetadata(
-            data=waveform, metadata=dict(sample_rate=self.config.sampling_rate, num_channels=1),
-        )
 
     def prompt_text(
         self, num_audio_tokens: int, context: str = "", language: str | None = None,

@@ -40,7 +40,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.canary_qwen.config import (
     ATTN,
     DECODE_LOOP,
@@ -51,7 +51,7 @@ from mstar.model.canary_qwen.config import (
     SAMPLER,
     CanaryQwenModelConfig,
 )
-from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
+from mstar.model.components.audio_features import HOP_LENGTH, clip_samples
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -315,10 +315,6 @@ class CanaryQwenModel(Model):
 
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
-
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality == "text":
