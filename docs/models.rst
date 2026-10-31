@@ -551,7 +551,7 @@ Qwen3-Omni notes
   one (147), and at 32 requests 325 and 349 ms (494 and 560). The ramp needs about 17
   frames/s per request, while ``(4, 8, 16)`` needs 27: at 32 requests on two GPUs the
   slowest 5% of requests get 21-27, so 4-14% of them paused against 1-6% with this
-  ramp, and on one worker on one GPU they get 15-16, so 22-62% paused.
+  ramp, and on one worker on one GPU they get 15-16, so 24-68% paused.
 - A request prefills in one Thinker step. Its walk runs the encoders its
   attachments need (``prefill_audio``, ``prefill_vision`` or
   ``prefill_audio_vision``; ``prefill_text`` for a text-only prompt), then the
