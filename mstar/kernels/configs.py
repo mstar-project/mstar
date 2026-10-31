@@ -14,6 +14,16 @@ The optional ``shapes`` table holds entries for single shapes (keyed by
 ``shape_key``), for the shapes a class's one setting serves badly; a shape
 entry wins over its class's.
 
+A kernel-choice table (``registry.KernelChoice``) has the same layout and says
+which of several kernels serves a shape. Its entries name the one that does and
+keep what was measured for all of them, the losers' parameters included, so a
+shape moves by editing one word::
+
+    "shapes": {"k4096-n24576-rows16": {
+        "impl": "hipblaslt_tuned",
+        "candidates": {"hipblaslt_tuned": {"us": 52.0, "solution": 205483},
+                       "triton": {"us": 56.2, "block_n": 32}, "hipblaslt": {"us": 57.5}}}}
+
 The kernel harness (``benchmark/kernels``) writes these from its results
 store; a config is promoted only after a model-level A/B.
 """

@@ -25,7 +25,7 @@ import dataclasses
 import importlib
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -51,6 +51,7 @@ DECLARING_MODULES = (
 )
 
 _OPS: dict[str, KernelOp] = {}
+_CHOICES: dict[str, KernelChoice] = {}
 _PLATFORM_KEYS = ("cuda", "rocm", "xpu", "default")
 
 
@@ -296,6 +297,58 @@ class KernelOp:
         return f"KernelOp({self.qualname!r})"
 
 
+class Choice(NamedTuple):
+    """What serves a shape: the implementation and its parameters."""
+    impl: str
+    params: Mapping[str, Any]
+
+
+class KernelChoice:
+    """Which of several kernels serves each shape of one kind of call.
+
+    The device's table ``configs/<arch>/[<product>/]<name>.json`` (see
+    ``mstar.kernels.configs``) is the one place that says; the harness writes
+    it from measurements (``ResultsStore.promote_best``). ``policy`` supplies
+    the shape classes, for shapes the table has no entry for. A device without
+    a table has no choice to read, and the caller keeps its default.
+    """
+
+    def __init__(self, name: str, policy: ShapePolicy):
+        if name in _CHOICES:
+            raise ValueError(f"kernel choice {name} is declared twice")
+        self.name = name
+        self.policy = policy
+        _CHOICES[name] = self
+
+    def table(self, device=None) -> Mapping[str, Any] | None:
+        facts = current_platform.device_facts(device)
+        return configs.load_config(self.name, facts.arch, facts.product)
+
+    def _entry(self, shape: Mapping[str, int], device=None) -> Mapping[str, Any] | None:
+        return configs.select(self.table(device), self.policy.shape_class(shape), shape)
+
+    def choose(self, shape: Mapping[str, int], device=None) -> Choice | None:
+        """What serves ``shape`` here, or None without a table."""
+        entry = self._entry(shape, device)
+        return None if entry is None else Choice(entry["impl"], self.params(shape, entry["impl"], device))
+
+    def params(self, shape: Mapping[str, int], impl: str, device=None) -> Mapping[str, Any]:
+        """What the table holds for ``impl`` on ``shape``, whether or not it won."""
+        entry = self._entry(shape, device) or {}
+        return entry.get("candidates", {}).get(impl, {})
+
+    def describe(self, device=None) -> dict[str, Any]:
+        """What a listing shows: shapes in this device's table, per implementation."""
+        table = self.table(device) or {}
+        impls: dict[str, int] = {}
+        for entry in table.get("shapes", {}).values():
+            impls[entry["impl"]] = impls.get(entry["impl"], 0) + 1
+        return {"choice": self.name, "shapes_by_impl": impls, "provenance": table.get("provenance")}
+
+    def __repr__(self) -> str:
+        return f"KernelChoice({self.name!r})"
+
+
 def get(name: str) -> KernelOp:
     """The op declared as ``name`` (``"rms_norm"`` or ``"mstar::rms_norm"``)."""
     return _OPS[name.removeprefix(f"{NAMESPACE}::")]
@@ -304,6 +357,11 @@ def get(name: str) -> KernelOp:
 def ops() -> list[KernelOp]:
     """Every op declared so far, by name."""
     return [_OPS[name] for name in sorted(_OPS)]
+
+
+def choices() -> list[KernelChoice]:
+    """Every kernel choice declared so far, by name."""
+    return [_CHOICES[name] for name in sorted(_CHOICES)]
 
 
 def load_all() -> list[KernelOp]:

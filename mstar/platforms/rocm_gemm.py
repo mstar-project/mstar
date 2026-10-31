@@ -6,17 +6,20 @@ inductor's own one-row GEMV reduction; from four rows on it loses, badly once
 K * rows outgrows its LDS tile. ``mstar::decode_gemv``, a Triton weight
 stream with split-K (``mstar.kernels.triton.gemv``), serves 1-16 rows, and
 ``mstar::decode_gemv_silu_mul`` also folds a gated MLP's ``silu(gate) * up``
-into the gate/up projection's store.
+into the gate/up projection's store. hipBLASLt's own pick can sit well off the
+best of its solutions at these shapes, and ``mstar::decode_linear`` runs a
+tuned solution, in decode buckets of up to ``DECODE_LINEAR_MAX_ROWS`` rows.
 
 Inductor can't pick these, so two graph passes swap such linears for them:
 one before inductor's decompositions (a one-row ``mm`` becomes a reduction
 there, and the gated activation is still one ``mul`` of a ``silu``), one after
 (``mm``/``addmm`` that only appear in the lowered graph). Which kernel serves
-a shape is the device's tuned ``decode_gemv`` config (``mstar.kernels.
-configs``): ``"aiter"``, ``"triton"`` or ``"hipblaslt"`` (left to inductor).
-Without one, 1-2 row linears go to AITER and the rest stay on hipBLASLt, as
-before the Triton kernel. ``RocmPlatform.inductor_overrides`` installs the
-passes for buckets of up to ``DECODE_GEMV_MAX_ROWS`` tokens only.
+a shape is the device's ``decode_gemm`` table (``DECODE_GEMM``), chosen by
+measurement: ``"aiter"``, ``"triton"``, ``"hipblaslt_tuned"`` or
+``"hipblaslt"`` (left to inductor) for a linear, and ``"fused"`` or
+``"unfused"`` for a gate/up projection followed by its gated activation.
+Without a table, 1-2 row linears go to AITER and the rest stay on hipBLASLt.
+``RocmPlatform.inductor_overrides`` installs the passes.
 
 AITER and Triton are imported on first call, never at module import.
 """
@@ -32,17 +35,19 @@ import torch
 import torch.nn.functional as F
 from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
 
-from mstar.kernels import KernelOp, ShapePolicy, Tolerance, configs
+from mstar.kernels import KernelChoice, KernelOp, ShapePolicy, Tolerance, configs
 
 logger = logging.getLogger(__name__)
 
 # what AITER serves when no tuned config says otherwise
 SKINNY_MAX_ROWS = 2
-# the largest bucket the passes are installed for
+# the largest bucket the Triton kernels serve
 DECODE_GEMV_MAX_ROWS = 16
+# the largest decode bucket a tuned hipBLASLt solution serves
+DECODE_LINEAR_MAX_ROWS = 128
 # what AITER's prebuilt module_custom serves
 _ARCHS = ("gfx90a", "gfx942", "gfx950")
-IMPLS = ("aiter", "triton", "hipblaslt")
+IMPLS = ("aiter", "triton", "hipblaslt_tuned", "hipblaslt")
 _DTYPES = (torch.bfloat16, torch.float16)
 # shapes already logged, so a server log lists what the pass covers once each
 _logged: set[tuple] = set()
@@ -115,7 +120,7 @@ SKINNY_GEMM = _skinny_op("skinny_gemm")
 # two rows: there inductor may pick a strided layout and pay for the copy.
 SKINNY_GEMM_ANY = _skinny_op("skinny_gemm_any", tags=(torch.Tag.flexible_layout,))
 
-# the shape classes a decode_gemv config is keyed by
+# the shape classes the decode_gemm table is keyed by
 _ROW_CLASSES = (
     ("rows1", lambda s: s["rows"] == 1), ("rows2", lambda s: s["rows"] == 2),
     ("rows4", lambda s: s["rows"] <= 4), ("rows8", lambda s: s["rows"] <= 8),
@@ -123,12 +128,13 @@ _ROW_CLASSES = (
 )
 
 
-def _decode_kernel(op: KernelOp, silu_mul: bool, rows: int, n: int, k: int, dtype: torch.dtype):
-    """The Triton kernel at the knobs the device's config names for this
-    shape, as a callable with the op's signature."""
+def _decode_kernel(silu_mul: bool, rows: int, n: int, k: int, dtype: torch.dtype):
+    """The Triton kernel at the knobs the device's table holds for this shape,
+    as a callable with the op's signature."""
     from mstar.kernels.triton import gemv as triton_gemv
 
-    entry = op.config({"rows": rows, "n": n, "k": k}) or {}
+    shape = {"rows": rows, "n": n, "k": k}
+    entry = DECODE_GEMM.params({**shape, "gated": 1}, "fused") if silu_mul else DECODE_GEMM.params(shape, "triton")
     knobs = {**triton_gemv.DEFAULT_KNOBS, **{k: v for k, v in entry.items() if k in triton_gemv.KNOBS}}
     kernel = triton_gemv.decode_gemv_silu_mul if silu_mul else triton_gemv.decode_gemv
     return functools.partial(kernel, knobs=knobs)
@@ -136,17 +142,16 @@ def _decode_kernel(op: KernelOp, silu_mul: bool, rows: int, n: int, k: int, dtyp
 
 def _tuned(name: str, silu_mul: bool):
     """A factory for ``name``'s implementation: each shape's kernel, picked
-    from the config on the shape's first call."""
+    from the table on the shape's first call."""
 
     def factory():
-        op = DECODE_GEMV_SILU_MUL if silu_mul else DECODE_GEMV
         chosen: dict[tuple, object] = {}
 
         def run(x: torch.Tensor, weight: torch.Tensor, *bias) -> torch.Tensor:
             key = (x.shape[0], weight.shape[0], x.shape[1], x.dtype)
             kernel = chosen.get(key)
             if kernel is None:
-                kernel = chosen[key] = _decode_kernel(op, silu_mul, *key)
+                kernel = chosen[key] = _decode_kernel(silu_mul, *key)
             return kernel(x, weight, *bias)
 
         return run
@@ -189,6 +194,10 @@ DECODE_GEMV = KernelOp(
     tolerance=Tolerance.accumulated(),
 )
 
+# Which kernel serves each decode GEMM: ``{"rows", "n", "k"}`` for a linear, and
+# with ``"gated": 1`` for a gate/up projection and its gated activation.
+DECODE_GEMM = KernelChoice("decode_gemm", DECODE_GEMV.shapes)
+
 # ``silu(x @ gate.T) * (x @ up.T)`` for ``weight = [gate; up]``; shapes name
 # the stacked weight's N
 DECODE_GEMV_SILU_MUL = KernelOp(
@@ -214,24 +223,48 @@ def _have_aiter() -> bool:
     return importlib.util.find_spec("aiter") is not None
 
 
+def _stack() -> str:
+    import triton
+
+    return f"torch-{torch.__version__}-hip-{torch.version.hip}-triton-{triton.__version__}".replace("+", "_")
+
+
+@functools.cache
+def _solutions_apply(device_index: int = 0) -> bool:
+    """Whether the device's table can run its tuned solutions here: the indices
+    are hipBLASLt's, so a table tuned on another stack cannot, and AITER calls them."""
+    table = DECODE_GEMM.table(device_index) or {}
+    stack = (table.get("provenance") or {}).get("stack")
+    if stack != _stack():
+        logger.warning("decode_gemm table was tuned on %s, not %s: its hipBLASLt solutions are not used",
+                       stack, _stack())
+        return False
+    return _have_aiter()
+
+
 def gemv_impl(rows: int, n: int, k: int) -> str:
     """Which kernel serves ``[rows, k] @ [n, k].T`` here: ``"aiter"``,
-    ``"triton"`` or ``"hipblaslt"``, from the device's ``decode_gemv`` config."""
-    entry = DECODE_GEMV.config({"rows": rows, "n": n, "k": k})
-    if entry is None:
+    ``"triton"``, ``"hipblaslt_tuned"`` or ``"hipblaslt"``, from the device's
+    ``decode_gemm`` table."""
+    choice = DECODE_GEMM.choose({"rows": rows, "n": n, "k": k})
+    if choice is None:
         impl = "aiter" if rows <= SKINNY_MAX_ROWS else "hipblaslt"
     else:
-        impl = entry.get("impl", "hipblaslt")
+        impl = choice.impl
         if impl not in IMPLS:
-            raise ValueError(f"decode_gemv config names an unknown implementation {impl!r}")
-    return "hipblaslt" if impl == "aiter" and not _have_aiter() else impl
+            raise ValueError(f"decode_gemm table names an unknown implementation {impl!r}")
+    if impl == "aiter" and not _have_aiter():
+        return "hipblaslt"
+    if impl == "hipblaslt_tuned" and not _solutions_apply():
+        return "hipblaslt"
+    return impl
 
 
 def fuses_silu_mul(rows: int, n: int, k: int) -> bool:
     """Whether a gated MLP's gate/up projection of stacked width ``n`` and its
     ``silu(gate) * up`` run as one ``decode_gemv_silu_mul`` here."""
-    entry = DECODE_GEMV_SILU_MUL.config({"rows": rows, "n": n, "k": k})
-    return entry is not None and entry.get("impl") == "triton"
+    choice = DECODE_GEMM.choose({"rows": rows, "n": n, "k": k, "gated": 1})
+    return choice is not None and choice.impl == "fused"
 
 
 def _val(node):
@@ -255,9 +288,9 @@ def _weight_of(node) -> torch.fx.Node | None:
 
 def _shape(x, weight, bias) -> tuple[int, int, int] | None:
     """``(rows, n, k)`` when ``x @ weight.T (+ bias)`` is a GEMM the decode
-    kernels serve: up to ``DECODE_GEMV_MAX_ROWS`` rows, fp16/bf16, K a multiple
-    of 8, a contiguous [N, K] weight with N > 8 (AITER's tiles), bias absent,
-    [N] or [rows, N]; else None."""
+    kernels can serve: up to ``DECODE_LINEAR_MAX_ROWS`` rows, fp16/bf16, K a
+    multiple of 8, a contiguous [N, K] weight with N > 8 (AITER's tiles), bias
+    absent, [N] or [rows, N]; else None."""
     xv, wv = _val(x), _val(weight)
     if not isinstance(xv, torch.Tensor) or not isinstance(wv, torch.Tensor):
         return None
@@ -267,7 +300,7 @@ def _shape(x, weight, bias) -> tuple[int, int, int] | None:
     n, wk = wv.shape
     if not all(isinstance(d, int) for d in (rows, k, n, wk)):
         return None  # symbolic: a forward compiled for any batch
-    if not 1 <= rows <= DECODE_GEMV_MAX_ROWS or k != wk or k % 8 or n <= 8:
+    if not 1 <= rows <= DECODE_LINEAR_MAX_ROWS or k != wk or k % 8 or n <= 8:
         return None
     if not wv.is_contiguous():
         return None
@@ -291,6 +324,9 @@ def _op_for(x, weight, bias):
         return torch.ops.mstar.skinny_gemm_any if shape[0] == 1 else torch.ops.mstar.skinny_gemm
     if impl == "triton":
         return torch.ops.mstar.decode_gemv
+    # tuned on bf16 without a bias, which is what the harness measures
+    if impl == "hipblaslt_tuned" and bias is None and _val(x).dtype == torch.bfloat16:
+        return torch.ops.mstar.decode_linear
     return None
 
 
@@ -433,56 +469,26 @@ class SkinnyGemmPass(CustomGraphPass):
 
 
 def _pass_hash() -> bytes:
-    """Inductor's cache key for the passes: this file and the configs that pick
-    the kernel per shape, so a changed config recompiles."""
+    """Inductor's cache key for the passes: this file and the table that picks
+    the kernel per shape, so a changed table recompiles."""
     from mstar.platforms import current_platform
 
     files = [__file__]
     if torch.cuda.is_available():
         facts = current_platform.device_facts()
-        for op in (DECODE_GEMV, DECODE_GEMV_SILU_MUL):
-            for product in (facts.product, None):
-                path = configs.config_path(op.name, facts.arch or "unknown", product)
-                if path.is_file():
-                    files.append(str(path))
+        for product in (facts.product, None):
+            path = configs.config_path(DECODE_GEMM.name, facts.arch or "unknown", product)
+            if path.is_file():
+                files.append(str(path))
     return get_hash_for_files(tuple(files))
 
 
-# --- decode linears past the skinny rows ---------------------------------------------------
-#
-# A decode linear the kernels above leave on hipBLASLt runs its own pick, which at a few rows can sit well off the best
-# of hipBLASLt's solutions for the shape. A product's table (mstar/kernels/configs/<arch>/<product>/decode_linear.json,
-# from benchmark/kernels' linear search) names, per "rows{r}-n{n}-k{k}", the solution to run instead; shapes it
-# does not name keep F.linear. The indices are hipBLASLt's, so a table tuned on another stack is ignored.
-DECODE_LINEAR_MAX_ROWS = 128
-
-
-def _stack() -> str:
-    import triton
-
-    return f"torch-{torch.__version__}-hip-{torch.version.hip}-triton-{triton.__version__}".replace("+", "_")
-
-
 @functools.cache
-def decode_linear_table(device_index: int = 0) -> dict[str, dict]:
-    """This device's tuned decode-linear entries by shape key; empty without a table for this stack."""
-    from mstar.kernels import configs
-    from mstar.platforms import current_platform
-
-    facts = current_platform.device_facts(device_index)
-    config = configs.load_config("decode_linear", facts.arch, facts.product)
-    if config is None:
-        return {}
-    stack = (config.get("provenance") or {}).get("stack")
-    if stack != _stack():
-        logger.warning("decode_linear table for %s/%s was tuned on %s, not %s: not used",
-                       facts.arch, facts.product, stack, _stack())
-        return {}
-    return {k: v for k, v in config["classes"].items() if k != "default" and v.get("impl") == "hipblaslt"}
-
-
-def _decode_key(rows: int, n: int, k: int) -> str:
-    return f"rows{rows}-n{n}-k{k}"
+def _decode_solution(rows: int, n: int, k: int) -> int | None:
+    """The tuned hipBLASLt solution for this shape, where it is the table's choice."""
+    if gemv_impl(rows, n, k) != "hipblaslt_tuned":
+        return None
+    return int(DECODE_GEMM.params({"rows": rows, "n": n, "k": k}, "hipblaslt_tuned")["solution"])
 
 
 def _hipblaslt_decode_linear():
@@ -491,10 +497,10 @@ def _hipblaslt_decode_linear():
     aiter.hipb_create_extension()
 
     def decode_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-        entry = decode_linear_table(x.device.index or 0).get(_decode_key(x.shape[0], weight.shape[0], x.shape[1]))
-        if entry is None:
+        solution = _decode_solution(x.shape[0], weight.shape[0], x.shape[1])
+        if solution is None:
             return torch.nn.functional.linear(x, weight, bias)
-        return aiter.hipb_mm(x, weight.t(), int(entry["solution"]), bias=bias)
+        return aiter.hipb_mm(x, weight.t(), solution, bias=bias)
 
     return decode_linear
 
@@ -516,65 +522,6 @@ DECODE_LINEAR = KernelOp(
 )
 
 
-class DecodeLinearPass(CustomGraphPass):
-    """The lowered graph: ``mm(x, w.T)`` whose shape the device's table names, for decode buckets past the
-    skinny rows. Up to ``DECODE_GEMV_MAX_ROWS`` it runs after `SkinnyGemmPass`, on what that leaves on hipBLASLt.
-    A table change changes the pass's hash, so inductor recompiles what it touches."""
-
-    def __call__(self, graph: torch.fx.Graph) -> None:
-        table = decode_linear_table(torch.cuda.current_device())
-        for node in list(graph.nodes):
-            if node.op != "call_function" or node.target is not torch.ops.aten.mm.default:
-                continue
-            x, wt = node.args
-            weight = _weight_of(wt)
-            xv, wv = _val(x), _val(weight)
-            if not isinstance(xv, torch.Tensor) or not isinstance(wv, torch.Tensor) or xv.dim() != 2:
-                continue
-            if xv.dtype != torch.bfloat16 or wv.dtype != xv.dtype or not wv.is_contiguous():
-                continue
-            if not all(isinstance(d, int) for d in (*xv.shape, *wv.shape)):
-                continue
-            if _decode_key(xv.shape[0], wv.shape[0], xv.shape[1]) not in table:
-                continue
-            with graph.inserting_before(node):
-                new = graph.call_function(torch.ops.mstar.decode_linear.default, (x, weight, None))
-            new.meta.update(node.meta)
-            node.replace_all_uses_with(new)
-            graph.erase_node(node)
-            if not wt.users:
-                graph.erase_node(wt)
-
-    def uuid(self) -> bytes:
-        return get_hash_for_files((__file__,)) + repr(sorted(decode_linear_table(0).items())).encode()
-
-
-class ChainedGraphPass(CustomGraphPass):
-    """Inductor takes one pass per slot, so a bucket that needs two runs them in order."""
-
-    def __init__(self, *passes: CustomGraphPass) -> None:
-        self.passes = passes
-
-    def __call__(self, graph: torch.fx.Graph) -> None:
-        for graph_pass in self.passes:
-            graph_pass(graph)
-
-    def uuid(self) -> bytes:
-        return b"".join(graph_pass.uuid() for graph_pass in self.passes)
-
-
-@functools.cache
-def decode_linear_pass() -> DecodeLinearPass | None:
-    """The pass, or None where nothing would change (no AITER, another arch, no table for this device)."""
-    if importlib.util.find_spec("aiter") is None or not torch.cuda.is_available():
-        return None
-    from mstar.platforms import current_platform
-
-    if not current_platform.is_rocm() or current_platform.arch() not in ("gfx942", "gfx950"):
-        return None
-    return DecodeLinearPass() if decode_linear_table(torch.cuda.current_device()) else None
-
-
 @functools.cache
 def skinny_gemm_passes() -> tuple[SkinnyLinearPrePass, SkinnyGemmPass] | None:
     """The (pre-grad, post-grad) passes, or None where no decode kernel can run
@@ -585,7 +532,16 @@ def skinny_gemm_passes() -> tuple[SkinnyLinearPrePass, SkinnyGemmPass] | None:
 
     if not current_platform.is_rocm() or current_platform.arch() not in _ARCHS:
         return None
-    facts = current_platform.device_facts()
-    if not _have_aiter() and configs.load_config(DECODE_GEMV.name, facts.arch, facts.product) is None:
+    if not _have_aiter() and DECODE_GEMM.table() is None:
         return None
     return SkinnyLinearPrePass(), SkinnyGemmPass()
+
+
+@functools.cache
+def tunes_wide_decode() -> bool:
+    """Whether the device's table sends a decode bucket past the Triton kernels'
+    rows anywhere but hipBLASLt's own pick, so such a bucket needs the passes."""
+    if skinny_gemm_passes() is None:
+        return False
+    shapes = (DECODE_GEMM.table() or {}).get("shapes", {})
+    return any(entry["impl"] == "hipblaslt_tuned" for entry in shapes.values()) and _solutions_apply()

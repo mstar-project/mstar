@@ -7,7 +7,7 @@ builds its implementation) and says which runs, or why none can.
 import argparse
 import json
 
-from mstar.kernels.registry import load_all
+from mstar.kernels.registry import choices, load_all
 
 
 def main() -> None:
@@ -28,6 +28,9 @@ def main() -> None:
         if args.probe:
             print(f"  on {row['platform']}: runs {row['runs']}"
                   + (f" ({row['unavailable_reason']})" if row["unavailable_reason"] else ""))
+    if args.probe:
+        for choice in choices():
+            print(f"choice {choice.name}: {choice.describe()['shapes_by_impl'] or 'no table on this device'}")
 
 
 if __name__ == "__main__":

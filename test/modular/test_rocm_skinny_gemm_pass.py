@@ -12,6 +12,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
+from mstar.kernels import Choice
 from mstar.platforms import RocmPlatform, rocm_gemm
 from mstar.platforms.rocm_gemm import SkinnyGemmPass, SkinnyLinearPrePass
 
@@ -138,31 +139,60 @@ def test_rocm_without_the_kernel_keeps_hipblaslt_only(monkeypatch):
     assert RocmPlatform().inductor_overrides(1) == {"max_autotune_gemm_backends": "ATEN"}
 
 
-def _route(monkeypatch, entries):
-    """``decode_gemv``'s config answering ``entries[rows]`` (None: no entry)."""
-    monkeypatch.setattr(rocm_gemm.DECODE_GEMV, "config", lambda shape: entries.get(shape["rows"]))
+def test_wide_decode_buckets_get_the_passes_only_where_the_table_tunes_them(monkeypatch):
+    pre, post = SkinnyLinearPrePass(), SkinnyGemmPass()
+    monkeypatch.setattr(rocm_gemm, "skinny_gemm_passes", lambda: (pre, post))
+    monkeypatch.setattr(rocm_gemm, "tunes_wide_decode", lambda: True)
+    platform = RocmPlatform()
+    assert platform.inductor_overrides(128, rows=128)["post_grad_custom_post_pass"] is post
+    # a packed prefill bucket of the same token count is not a decode
+    assert "post_grad_custom_post_pass" not in platform.inductor_overrides(32, rows=1)
+    assert platform.inductor_overrides(256, rows=256) == {}
+    monkeypatch.setattr(rocm_gemm, "tunes_wide_decode", lambda: False)
+    assert "post_grad_custom_post_pass" not in platform.inductor_overrides(64, rows=64)
+    assert platform.inductor_overrides(8, rows=8)["post_grad_custom_post_pass"] is post
+
+
+def _route(monkeypatch, linear, gated=None):
+    """The ``decode_gemm`` table answering ``linear[rows]`` for a linear and
+    ``gated`` for a gate/up projection (None: no entry)."""
+
+    def choose(shape):
+        impl = gated if "gated" in shape else linear.get(shape["rows"])
+        return None if impl is None else Choice(impl, {})
+
+    monkeypatch.setattr(rocm_gemm.DECODE_GEMM, "choose", choose)
     monkeypatch.setattr(rocm_gemm, "_have_aiter", lambda: True)
+    monkeypatch.setattr(rocm_gemm, "_solutions_apply", lambda: True)
 
 
 def _calls(graph, op):
     return sum(t is op for t in _targets(graph))
 
 
+def _passed(graph):
+    SkinnyGemmPass()(graph)
+    return graph
+
+
 @pytest.mark.parametrize(
     ("rows", "entry", "op"),
     [
-        (1, {"impl": "triton"}, torch.ops.mstar.decode_gemv.default),
-        (4, {"impl": "triton"}, torch.ops.mstar.decode_gemv.default),
-        (16, {"impl": "triton"}, torch.ops.mstar.decode_gemv.default),
-        (2, {"impl": "aiter"}, torch.ops.mstar.skinny_gemm.default),
-        (1, {"impl": "aiter"}, torch.ops.mstar.skinny_gemm_any.default),
-        (8, {"impl": "hipblaslt"}, torch.ops.aten.mm.default),
+        (1, "triton", torch.ops.mstar.decode_gemv.default),
+        (4, "triton", torch.ops.mstar.decode_gemv.default),
+        (16, "triton", torch.ops.mstar.decode_gemv.default),
+        (2, "aiter", torch.ops.mstar.skinny_gemm.default),
+        (1, "aiter", torch.ops.mstar.skinny_gemm_any.default),
+        (8, "hipblaslt", torch.ops.aten.mm.default),
+        (8, "hipblaslt_tuned", torch.ops.mstar.decode_linear.default),
+        (64, "hipblaslt_tuned", torch.ops.mstar.decode_linear.default),
         (4, None, torch.ops.aten.mm.default),
         (2, None, torch.ops.mstar.skinny_gemm.default),
     ],
-    ids=["1-triton", "4-triton", "16-triton", "2-aiter", "1-aiter", "8-hipblaslt", "4-no-config", "2-no-config"],
+    ids=["1-triton", "4-triton", "16-triton", "2-aiter", "1-aiter", "8-hipblaslt", "8-tuned", "64-tuned", "4-no-table",
+         "2-no-table"],
 )
-def test_the_config_picks_each_shapes_kernel(monkeypatch, rows, entry, op):
+def test_the_table_picks_each_shapes_kernel(monkeypatch, rows, entry, op):
     _route(monkeypatch, {rows: entry})
     graph = _linear_graph(rows)
     SkinnyGemmPass()(graph)
@@ -170,8 +200,16 @@ def test_the_config_picks_each_shapes_kernel(monkeypatch, rows, entry, op):
     graph.lint()
 
 
+def test_a_tuned_solution_needs_its_stack_no_bias_and_bf16(monkeypatch):
+    _route(monkeypatch, {8: "hipblaslt_tuned"})
+    assert _calls(_passed(_linear_graph(8, dtype=torch.float16)), torch.ops.mstar.decode_linear.default) == 0
+    assert _calls(_passed(_linear_graph(8, bias=True)), torch.ops.mstar.decode_linear.default) == 0
+    monkeypatch.setattr(rocm_gemm, "_solutions_apply", lambda: False)
+    assert _calls(_passed(_linear_graph(8)), torch.ops.mstar.decode_linear.default) == 0
+
+
 def test_aiter_missing_leaves_its_shapes_on_hipblaslt(monkeypatch):
-    monkeypatch.setattr(rocm_gemm.DECODE_GEMV, "config", lambda shape: {"impl": "aiter"})
+    _route(monkeypatch, {1: "aiter"})
     monkeypatch.setattr(rocm_gemm, "_have_aiter", lambda: False)
     graph = _linear_graph(1)
     SkinnyGemmPass()(graph)
@@ -179,7 +217,7 @@ def test_aiter_missing_leaves_its_shapes_on_hipblaslt(monkeypatch):
 
 
 def test_an_unknown_implementation_is_refused(monkeypatch):
-    _route(monkeypatch, {1: {"impl": "cublas"}})
+    _route(monkeypatch, {1: "cublas"})
     with pytest.raises(ValueError, match="unknown implementation"):
         SkinnyGemmPass()(_linear_graph(1))
 
@@ -212,8 +250,7 @@ def _mlp_graph(rows, **kwargs):
 
 @pytest.mark.parametrize("rows", [1, 4, 16])
 def test_a_gated_activation_folds_into_its_gate_up_projection(monkeypatch, rows):
-    _route(monkeypatch, {rows: {"impl": "triton"}})
-    monkeypatch.setattr(rocm_gemm.DECODE_GEMV_SILU_MUL, "config", lambda shape: {"impl": "triton"})
+    _route(monkeypatch, {rows: "triton"}, gated="fused")
     graph = _mlp_graph(rows)
     SkinnyLinearPrePass()(graph)
     targets = _targets(graph)
@@ -225,13 +262,11 @@ def test_a_gated_activation_folds_into_its_gate_up_projection(monkeypatch, rows)
 
 @pytest.mark.parametrize(
     ("kwargs", "entry"),
-    [({}, {"impl": "unfused"}), ({}, None), ({"bias": True}, {"impl": "triton"}),
-     ({"leak": True}, {"impl": "triton"})],
-    ids=["config-says-unfused", "no-config", "biased", "gate-up-used-elsewhere"],
+    [({}, "unfused"), ({}, None), ({"bias": True}, "fused"), ({"leak": True}, "fused")],
+    ids=["table-says-unfused", "no-table", "biased", "gate-up-used-elsewhere"],
 )
 def test_a_gated_activation_stays_unfused_otherwise(monkeypatch, kwargs, entry):
-    _route(monkeypatch, {4: {"impl": "triton"}})
-    monkeypatch.setattr(rocm_gemm.DECODE_GEMV_SILU_MUL, "config", lambda shape: entry)
+    _route(monkeypatch, {4: "triton"}, gated=entry)
     graph = _mlp_graph(4, **kwargs)
     SkinnyLinearPrePass()(graph)
     assert _calls(graph, torch.ops.mstar.decode_gemv_silu_mul.default) == 0
