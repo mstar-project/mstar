@@ -309,6 +309,7 @@ def test_shards_head_counts_at_build():
 
     class _Group:
         world_size = 2
+        head_shards = 2
 
     spec = RaggedAttentionSpec(
         resource_key=ATTN, nodes={"encoder"},

@@ -360,6 +360,12 @@ class JointGroups:
         """Total ranks in ``node``'s lockstep instance (tp_size * sp_size * cfg_size)."""
         return self.tp_group.world_size * self.sp_group.world_size * self.cfg_group.world_size
 
+    @property
+    def head_shards(self) -> int:
+        """Ranks each attention head's K/V is split over (tp_size * sp_size). A
+        guidance branch runs whole on its rank, so ``cfg_size`` does not split anything."""
+        return self.tp_group.world_size * self.sp_group.world_size
+
     def barrier(self) -> None:
         """Hold every rank of the instance here, one axis at a time."""
         for group in (self.tp_group, self.sp_group, self.cfg_group):

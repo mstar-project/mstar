@@ -844,7 +844,7 @@ class Engine:
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
-            submodule_mgmt.joint_comm_group.world_size,
+            submodule_mgmt.joint_comm_group.head_shards,
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see

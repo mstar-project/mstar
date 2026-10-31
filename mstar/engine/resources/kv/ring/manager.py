@@ -93,7 +93,7 @@ class RingKVManager(AttentionResource):
                 "built by hand with the wrong one."
             )
         if info.joint_comm_group is not None:
-            config.shard(info.joint_comm_group.world_size)
+            config.shard(info.joint_comm_group.head_shards)
         return cls(
             config=config,
             name=spec.resource_key,
