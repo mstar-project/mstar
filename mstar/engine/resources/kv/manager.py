@@ -2038,7 +2038,7 @@ class KVManager(AttentionResource):
         A request's footprint is every distinct page it would hold after the
         step: the ones its streams hold already, counted once where labels or
         requests share them, plus the ones `admit` would still reserve for each
-        stream. A segment that runs against the sink holds and needs nothing,
+        stream, a chunked row's whole walk included. A segment that runs against the sink holds and needs nothing,
         and a span-0 one needs nothing beyond what it holds, as in `admit`. The
         pool is every page but the sink, cached prefixes included, since those
         can be evicted. ``rows_sized`` is how many real rows were counted.
@@ -2047,6 +2047,9 @@ class KVManager(AttentionResource):
             return error
         page_size = self.config.page_size
         sink = step.sink
+        reserve_ahead = ctx.reserve_whole_prefill
+        ahead = ctx.chunk_tokens_after \
+            if reserve_ahead.value is not SettingValue.UNSET else None
         held: dict[str, set[int]] = {}
         needed: dict[tuple[str, str], int] = {}
         for segment in step.segments:
@@ -2064,7 +2067,11 @@ class KVManager(AttentionResource):
                 continue
             stored = 0 if stream is None else stream.stored_len
             key = (rid, segment.label)
-            more = -(-(stored + segment.span) // page_size) - len(pages)
+            seq_len = stored + segment.span
+            if ahead and reserve_ahead.holds_for(rid):
+                # as `admit` reserves it: a chunked row's whole walk
+                seq_len += ahead.get(rid, 0)
+            more = -(-seq_len // page_size) - len(pages)
             needed[key] = max(needed.get(key, 0), more)
         extra: dict[str, int] = {}
         for (rid, _), more in needed.items():

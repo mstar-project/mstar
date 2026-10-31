@@ -25,6 +25,7 @@ from mstar.engine.resources.step import (
     ADMIT_OK,
     ALL_SET,
     NONE_SET,
+    AdmitRuntimeError,
     AllocationFailed,
     PerReqSetting,
     Segment,
@@ -132,13 +133,27 @@ def test_a_later_chunk_takes_no_more_pages():
 def test_a_walk_that_does_not_fit_is_refused_before_it_holds_anything():
     kv = _kv(pages=8)  # 7 usable: page 0 is the sink
     kv.ingest_request(1, None)
+    kv.ingest_request(2, None)
+    assert kv.admit(_step(r2=4 * PAGE), _ctx(2)).ok  # leaves 3 free
     free = kv._arena.num_free
 
-    outcome = kv.admit(_step(r1=PAGE), _ctx(1, after={1: 10 * PAGE}))
+    outcome = kv.admit(_step(r1=PAGE), _ctx(1, after={1: 4 * PAGE}))
 
     assert not outcome.ok and isinstance(outcome.reason, AllocationFailed)
     kv.rollback_admit(_step(r1=PAGE), _ctx(1))
     assert kv._arena.num_free == free
+
+
+def test_a_walk_bigger_than_the_pool_is_refused_for_good():
+    """Sized by what its first chunk reserves, not by the chunk alone, which
+    fits: otherwise the refusal is retried until the client gives up."""
+    kv = _kv(pages=8)
+    kv.ingest_request(1, None)
+
+    outcome = kv.admit(_step(r1=PAGE), _ctx(1, after={1: 10 * PAGE}))
+
+    assert not outcome.ok and isinstance(outcome.reason, AdmitRuntimeError)
+    assert "needs 11 pages" in outcome.reason.message
 
 
 def test_a_refused_reservation_unwinds_with_the_step():
