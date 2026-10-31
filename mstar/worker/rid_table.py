@@ -14,7 +14,8 @@ arrival, chunk_started, cached_prefix} (purged by clear_rid),
 Worker.{_pending_removes, _pending_loop_stops, streaming_buffers,
 _lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine's and
-tensor manager's per-request state (including ChunkingManagement.prepared),
+tensor manager's per-request state (including ChunkingManagement.prepared and,
+among the resources, DraftVerifyResource's pending verdicts and emitted counts),
 RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,
 _unkeyed, _admit_restores, _admit_snaps} (purged by remove_request), and
 WorkerProfileInfo.

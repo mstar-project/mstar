@@ -25,7 +25,7 @@ from mstar.engine.resources.attn.ragged.config import (
     cross_label,
 )
 from mstar.engine.resources.attn.ragged.wrappers import _RaggedPrefillBase
-from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
+from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo, RewindKind
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
 
@@ -80,6 +80,7 @@ def _build_dense_or_flashinfer(spec, info: EngineResourceInfo, dense_cls, flashi
 
 class RaggedAttnManager(AttentionResource):
     prefix_skip_safe = True
+    rewind_kind = RewindKind.NONE  # cacheless
 
     # Remains abstract except for build; will build based on the backend.
 
@@ -111,6 +112,7 @@ class RaggedCrossAttnManager(AttentionResource):
     ``RaggedCrossAttentionSpec``."""
 
     prefix_skip_safe = True
+    rewind_kind = RewindKind.NONE  # cacheless
 
     @classmethod
     def build(cls, spec: RaggedCrossAttentionSpec, info: EngineResourceInfo):
@@ -138,6 +140,7 @@ class RaggedBlockCausalAttnManager(AttentionResource):
     ``RaggedBlockCausalAttentionSpec``."""
 
     prefix_skip_safe = True
+    rewind_kind = RewindKind.NONE  # cacheless
 
     @classmethod
     def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
