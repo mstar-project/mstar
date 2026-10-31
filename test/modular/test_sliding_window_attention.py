@@ -305,6 +305,18 @@ class SlidingWindowTests(unittest.TestCase):
         kv.rollback_admit(step, ctx)
         self.assertEqual(kv._arena.num_free, free)
 
+    def test_capacity_benchmark_counts_what_admission_lets_in(self):
+        """At one rank `benchmark/kv_capacity.py` stops at the request that waits for its allotment,
+        as above, though the pages left free hold its prompt; above one rank nothing allots."""
+        from benchmark import kv_capacity
+
+        def requests(shards):
+            cfg = window_pool(num_qo_heads=1, num_kv_heads=1, head_dim=4)
+            return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
+
+        self.assertEqual(requests(1), 1)
+        self.assertGreater(requests(2), 1)
+
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only
         with self.assertRaises(ValueError):
