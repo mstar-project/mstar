@@ -42,7 +42,9 @@ class RowState:
         ``on_commit`` hook, so a step that never commits changes nothing."""
 
     def released(self, slots: np.ndarray) -> None:
-        """Rows of removed requests left ``slots``: free what was kept for them."""
+        """Rows of removed requests left ``slots``: free what was kept for them.
+        Called once the step's row update is on the current stream, so a
+        reuse ordered after it on that stream sees the check-in done."""
 
 
 class _Walk(NamedTuple):
@@ -123,9 +125,11 @@ class NodeRows:
         return rows
 
     def commit(self, walk: str, rows: StepRows) -> None:
-        """Commit a step of ``walk`` that is launching; ``rows.apply`` puts it
-        on the device, on the step's stream."""
+        """Commit a step of ``walk`` that is launching, and put its row update
+        on the device, on the current stream. A store row of a removed request
+        is released only after that, since the update copies into it."""
         released = rows.commit()
+        rows.apply()
         if len(released):
             for state in self._walks[walk].states:
                 state.released(released)
@@ -144,7 +148,6 @@ class NodeRows:
                 state.check_in(rows)
             rows.stage()
             self.commit(walk, rows)
-            rows.apply()
 
     def forget(self, rid: int) -> None:
         """``rid`` was removed: its rows leave at their walk's next step."""
