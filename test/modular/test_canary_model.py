@@ -20,7 +20,7 @@ SPECIALS = [
     "<|startofcontext|>", "<|itn|>", "<|noitn|>", "<|timestamp|>", "<|notimestamp|>", "<|diarize|>",
     "<|nodiarize|>", "<|emo:undefined|>", *(f"<|{lang}|>" for lang in LANGUAGES),
 ]
-PIECES = ["▁he", "llo", "▁caf", "<0xC3>", "<0xA9>", "!"]
+PIECES = ["▁", "▁he", "llo", "▁caf", "<0xC3>", "<0xA9>", "!"]
 
 
 @pytest.fixture
@@ -58,16 +58,17 @@ def test_refuses_a_mel_front_end_it_does_not_compute(snapshot):
 
 
 def test_prompt_tokens(snapshot):
-    """The tokens ``chat_template.jinja`` renders for a transcription (and a
-    translation), in its order."""
+    """The tokens NeMo's transcribe feeds the decoder for a transcription (and a
+    translation), in its order: SentencePiece's ``▁``, then the task tokens."""
     cfg = CanaryModelConfig.from_pretrained(snapshot)
     ids = cfg.special_ids
-    assert cfg.prompt_ids("en") == [ids[t] for t in (
+    assert cfg.prompt_ids("en") == [cfg.word_boundary_id] + [ids[t] for t in (
         "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>", "<|en|>", "<|en|>",
         "<|pnc|>", "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
     )]
+    assert cfg.word_boundary_id == len(SPECIALS)  # the vocab's "▁", not an added token
     translate = cfg.prompt_ids("DE", "en", punctuation=False)
-    assert translate[3:6] == [ids["<|de|>"], ids["<|en|>"], ids["<|nopnc|>"]]
+    assert translate[4:7] == [ids["<|de|>"], ids["<|en|>"], ids["<|nopnc|>"]]
     # the output limit counts on it
     assert len(translate) == PROMPT_LENGTH
 
@@ -115,11 +116,11 @@ def test_graph_and_limits(snapshot):
     assert set(walks) == {"prefill", "decode"}
     assert model.nodes == ["audio_encoder", "decoder"]
     # the position table bounds prompt + transcript
-    assert model.get_max_output_tokens() == 64 - 9
+    assert model.get_max_output_tokens() == 64 - PROMPT_LENGTH
     assert model.get_max_output_tokens(max_output_tokens=10) == 10
-    assert model.get_max_output_tokens(max_output_tokens=None) == 64 - 9
+    assert model.get_max_output_tokens(max_output_tokens=None) == 64 - PROMPT_LENGTH
     # published, so the conductor refuses a larger request instead of cutting it short
-    assert model.get_max_output_tokens_limit() == 64 - 9
+    assert model.get_max_output_tokens_limit() == 64 - PROMPT_LENGTH
     # the request's max_output_tokens caps the loop, not the graph's max_iters
     assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 10}
 
