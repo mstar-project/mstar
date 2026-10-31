@@ -326,11 +326,11 @@ Endpoints and model coverage:
    * - ``POST /v1/messages``, ``POST /v1/messages/count_tokens``
      - ``glm52``, ``glm5_next``
      - Anthropic's Messages API, for Claude Code: streamed or whole, tools, thinking blocks
-       (not on ``--rust-frontend``).
+       (not on ``--rust-frontend``; see :ref:`coding-agents`).
    * - ``POST /v1/responses``
      - ``glm52``, ``glm5_next``
      - OpenAI's Responses API, stateless, for Codex: streamed or whole, function tools,
-       reasoning items (not on ``--rust-frontend``).
+       reasoning items (not on ``--rust-frontend``; see :ref:`coding-agents`).
    * - ``POST /v1/audio/speech``
      - ``kokoro``, ``orpheus``, ``qwen3_omni``
      - Text-to-speech (``kokoro`` streams sentence by sentence with ``stream=True``).
@@ -495,3 +495,75 @@ Per-model notes:
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).
+
+.. _coding-agents:
+
+Coding agents
+-------------
+
+GLM-5.2 (``glm52``) and GLM-5.3 (``glm5_next``) serve the three APIs coding agents speak, on
+the Python frontend only (``--rust-frontend`` answers ``404``): ``POST /v1/chat/completions``,
+Anthropic's ``POST /v1/messages`` and ``POST /v1/messages/count_tokens`` (Claude Code), and
+OpenAI's ``POST /v1/responses`` (Codex). All three run one chat path: the messages and
+``tools`` go to the checkpoint's chat template, and the reply comes back with its reasoning
+and tool calls split out, streamed or whole. Any ``model`` name gets the loaded model,
+``count_tokens`` counts the prompt as the same request would render it, and responses are
+stateless.
+
+- **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages)
+  match the answer only, not the reasoning or a call's arguments. The first to appear ends
+  the reply before it (``finish_reason: "stop"``, ``stop_reason: "stop_sequence"``) and stops
+  the request in the engine.
+- **Forced calls.** ``tool_choice`` ``"required"`` or a named function (Messages: ``any`` or
+  ``tool``) ends the prompt with the opening of the call, so the reply is that call, without
+  reasoning: asking for thinking as well is a ``400``. With several tools, ``"required"``
+  leaves the name to the model. Nothing constrains the arguments, and a ``strict`` tool on
+  ``/v1/responses`` is a ``400``.
+- **One call.** ``parallel_tool_calls: false`` (Messages: ``tool_choice`` with
+  ``disable_parallel_tool_use``) ends the reply, and the request, at the end of its first call.
+- **Reasoning.** GLM-5.3 always reasons, so turning it off (``enable_thinking: false``,
+  ``thinking: {"type": "disabled"}``, ``reasoning.effort: "none"``) is a ``400``. A Messages
+  request without ``thinking`` gets the model's default, and ``thinking.budget_tokens`` is
+  checked as Anthropic checks it but not enforced. Thinking blocks carry an empty
+  ``signature``; a Responses reply carries its reasoning as a ``reasoning`` item's text.
+- **Refused, not dropped.** On ``/v1/messages`` and ``/v1/responses``: fields the route does
+  not know, images and documents (the model reads text), server tools, a reply prefilled with
+  a final assistant turn, and what needs stored state (``previous_response_id``,
+  ``store: true``, ``background``). Hints (``metadata``, ``cache_control``,
+  ``prompt_cache_key``) are dropped.
+- **MTP** (``mtp_num_draft_tokens > 0``) verifies greedily: a ``temperature`` above 0 is a
+  ``400``, and a request that sets none runs greedy.
+
+An agent's system prompt and tools alone outgrow the 2,048-token window of
+``glm5_next_tp8.yaml``: serve them with ``glm5_next_tp8_longctx.yaml`` (1M tokens) or
+``glm52_tp8_longctx.yaml`` (256k).
+
+**Claude Code** sends the key as ``x-api-key``, which the Anthropic routes take
+(:ref:`api-key`):
+
+.. code-block:: bash
+
+   export ANTHROPIC_BASE_URL=http://localhost:8000
+   export ANTHROPIC_API_KEY=<the server's --api-key, or anything without one>
+   export ANTHROPIC_MODEL=glm-5.3   # any name: the server answers with the model it loaded
+   claude                           # or headless: claude -p "fix the failing test"
+
+**Codex**, in ``~/.codex/config.toml``. Its web search runs on OpenAI's side and its
+sub-agent tools come as a ``namespace`` tool, both of which ``/v1/responses`` refuses (it
+takes function tools), so turn them off:
+
+.. code-block:: toml
+
+   model = "glm-5.3"                # any name, as for Claude Code
+   model_provider = "mstar"
+   model_context_window = 1048576   # the served max_seq_len
+   web_search = "disabled"
+   [features]
+   multi_agent = false
+   [model_providers.mstar]
+   name = "M*"
+   base_url = "http://localhost:8000/v1"
+   env_key = "MSTAR_API_KEY"        # read from the environment as the bearer token
+   wire_api = "responses"
+
+then ``codex``, or ``codex exec "fix the failing test"``.
