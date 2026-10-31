@@ -58,7 +58,7 @@ def test_the_reference_is_the_layers_unfused_math():
 
 
 def test_no_implementation_off_amd_gpus():
-    assert prologue.available() is False
+    assert prologue.QKV_NORM_ROPE_CACHE.unavailable_reason() is not None
 
 
 def test_the_rope_tables_are_the_steps_tables():
