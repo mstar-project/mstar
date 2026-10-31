@@ -23,7 +23,11 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    STEP_POLICY_RECOMPILE_LIMIT,
+    ExactOps,
+    compile_transformer_forward,
+)
 from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
     compile_vae_decode,
@@ -211,6 +215,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
             compile_transformer_forward(
                 transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                recompile_limit=None if step_dtypes is None else STEP_POLICY_RECOMPILE_LIMIT,
             )
 
     # hooks -----------------------------------------------------------------
