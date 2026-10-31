@@ -51,8 +51,7 @@ _KDA_ROW_QKV_FLAT_RE = re.compile(r"\.self_attn\.dt_bias$")
 _KDA_ROW_HEADS_RE = re.compile(r"\.self_attn\.(A_log|b_proj\.weight)$")
 _KDA_COL_RE = re.compile(r"\.self_attn\.o_proj\.weight$")
 
-# glm52's MTP_GLUE_PREFIXES (glm52/components/mtp.py), kept here so the loader imports
-# without the engine
+# checkpoint sub-keys under ``layers.45.`` that keep their names on the MTP module
 MTP_GLUE_PREFIXES = ("enorm", "hnorm", "eh_proj", "shared_head")
 
 

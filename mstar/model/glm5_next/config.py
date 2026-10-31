@@ -235,8 +235,7 @@ class Glm5NextModelConfig:
                 )
         if any(t != "full" for t in self.indexer_types):
             raise ValueError(
-                "indexer_types must be all 'full' — GLM-5.3-Flash has no "
-                "IndexShare; do not port the glm52 formula"
+                "indexer_types must be all 'full': GLM-5.3-Flash has no IndexShare"
             )
         if self.num_attention_heads != self.num_key_value_heads:
             raise ValueError(

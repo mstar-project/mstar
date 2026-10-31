@@ -308,9 +308,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 f"request {fwd_info.request_id}: context {real + seq_len} "
                 f"({committed + seq_len} cache rows) exceeds index_topk={limit} "
                 f"or {self.config.kv_rows} rows; index_topk is the regime where "
-                "dense MLA is exactly GLM-5.3-Flash's DSA computation. Long "
-                "context needs the k-pool indexer engine path (dsa_long_context), "
-                "a post-M1 follow-up refused at model __init__."
+                "dense MLA is exactly GLM-5.3-Flash's DSA computation"
             )
         if graph_walk == "prefill":
             state.add("prompt_len", committed + seq_len)

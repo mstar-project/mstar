@@ -51,8 +51,7 @@ class Glm5NextMLAAttention(MLAAttention):
     ) -> None:
         if not config.mla_absorb:
             raise ValueError(
-                "Glm5NextMLAAttention serves the absorbed path only "
-                "(mla_absorb=False was the pre-resource-pool naive fallback)"
+                "Glm5NextMLAAttention serves the absorbed path only (mla_absorb=True)"
             )
         super().__init__(config, comm_group, layer_idx, kv_key=KV_CACHE, attn_key=ATTN,
                          pos_key=None, kv_label=LABEL, cache_layer=kv_plane)

@@ -94,14 +94,10 @@ class Glm5NextModel(Model):
         else:
             self.config = Glm5NextModelConfig()
         if kwargs.get("dsa_long_context", False):
-            # The config carries the opt-in long-context flag for shape
-            # parity, but the k-pool engine path (pooled scoring + sparse
-            # gather) is not built yet — refuse loudly instead of serving a
-            # silently-dense long context.
+            # rather than serve a long context densely
             raise NotImplementedError(
-                "glm5_next dsa_long_context is a post-M1 follow-up: the "
-                "k-pool indexer engine path is not implemented; serve "
-                "within index_topk (2048) where dense MLA is exact DSA"
+                "dsa_long_context needs the k-pool DSA path, which this build does not serve; "
+                "serve within index_topk (2048), where dense MLA is exact DSA"
             )
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
@@ -586,8 +582,6 @@ class Glm5NextModel(Model):
             _check_all_loaded(language_model, loaded, source)
             return
 
-        import json
-
         with open(index_file) as f:
             checkpoint_keys = list(json.load(f)["weight_map"])
         tp_rank = tp_group.rank if tp_group is not None else 0
@@ -608,8 +602,6 @@ class Glm5NextModel(Model):
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
         """Adopt the checkpoint's fp8-block quant config from its config.json."""
-        import json
-
         from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
         if self.config.quantization_config is not None:

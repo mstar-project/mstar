@@ -16,7 +16,7 @@ try:
     from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait, libdevice
 
     _HAS_TRITON = True
-except ModuleNotFoundError:  # no triton: the torch reference covers this install
+except ImportError:  # no triton, or one without CUDA extras: the torch reference serves
     _HAS_TRITON = False
 
 # tests switch this off to run the torch reference
@@ -24,7 +24,8 @@ _ENABLED = True
 
 
 def fused_available(t: torch.Tensor) -> bool:
-    return _ENABLED and _HAS_TRITON and t.is_cuda
+    # the kernels use NVIDIA's libdevice and PDL intrinsics
+    return _ENABLED and _HAS_TRITON and t.is_cuda and not current_platform.is_rocm()
 
 
 if _HAS_TRITON:

@@ -9,20 +9,6 @@ from mstar.model.glm5_next.components.decoder_layer import Glm5NextPlainDecoderL
 from mstar.model.glm5_next.components.language_model import build_rmsnorm
 from mstar.model.glm5_next.config import Glm5NextModelConfig
 
-# Sub-keys under ``layers.45.`` that map 1:1 onto attributes here. weight_loader keeps a
-# copy, since it imports without the engine; the two are asserted equal.
-MTP_GLUE_PREFIXES = ("enorm", "hnorm", "eh_proj", "shared_head")
-
-
-def _assert_loader_glue_contract() -> None:
-    from mstar.model.glm5_next import weight_loader
-
-    assert weight_loader.MTP_GLUE_PREFIXES == MTP_GLUE_PREFIXES, (
-        "MTP glue prefixes drifted between components/mtp.py and "
-        f"weight_loader.py: {MTP_GLUE_PREFIXES} vs "
-        f"{weight_loader.MTP_GLUE_PREFIXES}"
-    )
-
 
 class Glm5NextSharedHead(nn.Module):
     """The MTP module's final norm, named for the checkpoint's ``shared_head.norm``.
@@ -44,7 +30,6 @@ class Glm5NextMTPModule(nn.Module):
         self, config: Glm5NextModelConfig, comm_group: CommGroup | None = None
     ) -> None:
         super().__init__()
-        _assert_loader_glue_contract()
         self.kv_plane = len(config.full_attn_layer_indices)
         self.enorm = build_rmsnorm(config)
         self.hnorm = build_rmsnorm(config)
