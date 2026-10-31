@@ -17,7 +17,9 @@ need not be: `Candidates.probs` is a valid distribution even then.
 
 Draws are keyed by the request's seed, the row and a Philox word offset. Offsets
 count 32-bit words of the row's stream, so two draws overlap unless the first
-uses fewer words than the distance between their offsets (`words_per_step`).
+uses fewer words than the distance between their offsets. That is more than a
+nicety: a draft sharing a word with the residual draw before it is no longer a
+draw from ``p``, and the emitted tokens stop following ``q``.
 
 These functions are the kernels on an accelerator; a torch path serves CPU
 tensors, for tests that drive the step without one.
@@ -31,6 +33,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.sampler import utils as sampling
+from mstar.engine.resources.sampler.unfiltered import philox4x32
 from mstar.engine.resources.spec_decode.candidates import FILTER_PAST_CANDIDATES, FILTERED_CANDIDATES
 
 # Tokens a row's filters run on. On chat and 1k-token prompts, Qwen3.5 at temperature
@@ -51,10 +54,17 @@ def _on_device(tensor: torch.Tensor):
     return nullcontext() if tensor.device.type == "cpu" else torch.cuda.device(tensor.device)
 
 
+def chain_words(num_draft_tokens: int) -> int:
+    """Stream words `accept_chain` can use. A rejection at draft i uses i + 1, then
+    FlashInfer's kernel judges drafts i to k - 1 again for its acceptance metric,
+    then draws the replacement: k + 2 whichever draft it was."""
+    return num_draft_tokens + 2
+
+
 def words_per_step(num_draft_tokens: int) -> int:
-    """Stream words a verify step of k drafts uses: one per draft judged, one
-    for the residual or bonus draw, and the k draft draws for the next step."""
-    return 2 * num_draft_tokens + 1
+    """Stream words a verify step of k drafts uses: the chain's, then one for each
+    draft drawn for the next step."""
+    return chain_words(num_draft_tokens) + num_draft_tokens
 
 
 class Candidates(NamedTuple):
@@ -93,17 +103,26 @@ def filtered_probs(logits, temperature, top_k, top_p) -> torch.Tensor:
     return probs
 
 
-def _generator(seed, row: int, offset) -> torch.Generator:
-    return torch.Generator().manual_seed((int(seed) * 1_000_003 + row) * 1_000_033 + int(offset))
+def _word(seed, row: int, offset) -> torch.Tensor:
+    """The word of a row's stream at ``offset``, as a uniform in (0, 1]: rocRAND's
+    layout (four words per counter, the subsequence in the third counter word). The
+    torch paths read the stream word by word, as the kernels do, so that an overlap
+    between two draws shows up on a CPU."""
+    block, word = int(offset) // 4, int(offset) % 4
+    bits = torch.tensor([block], dtype=torch.int64), torch.zeros(1, dtype=torch.int64)
+    out = philox4x32(int(seed), bits[0], bits[1], bits[1] + row, bits[1])
+    return (out[word].to(torch.float64) + 1.0).to(torch.float32) * 2.0**-32
+
+
+def _inverse_cdf(probs: torch.Tensor, u: torch.Tensor) -> int:
+    cdf = probs.double().cumsum(0)
+    return min(int(torch.searchsorted(cdf, u.double() * cdf[-1], right=True)), int(probs.nonzero().max()))
 
 
 def draw(probs: torch.Tensor, seed: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
     """One ``[rows]`` int64 index into each row of ``probs``, at its seed and offset."""
     if probs.device.type == "cpu":
-        return torch.cat([
-            torch.multinomial(probs[r], 1, generator=_generator(seed[r], r, offset[r]))
-            for r in range(probs.shape[0])
-        ])
+        return torch.tensor([_inverse_cdf(probs[r], _word(seed[r], r, offset[r])) for r in range(probs.shape[0])])
     with _on_device(probs):
         return sampling._sampling_from_probs(probs, deterministic=True, seed=seed, offset=offset).to(torch.int64)
 
@@ -113,21 +132,23 @@ def _chain_reference(draft_probs, drafts, target_probs, seed, offset):
     tokens = torch.full((b, k + 1), -1, dtype=torch.int32, device=drafts.device)
     kept = torch.zeros(b, dtype=torch.int32, device=drafts.device)
     for r in range(b):
-        gen = _generator(seed[r], r, offset[r])
+        word = int(offset[r])
         n = k
         for i in range(k):
             d = drafts[r, i]
-            # (0, 1], as the kernel's uniform
-            u = 1.0 - torch.rand((), generator=gen)
+            u = _word(seed[r], r, word)
+            word += 1
             if u * draft_probs[r, i, d] < target_probs[r, i, d]:
                 tokens[r, i] = d
             else:
                 n = i
                 break
+        if n < k:
+            word += k - n  # the kernel's acceptance metric
         residual = target_probs[r, n]
         if n < k:
             residual = (residual - draft_probs[r, n]).clamp_min(0.0)
-        tokens[r, n] = torch.multinomial(residual, 1, generator=gen)[0]
+        tokens[r, n] = _inverse_cdf(residual, _word(seed[r], r, word))
         kept[r] = n
     return tokens, kept
 
@@ -138,7 +159,7 @@ def accept_chain(
     drafts: torch.Tensor,        # [rows, k]
     target_probs: torch.Tensor,  # [rows, k + 1, vocab]
     seed: torch.Tensor,          # [rows]
-    offset: torch.Tensor,        # [rows], k + 1 words of the stream are used
+    offset: torch.Tensor,        # [rows], `chain_words` of the stream are used
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Judge each row's drafts in order. Returns ``tokens`` ``[rows, k + 1]``,
     the kept drafts, then the residual or bonus draw, then -1; and how many

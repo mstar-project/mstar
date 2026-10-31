@@ -89,7 +89,8 @@ class _RowSampling(NamedTuple):
     top_k: torch.Tensor          # the vocabulary where the request's is off
     top_p: torch.Tensor
     seed: torch.Tensor
-    draft_offset: torch.Tensor   # stream offset of the step's first draft draw
+    offset: torch.Tensor         # stream offset of the step's accept chain
+    draft_offset: torch.Tensor   # and of its first draft draw
 
 
 class _StepImage(NamedTuple):
@@ -527,7 +528,7 @@ class SpecDecodeResource(Resource):
         ).view(b, t, vocab)
         tokens, kept = sampled.accept_chain(
             self._draft_ids.index_select(0, rows), self._draft_probs.index_select(0, rows),
-            self._ids.view(b, t)[:, 1:], target, row.seed, row.draft_offset - t,
+            self._ids.view(b, t)[:, 1:], target, row.seed, row.offset,
         )
         # -1 past the first rejection, which nothing emits but the draft embeds
         return self.accept_tokens(tokens.long().clamp(0, vocab - 1), kept=kept)
@@ -551,7 +552,8 @@ class SpecDecodeResource(Resource):
             top_k=torch.where(top_k > 0, top_k, vocab),
             top_p=self._top_p[rows],
             seed=self._seed[rows],
-            draft_offset=offset + self.tokens_per_row,
+            offset=offset,
+            draft_offset=offset + sampled.chain_words(self.num_draft_tokens),
         )
         return self._row_sampling
 
