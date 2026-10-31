@@ -1,7 +1,7 @@
 """Large host copies split over threads of their own.
 
 The API server sizes torch's intra-op pool for its small per-request ops
-(``entrypoint.default_preprocess_threads``), and one numpy memcpy runs on one
+(``cpus.CpuPlan.preprocess_threads``), and one numpy memcpy runs on one
 core. Most of a large copy into a fresh allocation is the destination's
 first-touch page faults, which a copy split into slices takes in parallel too.
 numpy releases the GIL while it copies, so slices on a pool of their own run in
@@ -9,10 +9,10 @@ parallel without resizing the intra-op pool.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import torch
+
+from mstar.utils.threads import ThreadPool
 
 # The smallest slice worth a pool thread: below a few MB the handoff costs
 # about what the slice saves, so a 3 MB image stays one memcpy and a copy gets
@@ -32,7 +32,7 @@ class HostCopier:
         self.workers = max(1, workers)
         self.min_slice_bytes = MIN_SLICE_BYTES if min_slice_bytes is None else max(1, min_slice_bytes)
         self._pool = (
-            ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="mstar-copy")
+            ThreadPool(max_workers=self.workers, thread_name_prefix="mstar-copy")
             if self.workers > 1 else None
         )
 

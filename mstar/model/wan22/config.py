@@ -75,7 +75,7 @@ class Wan22Config:
     # torch.compile the inner DiT region (patchify -> blocks -> head). The UniPC
     # solver stays eager — its CPU-resident sigma trips Inductor (see
     # Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates
-    # build with this False so the eager path stays the bit-exact reference.
+    # build with this False to hold the eager path against the reference.
     compile_dit: bool = True
     # "WxHxF" request shapes (width x height x num_frames) the compiled DiT
     # serves; None is the default shape (1280x704x81). Every other shape runs

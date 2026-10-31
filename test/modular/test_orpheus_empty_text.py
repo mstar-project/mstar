@@ -25,11 +25,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import torch
-from api_server_helpers import idle_poll, make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from test_request_id_reuse import _Socket, _TensorManager
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
+from mstar.communication.event import EventWakeup
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.utils.ipc_format import ConductorMessageType
@@ -55,11 +56,12 @@ class _Server:
     def __init__(self):
         self.socket = _Socket()
         self.stop = threading.Event()
+        results = EventWakeup()
         worker = PreprocessWorkerThread(
             in_queue=queue.Queue(),
             result_tensor_queue=queue.Queue(),
-            out_queue=queue.Queue(),
-            profile_queue=queue.Queue(),
+            out_queue=ResultQueue(results),
+            profile_queue=ResultQueue(results),
             cleanup_request_queue=queue.Queue(),
             abort_request_queue=queue.Queue(),
             reads_done_queue=queue.Queue(),
@@ -78,10 +80,11 @@ class _Server:
         facade.discard_tensor_queue = worker.discard_tensor_queue
         facade.output_queue = worker.out_queue
         facade.profile_queue = worker.profile_queue
+        facade.results_wakeup = results
         facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
         self.api = make_test_api_server(preprocess_worker=facade, model=worker.model, model_name="orpheus")
-        self.api.communicator = SimpleNamespace(poll_for_messages=idle_poll, get_all_new_messages=lambda: [])
+        self.api.communicator = StandInSocket()
         self.api.conductor_proc = None
         self.api._liveness_interval_s = 0.5
         self.api.running = True

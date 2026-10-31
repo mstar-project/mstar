@@ -1019,7 +1019,8 @@ class Model(ABC):
         the next graph walk, inputs, and whether the request is done.
 
         ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions. For single-partition models,
+        producer_done) for consumer partitions, one per stream from another
+        partition; a client stream has no entry. For single-partition models,
         this will be ``None`` or an empty list.
         """
         pass
