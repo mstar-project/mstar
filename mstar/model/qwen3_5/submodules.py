@@ -737,10 +737,11 @@ class LLMSubmodule(ARNodeSubmodule):
         accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
         ids = accepted.target.reshape(-1)
         keep = spec.draft_slots()
+        draft_head = head if self.model.draft_head is None else self.model.draft_head
         for j in range(self.num_draft_tokens):
             attend = functools.partial(self._attend_draft, spec, j)
             out = self.model.mtp.draft(hidden, lm.embed_tokens(ids), attend, keep=keep if j == 0 else None)
-            ids = spec.record_draft(j, (self.model.draft_head or head)(out))
+            ids = spec.record_draft(j, draft_head(out))
             hidden = out
         return accepted
 
