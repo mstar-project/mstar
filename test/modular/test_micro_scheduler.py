@@ -40,7 +40,9 @@ from mstar.worker.batch_builder import (
     BatchBuildRequest,
     BatchBuildResult,
     FIFOBatchBuilder,
+    LineOrder,
     StepCandidates,
+    StepPick,
 )
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
@@ -1846,6 +1848,33 @@ def test_a_mixed_step_takes_at_most_its_row_cap_of_prompts():
     assert batch.graph_walk == MIXED
     assert sorted(batch.request_to_worker_graph) == ["d0", "d1", "p0", "p1"]
     assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p2"]
+
+
+def _mixed_pick(rows: list[str], line: list[str]) -> StepPick:
+    """Over walks ``a`` and ``b``, capped at 2 and 8 and at 8 mixed: a row's
+    walk is its first letter, and ``line`` is who goes first."""
+    return FIFOBatchBuilder().pick(StepCandidates(
+        graph_walk=MIXED, queued=rows, walk_of=lambda rid: rid[0],
+        walk_caps={"a": 2, "b": 8, MIXED: 8},
+        line_order=lambda: LineOrder(line.index, strict=False),
+    ))
+
+
+def test_a_walks_own_cap_is_part_of_what_fits_a_mixed_step():
+    """The a-rows stop at their own cap before b1 mixes the step, so these
+    don't all fit: the earliest a-rows go, not the first two on the queue."""
+    pick = _mixed_pick(["a1", "a2", "a3", "b1"], line=["a3", "a1", "a2", "b1"])
+
+    assert pick.ordered
+    assert pick.taken == ["a3", "a1", "b1"]
+
+
+def test_rows_a_mixed_step_can_hold_in_their_order_keep_it():
+    """b1 mixes the step first, so its cap of 8 takes all three a-rows."""
+    pick = _mixed_pick(["b1", "a1", "a2", "a3"], line=["a3", "a1", "a2", "b1"])
+
+    assert not pick.ordered
+    assert pick.taken == ["b1", "a1", "a2", "a3"]
 
 
 @pytest.mark.parametrize("order", [StepOrder.TURNS, StepOrder.ARRIVAL])

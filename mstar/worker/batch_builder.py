@@ -294,28 +294,17 @@ def _min_cap(*caps: int | None) -> int | None:
 
 
 def _all_fit(rows: list[int], chain: set[int], c: StepCandidates) -> bool:
-    """Whether one step can take every row in ``rows``, whatever their order:
-    within the cap of the walks they hold, and of each walk's rows under a
-    step mixing walks."""
-    caps = c.walk_caps
+    """Whether a step taking ``rows`` in this order would hold them all."""
     if c.one_walk is not None:
-        cap = caps.get(c.one_walk)
+        cap = c.walk_caps.get(c.one_walk)
         return cap is None or len(rows) <= cap
-    counts: dict[str, int] = {}
+    step = _Composition(c)
     for rid in rows:
         walk = c.own_walk if rid in chain else c.walk_of(rid)
-        counts[walk] = counts.get(walk, 0) + 1
-    if len(counts) == 1:
-        (walk,) = counts
-        cap = caps.get(walk)
-        return cap is None or len(rows) <= cap
-    cap = caps.get(c.graph_walk)
-    if cap is None:
-        cap = _min_cap(*(caps.get(walk) for walk in counts))
-    if cap is not None and len(rows) > cap:
-        return False
-    row_caps = c.walk_row_caps
-    return all(n <= row_caps.get(walk, n) for walk, n in counts.items())
+        if step.admits(walk) is not _JOINS:
+            return False
+        step.add(walk)
+    return True
 
 
 class _Composition:
