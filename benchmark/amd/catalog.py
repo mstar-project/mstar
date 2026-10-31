@@ -69,7 +69,8 @@ def family_config_name(row: Row, arm: str) -> str:
 
 def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row:
     return Row(name or f"qwen3_5_{size.lower()}", "text", f"Qwen/Qwen3.5-{size}", "qwen3.5", gpus=gpus, tp=tp,
-               max_len=32768, runner_model_id=True, cost=1 + float(size.rstrip("B")) / 4)
+               max_len=32768, runner_model_id=True, cost=1 + float(size.rstrip("B")) / 4,
+               mstar_configs={"mstar-mtp2-topp": f"qwen3_5_{size.lower()}_mtp2"})
 
 
 QWEN3_OMNI_MOE = ("E=128,N=1536,K=2048", "E=128,N=768,K=1024")  # Thinker, Talker
@@ -176,7 +177,12 @@ class Arm:
     model_kwargs: dict = field(default_factory=dict)
     # Runs right after the named arm on each row, outside the per-row rotation of arm order.
     follows: str = ""
+    # Settings merged into every request of the arm's cells.
+    request_kwargs: dict = field(default_factory=dict)
 
+
+# Sampling as a production request asks for it, for the arms that measure decode under it
+TOP_P_SAMPLING = {"temperature": 0.7, "top_p": 0.9}
 
 SGLANG_NO_OFFLOAD = ("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false")
 SGLANG_DIFFUSION_MODELS = ("flux2_klein", "flux2_klein_9b", "z_image_turbo", "wan22", "cosmos3_nano", "cosmos3_edge")
@@ -197,6 +203,15 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
     Arm("mstar-tpasync", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_9b_tp2",),
         env={"MSTAR_SHM_ARENA": "1", "MSTAR_TP_ASYNC_SCHED": "1"}, tp_env={"GLOO_SOCKET_IFNAME": "lo"},
         recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),
+    # Text decode under top-p: plain sampling, and speculative decoding with the head drafting two tokens (the row's
+    # _mtp2 config). Greedy correctness does not apply, so these run with --no-correctness; sampled correctness is
+    # benchmark/spec_decode/sampled_dist.py.
+    Arm("mstar-topp", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_0.8b", "qwen3_5_9b"),
+        env={"MSTAR_SHM_ARENA": "1"}, request_kwargs=TOP_P_SAMPLING,
+        recipe="as the mstar arm, every request at temperature 0.7, top-p 0.9"),
+    Arm("mstar-mtp2-topp", "mstar", ("text",), client="ours_openai", rows=("qwen3_5_0.8b", "qwen3_5_9b"),
+        env={"MSTAR_SHM_ARENA": "1"}, request_kwargs=TOP_P_SAMPLING,
+        recipe="the row's _mtp2 config, every request at temperature 0.7, top-p 0.9"),
     Arm("mstar-colocated", "mstar", ("tts",), client="ours_openai", rows=("qwen3tts_1p7b",),
         env={"MSTAR_SHM_ARENA": "1"}, recipe="as the mstar arm, on the single-worker config"),
     # The encoder and the decoder as two worker processes on one GPU (configs/whisper_large_split.yaml, its
