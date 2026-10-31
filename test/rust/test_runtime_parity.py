@@ -2484,10 +2484,11 @@ def test_an_unread_loop_back_sends_nothing():
 
 # --- a loop body that emits only to EMPTY_DESTINATION ------------------------
 #
-# Chunked prefill's shape: the chunked node has no loop-back edge -- each
-# iteration re-runs it on the next slice of the same re-injected input -- and
-# no destination of its own, so only the Loop's declared output carries a
-# chunk's result on. The two runtimes cache loop outputs from different
+# A plain body that emits only to EMPTY_DESTINATION, with no loop-back (the
+# real chunk wrapper adds a tick, which the ``_wrapped_chunk_walk`` tests
+# below cover): each iteration re-runs it on the next slice of the same
+# re-injected input, so only the Loop's declared output carries a chunk's
+# result on. The two runtimes cache loop outputs from different
 # sources: Python from the node's declared ``outputs`` list
 # (``LoopStateRegistry.mark_entity_complete``), Rust from the routed-edge
 # slice (``cache_outputs`` over ``out[from..]``). An edge that routes nowhere

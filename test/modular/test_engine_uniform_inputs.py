@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("torch")
 
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine  # noqa: E402
 
 
@@ -65,8 +66,8 @@ def _engine(sub):
     eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
-    # no token budget: these steps are not chunked
-    eng._chunking = SimpleNamespace(check_budget=lambda batch, inputs: None)
+    # no policies: these steps are not chunked
+    eng._chunking = ChunkingManagement(eng._submodules)
     return eng
 
 

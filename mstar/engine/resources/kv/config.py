@@ -524,8 +524,8 @@ class KVStep(ResourceStep):
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
-    # the rows the forks apply to; None is every row (a chunked prompt
-    # pre-forks on its first chunk and post-forks on its last)
+    # the rows the forks apply to; None is every row. A chunked prompt forks
+    # on some of its chunks only, e.g. a pre-fork on its first
     fork_rids: frozenset | None = None
     # (request_id, label) pairs that run against SINK_PAGE and hold no pages
     sink: frozenset[tuple[str, str]] = frozenset()

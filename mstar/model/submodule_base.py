@@ -368,8 +368,9 @@ class ChunkingPolicy:
 
     ``accumulated_outputs``: output edges a consumer needs every chunk of,
     gathered on the Loop and handed over as one item per chunk when the
-    prompt finishes; the consumer joins the pieces itself. An edge not named
-    here carries the final chunk's tensors alone.
+    prompt finishes. A streamed edge's consumer gets them joined into one item
+    by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here
+    carries the final chunk's tensors alone.
 
     ``reserve_whole_prefill``: whether a first chunk reserves the KV the
     whole prefill needs, so a part-done row cannot wedge on a full arena.
@@ -742,8 +743,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
         """This row's token count, read from input shapes alone; None when the
-        walk does not declare one. Lets the scheduler leave out a row whose
-        KV does not fit instead of refusing the whole step."""
+        walk does not declare one. A chunkable walk's prompts are cut into
+        chunks by it, so it must equal ``prepare_inputs().input_seq_len`` of the
+        whole input (before any cached prefix is removed), or the row fails
+        at its first chunk."""
         del graph_walk, fwd_info, inputs, kwargs
         return None
 

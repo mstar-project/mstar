@@ -363,9 +363,10 @@ class RopeManager(PositionManager):
 
     @staticmethod
     def _forking_rids(plan_outputs: KVPlanOutputs, ctx: StepContext) -> Sequence[int]:
-        """The rows KV forked: a step's forks may cover only some of its rows
-        (a chunked prompt forks on its first and last chunk), and a counter
-        re-forked mid-prompt would restart the target's positions."""
+        """The rows KV forked: a step's forks may cover only some of its rows.
+        A chunked prompt forks on some of its chunks only (BAGEL's pre-forks on
+        its first), and a later chunk re-forking the target's counter would
+        restart its positions."""
         fork_rids = plan_outputs.fork_rids
         if fork_rids is None:
             return ctx.padded_request_ids

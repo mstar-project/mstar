@@ -85,6 +85,6 @@ def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
     assert ("LLM", "prefill_vision") not in policies
     mixed = policies[("LLM", LLM_MIXED)]
     assert not mixed.chunkable and mixed.max_batch_tokens == LLMSubmodule.MAX_BATCH_TOKENS
-    largest = max(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
-    assert LLMSubmodule.MAX_BATCH_TOKENS + max(LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES) <= largest
+    # decode rows count inside the budget, and a step over a bucket pads to the next one up
+    assert LLMSubmodule.MAX_BATCH_TOKENS in LLMSubmodule.PREFILL_TOKEN_BUCKETS
 

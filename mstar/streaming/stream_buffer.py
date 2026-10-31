@@ -110,8 +110,8 @@ class StreamBuffer:
 
         A chunked producer emits a piece per chunk; without this each would be
         an item of its own and a policy counting items would hand the consumer
-        only the first. Counted as one registration, so the producer's item
-        total still matches.
+        only the first. Each piece still counts towards the registered total,
+        which is in the producer's units (see below).
         """
         if len(tensor_ids) == 1 or self.join_dim is None:
             for tensor_id in tensor_ids:
