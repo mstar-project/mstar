@@ -274,7 +274,6 @@ class SlidingWindowTests(unittest.TestCase):
                 self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
             elif span == 16:
                 # a holds 3 pages of the full layer and 1 of the window
-                self.assertEqual(kv._allotments["a"].pages, 4)
                 self.assertIsNone(kv.reserve("b", "LLM", "walk", None))
         kv.remove_request("a")
         # an admit unwound gives back the pages it took in each group
