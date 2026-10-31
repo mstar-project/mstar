@@ -331,7 +331,7 @@ def test_a_row_whose_kept_set_fits_is_filtered_on_its_candidates_alone(monkeypat
     args = (torch.tensor([1.0]), torch.tensor([VOCAB]), torch.tensor([0.9]))
     cand = sampled.filtered_candidates(logits, *args)
     assert bool(cand.complete[0]) and (cand.probs[0] > 0).sum() < 4
-    dense = torch.zeros(1, VOCAB).scatter_(1, cand.ids, cand.probs)
+    dense = torch.zeros(1, VOCAB).scatter_add_(1, cand.ids, cand.probs)
     assert torch.allclose(dense, sampled.filtered_probs(logits, *args), atol=1e-5)
 
 
@@ -360,7 +360,7 @@ def test_a_draft_truncated_to_its_candidates_still_leaves_the_target_exact(monke
     args = (torch.tensor([1.0]), torch.tensor([VOCAB]), torch.tensor([0.95]))
     cand = sampled.filtered_candidates(raw[1:], *args)
     assert not cand.complete.any()
-    p = torch.zeros(VOCAB).scatter_(0, cand.ids[0], cand.probs[0])
+    p = torch.zeros(VOCAB).scatter_add_(0, cand.ids[0], cand.probs[0])
     spec = _spec(rows, k=1, temperature=1.0, top_p=0.95)
     first = torch.zeros(VOCAB)
     kept = 0
