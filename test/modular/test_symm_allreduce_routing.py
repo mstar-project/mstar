@@ -222,7 +222,7 @@ def test_init_dist_takes_the_config_mode(monkeypatch, fake_cuda):
 @pytest.mark.parametrize("tp_allreduce", [None, "symm_multimem"])
 def test_global_config_hands_it_to_every_worker(tp_allreduce):
     wg = SimpleNamespace(
-        tp_size=2, sp_size=1, _tp_ranks=[[0, 1]], _sp_ranks=[[0], [1]],
+        tp_size=2, sp_size=1, cfg_size=1, _tp_ranks=[[0, 1]], _sp_ranks=[[0], [1]], _cfg_ranks=[],
         ranks=[0, 1], _tp_comm_size=2, _instance_ranks=[[0, 1]],
         section=SimpleNamespace(get_nodes=lambda: {"llm": None}),
     )

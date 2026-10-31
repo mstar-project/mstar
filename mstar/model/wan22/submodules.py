@@ -761,6 +761,10 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
     The UniPC update matches the step functions in ``components/unipc.py`` to float32
     rounding; the CFG combine and the x0 conversion round through bf16 where the
     reference does.
+
+    Under ``GuidanceParallel`` this rank's forward holds one branch per request and
+    the other rank's arrives by all-gather before the combine, so the solver runs on
+    the same two velocities on both ranks and the loop-back edges stay replicated.
     """
 
     _I2V_WALK = Wan22DitSubmodule._I2V_WALK
@@ -785,10 +789,12 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
         max_batch_size: int = 2,
         capture_buckets=(),
         capture_batch_sizes=(1, 2),
+        guidance_parallel=None,
     ):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=max_batch_size, attn_resource_key=None,
             capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            guidance_parallel=guidance_parallel,
         )
         self.transformer = transformer
         self.config = config
@@ -838,28 +844,35 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
             UNIPC_LAST_SAMPLE: torch.zeros(shape, dtype=torch.float32, device=device),
         }
 
+    def _text_edges(self, bucket_key: Wan22Shape) -> tuple[str, ...]:
+        """The text embeddings this rank's rows read, in row order."""
+        if not bucket_key.cfg:
+            return ("text_embeds_pos",)
+        placed = self.guidance_parallel
+        if placed is None:
+            return ("text_embeds_pos", "text_embeds_neg")
+        return ("text_embeds_pos",) if placed.runs_cond else ("text_embeds_neg",)
+
     def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: Wan22Shape) -> dict[str, torch.Tensor]:
-        tensors = {"text_embeds_pos": inputs["text_embeds_pos"][0][0]}
-        if bucket_key.cfg:
-            tensors["text_embeds_neg"] = inputs["text_embeds_neg"][0][0]
+        tensors = {name: inputs[name][0][0] for name in self._text_edges(bucket_key)}
         if bucket_key.i2v:
             tensors["image_latent"] = inputs["image_latent"][0][0]
         return tensors
 
     def num_tokens(self, bucket_key: Wan22Shape) -> int:
-        return bucket_key.video_tokens * bucket_key.rows
+        return bucket_key.video_tokens * self.branch_rows(bucket_key.cfg)
 
     def capture_request_inputs(self, bucket_key: Wan22Shape, device) -> dict[str, torch.Tensor]:
         shape = (self.config.in_channels, *bucket_key.grid)
-        text = torch.zeros(bucket_key.text_len, self.config.text_dim, dtype=torch.bfloat16, device=device)
         tensors = {
             self.LATENTS: torch.zeros(shape, dtype=torch.float32, device=device),
             UNIPC_MODEL_OUTPUTS: torch.zeros((SOLVER_ORDER, *shape), dtype=torch.float32, device=device),
             UNIPC_LAST_SAMPLE: torch.zeros(shape, dtype=torch.float32, device=device),
-            "text_embeds_pos": text,
+            **{
+                name: torch.zeros(bucket_key.text_len, self.config.text_dim, dtype=torch.bfloat16, device=device)
+                for name in self._text_edges(bucket_key)
+            },
         }
-        if bucket_key.cfg:
-            tensors["text_embeds_neg"] = text.clone()
         if bucket_key.i2v:
             tensors["image_latent"] = torch.zeros(
                 (self.config.in_channels, 1, *bucket_key.grid[1:]), dtype=torch.float32, device=device,
@@ -878,7 +891,7 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
 
     def denoise(
         self, engine_inputs, bucket_key: Wan22Shape, latents, unipc_model_outputs, unipc_last_sample,
-        sigma, timestep, guidance, final, text_embeds_pos, text_embeds_neg=None, image_latent=None, **coeffs,
+        sigma, timestep, guidance, final, text_embeds_pos=None, text_embeds_neg=None, image_latent=None, **coeffs,
     ):
         batch = latents.shape[0]
 
@@ -894,12 +907,14 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
             else:
                 model_input = latents
                 timesteps = timestep.view(batch, 1).expand(batch, bucket_key.video_tokens)
-            # one transformer row per guidance branch, a request's two adjacent (cond
-            # first), the order declare_step gives the attention segments
-            rows = bucket_key.rows
+            # one transformer row per guidance branch this rank runs, a request's two
+            # adjacent (cond first), the order declare_step gives the attention segments
+            rows = self.branch_rows(bucket_key.cfg)
             hidden_states = model_input.to(dtype).repeat_interleave(rows, dim=0)
-            text = torch.stack([text_embeds_pos, text_embeds_neg], dim=1).flatten(0, 1) if bucket_key.cfg \
-                else text_embeds_pos
+            if rows == 2:
+                text = torch.stack([text_embeds_pos, text_embeds_neg], dim=1).flatten(0, 1)
+            else:
+                text = text_embeds_neg if text_embeds_pos is None else text_embeds_pos
             out = self._compiled.forward_for(self.transformer, hidden_states)(
                 hidden_states=hidden_states,
                 timestep=timesteps.repeat_interleave(rows, dim=0),
@@ -907,7 +922,7 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
                 **self.attention(),
             )
             if bucket_key.cfg:
-                cond, uncond = out.unflatten(0, (batch, 2)).unbind(1)
+                cond, uncond = self.guidance_branches(out, batch)
                 # the reference's bf16 combine with a Python-float scale: the product
                 # in float32, rounded to bf16
                 out = uncond + (per_row(guidance) * (cond - uncond).float()).to(out.dtype)
@@ -955,7 +970,7 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
         video, text = [], []
         for rid, inp in zip(request_ids, inputs, strict=True):
             shape: Wan22Shape = inp.resource_step_info
-            for _ in range(shape.rows):
+            for _ in range(self.branch_rows(shape.cfg)):
                 video.append(Segment(rid, VIDEO_SPAN, shape.video_tokens))
                 text.append(Segment(rid, TEXT_SPAN, shape.text_len))
         return SubmoduleStep(

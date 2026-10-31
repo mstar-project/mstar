@@ -6,6 +6,7 @@ from typing import Any
 
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.distributed.guidance_parallel import GuidanceParallel
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -46,9 +47,15 @@ def _node_group_entry_problem(i: int, group: Any) -> str | None:
             return f"node_groups[{i}]: {key} must be a list of names; got {names!r}"
     if not all(_is_count(rank, 0) for rank in group["ranks"]):
         return f"node_groups[{i}]: ranks must be integers >= 0; got {group['ranks']!r}"
-    for key in ("tp_size", "sp_size"):
+    for key in ("tp_size", "sp_size", "cfg_size"):
         if not _is_count(group.get(key, 1), 1):
             return f"node_groups[{i}]: {key} must be an integer >= 1; got {group[key]!r}"
+    if group.get("cfg_size", 1) not in (1, GuidanceParallel.NUM_BRANCHES):
+        return (
+            f"node_groups[{i}]: cfg_size places the {GuidanceParallel.NUM_BRANCHES} guidance "
+            f"branches, one per rank, so it must be 1 or {GuidanceParallel.NUM_BRANCHES}; "
+            f"got {group['cfg_size']!r}"
+        )
     return None
 
 
@@ -104,14 +111,15 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
     sharding = model.get_default_sharding_config()
     for i, group in enumerate(node_groups):
         names, ranks = group["node_names"], group["ranks"]
-        tp, sp = group.get("tp_size", 1), group.get("sp_size", 1)
-        if len(ranks) % (tp * sp):
+        tp, sp, cfg = group.get("tp_size", 1), group.get("sp_size", 1), group.get("cfg_size", 1)
+        if len(ranks) % (tp * sp * cfg):
             yield (
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
-                f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
+                f"divisible by tp_size*sp_size*cfg_size ({tp}*{sp}*{cfg}={tp * sp * cfg})."
             )
         for size, axis, enabled in (
             (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
+            (cfg, "cfg", sharding.cfg_enabled_nodes),
         ):
             if size > 1 and any(node not in enabled for node in names):
                 yield (
@@ -324,7 +332,7 @@ def _worker_parallelism(
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
     same groups the conductor hands it: at most one lockstep-parallel node per
-    worker, and every resource spec's nodes on one TP x SP shape and, on each
+    worker, and every resource spec's nodes on one TP x SP x CFG shape and, on each
     worker, in one parallel group. Over every node placed on the worker; the
     engine checked only nodes it built a submodule for, so a dummy run (no
     weights) skipped the resource checks."""
@@ -334,13 +342,13 @@ def _worker_parallelism(
     # GlobalParallelConfig and init_dist number workers by their position
     # among the deployment's ranks, and parallel groups by rank
     misplaced = sorted({
-        rank for wg in worker_graphs for group in wg._tp_ranks + wg._sp_ranks
+        rank for wg in worker_graphs for group in wg._tp_ranks + wg._sp_ranks + wg._cfg_ranks
         for rank in group if rank >= len(ranks) or ranks[rank] != rank
     })
     if misplaced:
         yield (
-            f"the deployment uses ranks {ranks}; ranks {misplaced} are in tensor- or "
-            "sequence-parallel groups, which need every lower rank in use too."
+            f"the deployment uses ranks {ranks}; ranks {misplaced} are in tensor-, "
+            "sequence- or guidance-parallel groups, which need every lower rank in use too."
         )
         return
     worker_ids = [f"worker_{rank}" for rank in ranks]

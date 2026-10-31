@@ -341,40 +341,54 @@ class CommGroup:
 class JointGroups:
     tp_group: CommGroup
     sp_group: CommGroup
+    cfg_group: CommGroup = field(default_factory=CommGroup.trivial)
 
     @property
     def rank(self):
         """This worker's rank within ``node``'s lockstep instance — the
-        TP x SP block, row-major [sp][tp] to match
+        TP x SP x CFG block, row-major [cfg][sp][tp] to match
         ``WorkerGraph._instance_ranks``. 0 iff this worker leads the
-        instance (it is rank 0 in both its TP and SP comm groups)."""
-        return self.sp_group.rank * self.tp_group.world_size + self.tp_group.rank
+        instance (it is rank 0 in each of its comm groups)."""
+        branch_size = self.tp_group.world_size * self.sp_group.world_size
+        return (
+            self.cfg_group.rank * branch_size
+            + self.sp_group.rank * self.tp_group.world_size + self.tp_group.rank
+        )
 
     @property
     def world_size(self):
-        """Total ranks in ``node``'s lockstep instance (tp_size * sp_size)."""
-        return  self.tp_group.world_size * self.sp_group.world_size
+        """Total ranks in ``node``'s lockstep instance (tp_size * sp_size * cfg_size)."""
+        return self.tp_group.world_size * self.sp_group.world_size * self.cfg_group.world_size
+
+    def barrier(self) -> None:
+        """Hold every rank of the instance here, one axis at a time."""
+        for group in (self.tp_group, self.sp_group, self.cfg_group):
+            group.barrier()
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-        """Broadcast from joint rank ``src`` to the whole TP x SP block.
+        """Broadcast from joint rank ``src`` to the whole instance.
 
-        ``src`` is indexed like ``rank`` (row-major [sp][tp]); each subgroup
-        takes its own coordinate out of it, since ``CommGroup.broadcast``
-        indexes its own members. TP first: that fills src's SP row across
-        every TP column, which the SP pass then broadcasts down.
+        ``src`` is indexed like ``rank`` (row-major [cfg][sp][tp]); each
+        subgroup takes its own coordinate out of it, since
+        ``CommGroup.broadcast`` indexes its own members. TP first: that fills
+        src's SP row across every TP column, which the SP pass then broadcasts
+        down, and the CFG pass across the guidance branches.
         """
         if not 0 <= src < self.world_size:
             raise ValueError(
                 f"broadcast src {src} outside the joint group "
                 f"(world size {self.world_size})"
             )
-        sp_src, tp_src = divmod(src, self.tp_group.world_size)
+        tp_size = self.tp_group.world_size
+        cfg_src, branch_src = divmod(src, tp_size * self.sp_group.world_size)
+        sp_src, tp_src = divmod(branch_src, tp_size)
         tensor = self.tp_group.broadcast(tensor, tp_src)
-        return self.sp_group.broadcast(tensor, sp_src)
+        tensor = self.sp_group.broadcast(tensor, sp_src)
+        return self.cfg_group.broadcast(tensor, cfg_src)
 
     def agree(self, values: list[int], op: dist.ReduceOp = dist.ReduceOp.MIN) -> list[int]:
-        """``CommGroup.agree`` over the whole TP x SP block."""
-        for group in (self.tp_group, self.sp_group):
+        """``CommGroup.agree`` over the whole instance."""
+        for group in (self.tp_group, self.sp_group, self.cfg_group):
             values = group.agree(values, op)
         return values
 
@@ -397,7 +411,7 @@ class WorkerParallelGroups:
     # GlobalParallelConfig from the global worker-graph view so all ranks
     # agree.
     any_parallelism: bool = False
-    # Every distinct TP / SP rank tuple in the run — the union of both mesh
+    # Every distinct TP / SP / CFG rank tuple in the run — the union of the mesh
     # axes, sorted for stable iteration order across workers. Set by
     # GlobalParallelConfig. ``init_dist`` calls ``dist.new_group`` once per
     # entry on every rank — including ranks that aren't members of the
@@ -407,13 +421,14 @@ class WorkerParallelGroups:
     world_parallel_groups: list[tuple[int, ...]] = field(default_factory=list)
     # Per-node comm groups, one per mesh axis (the SP group all-to-alls
     # around attention; the TP group all-reduces the row-parallel
-    # projections).
+    # projections; the CFG group all-gathers the guidance branches' velocity).
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
+    node_to_cfg_group: dict[str, CommGroup] = field(default_factory=dict)
     # Global topology metadata. Unlike the comm-group maps above, these maps
     # describe every replica, including ones this worker does not host.
     node_to_parallel_shapes: dict[
-        str, frozenset[tuple[int, int]]
+        str, frozenset[tuple[int, int, int]]
     ] = field(default_factory=dict)
     node_to_instance_groups: dict[
         str, frozenset[tuple[int, ...]]
@@ -447,6 +462,15 @@ class WorkerParallelGroups:
             )
         if node not in self.node_to_sp_group:
             self.node_to_sp_group[node] = comm_group
+
+    def add_cfg(self, node: str, comm_group: CommGroup):
+        # CFG analogue of ``add`` — the guidance-parallel comm group for a node.
+        if node in self.node_to_cfg_group and self.node_to_cfg_group[node].group_members != comm_group.group_members:
+            raise RuntimeError(
+                f"Node {node} already has a CFG comm group assigned for worker {self.global_rank}"
+            )
+        if node not in self.node_to_cfg_group:
+            self.node_to_cfg_group[node] = comm_group
 
     def init_dist(
         self, init_method="tcp://127.0.0.1:29500",
@@ -489,11 +513,11 @@ class WorkerParallelGroups:
             timeout=timeout,
         )
 
-        # One subgroup per distinct rank tuple across BOTH mesh axes —
+        # One subgroup per distinct rank tuple across every mesh axis —
         # ``world_parallel_groups`` is the sorted union, so every rank
         # iterates it identically; ``new_group`` is collective and
         # tag-ordered (see the field comment). A tuple shared by a TP and
-        # an SP group (degenerate meshes) maps to one subgroup.
+        # an SP or a CFG group (degenerate meshes) maps to one subgroup.
         #
         # The gloo twins are members only. With the default group bound to a
         # device, a non-member's subgroup creation joins an ncclCommSplit
@@ -526,7 +550,7 @@ class WorkerParallelGroups:
 
         seen: set[int] = set()
         for comm_group in (
-            list(self.node_to_tp_group.values()) + list(self.node_to_sp_group.values())
+            *self.node_to_tp_group.values(), *self.node_to_sp_group.values(), *self.node_to_cfg_group.values(),
         ):
             if id(comm_group) in seen:
                 continue
@@ -552,11 +576,17 @@ class WorkerParallelGroups:
             self.node_to_sp_group[node] = CommGroup.trivial()
         return self.node_to_sp_group[node]
 
+    def get_cfg_config_for_node(self, node: str) -> CommGroup:
+        if node not in self.node_to_cfg_group:
+            self.node_to_cfg_group[node] = CommGroup.trivial()
+        return self.node_to_cfg_group[node]
+
     def get_joint_group_for_node(self, node: str) -> JointGroups:
         if node not in self.node_to_joint_group:
             self.node_to_joint_group[node] = JointGroups(
                 tp_group=self.get_tp_config_for_node(node),
-                sp_group=self.get_sp_config_for_node(node)
+                sp_group=self.get_sp_config_for_node(node),
+                cfg_group=self.get_cfg_config_for_node(node),
             )
         return self.node_to_joint_group[node]
 
@@ -567,14 +597,14 @@ class WorkerParallelGroups:
         return self.get_joint_group_for_node(node).world_size
 
     def all_in_same_group(self, nodes: list[str]) -> bool:
-        """Whether every node shares one (tp, sp) group.
+        """Whether every node shares one (tp, sp, cfg) group.
 
         Per dimension, and only where someone parallelizes: unregistered reads
         as the single-rank group, so a TP-only run would otherwise be rejected
         for "differing" on SP. By membership, not identity — the lazy getters
         mint a fresh group per node (and would cache one for a remote node).
         """
-        for per_node in (self.node_to_tp_group, self.node_to_sp_group):
+        for per_node in (self.node_to_tp_group, self.node_to_sp_group, self.node_to_cfg_group):
             members = [
                 tuple(group.group_members) if group is not None else (0,)
                 for group in (per_node.get(node) for node in nodes)
@@ -586,8 +616,8 @@ class WorkerParallelGroups:
         return True
 
     def all_have_compatible_parallel_shape(self, nodes: set[str]) -> bool:
-        """Whether every replica uses the same tensor/sequence parallel size."""
-        shapes: set[tuple[int, int]] = set()
+        """Whether every replica uses the same tensor/sequence/guidance parallel size."""
+        shapes: set[tuple[int, int, int]] = set()
         for node in nodes:
             global_shapes = self.node_to_parallel_shapes.get(node)
             if global_shapes:
@@ -595,9 +625,11 @@ class WorkerParallelGroups:
                 continue
             tp = self.node_to_tp_group.get(node)
             sp = self.node_to_sp_group.get(node)
+            cfg = self.node_to_cfg_group.get(node)
             shapes.add((
                 tp.world_size if tp is not None else 1,
                 sp.world_size if sp is not None else 1,
+                cfg.world_size if cfg is not None else 1,
             ))
         return len(shapes) <= 1
 
@@ -642,7 +674,9 @@ class WorkerParallelGroups:
         if not self.any_parallelism or not resolve_dist_timeout(self.dist_timeout_s):
             return
         groups = [dist.group.WORLD]
-        for comm_group in (*self.node_to_tp_group.values(), *self.node_to_sp_group.values()):
+        for comm_group in (
+            *self.node_to_tp_group.values(), *self.node_to_sp_group.values(), *self.node_to_cfg_group.values(),
+        ):
             groups += [comm_group.device_group, comm_group.cpu_group]
         for pg in {id(g): g for g in groups if g is not None}.values():
             nccl = dist.get_backend(pg) == dist.Backend.NCCL
@@ -660,12 +694,12 @@ class GlobalParallelConfig:
     ):
         self.num_workers = len(worker_ids)
         any_parallelism = any(
-            wg.tp_size > 1 or wg.sp_size > 1 for wg in worker_graphs.values()
+            wg.tp_size > 1 or wg.sp_size > 1 or wg.cfg_size > 1 for wg in worker_graphs.values()
         )
-        node_to_parallel_shapes: dict[str, set[tuple[int, int]]] = {}
+        node_to_parallel_shapes: dict[str, set[tuple[int, int, int]]] = {}
         node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
         for wg in worker_graphs.values():
-            shape = (wg._tp_comm_size, wg.sp_size)
+            shape = (wg._tp_comm_size, wg.sp_size, wg.cfg_size)
             instance_groups = wg._instance_ranks or [
                 [rank] for rank in wg.ranks
             ]
@@ -694,10 +728,16 @@ class GlobalParallelConfig:
             for rank_group in wg._sp_ranks
             if len(rank_group) > 1
         })
-        # The union of both axes, sorted — the per-rank ``new_group``
+        world_cfg_groups: list[tuple[int, ...]] = sorted({
+            tuple(rank_group)
+            for wg in worker_graphs.values()
+            for rank_group in wg._cfg_ranks
+            if len(rank_group) > 1
+        })
+        # The union of the axes, sorted — the per-rank ``new_group``
         # schedule (see the ``world_parallel_groups`` field comment).
         world_parallel_groups: list[tuple[int, ...]] = sorted(
-            set(world_tp_groups) | set(world_sp_groups)
+            set(world_tp_groups) | set(world_sp_groups) | set(world_cfg_groups)
         )
         self.per_worker_config: dict[str, WorkerParallelGroups] = {
             wid: WorkerParallelGroups(
@@ -715,6 +755,7 @@ class GlobalParallelConfig:
         # (global rank, (group ranks...)) -> comm group, for each mesh axis.
         self.comm_groups: dict[tuple[int, tuple], CommGroup] = {}
         self.sp_comm_groups: dict[tuple[int, tuple], CommGroup] = {}
+        self.cfg_comm_groups: dict[tuple[int, tuple], CommGroup] = {}
         for wg in worker_graphs.values():
             for rank_group in wg._tp_ranks:
                 rank_group_tuple = tuple(rank_group)
@@ -743,4 +784,18 @@ class GlobalParallelConfig:
                     for node in wg.section.get_nodes().keys():
                         self.per_worker_config[worker_ids[rank]].add_sp(
                             node, self.sp_comm_groups[key]
+                        )
+            for rank_group in wg._cfg_ranks:
+                rank_group_tuple = tuple(rank_group)
+                for i, rank in enumerate(rank_group):
+                    key = (rank, rank_group_tuple)
+                    if key not in self.cfg_comm_groups:
+                        self.cfg_comm_groups[key] = CommGroup(
+                            my_global_rank=rank,
+                            my_group_rank=i,
+                            group_members=rank_group
+                        )
+                    for node in wg.section.get_nodes().keys():
+                        self.per_worker_config[worker_ids[rank]].add_cfg(
+                            node, self.cfg_comm_groups[key]
                         )

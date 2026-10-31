@@ -189,20 +189,25 @@ class WorkerGraph:
     ranks: list[int] = field(default_factory=list)
     tp_size: int = 1
     sp_size: int = 1
+    cfg_size: int = 1
 
-    # ``ranks`` form a 2D [sp_size, tp_size] mesh per instance (instances tile
-    # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
-    # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
-    # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (the conductor's lockstep
-    # routing unit — every rank of an instance runs a request together). With
-    # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
-    # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
-    # __post_init__ to the instance size (tp*sp) so the conductor — which models
-    # a parallel group as its lockstep unit — routes to the whole instance; the
-    # original per-axis degrees live in ``_tp_comm_size`` and ``sp_size``.
+    # ``ranks`` form a 3D [cfg_size, sp_size, tp_size] mesh per instance
+    # (instances tile for data parallelism). ``_tp_ranks`` are the mesh rows
+    # (tensor-parallel comm groups: sharded heads/weights, all-reduce);
+    # ``_sp_ranks`` are the columns (sequence-parallel comm groups: Ulysses
+    # all-to-all); ``_cfg_ranks`` run along the third axis (guidance-parallel
+    # comm groups: one classifier-free guidance branch per rank, see
+    # ``GuidanceParallel``); ``_instance_ranks`` are the whole instances (the
+    # conductor's lockstep routing unit — every rank of an instance runs a
+    # request together). With sp_size==cfg_size==1 this reduces to the old
+    # ``ranks`` chunked by ``tp_size`` (trivial SP and CFG groups; instance ==
+    # TP row). ``tp_size`` is rewritten in __post_init__ to the instance size
+    # (tp*sp*cfg) so the conductor — which models a parallel group as its
+    # lockstep unit — routes to the whole instance; the original per-axis
+    # degrees live in ``_tp_comm_size``, ``sp_size`` and ``cfg_size``.
     _tp_ranks: list[list[int]] = field(default_factory=list)
     _sp_ranks: list[list[int]] = field(default_factory=list)
+    _cfg_ranks: list[list[int]] = field(default_factory=list)
     _instance_ranks: list[list[int]] = field(default_factory=list)
     _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
@@ -215,28 +220,38 @@ class WorkerGraph:
     worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
-        if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
+        if (self.tp_size > 1 or self.sp_size > 1 or self.cfg_size > 1) and not self._tp_ranks:
             tp = self.tp_size  # tensor-parallel (row / all-reduce) degree
             sp = self.sp_size  # sequence-parallel (all-to-all) degree
-            inst = tp * sp
+            cfg = self.cfg_size  # guidance-parallel (one branch per rank) degree
+            branch_size = tp * sp
+            inst = branch_size * cfg
             assert len(self.ranks) % inst == 0, (
                 f"WorkerGraph {self.worker_graph_id} has {len(self.ranks)} ranks; "
-                f"not divisible by tp_size*sp_size ({tp}*{sp}={inst})."
+                f"not divisible by tp_size*sp_size*cfg_size ({tp}*{sp}*{cfg}={inst})."
             )
             tp_ranks: list[list[int]] = []
             sp_ranks: list[list[int]] = []
+            cfg_ranks: list[list[int]] = []
             instance_ranks: list[list[int]] = []
             for base in range(0, len(self.ranks), inst):
                 block = self.ranks[base:base + inst]
                 instance_ranks.append(block)
-                # row-major [sp][tp] grid over this instance's ranks
-                grid = [block[s * tp:(s + 1) * tp] for s in range(sp)]
-                tp_ranks += grid  # rows: vary tp within fixed sp
-                sp_ranks += [
-                    [grid[s][t] for s in range(sp)] for t in range(tp)
-                ]  # columns: vary sp within fixed tp
+                # one [sp][tp] grid per guidance branch
+                branches = [block[c * branch_size:(c + 1) * branch_size] for c in range(cfg)]
+                for branch in branches:
+                    # row-major [sp][tp] grid over this branch's ranks
+                    grid = [branch[s * tp:(s + 1) * tp] for s in range(sp)]
+                    tp_ranks += grid  # rows: vary tp within fixed sp
+                    sp_ranks += [
+                        [grid[s][t] for s in range(sp)] for t in range(tp)
+                    ]  # columns: vary sp within fixed tp
+                cfg_ranks += [
+                    [branches[c][i] for c in range(cfg)] for i in range(branch_size)
+                ]  # vary the branch within a fixed (sp, tp)
             self._tp_ranks = tp_ranks
             self._sp_ranks = sp_ranks
+            self._cfg_ranks = cfg_ranks
             self._instance_ranks = instance_ranks
             self._tp_comm_size = tp
             # Conductor routes to the lockstep unit (the whole instance).
@@ -284,6 +299,7 @@ def _divide_into_worker_graphs(
                 ranks=ng["ranks"],
                 tp_size=ng.get("tp_size", 1),
                 sp_size=ng.get("sp_size", 1),
+                cfg_size=ng.get("cfg_size", 1),
             )
         ]
 
@@ -529,14 +545,15 @@ class Model(ABC):
                 )
             tp = ng.get("tp_size", 1)
             sp = ng.get("sp_size", 1)
-            instance_size = tp * sp
+            cfg = ng.get("cfg_size", 1)
+            instance_size = tp * sp * cfg
             if instance_size <= 1:
                 continue
-            # The sharding group is the lockstep unit — tp*sp workers routed
-            # together. TP shards weights via shard_dim-driven fanout; SP is
-            # in-module (replicated signals, no shard_dim) but its ranks must
-            # still run each request together, so the group spans the whole
-            # instance.
+            # The sharding group is the lockstep unit — tp*sp*cfg workers
+            # routed together. TP shards weights via shard_dim-driven fanout;
+            # SP and guidance parallelism are in-module (replicated signals,
+            # no shard_dim) but their ranks must still run each request
+            # together, so the group spans the whole instance.
             groups.append(ShardingGroup(
                 nodes=set(ng["node_names"]),
                 tp_size=instance_size,

@@ -1,0 +1,29 @@
+model: "wan22"
+
+# wan22.yaml on two GPUs: the DiT runs each request's guidance branches on a rank
+# each (cfg_size: 2) and exchanges the two velocities once per step, before the
+# solver. Everything but node_groups is wan22.yaml's; see there for the knobs.
+max_seq_len: 512
+
+model_kwargs:
+  compile_dit_sizes: ["1280x704x81", "832x480x33"]
+  vae_decode_fast_sizes: ["1280x704", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks:
+      - 0
+      - 1
+    cfg_size: 2
