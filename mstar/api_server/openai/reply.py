@@ -1,9 +1,8 @@
-"""A chat reply as protocol-neutral events, which each API writes in its own
-shape: chat completions (``serving_chat``), Anthropic messages
-(``serving_messages``) and responses (``serving_responses``).
+"""A chat reply as protocol-neutral events, which chat completions
+(``serving_chat``), Anthropic messages (``serving_messages``) and responses
+(``serving_responses``) each write in their own shape.
 
-``reply_events`` reads a request's result chunks and yields, per batch the
-server hands out, a list of events:
+``reply_events`` yields a list of events per batch of result chunks:
 
 * a delta, as the output parser writes them: ``{"reasoning_content": str}``,
   ``{"content": str}`` or ``{"tool_calls": [call]}``, where a call's first
@@ -13,8 +12,7 @@ server hands out, a list of events:
 * :class:`Failure` when the request failed after it was submitted;
 * :class:`Finish`, last, with why the reply ended and its usage.
 
-A failed reply has no ``Finish``. A whole reply is ``collect``-ed, and
-``runs`` puts its deltas together.
+A failed reply has no ``Finish``.
 """
 
 from __future__ import annotations
@@ -150,23 +148,20 @@ def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:
 def reply_events(api, request_id: str, parser=None, stops: list[str] | None = None,
                  usage: Usage | None = None, batches=None, key=None):
     """The events of a request's reply, one list per batch of result chunks.
-    Bound to the submission when called: a stream's body is iterated later,
-    by Starlette.
+    Bound to the submission when called, as Starlette iterates a stream's body
+    later.
 
-    A stop string ends the reply where it starts, and a parser that is
-    ``done`` (one call, under ``parallel_tool_calls: false``) ends it too:
-    the request stops in the engine, and counts as a success, as the client
-    has its whole reply. Closing the chunk iterator early otherwise, as a
-    client that goes away does, aborts it.
-    Usage counts every token read until then, the stop's own included, as
-    vLLM counts them. It can count more: the tokens that arrived in one chunk
-    with the stop's last (up to k under MTP, k drafts a step), and those read
-    while the parser held the stop's end, when it may start a tag, or is the
-    answer's trailing whitespace (held until text follows it).
-    ``usage``, when given, is filled as the chunks arrive (a stream that opens
-    with the prompt's count reads it from there). ``batches`` and ``key``, when
-    given, are the request's chunk batches already opened
-    (``api.open_result_stream``) and its submission, named when it was submitted.
+    A stop string, or a parser that is ``done`` (``parallel_tool_calls:
+    false``), ends the reply: the request stops in the engine and counts as a
+    success, as the client has its whole reply. Closing the iterator early
+    otherwise, as a client that leaves does, aborts it. Usage counts every
+    token read until then, the stop's own included, as vLLM counts them, and
+    can count a few past it: the rest of the stop's chunk (up to k under MTP),
+    and what was read while the parser held the stop's end back.
+    ``usage``, when given, is filled as the chunks arrive, for a stream that
+    opens with the prompt's count. ``batches`` and ``key`` are the chunk
+    batches already opened (``api.open_result_stream``) and the submission,
+    named when it was submitted.
     """
     if batches is None:
         batches = api.iter_result_chunk_batches(request_id)
@@ -199,11 +194,8 @@ async def _events(batches, served, parser, stops, usage):
                     if parser is not None and parser.done:
                         break
                 elif c.modality == "error":
-                    # The request failed after the stream opened (an engine error
-                    # mid generation, a preprocess error). The error is the
-                    # iterator's last chunk, so the loop ends on its own;
-                    # breaking out instead would trip the iterator's abort on a
-                    # request that is already gone.
+                    # the iterator's last chunk, so the loop ends on its own: breaking
+                    # out would trip the iterator's abort on a request already gone
                     failed = True
                     events.append(Failure(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500))))
                 else:

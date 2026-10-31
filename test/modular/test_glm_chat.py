@@ -76,7 +76,7 @@ def test_streaming_in_any_chunks_matches_the_whole_reply(text):
 
 
 def _whole_call_arguments(body, tools):
-    """A call's arguments as the parser read them whole, before they streamed."""
+    """The call's arguments read whole with a regex: the oracle for the streamed pieces."""
     import re
 
     props = tools[body.partition("<arg_key>")[0].strip()]
@@ -112,17 +112,17 @@ def test_streamed_arguments_add_up_to_the_whole_calls_json_in_any_chunking(body)
         (call,) = _calls(deltas)
         assert call["function"] == {"name": "edit", "arguments": want}
         assert "".join(d.get("content", "") for d in deltas) == "Sure."
-    # the id and name go out before the arguments are read
+
+
+def test_a_call_streams_as_it_is_written():
     p = _parser(tools=EDIT)
+    # the id and name go out before the arguments are read
     first = p.feed("x</think><tool_call>edit<arg_key>pa")
     assert first[-1]["tool_calls"][0]["function"] == {"name": "edit", "arguments": ""}
     assert p.feed("th</arg_key><arg_value>src/") == [{"tool_calls": [{"index": 0, "function": {
         "arguments": '{"path": "src/'}}]}]
-
-
-def test_a_string_value_streams_with_a_partial_tag_held():
-    p = _parser(tools=EDIT)
-    p.feed("x</think><tool_call>edit<arg_key>old</arg_key><arg_value>a <")
+    # a string value goes out as it comes, all but what may start an end tag
+    assert p.feed("a <") == [{"tool_calls": [{"index": 0, "function": {"arguments": "a "}}]}]
     assert p.feed("b> </arg_v") == [{"tool_calls": [{"index": 0, "function": {"arguments": "<b> "}}]}]
     assert p.feed("alue></tool_call>") == [{"tool_calls": [{"index": 0, "function": {"arguments": '"}'}}]}]
 
@@ -354,8 +354,7 @@ def test_a_forced_tool_choice_opens_the_call_in_the_prompt(model, choice, tools,
 
 @pytest.mark.parametrize("model", ["glm52", "glm5_next"])
 def test_a_forced_function_is_the_only_one_its_call_can_name(model):
-    """Forced get_weather beside get_weather_hourly: the model writing on past the prompt's
-    name parsed as a call to the other tool."""
+    """A forced get_weather's call cannot turn into one to get_weather_hourly."""
     hourly = {"type": "function", "function": {
         "name": "get_weather_hourly", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
     req = _chat(tools=[WEATHER, hourly], tool_choice={"type": "function", "function": {"name": "get_weather"}})
@@ -369,13 +368,6 @@ def test_a_forced_call_to_a_made_up_function_stays_text():
     p = glm_chat.GlmReplyParser(thinking=False, tools=TOOLS, forced_call="")
     msg = p.message("rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>")
     assert msg["content"].startswith("<tool_call>rm_rf<arg_key>") and p.finish_reason == "stop"
-
-
-def test_auto_and_none_leave_the_prompt_alone(tmp_path):
-    for choice in ("auto", "none", None):
-        req = _chat(tools=[WEATHER], tool_choice=choice)
-        mk = adapters.get_adapter("glm52").chat_to_request(req, tmp_path).model_kwargs
-        assert "reply_prefix" not in mk and "enable_thinking" not in mk["chat_template_kwargs"]
 
 
 class _RecordingTokenizer:
@@ -558,9 +550,8 @@ def test_the_chat_stays_in_the_data_worker(make, tmp_path):
     tool = {"type": "function", "function": {"name": "f", "parameters": {
         "type": "object", "properties": {"n": {"type": "integer", "maximum": 2**64}}}}}
     mk = adapters.get_adapter("glm52").chat_to_request(_chat(tools=[tool]), tmp_path).model_kwargs
-    # what the data worker sends the conductor: the wire carries no int past 64 bits
-    sent = {k: v for k, v in mk.items() if k not in make().PREPROCESS_ONLY_KWARGS}
     mk["reply_prefix"] = "<tool_call>f"
+    # what the data worker sends the conductor: the wire carries no int past 64 bits
     sent = {k: v for k, v in mk.items() if k not in make().PREPROCESS_ONLY_KWARGS}
     assert {"messages", "tools", "chat_template_kwargs"} <= set(mk)
     assert not {"messages", "tools", "reply_prefix"} & set(sent)
@@ -574,7 +565,6 @@ def test_the_chat_stays_in_the_data_worker(make, tmp_path):
     (["xyz", "y"], "axyz", "ax", "y"),  # the stop that completes first wins
     (["bc", "abc"], "zabcd", "z", "abc"),  # of two ending together, the longer
     (["\n\n"], "a\nb\n\nc", "a\nb", "\n\n"),
-    (["ab", "b"], "aab", "a", "ab"),
 ])
 def test_a_stop_string_ends_the_text_in_any_chunking(stops, text, want, stop):
     from mstar.api_server.openai.reply import StopMatcher

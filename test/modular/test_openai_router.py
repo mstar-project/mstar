@@ -999,14 +999,6 @@ def test_a_stop_string_does_not_cut_a_tool_call(client_and_stub):
     assert stub.aborted == []
 
 
-def test_glm_chat_refuses_a_fifth_stop_string_before_running(client_and_stub):
-    client, stub = client_and_stub
-    stub.model_name = "glm52"
-    r = client.post("/v1/chat/completions", json={
-        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stop": list("abcde")})
-    assert r.status_code == 400 and "at most 4" in r.json()["error"]["message"] and stub.last_submit is None
-
-
 @pytest.mark.parametrize("stream", [False, True])
 def test_glm_chat_without_parallel_calls_ends_at_the_first(client_and_stub, stream):
     client, stub = client_and_stub

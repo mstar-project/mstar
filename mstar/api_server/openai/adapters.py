@@ -1589,17 +1589,13 @@ class GlmChatAdapter(TextChatAdapter):
     Anthropic's ``/v1/messages`` and OpenAI's ``/v1/responses`` are translated
     onto this chat.
 
-    ``tool_choice`` is ``"auto"`` (default), ``"none"``, which leaves the tools
-    out of the prompt, ``"required"`` or a named function. With no grammar, a
-    forced call is the prompt's: it ends in ``<tool_call>`` (and the name), so
-    the reply opens inside the call. ``"required"`` over one tool names it;
-    over several the model picks, and a name it makes up stays text. The call
-    opens the reply, so a forced call has no reasoning: GLM-5.2's prompt ends
-    as with thinking off, GLM-5.3's closes the empty ``<think>``, and an
-    explicit ``enable_thinking`` with it is a 400.
-
-    ``parallel_tool_calls: false`` ends the reply, and the request, when its
-    first call ends.
+    ``tool_choice`` is ``"auto"`` (default), ``"none"`` (the tools stay out of
+    the prompt), ``"required"`` or a named function. With no grammar, the
+    prompt forces the call: it ends in ``<tool_call>`` and the name, which
+    ``"required"`` over several tools leaves to the model (a name it makes up
+    stays text). The call opens the reply, so a forced call does not reason,
+    and ``enable_thinking`` with it is a 400.
+    ``parallel_tool_calls: false`` ends the request at the end of its first call.
 
     ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always reasons, and turning it
     off is a 400), ``reasoning_effort`` and ``clear_thinking`` reach the

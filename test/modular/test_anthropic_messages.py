@@ -94,7 +94,7 @@ def _body(**kw):
 
 
 def _events(text):
-    """(event name, data) per server-sent event; the name must match the data's type."""
+    """The data of each server-sent event; the event name must match its type."""
     out = []
     for block in text.strip().split("\n\n"):
         lines = dict(line.split(": ", 1) for line in block.splitlines())
@@ -156,7 +156,6 @@ def test_tool_choice_maps_onto_chat(choice, want):
 
 @pytest.mark.parametrize("body, message", [
     (_body(max_tokens=None), "max_tokens"),
-    ({"model": "m", "messages": [{"role": "user", "content": "hi"}]}, "max_tokens"),
     (_body(messages=[{"role": "user", "content": [
         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}}]}]), "reads text"),
     (_body(tools=[{"type": "web_search_20250305", "name": "web_search"}]), "server tool"),
@@ -169,6 +168,9 @@ def test_tool_choice_maps_onto_chat(choice, want):
     (_body(stop_sequences=["", "x"]), "stop_sequences"),
     (_body(tool_choice={"type": "tool"}), "name"),
     (_body(messages=[{"role": "system", "content": "x"}]), "role"),
+    # a forced call opens the reply, so Anthropic refuses it with thinking on too
+    (_body(tools=[WEATHER], tool_choice={"type": "any"}, thinking={"type": "enabled", "budget_tokens": 1024},
+           max_tokens=4096), "enable_thinking"),
 ])
 def test_what_cannot_be_served_is_an_anthropic_400(client_and_stub, body, message):
     client, stub = client_and_stub
@@ -177,14 +179,6 @@ def test_what_cannot_be_served_is_an_anthropic_400(client_and_stub, body, messag
     err = r.json()
     assert err["type"] == "error" and err["error"]["type"] == "invalid_request_error"
     assert message in err["error"]["message"]
-
-
-def test_a_forced_tool_with_thinking_on_is_a_400_as_anthropic_makes_it(client_and_stub):
-    client, _ = client_and_stub
-    thinking = {"type": "enabled", "budget_tokens": 1024}
-    r = client.post("/v1/messages", json=_body(tools=[WEATHER], tool_choice={"type": "any"}, thinking=thinking,
-                                               max_tokens=4096))
-    assert r.status_code == 400 and "enable_thinking" in r.json()["error"]["message"]
 
 
 def test_a_model_without_the_api_is_an_anthropic_404(client_and_stub):
@@ -273,8 +267,6 @@ def test_a_stream_reports_a_failure_in_band(client_and_stub):
 
 
 def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
-    """Refused before its first token, a stream is the refusal's status and error, not a
-    200 that carries it."""
     client, stub = client_and_stub
     stub.next_chunks = [_Chunk("error", b"prompt too long", {"status": 400})]
     r = client.post("/v1/messages", json=_body(stream=True))
@@ -285,8 +277,7 @@ def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
 
 @pytest.mark.parametrize("model_name", ["glm52", "glm5_next"])
 def test_count_tokens_counts_what_the_real_model_returns(client_and_stub, model_name):
-    """Both GLM models answer process_prompt with a ProcessPromptOutput (their KV layout beside
-    the tensors), not a dict: the route counts its text_inputs (it was a 500)."""
+    """Both GLMs' process_prompt returns a ProcessPromptOutput, not a dict."""
     from mstar.api_server.openai import serving_messages
     from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
     from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
@@ -306,30 +297,9 @@ def test_count_tokens_counts_what_the_real_model_returns(client_and_stub, model_
     assert r.json() == {"input_tokens": out.new_input_tensors["text_inputs"][0].numel()}
 
 
-def test_count_tokens_renders_the_prompt_the_model_would_get(client_and_stub):
-    import torch
-
-    client, stub = client_and_stub
-    seen = {}
-
-    def process_prompt(text, input_modalities, output_modalities, **kw):
-        seen.update(kw)
-        return {"text_inputs": [torch.zeros(37, dtype=torch.long)]}
-
-    stub.model.process_prompt = process_prompt
-    r = client.post("/v1/messages/count_tokens", json={
-        "model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "system": "Be brief.", "tools": [WEATHER]})
-    assert r.json() == {"input_tokens": 37} and stub.last_submit is None
-    assert [m["role"] for m in seen["messages"]] == ["system", "user"] and seen["tools"][0]["function"]["name"]
-    r = client.post("/v1/messages/count_tokens", json={"messages": [{"role": "user", "content": "hi"}],
-                                                        "max_tokens": 5})
-    assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]
-
-
 def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):
-    """process_prompt gets what the data worker passes it for the request itself, the
-    prompt's parts (each turn's role) included: a model that renders the chat from them
-    counted the turns joined into one user turn."""
+    """process_prompt gets what the data worker passes it for the request, each turn's
+    role included, and nothing is submitted."""
     import torch
 
     client, stub = client_and_stub
@@ -340,10 +310,11 @@ def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):
         return {"text_inputs": [torch.zeros(3, dtype=torch.long)]}
 
     stub.model.process_prompt = process_prompt
-    body = {"system": "Be brief.", "messages": [{"role": "user", "content": "hi"},
-                                                {"role": "assistant", "content": "Hello."},
-                                                {"role": "user", "content": "bye"}]}
+    body = {"system": "Be brief.", "tools": [WEATHER],
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hello."},
+                         {"role": "user", "content": "bye"}]}
     assert client.post("/v1/messages/count_tokens", json=body).json() == {"input_tokens": 3}
+    assert stub.last_submit is None
     assert client.post("/v1/messages", json={**body, "model": "glm-5.2", "max_tokens": 8}).status_code == 200
     ((args, kw),) = calls
     sent = stub.last_submit
@@ -352,3 +323,5 @@ def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):
     assert [p.role for p in sent["prompt_parts"]] == ["system", "user", "assistant", "user"]
     # and every model kwarg the request renders with: all but its token budget
     assert kw == {k: v for k, v in sent["model_kwargs"].items() if k != "max_output_tokens"}
+    r = client.post("/v1/messages/count_tokens", json={**body, "max_tokens": 5})
+    assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]

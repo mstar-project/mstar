@@ -565,9 +565,8 @@ def test_each_way_a_request_ends_counts_once_under_its_outcome(served, end, outc
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_reply_its_handler_ends_whole_counts_as_a_success(served, stream):
-    """A stop string ends a chat reply in the API server, which stops its
-    request in the engine: the client got a whole reply, so it is a success,
-    timed like one, and not an abort."""
+    """A reply the API server ends at a stop string stops its request in the
+    engine, and counts as a success, timed like one."""
     from mstar.api_server.openai import reply
 
     async def run():

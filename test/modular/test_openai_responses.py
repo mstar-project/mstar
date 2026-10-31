@@ -13,59 +13,7 @@ pytest.importorskip("httpx")
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-
-from mstar.api_server.entrypoint import APIServer  # noqa: E402
-
-
-class _Chunk:
-    def __init__(self, modality, data, metadata=None):
-        self.modality, self.data, self.metadata = modality, data, metadata or {}
-
-
-def _usage_chunks(*parts, stop=True):
-    """Text chunks as the data worker tags them: per-chunk token counts and the prompt's."""
-    return [_Chunk("text", text, {"tokens": n, "prompt_tokens": 11, "stop_token": stop and i == len(parts) - 1})
-            for i, (text, n) in enumerate(parts)]
-
-
-class _StubAPI:
-    """The APIServer as the agent routes use it: submit, then read the chunks
-    in batches; a reader that stops early aborts the request."""
-
-    open_result_stream = APIServer.open_result_stream
-
-    def __init__(self, model_name):
-        self.model_name = model_name
-        self.model = types.SimpleNamespace()
-        self.upload_dir = "/nonexistent"
-        self.last_submit = None
-        self.next_chunks: list = []
-        self.aborted: list = []
-        self.ended: dict = {}  # how each submission stopped early ended
-
-    def submit_request(self, **kw):
-        self.last_submit = kw
-        return kw["request_id"]
-
-    def submission_key(self, request_id):
-        return request_id
-
-    def abort_submission(self, key, outcome="abort"):
-        # once per submission, as the real one: after a handler ends a whole
-        # reply (a success), the stream's close aborts nothing more
-        if key not in self.ended:
-            self.ended[key] = outcome
-            self.aborted.append(key)
-
-    async def iter_result_chunk_batches(self, request_id):
-        finished = False
-        try:
-            if self.next_chunks:
-                yield list(self.next_chunks)
-            finished = True
-        finally:
-            if not finished:
-                self.abort_submission(request_id)
+from test_anthropic_messages import _Chunk, _events, _StubAPI, _usage_chunks  # noqa: E402
 
 
 @pytest.fixture
@@ -99,17 +47,6 @@ def _codex(**kw):
         "tools": [SHELL], "tool_choice": "auto", "parallel_tool_calls": False, "store": False, "stream": False,
         "reasoning": {"effort": "medium", "summary": "auto"}, "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": "conv-1", **kw}
-
-
-def _events(text):
-    """The data of each server-sent event; the event name must match its type."""
-    out = []
-    for block in text.strip().split("\n\n"):
-        lines = dict(line.split(": ", 1) for line in block.splitlines())
-        data = json.loads(lines["data"])
-        assert lines["event"] == data["type"]
-        out.append(data)
-    return out
 
 
 def test_input_items_translate_onto_the_chat_template():
@@ -270,8 +207,6 @@ def test_a_stream_reports_a_failure_as_response_failed(client_and_stub):
 
 
 def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
-    """Refused before its first token, a stream is the refusal's status and error, not a
-    200 that carries it."""
     client, stub = client_and_stub
     stub.next_chunks = [_Chunk("error", b"prompt too long", {"status": 400})]
     r = client.post("/v1/responses", json=_codex(stream=True))

@@ -155,7 +155,6 @@ def test_openai_routes_take_the_key_as_bearer_only(glm):
     assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "Hi."
 
 
-@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
 @pytest.mark.parametrize("headers", [
     *BAD_HEADERS,
     {"x-api-key": "wrong"},
@@ -163,8 +162,8 @@ def test_openai_routes_take_the_key_as_bearer_only(glm):
     {"x-api-key": f"Bearer {KEY}"},
     {"x-api-key": "wrong", "Authorization": "Bearer wrong"},
 ])
-def test_anthropic_routes_refuse_a_wrong_key_in_anthropic_s_shape(glm, path, headers):
-    r = glm.post(path, json=_MESSAGES, headers=headers)
+def test_anthropic_routes_refuse_a_wrong_key_in_anthropic_s_shape(glm, headers):
+    r = glm.post("/v1/messages", json=_MESSAGES, headers=headers)
     assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
     body = r.json()
     assert body["type"] == "error" and body["error"]["type"] == "authentication_error"

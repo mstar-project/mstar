@@ -7,9 +7,7 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 
 A streamed reply, and a whole one that is parsed or has stop strings, is read
-as ``reply`` events, which this module writes as chat completion chunks or one
-chat completion. Stop strings match the answer (``content``) only, not the
-reasoning or a tool call's arguments (see ``reply``).
+as ``reply`` events.
 """
 
 from __future__ import annotations
@@ -73,7 +71,6 @@ def _usage(usage: reply.Usage) -> dict:
 
 
 def _text_response(model_name, request_id, events) -> dict:
-    """A text reply, from its events."""
     finish = events[-1]
     content, reasoning, calls = "", "", []
     for run in reply.runs(events):

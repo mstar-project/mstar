@@ -1,31 +1,19 @@
 """Anthropic's ``POST /v1/messages`` (and ``/v1/messages/count_tokens``),
-translated onto the chat path: the request becomes a chat request the model's
-adapter takes, and the reply's ``reply`` events come back as an Anthropic
-message, whole or streamed as its server-sent events.
+translated onto the chat path: the request becomes a chat request for the
+model's adapter, and its ``reply`` events come back as a message or its
+server-sent events. What the model cannot serve is a 400, not dropped: images
+and documents, server tools, redacted thinking, a final assistant turn
+(prefill) and unknown fields. ``metadata`` and ``cache_control`` are hints and
+drop.
 
-What maps: ``system`` (a string or text blocks), ``messages`` with text,
-``thinking``, ``tool_use`` and ``tool_result`` blocks, ``tools`` (their
-``input_schema`` is the function's parameters), ``tool_choice`` (``auto``,
-``any`` as ``required``, ``tool`` as a named function, ``none``, and
-``disable_parallel_tool_use``), ``max_tokens``, ``stop_sequences``,
-``temperature``, ``top_p``, ``top_k`` and ``thinking``. ``metadata`` and
-``cache_control`` are hints and drop. Anything else is a 400: images and
-documents (the model reads text), server tools, redacted thinking, a final
-assistant turn to continue (prefill), and unknown fields.
+Where the APIs differ:
 
-Choices where the APIs differ:
-
-* ``thinking`` absent leaves the model's default (GLM reasons), where Anthropic
-  does not think unless asked; ``disabled`` turns it off where the model can.
-  ``budget_tokens`` is checked as Anthropic checks it but not enforced: the
-  model's reasoning ends where it ends, within ``max_tokens``.
-* A ``tool_result`` with ``is_error`` reads ``Error: `` before its content, as
-  the template has no flag for it.
-* A reply's ``thinking`` block carries an empty ``signature``; one sent back
-  is read for its text.
-* A call cut off by ``max_tokens`` has no ``input`` to give: the whole message
-  leaves it out, the stream ends inside its ``input_json_delta`` pieces, and
-  both say ``stop_reason: max_tokens``.
+* ``thinking`` absent leaves the model's default, where Anthropic does not
+  think unless asked. ``budget_tokens`` is checked as Anthropic checks it but
+  not enforced.
+* A reply's ``thinking`` block carries an empty ``signature``.
+* A call cut off by ``max_tokens`` has no ``input``: the message leaves it
+  out, and the stream ends inside its ``input_json_delta`` pieces.
 * Stop sequences match the answer's text, not the thinking or a call's input.
 """
 
@@ -265,15 +253,14 @@ async def create_message(api, model_name, adapter, body, raw_request=None):
 
 
 async def count_tokens(api, adapter, body) -> dict:
-    """``input_tokens`` of the prompt a Messages request renders, by the
-    model's own prompt processing (chat template and tokenizer), called
-    with what the data worker passes it for the request."""
+    """``input_tokens`` of the prompt a Messages request renders: the model's
+    own ``process_prompt``, called as the data worker calls it."""
     req, _ = to_chat_request(body, counting=True)
     args = adapter.chat_to_request(req, api.upload_dir)
     tensors = await asyncio.to_thread(
         api.model.process_prompt, args.text, args.input_modalities, args.output_modalities,
         prompt_parts=args.prompt_parts, **args.model_kwargs)
-    if isinstance(tensors, ProcessPromptOutput):  # a model that lays out its KV, both GLMs
+    if isinstance(tensors, ProcessPromptOutput):  # a model that also lays out its KV
         tensors = tensors.new_input_tensors
     return {"input_tokens": sum(t.numel() for t in tensors.get("text_inputs", []))}
 
@@ -309,10 +296,8 @@ def _message(model_name, request_id, events) -> dict:
 
 
 async def _stream(model_name, request_id, events, usage: reply.Usage):
-    """The Messages stream: ``message_start``, each block's start, deltas and
-    stop, ``message_delta`` with the stop reason and usage, ``message_stop``.
-    ``message_start`` goes out with the first block, as clients time the first
-    token from the first event, and carries the prompt's token count."""
+    """The Messages stream. ``message_start`` goes out with the first block,
+    not before it, as clients time the first token from the first event."""
     started = False
     block = None  # the open block's kind: "thinking", "text" or "tool_use"
     index = -1

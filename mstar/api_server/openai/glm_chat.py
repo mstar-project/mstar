@@ -159,21 +159,16 @@ class GlmReplyParser:
     call may end the reasoning without ``</think>``, and a call to a function the
     request did not offer stays text.
     Content is stripped at both ends, as the template strips it on the way back.
-    ``forced_call`` says the prompt opened a call (a forced ``tool_choice``):
-    the reply starts inside it, after the name if the prompt gave one.
-    ``single_call`` (``parallel_tool_calls: false``) ends the reply at the end
-    of its first call: ``done`` turns true, and what follows drops.
+    ``forced_call`` says the prompt opened a call, and named it unless empty.
+    ``single_call`` ends the reply at the end of its first call: ``done``
+    turns true, and what follows drops.
 
-    A call streams as it is written: its id and name once the name ends (at
-    the first ``<arg_key>`` or ``</tool_call>``), then its ``arguments`` JSON
-    in pieces: ``{"key": `` as a value opens, a value the schema allows only
-    as a string JSON-escaped as it comes, any other whole at ``</arg_value>``,
-    and ``}`` at ``</tool_call>``. The pieces add up to the ``json.dumps`` of
-    the arguments, in any chunking. Text between arguments drops, and so does
-    a key with no value; a key given twice is in the JSON twice. A reply cut
-    off inside a call keeps the call as far as it got (its ``arguments`` not
-    JSON), and the parser then reports no ``tool_calls`` finish; cut off before
-    the name ends, the call is text, as is a call to a function not offered.
+    A call streams as it is written: its id and name once the name ends, then
+    its ``arguments`` in pieces that add up to their ``json.dumps`` in any
+    chunking. A value the schema allows only as a string streams as it comes;
+    any other goes whole at ``</arg_value>``. A key given twice is in the JSON
+    twice. A reply cut off inside a call keeps the call as far as it got, with
+    no ``tool_calls`` finish; cut off before the name ends, the call is text.
     """
 
     def __init__(self, *, thinking: bool, tools: dict[str, dict] | None, forced_call: str | None = None,

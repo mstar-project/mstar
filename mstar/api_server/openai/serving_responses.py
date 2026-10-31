@@ -1,35 +1,22 @@
 """OpenAI's ``POST /v1/responses``, stateless, translated onto the chat path:
-the request becomes a chat request the model's adapter takes, and the reply's
-``reply`` events come back as a response object, whole or streamed as its
-server-sent events.
+the request becomes a chat request for the model's adapter, and its ``reply``
+events come back as a response object or its server-sent events. What needs
+state or a server this does not have (``previous_response_id``,
+``conversation``, ``store: true``, built-in and custom tools), constrained
+decoding (a ``strict`` schema, structured output), images and files are a
+400, as are unknown fields. ``metadata``, ``user``, ``prompt_cache_key``,
+``safety_identifier`` and ``stream_options`` are hints and drop.
 
-What maps: ``input`` (a string, or ``message``, ``function_call``,
-``function_call_output`` and ``reasoning`` items), ``instructions`` (a system
-turn first), function ``tools``, ``tool_choice``, ``parallel_tool_calls``,
-``max_output_tokens``, ``reasoning.effort``, ``temperature``, ``top_p`` and
-``stream``. ``metadata``, ``user``, ``prompt_cache_key``, ``safety_identifier``
-and ``stream_options`` are hints and drop. A 400 for what needs state or a
-server this does not have: ``previous_response_id``, ``conversation``,
-``prompt``, ``store: true``, ``background``, built-in and custom tools, a
-``strict`` schema (that needs constrained decoding), images and files, and
-unknown fields.
+Where the APIs differ:
 
-Choices where the APIs differ:
-
-* Reasoning comes back as a ``reasoning`` item's ``reasoning_text`` content
-  (``response.reasoning_text.delta`` streamed), which Codex reads and sends
-  back; there is no summary, so ``reasoning.summary`` other than ``auto`` is a
-  400. ``include: ["reasoning.encrypted_content"]`` is taken, and served by
-  that content: ``encrypted_content`` stays unset, as the reasoning is no
-  secret. An input reasoning item is read for its content, or its summary.
-* ``reasoning.effort`` maps onto the template's levels, least to most: GLM's
-  lowest takes ``minimal`` and ``low``, its middle ``medium``, its highest
-  ``high`` and ``xhigh`` (GLM-5.2 has no low: its levels are high and max).
-  ``none`` turns thinking off where the model can.
-* ``output_tokens_details.reasoning_tokens`` counts the tokens of the chunks
-  that began inside the reasoning; ``input_tokens_details`` is left out.
-* A reply cut off by ``max_output_tokens`` is ``incomplete``, and a call it
-  cut keeps its ``arguments`` as far as they got, with ``status: incomplete``.
+* Reasoning comes back as a ``reasoning`` item's ``reasoning_text`` content,
+  which Codex reads and sends back. There is no summary, and
+  ``encrypted_content`` stays unset: the reasoning is no secret.
+* ``reasoning.effort`` asks the template for ``low`` (``minimal``, ``low``),
+  ``high`` (``medium``) or ``max`` (``high``, ``xhigh``), or for its lowest
+  level when it has no such one; ``none`` turns thinking off.
+* A reply cut off by ``max_output_tokens`` is ``incomplete``, and so is a call
+  it cut, its ``arguments`` as far as they got.
 """
 
 from __future__ import annotations
@@ -210,7 +197,7 @@ def _reasoning(reasoning, efforts: tuple[str, ...]) -> dict:
         return {"enable_thinking": False}
     if effort not in _EFFORT_RANK:
         raise ValueError(f"reasoning.effort takes none, minimal, low, medium, high or xhigh; got {effort!r}")
-    # the levels above the template's lowest, ranked from its top
+    # GLM's level names; a template without the one asked for takes its lowest
     wanted = {0: "low", 1: "high", 2: "max"}[_EFFORT_RANK[effort]]
     return {"reasoning_effort": wanted if wanted in efforts else efforts[0]}
 
@@ -386,9 +373,9 @@ def _copy(item: dict) -> dict:
 
 
 async def _stream(response: _Response, events, usage: reply.Usage):
-    """The Responses stream: ``response.created`` with the first output, as
-    clients time the first token from the first event; each item's events;
-    then ``response.completed`` (or ``incomplete``, or ``failed``)."""
+    """The Responses stream. ``response.created`` goes out with the first
+    output, not before it, as clients time the first token from the first
+    event."""
     seq = 0
 
     def write(kind: str, fields: dict) -> str:

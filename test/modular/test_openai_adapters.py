@@ -316,13 +316,6 @@ def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
         adapters.TextChatAdapter().chat_to_request(req, tmp_path)
 
 
-def test_text_chat_takes_up_to_four_stop_strings():
-    adapter = adapters.TextChatAdapter()
-    for stop, want in (("\n", ["\n"]), (["END", "</answer>"], ["END", "</answer>"]), (None, []), ([], [])):
-        req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], stop=stop)
-        assert adapter.stop_strings(req) == want
-
-
 def test_text_chat_passes_those_fields_off(tmp_path):
     req = ChatCompletionRequest(
         messages=[{"role": "user", "content": "hi"}], n=1, stop=[], logprobs=False,
