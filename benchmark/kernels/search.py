@@ -20,6 +20,7 @@ import datetime
 import json
 import logging
 import os
+import statistics
 import subprocess
 import sys
 import zlib
@@ -41,6 +42,7 @@ from mstar.platforms.facts import DeviceFacts
 
 logger = logging.getLogger(__name__)
 BASELINES = ("registry", "torch")
+STATS = {"median": statistics.median, "fastest": min}
 
 
 def git_sha() -> str | None:
@@ -229,6 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--budget", type=int, default=8, help="knob points per searched family")
     parser.add_argument("--calls", type=int, default=256, help="calls per captured graph")
     parser.add_argument("--rounds", type=int, default=3, help="interleaved replays per candidate")
+    parser.add_argument("--stat", choices=sorted(STATS), default="median", help="which replay stands for a candidate")
     parser.add_argument("--store", default=str(DEFAULT_ROOT), help="results store root ('' to write none)")
     parser.add_argument("--seed-store", help="take earlier winners from this store, not --store, so a new store "
                                              "compares only what one run timed")
@@ -259,7 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             setattr(torch._dynamo.config, limit, 4096)
     store = ResultsStore(args.store) if args.store else None
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    bench = Bench(device, calls=args.calls, rounds=args.rounds,
+    bench = Bench(device, calls=args.calls, rounds=args.rounds, stat=STATS[args.stat],
                   rotate_bytes=2 * facts.mall_bytes if facts.mall_bytes else None)
     meta = {"job": args.job, "sha": git_sha()}
     seed_store = ResultsStore(args.seed_store) if args.seed_store else None

@@ -6,8 +6,11 @@ cache (twice the Infinity Cache on AMD, so every pass reads HBM; capped by
 ``max_copies`` and ``max_bytes``), the way a decode step streams its weights.
 Graphs are built first, then replayed in turn for ``rounds`` rounds, so a
 drifting clock or a co-tenant affects every candidate alike, and the median
-replay is kept. A candidate that cannot be captured is timed eagerly and
-marked so. On the CPU (the harness's own tests) a wall clock stands in.
+replay is kept, or the fastest with ``stat=min``: on MI325X VFs about one replay
+in fifteen also carried a stall of a multiple of 8.3 ms, which only ever adds
+time and can outvote a median of a few. A candidate that cannot be captured is
+timed eagerly and marked so. On the CPU (the harness's own tests) a wall clock
+stands in.
 """
 
 from __future__ import annotations
@@ -71,6 +74,7 @@ class Bench:
         max_copies: int = 64,
         max_bytes: int = 4 << 30,
         timer: Callable[[], float] | None = None,
+        stat: Callable[[Sequence[float]], float] = statistics.median,
     ):
         self.device = torch.device(device)
         self.calls = calls
@@ -79,6 +83,7 @@ class Bench:
         self.max_copies = max_copies
         self.max_bytes = max_bytes
         self.timer = timer or time.perf_counter
+        self.stat = stat
 
     def operand_sets(self, make: Callable[[int], tuple]) -> list[tuple]:
         """Copies of the operands, ``make(i)`` building the i-th."""
@@ -110,7 +115,7 @@ class Bench:
                     del runners[name]
         for name, runner in runners.items():
             results[name] = Timing(
-                us=statistics.median(runs[name]), runs_us=runs[name], captured=runner.captured, calls=calls,
+                us=self.stat(runs[name]), runs_us=runs[name], captured=runner.captured, calls=calls,
                 copies=len(arg_sets), note=runner.note,
             )
         return results
@@ -166,7 +171,7 @@ class Bench:
                 runs.append((self.timer() - t0) * 1e6 / calls)
         except Exception as exc:  # noqa: BLE001
             return f"{type(exc).__name__}: {exc}"[:500]
-        return Timing(statistics.median(runs), runs, captured=False, calls=calls, copies=len(arg_sets),
+        return Timing(self.stat(runs), runs, captured=False, calls=calls, copies=len(arg_sets),
                       note="wall clock on the CPU")
 
     def node_floor_us(self) -> float | None:
