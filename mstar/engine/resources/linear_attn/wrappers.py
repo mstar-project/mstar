@@ -586,31 +586,41 @@ class _PinnedIndexStage:
     that step to finish. ``done`` is recorded once the copies are issued; the
     next stage waits on it before rewriting the buffers. Callers pair
     ``begin`` with ``end`` in a ``finally``: a plan that raises after an
-    upload still has that copy in flight."""
+    upload still has that copy in flight. Device-generic: on any
+    accelerator the buffers are pinned and the event recorded, since a
+    non-blocking copy is free to read its source after it returns."""
 
     def __init__(self):
         self._bufs: dict[str, torch.Tensor] = {}
-        self._done = None
+        self._pinned = torch.accelerator.is_available()
+        self._done: torch.Event | None = None
+        # the accelerator the last stage copied to, if any
+        self._device: torch.device | None = None
 
     def begin(self) -> None:
-        if self._done is None:
-            self._done = torch.cuda.Event() if torch.cuda.is_available() else None
-        elif self._done is not None:
+        if self._done is not None:
             self._done.synchronize()
+        self._device = None
 
     def upload(self, name: str, values: np.ndarray, dst: torch.Tensor) -> None:
         n = len(values)
         buf = self._bufs.get(name)
         if buf is None or buf.shape[0] < n or buf.dtype != dst.dtype:
             buf = self._bufs[name] = torch.empty(
-                max(n, 64), dtype=dst.dtype, pin_memory=torch.cuda.is_available(),
+                max(n, 64), dtype=dst.dtype, pin_memory=self._pinned,
             )
         buf.numpy()[:n] = values
         dst[:n].copy_(buf[:n], non_blocking=True)
+        if dst.device.type != "cpu":
+            self._device = dst.device
 
     def end(self) -> None:
-        if self._done is not None:
-            self._done.record()
+        device = self._device
+        if device is None:
+            return
+        if self._done is None:
+            self._done = torch.Event(device=device)
+        self._done.record(torch.accelerator.current_stream(device))
 
 
 class GDNMixedWrapper(GDNWrapper):
