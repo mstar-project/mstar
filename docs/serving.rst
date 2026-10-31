@@ -296,6 +296,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        keeps to its own walk and yields to the others, and a step mixes walks only
        when the scheduler builds one fresh. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``max_batch_tokens``
+     - *(optional)* Per node, one token budget for every walk the model budgets, or a
+       mapping of walk -> budget; null turns a walk's chunking off. Overrides the
+       model's defaults. See *Chunked prefill budgets* below.
+   * - ``can_override_mixed_max_tokens``
+     - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
+       of its own under the step's. See *Chunked prefill budgets* below.
    * - ``speculate_mid_prefill``
      - *(optional, default true)* Per node, ``true``/``false`` for every walk it chunks,
        or a mapping of walk -> ``true``/``false``. On, a prompt mid-prefill takes its
@@ -418,7 +425,33 @@ prefix cache.
 
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
-budgets. A deployment can override them per node, either with one budget for every walk
+budgets:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Model
+     - Node
+     - Chunked walks
+     - Default budget
+   * - Qwen3.5
+     - ``LLM``
+     - ``prefill_text`` (in ``mixed``)
+     - 2048
+   * - Qwen3-Omni
+     - ``Thinker``
+     - ``prefill_text``, ``prefill_audio``, ``prefill_vision`` (in ``thinker_mixed``)
+     - 1024
+   * - BAGEL
+     - ``LLM``
+     - ``prefill_text`` (in ``mixed_text``)
+     - 1024
+   * - Orpheus
+     - ``LLM``
+     - ``prefill`` (in ``mixed``)
+     - 512
+
+A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
