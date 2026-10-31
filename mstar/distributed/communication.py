@@ -324,6 +324,21 @@ class CommGroup:
             outs = [torch.cat([pieces[i] for pieces in per_rank], dim=gather_dim) for i in range(len(tensors))]
         return outs[0] if isinstance(input_, torch.Tensor) else tuple(outs)
 
+    def all_to_all_single(
+        self, send: torch.Tensor, recv: torch.Tensor,
+        send_counts: list[int] | None = None, recv_counts: list[int] | None = None,
+    ) -> torch.Tensor:
+        """One ``all_to_all_single`` over contiguous buffers the caller laid out:
+        ``send`` holds a block for each rank in rank order, ``send_counts[r]``
+        elements long, and ``recv`` gets one from each rank, ``recv_counts[r]``
+        long; ``None`` splits a buffer evenly. Returns ``recv``. Hidden from
+        torch.compile, like :meth:`all_to_all`."""
+        if self.world_size == 1:
+            recv.view(-1).copy_(send.view(-1))
+            return recv
+        out = _all_to_all_single(self.device_group, send.view(-1), recv.view(-1), recv_counts, send_counts)
+        return out.view(recv.shape)
+
     def _all_to_all_uneven_scatter(
         self, input_: torch.Tensor, scatter_dim: int, gather_dim: int,
         scatter_sizes: list[int], gather_sizes: list[int] | None,

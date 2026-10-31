@@ -3,17 +3,22 @@
 Same layouts as the FlashInfer wrappers, without a workspace or head-dim padding.
 """
 
+import functools
+import logging
+
 import torch
 import triton
 import triton.language as tl
 
-from mstar.engine.resources.attn.dense import flash_attn_varlen_func
+from mstar.engine.resources.attn.dense import VARLEN_READS_STRIDES, flash_attn_varlen_func
 from mstar.engine.resources.attn.ragged.wrappers import (
     PrefixedPrefillWrapper,
     RaggedCrossPrefillWrapper,
     RaggedPrefillWrapper,
     _RaggedPrefillBase,
 )
+
+logger = logging.getLogger(__name__)
 
 _ZERO_BLOCK = 4096
 
@@ -27,6 +32,20 @@ def _zero_rows_from(out_ptr, first_row_ptr, numel, row_numel, BLOCK: tl.constexp
     if start + BLOCK > first:
         offs = start + tl.arange(0, BLOCK)
         tl.store(out_ptr + offs, 0.0, mask=(offs >= first) & (offs < numel))
+
+
+@functools.cache
+def _note_strided_copy() -> None:
+    logger.info("dense varlen attention on AITER is handed strided q/k/v as contiguous copies")
+
+
+def _kernel_layout(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as it lies if the varlen kernel reads its strides (FA3), else contiguous."""
+    if t.is_contiguous() or (VARLEN_READS_STRIDES and t.stride(-1) == 1):
+        return t
+    if not VARLEN_READS_STRIDES:
+        _note_strided_copy()
+    return t.contiguous()
 
 
 def _max_span(cu_seqlens: torch.Tensor) -> int:
@@ -81,7 +100,7 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
     def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False) -> torch.Tensor:
         if return_lse:
             raise NotImplementedError("the DENSE ragged backend does not return the log-sum-exp; use FLASHINFER")
-        q, k, v = (t.to(self.q_data_type).contiguous() for t in (q, k, v))
+        q, k, v = (_kernel_layout(t.to(self.q_data_type)) for t in (q, k, v))
         out = flash_attn_varlen_func(
             q, k, v, self._cu_q, self._cu_k, self._max_q, self._max_k,
             causal=self._causal, softmax_scale=self.sm_scale,

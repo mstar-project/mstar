@@ -998,6 +998,13 @@ LTX-2.5's audio queries attend each rank's share of the video tokens, and
 ``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
 merges them.
 
+A ragged callable takes q, k and v as views with strided rows, provided the head dim is dense.
+``ulysses_attention`` hands one sequence's q, k and v over as views of the buffer they arrive
+in, and a split fused q/k/v projection is another such view. The FlashInfer backend passes them
+to FA2 and FA3, which read the strides, as they lie, and copies them contiguous for its other
+kernels (``STRIDED_QKV_BACKENDS`` in ``attn/ragged/wrappers.py``); the dense backend passes them
+to FA3 and copies them for AITER.
+
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
