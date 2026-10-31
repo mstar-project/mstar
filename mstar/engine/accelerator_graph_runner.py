@@ -408,12 +408,9 @@ def _capture_thrown_away(
 
 
 def _pool_bytes(pool_id) -> int:
-    """The bytes the caching allocator holds for graph pool ``pool_id``.
-
-    Read off the whole snapshot, not ``memory_snapshot(pool_id)``: that call drops a
-    reference to each item of the id it is handed (torch 2.9-2.13), and once a process has
-    made 256 pools the id is no cached small int, so the call frees it while the pool's
-    handle still holds it. The handle's own release then writes into freed memory.
+    """The bytes the caching allocator holds for graph pool ``pool_id``, read off the whole
+    snapshot: ``memory_snapshot(pool_id)`` drops a reference to each item of the id (torch
+    2.9-2.13), which past 256 pools frees the id while the pool's handle still holds it.
     """
     pool_id = tuple(pool_id)
     return sum(

@@ -670,10 +670,8 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the reference is dropped in torch's CUDA snapshot")
 def test_sizing_a_throwaway_capture_keeps_the_references_to_its_pool_id(monkeypatch):
-    """torch's ``memory_snapshot(pool_id)`` drops a reference to each item of the id (2.9-2.13).
-    Past 256 pools the id is no cached small int, so sizing a throwaway capture freed it while
-    the pool's handle still held it, and the handle's release then wrote into freed memory: the
-    glibc heap corruption the draft-verify GPU modules hit when one process ran enough of them."""
+    """Sizing leaves the id's references as they were: past 256 pools the id is no cached
+    small int, so a dropped reference frees it while the pool's handle still holds it."""
     pool_id = (0, int("1000007"))
     held = [pool_id[1]] * 4  # so the id outlives a dropped reference and the count stays readable
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: pool_id)
