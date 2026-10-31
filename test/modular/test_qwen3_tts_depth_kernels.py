@@ -1,9 +1,9 @@
 """Qwen3-TTS's depth loop: the fused q/k norm + RoPE + KV write (``qk_norm_rope_kv_write``) with its guard and eager
-fallback.
+fallback, the decode attention over several tokens of a row, and the two-token first pass.
 
-The CPU tests stand a Python reference in for the Triton kernels and pin the selection and the guard. The GPU tests hold
-the kernels to the eager path at bf16 tolerance on the predictor's own geometry (16 groups, 16 q and 8 KV heads of 128,
-rows 1/8/28).
+The CPU tests stand a Python reference in for the Triton kernels and pin the selection, the guard and what a two-token
+pass means. The GPU tests hold the kernels to the eager path at bf16 tolerance on the predictor's own geometry (16
+groups, 16 q and 8 KV heads of 128, rows 1/8/28).
 """
 from __future__ import annotations
 
@@ -14,12 +14,13 @@ import torch
 import torch.nn.functional as F
 
 import mstar.model.qwen3_tts.components.talker as talker_module
-from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor
+from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     Qwen3TTSCodePredictorConfig,
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
+from mstar.model.qwen3_tts.submodules import FIRST_PASS_TOKENS, TalkerSubmodule
 from mstar.utils import attention
 
 CUDA = torch.cuda.is_available()
@@ -87,6 +88,65 @@ def python_kernels(monkeypatch):
 def _cache(config, batch):
     cp = config.talker.code_predictor
     return torch.zeros(cp.num_hidden_layers, batch, 2, GROUPS, cp.num_key_value_heads, cp.head_dim)
+
+
+def test_two_token_pass_is_two_one_token_passes(python_kernels):
+    config = _config()
+    torch.manual_seed(0)
+    predictor = Qwen3TTSCodePredictor(config)
+    _init_weights(predictor)
+    batch = 3
+    inputs = torch.randn(batch, FIRST_PASS_TOKENS, config.talker.hidden_size)
+    rows = torch.arange(batch)
+
+    one = _cache(config, batch)
+    with torch.no_grad():
+        predictor.forward_depth_unrolled(inputs[:, :1].clone(), rows * 0, rows, one, cache_pos=0)
+        second = predictor.forward_depth_unrolled(inputs[:, 1:].clone(), rows * 0 + 1, rows, one, cache_pos=1)
+
+        two = _cache(config, batch)
+        out = predictor.forward_depth_unrolled(
+            inputs.clone(),
+            torch.arange(FIRST_PASS_TOKENS).repeat(batch),
+            rows.repeat_interleave(FIRST_PASS_TOKENS),
+            two,
+            cache_pos=0,
+        )
+    assert out.shape == (batch, FIRST_PASS_TOKENS, config.code_predictor.hidden_size)
+    torch.testing.assert_close(out[:, 1:], second)
+    torch.testing.assert_close(two, one)
+
+
+def addressing_dtypes(submodule: TalkerSubmodule) -> set[torch.dtype]:
+    full = submodule._depth_addressing
+    return {full.first_positions.dtype, full.positions.dtype}
+
+
+def test_depth_loop_runs_the_first_two_tokens_as_one_pass(monkeypatch):
+    config = _config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule.code_predictor.consolidate_stacked_weights()
+    cp = config.talker.code_predictor
+    calls = []
+
+    def fake_pass(inputs_embeds, position_ids, batch_rows, kv_cache, cache_pos):
+        calls.append((inputs_embeds.shape[:2], position_ids.tolist(), batch_rows.tolist(), cache_pos))
+        return torch.zeros(*inputs_embeds.shape[:2], cp.hidden_size)
+
+    monkeypatch.setattr(submodule.code_predictor, "forward_depth_unrolled", fake_pass)
+    batch = 2
+    hidden = torch.randn(batch, config.talker.hidden_size)
+    layer0 = torch.tensor([1, 2])
+    codes, embed_sum = submodule._depth_loop(hidden, layer0, lambda logits: logits.argmax(-1))
+
+    assert len(calls) == GROUPS - 1
+    assert calls[0] == ((batch, 2), [0, 1, 0, 1], [0, 0, 1, 1], 0)
+    assert addressing_dtypes(submodule) == {torch.int32}
+    for group in range(2, GROUPS):
+        assert calls[group - 1] == ((batch, 1), [group, group], [0, 1], group)
+    assert codes.shape == (batch, GROUPS)
+    assert codes[:, 0].tolist() == [1, 2]
+    assert embed_sum.shape == (batch, config.talker.hidden_size)
 
 
 def _fake_tensors(head_dim=128, dtype=torch.bfloat16, cache_dtype=None, q_stride=1, cache_stride=1, device_type="cuda"):
@@ -221,7 +281,7 @@ def _split(qkv):
 
 @needs_cuda
 @pytest.mark.parametrize("rows", ROWS)
-@pytest.mark.parametrize("tokens,cache_pos", [(1, 0), (1, 2), (1, 15)])
+@pytest.mark.parametrize("tokens,cache_pos", [(2, 0), (1, 2), (1, 15)])
 def test_kernel_matches_eager_norm_rope_write(rows, tokens, cache_pos):
     from mstar.engine.resources.rms_norm import run_rms_norm
 
@@ -250,6 +310,30 @@ def test_kernel_matches_eager_norm_rope_write(rows, tokens, cache_pos):
     assert cache[:, :, :cache_pos].abs().sum() == 0 and cache[:, :, end:].abs().sum() == 0
 
 
+@needs_cuda
+@pytest.mark.parametrize("rows", ROWS)
+@pytest.mark.parametrize("cache_len", [1, 2, 16])
+def test_one_token_attention_matches_the_reference(rows, cache_len):
+    g = torch.Generator(device="cpu").manual_seed(cache_len)
+    q = torch.randn(rows, 1, HQ, D, generator=g).cuda().bfloat16()
+    k = torch.randn(rows, 16, HKV, D, generator=g).cuda().bfloat16()
+    v = torch.randn(rows, 16, HKV, D, generator=g).cuda().bfloat16()
+    got = attention.decode_attn_nhd(q, k, v, cache_len)
+    _assert_bf16_close(got, _reference_attention(q, k, v, cache_len), min_equal=0.3)
+
+
+@needs_cuda
+@pytest.mark.parametrize("rows", ROWS)
+def test_two_token_attention_matches_one_token_calls(rows):
+    g = torch.Generator(device="cpu").manual_seed(2)
+    q = torch.randn(rows, 2, HQ, D, generator=g).cuda().bfloat16()
+    k = torch.randn(rows, 16, HKV, D, generator=g).cuda().bfloat16()
+    v = torch.randn(rows, 16, HKV, D, generator=g).cuda().bfloat16()
+    got = attention.decode_attn_nhd(q, k, v, 2)
+    want = torch.cat([attention.decode_attn_nhd(q[:, t:t + 1], k, v, t + 1) for t in range(2)], dim=1)
+    _assert_bf16_close(got, want, min_equal=0.99)
+
+
 def _predictor(rows):
     config = _config(layers=5, heads=HQ, kv_heads=HKV, head_dim=D, hidden=1024, groups=16)
     torch.manual_seed(0)
@@ -261,25 +345,33 @@ def _predictor(rows):
 
 @needs_cuda
 @pytest.mark.parametrize("rows", ROWS)
-def test_depth_passes_match_the_eager_passes(rows, monkeypatch):
-    """All 16 positions through five real-geometry layers, the fused path against the eager one."""
+def test_depth_passes_match_the_eager_one_token_passes(rows, monkeypatch):
+    """All 16 positions through five real-geometry layers: the fused path with its two-token
+    first pass against the eager path with one token per pass."""
     predictor, cache = _predictor(rows)
     g = torch.Generator(device="cpu").manual_seed(3)
     inputs = torch.randn(rows, 16, 2048, generator=g).cuda().bfloat16()
     batch_rows = torch.arange(rows, device="cuda")
 
-    def run(kv_cache):
-        return [
-            predictor.forward_depth_unrolled(
-                inputs[:, pos:pos + 1].clone(), batch_rows * 0 + pos, batch_rows, kv_cache, cache_pos=pos,
-            )[:, 0]
-            for pos in range(16)
-        ]
-
     with torch.inference_mode():
-        fused = run(cache)
+        fused = [predictor.forward_depth_unrolled(
+            inputs[:, :2].clone(), torch.arange(2, device="cuda").repeat(rows), batch_rows.repeat_interleave(2),
+            cache, cache_pos=0,
+        )[:, 1]]
+        for pos in range(2, 16):
+            fused.append(predictor.forward_depth_unrolled(
+                inputs[:, pos:pos + 1].clone(), batch_rows * 0 + pos, batch_rows, cache, cache_pos=pos,
+            )[:, 0])
+
         monkeypatch.setattr(talker_module, "qk_norm_rope_kv_write_applies", lambda q, layer: False)
-        eager = run(cache.clone().zero_())
+        eager_cache = cache.clone().zero_()
+        eager = []
+        for pos in range(16):
+            out = predictor.forward_depth_unrolled(
+                inputs[:, pos:pos + 1].clone(), batch_rows * 0 + pos, batch_rows, eager_cache, cache_pos=pos,
+            )[:, 0]
+            if pos:
+                eager.append(out)
 
     for got, want in zip(fused, eager, strict=True):
         # five layers of rounding, each at most a step or so

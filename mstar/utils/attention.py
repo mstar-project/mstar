@@ -13,15 +13,15 @@ from mstar.platforms import current_platform
         triton.Config({"BLOCK_N": 128},  num_warps=8,  num_stages=2),
         triton.Config({"BLOCK_N": 256},  num_warps=8,  num_stages=2),
     ],
-    key=["cache_len"],
+    key=["cache_len", "TOKENS"],
 )
 @triton.jit
 def _decode_attn_nhd_kernel(
-    Q_ptr,          # (B, H_q, D)        - query, q_len=1 squeezed out
+    Q_ptr,          # (B * T, H_q, D)    - query, T tokens per batch row
     K_ptr,          # (B, S, H_kv, D)    - NHD layout
     V_ptr,          # (B, S, H_kv, D)    - NHD layout
-    O_ptr,          # (B, H_q, D)        - output
-    cache_len,      # int: actual filled length (attend to [0, cache_len))
+    O_ptr,          # (B * T, H_q, D)    - output
+    cache_len,      # int: filled length; the last token attends [0, cache_len)
     sm_scale,       # float: 1/sqrt(D) typically
     # Q strides
     sq_b, sq_h, sq_d,
@@ -35,17 +35,21 @@ def _decode_attn_nhd_kernel(
     H_kv: tl.constexpr,
     GROUP: tl.constexpr,        # H_q // H_kv
     D: tl.constexpr,            # head dim, power of 2
+    TOKENS: tl.constexpr,       # T, the query tokens per batch row
     BLOCK_N: tl.constexpr,      # KV chunk size along sequence
 ):
-    # One program per (batch, q_head).
-    pid_b = tl.program_id(0)
+    # One program per (token, q_head).
+    pid_t = tl.program_id(0)
     pid_hq = tl.program_id(1)
     pid_hkv = pid_hq // GROUP
+    pid_b = pid_t // TOKENS
+    # causal: a token sees the cache up to and including itself
+    token_len = cache_len - (TOKENS - 1 - pid_t % TOKENS)
 
     offs_d = tl.arange(0, D)
 
     # Load query vector: (D,)
-    q = tl.load(Q_ptr + pid_b * sq_b + pid_hq * sq_h + offs_d * sq_d).to(tl.float32)
+    q = tl.load(Q_ptr + pid_t * sq_b + pid_hq * sq_h + offs_d * sq_d).to(tl.float32)
     q = q * sm_scale
 
     # Online softmax accumulators
@@ -58,9 +62,9 @@ def _decode_attn_nhd_kernel(
     V_base = V_ptr + pid_b * sv_b + pid_hkv * sv_h
 
     # Iterate over the KV sequence in chunks of BLOCK_N
-    for start_n in range(0, cache_len, BLOCK_N):
+    for start_n in range(0, token_len, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < cache_len
+        mask_n = offs_n < token_len
 
         # Load K block: (BLOCK_N, D)
         k_ptrs = K_base + offs_n[:, None] * sk_n + offs_d[None, :] * sk_d
@@ -86,7 +90,7 @@ def _decode_attn_nhd_kernel(
 
     # Finalize and store
     out = acc / l_i
-    o_ptrs = O_ptr + pid_b * so_b + pid_hq * so_h + offs_d * so_d
+    o_ptrs = O_ptr + pid_t * so_b + pid_hq * so_h + offs_d * so_d
     tl.store(o_ptrs, out.to(O_ptr.dtype.element_ty))
 
 
@@ -95,24 +99,26 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
     """
     Decode-only SDPA for NHD-format KV cache.
 
-    q:        (B, 1, H_q, D)  or  (B, H_q, D)        - fp32
+    q:        (B, T, H_q, D)  or  (B, H_q, D)        - fp32
     k_cache:  (B, S_max, H_kv, D)                    - fp32
     v_cache:  (B, S_max, H_kv, D)                    - fp32
     cache_len: int, number of valid KV positions
 
-    returns: (B, 1, H_q, D) matching q's input shape
+    The T tokens of a row hold the last T valid positions, so each attends
+    causally: token t of T over ``[0, cache_len - T + t + 1)``.
+
+    returns: the same dimensions as q
     """
-    squeeze_qlen = False
+    query_shape = q.shape
+    tokens = query_shape[1] if q.dim() == 4 else 1
     if q.dim() == 4:
-        assert q.shape[1] == 1, "decode kernel requires q_len == 1"
-        q = q.squeeze(1)
-        squeeze_qlen = True
+        q = q.flatten(0, 1)
 
     B, H_q, D = q.shape
     _, _, H_kv, _ = k_cache.shape
     assert H_q % H_kv == 0, "H_q must be divisible by H_kv"
     assert D in (16, 32, 64, 128, 256), f"head_dim {D} should be a power of 2"
-    assert cache_len > 0, "Attention not well-define with empty KV"
+    assert cache_len >= tokens > 0, "Attention not well-define with empty KV"
     assert q.is_contiguous() or q.stride(-1) == 1
 
     if sm_scale is None:
@@ -130,10 +136,10 @@ def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
         out.stride(0), out.stride(1), out.stride(2),
-        H_q=H_q, H_kv=H_kv, GROUP=GROUP, D=D,
+        H_q=H_q, H_kv=H_kv, GROUP=GROUP, D=D, TOKENS=tokens,
     )
 
-    return out.unsqueeze(1) if squeeze_qlen else out
+    return out.view(query_shape)
 
 
 @triton.jit

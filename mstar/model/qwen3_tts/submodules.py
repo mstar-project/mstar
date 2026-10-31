@@ -96,13 +96,17 @@ from mstar.utils.h2d import PinnedStager
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
+# what the first depth pass feeds: the Talker hidden state and the group-0 embedding
+FIRST_PASS_TOKENS = 2
 
 
 class DepthAddressing(NamedTuple):
     """Each depth token's position and batch row, for one batch size. The tensors
     outlive a capture, so a replay spends no launches rebuilding them."""
 
-    positions: torch.Tensor  # [groups, batch]
+    first_positions: torch.Tensor  # [batch * FIRST_PASS_TOKENS], the first pass
+    first_rows: torch.Tensor  # [batch * FIRST_PASS_TOKENS]
+    positions: torch.Tensor  # [groups, batch], the single-token passes
     rows: torch.Tensor  # [batch]
 
 
@@ -250,13 +254,20 @@ class TalkerSubmodule(ARNodeSubmodule):
         full = self._depth_addressing
         if full is None:
             device = self.get_device()
+            rows = torch.arange(self.MAX_BATCH_SIZE, dtype=torch.long, device=device)
+            # int32 is what the eager RoPE reads, so it casts nothing per layer
+            first = torch.arange(FIRST_PASS_TOKENS, dtype=torch.int32, device=device)
             full = self._depth_addressing = DepthAddressing(
-                # int32 is what the eager RoPE reads, so it casts nothing per layer
+                first_positions=first.repeat(self.MAX_BATCH_SIZE),
+                first_rows=rows.repeat_interleave(FIRST_PASS_TOKENS),
                 positions=torch.arange(self.num_codes, dtype=torch.int32, device=device)
                 .unsqueeze(1).repeat(1, self.MAX_BATCH_SIZE),
-                rows=torch.arange(self.MAX_BATCH_SIZE, dtype=torch.long, device=device),
+                rows=rows,
             )
+        tokens = batch_size * FIRST_PASS_TOKENS
         return DepthAddressing(
+            first_positions=full.first_positions[:tokens],
+            first_rows=full.first_rows[:tokens],
             positions=full.positions[:, :batch_size],
             rows=full.rows[:batch_size],
         )
@@ -659,16 +670,20 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         cp_cache = self._get_cp_kv_cache(batch_size)
         addressing = self._get_depth_addressing(batch_size)
-        # Position 0 conditions the depth decoder on the Talker hidden state.
-        # Each following position consumes the previous group's embedding.
-        self.code_predictor.forward_depth_unrolled(
-            last_hidden.unsqueeze(1), addressing.positions[0], addressing.rows, cp_cache, cache_pos=0,
+        # The first pass runs positions 0 and 1 as two tokens of one pass: the
+        # Talker hidden state conditions the decoder, and the group-0 embedding
+        # predicts group 1. Each later position consumes the previous group's
+        # embedding.
+        cp_hidden = self.code_predictor.forward_depth_unrolled(
+            torch.stack((last_hidden, codec_embed), dim=1),
+            addressing.first_positions, addressing.first_rows, cp_cache, cache_pos=0,
         )
         for group_idx in range(1, self.num_codes):
-            cp_hidden = self.code_predictor.forward_depth_unrolled(
-                codec_embed.unsqueeze(1),
-                addressing.positions[group_idx], addressing.rows, cp_cache, cache_pos=group_idx,
-            )
+            if group_idx > 1:
+                cp_hidden = self.code_predictor.forward_depth_unrolled(
+                    codec_embed.unsqueeze(1),
+                    addressing.positions[group_idx], addressing.rows, cp_cache, cache_pos=group_idx,
+                )
             cp_logits = torch.matmul(
                 cp_hidden[:, -1],
                 self.code_predictor.lm_head_weight[group_idx - 1].t(),

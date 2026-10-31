@@ -228,10 +228,11 @@ class Qwen3TTSCodePredictorInnerModel(nn.Module):
 class Qwen3TTSCodePredictor(nn.Module):
     """Five-layer decoder that predicts codec groups 1 through 15.
 
-    ``forward_depth_unrolled`` performs one position on the group-depth axis.
-    Callers first write the Talker hidden state at position 0, then repeatedly
-    feed the preceding codec embedding at positions 1-15. Keeping this as
-    tensor-only code allows the complete depth loop to be CUDA-graph captured.
+    ``forward_depth_unrolled`` runs one pass along the group-depth axis. Callers
+    feed the Talker hidden state and the group-0 embedding as one two-token pass
+    at positions 0-1, then each further codec embedding at positions 2-15.
+    Keeping this as tensor-only code allows the complete depth loop to be
+    CUDA-graph captured.
 
     Every depth input arrives in the Talker width and passes through
     ``small_to_mtp_projection`` (a biased linear layer on the 1.7B
