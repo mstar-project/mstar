@@ -1,9 +1,13 @@
 """``mstar.platforms``: which hardware the process runs on."""
 
 import copy
+import importlib.util
 import multiprocessing
 import os
 import pickle
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +15,7 @@ import torch
 
 from mstar import platforms
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform, current_platform
+from mstar.platforms.interface import BF16_HEADER_FLAG
 
 
 @pytest.fixture
@@ -152,6 +157,60 @@ def test_a_callable_env_default_adds_to_the_value_already_set(monkeypatch):
 
     platforms.apply_process_env_defaults()
     assert os.environ["PLATFORM_ENV_TEST_SET"] == "user-default"
+
+
+@pytest.mark.parametrize(
+    ("exported", "expected"),
+    [
+        (None, BF16_HEADER_FLAG),
+        ("-DUSER_FLAG", f"-DUSER_FLAG {BF16_HEADER_FLAG}"),
+        (f"{BF16_HEADER_FLAG} -DUSER_FLAG", f"{BF16_HEADER_FLAG} -DUSER_FLAG"),
+    ],
+)
+def test_rocm_adds_the_bf16_header_to_flashinfer_flags(monkeypatch, exported, expected):
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setenv("FLASHINFER_EXTRA_CUDAFLAGS", "")
+    if exported is None:
+        monkeypatch.delenv("FLASHINFER_EXTRA_CUDAFLAGS")
+    else:
+        monkeypatch.setenv("FLASHINFER_EXTRA_CUDAFLAGS", exported)
+
+    # the conductor applies the defaults, then each worker again
+    platforms.apply_process_env_defaults()
+    platforms.apply_process_env_defaults()
+    assert os.environ["FLASHINFER_EXTRA_CUDAFLAGS"] == expected
+
+
+# aiter's import asks rocminfo for a live GPU; the module generator reads only its path
+_BF16_PREFILL_JIT = """
+import importlib.util, sys, types
+import torch
+aiter = types.ModuleType("aiter")
+aiter.__file__ = importlib.util.find_spec("aiter").origin
+sys.modules["aiter"] = aiter
+from flashinfer.jit.rocm.modules import gen_batch_prefill_module
+bf16 = torch.bfloat16
+gen_batch_prefill_module("aiter", bf16, bf16, bf16, torch.int32, 64, 64, 0, False, False, False).build()
+"""
+
+
+def test_flashinfer_builds_its_bf16_aiter_prefill_with_the_rocm_flags(tmp_path):
+    if importlib.util.find_spec("aiter") is None:
+        pytest.skip("needs AITER")
+    pytest.importorskip("flashinfer.jit.rocm.modules")
+    if shutil.which("amdclang++") is None:
+        pytest.skip("needs amdclang++")
+    env = {
+        **os.environ,
+        "FLASHINFER_EXTRA_CUDAFLAGS": BF16_HEADER_FLAG,
+        "FLASHINFER_ROCM_ARCH_LIST": "gfx942",
+        "FLASHINFER_WORKSPACE_BASE": str(tmp_path),
+    }
+    built = subprocess.run(
+        [sys.executable, "-c", _BF16_PREFILL_JIT],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert built.returncode == 0, built.stderr[-2000:] + built.stdout[-2000:]
 
 
 def test_a_worker_sets_its_env_defaults_before_anything_else(monkeypatch):
