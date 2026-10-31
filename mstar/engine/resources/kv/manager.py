@@ -367,8 +367,9 @@ class KVPageCounts(NamedTuple):
 @dataclass(slots=True)
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: its prompt, less the
-    cache hits another request holds. ``remaining`` is its share of `KVManager._unused`, and
-    ``prompt`` is the request's prompt in pages, which `unreserve` puts back in `_asks`."""
+    cache hits another request holds, and less what a window doesn't hold once its prompt is
+    written. ``remaining`` is its share of `KVManager._unused`, and ``prompt`` is the request's
+    prompt in pages, which `unreserve` puts back in `_asks`."""
     pages: int
     remaining: int = 0
     prompt: int = 0
@@ -3172,7 +3173,9 @@ class KVManager(AttentionResource):
         """On the commit that writes the last of a stream's prompt, drop its window groups' share of
         the allotment to the pages they hold. The allotment covers the prompt, and the pages a window
         released while the prompt filled stayed in it for the prompt's later steps; past the prompt a
-        window's pages only cycle, so what it doesn't hold is room again. Under the lock."""
+        window's pages only cycle, so what it doesn't hold (or need for the layout's scratch) is room
+        again. A growth loop that runs before the last span ends the prompt early here, as it does for
+        the first group's allotment. Under the lock."""
         rid = segment.request_id
         layout = self._held_layout(rid, segment.label)
         if layout is None:
@@ -3184,10 +3187,12 @@ class KVManager(AttentionResource):
             return
         caps = dict.fromkeys(overrides.loop_caps or (), 0)
         allotment = self._allotments[rid]
-        allotment.pages = max(0, allotment.pages - sum(
-            max(0, layout.pages(caps, group.page_size, group.retention) - len(stream.group(g).page_indices))
-            for g, group in self._windows
-        ))
+        excess = 0
+        for g, group in self._windows:
+            part = stream.group(g)
+            kept = max(len(part.page_indices), -(-(part.stored_len + layout.scratch) // group.page_size))
+            excess += max(0, layout.pages(caps, group.page_size, group.retention) - kept)
+        allotment.pages = max(0, allotment.pages - excess)
         self._recount(rid)
 
     def _release_oldest_locked(
