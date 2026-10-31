@@ -326,13 +326,23 @@ def _sharding_groups(
                     )
 
 
+def _placement(groups, node: str) -> str:
+    """``node``'s TP and SP ranks on a worker, leaving out an axis of one rank."""
+    axes = (("TP", groups.get_tp_config_for_node(node)), ("SP", groups.get_sp_config_for_node(node)))
+    return f"{node} on " + ", ".join(
+        f"{axis} ranks {group.group_members}" for axis, group in axes if group.world_size > 1
+    )
+
+
 def _worker_parallelism(
     worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
-    same groups the conductor hands it: at most one lockstep-parallel node per
-    worker, and every resource spec's nodes on one TP x SP shape and, on each
-    worker, in one parallel group. Over every node placed on the worker; the
+    same groups the conductor hands it: every lockstep-parallel node on a
+    worker in the same TP and SP groups (one lockstep instance), every
+    resource spec's nodes on one TP x SP shape and, on each worker, in one
+    parallel group, and no resource that journals resident moves under two
+    lockstep nodes of a worker. Over every node placed on the worker; the
     engine checked only nodes it built a submodule for, so a dummy run (no
     weights) skipped the resource checks."""
     ranks = sorted({rank for wg in worker_graphs for rank in wg.ranks})
@@ -365,15 +375,18 @@ def _worker_parallelism(
         for rank, wid in zip(ranks, worker_ids, strict=True)
     }
     for wid, nodes in deployed.items():
+        groups = per_worker[wid]
         parallel_nodes = sorted(
-            node for node in nodes
-            if per_worker[wid].get_instance_world_size_for_node(node) > 1
+            node for node in nodes if groups.get_instance_world_size_for_node(node) > 1
         )
-        if len(parallel_nodes) > 1:
+        # A worker leads or follows one instance, whose steps go out as one
+        # ordered stream from its rank 0, so its lockstep nodes share it.
+        if not groups.all_in_same_group(parallel_nodes):
+            placed = "; ".join(_placement(groups, node) for node in parallel_nodes)
             yield (
-                f"Multiple parallel nodes {parallel_nodes} found in worker {wid}; "
-                "current implementation requires at most one lockstep-parallel node "
-                "per worker."
+                f"Lockstep-parallel nodes on {wid} are not in the same TP and SP groups: "
+                f"{placed}. A worker's lockstep nodes must share one instance: the same "
+                "TP and SP groups, of the same ranks in the same order."
             )
 
     all_nodes = set().union(*deployed.values())
@@ -386,6 +399,7 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same TP x SP shape across replicas"
             )
+        shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
@@ -393,3 +407,21 @@ def _worker_parallelism(
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
                     f"on {wid} must all be in the same parallel (tp x sp) group"
                 )
+            lockstep = tuple(sorted(
+                node for node in local
+                if per_worker[wid].get_instance_world_size_for_node(node) > 1
+            ))
+            if len(lockstep) > 1 and spec.resource_class.journals_resident_moves():
+                shared.setdefault(lockstep, []).append(wid)
+        # Rank 0's resident journal is per node, so a move on a shared pool reaches a
+        # follower only with one node's next step. Separate pools are safe: each
+        # node's moves ride on its own next step. Refused with offload off too, since
+        # prefix hits and page trails also ride a node's own head, until rank 0
+        # journals a shared pool's moves in one stream.
+        for lockstep, wids in shared.items():
+            yield (
+                f"Resource {spec.resource_key} is shared by lockstep-parallel nodes "
+                f"{list(lockstep)} on {', '.join(wids)}; the other ranks replay rank 0's moves on the pool "
+                "per node, so a shared pool can admit out of step. "
+                "Give each node a resource of its own, or place them on different workers."
+            )
