@@ -793,7 +793,6 @@ def test_wan22_postprocess_honors_request_fps():
 
 
 def test_wan22_postprocess_rejects_bad_fps():
-    pytest.importorskip("av")
     model = _make_model()
     for bad in (0, -24, "fast"):
         with pytest.raises(ValueError, match="fps"):

@@ -1924,7 +1924,7 @@ A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
 encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
-rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
+rgb24 frames for PyAV's ``image_io.encode_mp4`` (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
 A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
 frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
 copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
@@ -2378,7 +2378,7 @@ Shared pieces to build the components from: ``flow_match.py`` (shift schedules a
 exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
 attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
 ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
-family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
+family), ``image_io.py`` (latent packing, PNG, the mp4 encoder) and ``lora.py`` (static LoRA merge at load,
 also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``).
 
 Two pieces swap a one-pass kernel in for what Inductor would emit, inside a compiled

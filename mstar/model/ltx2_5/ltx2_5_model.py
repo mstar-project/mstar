@@ -31,9 +31,7 @@ The distilled checkpoint runs a fixed 8-sigma schedule with no guidance;
 
 from __future__ import annotations
 
-import io
 import logging
-from fractions import Fraction
 
 import torch
 
@@ -49,6 +47,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.diffusion.image_io import encode_mp4
 from mstar.model.ltx2_5.config import (
     AUDIO_DECODER_NODE,
     DENOISE_LOOP,
@@ -487,28 +486,9 @@ class LTX25Model(Model):
             return pcm.T.contiguous().cpu().numpy().tobytes()
         if modality != "video":
             raise ValueError(f"unsupported output modality for LTX-2.5: {modality!r}")
-        import av
-
         fps = self.resolve_request(request_kwargs or {})["fps"]
-        # the decoder emits [F, H, W, 3] already, the layout PyAV encodes from
-        frames = (output[0] if output.ndim == 5 else output).cpu().numpy()
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        # PyAV wants a rational rate: 24 -> 24, 23.976 -> 2997/125
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
-        stream.height, stream.width = frames.shape[1], frames.shape[2]
-        stream.pix_fmt = "yuv420p"
-        # As Cosmos3 encodes: CRF 18 is less lossy than libx264's default 23, and the
-        # multithreaded ultrafast preset is several times faster than the default (121 frames
-        # at 544x960 in 0.23 s), all of it on the request's critical path.
-        stream.options = {"crf": "18", "preset": "ultrafast", "threads": "0"}
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-        container.close()
-        return buffer.getvalue()
+        # the decoder emits [F, H, W, 3] already, the layout the encoder takes
+        return encode_mp4(output[0] if output.ndim == 5 else output, fps)
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.geometry.output_sample_rate

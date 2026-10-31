@@ -26,11 +26,9 @@ request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
 """
 
 import html
-import io
 import logging
 import os
 import re
-from fractions import Fraction
 
 import torch
 
@@ -50,6 +48,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.diffusion.image_io import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -452,7 +451,6 @@ class Wan22Model(Model):
         """
         if modality != "video":
             raise ValueError(f"Unsupported modality for Wan2.2: {modality!r}")
-        import av
 
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = (request_kwargs or {}).get("fps")
@@ -465,22 +463,8 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output.cpu().numpy()
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        # PyAV rejects float rates, so the rate is handed over as an exact
-        # Fraction: integer rates stay integral (24 -> 24) and fractional ones
-        # become a rational the container can carry (23.976 -> 2997/125).
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
-        stream.height, stream.width = frames.shape[1], frames.shape[2]
-        stream.pix_fmt = "yuv420p"
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():  # flush encoder delay
-            container.mux(packet)
-        container.close()
-        return buffer.getvalue()
+        # CRF 23 and medium, libx264's defaults, which Wan2.2 served at on PyAV >= 14.2
+        return encode_mp4(output, fps, crf=23, preset="medium")
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration

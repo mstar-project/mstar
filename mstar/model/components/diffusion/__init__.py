@@ -12,7 +12,7 @@ component ports, a weight loader and a thin graph file:
                    checkpoint rules that fill it (model-specific, hence its own package)
 * ``denoise_loop`` the Loop-body submodule: seeded noise, equal-shape request batching, per-step
                    CUDA graphs, stop at the request's step count
-* ``image_io``     pixel/latent packing helpers and PNG encoding
+* ``image_io``     pixel/latent packing helpers, PNG encoding and the shared mp4 encoder
 * ``lora``         static LoRA merging at load time
 * ``compile_utils``/``decode_utils``  the transformer/VAE ``torch.compile`` wrappers, the exact-op
                    exclusions, and the batch splitting that keeps a compiled decode on warm shapes

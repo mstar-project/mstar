@@ -1045,8 +1045,9 @@ Cosmos3 environment requirements
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
-  when available (torchcodec >= 0.9), otherwise with ``torchvision``'s
-  ``write_video``, which needs the PyAV (``av``) package.
+  when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
+  ``image_io.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
+  covers a torchcodec that cannot load FFmpeg.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).

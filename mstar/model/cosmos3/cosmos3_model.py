@@ -89,6 +89,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.diffusion.image_io import encode_mp4
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -134,35 +135,6 @@ VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
 
 
-
-def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str = "ultrafast") -> bytes:
-    """H.264 mp4 bytes from uint8 frames ``[T, H, W, 3]`` through PyAV (its
-    wheel bundles FFmpeg + libx264), matching the torchcodec encoder's
-    CRF / preset / threading settings. Odd frame sizes are edge-padded to
-    even dimensions for yuv420p."""
-    import io
-    from fractions import Fraction
-
-    import av
-
-    _, h, w, _ = frames.shape
-    arr = frames.numpy()
-    if (w % 2) or (h % 2):
-        import numpy as np
-
-        arr = np.pad(arr, ((0, 0), (0, h % 2), (0, w % 2), (0, 0)), mode="edge")
-    buf = io.BytesIO()
-    with av.open(buf, mode="w", format="mp4") as container:
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
-        stream.width, stream.height = arr.shape[2], arr.shape[1]
-        stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": str(crf), "preset": preset, "threads": "0"}
-        for frame in arr:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-    return buf.getvalue()
 
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
@@ -1137,14 +1109,9 @@ class Cosmos3Model(Model):
             # encode all of them as an H.264 mp4. The frames already reflect the
             # request fps (it modulates the temporal positions during generation),
             # and the container carries that same rate so playback runs at the
-            # requested speed.
-            #
-            # CRF 18 keeps the H.264 output near-visually-lossless; libx264
-            # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
-            # preset and multithreading (threads=0) target the same CRF/quality
-            # but encode several times faster than libx264's default "medium"
-            # preset, which otherwise dominates the serving latency for a
-            # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
+            # requested speed. torchcodec takes the same CRF 18 / ultrafast /
+            # threads=0 settings as ``encode_mp4`` (see there); the preset is
+            # overridable via COSMOS3_X264_PRESET.
             frames = output.cpu()
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
@@ -1170,7 +1137,7 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-                data = encode_mp4_pyav(frames.permute(0, 2, 3, 1), fps=fps, crf=18, preset=preset)
+                data = encode_mp4(frames.permute(0, 2, 3, 1), fps=fps, preset=preset)
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
