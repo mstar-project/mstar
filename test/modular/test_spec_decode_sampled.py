@@ -235,6 +235,19 @@ def test_a_greedy_row_keeps_exact_greedy_acceptance_whatever_the_registers_hold(
     assert out.tokens.tolist() == [[5, 6, 7], [5, 6, -1], [5, -1, -1]]
 
 
+def test_a_samplers_count_decides_the_step_where_greedy_acceptance_would_go_on():
+    """The next token can equal the next draft past where the sampler stopped; what
+    it kept stands. Without a count the step is greedy acceptance."""
+    target = torch.tensor([[5, 6, 7]])
+    for kept, accepted, tokens in ((torch.tensor([1], dtype=torch.int32), 2, [5, 6, -1]), (None, 3, [5, 6, 7])):
+        spec = _spec(1, k=2)
+        spec._tokens[:, 1] = torch.tensor([3, 5, 6])
+        spec.verify_inputs()
+        out = spec.accept_tokens(target, kept=kept)
+        assert out.accepted.tolist() == [accepted] and out.tokens.tolist() == [tokens]
+        assert int(spec._seq_len[1]) == 10 + accepted and int(spec._tokens[0, 1]) == tokens[accepted - 1]
+
+
 # --- seeds and offsets --------------------------------------------------------
 
 

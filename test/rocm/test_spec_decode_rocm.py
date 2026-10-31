@@ -39,7 +39,7 @@ from mstar.engine.resources.recurrent import (
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.spec_decode import sampled
+from mstar.engine.resources.spec_decode import kernels, sampled
 from mstar.engine.resources.spec_decode.config import SpecPhase
 from mstar.engine.resources.spec_decode.draft_head import Fp8DraftHead
 from mstar.engine.resources.spec_decode.resource import RNG_START, SpecDecodePlan, SpecDecodeResource
@@ -344,6 +344,23 @@ def test_a_verify_step_issues_no_host_sync(k, sample):
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
+
+
+def test_the_accept_kernel_stops_where_a_sampler_did():
+    args = kernels._accept_args({"rows": 6, "tokens": 3}, torch.int32, DEV)
+    kept = torch.tensor([0, 1, 2, 2, 1, 0], dtype=torch.int32, device=DEV)
+
+    def run(fn):
+        copy = [x.clone() if torch.is_tensor(x) else x for x in args]
+        fn(*copy, kept)
+        return copy
+
+    got, want = run(kernels._accept), run(kernels._accept_reference)
+    torch.cuda.synchronize()
+    assert (want[14] == kept + 1).all()
+    for ours, theirs in zip(got, want, strict=True):
+        if torch.is_tensor(ours):
+            assert torch.equal(ours, theirs)
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4])
