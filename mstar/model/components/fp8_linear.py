@@ -10,7 +10,9 @@ sensitive to. ``apply_linear_dtype`` swaps the rest once at load (after
 any LoRA merge, before compile), so the compiled forward sees the per-token
 quantisation as plain torch and fuses it into the producer of the
 activations, usually the modulated norm, with no extra pass over the hidden
-state.
+state. A config can also pick the dtype per denoise step
+(``linear_dtype_steps``): those linears then keep both sets of weights and the
+denoise loop chooses one per step, see ``StepDtypes``.
 
 The output moves from the bf16 model's within the error of e4m3 rounding
 (3 mantissa bits). Whether that is acceptable is a per-model quality call,
@@ -34,6 +36,7 @@ from mstar.platforms import current_platform
 logger = logging.getLogger(__name__)
 
 LINEAR_DTYPES = ("bf16", "fp8")
+BF16, FP8 = LINEAR_DTYPES
 # hipBLASLt's fp8 kernels need both GEMM dimensions of the weight in multiples of 16
 _ALIGN = 16
 
@@ -77,6 +80,37 @@ class Fp8Linear(nn.Module):
         return f"in_features={self.in_features}, out_features={self.out_features}, dtype={self.weight.dtype}"
 
 
+class StepDtypes:
+    """The dtype a transformer's fp8 linears run in on each denoise step (``linear_dtype_steps``).
+
+    ``steps[k]`` is step ``k``'s dtype and steps past the list take its last entry. The denoise
+    loop sets ``active`` before each forward. A compiled forward guards on it, so each dtype
+    compiles, and captures, on its own."""
+
+    def __init__(self, steps: Sequence[str]):
+        self.steps = tuple(steps)
+        self.dtypes = tuple(dict.fromkeys(self.steps))
+        self.active = self.steps[0]
+
+    def at(self, step: int) -> str:
+        return self.steps[min(step, len(self.steps) - 1)]
+
+
+class SteppedFp8Linear(nn.Module):
+    """A linear holding its own weights and their fp8 copy, run in ``policy.active``.
+
+    Under compile the choice folds away: each dtype's graph holds one GEMM."""
+
+    def __init__(self, linear: nn.Linear | FusedColumnLinear, fp8_dtype: torch.dtype, policy: StepDtypes):
+        super().__init__()
+        self.bf16 = linear
+        self.fp8 = Fp8Linear.from_linear(linear, fp8_dtype)
+        self.policy = policy
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fp8(x) if self.policy.active == FP8 else self.bf16(x)
+
+
 _RANGE = re.compile(r"(\d+)-(\d+)")
 
 
@@ -104,10 +138,12 @@ def _fits(linear: nn.Module) -> bool:
 
 def quantize_linears(
     module: nn.Module, patterns: Sequence[str], fp8_dtype: torch.dtype, keep: Sequence[str] = (),
+    policy: StepDtypes | None = None,
 ) -> list[str]:
     """Replace every ``nn.Linear`` / ``FusedColumnLinear`` under ``module`` whose name matches
-    one of ``patterns`` and none of ``keep`` with an ``Fp8Linear``; returns the names replaced.
-    A match whose dimensions the GEMM cannot take keeps its weights."""
+    one of ``patterns`` and none of ``keep`` with an ``Fp8Linear``, or a ``SteppedFp8Linear``
+    under ``policy``; returns the names replaced. A match whose dimensions the GEMM cannot take
+    keeps its weights."""
     replaced = []
     for name, child in list(module.named_modules()):
         if not isinstance(child, (nn.Linear, FusedColumnLinear)):
@@ -119,7 +155,8 @@ def quantize_linears(
                         tuple(child.weight.shape), _ALIGN)
             continue
         parent, _, attr = name.rpartition(".")
-        setattr(module.get_submodule(parent), attr, Fp8Linear.from_linear(child, fp8_dtype))
+        fp8 = Fp8Linear.from_linear(child, fp8_dtype) if policy is None else SteppedFp8Linear(child, fp8_dtype, policy)
+        setattr(module.get_submodule(parent), attr, fp8)
         replaced.append(name)
     return replaced
 
@@ -140,13 +177,29 @@ def check_linear_dtype(linear_dtype: str) -> str:
     return linear_dtype
 
 
+def check_linear_dtype_steps(steps: Sequence[str] | None, linear_dtype: str) -> StepDtypes | None:
+    """A model config's ``linear_dtype_steps``, checked when the model is constructed."""
+    if not steps:
+        return None
+    if linear_dtype != FP8:
+        raise ValueError(f"linear_dtype_steps needs linear_dtype: {FP8}, not {linear_dtype!r}")
+    unknown = sorted({s for s in steps if s not in LINEAR_DTYPES}, key=str)
+    if unknown:
+        raise ValueError(f"linear_dtype_steps {unknown} are not in {LINEAR_DTYPES}")
+    if len(set(steps)) == 1:
+        raise ValueError(f"linear_dtype_steps {list(steps)} name one dtype: set linear_dtype to it instead")
+    return StepDtypes(steps)
+
+
 def apply_linear_dtype(
     module: nn.Module, linear_dtype: str, patterns: Sequence[str], what: str, keep: Sequence[str] = (),
+    policy: StepDtypes | None = None,
 ) -> list[str]:
     """Serve ``module``'s linears matching ``patterns`` in ``linear_dtype`` (a model config's
     ``linear_dtype``), except those matching ``keep`` (its ``fp8_keep_bf16``). ``bf16`` keeps the
     checkpoint's weights. ``fp8`` quantises them where the platform has an fp8 GEMM and keeps them
-    otherwise, with a warning, so one config serves on every GPU. Returns the names quantised."""
+    otherwise, with a warning, so one config serves on every GPU; ``policy`` keeps both sets and
+    picks one per denoise step. Returns the names quantised."""
     if check_linear_dtype(linear_dtype) == "bf16":
         return []
     eligible = [n for n, _ in module.named_modules() if any(matches(n, p) for p in patterns)]
@@ -157,7 +210,7 @@ def apply_linear_dtype(
     if reason is not None:
         logger.warning("%s: linear_dtype fp8 requested, but %s; its linears stay bf16", what, reason)
         return []
-    replaced = quantize_linears(module, patterns, current_platform.fp8_dtype(), keep)
+    replaced = quantize_linears(module, patterns, current_platform.fp8_dtype(), keep, policy)
     if not replaced:
         raise ValueError(f"{what}: linear_dtype fp8 matched no linear (patterns {list(patterns)})")
     logger.info("%s: %d linears run fp8 (%s), %d of the eligible kept bf16", what, len(replaced),
