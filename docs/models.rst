@@ -408,12 +408,18 @@ default, which lowers the token count of short clips. Notes:
 - The vision encoder attends within each image and each video frame group
   separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
   segments per prompt. A prompt over either limit runs the encoder without the
-  graph: a long video at ordinary resolution exceeds the patches, and one over
-  ~64 s with frames resized below ~256x256 pixels exceeds the segments.
+  graph (still compiled, so only the launches are extra): a long video at
+  ordinary resolution exceeds the patches, and one over ~64 s with frames
+  resized below ~256x256 pixels exceeds the segments.
 - An encoder step packs the images and videos of up to 8 requests into one
   replay; requests that would overflow it together run one at a time. The
   packed GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
+- On two GPUs, ``configs/qwen3_5_9b_dp2.yaml`` (a whole replica per GPU)
+  serves image and video traffic faster than ``configs/qwen3_5_9b_tp2.yaml``,
+  whose vision encoder runs on one rank while the other waits for it in the
+  lockstep LLM: 9B on 2xH200, video_60s c32 1520 vs ~900-1000 output tok/s,
+  MMMU c32 4457 vs ~3100.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
   beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
   eagerly.
@@ -436,6 +442,15 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+Text prefill and mixed steps replay captured graphs by total tokens, on the
+ladder ``32 ... 8192`` (powers of two); a step pads to its bucket and a longer
+one runs eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
+deployment's own ladder (distinct positive token counts, checked when the
+worker loads): ``configs/qwen3_5_9b*.yaml`` add 3072, 5120, 6144 and
+7168, which cut the padding of compute-bound long prefills (+2% output tok/s
+on 9B, random 1024/256 at c=64/128, H200); the same ladder was not a win on
+0.8B, whose prefill is launch-bound. Each bucket adds captures and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -574,12 +589,23 @@ Qwen3-Omni notes
   resource, and the 32-layer stack replays a CUDA graph by packed token count
   up to 4096 tokens (about 5 minutes of audio). A step over 4096 tokens runs
   its clips one by one, each replayed if it fits a bucket, so only a clip
-  longer than that runs eagerly, on its own. A
-  clip's embeddings can differ at the last bit with what it is batched beside,
-  since the step's total tokens pick the captured bucket (or the eager GEMMs'
-  shapes), and a prefix-cached audio prefix keeps the embeddings it was first
-  computed with, so a later request reusing it inherits that first batch's
-  rounding.
+  longer than that runs eagerly, on its own. A clip's last 1 s chunk is
+  zero-padded to a full chunk before the convolutions, as HF's encoder pads
+  it whenever its batch holds a full chunk, so a clip under 1 s encoded alone
+  differs from HF's: in its last conv row and, through the windowed
+  attention, in every embedding of the clip. A clip's embeddings can differ
+  at the last bit with what it is batched beside, since the step's total
+  tokens pick the captured bucket (or the eager GEMMs' shapes), and a
+  prefix-cached audio prefix keeps the embeddings it was first computed with,
+  so a later request reusing it inherits that first batch's rounding.
+- The Thinker's text and audio prefill replay captured graphs on the ladder
+  ``128 ... 2048`` tokens, and a longer step runs eagerly.
+  ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
+  ladder; ``configs/qwen3omni_2gpu*.yaml`` run it to 8192 (with 4096 and
+  6144), so a burst of new prompts that batches into one step of a few
+  thousand tokens still replays (measured on 2xH200: the first t2t c=32
+  burst's TTFT p99 3.5 s -> 0.45 s). Each bucket adds captures, graph memory
+  and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.

@@ -450,5 +450,4 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
                 "audio_features": [torch.zeros(config.num_mel_bins, frames)],
             })
         assert reads.reads == []
-        assert row.kwargs["num_frames"] == frames
         assert row.input_seq_len == int(_get_feat_extract_output_lengths(torch.tensor(frames)))

@@ -1489,8 +1489,11 @@ class AcceleratorGraphRunner:
 
         Each key is sliced along the dim ``_intern_static_buffer`` recorded as
         its seq dim, so mrope-style ``[.., seq, ..]`` inputs land on the right
-        axis. Trailing slots beyond the real length keep capture-time contents;
-        the plan's indptrs keep attention off them.
+        axis. Trailing slots beyond the real length keep whatever the last
+        replay left there, which is not the capture-time contents when a
+        forward writes a static input in place (a residual stream updated by
+        fused add + norm kernels does); the plan's indptrs keep attention off
+        them, and every other op must treat rows independently.
         """
         slot = self.slot_for(lease)
         for key in slot.static_input_keys:

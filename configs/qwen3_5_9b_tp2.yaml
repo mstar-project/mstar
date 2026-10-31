@@ -1,5 +1,9 @@
 model: "qwen3_5_9b"
 max_seq_len: 32768
+# Captured text-prefill ladder (see docs/models.rst): the default powers of
+# two plus 3072-7168, which cut the padding of 9B's compute-bound long prefills.
+model_kwargs:
+  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.

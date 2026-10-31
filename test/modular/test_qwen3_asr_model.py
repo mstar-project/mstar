@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
-from mstar.model.components.aut_encoder_submodule import AUT_ATTN, AuTEncoderSubmodule  # noqa: E402
+from mstar.model.components.aut_encoder_submodule import AUT_ATTN, AUT_ENCODE, AuTEncoderSubmodule  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
@@ -284,15 +284,82 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     assert all(s.label == "main" for s in step.segments)
 
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs("abc"), rows)
-    assert batch["audio_features"].shape == (3, cfg.num_mel_bins, 305) and batch["feature_lens"] == [230, 150, 305]
     with torch.no_grad():
         out = sub.forward_batched(PREFILL_WALK, _engine_inputs("abc"), **batch)
-        single = sub.forward(PREFILL_WALK, _engine_inputs("b"),
-                             audio_features=rows[1].tensor_inputs["audio_features"], feature_lens=[150])
+        alone = sub.preprocess(PREFILL_WALK, _engine_inputs("b"), rows[1:2])
+        single = sub.forward(PREFILL_WALK, _engine_inputs("b"), **alone)
     assert [out[r]["audio_embeds"][0].shape[0] for r in "abc"] == [r.input_seq_len for r in rows]
     assert out["a"]["audio_embeds"][0].shape[1] == cfg.audio.output_dim
     assert torch.allclose(out["b"]["audio_embeds"][0], single["audio_embeds"][0], atol=1e-5)
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
+
+
+class _WindowedAttention:
+    """The ragged attention resource's answer: each planned window attends only to itself."""
+
+    def __init__(self, spans: list[int]):
+        self.spans = spans
+
+    def run(self, q, k, v):
+        return torch.cat([
+            torch.nn.functional.scaled_dot_product_attention(*(t.transpose(0, 1) for t in qkv)).transpose(0, 1)
+            for qkv in zip(q.split(self.spans), k.split(self.spans), v.split(self.spans), strict=True)
+        ])
+
+
+class _Replay:
+    """The captured stack's answer: the layers over the windows the replay was handed."""
+
+    def __init__(self, sub: AuTEncoderSubmodule):
+        self.sub = sub
+
+    def run(self, static_inputs, request_ids, seq_lens, real_bs):
+        self.seq_lens = seq_lens
+        self.sub.bind_node_resources({AUT_ATTN: _WindowedAttention(seq_lens)})
+        return {"embeds": self.sub.encoder.encode(static_inputs["hidden"], None)}
+
+
+@pytest.mark.parametrize("leased", [False, True], ids=["eager", "replayed"])
+def test_packed_clips_split_by_the_encoder_s_own_window(leased):
+    """Each clip of a packed step, over several conv chunks and attention
+    windows, comes back as HF's encoder gives it alone, whether the step
+    replays the captured stack or runs it under its own plan. Qwen3-Omni's
+    ``n_window`` of 52 makes a 104-frame clip 13 embeddings, where the
+    default window's count would claim 14."""
+    hf_config = pytest.importorskip("transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe")
+    hf_modeling = pytest.importorskip("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe")
+    config = hf_config.Qwen3OmniMoeAudioEncoderConfig(
+        encoder_layers=1, d_model=32, encoder_attention_heads=2, encoder_ffn_dim=64, output_dim=16,
+        downsample_hidden_size=8, n_window=52,
+    )
+    hf = hf_modeling.Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation="sdpa").eval()
+    encoder = AuTEncoder(AuTEncoderConfig.from_hf(config.to_dict()), attn_key=AUT_ATTN).eval()
+    encoder.load_weights(list(hf.state_dict().items()))
+    sub = AuTEncoderSubmodule(encoder)  # fed log-mel features, as Qwen3-Omni's node is
+
+    rids = ["a", "b", "c"]
+    # one chunk; under one chunk; ten chunks over two attention windows
+    clips = (torch.randn(128, 104), torch.randn(128, 60), torch.randn(128, 1000))
+    rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio_features": [clip]}) for clip in clips]
+    windows = [segment.span for segment in sub.declare_step(PREFILL_WALK, rids, rows).segments]
+    sub.bind_node_resources({AUT_ATTN: _WindowedAttention(windows)})
+    runner = _Replay(sub)
+    # the engine hands a forward the runner only on a step that leased it
+    engine_inputs = _engine_inputs(rids)
+    if leased:
+        engine_inputs.piecewise_runners[AUT_ENCODE] = runner
+    with torch.no_grad():
+        packed = sub.forward_batched(PREFILL_WALK, engine_inputs, **sub.preprocess(PREFILL_WALK, engine_inputs, rows))
+        alone = [hf(clip, feature_lens=torch.tensor([clip.shape[-1]])).last_hidden_state for clip in clips]
+
+    assert len(windows) == 4, "the long clip was not split over two attention windows"
+    if leased:
+        assert runner.seq_lens == windows, "the replay attended over windows other than the step's"
+    assert [packed[rid]["audio_embeds"][0].shape for rid in rids] == [a.shape for a in alone], (
+        "a packed clip's embeddings were split at a window other than the encoder's"
+    )
+    for rid, ref in zip(rids, alone, strict=True):
+        torch.testing.assert_close(packed[rid]["audio_embeds"][0], ref, rtol=1e-4, atol=1e-4)
 
 
 def test_encoder_packs_a_step_only_up_to_its_largest_capture():

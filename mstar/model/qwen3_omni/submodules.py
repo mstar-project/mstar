@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 #
 # Five submodules covering the full Thinker-Talker dual-AR pipeline:
-#   1. the audio encoder: Qwen3-ASR's AuT node (mstar.model.qwen3_asr)
+#   1. the audio encoder: the shared AuT node (mstar.model.components.aut_encoder_submodule)
 #   2. VisionEncoderSubmodule
 #   3. ThinkerSubmodule        (3D MRoPE, MoE, layer captures)
 #   4. TalkerSubmodule         (streaming decode, Code Predictor)
@@ -79,23 +79,24 @@ logger = logging.getLogger(__name__)
 
 def talker_text_mask(input_ids: torch.Tensor, config: Qwen3OmniModelConfig) -> torch.Tensor:
     """
-    Cut system prompt and previous assistant parts out of the talker input
-    """
-    im_start_indexes = (
-        input_ids == config.im_start_token_id
-    ).nonzero(as_tuple=True)[0]
-    mask = torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+    Cut system prompt and previous assistant parts out of the talker input.
 
-    for i in range(len(im_start_indexes) - 1):
-        im_start_index = im_start_indexes[i]
-        segment_end_index = im_start_indexes[i + 1]
-        role_token = input_ids[im_start_index + 1]
-        # Talker should ignore thinker system prompt
-        if role_token == config.system_token_id:
-            mask[im_start_index:segment_end_index] = 0
-        elif role_token == config.assistant_token_id:
-            mask[im_start_index:segment_end_index] = 0
-    return mask
+    Each ``<|im_start|>`` opens a turn whose role is the token after it. A system or
+    assistant turn is cut up to the next ``<|im_start|>``; the span's last turn is
+    kept whatever its role. Device ops only, so a prefill on the GPU thread never
+    waits for the host.
+    """
+    if input_ids.numel() == 0:
+        return torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+    is_start = input_ids == config.im_start_token_id
+    turn = torch.cumsum(is_start, 0)  # 0 before the first turn
+    # each turn's role token, scattered to its turn number (the wrapped-around last
+    # entry can only be the last turn's, which is kept anyway)
+    roles = torch.zeros(input_ids.shape[0] + 1, dtype=input_ids.dtype, device=input_ids.device)
+    roles.scatter_reduce_(0, turn * is_start, torch.roll(input_ids, -1) * is_start, "amax")
+    role = roles[turn]
+    cut = (role == config.system_token_id) | (role == config.assistant_token_id)
+    return ~(cut & (turn > 0) & (turn < turn[-1]))
 
 
 # ===================================================================
@@ -243,8 +244,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self,
         thinker_model: nn.Module,
         config: Qwen3OmniModelConfig,
+        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__()
+        super().__init__(prefill_token_buckets)
         self.model = thinker_model  # Qwen3OmniThinkerModel
         self.config = config
         # only a decode row's token ends the loop; a prefill is not in it yet
@@ -325,41 +327,26 @@ class ThinkerSubmodule(ARNodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
-        start_pos = self.node_resources[THINKER_POS].position(
-            rid=fwd_info.rid_handle, label="main"
-        )
         if graph_walk == "thinker_decode":
-            # Get previous token ID from text_inputs
-            token_id = inputs["text_inputs"][0].to(device)  # (1,) or scalar
-            if token_id.dim() == 0:
-                token_id = token_id.unsqueeze(0)
-            embeds = self.model.model.embed_tokens(token_id)
-
-            # Next MRoPE position for all 3 components: read from the
-            # stream's position counter (advanced by the runner's commit
-            # of each declared step).
-            # Fill kernel, not ``torch.tensor(..., device=cuda)``: a pageable H2D
-            # syncs the stream, stalling prepare(N+1) until step N drains.
-            pos_ids = torch.full(
-                (3, 1), float(start_pos), dtype=torch.float, device=device,
-            )  # (3, 1)
-
+            # The previous token, embedded with the step's other decode rows in
+            # `preprocess`; its MRoPE position (the same for all 3 components)
+            # is the plan's, as a text row's.
+            token_id = inputs["text_inputs"][0].to(device).reshape(1)
             return ARNodeInputs(
                 input_seq_len=1,
-                input_embeds=embeds,
-                custom_pos_ids=pos_ids,
+                input_ids=token_id,
             )
 
         if graph_walk == "prefill_text":
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
             embeds = self.model.model.embed_tokens(text_ids)
             seq_len = text_ids.shape[0]
+            # A text row leaves its positions to the plan, which starts from the
+            # counter a cache hit has already moved.
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
                 talker_text_mask(text_ids, self.config) # text inclusion
             ])
-            # A text row leaves its positions to the plan, which starts from the
-            # counter a cache hit has already moved.
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
@@ -369,19 +356,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+        # an audio or vision row's own positions start from the stream's counter
+        start_pos = self.node_resources[THINKER_POS].position(
+            rid=fwd_info.rid_handle, label="main"
+        )
         if graph_walk == "prefill_audio":
             audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
             audio_len = audio_embeds.shape[0]
 
-            mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-            mm_mask[[0, -1]] = 0
-            masks_for_talker = torch.stack([
-                mm_mask,
-                ~mm_mask
-            ])
-
-            wrapped_embeds = self._wrap_audio_input(audio_embeds)
-            seq_len = audio_len + 2
             # Position IDs:
             #   - audio_start_token: text-like position at start_pos
             #   - audio tokens:      temporal increments per frame,
@@ -400,12 +382,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
             pos_ids = torch.cat(
                 [start_pos_ids, audio_pos_ids, end_pos_ids], dim=1
             )
+            mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
+            mm_mask[0] = False
+            mm_mask[-1] = False
             return ARNodeInputs(
-                input_seq_len=seq_len,
-                input_embeds=wrapped_embeds,
+                input_seq_len=audio_len + 2,
+                input_embeds=self._wrap_audio_input(audio_embeds),
                 custom_pos_ids=pos_ids,
                 tensor_inputs={
-                    "masks_for_talker": masks_for_talker
+                    "masks_for_talker": torch.stack([mm_mask, ~mm_mask])
                 }
             )
 
@@ -414,7 +399,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_len = vision_embeds.shape[0]
 
             mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            mm_mask[[0, -1]] = 0
+            # scalar writes: a list index uploads from pageable memory, a host sync
+            mm_mask[0] = False
+            mm_mask[-1] = False
             masks_for_talker = torch.stack([
                 mm_mask,
                 ~mm_mask
@@ -463,7 +450,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             deepstack = []
             for deepstack_inp in inputs["deepstack"]:
                 full_deepstack = torch.zeros_like(wrapped_embeds)
-                full_deepstack[mm_mask, :] = deepstack_inp
+                full_deepstack[1:-1] = deepstack_inp  # between the sentinels
                 deepstack.append(full_deepstack)
 
             return ARNodeInputs(
@@ -563,10 +550,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         self.model.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
         device = self.get_device()
-        # Concatenate across requests
-        input_embeds = torch.cat([
-            inp.input_embeds for inp in inputs
-        ], dim=0)
+        # Concatenate across requests. A decode row carries only its token: the
+        # step's decode tokens embed in one call rather than a kernel a row
+        # ahead of the step's graph, and like a text row it takes the plan's
+        # position.
+        decode = [i for i, inp in enumerate(inputs) if inp.input_embeds is None]
+        if len(decode) == len(inputs):
+            input_embeds = self.model.model.embed_tokens(torch.cat([inp.input_ids for inp in inputs]))
+        else:
+            decode_rows = iter(())
+            if decode:
+                decode_rows = iter(self.model.model.embed_tokens(torch.cat([inputs[i].input_ids for i in decode])))
+            input_embeds = torch.cat([
+                next(decode_rows).unsqueeze(0) if inp.input_embeds is None else inp.input_embeds for inp in inputs
+            ], dim=0)
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         seq_lens = [
             inp.input_seq_len for inp in inputs
@@ -751,6 +748,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return len(model_inputs) > 1
 
+    # A deployment sets its own with `model_kwargs.prefill_token_buckets`
+    # (configs/qwen3omni_2gpu*.yaml run it to 8192).
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     # past 4 for thinker_mixed, whose decode rows ride in these captures
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -769,34 +768,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="thinker_decode",
+                # a text row, as a decode row is, so padded steps keep the broadcast positions
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=1,
-                    input_embeds=torch.zeros(
-                        (1, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16
-                    ),
-                    custom_pos_ids=torch.tensor(
-                        [[0], [0], [0]],
-                        dtype=torch.float,
-                        device=device,
-                    ),
+                    input_ids=torch.zeros((1,), dtype=torch.long, device=device),
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text", "prefill_audio", THINKER_MIXED],
+                # text rows, so padded text and mixed steps keep the broadcast
+                # positions; an audio row brings its own
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
                     input_ids=torch.zeros((n,), dtype=torch.long, device=device),
                     input_embeds=torch.zeros(
                         (n, self.config.thinker_hidden_size),
                         device=device, dtype=torch.bfloat16
-                    ),
-                    custom_pos_ids=torch.zeros(
-                        (3, n),
-                        dtype=torch.float,
-                        device=device,
                     ),
                     tensor_inputs={
                         "masks_for_talker": torch.zeros(

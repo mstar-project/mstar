@@ -173,10 +173,13 @@ class Qwen3_5DenseModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None,
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        # the captured text-prefill ladder (`LLMSubmodule.PREFILL_TOKEN_BUCKETS`)
+        self.prefill_token_buckets = prefill_token_buckets
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
@@ -967,7 +970,10 @@ class Qwen3_5DenseModel(Model):
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(model, self.config, self.vision_config)
+        return LLMSubmodule(
+            model, self.config, self.vision_config,
+            prefill_token_buckets=self.prefill_token_buckets,
+        )
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:

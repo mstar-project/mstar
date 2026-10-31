@@ -89,7 +89,7 @@ def test_aut_encoder_matches_hf_on_real_audio(model):
         feats = model.log_mel(wave).to("cuda", torch.bfloat16)
         with torch.no_grad():
             expected = hf(feats, feature_lens=torch.tensor([feats.shape[-1]], device="cuda")).last_hidden_state
-            actual, layout = sub.encoder(feats.unsqueeze(0), [feats.shape[-1]])
+            actual, layout = sub.encoder([feats])
         assert layout.tokens_per_request == [expected.shape[0]]
         worst = max(worst, (actual.float() - expected.float()).abs().max().item())
     assert worst < 0.1, worst

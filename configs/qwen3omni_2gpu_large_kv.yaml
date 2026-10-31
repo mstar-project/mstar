@@ -1,5 +1,10 @@
 model: "qwen3_omni"
 max_seq_len: 32768
+# The Thinker's captured prefill ladder, past the default 2048: a burst of new
+# prompts batches into one prefill step (5101 tokens for 32 ShareGPT prompts),
+# which otherwise ran eagerly and recompiled on the request path.
+model_kwargs:
+  prefill_token_buckets: [128, 256, 512, 1024, 2048, 4096, 6144, 8192]
 # The Thinker's KV pool at its default 2,048 pages, 24 GiB at 12 MiB a page. It fits
 # beside the weights on an H200; qwen3omni_2gpu.yaml sizes it for an 80 GB GPU.
 node_groups:
@@ -13,3 +18,7 @@ node_groups:
   
   - node_names: [Code2Wav]
     ranks: [0]
+# A Thinker prefill row rides the speculated decode step instead of a step of
+# its own (a prefill reads nearly every expert, as a decode step at 16+ rows does).
+speculation_mixes_walks:
+  Thinker: true

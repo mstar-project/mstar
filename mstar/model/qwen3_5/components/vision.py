@@ -165,11 +165,12 @@ class VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(
-            -1, self.in_channels, self.temporal_patch_size,
-            self.patch_size, self.patch_size,
-        )
-        return self.proj(x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
+        # The conv's stride is its kernel, so it is one GEMM over flattened
+        # patches; cuDNN ran it as a legacy implicit-GEMM kernel at ~17 ms for
+        # a 60 s video's patches, ~1 ms as a matmul.
+        weight = self.proj.weight
+        x = x.reshape(-1, weight[0].numel()).to(weight.dtype)
+        return nn.functional.linear(x, weight.view(self.embed_dim, -1), self.proj.bias)
 
 
 class VisionPatchMerger(nn.Module):

@@ -1203,6 +1203,29 @@ class ARNodeSubmodule(NodeSubmodule):
     # the device; the loop-back hooks below follow from it.
     device_loopback: DeviceLoopback | None = None
 
+    # The packed token counts a prefill capture is built at, which
+    # ``__init__``'s ``prefill_token_buckets`` replaces per instance. A
+    # submodule that takes that kwarg must read its capture ladder off
+    # ``self.PREFILL_TOKEN_BUCKETS``, or the override is silently ignored.
+    PREFILL_TOKEN_BUCKETS: list[int]
+
+    def __init__(self, prefill_token_buckets: Sequence[int] | None = None):
+        """``prefill_token_buckets``: a deployment's own captured prefill ladder
+        (``model_kwargs.prefill_token_buckets``), in place of the class's
+        ``PREFILL_TOKEN_BUCKETS``."""
+        super().__init__()
+        if prefill_token_buckets is not None:
+            buckets = prefill_token_buckets
+            if (
+                not isinstance(buckets, (list, tuple)) or not buckets
+                or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in buckets)
+                or len(set(buckets)) < len(buckets)
+            ):
+                raise ValueError(
+                    f"prefill_token_buckets must be a non-empty list of distinct positive token counts, got {buckets!r}"
+                )
+            self.PREFILL_TOKEN_BUCKETS = sorted(buckets)
+
     def _loops_back(self, graph_walk: str) -> bool:
         """Whether this walk's token loops back on the device."""
         loopback = self.device_loopback
