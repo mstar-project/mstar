@@ -103,34 +103,3 @@ def remap_mtp_key(sub_key: str) -> str:
     if sub_key.startswith(MTP_GLUE_PREFIXES):
         return sub_key
     return f"transformer_layer.{sub_key}"
-
-
-def mtp_greedy_verify(
-    draft_tokens: torch.Tensor, target_argmax: torch.Tensor
-) -> tuple[int, torch.Tensor]:
-    """Greedy (temp-0) acceptance: the drafts' longest prefix matching argmax."""
-    k = draft_tokens.shape[0]
-    if target_argmax.shape[0] != k + 1:
-        raise ValueError(
-            f"target_argmax must have k+1={k + 1} entries, got "
-            f"{target_argmax.shape[0]}"
-        )
-    mismatch = draft_tokens != target_argmax[:k]
-    num_accepted = int(mismatch.nonzero()[0, 0]) if bool(mismatch.any()) else k
-    return num_accepted, target_argmax[num_accepted]
-
-
-def mtp_greedy_verify_host(
-    draft_tokens: list[int], target_argmax: list[int]
-) -> int:
-    """The same rule on host lists — no device round trip."""
-    k = len(draft_tokens)
-    if len(target_argmax) != k + 1:
-        raise ValueError(
-            f"target_argmax must have k+1={k + 1} entries, got "
-            f"{len(target_argmax)}"
-        )
-    for j in range(k):
-        if draft_tokens[j] != target_argmax[j]:
-            return j
-    return k

@@ -423,7 +423,7 @@ def _linear(x, w, s, block_size, glu):
     return _w8a16(x, w, s, block_size, glu)
 
 
-@torch.library.custom_op("glm52::fp8_linear", mutates_args=())
+@torch.library.custom_op("mstar::fp8_block_linear", mutates_args=())
 def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, block_n: int,
                block_k: int, glu: bool) -> torch.Tensor:
     """``(M, K) -> (M, N)``; an opaque op to dynamo, so compiled graphs keep it whole."""

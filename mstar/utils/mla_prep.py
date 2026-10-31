@@ -113,7 +113,7 @@ def _kv_write_q_rope_kernel(
         tl.store(q_pe + (t * H + h) * R + d[None, :], y.to(q_pe.dtype.element_ty), mask=live)
 
 
-@torch.library.custom_op("glm52::mla_q_norm", mutates_args=())
+@torch.library.custom_op("mstar::mla_q_norm", mutates_args=())
 def q_norm(fused: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """``rmsnorm(fused[:, :Q])`` as a contiguous ``(T, Q)``, Q = ``weight``'s width: the q_c
     q_b reads, straight from the fused q_a/kv_a projection's rows."""
