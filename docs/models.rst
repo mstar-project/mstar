@@ -1508,6 +1508,19 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      both models' images closer to the reference (24.2 and 26.8 dB median, floors 22.4
      and 25.5).
 
+``tuned_linears``
+   Z-Image only, off by default. The transformer's GEMMs run the tuned hipBLASLt solutions
+   of the device's ``dit_linear`` table (``mstar/platforms/rocm_dit_gemm.py``, written by
+   ``benchmark/kernels/dit_linear.py``) instead of the library's own pick per shape. It is
+   the same math with another summation order. Shapes the table does not name, and
+   platforms without a table, keep inductor's GEMM.
+
+``text_pad_to_max_length``
+   Z-Image only. ``true`` (the default) encodes every prompt padded to 512 tokens, as the
+   reference pipeline does. ``false`` pads to the batch's longest caption bucket. The real
+   tokens' states do not depend on the padding mathematically, and they are all the DiT
+   reads, but the attention kernel's accumulation order does, so the last bit moves.
+
 ``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``
    and batch size. Other shapes run the eager batched path.
