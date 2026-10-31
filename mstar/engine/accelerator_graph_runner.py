@@ -12,6 +12,7 @@ from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
+from mstar.engine import with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
@@ -1215,9 +1216,9 @@ class AcceleratorGraphRunner:
             self._compiled_forwards[spec.config_idx] = torch.compile(
                 forward, **compile_kwargs(spec.config.compile_mode),
             )
-        return with_inductor_overrides(
+        return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
-        )
+        ), self._submodule)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,
@@ -1960,6 +1961,9 @@ class PiecewiseAcceleratorGraphRunner:
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
             self.dropped_shapes.append((shape.bs, shape.total_tokens))
+        if self._config.get_config_type() == PiecewiseConfigType.PACKED:
+            # a packed replay pads with zero-length rows; a batched one replays real spans
+            self._dummy_rows.release_all()
         if self.dropped_shapes:
             logger.error(
                 "PiecewiseAcceleratorGraphRunner[%s]: captured %d of %d shapes; these "
@@ -2035,8 +2039,7 @@ class PiecewiseAcceleratorGraphRunner:
                 dummy_rids=dummy_rids, warm_outputs=warm_outputs, peak=peak,
             )
         finally:
-            # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident
+            # at rest for the next shape; `warmup_and_capture` frees a packed region's pages
             self._dummy_rows.reset(dummy_rids)
 
     def _call_inputs(
@@ -2226,7 +2229,9 @@ class PiecewiseAcceleratorGraphRunner:
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
             n = value.shape[0]
-            buffer[:n].copy_(value)
+            # a pinned host input must not drain the stream; the copy is
+            # stream-ordered ahead of the replay either way
+            buffer[:n].copy_(value, non_blocking=True)
             if n < buffer.shape[0]:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values

@@ -196,3 +196,118 @@ def test_prefill_buckets_past_the_context_limit_skip_small_batches():
     assert packed.get_total_tokens(1) == [1024, 2048]
     assert packed.get_total_tokens(2) == [1024, 2048, 3072, 4096]
     assert packed.get_total_tokens(4) == [1024, 2048, 3072, 4096]
+
+
+def test_batched_prefill_buckets_get_their_own_capture():
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="full",
+                       prefill_token_buckets=[64, 128, 192],
+                       prefill_batched_token_buckets=[1024, 2048],
+                       prefill_capture_batch_sizes=[1, 4, 16])
+    prefill = [c for c in _submodule(model.config).get_accelerator_graph_configs(torch.device("cpu"))
+               if c.capture_graph_walk == "prefill"]
+    assert [(c.capture_batch_sizes, c.get_total_tokens(c.capture_batch_sizes[0]))
+            for c in prefill] == [([1], [64, 128, 192]), ([4, 16], [1024, 2048])]
+
+
+# ── the router's top-k kernel (kernels: auto) ──
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="triton top-k kernel on CUDA")
+@pytest.mark.parametrize("tokens", [1, 65, 1100])
+def test_router_kernel_matches_the_torch_top_k(tokens):
+    from mstar.utils.fused_moe import decode as moe_decode
+
+    gate = _gate(hidden=6144, experts=256, device="cuda")
+    x = torch.randn(tokens, 6144, dtype=torch.bfloat16, device="cuda")
+    with torch.no_grad():  # as the engine runs it
+        w_ref, ids_ref, _ = gate(x)
+        gate._topk_op = moe_decode.router_topk
+        w, ids, _ = torch.compile(gate, fullgraph=True)(x)  # an opaque op: no graph break
+    _, _, gap = _fp32_reference(gate, x)
+    clear = gap > 1e-5
+    ids, order = ids.sort(dim=-1)
+    ids_ref, order_ref = ids_ref.sort(dim=-1)
+    torch.testing.assert_close(ids[clear], ids_ref[clear], rtol=0, atol=0)
+    torch.testing.assert_close(w.gather(1, order)[clear], w_ref.gather(1, order_ref)[clear],
+                               rtol=1e-6, atol=1e-7)
+
+
+# ── the last layer's FFN on the sampled rows (kernels: auto) ──
+
+
+def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
+    """Under kernels: auto the last layer's MLP sees only the sampled rows, and the tokens and
+    logits match the full forward."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources import StepContext
+    from mstar.model.glm52._testing import build_cpu_resources, per_request_outputs
+    from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
+    from mstar.model.glm52.config import SAMPLER_RESOURCE
+    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.utils import process_weights_after_loading
+
+    _cpu_flashinfer(monkeypatch)
+    cfg = Glm52ModelConfig.reduced()
+    torch.manual_seed(0)
+    lm = Glm52ForCausalLM(cfg)
+    for p in lm.parameters():
+        p.data.normal_(0, 0.05)
+    process_weights_after_loading(lm, torch.device("cpu"))
+    lm.eval()
+    rows_seen = []
+    for layer in lm.model.layers:
+        layer.mlp.register_forward_pre_hook(lambda m, a: rows_seen.append(a[0].shape[0]))
+    logits = []
+    lm.lm_head.register_forward_hook(lambda m, a, out: logits.append(out))
+
+    def prefill(rows_only, rids):
+        cfg.kernels = "auto" if rows_only else "reference"
+        sub = Glm52LLMSubmodule(lm, cfg)
+        resources, runner = build_cpu_resources(cfg, rids)
+        sub.bind_node_resources(resources)
+        info = {rid: SimpleNamespace(
+            request_id=rid, max_tokens=8, dynamic_loop_iter_counts={},
+            resource_configs={SAMPLER_RESOURCE: SimpleNamespace(
+                ignore_eos=True, temperature=0.0, repetition_penalty=1)}) for rid in rids}
+        prompts = [torch.arange(5) + 3, torch.arange(7) + 11]
+        inputs = [sub.prepare_inputs("prefill", info[rid], {"text_inputs": [p]})
+                  for rid, p in zip(rids, prompts, strict=True)]
+        step = sub.declare_step("prefill", rids, inputs)
+        step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0,
+                                 capture=False))
+        assert runner.admit(step).ok
+        runner.plan(step)
+        ei = ModelInputsFromEngine(request_ids=rids, per_request_info=info,
+                                   resources=resources, step=step)
+        rows_seen.clear()
+        with torch.no_grad():
+            out = per_request_outputs(
+                sub.forward_batched("prefill", ei, **sub.preprocess("prefill", ei, inputs)), rids)
+        return [out[rid]["new_token"][0] for rid in rids], list(rows_seen)
+
+    full_tokens, full_rows = prefill(False, ["a", "b"])
+    rows_tokens, rows_rows = prefill(True, ["c", "d"])
+    assert full_rows == [12] * cfg.num_hidden_layers
+    assert rows_rows == [12] * (cfg.num_hidden_layers - 1) + [2]
+    assert [int(t) for t in rows_tokens] == [int(t) for t in full_tokens]
+    torch.testing.assert_close(logits[1], logits[0], rtol=1e-5, atol=1e-5)
+
+
+def test_capture_configs_ask_for_the_recompile_limit_they_need():
+    # every captured token count costs a decoder layer's frames up to three entries
+    buckets = list(range(64, 2049, 64))
+    cfg = Glm52ModelConfig(prefill_token_buckets=buckets,
+                           prefill_batched_token_buckets=[2304, 2560, 3072, 3584, 4096],
+                           prefill_capture_batch_sizes=[1, 4, 16])
+    before = torch._dynamo.config.recompile_limit
+    sub = _submodule(cfg)
+    sub.get_accelerator_graph_configs(torch.device("cpu"))
+    shapes = len(buckets) + 5 + 7  # + the decode batch sizes
+    assert sub.dynamo_recompile_limit() >= 3 * shapes
+    assert torch._dynamo.config.recompile_limit == before  # the engine applies it, per call
+    default = _submodule(Glm52ModelConfig())
+    default.get_accelerator_graph_configs(torch.device("cpu"))
+    assert default.dynamo_recompile_limit() <= 84  # the default buckets fit
+
+

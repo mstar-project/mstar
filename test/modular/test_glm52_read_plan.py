@@ -123,6 +123,60 @@ def test_expert_loaders_accept_full_and_presliced():
         _down_proj_fp8_weight_loader(1, tp, full_inter, 1, dparam, dfull[:, :10], "down:2")
 
 
+def _mtp_fp8_config():
+    """reduced_fp8 with drafting on and 4 trunk layers, which put the MTP layer on a FULL
+    indexer slot, as layer 78 is."""
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    cfg.num_hidden_layers = 4
+    cfg.mtp_num_draft_tokens = 2
+    return cfg
+
+
+def test_read_plan_includes_mtp_when_enabled():
+    """With drafting on the plan keeps the layer-78 keys: without them the MTP module would
+    load empty memory with no error and accept no draft."""
+    cfg = _mtp_fp8_config()
+    keys = [
+        "model.layers.3.self_attn.q_a_proj.weight",
+        "model.layers.4.enorm.weight",
+        "model.layers.4.eh_proj.weight",
+        "model.layers.4.self_attn.indexer.wk.weight",   # layer 4 FULL
+        "model.layers.4.mlp.experts.0.up_proj.weight",
+        "model.layers.4.mlp.experts.0.up_proj.weight_scale_inv",
+    ]
+    # without load_mtp the MTP layer is never read
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2)
+    assert "model.layers.3.self_attn.q_a_proj.weight" in plan_keys
+    assert not any(".layers.4." in k for k in plan_keys)
+
+    plan_keys, specs = build_glm52_read_plan(
+        keys, cfg, tp_rank=1, tp_size=2, load_mtp=True)
+    assert "model.layers.4.enorm.weight" in plan_keys
+    assert "model.layers.4.eh_proj.weight" in plan_keys
+    # the MTP layer's own indexer follows the DSA flag like the trunk's
+    assert "model.layers.4.self_attn.indexer.wk.weight" not in plan_keys
+    cfg.dsa_long_context = True
+    on_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2, load_mtp=True)
+    assert "model.layers.4.self_attn.indexer.wk.weight" in on_keys
+    cfg.dsa_long_context = False
+    shard = cfg.moe_intermediate_size // 2
+    assert specs["model.layers.4.mlp.experts.0.up_proj.weight"] == (
+        0, shard, 2 * shard)
+    srows = shard // BLOCK[0]
+    assert specs["model.layers.4.mlp.experts.0.up_proj.weight_scale_inv"] == (
+        0, srows, 2 * srows)
+    assert "model.layers.4.enorm.weight" not in specs
+
+
+def test_mtp_loads_one_next_token_layer():
+    from mstar.model.glm52.weight_loader import _make_glm52_name_remapper
+
+    remap = _make_glm52_name_remapper(78, load_mtp=True)
+    assert remap("model.layers.78.eh_proj.weight").startswith("mtp.")
+    with pytest.raises(ValueError, match="one next-token layer"):
+        remap("model.layers.79.eh_proj.weight")
+
+
 def test_read_plan_refuses_shards_that_split_a_scale_block():
     # per-rank intermediate must be a whole number of scale blocks, or the
     # sliced fp8 bytes and sliced scales would misalign
