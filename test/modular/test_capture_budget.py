@@ -66,6 +66,7 @@ class _StubMeasuredRunner:
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
+    _capture_stream = None
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
         self._steps = steps

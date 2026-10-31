@@ -567,6 +567,11 @@ Qwen3-TTS notes
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
+- On a shared worker the Codec's windows run beside the Talker's chain on a
+  second stream (``side_stream_walks``, see :doc:`adding_models`), so decode
+  neither takes turns with them nor queues behind their kernels: on a B300,
+  +15% audio-s/s at c=8 and +5% at c=32. The Codec's graphs capture on a stream
+  of their own, since a prefill overlapping them shares state otherwise.
 - ``configs/qwen3tts_1p7b_split.yaml`` runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
   On its own it lowers first-audio latency at high concurrency; with

@@ -663,6 +663,8 @@ class WarmedSpec(NamedTuple):
 class AcceleratorGraphRunner:
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
+    # None: the backend's shared capture stream (see ``Engine._capture_stream_for``)
+    _capture_stream: Any = None
 
     def __init__(
         self,
@@ -1665,6 +1667,8 @@ class PiecewiseAcceleratorGraphRunner:
 
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
+
+    _capture_stream: Any = None
 
     def __init__(
         self,

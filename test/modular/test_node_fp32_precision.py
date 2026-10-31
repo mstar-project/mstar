@@ -222,7 +222,7 @@ def test_capture_runs_under_the_node_precision(monkeypatch):
     monkeypatch.setattr(engine_module.AcceleratorGraphRunner, "warmup_and_capture", record)
     monkeypatch.setattr(
         Engine, "_build_piecewise_runners",
-        lambda self, node, mgmt: {"blocks": _Region(node)},
+        lambda self, node, mgmt, capture_stream=None: {"blocks": _Region(node)},
     )
     engine = _engine({"a": _Recorder(matmul="highest", cudnn=False), "b": _Recorder()})
     engine.warmup()
