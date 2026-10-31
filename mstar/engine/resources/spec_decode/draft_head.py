@@ -115,5 +115,10 @@ class Fp8DraftHead(nn.Module):
         scale = weight.float().abs().amax() / torch.finfo(fp8).max
         self.register_buffer("weight", (weight.float() / scale).to(fp8), persistent=False)
 
+    def _apply(self, fn, recurse=True):
+        # the engine moves a whole submodule to its dtype, which would widen the copy
+        fp8 = self.weight.dtype
+        return super()._apply(lambda t: fn(t).to(fp8), recurse)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return FP8_HEAD(x, self.weight)
