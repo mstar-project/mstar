@@ -74,6 +74,14 @@ class EngineResourceInfo:
         default_factory=dict
     )
 
+    @property
+    def head_shards(self) -> int:
+        """How many ways the node's ranks split its attention heads, which each
+        builder sizes head counts by: all its TP × SP ranks. A ragged resource
+        declaring ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
+        group = self.joint_comm_group
+        return 1 if group is None else group.world_size
+
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
         if spec is None:

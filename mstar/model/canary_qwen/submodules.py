@@ -21,6 +21,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     ModelInputsFromEngine,
+    TokenStop,
 )
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -48,7 +49,10 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.model = llm
         self.audio_token_id = audio_token_id
-        self.stop_token_ids = frozenset(stop_token_ids)
+        self.token_stop = TokenStop(
+            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(stop_token_ids),
+            sampler=self.SAMPLER,
+        )
 
     def splice_audio(self, input_ids: torch.Tensor, audio_embeds: torch.Tensor) -> torch.Tensor:
         """Prompt embeddings with the k-th audio frame over the k-th

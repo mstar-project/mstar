@@ -223,10 +223,10 @@ def _env_number(name: str, default, parse, minimum):
     """A numeric tuning knob from the environment.
 
     A malformed value falls back to *default* and one below *minimum* is
-    raised to it, each with a warning, as ``MSTAR_PY_SWITCH_INTERVAL_SEC``
-    and ``MSTAR_RECOMPILE_LIMIT`` already do. The worker reads these when it
-    is built: raising from ``run()`` would come after weight load, warmup and
-    capture, and after the conductor has counted the worker ready.
+    raised to it, each with a warning, as ``MSTAR_RECOMPILE_LIMIT`` already
+    does. The worker reads these when it is built: raising from ``run()``
+    would come after weight load, warmup and capture, and after the conductor
+    has counted the worker ready.
     """
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -3494,7 +3494,10 @@ class Worker:
 
         Qualifies only where ``_store_and_route`` would take its device-loopback
         branch and ``_stream_and_send`` would add nothing Python-side before
-        the send. Returns False, having done nothing, otherwise.
+        the send. Returns False, having done nothing, otherwise. A step whose
+        stop check withheld an output (``StopCheck.withheld``) does not: the
+        column holds that row's token, which ``_inline_emit_values`` sends
+        as None.
         """
         rt = self._graph_runtime
         batch = batch_N.batch
@@ -3502,6 +3505,7 @@ class Worker:
         if (
             host_rows is None or batch.request_walks or self.enable_prof
             or batch_N.node_batch.stream_partition_done_rids
+            or batch_N.node_batch.withheld_outputs
             or not getattr(rt, "supports_route_and_send_inline", False)
             or not self._all_on_device(
                 engine, batch_N.node_name, batch_N.graph_walk, signals,
@@ -3836,17 +3840,34 @@ class Worker:
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int]]:
+    ) -> tuple[str | None, list[int | None]]:
         """The values of a client signal that can ride inline this step.
 
         Taken off the stop check's host copy, one ``tolist`` for the batch.
         Every rid must have a row, or the step keeps the tensor path for the
-        whole batch: the runtime applies the values positionally.
+        whole batch: the runtime applies the values positionally. A row whose
+        output the stop check withheld (``StopCheck.withheld``) gets None,
+        which the runtime routes as that row's tensors: none.
         """
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
             return None, []
-        if not batch_N.batch.request_walks:
-            return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
+        if batch_N.batch.request_walks:
+            signal, values = self._inline_emit_mixed(engine, batch_N, host_rows, rids, signals)
+        else:
+            signal, values = self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
+        withheld = batch_N.node_batch.withheld_outputs
+        if signal is not None and withheld:
+            values = [
+                None if signal in withheld.get(rid, ()) else value
+                for rid, value in zip(rids, values, strict=True)
+            ]
+        return signal, values
+
+    def _inline_emit_mixed(
+        self, engine, batch_N: PendingBatch, host_rows: "HostRows",
+        rids: list[int], signals,
+    ) -> tuple[str | None, list[int]]:
+        """`_inline_emit_values` for a step that mixes walks."""
         # Per real walk: a combined walk is no walk of the submodule's.
         walk_of = batch_N.batch.walk_of
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]

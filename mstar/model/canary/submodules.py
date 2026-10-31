@@ -15,7 +15,7 @@ from mstar.model.canary.config import (
 )
 from mstar.model.canary.decoder import CanaryDecoderModel
 from mstar.model.components.encoder_decoder import EncoderDecoderNode
-from mstar.model.submodule_base import ARNodeSubmodule
+from mstar.model.submodule_base import ARNodeSubmodule, TokenStop
 
 
 class CanaryDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
@@ -39,4 +39,7 @@ class CanaryDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        self.stop_token_ids = frozenset({config.eos_token_id})
+        self.token_stop = TokenStop(
+            loop=self.DECODE_LOOP, buffer="new_token",
+            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+        )

@@ -30,6 +30,7 @@ from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 from mstar.model.nemotron_duplex.components._util import param
 from mstar.model.nemotron_duplex.components.dft import stft_as_real, stft_basis
 from mstar.model.nemotron_duplex.config import ConformerSTTConfig
+from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
@@ -411,13 +412,6 @@ def final_encoder_frames(config: ConformerSTTConfig, mels: int, samples: int, fi
     return (mels - 1) // config.subsampling_factor + 1
 
 
-def device_counts(values, device: torch.device) -> torch.Tensor:
-    """Host counts on the device without a blocking copy, which would wait for
-    every kernel queued ahead of this step."""
-    t = torch.tensor(values, dtype=torch.long)
-    return (t.pin_memory() if device.type == "cuda" else t).to(device, non_blocking=True)
-
-
 class EncoderInputs(NamedTuple):
     """A step's new encoder-input frames, ``x (B, t, D)`` zero-padded to the
     most any call got, and per call its new ones."""
@@ -496,7 +490,7 @@ class ConformerStreamer:
         else:
             # A strided stage reads one frame past a row's end, where a row on its own
             # reads the conv's zero padding: zero each stage's input past each row.
-            n = device_counts(lens, out.device).view(-1, 1, 1, 1)
+            n = to_device_nonblocking(lens, out.device, dtype=torch.long).view(-1, 1, 1, 1)
             for m in self.p.encoder.pre_encode.conv:
                 if isinstance(m, _CausalConv2d):
                     t = torch.arange(out.shape[2], device=out.device).view(1, 1, -1, 1)

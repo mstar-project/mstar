@@ -539,8 +539,6 @@ class KVManager(AttentionResource):
         self.config = cfg
         tp_cache = False
         if joint_comm_group is not None:
-            # before the cache is allocated: it is sized off the head counts
-            cfg.shard(joint_comm_group.world_size)
             tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
             if tp_cache and cfg.cpu_offload_pages > 0:
                 raise ValueError(
@@ -703,6 +701,8 @@ class KVManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
+        # before the cache is allocated: it is sized off the head counts
+        spec.config.shard(info.head_shards)
         return cls(
             cfg=spec.config,
             name=spec.resource_key,

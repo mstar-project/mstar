@@ -26,6 +26,7 @@ from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
+from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import to_device_nonblocking
 
 
@@ -232,12 +233,12 @@ class NemoLogMel:
         device = self.window.device
         source = waveforms[0].device
         # host clips are padded straight into pinned memory: one copy to the device
-        pin = source.type == "cpu" and device.type == "cuda"
+        pin = source.type == "cpu" and DeviceCapability.of(device).pin_memory
         x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
         for row, w in enumerate(waveforms):
             x[row, :lengths[row]] = w.reshape(-1)
         x = to_device_nonblocking(x, device)
-        n_samples = to_device_nonblocking(torch.tensor(lengths), device)
+        n_samples = to_device_nonblocking(lengths, device)
         if self.preemphasis:
             x = torch.cat([x[:, :1], x[:, 1:] - self.preemphasis * x[:, :-1]], dim=1)
             x = x * (torch.arange(x.shape[1], device=device) < n_samples[:, None])
@@ -254,7 +255,7 @@ class NemoLogMel:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
             # zero where the reference's rounding amplifies it into noise
-            n = to_device_nonblocking(torch.tensor(frames), device)[:, None, None]
+            n = to_device_nonblocking(frames, device)[:, None, None]
             valid = torch.arange(mel.shape[2], device=device) < n
             ref = mel[:, :, :1]
             mean = ref + ((mel - ref) * valid).sum(dim=2, keepdim=True) / n

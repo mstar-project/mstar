@@ -53,7 +53,7 @@ class _Producer(NodeSubmodule):
     def check_stop(self, request_id, request_info, outputs):
         return self._check(request_id, int(outputs["token"][0].item()))
 
-    def check_stop_batched(self, request_ids, request_infos, host_rows, step_walk=None):
+    def check_stop_batched(self, request_ids, request_infos, host_rows):
         if not self.batched:
             return None
         stops, withheld = {}, {}

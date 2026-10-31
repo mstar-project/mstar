@@ -28,7 +28,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.model.media_limits import VideoBudget, read_image
+from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
 
@@ -248,6 +248,12 @@ class WorkerGraph:
             self._tp_comm_size = tp
             # Conductor routes to the lockstep unit (the whole instance).
             self.tp_size = inst
+
+    @property
+    def replica_ranks(self) -> list[list[int]]:
+        """The ranks of each data-parallel replica: the lockstep instances, or
+        one rank apiece without TP/SP. The conductor routes a request to one."""
+        return self._instance_ranks or [[r] for r in self.ranks]
 
 
 def _combine_sections_sequential_or_parallel(
@@ -771,7 +777,7 @@ class Model(ABC):
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device)
+        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
         for frame in decoder:

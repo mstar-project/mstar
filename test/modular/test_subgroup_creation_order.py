@@ -72,6 +72,7 @@ def _mesh(tp: int, sp: int) -> GlobalParallelConfig:
         _tp_ranks=[ranks[s * tp:(s + 1) * tp] for s in range(sp)] if tp > 1 else [],
         _sp_ranks=[ranks[t::tp] for t in range(tp)] if sp > 1 else [],
         _instance_ranks=[ranks],
+        replica_ranks=[ranks],
     )
     return GlobalParallelConfig(
         worker_graphs={"main": graph}, worker_ids=[f"worker-{r}" for r in ranks],

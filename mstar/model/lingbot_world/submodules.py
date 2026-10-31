@@ -38,7 +38,6 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.lingbot_world.components.camera import plucker_embedding
@@ -252,7 +251,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
                 self._attention = REFERENCE_ATTENTION
             else:
                 def on(kv_label):
-                    ragged = RaggedAttentionCallable(resource, cross_label(CHUNK_SPAN, kv_label))
+                    ragged = functools.partial(resource.run, label=cross_label(CHUNK_SPAN, kv_label))
                     return functools.partial(joint_attention, ragged=ragged)
                 self._attention = DitAttention(window=on(WINDOW_SPAN), text=on(TEXT_SPAN))
         return self._attention

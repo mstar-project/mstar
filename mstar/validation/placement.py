@@ -188,7 +188,7 @@ def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
     node_group, or each is a single instance on the same ranks."""
     if len({wg._group_id for wg in wgs}) == 1:
         return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+    return all(len(wg.replica_ranks) == 1 and wg.ranks == wgs[0].ranks for wg in wgs)
 
 
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
