@@ -143,6 +143,8 @@ class ResultsStore:
         root: Path | None = None,
         per_product: bool = True,
         provenance: Mapping[str, Any] | None = None,
+        table: str | None = None,
+        extra: Mapping[str, int] | None = None,
     ) -> Path:
         """Write the implementation that serves each stored shape best as
         ``kernel``'s config, for an op whose implementation is chosen per shape.
@@ -159,6 +161,12 @@ class ResultsStore:
         what they did before.
         ``dims`` names the shape dimensions the op's configs are keyed by (all of
         them by default).
+
+        With ``table``, the shapes join that kernel-choice table instead
+        (``mstar.kernels.registry.KernelChoice``), beside what it holds: every
+        measured shape gets an entry that keeps each implementation's best time
+        and parameters, and ``extra`` dimensions in its key let a second kernel
+        choose in the same table without touching its classes.
         """
         chosen: dict[str, tuple[str, dict]] = {}
         for record in self.records(facts, kernel):
@@ -167,8 +175,8 @@ class ResultsStore:
                 mapped = impl_of(cand.get("family", ""))
                 if mapped is None or not _ok(cand):
                     continue
-                impl, extra = mapped
-                knobs = {**cand.get("knobs", {}), **extra} if impl in tuned else {}
+                impl, added = mapped
+                knobs = {**cand.get("knobs", {}), **added} if impl in tuned else {}
                 timed.append((cand["us"], impl, knobs))
             if not timed:
                 continue
@@ -185,7 +193,13 @@ class ResultsStore:
                 if kept is not None and pick[1] != default and pick[0] > (1 - margin) * kept[0]:
                     pick = kept
             shape = {k: v for k, v in record["shape"].items() if dims is None or k in dims}
-            chosen[json.dumps(shape)] = (klass, {"impl": pick[1], **pick[2]})
+            entry = {"impl": pick[1], **pick[2]}
+            if table is not None:
+                shape = {**shape, **(extra or {})}
+                entry = {"impl": pick[1], "candidates": {
+                    impl: {"us": round(us, 2), **knobs} for us, impl, knobs in sorted(timed, key=lambda t: -t[0])
+                }}
+            chosen[json.dumps(shape)] = (klass, entry)
         if not chosen:
             raise ValueError(f"no passing results for {kernel} on {facts.arch}/{facts.product}")
         votes: dict[str, dict[str, int]] = {}
@@ -200,12 +214,14 @@ class ResultsStore:
             config_shape_key(json.loads(shape)): entry
             for shape, (klass, entry) in chosen.items() if entry != classes[klass]
         }
+        path = config_path(table or kernel, facts.arch, facts.product if per_product else None, root or CONFIG_ROOT)
+        held = json.loads(path.read_text()) if table is not None and path.is_file() else {}
         config = {
-            "kernel": kernel, "arch": facts.arch, "product": facts.product if per_product else None,
-            "classes": classes, "shapes": shapes,
+            "kernel": table or kernel, "arch": facts.arch, "product": facts.product if per_product else None,
+            "classes": held.get("classes", classes) if extra else classes,
+            "shapes": {**held.get("shapes", {}), **shapes},
             "provenance": {"stack": self.stack, "margin": margin, **(provenance or {})},
         }
-        path = config_path(kernel, facts.arch, facts.product if per_product else None, root or CONFIG_ROOT)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config, indent=1, sort_keys=True) + "\n")
         return path
