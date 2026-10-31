@@ -561,6 +561,16 @@ class Worker:
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         self._tp_leader_gap_warned = False
+        # without these the runtime sees no parallel node, and its speculation
+        # filter never holds one to the leader
+        self._graph_runtime.set_node_metadata(
+            parallel_nodes=self.parallel_nodes,
+            parallel_leader_nodes=self.parallel_leader_nodes,
+            tp_async_nodes={
+                n for n in node_names if self._tp_async_for(n)
+            },
+        )
+
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
