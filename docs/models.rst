@@ -329,6 +329,11 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
 - One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- All four run the FastConformer encoder ``nemotron_duplex`` streams
+  (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
+  Nemotron ASR read its dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's
+  ``perception.encoder`` (``FastConformerConfig.from_nemo``), which refuses an encoder
+  whose parts NeMo configures as partly causal.
 - Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
   ``model_kwargs``:
 
@@ -580,10 +585,9 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
-- Numerics: the code predictor is Qwen3-TTS's (``ResidualCodePredictor``):
-  each projection is one ``cp_linear`` launch with its RMSNorm folded into the
-  weight and the residual add or SwiGLU in its epilogue, and attention is one
-  ``cp_attend`` launch, none bit-exact with the unfused ops. Its 15 depth
+- Numerics: the code predictor's residual adds fold into the next RMSNorm
+  (FlashInfer's fused add + norm) and its attention is a Triton kernel
+  (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
   steps feed each sampled code into the next, so small differences can change
   later codes at near-ties.
 - The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
@@ -674,50 +678,41 @@ Qwen3-TTS notes
   two kept in flight while the current one streams); set
   ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
 - Audio streams in a ramp of codec chunks: the first frame is decoded on its
-  own (first audio one Talker step after prefill), the next chunks add 3, 8
-  and 16 frames, then 25 frames a chunk. The decoder is causal, so the codec
-  decodes every frame once: per stream it keeps each causal conv's last input
-  samples, the transformer's sliding-window keys and values (71 per layer) and
-  the frame count, about 5 MiB in float32, in the ``codec_state`` recurrent
-  pool (``resources: {codec_state: {max_slots: N}}`` sizes it: N slots hold
-  N - 1 streams, as the pool's sink takes one; 256 streams by default). In
-  float32 with TF32 off (as on CPU), a stream's audio matches a
-  whole-utterance decode to within one PCM16 step. Each chunk width is a
-  CUDA-graph bucket captured for batch sizes 1 to 32 (densely: the
-  codec's cost is per row, so a padding row costs as much as a real one). A
-  step batches chunks of any width, padded to its widest. A voice clone's
-  stream leads with the reference's last 72 frames, decoded with the first
-  chunk to warm the state on the voice and trimmed from its audio, so on Base
-  the scheduler batches each width apart: a row batched with a clone's first
-  chunk would decode 73 frames.
-  The SnakeBeta activations run as one fused kernel. A deployment sets the
-  ramp and the steady chunk with ``model_kwargs: {codec_chunk_schedule: [1, 3,
-  8, 16], codec_chunk_frames: 25}`` (positive integers; ``[]`` starts at the
-  steady chunk).
+  own (first audio one Talker step after prefill), the next windows add 3, 8
+  and 16 frames, then 25 new frames behind up to 72 frames of already decoded
+  left context, the decoder transformer's sliding window. The
+  transformer stacks 8 such layers, so a window still differs slightly from a
+  whole-utterance decode once an utterance outgrows the context; 25 frames of
+  context differed far more. Each window size is a CUDA-graph bucket captured
+  for batch sizes 1 to 32 (densely: the codec's cost is per row, so a padding
+  row costs as much as a real one); the stream buffer reports how many leading
+  frames of a window are repeated context, and the codec trims their audio. The
+  scheduler batches each window size apart, so a stream's small first windows
+  are not padded to a full window's width or queued behind a batch of them. A
+  voice clone's reference tail (its last 72 frames) is the first window's context.
+- The codec runs its transformer over the whole window but its conv stack (all
+  but a few percent of the codec's time) only over the new frames plus the
+  stack's causal receptive field, derived from the decoder's modules at load
+  (10 frames for the 12 Hz decoder; the new frames' audio equals the
+  whole-window decode). It also fuses the SnakeBeta activations into one kernel.
 - Talker prefill, the clone prefill included, replays a packed CUDA Graph for
   the smallest token bucket (32 to 1024 tokens) that holds the batch; a clone's
-  reference frames join the codec stream in ``postprocess``. Prefill and decode
-  are one combined walk (``talker_mixed``): up to four new prompts ride a decode
-  step instead of a prefill-only step every decode row waits behind, replaying
-  a packed capture sized to the decode batch (four long-reference clones can
-  outgrow the top token bucket and run eager). A decode-only step uses the
-  whole-walk CUDA Graph (up to 64 rows a step), with the 15-step CodePredictor
-  loop captured inside it; request-local EOS suppression is
+  reference frames join the codec stream in ``postprocess``. Decode
+  always uses the whole-walk CUDA Graph (up to 64 rows a step), with the 15-step
+  CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
   It is the same component as Qwen3-Omni's code predictor
-  (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``),
-  five launches a layer: each projection is one ``cp_linear`` launch with the
-  RMSNorm folded into its weight (a row scale from partial sums of squares its
-  producer recorded), the residual add or the SwiGLU in its epilogue, and the
-  q/k norm, RoPE, KV write and attention are one ``cp_attend`` launch. Every
-  embedding table the loop reads is kept already projected by
-  ``small_to_mtp_projection``, and the frame's 16 codec embeddings are summed
-  in fp32 and rounded once to the model dtype. None of this is bit-exact with
-  the unfused ops: the sampled residual codes can differ at near-ties.
+  (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
+  the depth sequence opens with the Talker hidden state and the group-0
+  embedding in one two-token pass, each layer's q/k norm, RoPE and KV write
+  run in one launch and attention in ``cp_attention``, and the frame's 16 codec
+  embeddings are summed in fp32 and rounded once to the model dtype. Earlier
+  releases rounded the sum after every add, so greedy codes can differ at
+  near-ties.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
@@ -725,21 +720,11 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
-- The codec decoder runs in float32 by default; ``configs/qwen3tts_1p7b.yaml``
-  serves it in bfloat16 (``model_kwargs: {codec_dtype: bfloat16}``; RMSNorm
-  and RoPE are computed in float32 from the bf16 weights and frequencies; the
-  Talker is bf16 either way), about 1.9x a codec step's speed on an H200 once
-  the captures keep cuDNN's searched conv plans (``capture_cudnn_benchmark``).
-  That config was gated on an H200. H100 runs served it too, at a Whisper
-  large-v3 WER of 1.73% with its ``[2, 4, 8, 16]`` chunk schedule (2.09%
-  with ``[4, 8, 16]``) over 128 sentences, but its speed against float32
-  there is unmeasured. On a B300 with cuDNN's
-  heuristic conv picks, the previous windowed codec ran bf16 slower, not
-  faster (several of its convs on a kernel without tensor cores), and this
-  decoder has not been measured there: serve ``codec_dtype: float32`` on
-  other GPUs until it is.
-  Its decode is compiled (Inductor) with dynamic shapes, so a few graphs
-  serve every chunk width and batch bucket the captures use.
+- The codec decoder runs in float32 by default, reproducing the reference
+  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
+  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
+  B300 that is slower, not faster: cuDNN's heuristics run several of its
+  convs on a kernel without tensor cores, so measure before switching.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
@@ -844,7 +829,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   streamed: each chunk runs the layers over its new frames only, against the
   call's cached last 70 frames, so a step costs the same however long the call
   is; it emits the frames no later audio can change, the last ones at the end
-  of input)
+  of input. It is the shared FastConformer, Canary's encoder, as a stream node
+  (``FastConformerStreamSubmodule``), with the featurizer of the VoiceChat
+  reference, which predates NeMo 2.5: reflected clip edges and
+  ``samples // 160 + 1`` mel frames. The checkpoint's RNN-T transcription head
+  is not loaded)
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
   → ``eartts_talker`` (one text token → 31 RVQ codes, decoded by the RVQ codec
@@ -953,14 +942,23 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   shorter appends need several steps per frame and fall behind once a step
   takes longer than an append.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
-  weights: an upload is one encoder pass, bit for bit the offline encoder's in
-  fp32 and under bf16 autocast, save the last frame when the end of input
-  reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
-  the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
-  autocast. So live and one-shot text should agree token for token in fp32
-  (inferred from those frames, not measured on served text); under the served
-  bf16 a different chunking can flip a knife-edge frame such as the agent's
-  turn start.
+  weights on the duplex encoder the shared FastConformer replaced, and not
+  since: an upload was one encoder pass, bit for bit that encoder's offline
+  pass in fp32 and under bf16 autocast, save the last frame when the end of
+  input reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends
+  put the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
+  autocast. The shared encoder's stream attention adds the relative-position
+  term before scaling and its offline attention after, so an upload is no
+  longer expected to match the offline pass bit for bit. From those figures,
+  live and one-shot text should agree token for token in fp32 (inferred, not
+  measured on served text); under the served bf16 a different chunking can flip
+  a knife-edge frame such as the agent's turn start. Under bf16 autocast the
+  stream node keeps the blocks' residual in fp32, as the replaced encoder did
+  from its second layer on; the offline FastConformer encoders keep theirs in
+  bf16. Against an fp32 run on 13 clips (one H200, real checkpoint,
+  2026-10-29), live frames have a mean per-frame relative error of 1.35%,
+  level with the replaced encoder's 1.39%, where a bf16 residual gave 1.63%;
+  uploads and offline passes are as close as the replaced encoder's too.
 - The encoder keeps each call's state in a slot per session of three
   resources: its attention keys and values in a bounded KV (``encoder_kv``),
   which keeps a call's last 70 frames per layer and runs the attention, each new

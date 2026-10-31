@@ -482,42 +482,6 @@ class ExecutingBatch:
             self.set_slot(slot_lease.slot)
 
 
-def compile_node_regions(
-    node_name: str,
-    submodule: NodeSubmodule,
-    fp32_precision: Fp32Precision | None,
-    autocast_dtype: torch.dtype | None,
-    device_type: str,
-) -> None:
-    """Compile and warm one node's ``compile_regions`` with dynamic=True in
-    torch.compile's default mode:
-    the compile level (``MSTAR_COMPILE_LEVEL``) tunes captured forwards, whose
-    shapes are fixed per bucket. A standalone harness calls this to run a
-    node's regions as the engine does."""
-    regions = submodule.compile_regions()
-    if regions and not submodule.disable_torch_compile:
-        raise ValueError(
-            f"{node_name} declares compile_regions but its forward is compiled whole; "
-            "set disable_torch_compile"
-        )
-    for path, examples in regions.items():
-        owner_path, _, name = path.rpartition(".")
-        owner = submodule
-        for part in filter(None, owner_path.split(".")):
-            owner = getattr(owner, part)
-        target = getattr(owner, name)
-        if isinstance(target, torch.nn.Module):
-            owner, name, target = target, "forward", target.forward
-        # an instance attribute shadows the method for every caller
-        setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
-        with torch.no_grad(), fp32_precision_scope(fp32_precision), autocast_scope(
-            autocast_dtype, device_type, node_name,
-        ):
-            for args in examples:
-                getattr(owner, name)(*args)
-        logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
-
-
 class Engine:
     @property
     def device_capability(self) -> DeviceCapability:
@@ -724,15 +688,36 @@ class Engine:
                 )
 
     def _compile_regions(self) -> None:
-        """Compile and warm each node's ``compile_regions`` (see
-        ``compile_node_regions``), on an accelerator only."""
+        """Compile and warm each node's ``compile_regions`` with dynamic=True
+        (a whole-forward compile uses dynamic=None) in torch.compile's default
+        mode: the compile level (``MSTAR_COMPILE_LEVEL``) tunes captured
+        forwards, whose shapes are fixed per bucket."""
         if not self.device_capability.is_available:
             return
         for node_name, submodule_mgmt in self._submodules.items():
-            compile_node_regions(
-                node_name, submodule_mgmt.submodule, submodule_mgmt.fp32_precision,
-                self._autocast_dtype_for(node_name), self._device.type,
-            )
+            submodule = submodule_mgmt.submodule
+            regions = submodule.compile_regions()
+            if regions and not submodule.disable_torch_compile:
+                raise ValueError(
+                    f"{node_name} declares compile_regions but its forward is compiled whole; "
+                    "set disable_torch_compile"
+                )
+            for path, examples in regions.items():
+                owner_path, _, name = path.rpartition(".")
+                owner = submodule
+                for part in filter(None, owner_path.split(".")):
+                    owner = getattr(owner, part)
+                target = getattr(owner, name)
+                if isinstance(target, torch.nn.Module):
+                    owner, name, target = target, "forward", target.forward
+                # an instance attribute shadows the method for every caller
+                setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
+                with torch.no_grad(), fp32_precision_scope(submodule_mgmt.fp32_precision), autocast_scope(
+                    self._autocast_dtype_for(node_name), self._device.type, node_name,
+                ):
+                    for args in examples:
+                        getattr(owner, name)(*args)
+                logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
 
     def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
         """This node's resolved dtype, or None for one that opted out."""

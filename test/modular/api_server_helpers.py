@@ -10,19 +10,13 @@ lacks any field a real ``APIServer`` has.
 Import it by module name (``from api_server_helpers import ...``): on CI the
 stdlib ``test`` package shadows the repo's ``test/`` directory.
 """
+import select
 import tempfile
 import time
 from pathlib import Path
 
 from mstar.api_server.entrypoint import APIServer
-
-
-def idle_poll(timeout_ms: int = 1) -> bool:
-    """``poll_for_messages`` for a stand-in transport with nothing queued: it
-    waits out the timeout as the socket's poll does, so an API server message
-    loop on a thread doesn't spin on the GIL."""
-    time.sleep(timeout_ms / 1000)
-    return False
+from mstar.communication.event import EventWakeup
 
 
 def make_test_api_server(**overrides) -> APIServer:
@@ -47,8 +41,39 @@ def make_test_api_server(**overrides) -> APIServer:
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None
+    server._result_cpu = None  # never pins a test's thread
+    server._process_cpus = frozenset()
     for name, value in overrides.items():
         if not hasattr(server, name):
             raise TypeError(f"APIServer has no field {name!r}")
         setattr(server, name, value)
     return server
+
+
+class StandInSocket:
+    """The communicator surface ``APIServer._process_messages`` uses, over a
+    test's own ``messages`` (or an override of ``get_all_new_messages``). Its
+    poll ends on the registered wakeup as the real communicators' does, and
+    otherwise after at most ``tick_ms``: messages a test queues signal
+    nothing."""
+
+    def __init__(self, messages=lambda: [], tick_ms: float = 1.0):
+        self._messages = messages
+        self.tick_ms = tick_ms
+        self.event: EventWakeup | None = None
+        self.timeouts: list[int] = []  # each poll's timeout_ms, as the loop asked
+
+    def get_all_new_messages(self) -> list:
+        return self._messages()
+
+    def register_event_for_poll(self, event: EventWakeup) -> None:
+        self.event = event
+
+    def poll_for_messages(self, timeout_ms: int = 20) -> bool:
+        self.timeouts.append(timeout_ms)
+        timeout_s = min(timeout_ms, self.tick_ms) / 1000
+        if self.event is None:
+            time.sleep(timeout_s)
+        elif select.select([self.event.fd], [], [], timeout_s)[0]:
+            self.event.drain()
+        return False

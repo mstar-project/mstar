@@ -165,10 +165,11 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
 
 
 def test_admit_is_refused_after_a_drain():
-    """A NEW can arrive after the DRAIN that tears the rid down; admitting it
-    would leave state behind that no REMOVE will ever collect."""
+    """A NEW that arrives after this rank sent READS_DONE for the rid is
+    refused: the drain is complete, so nothing may be read for it any more."""
     w = _worker()
     w._draining_rids.add("r1")
+    w._reads_done_sent.add("r1")
     w._add_new_request(_new_request("r1"))
     assert w._rid("r1") is None
     assert w.tensor_manager.registered == []

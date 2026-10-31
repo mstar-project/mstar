@@ -19,6 +19,7 @@ The dataclasses below preserve that ownership while exposing one
 """
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,11 +32,6 @@ TALKER_ATTN = "talker_attn"
 TALKER_POS = "talker_pos"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_predictor"
-# Codec node: each stream's incremental decoder state
-CODEC_STATE = "codec_state"
-# combined walk of the Talker's prefills and decode: a new prompt rides a
-# decode step (Model.get_combined_graph_walks)
-TALKER_MIXED = "talker_mixed"
 
 # Step-metadata keys ``process_prompt`` settles on the host for the prefill:
 # ``[instruct_len, text_len, stream_text, ref_text_len, ref_frames]``, the
@@ -260,20 +256,27 @@ class Qwen3TTSCodecConfig:
     encoder_config: dict[str, Any] = field(default_factory=dict)
 
     # M* stream policy: the codec pops a ramp of small chunks first (the first
-    # frame alone, so first audio leaves one Talker step after prefill), then
-    # ``chunk_frames`` new frames per call. The decoder is causal and keeps its
-    # state between chunks, so a frame's audio does not depend on how the
-    # stream was chunked and no chunk repeats earlier frames.
+    # frame alone, so first audio leaves one Talker step after prefill; the
+    # decoder is causal, so a frame's audio does not depend on how it was
+    # chunked), then ``chunk_frames`` new frames per call, each preceded by up
+    # to ``left_context_frames`` already decoded frames. That context defaults
+    # to the decoder transformer's ``sliding_window``: with less, the streamed
+    # audio drifts from a whole decode (25 frames gave 25-39 dB SNR).
     chunk_schedule: tuple[int, ...] = (1, 3, 8, 16)
     chunk_frames: int = 25
-    # An in-context clone's stream leads with this many of the reference's
-    # last frames (fewer for a shorter clip), decoded to warm the state on the
-    # voice and trimmed from the audio. None: the transformer's sliding window.
-    clone_lead_frames: int | None = None
+    left_context_frames: int | None = None
+    # Context the conv stack after the transformer sees. It is causal, so the
+    # transformer runs over the whole window and the (dominant) conv stack only
+    # over the new frames plus this much context. None: the stack's exact
+    # receptive field, derived from the decoder (10 frames for the 12 Hz one).
+    conv_context_frames: int | None = None
+    # Decode the conv stack over the new frames only (see conv_context_frames);
+    # off decodes whole windows.
+    split_decode: bool = True
 
     def __post_init__(self) -> None:
-        if self.clone_lead_frames is None:
-            self.clone_lead_frames = self.sliding_window
+        if self.left_context_frames is None:
+            self.left_context_frames = self.sliding_window
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3TTSCodecConfig":
@@ -297,6 +300,29 @@ class Qwen3TTSCodecConfig:
         })
         return cls(**values)
 
+    def codec_windows(self, lead_frames: Sequence[int] = (0,)) -> list[int]:
+        """Distinct window sizes (context + new frames) the chunk schedule produces.
+
+        One pass per entry of ``lead_frames``: a stream that starts with that
+        many context-only frames (a voice clone's reference tail). These are
+        the shapes the codec captures CUDA graphs for; any other window (a
+        terminal flush, a shorter reference tail) pads up to the next one.
+        """
+        left = self.left_context_frames
+        windows = set()
+        for lead in lead_frames:
+            delivered = lead
+            for size in self.chunk_schedule:
+                windows.add(min(left, delivered) + size)
+                delivered += size
+            while True:
+                windows.add(min(left, delivered) + self.chunk_frames)
+                if delivered >= left:
+                    break
+                delivered += self.chunk_frames
+        return sorted(windows)
+
+
     def frames_for_samples(self, num_samples: int) -> int:
         """Codec frames the encoder emits for ``num_samples`` of input audio."""
         return -(-int(num_samples) // self.encode_downsample_rate)
@@ -312,7 +338,9 @@ class Qwen3TTSCodecConfig:
             "encoder_config",
             "chunk_schedule",
             "chunk_frames",
-            "clone_lead_frames",
+            "left_context_frames",
+            "conv_context_frames",
+            "split_decode",
         }
         return {
             name: getattr(self, name)

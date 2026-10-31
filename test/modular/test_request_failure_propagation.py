@@ -24,7 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
-from api_server_helpers import idle_poll, make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import (
@@ -33,6 +33,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
+from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -182,13 +183,11 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
 
 def _api_server(messages):
     s = make_test_api_server(
-        communicator=SimpleNamespace(
-            poll_for_messages=idle_poll,
-            get_all_new_messages=lambda: messages.pop(0) if messages else [],
-        ),
+        communicator=StandInSocket(lambda: messages.pop(0) if messages else []),
     )
     s.cleaned = []
     s.preprocess_worker = SimpleNamespace(
+        results_wakeup=EventWakeup(),
         get_profile_updates=lambda: [],
         get_result_chunks=lambda: [],
         has_pending_tensors=lambda rid: False,

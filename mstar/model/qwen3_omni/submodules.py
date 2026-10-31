@@ -1368,7 +1368,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Groups 1..15 sample from the "code_predictor" aux sampler's static
         # buffers, so per-request values survive graph replay.
         all_codes, codec_emb_sum = self.code_predictor.depth_loop(
-            last_hidden, layer0_codes, self.talker_code_emb.weight,
+            last_hidden, layer0_codes, self.talker_code_emb(layer0_codes),
             lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
         )
 

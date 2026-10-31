@@ -14,12 +14,12 @@ import functools
 import logging
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
 from mstar.model.media_limits import video_decode_threads
-from mstar.utils.cpus import usable_cpus
+from mstar.utils import cpus
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +28,21 @@ logger = logging.getLogger(__name__)
 def _max_decoders() -> int:
     """The shared decode pool's size, so also the most groups one request's
     frames split into. Each decoder runs ``video_decode_threads()`` FFmpeg
-    threads, so the pool fits the CPUs this process may use; and at most 6,
-    as a larger pool measured within noise on V-JEPA2's benchmark."""
-    return max(1, min(6, usable_cpus() // video_decode_threads()))
+    threads, so the pool fits the CPUs the process's plan leaves unpinned; and
+    at most 6, as a larger pool measured within noise on V-JEPA2's benchmark."""
+    return max(1, min(6, cpus.plan().left // video_decode_threads()))
 
 
-_pool: ThreadPoolExecutor | None = None
+_pool: ThreadPool | None = None
 _pool_lock = threading.Lock()
 
 
-def _decode_pool() -> ThreadPoolExecutor:
+def _decode_pool() -> ThreadPool:
     """One pool for the process's concurrent preprocesses, so they share the decoder cap."""
     global _pool
     with _pool_lock:
         if _pool is None:
-            _pool = ThreadPoolExecutor(_max_decoders(), thread_name_prefix="video_decode")
+            _pool = ThreadPool(_max_decoders(), thread_name_prefix="video_decode")
         return _pool
 
 
