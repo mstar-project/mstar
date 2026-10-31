@@ -1,11 +1,8 @@
 """A request's draws never share an RNG offset, whichever path each step takes.
 
 A step samples eagerly (no slot lease: a prefill past the capture buckets, a
-batch over the largest bucket) or under a captured graph. Each path used to keep
-its own offset counter, both starting at 0, so a request prefilled eagerly and
-decoded under a graph drew its first two tokens from the same uniform: at c=1
-both sit at row 0 under the same seed, and with equal logits the two tokens were
-always equal.
+batch over the largest bucket) or under a captured graph, and both draw from
+the request's one offset counter.
 """
 
 from __future__ import annotations
@@ -76,7 +73,8 @@ def _run(res: SamplerResource, rid: int, modes: str, step: SamplerStep = Sampler
         res.commit(step, ctx)
 
 
-@pytest.mark.parametrize("modes", ["EC", "CE", "ECEC", "EECCE", "CCEEC"])
+# between them, every transition (EE, EC, CC, CE) from either first step
+@pytest.mark.parametrize("modes", ["EECCE", "CCEEC"])
 def test_offsets_are_unique_across_eager_and_captured_steps(drawn, modes):
     res = _resource(torch.device("cpu"))
     _ingest(res, RID, seed=1)
@@ -94,8 +92,8 @@ def test_a_dropped_eager_draw_does_not_advance(drawn):
 
 
 def test_a_recycled_slot_starts_at_zero(drawn):
-    """The reset is queued at registration and drained by whichever path reads
-    first, so a slot reused after eager and captured draws starts clean."""
+    """A slot reused after eager and captured draws starts at offset 0,
+    whichever path draws first."""
     res = _resource(torch.device("cpu"))
     _ingest(res, RID, seed=1)
     _run(res, RID, "ECE")

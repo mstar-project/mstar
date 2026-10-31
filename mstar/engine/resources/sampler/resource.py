@@ -590,9 +590,7 @@ class SamplerResource(Resource):
         by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
         slots = offsets = None
         if by_slot:
-            # One RNG counter per request, shared with the captured steps: with
-            # a counter per path, both start at 0, and a request prefilled eagerly
-            # and decoded captured drew its first two tokens from one number.
+            # draw at the counter captured steps use, so mixing the two never redraws an offset
             slots, offsets = bufs.eager_offsets(request_ids)
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
