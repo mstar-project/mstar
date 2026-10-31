@@ -538,6 +538,24 @@ Qwen3-Omni notes
   default) at the same text throughput, with image throughput 3% lower in its
   one pair of runs. Spoken questions at c=32 keep one GPU too busy for either
   ramp (0.90 of chunks in time, 0.87 with the default).
+- On AMD GPUs ``configs/qwen3omni_2gpu.yaml`` gives Code2Wav a worker of its own on
+  the Talker's GPU (a ``platform_overrides`` entry, see :ref:`platform-overrides`),
+  the layout of ``configs/qwen3omni_2gpu_split.yaml``, so Talker steps no longer
+  take turns with Code2Wav steps on one worker loop. On MI325X, at 32 text requests:
+  168 audio-s/s against 135, the same at one request. Other platforms serve one
+  worker, and ``configs/qwen3omni_2gpu_stock.yaml`` keeps it everywhere.
+- ``configs/qwen3omni_colocated_split3.yaml`` runs the Thinker with the encoders, the
+  Talker and Code2Wav as three workers on one GPU. On one MI325X (a shared node, three
+  launches): 118 audio-s/s against 82 at 32 text requests, 13.0 against 10.3 and time
+  to first audio 147 against 184 ms at one request, first text 40 against 27 ms.
+- ``configs/qwen3omni_2gpu_ramp4g.yaml`` and
+  ``configs/qwen3omni_colocated_split3_ramp4g.yaml`` start audio after 4 frames,
+  ``codec_chunk_schedule: [4, 5, 6, 8, 10, 13, 16, 20]``. On MI325X time to first
+  audio at one text request is 83 ms on two GPUs (134 without the ramp) and 96 ms on
+  one (147), and at 32 requests 325 and 349 ms (494 and 560). The ramp needs about 17
+  frames/s per request, while ``(4, 8, 16)`` needs 27: at 32 requests on two GPUs the
+  slowest 5% of requests get 21-27, so 4-14% of them paused against 1-6% with this
+  ramp, and on one worker on one GPU they get 15-16, so 22-62% paused.
 - A request prefills in one Thinker step. Its walk runs the encoders its
   attachments need (``prefill_audio``, ``prefill_vision`` or
   ``prefill_audio_vision``; ``prefill_text`` for a text-only prompt), then the
