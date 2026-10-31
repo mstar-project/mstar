@@ -1371,6 +1371,10 @@ corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
 travels with the request rather than living in a scheduler object on one rank.
 Requests are therefore independent and the loop is resumable across ranks.
 
+**Two GPUs.** ``configs/wan22_cfg2.yaml`` runs each guidance branch on its own rank
+(``cfg_size: 2``, see :doc:`serving`) on the scaffold loop, with one captured graph per
+shape and rank at half the rows; ``dit_loop: legacy`` refuses it.
+
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
 compiled (``vae_decode_fast``; set it to ``false`` under the yaml's
