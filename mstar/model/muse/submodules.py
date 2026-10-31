@@ -30,8 +30,6 @@ from mstar.model.submodule_base import NodeInputs
 class LLMSubmodule(SampledTokenDecoder):
     # either attention resource's plan picks each prefill row's last token
     ATTN_KEY = ATTN_FULL
-    # max-autotune until the default compile level (mstar serve -O) is measured on this model
-    CAPTURE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         # one KV cache, read through a windowed and an unwindowed resource

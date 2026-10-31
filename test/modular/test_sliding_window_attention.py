@@ -266,8 +266,9 @@ class SlidingWindowTests(unittest.TestCase):
         self.assertLessEqual(named, captured_page_capacity(len(step.segments), num_tokens, cfg, cfg.groups[0]))
 
     def test_a_window_pool_allots_every_group(self):
-        """A request is allotted its pages in every group, so one that fits only if the window's
-        pages went uncounted waits, and the allotment stays whole as the window releases pages."""
+        """A request is allotted its prompt's pages in every group, so one that fits only if the
+        window's pages went uncounted waits; once the prompt is written, the window's share drops
+        to the pages it holds, and the waiting request fits."""
         from mstar.communication.tensors import LocalTransferEngine
         from mstar.engine.resources.kv import manager as manager_mod
         from mstar.engine.resources.kv.manager import KVManager, RoomMark
@@ -289,14 +290,19 @@ class SlidingWindowTests(unittest.TestCase):
             kv.ask(rid, "LLM", "walk")
         self.assertIsNone(kv.reserve("a", "LLM", "walk", None))
         self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
-        for span in (48, *[1] * 16):
+        for span in (32, 16, *[1] * 16):
             step, ctx = KVStep(segments=(Segment("a", "main", span),)), StepContext(("a",), "walk", 0, False)
             self.assertTrue(kv.admit(step, ctx).ok)
             kv.plan(step, ctx)
             kv.commit(step, ctx)
-            self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
+            if span == 32:
+                # the prompt's second chunk still needs the pages the window released
+                self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
+            elif span == 16:
+                # a holds 3 pages of the full layer and 1 of the window
+                self.assertEqual(kv._allotments["a"].pages, 4)
+                self.assertIsNone(kv.reserve("b", "LLM", "walk", None))
         kv.remove_request("a")
-        self.assertIsNone(kv.reserve("b", "LLM", "walk", None))
         # an admit unwound gives back the pages it took in each group
         free = kv._arena.num_free
         step, ctx = KVStep(segments=(Segment("b", "main", 48),)), StepContext(("b",), "walk", 0, False)
@@ -304,6 +310,18 @@ class SlidingWindowTests(unittest.TestCase):
         self.assertEqual(free - kv._arena.num_free, 9)
         kv.rollback_admit(step, ctx)
         self.assertEqual(kv._arena.num_free, free)
+
+    def test_capacity_benchmark_counts_what_admission_lets_in(self):
+        """At one rank `benchmark/kv_capacity.py` stops at the request that waits for its allotment,
+        as above, though the pages left free hold its prompt; above one rank nothing allots."""
+        from benchmark import kv_capacity
+
+        def requests(shards):
+            cfg = window_pool(num_qo_heads=1, num_kv_heads=1, head_dim=4)
+            return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
+
+        self.assertEqual(requests(1), 1)
+        self.assertGreater(requests(2), 1)
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only
@@ -318,6 +336,17 @@ class SlidingWindowTests(unittest.TestCase):
         # a window over a pool its specs never resolved would plan as if it kept every page
         with self.assertRaisesRegex(ValueError, "resolve"):
             build_manager(WINDOW, kv_config=geometry(), layers=(0,))
+        # a window turns the prefix cache off, unless the serving config asked for it
+        cfg = PagedKVConfig(num_layers=2, num_qo_heads=4, num_kv_heads=2, head_dim=128,
+                            max_seq_len=64, page_size=16, max_num_pages=6)
+        cfg.apply_yaml_overrides(prefix_cache=True)
+        with self.assertRaisesRegex(ValueError, "prefix_cache"):
+            resolve_spec_dependencies([
+                KVSpec(resource_key="kv", nodes={"LLM"}, config=cfg),
+                AttentionSpec(resource_key="local", nodes={"LLM"},
+                              config=AttentionConfig("kv", sliding_window=WINDOW, layers=(1,))),
+                AttentionSpec(resource_key="full", nodes={"LLM"}, config=AttentionConfig("kv")),
+            ])
         for layers in ((), (1, 1)):
             with self.subTest(layers=layers), self.assertRaisesRegex(ValueError, "layers"):
                 AttentionConfig("kv", sliding_window=WINDOW, layers=layers)

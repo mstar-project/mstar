@@ -22,7 +22,8 @@ contract that makes this capture-safe:
   cumulative pad count;
 - real tokens precede a replay's padding tail, so the tail's stale ids
   cannot shift a real row's index; and a captured media buffer has at least
-  the bucket's tokens rows, so a tail index stays in bounds.
+  the bucket's tokens rows, so a tail index stays in bounds and
+  `splice_media`'s clamp to the last row never binds.
 
 A step that splits a media row (chunked prefill) must slice its media by
 the host pad counts of each piece.
@@ -63,7 +64,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, ROPE, SAMPLER
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -73,19 +74,6 @@ from mstar.model.submodule_base import (
     device_loopback_enabled,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
-
-
-def splice_media(
-    embeds: torch.Tensor, ids: torch.Tensor, media: torch.Tensor, pad_ids: Sequence[int],
-) -> torch.Tensor:
-    """``embeds`` with the nth pad (any of ``pad_ids``) of ``ids`` replaced by
-    ``media[n]``. Static shapes and no host sync, so it runs inside a
-    captured forward; see the module docstring for the row contract."""
-    pad = ids == pad_ids[0]
-    for p in pad_ids[1:]:
-        pad = pad | (ids == p)
-    index = (torch.cumsum(pad, 0) - 1).clamp_(min=0)
-    return torch.where(pad[:, None], media[index].to(embeds.dtype), embeds)
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
@@ -119,9 +107,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # near the top bucket (4 fit ~1000 tokens a request: a ~1000 px square
     # image plus text). Chunked prefill replaces this cap.
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4]
-    # The compile mode every capture here names; None takes the deployment's
-    # compile level (mstar serve -O).
-    CAPTURE_COMPILE_MODE: str | None = None
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
@@ -203,20 +188,17 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
         configs = [
             BatchedAcceleratorGraphConfig(
-                compile_mode=self.CAPTURE_COMPILE_MODE,
                 capture_graph_walk="decode",
                 single_request_inputs=ids(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
             PackedAcceleratorGraphConfig(
-                compile_mode=self.CAPTURE_COMPILE_MODE,
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
             PackedAcceleratorGraphConfig(
-                compile_mode=self.CAPTURE_COMPILE_MODE,
                 capture_graph_walk=MIXED,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
@@ -229,7 +211,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             walks = media_walk_names(self._encoders)
             # one capture every media walk replays
             configs.append(PackedAcceleratorGraphConfig(
-                compile_mode=self.CAPTURE_COMPILE_MODE,
                 capture_graph_walk=walks[0],
                 replay_graph_walks=walks,
                 capture_token_lengths=self.PREFILL_MEDIA_TOKEN_BUCKETS,
@@ -425,7 +406,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             rows = media.get(e.output)
             # a host shape: an eager step without this medium skips it
             if rows is not None and rows.shape[0]:
-                embeds = splice_media(embeds, input_ids, rows, e.pad_ids)
+                embeds = splice_media(embeds, e.pads(input_ids), rows)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
         if graph_walk != "decode":
             # only the last token of each prefill row feeds the head

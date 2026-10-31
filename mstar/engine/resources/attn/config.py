@@ -41,9 +41,10 @@ class AttentionConfig:
     # pass the *original* qk head dim's scale, not the latent width's. FlashInfer
     # and MLA read it; the others refuse it at build
     sm_scale: float | None = None
-    # FlashInfer only: combined walks whose captured steps plan their
-    # one-token rows on the decode wrapper and their prompt rows on a prefill
-    # wrapper sized to them (`FlashInferMixedWrapper`)
+    # FlashInfer only: combined walks whose captured steps run their leading
+    # one-token rows on a decode half and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
+    # every step of those walks decode first
     splits: tuple[CombinedSplit, ...] = ()
     # FlashInfer only: run one-token decode rows on the tensor-core kernel.
     # False picks the CUDA-core decode kernel, which can win for MHA and
@@ -79,6 +80,9 @@ class AttentionSpec(NodeResourceSpec):
         # the wrappers are planned against the cache's geometry, and it has to
         # be the same KVConfig the KV resource holds
         return {self.config.kv_cache}
+
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -161,6 +165,9 @@ def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceS
         cfg.keep_window(None, ())
         return problems
     if window is not None and cfg.prefix_cache:
+        if cfg.prefix_cache_given:
+            problems.append("keeps a sliding window, which doesn't prefix cache yet; drop its prefix_cache: true")
+            return problems
         logger.info("KV %s keeps a sliding window, which doesn't prefix cache yet: its prefix cache is off", name)
         cfg.prefix_cache = False
     return problems

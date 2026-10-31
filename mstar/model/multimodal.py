@@ -400,6 +400,21 @@ class MediaEncoder:
             # the splice would have no pad to fill
             raise ValueError(f"media encoder {self.node!r} names no pad ids")
 
+    def pads(self, ids: torch.Tensor) -> torch.Tensor:
+        """Which of ``ids`` are this encoder's pads."""
+        pad = ids == self.pad_ids[0]
+        for p in self.pad_ids[1:]:
+            pad = pad | (ids == p)
+        return pad
+
+
+def splice_media(embeds: torch.Tensor, pad: torch.Tensor, media: torch.Tensor) -> torch.Tensor:
+    """``embeds`` with the nth token that ``pad`` marks replaced by ``media[n]``,
+    an index past the end taking the last row. Static shapes and no host sync,
+    so it runs inside a captured forward."""
+    index = (torch.cumsum(pad, 0) - 1).clamp_(0, media.shape[0] - 1)
+    return torch.where(pad[:, None], media[index].to(embeds.dtype), embeds)
+
 
 def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
     """The ``vision_encoder`` node every VLM here declares."""

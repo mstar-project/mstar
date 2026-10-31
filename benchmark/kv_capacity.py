@@ -2,12 +2,16 @@
 
 Builds the KV manager as a server would: the model's own KV spec with the serving
 config's ``resources:`` block applied (``apply_yaml_overrides``), sharded to one rank of
-its node's tp * sp heads, on the GPU. It then grows requests one after another until an
-admit is refused: a prefill of L - 128 tokens in one step, then 128 one-token decode
-steps. Every request stays resident. A one-step prefill holds all of a prompt's sliding
-K/V until it commits, so a server that chunks a prompt's prefill can hold more requests
-of long prompts than this counts. "without" is the same pool keeping every layer's
-tokens, with the same max_num_pages, so the same bytes.
+its node's tp * sp heads, on the GPU. It then admits requests one after another as a
+server does and grows each one: a prefill of L - 128 tokens in one step, then 128 one-token
+decode steps. It stops at the first request admission makes wait, or whose step is refused.
+At one rank a request waits until it can be allotted its pages (`ask` / `reserve`); above
+one rank no pool allots, so only a refused step stops it. Every request stays resident.
+A one-step prefill holds all of a prompt's sliding K/V until it commits, so above one rank
+a server that chunks a prompt's prefill can hold more requests of long prompts than this
+counts (at one rank a request is allotted its whole prompt's pages, however it is chunked).
+"without" is the same pool keeping every layer's tokens, with the same max_num_pages, so
+the same bytes.
 
 Only the checkpoint's metadata (configs, tokenizer) is read, from the registry's repo.
 ``--model-path`` reads another repo or a local directory instead:
@@ -31,7 +35,14 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from mstar.communication.tensors import LocalTransferEngine  # noqa: E402
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig  # noqa: E402
+from mstar.engine.resources.kv.config import (  # noqa: E402
+    KVReqConfig,
+    KVSpec,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+    StreamLayout,
+)
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.kv.transfer import TransferEngineInfo  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
@@ -70,14 +81,16 @@ def kv_configs(config, model_path=None):
     (shards,) = shards
     cfg.shard(shards)
     without.shard(shards)
-    return cfg, without, int(serving.get("max_seq_len", cfg.max_seq_len))
+    return cfg, without, int(serving.get("max_seq_len", cfg.max_seq_len)), shards
 
 
-def manager(cfg):
+def manager(cfg, shards=1, device="cuda"):
+    # Built at one rank, so above one it is told not to lead: like a pool there, it then
+    # doesn't decide admission (`KVManager._decides`).
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None,
         transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
-        device=torch.device("cuda"), dtype=torch.bfloat16,
+        device=torch.device(device), dtype=torch.bfloat16, leads=shards == 1,
     )
 
 
@@ -91,13 +104,27 @@ def step(m, rid, span):
     return True
 
 
-def fill(cfg, length):
-    m = manager(cfg)
+def admitted(m, rid, prompt, decode):
+    """Whether admission lets ``rid`` in: a pool that decides allots it its prompt's pages,
+    and one that doesn't asks nothing."""
+    layout = StreamLayout(spans=(PrefixSpan(prompt, prompt, "walk"),), growth=(("decode", 1),))
+    m.ingest_request(rid, KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": decode}))
+    asked = m.ask(rid, "node", "walk")
+    if asked is None:
+        return True
+    # a request that can never fit fails its ask
+    return asked.ok and m.reserve(rid, "node", "walk", None) is None
+
+
+def fill(cfg, length, shards=1, decode=DECODE, device="cuda"):
+    m = manager(cfg, shards, device)
     n = 0
     while True:
         rid = f"r{n}"
-        m.ingest_request(rid)
-        if not (step(m, rid, length - DECODE) and all(step(m, rid, 1) for _ in range(DECODE))):
+        if not (
+            admitted(m, rid, length - decode, decode)
+            and step(m, rid, length - decode) and all(step(m, rid, 1) for _ in range(decode))
+        ):
             m.remove_request(rid)
             break
         n += 1
@@ -113,19 +140,21 @@ def main():
     ap.add_argument("--config", required=True, help="serving config, e.g. configs/muse_glimmer.yaml")
     ap.add_argument("--out", help="JSON results, rewritten after each cell (required unless --one)")
     ap.add_argument("--lengths", default="8192,32768,131072",
-                    help="request lengths; those past the config's max_seq_len are skipped")
+                    help=f"request lengths; those past the config's max_seq_len, or not past {DECODE} "
+                         "decode tokens, are skipped")
     ap.add_argument("--model-path", help="read the checkpoint's configs from this repo or directory")
     ap.add_argument("--one", help="length,arm: run one cell in this process and print its JSON")
     a = ap.parse_args()
     if a.one:
         length, arm = a.one.split(",")
-        with_cfg, without_cfg, _ = kv_configs(a.config, a.model_path)
-        print("RESULT " + json.dumps(fill(with_cfg if arm == "with" else without_cfg, int(length))), flush=True)
+        with_cfg, without_cfg, _, shards = kv_configs(a.config, a.model_path)
+        cfg = with_cfg if arm == "with" else without_cfg
+        print("RESULT " + json.dumps(fill(cfg, int(length), shards)), flush=True)
         return
     if not a.out:
         ap.error("--out is required")
-    _, _, max_seq_len = kv_configs(a.config, a.model_path)
-    lengths = [n for n in map(int, a.lengths.split(",")) if n <= max_seq_len]
+    _, _, max_seq_len, _ = kv_configs(a.config, a.model_path)
+    lengths = [n for n in map(int, a.lengths.split(",")) if DECODE < n <= max_seq_len]
     # a process per cell: a built KV manager's pool isn't returned to the GPU when it's dropped
     results = {}
     for length in lengths:

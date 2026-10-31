@@ -107,6 +107,8 @@ class PagedKVConfig(KVConfig):
     # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
     # the attention backend would plan; a cache only stored (index keys) needs no query heads
     qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
+    # whether the serving config's ``resources:`` block turned the prefix cache on itself
+    prefix_cache_given: bool = field(default=False, init=False, repr=False, compare=False)
     # Derived, never declared: the layers cut by page size and retention, the layers no window
     # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
     # before anything builds or sizes from the pool). One group of every layer until then.
@@ -230,6 +232,8 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+        if prefix_cache is not None:
+            self.prefix_cache_given = prefix_cache
         if page_size is not None:
             # every token kept at this page size until the specs derive the window again
             self.keep_window(None, ())
@@ -650,6 +654,9 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
+    # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
+    commits: int = field(default=0, init=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)

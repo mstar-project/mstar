@@ -230,8 +230,7 @@ class _Rope:
 def _submodule_class():
     from mstar.engine.resources.kv.config import KVStep
     from mstar.engine.resources.step import Segment, SubmoduleStep
-    from mstar.model.components.sampled_token_decoder import splice_media
-    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal import splice_media, vision_encoder
     from mstar.model.qwen3_5.config import ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
@@ -313,7 +312,7 @@ def _submodule_class():
             for inp in inputs:
                 rows = self.model.model.embed_tokens(inp.input_ids)
                 media = inp.tensor_inputs.get("vision_embeds")
-                embeds.append(rows if media is None else splice_media(rows, inp.input_ids, media, (PAD,)))
+                embeds.append(rows if media is None else splice_media(rows, inp.input_ids == PAD, media))
             return {"embeds": embeds}
 
         def forward(self, graph_walk, engine_inputs, **kwargs):
@@ -665,6 +664,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.utils.containers import RecentSet
     from mstar.worker.micro_scheduler import MicroScheduler
+    from mstar.worker.stream_buffers import StreamBufferManager
     from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
 
     w = Worker.__new__(Worker)
@@ -677,7 +677,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._max_consecutive_spec = 1
     w._device_loopback = {}
     w._host_rows_slot = 0
-    w._stream_buffer_rids = set()
     w._phase_period = 0
     w._phase_buf = {}
     w._gpu_spans = []
@@ -723,6 +722,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._streaming_edge_names = set()
     w._consumer_node_cache = {}
     w._stream_partition = {}
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._metrics = None
     for setup in _DESIGN_SETUP:

@@ -2,7 +2,7 @@ import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import torch
@@ -61,6 +61,16 @@ def _rms_norm(r: torch.Tensor, weight: torch.Tensor, eps: float, weight_bias: fl
     return (v * (weight.float() + weight_bias)).to(r.dtype)
 
 
+class ArFusionWorkspace(NamedTuple):
+    """A fused all-reduce workspace of a ``CommGroup``: its id in
+    ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows, and
+    ``allreduce_rmsnorm``'s ``[max_tokens, hidden]`` zero residual (shared,
+    which is safe only because the fused op never writes its residual)."""
+    ws_id: int
+    max_tokens: int
+    zeros: torch.Tensor
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -87,12 +97,8 @@ class CommGroup:
         # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
-        # see ``init_allreduce_fusion``
-        self._ar_fusion_ws: int | None = None
-        self._ar_fusion_max_tokens = 0
-        # ``[max_tokens, hidden]`` zeros, ``allreduce_rmsnorm``'s residual; shared,
-        # which is safe only because the fused op never writes ``residual``
-        self._ar_fusion_zeros: torch.Tensor | None = None
+        # (dtype, hidden) -> its fused all-reduce workspace; see ``init_allreduce_fusion``
+        self._ar_fusion: dict[tuple[torch.dtype, int], ArFusionWorkspace] = {}
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -171,25 +177,32 @@ class CommGroup:
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
         """Set up the fused kernel of ``allreduce_add_rmsnorm`` and
-        ``allreduce_rmsnorm`` for ``[<=max_tokens, hidden]`` inputs; larger
-        inputs keep the NCCL path. Also allocates ``allreduce_rmsnorm``'s zero
-        residual, ``max_tokens x hidden`` in ``dtype`` per rank (16 MiB at
-        hidden 4096, bf16). Collective: every member calls it at the same
-        point. Returns whether it is available."""
-        if self.world_size == 1 or self._ar_fusion_ws is not None:
-            return self._ar_fusion_ws is not None
+        ``allreduce_rmsnorm`` for ``[<=max_tokens, hidden]`` inputs of ``dtype``,
+        with ``allreduce_rmsnorm``'s zero residual (16 MiB per rank at 2048 x
+        4096, bf16). Returns whether it is available for them.
+
+        Collective: every member calls it at load, in the same order with the
+        same arguments. The lockstep nodes of an instance share its group, so
+        it uses one workspace per ``(dtype, hidden)``. A larger ``max_tokens``
+        builds another if it can and leaves the old one allocated, outside torch's
+        allocator: 512 MiB per rank in each shape measured at TP2 on H200, with
+        the MNNVL backend FlashInfer 0.7.2's "auto" chose. Other inputs take the
+        group's ``all_reduce`` and a separate norm.
+        """
+        if self.world_size == 1:
+            return False
+        have = self._ar_fusion.get((dtype, hidden))
+        if have is not None and have.max_tokens >= max_tokens:
+            return True
         from mstar.distributed.ar_fusion import create_workspace
 
-        self._ar_fusion_ws = create_workspace(
-            self, max_tokens, hidden, dtype,
-        )
-        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
-        if self._ar_fusion_ws is not None:
-            # where the workspace was just built
-            self._ar_fusion_zeros = torch.zeros(
-                max_tokens, hidden, dtype=dtype, device=torch.accelerator.current_accelerator(),
-            )
-        return self._ar_fusion_ws is not None
+        ws_id = create_workspace(self, max_tokens, hidden, dtype)
+        if ws_id is None:
+            return False
+        # on the device the workspace was just built on
+        zeros = torch.zeros(max_tokens, hidden, dtype=dtype, device=torch.accelerator.current_accelerator())
+        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens, zeros)
+        return True
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
@@ -198,14 +211,12 @@ class CommGroup:
         """``r = all_reduce(x) + residual``; returns ``(rms_norm(r), r)``,
         scaling by ``weight + weight_bias``. ``x`` is a row-parallel
         projection's partial sum (its linear skipped ``reduce_results``)."""
-        if (self._ar_fusion_ws is not None
-                and x.shape[0] <= self._ar_fusion_max_tokens
+        ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
+        if (ws is not None and x.shape[0] <= ws.max_tokens
                 and x.is_contiguous() and residual.is_contiguous()):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
-            return allreduce_add_rmsnorm(
-                x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
-            )
+            return allreduce_add_rmsnorm(x, residual, weight, eps, weight_bias, ws.ws_id)
         r = self.all_reduce(x) + residual
         return _rms_norm(r, weight, eps, weight_bias), r
 
@@ -214,12 +225,12 @@ class CommGroup:
     ) -> torch.Tensor:
         """``rms_norm(all_reduce(x))``, a norm before the residual add, in the
         same fused kernel: it always adds a residual, so this adds zeros."""
-        zeros = self._ar_fusion_zeros
-        if zeros is not None and x.shape[0] <= zeros.shape[0] and x.is_contiguous():
+        ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
+        if ws is not None and x.shape[0] <= ws.max_tokens and x.is_contiguous():
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
             return allreduce_add_rmsnorm(
-                x, zeros[: x.shape[0]], weight, eps, weight_bias, self._ar_fusion_ws,
+                x, ws.zeros[: x.shape[0]], weight, eps, weight_bias, ws.ws_id,
             )[0]
         return _rms_norm(self.all_reduce(x), weight, eps, weight_bias)
 
@@ -442,8 +453,6 @@ class WorkerParallelGroups:
     node_to_instance_groups: dict[
         str, frozenset[tuple[int, ...]]
     ] = field(default_factory=dict)
-    # The config's node groups (by index) that run each node; one per walk at most
-    node_to_node_groups: dict[str, frozenset[int]] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
@@ -630,22 +639,17 @@ class WorkerParallelGroups:
     def resource_needs_remote_transfer(
         self, nodes: set[str], local_nodes: set[str],
     ) -> bool:
-        """Whether one request's reads of a logical resource can span more than one
-        worker instance. A request runs every node of a node group on one of its
-        replicas (`Conductor._assign_worker_graphs_to_workers`), so the replicas of a
-        group never read each other's copy."""
+        """Whether a logical resource spans more than one worker instance."""
         instance_groups: set[tuple[int, ...]] = set()
-        node_groups: set[int] = set()
         topology_known = True
         for node in nodes:
             groups = self.node_to_instance_groups.get(node)
-            if not groups or node not in self.node_to_node_groups:
+            if not groups:
                 topology_known = False
                 break
             instance_groups.update(groups)
-            node_groups.update(self.node_to_node_groups[node])
         if topology_known:
-            return len(instance_groups) > 1 and len(node_groups) > 1
+            return len(instance_groups) > 1
         # Preserve sensible behavior for hand-built/test configs that lack the
         # global maps: another named consumer necessarily needs a transfer.
         return bool(nodes - local_nodes)
@@ -695,7 +699,6 @@ class GlobalParallelConfig:
         )
         node_to_parallel_shapes: dict[str, set[tuple[int, int]]] = {}
         node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
-        node_to_node_groups: dict[str, set[int]] = {}
         for wg in worker_graphs.values():
             shape = (wg._tp_comm_size, wg.sp_size)
             instance_groups = wg._instance_ranks or [
@@ -706,7 +709,6 @@ class GlobalParallelConfig:
                 node_to_instance_groups.setdefault(node, set()).update(
                     tuple(group) for group in instance_groups
                 )
-                node_to_node_groups.setdefault(node, set()).add(wg._group_id)
         frozen_parallel_shapes = {
             node: frozenset(shapes)
             for node, shapes in node_to_parallel_shapes.items()
@@ -742,12 +744,6 @@ class GlobalParallelConfig:
                 tp_allreduce_max_kb=tp_allreduce_max_kb,
                 node_to_parallel_shapes=frozen_parallel_shapes,
                 node_to_instance_groups=frozen_instance_groups,
-                # a WorkerGraph built without its node group (_group_id -1) leaves its
-                # nodes' topology unknown, so their pools count as shared
-                node_to_node_groups={
-                    node: frozenset(groups) for node, groups in node_to_node_groups.items()
-                    if min(groups) >= 0
-                },
             ) for i, wid in enumerate(worker_ids)
         }
 

@@ -392,7 +392,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     """The schedule and the LLM's media row, against transformers: the
     spliced row's token order and its 3D positions, plus where decode
     resumes."""
-    from mstar.model.components.sampled_token_decoder import splice_media
+    from mstar.model.multimodal import splice_media
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
@@ -421,7 +421,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
     expected_row[ref["input_ids"][0] == model.config.video_token_id] = VIDEO_MARK
-    spliced = splice_media(row.input_ids.float()[:, None], row.input_ids, marks, encoder.pad_ids)
+    spliced = splice_media(row.input_ids.float()[:, None], encoder.pads(row.input_ids), marks)
     assert torch.equal(spliced[:, 0], expected_row)
 
     positions, _ = rope_model.get_rope_index(

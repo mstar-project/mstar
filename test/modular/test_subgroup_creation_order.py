@@ -60,11 +60,19 @@ class _FakeDist:
         return SimpleNamespace(backend=backend, ranks=members, name=name)
 
 
-def _mesh(tp: int, sp: int) -> GlobalParallelConfig:
-    """One node on tp * sp ranks, laid out [sp][tp] as WorkerGraph does."""
+def _mesh(tp: int, sp: int, nodes: tuple[str, ...] = ("dit",)) -> GlobalParallelConfig:
+    """Each node its own worker graph on the same tp * sp ranks, laid out
+    [sp][tp] as WorkerGraph does."""
     ranks = list(range(tp * sp))
-    graph = SimpleNamespace(
-        section=SimpleNamespace(get_nodes=lambda: {"dit": None}),
+    graphs = {node: _graph(node, ranks, tp, sp) for node in nodes}
+    return GlobalParallelConfig(
+        worker_graphs=graphs, worker_ids=[f"worker-{r}" for r in ranks],
+    )
+
+
+def _graph(node: str, ranks: list[int], tp: int, sp: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        section=SimpleNamespace(get_nodes=lambda: {node: None}),
         ranks=ranks,
         tp_size=tp,
         sp_size=sp,
@@ -72,15 +80,11 @@ def _mesh(tp: int, sp: int) -> GlobalParallelConfig:
         _tp_ranks=[ranks[s * tp:(s + 1) * tp] for s in range(sp)] if tp > 1 else [],
         _sp_ranks=[ranks[t::tp] for t in range(tp)] if sp > 1 else [],
         _instance_ranks=[ranks],
-        _group_id=0,
-    )
-    return GlobalParallelConfig(
-        worker_graphs={"main": graph}, worker_ids=[f"worker-{r}" for r in ranks],
     )
 
 
-def _run(monkeypatch, tp: int, sp: int):
-    config = _mesh(tp, sp)
+def _run(monkeypatch, tp: int, sp: int, nodes: tuple[str, ...] = ("dit",)):
+    config = _mesh(tp, sp, nodes)
     # these need a real torch.distributed (and rank 0 binds a socket)
     monkeypatch.setattr(communication, "rendezvous_store", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(communication, "default_group_timeout", lambda backend: None, raising=False)
@@ -147,3 +151,15 @@ def test_the_groups_land_on_the_right_comm_groups(monkeypatch):
         assert sp.device_group.ranks == tuple(sp.group_members) == sp.cpu_group.ranks
         assert tp.cpu_group.backend == "gloo" and tp.device_group.backend == "nccl"
         assert rank in tp.group_members and rank in sp.group_members
+
+
+@pytest.mark.parametrize(("tp", "sp"), [(2, 2), (2, 1)])
+def test_lockstep_nodes_on_the_same_ranks_share_one_set_of_groups(monkeypatch, tp, sp):
+    # several lockstep nodes on one instance: a rank tuple is split once, not
+    # once per node, so every rank still makes the same calls
+    fakes, views = _run(monkeypatch, tp, sp, nodes=("a", "b"))
+    one_node, _ = _run(monkeypatch, tp, sp)
+    for rank, fake in fakes.items():
+        assert fake.calls == one_node[rank].calls
+        view = views[rank]
+        assert view.node_to_tp_group["a"] is view.node_to_tp_group["b"]

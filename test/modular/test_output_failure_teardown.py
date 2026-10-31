@@ -24,8 +24,10 @@ from test_request_id_reuse import TEXT, _api_server, _PreprocessWorker, _routes,
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
 
 from mstar.api_server import entrypoint
-from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread, RequestOutputState
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState, ResultQueue
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
+from mstar.communication.event import EventWakeup
+from mstar.model.base import Model
 from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests, ReadsDone
 
@@ -98,6 +100,10 @@ class _Model:
         if self.prompt_raises:
             raise ValueError("bad prompt")
 
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
+    text_output = Model.text_output
+
     def postprocess(self, output, modality, request_kwargs=None):
         if self.postprocess_raises:
             raise RuntimeError("decode failed")
@@ -109,8 +115,8 @@ def _thread(model, tensor_manager):
     wt = PreprocessWorkerThread(
         in_queue=queue.Queue(),
         result_tensor_queue=queue.Queue(),
-        out_queue=queue.Queue(),
-        profile_queue=queue.Queue(),
+        out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(),
         reads_done_queue=queue.Queue(),
@@ -152,8 +158,8 @@ def _with_output(stage):
         wt.tensor_uuid_to_metadata_per_request["r1"] = {"u1": {}, "u2": {}}
     else:
         wt = _thread(_Model(postprocess_raises=True), _TensorManager())
-        wt.result_tensor_queue.put(InlineToken("r1", 7, None, "text"))
-        wt.result_tensor_queue.put(InlineToken("r1", 8, None, "text"))
+        wt.result_tensor_queue.put(InlineTokens(["r1"], [7], "text"))
+        wt.result_tensor_queue.put(InlineTokens(["r1"], [8], "text"))
     return wt
 
 

@@ -15,7 +15,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -31,6 +31,7 @@ from mstar.observability.catalog import TRANSFER_API_SERVER
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.threads import ThreadPool
 
 try:
     from mooncake.engine import TransferEngine
@@ -379,7 +380,7 @@ class AsyncMooncakeReader:
     ):
         self._engine = engine
         self.max_batch_size = max_batch_size
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._executor = ThreadPool(max_workers=max_workers)
         self._pending: list[Future] = []
         # none on the host: host buffers have no GPU work to wait for, and a stream or event would
         # create a CUDA context on a GPU that other processes may have filled
@@ -2465,10 +2466,11 @@ def _hold_namespace_lock(shm_dir: str, namespace: str) -> None:
 
 
 def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
-    """Delete every ``mstar_<ns>_*`` file in ``shm_dir`` of each of this
-    uid's namespaces whose lock there this process can take exclusively,
-    then the lock file. A per-launch namespace never collides with a dead
-    run's files, so nothing else reclaims them."""
+    """Delete every ``mstar_<ns>_*`` entry in ``shm_dir`` (files, and this
+    uid's directories with their contents) of each of this uid's namespaces
+    whose lock there this process can take exclusively, then the lock file.
+    A per-launch namespace never collides with a dead run's files, so
+    nothing else reclaims them."""
     try:
         names = os.listdir(shm_dir)
     except OSError:
@@ -2498,13 +2500,20 @@ def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
             swept = 0
             for stale in os.listdir(shm_dir):
                 if stale.startswith(prefix):
+                    stale_path = os.path.join(shm_dir, stale)
                     try:
-                        os.unlink(os.path.join(shm_dir, stale))
+                        st = os.lstat(stale_path)
+                        if not stat.S_ISDIR(st.st_mode):
+                            os.unlink(stale_path)
+                        elif st.st_uid == uid:
+                            shutil.rmtree(stale_path)
+                        else:
+                            continue
                         swept += 1
                     except OSError:
                         pass
             os.unlink(path)
-            logger.info("SHM: swept %d file(s) of dead deployment namespace "
+            logger.info("SHM: swept %d entries of dead deployment namespace "
                         "%s", swept, m[1])
         except OSError as e:
             logger.debug("SHM: cannot sweep %s: %s", name, e)
@@ -2726,6 +2735,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None
     ):
+        if not any(e.tensor_info for e in graph_edges):
+            return []  # signal-only edges: no stream context to pay for
         # Run H2D copies on a dedicated stream so they overlap with the
         # consumer's in-flight default-stream work. We make default wait
         # for the H2D stream at the end so downstream kernels see the data.
@@ -2838,7 +2849,8 @@ def create_tensor_communication_manager(
     metadata_server: str = "P2PHANDSHAKE",
     tcp_transfer_device: str = "",
     shm_dir: str | None = None,
-    enable_prof: bool=False
+    enable_prof: bool=False,
+    copy_workers: int = 1,
 ) -> TensorCommunicationManager:
     """Select tensor transport backend based on protocol.
 
@@ -2848,7 +2860,8 @@ def create_tensor_communication_manager(
     ``mstar_rust`` extension is missing); ``AUTO`` — the arena when the
     extension imports, files otherwise. The flag must match across the
     deployment: the arena location rides in the tensor descriptors, so a
-    file-transport consumer cannot read an arena producer.
+    file-transport consumer cannot read an arena producer. ``copy_workers``
+    is the width of the arena's CPU reads (``host_copy.HostCopier``).
     """
     if protocol == CommProtocol.SHM:
         choice = os.getenv("MSTAR_SHM_ARENA", "0").upper()
@@ -2872,7 +2885,8 @@ def create_tensor_communication_manager(
                     device=device,
                     communicator=communicator,
                     shm_dir=shm_dir,
-                    enable_prof=enable_prof
+                    enable_prof=enable_prof,
+                    copy_workers=copy_workers,
                 )
         return SharedMemoryCommunicationManager(
             my_entity_id=my_entity_id,
