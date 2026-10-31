@@ -423,3 +423,32 @@ def test_a_choice_table_keeps_every_implementations_time_and_parameters(tmp_path
     store.write(MI300X, "decode_gemv_silu_mul", shape, torch.bfloat16, tied)
     path = decode_gemv.promote(store, MI300X, 0.01, root=tmp_path / "configs")
     assert json.loads(path.read_text())["shapes"]["gated1-k32-n64-rows16"]["impl"] == "fused"
+
+
+def test_a_served_shape_moves_only_for_a_gain_past_the_margin_and_a_node(tmp_path):
+    store = ResultsStore(tmp_path / "store", stack="torch-test-hip-test-triton-test")
+
+    def table_for(served_us, triton_us, node_us=1.5, serves="aiter", **knobs):
+        shape = {"rows": 1, "n": 64, "k": 32}
+        cands = {"registry": {**_timed("registry", served_us, serves=serves, **knobs)},
+                 "aiter": _timed("aiter_skinny", served_us + 0.05), "torch": _timed("torch", 30.0),
+                 "triton": _timed("triton_dot", triton_us, block_n=32)}
+        record = {"shape": shape, "candidates": cands, "node_us": node_us}
+        store.write(MI300X, "decode_gemv", shape, torch.bfloat16, record)
+        store.write(MI300X, "decode_gemv_silu_mul", shape, torch.bfloat16, {
+            "shape": shape, "node_us": node_us, "candidates": {
+                "registry": _timed("registry", 20.0, serves="unfused"), "pair": _timed("torch", 20.0),
+                "fused": _timed("triton_dot", 19.5, block_n=8)}})
+        path = decode_gemv.promote(store, MI300X, 0.02, root=tmp_path / "configs")
+        return json.loads(path.read_text())["shapes"]
+
+    # 5% faster but under a node: it stays, as does a gate/up the tree leaves unfused
+    shapes = table_for(4.42, 4.2)
+    assert shapes["k32-n64-rows1"]["impl"] == "aiter"
+    assert shapes["k32-n64-rows1"]["candidates"]["triton"]["block_n"] == 32
+    assert shapes["gated1-k32-n64-rows1"]["impl"] == "unfused"
+    # past the margin and a node, it moves
+    assert table_for(24.0, 20.0)["k32-n64-rows1"]["impl"] == "triton"
+    # kept on the tree's own knobs, not the fastest candidate's, when the two tie
+    entry = table_for(11.0, 10.9, serves="triton", block_n=16)["k32-n64-rows1"]
+    assert entry["impl"] == "triton" and entry["candidates"]["triton"]["block_n"] == 16
