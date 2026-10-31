@@ -75,16 +75,11 @@ from mstar.model.submodule_base import (
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
-def splice_media(
-    embeds: torch.Tensor, ids: torch.Tensor, media: torch.Tensor, pad_ids: Sequence[int],
-) -> torch.Tensor:
-    """``embeds`` with the nth pad (any of ``pad_ids``) of ``ids`` replaced by
-    ``media[n]``. Static shapes and no host sync, so it runs inside a
-    captured forward; see the module docstring for the row contract."""
-    pad = ids == pad_ids[0]
-    for p in pad_ids[1:]:
-        pad = pad | (ids == p)
-    index = (torch.cumsum(pad, 0) - 1).clamp_(min=0)
+def splice_media(embeds: torch.Tensor, pad: torch.Tensor, media: torch.Tensor) -> torch.Tensor:
+    """``embeds`` with the nth token that ``pad`` marks replaced by ``media[n]``
+    (the last row past the end). Static shapes and no host sync, so it runs
+    inside a captured forward; see the module docstring for the row contract."""
+    index = (torch.cumsum(pad, 0) - 1).clamp_(0, media.shape[0] - 1)
     return torch.where(pad[:, None], media[index].to(embeds.dtype), embeds)
 
 
@@ -418,7 +413,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             rows = media.get(e.output)
             # a host shape: an eager step without this medium skips it
             if rows is not None and rows.shape[0]:
-                embeds = splice_media(embeds, input_ids, rows, e.pad_ids)
+                embeds = splice_media(embeds, e.pads(input_ids), rows)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
         if graph_walk != "decode":
             # only the last token of each prefill row feeds the head

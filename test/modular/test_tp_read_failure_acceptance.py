@@ -313,7 +313,7 @@ def _submodule_class():
             for inp in inputs:
                 rows = self.model.model.embed_tokens(inp.input_ids)
                 media = inp.tensor_inputs.get("vision_embeds")
-                embeds.append(rows if media is None else splice_media(rows, inp.input_ids, media, (PAD,)))
+                embeds.append(rows if media is None else splice_media(rows, inp.input_ids == PAD, media))
             return {"embeds": embeds}
 
         def forward(self, graph_walk, engine_inputs, **kwargs):

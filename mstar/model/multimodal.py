@@ -400,6 +400,13 @@ class MediaEncoder:
             # the splice would have no pad to fill
             raise ValueError(f"media encoder {self.node!r} names no pad ids")
 
+    def pads(self, ids: torch.Tensor) -> torch.Tensor:
+        """Which of ``ids`` are this encoder's pads."""
+        pad = ids == self.pad_ids[0]
+        for p in self.pad_ids[1:]:
+            pad = pad | (ids == p)
+        return pad
+
 
 def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
     """The ``vision_encoder`` node every VLM here declares."""

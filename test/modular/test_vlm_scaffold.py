@@ -76,7 +76,7 @@ def test_the_splice_fills_each_pad_with_the_next_media_row(compiled):
     splice = torch.compile(splice_media, fullgraph=True, backend="aot_eager") if compiled else splice_media
     ids = torch.tensor([1, IMAGE_PAD, IMAGE_PAD, 2, VIDEO_PAD, 3])
     media = torch.tensor([[100.0], [101.0], [102.0]])
-    out = splice(ids.float()[:, None], ids, media, (IMAGE_PAD, VIDEO_PAD))
+    out = splice(ids.float()[:, None], (ids == IMAGE_PAD) | (ids == VIDEO_PAD), media)
     assert out[:, 0].tolist() == [1, 100, 101, 2, 102, 3]
 
 
@@ -90,7 +90,7 @@ def test_a_replay_tail_cannot_shift_a_real_row():
     ids = torch.tensor(real + [IMAGE_PAD, IMAGE_PAD, IMAGE_PAD])  # a previous replay's tail
     media = torch.zeros(len(ids), 1)
     media[0] = 100.0
-    out = splice_media(ids.float()[:, None], ids, media, (IMAGE_PAD,))
+    out = splice_media(ids.float()[:, None], ids == IMAGE_PAD, media)
     assert out[:3, 0].tolist() == [5, 100, 6]
 
 
