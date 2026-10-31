@@ -596,6 +596,37 @@ def test_local_work_runs_when_no_lockstep_step_is_ready():
     assert scheduler._lockstep_first(None, {}) is None
 
 
+def _follow_head(scheduler, waiting):
+    """Whether a follower takes the leader's head, with other work ``waiting`` on the worker."""
+    from types import SimpleNamespace
+
+    popped = []
+    scheduler.tp_batches_pending_schedule.append(SimpleNamespace(node_name="dit", graph_walk=WALK))
+    scheduler.has_ready_excluding = lambda request_state, key: waiting
+    scheduler.settle_tp_follow_delta = lambda caught_up: popped.append(True) and False
+    scheduler._try_schedule_tp_follow(None)
+    scheduler.tp_batches_pending_schedule.clear()
+    return bool(popped)
+
+
+def test_a_long_loop_does_not_use_up_a_followers_bound():
+    scheduler = _scheduler(lockstep_first_nodes={"dit"})
+    # twenty steps with nothing else ready, the way a denoise loop runs
+    assert all(_follow_head(scheduler, waiting=False) for _ in range(20))
+    limit = scheduler.LOCKSTEP_FIRST_STEPS
+    # then a decode is ready: the bound starts here
+    assert all(_follow_head(scheduler, waiting=True) for _ in range(limit))
+    assert not _follow_head(scheduler, waiting=True)
+    assert _follow_head(scheduler, waiting=True)
+
+
+def test_a_follower_keeps_its_turn_taking_unless_the_placement_asks():
+    scheduler = _scheduler()
+    scheduler.num_consec_tp_follower_batches = 1
+    assert not _follow_head(scheduler, waiting=True)
+    assert _follow_head(scheduler, waiting=False)
+
+
 def test_no_node_goes_first_unless_the_placement_asks():
     scheduler = _scheduler()
     dit, vae = ("dit", WALK), ("vae_decoder", WALK)
