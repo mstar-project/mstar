@@ -1,3 +1,4 @@
+import functools
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
@@ -106,6 +107,16 @@ def _wrap_node_in_loop(
             )
         return section
     raise TypeError(f"cannot wrap a chunkable node in {type(section).__name__}")
+
+
+def _applying_chunking(build):
+    """A model's own ``get_graph_walk_graphs``, its result passed through
+    ``Model.apply_chunking``."""
+    @functools.wraps(build)
+    def get_graph_walk_graphs(self):
+        return self.apply_chunking(build(self))
+    get_graph_walk_graphs._applies_chunking = True
+    return get_graph_walk_graphs
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -502,6 +513,15 @@ class ForwardPassArgs:
 
 
 class Model(ABC):
+    def __init_subclass__(cls, **kwargs):
+        # A chunkable node runs inside its chunk Loop wherever the walk graphs
+        # are read, so every model's declaration is wrapped here rather than
+        # each model having to call `apply_chunking` itself.
+        super().__init_subclass__(**kwargs)
+        build = cls.__dict__.get("get_graph_walk_graphs")
+        if build is not None and not getattr(build, "_applies_chunking", False):
+            cls.get_graph_walk_graphs = _applying_chunking(build)
+
     # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
     # Retain them locally for postprocessing, but do not send the original
     # values to the conductor alongside their tensor descriptors.
@@ -747,8 +767,7 @@ class Model(ABC):
         A node's prefill for a chunkable walk runs as a Loop, one iteration per
         chunk, so the declaration has to be here rather than on the submodule:
         the graph build reads it to wrap the node. Pass the walk dict through
-        ``apply_chunking`` to do that; a policy whose node was left unwrapped is
-        refused at load.
+        ``get_graph_walk_graphs`` returns them wrapped (``apply_chunking``).
         """
         return {}
 
@@ -793,11 +812,9 @@ class Model(ABC):
         """``get_graph_walk_graphs``'s result with every chunkable node wrapped
         in a Loop, one iteration per chunk.
 
-        Called by the model at the end of its own ``get_graph_walk_graphs``,
-        rather than applied to it from outside, because that method is what
-        declares the graph and ~20 call sites read it directly; a model that
-        declares a chunkable walk and forgets the call is caught at load by
-        ``mstar.validation.placement``.
+        Applied to every model's ``get_graph_walk_graphs`` by ``Model``
+        itself, so a model returns its walks unwrapped. A node already in its
+        chunk Loop (a subclass building on its parent's walks) is left alone.
         """
         for node, policies in self.get_chunking_policies().items():
             for policy in policies:
@@ -805,7 +822,7 @@ class Model(ABC):
                     continue
                 for walk in policy.walks:
                     section = walk_graphs.get(walk)
-                    if section is None:
+                    if section is None or chunk_loop_name(node, walk) in section.get_loops():
                         continue
                     walk_graphs[walk] = _wrap_node_in_loop(section, node, walk, policy)
         return walk_graphs

@@ -171,11 +171,11 @@ class OrpheusModel(Model):
             ],
         )
 
-        return self.apply_chunking(dict(
+        return dict(
             prefill=prefill,
             decode=decode,
             snac_chunk=snac_chunk,
-        ))
+        )
 
     # -------------------------------------------------------------------
     # Partition API: async streaming (LLM + SNAC)

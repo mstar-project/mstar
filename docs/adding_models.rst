@@ -1176,13 +1176,13 @@ Two more methods control batching and CUDA graphs: ``can_batch`` with
 
 **Chunked prefill (optional).** A walk with long prompts can run each across several steps,
 at most a token budget per step, so the decode rows batched beside it keep running. Each
-chunk is one iteration of a Loop around the node. To opt a walk in:
+chunk is one iteration of a Loop around the node, which counts the tokens its chunks ran
+and ends at the prompt's length. To opt a walk in:
 
 - ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
   naming the ``walks`` it covers. It is declared on the model, not the submodule, because
-  the graph build reads it: pass the dict ``get_graph_walk_graphs`` returns through
-  ``self.apply_chunking(...)``, which wraps each chunkable node in its Loop. A chunkable
-  walk whose node is not wrapped is refused at startup. The fields:
+  the graph build reads it: ``Model`` wraps each chunkable node in its Loop wherever
+  ``get_graph_walk_graphs`` is read, so the model returns its walks as usual. The fields:
 
   - ``chunkable=True`` lets the walk's rows be cut.
   - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries

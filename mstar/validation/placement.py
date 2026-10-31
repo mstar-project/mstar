@@ -67,7 +67,6 @@ def check_placement(model: Model, config: Mapping[str, Any]) -> list[str]:
         *_node_group_shapes(model, node_groups),
         *_walk_partitions(model, walk_graphs),
         *_node_placement(walk_graphs, node_groups),
-        *_chunkable_nodes_are_looped(model, walk_graphs),
     ]
 
 
@@ -92,31 +91,6 @@ def check_worker_graphs(
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
     ]
-
-
-def _chunkable_nodes_are_looped(
-    model: Model, walk_graphs: Mapping[str, GraphSection],
-) -> Iterator[str]:
-    """A chunkable ``(node, walk)`` whose graph has no chunk Loop.
-
-    A chunk is an iteration of that Loop, so without it the walk runs the node
-    once and reports the prompt done after its first chunk. The model opts in
-    by passing its walk dict through ``Model.apply_chunking``; forgetting the
-    call is a silent wrong answer, so it is refused at load.
-    """
-    from mstar.model.submodule_base import chunk_loop_name
-
-    for (node, walk), policy in model.chunking_policy_of().items():
-        if not policy.chunkable:
-            continue
-        name = chunk_loop_name(node, walk)
-        loop = walk_graphs[walk].get_loops().get(name)
-        if loop is None or node not in loop.section.get_nodes():
-            yield (
-                f"node {node!r} declares chunkable walk {walk!r}, but that "
-                f"walk's graph has no Loop {name!r} around it; return "
-                "apply_chunking(...) from get_graph_walk_graphs()"
-            )
 
 
 def _describe(wg: WorkerGraph) -> str:

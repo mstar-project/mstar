@@ -376,11 +376,11 @@ class Qwen3_5DenseModel(Model):
             ),
         ])
 
-        return self.apply_chunking(dict(
+        return dict(
             prefill_text=prefill_text,
             prefill_vision=prefill_vision,
             decode=decode,
-        ))
+        )
 
     # ------------------------------------------------------------------
     # Model ABC: I/O

@@ -1245,7 +1245,7 @@ class BagelModel(Model):
         }
         if self._has_cfg_parallel:
             walks["image_gen_cfg"] = image_gen_cfg
-        return self.apply_chunking(walks)
+        return walks
 
     def _build_prefill_schedule(
         self, input_modalities: list[str],

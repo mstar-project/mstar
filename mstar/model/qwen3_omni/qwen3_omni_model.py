@@ -599,7 +599,7 @@ class Qwen3OmniModel(Model):
             ],
         )
 
-        return self.apply_chunking({
+        return {
             "prefill_text": prefill_text,
             "prefill_audio": prefill_audio,
             "prefill_vision": prefill_vision,
@@ -608,7 +608,7 @@ class Qwen3OmniModel(Model):
             "talker_last_prefill": talker_last_prefill,
             "talker_decode": talker_decode,
             "code2wav_chunk": code2wav_chunk,
-        })
+        }
 
     # -----------------------------------------------------------------------
     # Partition API: 3-partition streaming topology
