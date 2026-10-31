@@ -214,6 +214,9 @@ class MicroScheduler:
 
     # Seconds to wait before retrying a held request after OOM
     HOLD_BACKOFF_SECONDS = 0.05
+    # Steps a lockstep-first node may run ahead of other ready work on this worker
+    # before that work gets its turn. About the gap between two requests of a batch.
+    LOCKSTEP_FIRST_STEPS = 8
 
     def __init__(
         self, engine_manager: EngineManager,
@@ -223,8 +226,14 @@ class MicroScheduler:
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         speculation_mixes_walks: Mapping[str, Any] | None = None,
+        lockstep_first_nodes: Collection[str] = (),
     ):
         self.engine_manager = engine_manager
+        # Nodes whose step holds every rank of the instance, so work local to one
+        # rank (a VAE decode) goes after it: the local work only waits, while the
+        # other rank would sit idle in the step's collective.
+        self.lockstep_first_nodes = frozenset(lockstep_first_nodes)
+        self.lockstep_first_steps = 0
         # (node, real walk) -> combined walk; scheduling keys use the combined one
         self.combined_walk_of = combined_walk_of or {}
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -365,6 +374,20 @@ class MicroScheduler:
             ready, default=None,
             key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
         )
+
+    def _lockstep_first(
+        self, picked: tuple[str, str] | None, ready: dict[tuple[str, str], list[ReadyNodeEntry]],
+    ) -> tuple[str, str] | None:
+        """``picked``, or a ready lockstep-first key ahead of it, up to
+        ``LOCKSTEP_FIRST_STEPS`` times running."""
+        if picked is None or picked[0] in self.lockstep_first_nodes:
+            return picked
+        first = next((key for key in ready if key[0] in self.lockstep_first_nodes), None)
+        if first is None or self.lockstep_first_steps >= self.LOCKSTEP_FIRST_STEPS:
+            self.lockstep_first_steps = 0
+            return picked
+        self.lockstep_first_steps += 1
+        return first
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -630,7 +653,10 @@ class MicroScheduler:
         head_key = self._key(first_tp_node.node_name, first_tp_node.graph_walk)
         if exclude_target is not None and head_key == self._key(*exclude_target):
             return
-        if self.num_consec_tp_follower_batches >= self.max_consec_tp_follower_batches and \
+        max_consecutive = self.max_consec_tp_follower_batches
+        if first_tp_node.node_name in self.lockstep_first_nodes:
+            max_consecutive = self.LOCKSTEP_FIRST_STEPS
+        if self.num_consec_tp_follower_batches >= max_consecutive and \
                 self.has_ready_excluding(request_state, head_key):
             return
         # Check readiness for every rid to pop all-or-none. Use the
@@ -831,9 +857,9 @@ class MicroScheduler:
             ready = self._scan_ready(request_state, scan_target, scan_exclude)
         # A walk with no room (a cap of 0) takes nothing, so it stays the least
         # recent; picked anyway, it would starve the walk that frees the room.
-        rr_key = self._select_node_rr({
+        rr_key = self._lockstep_first(self._select_node_rr({
             key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
-        })
+        }), ready)
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
