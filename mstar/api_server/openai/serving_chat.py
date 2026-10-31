@@ -66,8 +66,12 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
 
 
 def _usage(usage: reply.Usage) -> dict:
-    return {"prompt_tokens": usage.prompt, "completion_tokens": usage.completion,
-            "total_tokens": usage.prompt + usage.completion}
+    out = {"prompt_tokens": usage.prompt, "completion_tokens": usage.completion,
+           "total_tokens": usage.prompt + usage.completion}
+    if usage.reasoning:
+        # OpenAI's field for a reasoning model's share; a reply parser counts it
+        out["completion_tokens_details"] = {"reasoning_tokens": usage.reasoning}
+    return out
 
 
 def _text_response(model_name, request_id, events) -> dict:

@@ -889,7 +889,8 @@ def test_chat_reports_usage_and_why_it_stopped(client_and_stub, stop, finish):
     stub.next_chunks = _usage_chunks((b"Plan</think>", 2), (b"Hello", 1), stop=stop)
     body = client.post("/v1/chat/completions", json={
         "model": "glm52", "messages": [{"role": "user", "content": "hi"}]}).json()
-    assert body["usage"] == {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14}
+    assert body["usage"] == {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14,
+                             "completion_tokens_details": {"reasoning_tokens": 2}}
     assert body["choices"][0]["finish_reason"] == finish
 
 
@@ -904,6 +905,7 @@ def test_chat_stream_sends_usage_when_asked(client_and_stub):
     events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
     assert events[-2]["choices"][0]["finish_reason"] == "length"
     assert events[-1]["choices"] == [] and events[-1]["usage"]["completion_tokens"] == 3
+    assert events[-1]["usage"]["completion_tokens_details"] == {"reasoning_tokens": 2}
 
 
 def test_chat_refuses_bad_stream_options_before_running(client_and_stub):
