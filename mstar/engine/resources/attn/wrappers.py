@@ -19,6 +19,8 @@ import logging
 import numpy as np
 import torch
 
+from mstar.platforms import current_platform
+
 logger = logging.getLogger(__name__)
 
 
@@ -413,6 +415,147 @@ class FlashInferDecodeWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
 
 
+class FmhaDecodeWrapper:
+    """Captured decode attention on FlashInfer's trtllm-gen fmha kernel.
+
+    Runs the paged pages as they are (NHD, through strided views) from a block
+    table this wrapper owns, so a replay reads whatever the last plan staged:
+    a capture holds the table's and the lengths' addresses, and its batch size
+    and ``max_seq_len`` pick the kernel. There is no per-step FlashInfer plan.
+    """
+
+    def __init__(
+        self,
+        workspace_buffer: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        batch_size: int,
+        max_seq_len: int,
+        device: torch.device,
+    ):
+        from flashinfer.utils import (
+            _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+            get_device_sm_count,
+        )
+
+        check_flashinfer_head_dim(head_dim, device)
+        self.batch_size = batch_size
+        self.dtype = torch.bfloat16
+        self._workspace = workspace_buffer
+        self._num_kv_heads = num_kv_heads
+        self._page_size = page_size
+        self._scale = head_dim ** -0.5
+        self._window_left = -1
+        # a row's pages sit at [row, 0..], stride the widest row a request can reach
+        self._max_seq_len = -(-max_seq_len // page_size) * page_size
+        width = self._max_seq_len // page_size + 1
+        self._table = torch.zeros((batch_size, width), dtype=torch.int32, device=device)
+        self._lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+        # the kernel resets these itself at the end of every launch
+        self._counters = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, get_device_sm_count(device), device,
+        )
+        on_gpu = device.type == "cuda"
+        self._pinned_table = torch.zeros_like(self._table, device="cpu", pin_memory=on_gpu)
+        self._pinned_lens = torch.ones_like(self._lens, device="cpu", pin_memory=on_gpu)
+        self._table_np = self._pinned_table.numpy()
+        self._lens_np = self._pinned_lens.numpy()
+        self._rows = np.arange(batch_size, dtype=np.int64)
+        # set once the previous plan's copies out of the staging buffers are issued
+        self._done = torch.cuda.Event() if on_gpu else None
+        self._planned = False
+
+    def plan(
+        self,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        dtype: torch.dtype = torch.bfloat16,
+        kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
+        **kwargs,
+    ):
+        n_req = paged_kv_indptr.shape[0] - 1
+        if n_req != self.batch_size:
+            raise ValueError(
+                f"FmhaDecodeWrapper: {n_req} rows planned, captured for {self.batch_size}"
+            )
+        if self._done is not None and self._planned:
+            # this wrapper's previous plan, a step or more back: long since done
+            self._done.synchronize()
+        indptr = paged_kv_indptr.numpy()
+        pages = np.diff(indptr)
+        row = np.repeat(self._rows, pages)
+        self._table_np[row, np.arange(len(row)) - indptr[row]] = paged_kv_indices.numpy()
+        self._lens_np[:] = (
+            np.asarray(kv_lens) if kv_lens is not None
+            else np.maximum(pages - 1, 0) * self._page_size + paged_kv_last_page_len.numpy()
+        )
+        self._table.copy_(self._pinned_table, non_blocking=True)
+        self._lens.copy_(self._pinned_lens, non_blocking=True)
+        if self._done is not None:
+            self._done.record()
+        self._planned = True
+        self.dtype = dtype
+        self._window_left = window_left
+
+    @torch.compiler.disable
+    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+        """``q`` is ``[batch, num_qo_heads, head_dim]``, ``kv_cache_layer``
+        ``[max_pages, 2, page_size, num_kv_heads, head_dim]``."""
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+
+        return trtllm_batch_decode_with_kv_cache(
+            query=q.to(self.dtype),
+            kv_cache=(
+                kv_cache_layer[:, 0].transpose(1, 2),
+                kv_cache_layer[:, 1].transpose(1, 2),
+            ),
+            workspace_buffer=self._workspace,
+            block_tables=self._table,
+            seq_lens=self._lens,
+            max_seq_len=self._max_seq_len,
+            bmm1_scale=self._scale,
+            bmm2_scale=1.0,
+            window_left=self._window_left,
+            out_dtype=self.dtype,
+            multi_ctas_kv_counter_buffer=self._counters,
+        )
+
+    def has_kernel(self, head_dim: int, num_qo_heads: int) -> bool:
+        """One launch over one sink-sized page, on this wrapper's own settings:
+        trtllm-gen ships a kernel per geometry and fetches it at first use, so
+        a missing or unreachable one surfaces here rather than mid-capture."""
+        device = self._table.device
+        q = torch.zeros(
+            (self.batch_size, num_qo_heads, head_dim), dtype=torch.bfloat16, device=device,
+        )
+        page = torch.zeros(
+            (1, 2, self._page_size, self._num_kv_heads, head_dim),
+            dtype=torch.bfloat16, device=device,
+        )
+        try:
+            self.run(q, page)
+        except (RuntimeError, ValueError, AssertionError) as exc:
+            logger.warning(
+                "no trtllm-gen fmha decode kernel for head_dim %d, %d q heads, %d kv "
+                "heads, page %d, batch %d (%s); this bucket keeps the paged decode kernel",
+                head_dim, num_qo_heads, self._num_kv_heads, self._page_size,
+                self.batch_size, str(exc)[:200],
+            )
+            return False
+        return True
+
+
+def fmha_decode_applies(device: torch.device) -> bool:
+    """trtllm-gen's fmha kernels are built for Blackwell's compute capability
+    10.x; everything else keeps the paged decode kernel."""
+    capability = current_platform.cuda_capability(device) if device.type == "cuda" else None
+    return capability is not None and capability[0] == 10
+
+
 class FlashInferMixedWrapper:
     """A step mixing one-token rows (decode) with prompt rows, on two plans.
 
@@ -448,6 +591,7 @@ class FlashInferMixedWrapper:
         device: torch.device,
         backend: str = "auto",
         use_tensor_cores: bool = True,
+        decode_wrapper: "FmhaDecodeWrapper | None" = None,
     ):
         from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -461,8 +605,12 @@ class FlashInferMixedWrapper:
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
             head_dim=head_dim, page_size=page_size, device=device, backend=backend,
         )
-        self._tensor_cores = use_tensor_cores
-        if use_tensor_cores:
+        self._tensor_cores = use_tensor_cores and decode_wrapper is None
+        if decode_wrapper is not None:
+            # every row of the bucket gets a query, the ones outside the run on
+            # the sink page
+            self._decode = decode_wrapper
+        elif use_tensor_cores:
             # The kernel FlashInfer's tensor-core decode runs (FA2 paged
             # prefill), planned with this step's qo_indptr: its KV split budget
             # (2 CTAs per SM over the KV heads) charges each row with a query,

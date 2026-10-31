@@ -596,7 +596,11 @@ The spec types are:
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper and Qwen3-ASR declare ``False``. ``FLASHINFER_MLA`` is
+       Whisper and Qwen3-ASR declare ``False``. ``decode_fmha`` (default ``False``) runs
+       captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
+       with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
+       the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
+       kernels. Qwen3.5 declares ``True``. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
        the softmax scale of the model's original qk head dim, which the other backends
        refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
@@ -1859,7 +1863,7 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``)
+       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
