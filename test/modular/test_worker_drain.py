@@ -1,8 +1,8 @@
 """Worker- and preprocess-worker-side teardown drain.
 
-DRAIN_REQUEST stops scheduling/reading a request and ACKs READS_DONE once its
-in-flight reads finish; the hard cleanup (force_cleanup_request) waits for the
-conductor's REMOVE_REQUEST. No read may start for a draining request.
+DRAIN_REQUEST stops scheduling a request and ACKs READS_DONE once no read for it
+is in flight; no read may start after that. The hard cleanup
+(force_cleanup_request) waits for the conductor's REMOVE_REQUEST.
 """
 
 from types import SimpleNamespace
@@ -11,10 +11,15 @@ import pytest
 import torch
 
 from mstar.communication.tensors import StoredOutputs
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
+from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.topology import CLIENT
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -379,23 +384,95 @@ def test_remove_force_cleans_and_clears_drain_state():
     assert "X" not in w._reads_done_sent
 
 
-def test_process_new_inputs_skips_reads_for_draining_rid():
-    w = _worker(draining=("X",))
-
-    def _boom(*a, **k):
-        raise AssertionError("must not start a read while draining")
-
-    w.tensor_manager.start_read_tensors = _boom
-    # Returns before touching the read path.
-    Worker._process_new_inputs(
-        w, InputSignals(request_id="X", inputs=[], request_info=None)
+def _input(uuid, streaming=True):
+    """An input for request X: a stream item, or a plain one-pass input."""
+    info = TensorPointerInfo(
+        dims=[4], dtype=torch.float32, nbytes=16, address=0, stride=[1], uuid=uuid,
+        source_session_id="s", source_entity="api_server_preprocess_worker",
+    )
+    return InputSignals(
+        request_id="X", partition_name="Ear",
+        inputs=[GraphEdge(next_node="ear", name="audio_in" if streaming else "prompt",
+                          tensor_info=[info], is_streaming=streaming)],
+        request_info=CurrentForwardPassInfo(
+            request_id="X", graph_walk="listen", fwd_index=0, random_seed=0, max_tokens=0,
+        ),
     )
 
 
-def test_add_new_request_skips_draining_rid():
-    w = _worker(draining=("X",))
-    # Bails before touching engine/graph managers (out-of-order NEW after DRAIN).
-    Worker._add_new_request(w, SimpleNamespace(request_id="X"))
+def _input_worker(**kwargs):
+    """A worker whose request X takes ``audio_in`` through a StreamBuffer;
+    ``reads`` gets the uuids of each read it starts."""
+    w = _worker(**kwargs)
+    w.enable_nvtx = False
+    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    w._graph_runtime.set_walk = lambda rid, partition, walk: None
+    w._graph_runtime.get_dynamic_loop_iters = lambda rids, partition: []
+    w.request_state.update_request_info = lambda rid, current_fwd_info, partition_name: None
+    sbuf = StreamBuffer(request_id="X", edge_name="audio_in", from_partition=CLIENT,
+                        policy=FixedChunkPolicy(chunk_size=1))
+    w.request_state.per_request_info["X"].stream_buffers = {"audio_in": sbuf}
+    reads = []
+    w.tensor_manager.start_read_tensors = lambda rid, edges, graph_walk=None: edges and reads.append(
+        [info.uuid for edge in edges for info in edge.tensor_info]
+    ) or []
+    return w, sbuf, reads
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_a_follower_draining_before_its_input_arrives_still_reads_it(streaming):
+    """Rank 0 committed a step on an input, then forwarded the drain; the
+    follower's copy of the input, sent by its producer or the conductor on
+    another FIFO, lands behind the drain. Dropped, the committed step would
+    wait for it for ever, and READS_DONE behind that step."""
+    w, sbuf, reads = _input_worker(is_follower=True, tp_follow=("X",))
+    Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
+    assert not _reads_done(w)  # behind the committed step
+
+    Worker._process_new_inputs(w, _input(1, streaming))
+    assert reads == [[1]] and [tid for tid, _walk in sbuf._tensor_ids_in_order] == ([1] if streaming else [])
+
+    # the step runs on it, READS_DONE goes, and no read starts after it
+    w.scheduler.pending_tp_follow_count.pop("X")
+    Worker._apply_pending_drains(w, set())
+    assert len(_reads_done(w)) == 1
+    Worker._process_new_inputs(w, _input(2, streaming))
+    assert reads == [[1]]
+
+
+def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
+    """A follower gets rank 0's forwarded drain before the conductor's
+    NEW_REQUEST, with a step rank 0 committed on the request. READS_DONE waits
+    for that step, so the NEW_REQUEST is admitted (its handle failed) and the
+    step can run; refused, the step's head would wait for the handle for ever."""
+    known = []
+    w = _worker(known_rids=known, is_follower=True, tp_follow=("X",))
+    w._all_wg_nodes = {}
+    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    w._graph_runtime.add_request = lambda request_id, **kw: known.append(request_id) or request_id
+    w.request_state.add_request = lambda rid, info: w.request_state.per_request_info.update(
+        {rid: SimpleNamespace(stream_buffers={})}
+    )
+    w.engine_manager.add_request = lambda rid, cfgs, info: None
+    w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
+    w.tensor_manager.register_request = lambda rid, cfg: None
+    w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
+
+    Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
+    assert not _reads_done(w)
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    Worker._add_new_request(w, SimpleNamespace(
+        request_id="X", request_info=info, initial_inputs=[],
+        partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
+    ))
+    # failed by the drain check, not by an ingest error
+    assert known == ["X"] and w.failed == {"X"}
+    assert not [m for _e, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
+
+    # the step runs, and READS_DONE goes once
+    w.scheduler.pending_tp_follow_count.pop("X")
+    Worker._apply_pending_drains(w, set())
+    assert len(_reads_done(w)) == 1
 
 
 def test_add_new_request_hands_off_the_handle_not_the_string():
@@ -404,6 +481,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._walk_driven_edges = {}
     w.worker_id = "w0"
     w._draining_rids = set()
+    w._reads_done_sent = set()
     w._unprocessed_messages = {}
     w._last_active = {}
     rids = RidTable()

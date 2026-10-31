@@ -398,7 +398,8 @@ impl InputSignals<'_> {
             }
             w_str(m.key("partition_name"), self.partition_name);
             // A set, which msgpack cannot express; the codec sends a list.
-            // Always empty: only the conductor ever populates it.
+            // Always empty: a worker never sends a stream's end itself (the
+            // conductor does for a partition, the data worker for the client).
             w_arr(m.key("producer_done"), 0);
         });
         out

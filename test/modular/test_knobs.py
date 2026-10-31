@@ -36,3 +36,24 @@ def test_env_then_config_then_default(monkeypatch):
 def test_a_malformed_block_fails_the_startup_check(bad):
     with pytest.raises(ValueError):
         knobs.check(bad)
+
+
+def test_step_thread_core_from_the_config_and_the_environment(monkeypatch):
+    assert knobs.step_thread_core() == "off"
+    # yaml reads a bare off as False
+    for value, expected in ((False, "off"), (True, "auto"), ("auto", "auto"), ("OFF", "off"), (12, 12)):
+        knobs.configure({"step_thread_core": value})
+        assert knobs.step_thread_core() == expected
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "off")
+    assert knobs.step_thread_core() == "off"
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "7")
+    assert knobs.step_thread_core() == 7
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "first")
+    with pytest.raises(ValueError, match="MSTAR_STEP_THREAD_CORE"):
+        knobs.step_thread_core()
+
+
+@pytest.mark.parametrize("value", [-1, "on", "3-4", 1.5])
+def test_a_bad_step_thread_core_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="step_thread_core"):
+        knobs.check({"step_thread_core": value})
