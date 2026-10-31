@@ -124,9 +124,8 @@ def test_expert_loaders_accept_full_and_presliced():
 
 
 def _mtp_fp8_config():
-    """reduced_fp8 with the MTP position landing FULL: 4 trunk layers put
-    layer 4 on the IndexShare grid (offset-1 + freq, the same geometry as
-    the real 78 = 2 + 19·4), and drafting on builds the mtp submodule."""
+    """reduced_fp8 with drafting on and 4 trunk layers, which put the MTP layer on a FULL
+    indexer slot, as layer 78 is."""
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     cfg.num_hidden_layers = 4
     cfg.mtp_num_draft_tokens = 2
@@ -134,10 +133,8 @@ def _mtp_fp8_config():
 
 
 def test_read_plan_includes_mtp_when_enabled():
-    """With drafting on, the plan must keep the layer-78 keys. Dropping them
-    leaves the MTP module reading the uninitialized ``to_empty`` memory it was
-    constructed with, which loads without error and accepts no draft.
-    """
+    """With drafting on the plan keeps the layer-78 keys: without them the MTP module would
+    load empty memory with no error and accept no draft."""
     cfg = _mtp_fp8_config()
     keys = [
         "model.layers.3.self_attn.q_a_proj.weight",
@@ -147,7 +144,7 @@ def test_read_plan_includes_mtp_when_enabled():
         "model.layers.4.mlp.experts.0.up_proj.weight",
         "model.layers.4.mlp.experts.0.up_proj.weight_scale_inv",
     ]
-    # Default stays flag-off: the MTP layer is never read.
+    # without load_mtp the MTP layer is never read
     plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2)
     assert "model.layers.3.self_attn.q_a_proj.weight" in plan_keys
     assert not any(".layers.4." in k for k in plan_keys)
@@ -169,6 +166,15 @@ def test_read_plan_includes_mtp_when_enabled():
     assert specs["model.layers.4.mlp.experts.0.up_proj.weight_scale_inv"] == (
         0, srows, 2 * srows)
     assert "model.layers.4.enorm.weight" not in specs
+
+
+def test_mtp_loads_one_next_token_layer():
+    from mstar.model.glm52.weight_loader import _make_glm52_name_remapper
+
+    remap = _make_glm52_name_remapper(78, load_mtp=True)
+    assert remap("model.layers.78.eh_proj.weight").startswith("mtp.")
+    with pytest.raises(ValueError, match="one next-token layer"):
+        remap("model.layers.79.eh_proj.weight")
 
 
 def test_read_plan_refuses_shards_that_split_a_scale_block():

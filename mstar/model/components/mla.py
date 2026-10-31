@@ -3,8 +3,8 @@
 ``config`` carries the MLA dims: ``hidden_size``, ``num_attention_heads``, ``q_lora_rank``,
 ``kv_lora_rank``, ``qk_nope_head_dim``, ``qk_rope_head_dim``, ``qk_head_dim``, ``v_head_dim``,
 ``padded_head_dim``, ``rms_norm_eps``, ``softmax_scale``, ``mla_absorb`` (the backend), and
-optionally the fp8 block-scale fields ``dense_fp8_block`` reads and ``kernels`` (``reference`` runs
-the fp8 linears dequantized per call and the latent prep op by op). The backends:
+optionally the fp8 fields ``dense_fp8_block`` reads and ``kernels`` (``reference``: the fp8
+linears dequantized and the latent prep op by op). The backends:
 
 * absorbed: once the weights load, ``kv_b_proj`` folds into the query (``w_kc``) and the output
   (``w_vc``), and the two down projections into one GEMM. Attention runs over the cache's compressed
@@ -12,13 +12,13 @@ the fp8 linears dequantized per call and the latent prep op by op). The backends
 * naive: per-head K/V padded to the attention backend's head size, the reduced-dims parity path.
 
 The decoupled RoPE is the position resource's (``pos_key``; the model's ``PositionConfig`` sets
-its layout and table), at the positions the caller passes. With ``mla_use_nope`` (an optional
-``config`` field) there are no decoupled dims (``qk_rope_head_dim`` 0, GLM-5.3), so no rotation and
-no position resource (``pos_key=None``); the cache row's rope slot, ``mla_cache_kpe`` wide (0 or
-the 64 FlashInfer's MLA kernel may need), is zeros, and its query part is ``kpe_query_fill``.
+its layout and table), at the positions the caller passes. ``mla_use_nope`` (optional) drops the
+decoupled dims (``qk_rope_head_dim`` 0) and with them the position resource (``pos_key=None``);
+the cache row's rope slot, ``mla_cache_kpe`` wide (0, or the 64 FlashInfer's MLA kernel may
+need), is zeros, and its query part ``kpe_query_fill``.
 
-``kv_label`` names the cache stream a multi-label model writes and attends this layer under, and
-``cache_layer`` the KV layer, where a model packs its attention layers' planes. A model's sparse
+``kv_label`` names the cache stream this layer writes and attends under, and ``cache_layer`` its
+KV layer, where a model packs its attention planes. A model's sparse
 attention plugs in by overriding ``_select`` and ``_attend_selected`` (absorbed) or ``_attend_naive``
 (naive); the keyword arguments ``forward`` takes beyond its own reach them unchanged.
 """
@@ -126,10 +126,9 @@ class MLAAttention(nn.Module):
         self.softmax_scale_boost = math.sqrt(self.padded_head_dim) * self.softmax_scale
 
         self.mla_absorb = config.mla_absorb
-        # The absorbed path's latent norms, RoPEs and cache write as two kernels (mla_prep.py)
-        # instead of seven, where they run. Each kernel has the bits of the ops it replaces,
-        # but a GLM-5.2 MTP step's cache rows and logits can differ, so the reference keeps
-        # the ops.
+        # the absorbed path's norms, RoPEs and cache write in two kernels (mla_prep.py). Each
+        # has its ops' bits alone, but a captured MTP step writes different bits into each
+        # request's last live cache rows with them, so the reference keeps the ops
         self.mla_fused_prep = (
             not ref and self.mla_absorb and self.use_rope
             and mla_prep.supports(config.q_lora_rank, config.kv_lora_rank, self.qk_rope_head_dim))
@@ -168,8 +167,7 @@ class MLAAttention(nn.Module):
 
     @property
     def cache_layer_idx(self) -> int:
-        """The KV layer this attention writes and reads: ``cache_layer``, else its own index
-        (an MTP module's is past the trunk's, sharing the trunk's page table)."""
+        """The KV layer this attention writes and reads: ``cache_layer``, else its own index."""
         if self._cache_layer is not None:
             return self._cache_layer
         return 0 if self.layer_idx is None else self.layer_idx
@@ -265,9 +263,8 @@ class MLAAttention(nn.Module):
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         """``attn_latent (T, H_local, L)`` through ``w_vc``: ``(T, H_local * Dv)``. Eager, bmm
-        writes ``(T, H, Dv)`` in place of einsum's ``(H, T, Dv)``, so the reshape stays a view
-        (the same bits on H100); compiled, Inductor lays out einsum's, and under autograd (an
-        ``out=`` has no backward) einsum runs too."""
+        writes ``(T, H, Dv)`` in place, so the reshape stays a view (einsum's bits on H100);
+        compiled, or under autograd (``out=`` has no backward), einsum runs."""
         num_tokens, h = attn_latent.shape[:2]
         if torch.compiler.is_compiling() or attn_latent.requires_grad or self.w_vc.requires_grad:
             out = torch.einsum("thl,hdl->thd", attn_latent, self.w_vc)
@@ -350,8 +347,7 @@ class MLAAttention(nn.Module):
         **sparse,
     ) -> torch.Tensor:
         """Norms, RoPE, cache write and attention over the latent, op by op. The
-        post-q_a_layernorm ``q_c`` reaches ``_select`` too: a sparse selection may query from it
-        (GLM-5.x's DSA indexers do)."""
+        post-q_a_layernorm ``q_c`` reaches ``_select`` too: a sparse selection may query from it."""
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
         if self.qk_rope_head_dim == 0:
@@ -437,8 +433,8 @@ class MLAAttention(nn.Module):
     _attends_written = False
 
     def _selects(self, **sparse) -> bool:
-        """Whether this forward may select rows (else the fused prep may serve it, or with
-        ``_attends_written`` either way)."""
+        """Whether this forward may select rows: the fused prep serves only one that doesn't,
+        unless the class sets ``_attends_written``."""
         del sparse
         return False
 

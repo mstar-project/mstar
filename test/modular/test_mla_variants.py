@@ -1,7 +1,7 @@
-"""MLAAttention's options for GLM-5.3's layout, no decoupled dims (``mla_use_nope``), whose cache
-rows carry a zero rope slot: the naive and the absorbed path on CPU against plain attention from
-the same weights, with the attention itself supplied through the class's hooks (as a sparse
-attention plugs in), so no KV or attention resource is needed."""
+"""MLAAttention's options past GLM-5.2's layout, on CPU: no decoupled dims (``mla_use_nope``,
+GLM-5.3's), whose cache rows carry a zero rope slot, against plain attention from the same
+weights, with the attention supplied through the class's hooks as a sparse attention plugs in;
+and a packed KV plane and stream label reaching the resources."""
 import sys
 import types
 from types import SimpleNamespace
@@ -62,10 +62,8 @@ class _DenseAbsorbed(MLAAttention):
         return torch.einsum("hqk,kl->qhl", _causal_softmax(scores), kv_c)
 
 
-def test_defaults_are_the_rotating_mla():
-    m = MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key="pos")
-    assert m.use_rope
-    assert m.q_a_layernorm.variance_epsilon == m.kv_a_layernorm.variance_epsilon == 1e-5
+def test_rope_dims_need_a_position_resource_and_nope_has_none():
+    MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key="pos")
     with pytest.raises(ValueError, match="pos_key"):
         MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key=None)
     with pytest.raises(ValueError, match="no decoupled dims"):

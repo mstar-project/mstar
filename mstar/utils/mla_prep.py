@@ -1,18 +1,16 @@
 """Fused MLA pre-attention for the absorbed path: the latent RMSNorms, both RoPEs and the
 latent's KV-cache write in two kernels, where the unfused path launches seven.
 
-``q_norm`` normalizes the q_a slice of the fused q_a/kv_a projection into the contiguous q_c
-that q_b reads. ``kv_write_q_rope`` runs after q_b: per token, one program normalizes the kv_a
-slice, rotates k_pe and stores the ``[kv_c | k_pe]`` latent straight into its planned cache
-slot, and another rotates every head's q_pe. Both RoPEs read the position resource's fp32
-cos/sin table (``RopeManager.cos_sin_table``) at each token's position.
+``q_norm`` normalizes the q_a slice of the fused q_a/kv_a projection into the q_c that q_b
+reads. ``kv_write_q_rope`` runs after q_b: per token, one program normalizes the kv_a slice,
+rotates k_pe and stores the ``[kv_c | k_pe]`` latent in its planned cache slot, and another
+rotates every head's q_pe, both from the position resource's fp32 cos/sin table
+(``RopeManager.cos_sin_table``).
 
-Both reproduce the unfused path bit for bit. The norms sum their squares in the order of
-FlashInfer's rmsnorm for rows of 256 to 3072 (lane i of 32 accumulates the 8-wide vectors at
-``256 j + 8 i``, then a butterfly across the lanes), and the RoPE rounds as the position
-resource's (FlashInfer's cos/sin-cache kernel) does, ``fma(x, cos, rotate(x) * sin)``. The CPU
-tests' stand-in rounds the two products apart, so against it q_pe / k_pe differ by one bf16
-ulp in ~1e-5 of values.
+Each matches the unfused op bit for bit: the norms sum their squares in FlashInfer rmsnorm's
+order for rows of 256 to 3072 (lane i of 32 accumulates the 8-wide vectors at ``256 j + 8 i``,
+then a butterfly), and the RoPE rounds as FlashInfer's cos/sin-cache kernel does,
+``fma(x, cos, rotate(x) * sin)``.
 """
 from __future__ import annotations
 
@@ -115,7 +113,7 @@ def _kv_write_q_rope_kernel(
         tl.store(q_pe + (t * H + h) * R + d[None, :], y.to(q_pe.dtype.element_ty), mask=live)
 
 
-@torch.library.custom_op("glm52::mla_q_norm", mutates_args=())
+@torch.library.custom_op("mstar::mla_q_norm", mutates_args=())
 def q_norm(fused: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """``rmsnorm(fused[:, :Q])`` as a contiguous ``(T, Q)``, Q = ``weight``'s width: the q_c
     q_b reads, straight from the fused q_a/kv_a projection's rows."""

@@ -15,6 +15,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
+from mstar.engine import with_recompile_limit
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
@@ -490,6 +491,8 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
+        # (node, combined walk) -> the walks whose rows a step of it runs last
+        self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -569,6 +572,7 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
+            self._add_split_row_order(spec, relevant_nodes)
             declared_by[spec.resource_key] = frozenset(spec.nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
@@ -651,16 +655,16 @@ class Engine:
             dynamic = True if item_encoder and not getattr(submodule, "marks_dynamic_dims", False) else None
             try:
                 # no token count, these serve eager batches of any size
-                submodule_mgmt.forward = with_inductor_overrides(torch.compile(
+                submodule_mgmt.forward = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=dynamic,
-                ))
-                submodule_mgmt.forward_batched = with_inductor_overrides(torch.compile(
+                )), submodule)
+                submodule_mgmt.forward_batched = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=dynamic,
-                ))
+                )), submodule)
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(
@@ -2310,6 +2314,33 @@ class Engine:
             graph_walk, {request_id: request_info},
             per_request_input_metadata={request_id: input_metadata},
         )
+
+    def _add_split_row_order(self, spec: NodeResourceSpec, nodes: set[str]) -> None:
+        """Record the row order ``spec``'s split kernels read (``CombinedSplit``)."""
+        for split in spec.combined_splits():
+            last = frozenset(split.prefill_walks)
+            for node in nodes:
+                key = (node, split.combined_walk)
+                if self._split_prompt_walks.setdefault(key, last) != last:
+                    raise ValueError(
+                        f"resource {spec.resource_key!r}: {node!r} splits combined walk "
+                        f"{split.combined_walk!r} with prefill walks {sorted(last)}, "
+                        f"another resource with {sorted(self._split_prompt_walks[key])}"
+                    )
+
+    def order_split_rows(
+        self, node_name: str, graph_walk: str, request_ids: list[int],
+        request_walks: Mapping[int, str],
+    ) -> list[int]:
+        """``request_ids`` as a step of ``graph_walk`` runs them: a walk run on
+        split kernels takes its prefill walks' rows last, in their order."""
+        last = self._split_prompt_walks.get((node_name, graph_walk))
+        if last is None:
+            return request_ids
+        first = [rid for rid in request_ids if request_walks.get(rid) not in last]
+        if len(first) == len(request_ids):
+            return request_ids
+        return first + [rid for rid in request_ids if request_walks.get(rid) in last]
 
     @staticmethod
     def _max_rows_in_combined(

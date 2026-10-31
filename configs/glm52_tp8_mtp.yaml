@@ -1,16 +1,11 @@
 model: "glm52"
 # GLM-5.2 TP8 with MTP speculative decoding (glm52_tp8.yaml plus drafting).
 #
-# mtp_num_draft_tokens=k loads the layer-78 draft module (~9.7B extra
-# params) and makes each decode step draft-then-verify: the target forwards
-# k+1 tokens per request, emits accepted+1 (greedy prefix match against the
-# target's own argmax), takes the rejected KV tail back in place, and the
-# draft module proposes the next k. KV grows by one layer plane, the draft
-# module's own cache sharing the trunk's page table.
-#
-# The routed experts run the fused fp8 kernel (kernels: auto), so a decode
-# step (the draft chain, the trunk verify and the MTP pass) replays as one
-# CUDA graph.
+# mtp_num_draft_tokens=k loads the layer-78 draft module (~9.7B params). A decode
+# step drafts k tokens, verifies them in one trunk pass of k+1 rows per request,
+# emits the accepted drafts and the token after them, and takes the rejected KV
+# rows back. The draft module's KV is one more layer plane on the trunk's page
+# table. Under kernels: auto the whole step replays as one CUDA graph.
 #
 # Limits: greedy only (requests asking for temperature > 0 or a repetition
 # penalty are refused per request), and short context, since MTP and
@@ -27,8 +22,8 @@ model_kwargs:
   # Drafts per step. k=3 was the best of k=2..4 on an 8xH200 node; re-sweep
   # on other hardware.
   mtp_num_draft_tokens: 3
-  # glm52_tp8.yaml's kernels (kernels: auto); MTP's prefill runs every row through the
-  # last layer
+  # glm52_tp8.yaml's buckets, though MTP's prefill runs every row through the last
+  # layer: the MTP pass reads them all
   prefill_token_buckets: [
     64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
     832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
