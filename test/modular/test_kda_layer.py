@@ -14,7 +14,6 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnStep,
     LinearAttnVariant,
 )
-from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import (
     DeltaNetGeometry,
     RecurrentStateConfig,
@@ -57,11 +56,10 @@ def _resources(cfg: KDAConfig):
     ))
     kda_spec = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
         recurrent_state=POOL, variant=LinearAttnVariant.KDA, backend=LinearAttnBackend.TRITON,
-        gate_lower_bound=cfg.gate_lower_bound,
+        gate_lower_bound=cfg.gate_lower_bound, full_rank_output_gate=cfg.full_rank_output_gate,
     ))
     pool = build_resource(pool_spec, EngineResourceInfo(device=CPU))
     kda = build_resource(kda_spec, EngineResourceInfo(device=CPU, dependencies={POOL: pool_spec}))
-    kda.set_kernels(TorchKDAKernels())
     return pool, kda
 
 
