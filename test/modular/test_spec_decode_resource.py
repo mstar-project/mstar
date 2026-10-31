@@ -258,12 +258,13 @@ class Harness:
         targets = self._target(plan, b, positions)
         out = self.spec.accept_tokens(targets)
         drafted = out.target.reshape(-1)
-        verify_positions = positions
+        keep = self.spec.draft_slots()
         for j in range(self.k):
-            self.spec.begin_draft_pass(j)
-            positions = verify_positions + j
-            self._write(plan, drafted, layer=1)
-            drafted = self.spec.record_draft(j, self._draft(plan, b, positions)[self.spec.draft_slots()])
+            where = self.spec.draft_address(j)
+            self._write_flat(where.slots, drafted, layer=1)
+            query = where.positions[keep] if j == 0 else where.positions
+            guess = self._draft(plan, b, query, where.kv_lens)
+            drafted = self.spec.record_draft(j, torch.nn.functional.one_hot(guess, VOCAB).float())
         self.kv.commit(kv_step, ctx)
         self.pool.commit(pool_step, ctx)
         self.spec.commit(spec_step, ctx)
@@ -278,6 +279,12 @@ class Harness:
 
     def _write(self, plan, tokens, layer):
         pages, offsets = plan.write_pages, plan.write_offsets
+        real = pages != SINK_PAGE
+        self.cache[pages[real], offsets[real], layer] = tokens[real]
+
+    def _write_flat(self, slots, tokens, layer):
+        """A draft pass's KV write, one flat slot per token."""
+        pages, offsets = torch.div(slots, PAGE, rounding_mode="floor"), slots % PAGE
         real = pages != SINK_PAGE
         self.cache[pages[real], offsets[real], layer] = tokens[real]
 
@@ -303,22 +310,18 @@ class Harness:
                 out[r * t + i] = EOS if self.stop_at == seen else next_token(ctx_tokens)
         return out
 
-    def _draft(self, plan, b, positions) -> torch.Tensor:
-        """Query i at position q reads the draft layer's keys 0 .. q (the token
-        after each) and guesses the token at q + 2."""
-        t = self.t
-        lens = plan.kv_lens
-        out = torch.zeros(b * t, dtype=torch.long)
+    def _draft(self, plan, b, positions, kv_lens) -> torch.Tensor:
+        """A row's one query, at position q, reads the draft layer's keys 0 ..
+        q (the token after each) and guesses the token at q + 2."""
+        out = torch.zeros(b, dtype=torch.long)
         for r in range(b):
             if not bool(plan.image.real[r]):
                 continue
-            first = self._read(plan, r, 1, layer=0)
-            for i in range(t):
-                seen = int(lens[r]) - t + i + 1
-                q = int(positions[r * t + i])
-                assert seen == q + 1, "a draft query must see its own position and none after"
-                seq = first + self._read(plan, r, seen, layer=1)
-                out[r * t + i] = self._draft_guess(seq, q + 2) if -1 not in seq else 0
+            seen = int(kv_lens[r])
+            q = int(positions[r])
+            assert seen == q + 1, "a draft query must see its own position and none after"
+            seq = self._read(plan, r, 1, layer=0) + self._read(plan, r, seen, layer=1)
+            out[r] = self._draft_guess(seq, q + 2) if -1 not in seq else 0
         return out
 
     def _recurrent(self, wrapper: GDNVerifyWrapper, ids, b):
@@ -547,7 +550,7 @@ def test_sampled_verification_follows_the_target_distribution(params, monkeypatc
     draft = int(p0.argmax())
     first, after = torch.zeros(vocab), torch.zeros(vocab)
     for _ in range(draws):
-        spec._tokens[regs] = torch.tensor([3, draft])
+        spec._tokens[:, regs] = torch.tensor([[3], [draft]])
         spec._seq_len[regs] = 10
         spec.verify_inputs()
         out = spec.accept(logits.repeat(rows, 1), sample=True)

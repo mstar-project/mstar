@@ -102,6 +102,16 @@ class SpecDecodeStep(ResourceStep):
     sampling: Mapping[int, tuple[float, float, int]] = field(default_factory=dict)
 
 
+class DraftAddress(NamedTuple):
+    """Where a draft pass writes and reads, on the device: its tokens' flat KV
+    slots and rotary positions (all k + 1 slots of a row on the first pass,
+    one a row on the others) and the keys each row's one real query reads."""
+
+    slots: torch.Tensor      # [tokens] int64: page * page_size + offset
+    positions: torch.Tensor  # [tokens] int64
+    kv_lens: torch.Tensor    # [rows] int32
+
+
 class AcceptedTokens(NamedTuple):
     """What a verify step hands back, one row per request. A NamedTuple, so a
     compiled forward takes it back from the (uncompiled) resource call as a

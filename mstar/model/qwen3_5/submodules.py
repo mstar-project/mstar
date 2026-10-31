@@ -6,6 +6,7 @@ MRoPE (``components/rope.py``): the position resource is only a per-request
 counter, and the 3D ids are built here and passed in as cos/sin.
 """
 
+import functools
 import logging
 import os
 from collections.abc import Mapping
@@ -176,6 +177,10 @@ class LLMSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         """Decode, text prefill and vision prefill all capture."""
+        if self._speculative:
+            # built here, before any capture, so no replay rebuilds them
+            self.model.model.rope_tables(self.model.model.embed_tokens.weight.dtype)
+
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -220,6 +225,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 single_request_inputs=dummy(self._decode_tokens),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 additional_key_info=key,
+                decode_rows=self._speculative,
             ) for key in decode_keys),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
@@ -722,33 +728,27 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _verify(self, engine_inputs: ModelInputsFromEngine):
         """A speculative decode step: verify each row's k drafts, then draft
-        the next k with the MTP head, every pass over the same (rows, k + 1)
-        tokens (see `SpecDecodeResource`)."""
+        the next k with the MTP head (see `SpecDecodeResource`)."""
         spec = engine_inputs.resources[SPEC_DECODE]
         lm, head = self.model.model, self.model.lm_head
-        k = self.num_draft_tokens
         ids, positions = spec.verify_inputs()
-        # draft pass j sits at the verify positions plus j: one table for all
-        shifts = torch.arange(k, dtype=positions.dtype, device=positions.device)
-        cos, sin = self._cos_sin_1d((positions[None, :] + shifts[:, None]).reshape(-1))
-        cos, sin = cos.view(k, positions.shape[0], -1), sin.view(k, positions.shape[0], -1)
-        hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=(cos[0], sin[0]))
+        hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=self._cos_sin_1d(positions))
         step = engine_inputs.step
         accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
         ids = accepted.target.reshape(-1)
-        rows = positions.shape[0] // (k + 1)
-        for j in range(k):
-            spec.begin_draft_pass(j)
-            # only each row's last accepted slot is a real query: the head's
-            # work after attention, and the lm_head, run on that row alone, and
-            # the next pass reads its output in every slot
-            out = self.model.mtp(
-                hidden, lm.embed_tokens(ids), label="main", cos_sin=(cos[j], sin[j]),
-                keep=spec.draft_slots(),
-            )
-            ids = spec.record_draft(j, head(out).argmax(dim=-1))
-            hidden = out[:, None, :].expand(rows, k + 1, out.shape[-1]).reshape(rows * (k + 1), -1)
+        keep = spec.draft_slots()
+        for j in range(self.num_draft_tokens):
+            attend = functools.partial(self._attend_draft, spec, j)
+            out = self.model.mtp.draft(hidden, lm.embed_tokens(ids), attend, keep=keep if j == 0 else None)
+            ids = spec.record_draft(j, head(out))
+            hidden = out
         return accepted
+
+    def _attend_draft(self, spec, j: int, qkv, q_weight, k_weight, *layout) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft pass ``j``'s attention, from the MTP layer's packed projection."""
+        lm = self.model.model
+        cos, sin = lm.rope_tables(lm.embed_tokens.weight.dtype)
+        return spec.attend_draft(j, qkv, q_weight, k_weight, cos, sin, *layout, self.model.mtp.kv_layer_idx)
 
     def forward(
         self,
