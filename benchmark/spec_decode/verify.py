@@ -16,6 +16,7 @@ import torch
 class SamplingParams:
     temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
 
     @property
     def greedy(self) -> bool:
@@ -28,11 +29,16 @@ def sampling_probs(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor
     if params.greedy:
         return torch.nn.functional.one_hot(logits.argmax(-1), logits.shape[-1]).to(torch.float32)
     probs = torch.softmax(logits / params.temperature, dim=-1)
-    if params.top_p < 1.0:
+    if params.top_k > 0 or params.top_p < 1.0:
         sorted_probs, order = probs.sort(dim=-1, descending=True)
-        cumulative = sorted_probs.cumsum(-1)
-        # Keep the smallest prefix whose mass reaches top_p, including the token that crosses it.
-        sorted_probs = sorted_probs.masked_fill(cumulative - sorted_probs > params.top_p, 0.0)
+        if params.top_k > 0:
+            sorted_probs[..., params.top_k:] = 0.0
+            sorted_probs = sorted_probs / sorted_probs.sum(-1, keepdim=True)
+        if params.top_p < 1.0:
+            cumulative = sorted_probs.cumsum(-1)
+            # Keep the smallest prefix whose mass reaches top_p, including the token that crosses it. Top-k first
+            # and top-p over what is left, renormalised: the order the serving sampler applies them in.
+            sorted_probs = sorted_probs.masked_fill(cumulative - sorted_probs >= params.top_p, 0.0)
         probs = torch.zeros_like(probs).scatter_(-1, order, sorted_probs)
         probs = probs / probs.sum(-1, keepdim=True)
     return probs
