@@ -254,19 +254,8 @@ def _split(a, b):
 @pytest.fixture(scope="module")
 def greedy():
     eng = _Engine(k=0)
-    out = {n: eng.generate(_prompts(lengths), captured_decode=True)[0]
-           for n, lengths in LENGTHS.items()}
-    # the control: request r0 of "two" decoded alone, without MTP
-    alone = eng.generate({"r0": _prompts(LENGTHS["two"])["r0"]}, captured_decode=True)[0]
-    out["two_r0_alone"] = alone["r0"]
-    return out
-
-
-def test_greedy_alone_vs_batched_control(greedy):
-    """Without MTP, the same prompt decoded alone and next to another request: where this
-    splits, bf16 near-ties decide, not MTP. Reported, not asserted."""
-    print("k=0 r0 alone vs batched: first split",
-          _split(greedy["two_r0_alone"], greedy["two"]["r0"]))
+    return {n: eng.generate(_prompts(lengths), captured_decode=True)[0]
+            for n, lengths in LENGTHS.items()}
 
 
 @pytest.mark.parametrize("k", [1, 3])
@@ -281,21 +270,17 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
     # capture must not change a single token
     assert graph == eager, ("graph", graph, "eager", eager)
     assert steps_g == steps_e
-    # The trunk sees k + 1 rows per request under MTP, one without (other GEMM shapes), and
-    # the cache keeps masked holes (other KV splits: FlashInfer MLA moves by <= 1 bf16 ulp),
-    # so a near-tie in this random model can flip a token after a few steps. The fp32 CPU
-    # test pins exact equality. A broken verify step splits at once.
+    # MTP changes the trunk's GEMM shapes and the cache's KV splits (its holes move FlashInfer
+    # MLA by <= 1 bf16 ulp), so a near-tie in this random model can flip a token after a few
+    # steps; a broken verify step splits at once. The fp32 CPU test pins exact equality.
     for rid in eager:
         split = _split(eager[rid], greedy[batch][rid])
-        print(f"k={k} {batch} {rid}: MTP vs greedy first split {split}")
         assert split is None or split >= 4, (rid, split, eager[rid], greedy[batch][rid])
-    # The captured prefill too (the MTP pass over the prompt inside the graph). A padded
-    # bucket moves the prefill GEMMs' rounding (test_glm5next_prefill_graph), so the same
-    # rule as against greedy.
+    # the captured prefill too, with its MTP pass; a padded bucket moves the prefill GEMMs'
+    # rounding, so the same rule
     full, _ = eng.generate(_prompts(lengths), captured_decode=True, captured_prefill=True)
     for rid in eager:
         split = _split(full[rid], eager[rid])
-        print(f"k={k} {batch} {rid}: fully captured vs eager first split {split}")
         assert split is None or split >= 4, (rid, split, full[rid], eager[rid])
     # TP async's order: each decode step planned before its prepare_inputs, which a verify
     # step allows because nothing it plans waits on the last verdict.
@@ -410,6 +395,4 @@ def test_holes_move_flashinfer_mla_by_at_most_one_bf16_ulp():
     # one bf16 ulp of each (query, head) row's largest output
     ulp = torch.exp2(torch.floor(torch.log2(base.abs().amax(-1, keepdim=True))) - 7)
     diff = (holes - base).abs()
-    print(f"holes vs none: max |diff| {diff.max().item():.3e}, "
-          f"{(diff > 0).float().mean().item():.4f} of outputs moved")
     assert (diff <= ulp).all(), (diff / ulp).max()

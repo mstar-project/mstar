@@ -1,4 +1,6 @@
-"""glm5_next small-batch MoE decode kernels (moe_decode) vs an fp32 oracle on CUDA."""
+"""GLM-5.3's MoE block on the fused kernels, on CUDA: the decode kernels with the SwiGLU clamp
+against an fp32 oracle, the router's fused paths against its reference, and large batches on
+the runner. The shared kernels' own tests are in test_glm52_moe_decode.py."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -116,59 +118,6 @@ def test_decode_matches_oracle(tokens, limit, fp32_matmul):
     assert _rel_err(got, ref) <= _rel_err(old, ref)
 
 
-@pytest.mark.parametrize("tokens", [5, 20])
-def test_odd_expert_count_and_top_k(tokens, fp32_matmul):
-    block = _block(experts=7, top_k=3, hidden=512, inter=128)
-    x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
-    topk_ids = torch.stack([torch.randperm(7, device="cuda")[:3] for _ in range(tokens)])
-    topk_w = torch.rand(tokens, 3, device="cuda")
-    with torch.no_grad():
-        got = block._dispatch_decode(x, topk_w, topk_ids)
-        ref = _oracle(block, x, topk_w, topk_ids) + _shared_oracle(block, x)
-    _assert_near_oracle(got, ref)
-
-
-@pytest.mark.parametrize("tokens", [24, 64])
-@pytest.mark.parametrize("skew", ["same8", "zipf"])
-def test_grouped_skewed_routing(tokens, skew, fp32_matmul):
-    # Real routing concentrates: an expert can hold every token, i.e. several row tiles.
-    block = _block()
-    x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
-    if skew == "same8":
-        topk_ids = torch.arange(8, device="cuda").expand(tokens, 8)
-    else:
-        p = 1.0 / torch.arange(1, 33, device="cuda", dtype=torch.float32)
-        topk_ids = torch.multinomial(p.expand(tokens, 32), 8)
-    topk_w = torch.rand(tokens, 8, device="cuda")
-    with torch.no_grad():
-        got = block._dispatch_decode(x, topk_w, topk_ids)
-        ref = _oracle(block, x, topk_w, topk_ids) + _shared_oracle(block, x)
-        old = _runner(block, x, topk_w, topk_ids) + block.shared_expert(x)
-    _assert_near_oracle(got, ref)
-    assert _rel_err(got, ref) <= _rel_err(old, ref)
-
-
-@pytest.mark.parametrize("tokens", [11, 64])
-def test_grouped_x_row_scales(tokens, fp32_matmul):
-    # The grouped gate/up meets x as two e4m3 terms under one power-of-two scale per row:
-    # rows four decades apart, a zero row and a row with one large outlier must each stay
-    # within the oracle bound.
-    block = _block()
-    x = torch.randn(tokens, block.hidden_size, device="cuda")
-    x *= torch.logspace(-2, 2, tokens, device="cuda")[:, None]
-    x[1] = 0.0
-    x[2, 7] = 3.0e4
-    x = x.to(torch.bfloat16)
-    with torch.no_grad():
-        topk_w, topk_ids = block.gate(x)
-        got = block._dispatch_decode(x, topk_w, topk_ids).float()
-        ref = _oracle(block, x, topk_w, topk_ids) + _shared_oracle(block, x)
-    assert torch.equal(got[1], torch.zeros_like(got[1]))
-    rows = [r for r in range(tokens) if r != 1]
-    err = (got[rows] - ref[rows]).abs().amax(1) / ref[rows].abs().amax(1)
-    assert float(err.max()) < 5e-3
-
-
 def _gate(experts=288, top_k=8, hidden=4096, dtype=torch.bfloat16, seed=1):
     torch.manual_seed(seed)
     gate = Glm5NextMoEGate(hidden, experts, top_k, routed_scaling_factor=2.5).cuda()
@@ -187,28 +136,33 @@ def _assert_same_routing(gate, x, monkeypatch):
         w_r, ids_r = gate(x)
         monkeypatch.setattr(fused_decode, "_ENABLED", True)
     assert w.dtype == torch.float32 and ids.dtype == torch.int64
-    # Same experts per token (the reference's topk order is unspecified); ties would go to
-    # the lower expert id, and the random scores here have none.
+    # the same experts per token (the reference's topk order is unspecified); ties would go
+    # to the lower expert id, and the random scores here have none
     ids, order = ids.sort(dim=-1)
     ids_r, order_r = ids_r.sort(dim=-1)
     torch.testing.assert_close(ids, ids_r, rtol=0, atol=0)
     torch.testing.assert_close(w.gather(1, order), w_r.gather(1, order_r), rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("tokens", [1, 2, 3, 5, 8, 16, 32, 64])
-def test_decode_router_matches_reference(tokens, monkeypatch, fp32_matmul):
-    gate = _gate()
-    for seed in range(3):
-        torch.manual_seed(seed)
-        x = torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16)
-        _assert_same_routing(gate, x, monkeypatch)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_decode_router_fp32_operands_and_odd_sizes(dtype, monkeypatch, fp32_matmul):
-    gate = _gate(experts=7, top_k=3, hidden=512, dtype=dtype)
-    x = torch.randn(5, 512, device="cuda", dtype=dtype)
+@pytest.mark.parametrize("tokens", [1, 5, 33, 64, 65, 300, 1036])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
+def test_router_matches_reference(tokens, weight_dtype, monkeypatch, fp32_matmul):
+    """Each fused path of the gate (the decode kernel up to _DECODE_MAX_TOKENS rows, then a
+    bf16 or fp32 GEMM into router_topk) picks the reference's experts with its weights."""
+    gate = _gate(dtype=weight_dtype)
+    torch.manual_seed(tokens)
+    x = torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16)
     _assert_same_routing(gate, x, monkeypatch)
+
+
+def test_a_nan_router_row_picks_experts_in_range():
+    logits = torch.randn(4, 16, device="cuda")
+    logits[1] = float("nan")
+    _, ids = fused_decode.router_topk(logits, torch.zeros(16, device="cuda"), top_k=4, scale=1.0,
+                                      normalize=True)
+    assert int(ids.max()) < 16 and int(ids.min()) >= 0
+    ref = torch.topk(torch.sigmoid(logits[0]), 4).indices.sort().values
+    assert torch.equal(ids[0].sort().values, ref)
 
 
 def test_large_batch_and_disabled_use_the_runner(monkeypatch):
@@ -221,25 +175,3 @@ def test_large_batch_and_disabled_use_the_runner(monkeypatch):
             topk_w, topk_ids = block.gate(x)
             old = _runner(block, x, topk_w, topk_ids) + block.shared_expert(x)
         torch.testing.assert_close(got, old, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("tokens", [1, 4, 10, 11, 32, 64])
-def test_graph_replay_matches_unchained_path(tokens):
-    # The captured forward runs the PDL chain; route + experts launch without it. Fresh
-    # inputs every replay, so a kernel reading its predecessor's output early shows up.
-    block = _block()
-    x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            block(x)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = block(x)
-        for _ in range(20):
-            x.copy_(torch.randn_like(x))
-            graph.replay()
-            ref = block._dispatch_decode(x, *block.gate(x))
-            torch.testing.assert_close(out, ref, rtol=0, atol=0)

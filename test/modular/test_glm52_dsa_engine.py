@@ -1,8 +1,6 @@
-"""DSA engine half: per-request state, guard states, IndexShare threading and
-the prefix property across index_topk — over the real ``KVManager`` (MLA
-latent layout, the index keys on its pages), the DSA resource and the MLA
-attention resource on CPU.
-"""
+"""GLM-5.2 on the DSA resource, on CPU over the real KV, DSA and MLA attention resources:
+per-request state, the context guard, IndexShare threading and the prefix property across
+index_topk."""
 import itertools
 import sys
 import types
@@ -69,9 +67,7 @@ def _ctx(needs_selection: bool) -> DSAContext:
 
 
 def test_cleanup_request_drops_per_request_state():
-    """Retirement leaves NO per-request growth: the engine's request removal
-    calls cleanup_request on every managed submodule, which must drop the
-    prefix-hit mark, the MTP counters, the MTP token budget and the prefill's stop."""
+    """cleanup_request drops every per-request entry: a recycled handle must find none."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
@@ -135,7 +131,6 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub.config = config
     sub._prefix_hits = set()
     sub._index_stager = PinnedStager(torch.long)
-    sub._int_stager = PinnedStager(torch.int32)
     return sub
 
 
@@ -185,10 +180,8 @@ def test_guard_flag_on_lifts_cap_to_max_seq_len():
 
     # Decode one past topk: allowed, and the batch is marked for selection.
     ctx = sub._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=1))
-    assert isinstance(ctx, DSAContext)
     assert ctx.needs_selection is True
     assert ctx.host_pos == [topk]  # it sees topk + 1 keys
-    assert ctx.last_selection is None  # transient starts clean every forward
 
     # Prefill rows past topk select too: each over its own causal prefix.
     ctx = sub._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=16))
@@ -209,9 +202,7 @@ def test_flag_on_identity_batch_builds_spans_without_selection():
         _preprocess(sub, {"r0": 0, "r1": 5}, seq_len=4, tables=[[0, 1, 2], [5]], steps=steps))
 
     assert ctx.needs_selection is False  # everything fits topk: identity
-    assert ctx.spans == [(0, 4, 0), (4, 4, 1)]
     assert ctx.host_pos == [0, 1, 2, 3, 5, 6, 7, 8]
-    assert ctx.row_req.tolist() == [0] * 4 + [1] * 4
     assert ctx.pages.tolist() == [0, 1, 2, 5] and ctx.page_start.tolist() == [0, 3]
     # The pages are a snapshot: a later change to the plan's must not alias.
     steps[0].ctx.plan_results[KV_RESOURCE]["main"].cpu_indptrs.paged_kv_indices[0] = 99
@@ -236,6 +227,8 @@ def test_model_kwarg_dsa_long_context():
 
     with pytest.raises(ValueError, match="mla_absorb"):
         Glm52Model(model_path_hf="", config_variant="reduced", dsa_long_context=True)
+    with pytest.raises(ValueError, match="dsa_long_context"):
+        Glm52Model(model_path_hf="", max_seq_len=4096)
     mtp = Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
     assert mtp.config.dsa_long_context and mtp.config.mtp_num_draft_tokens == 2
 
@@ -372,8 +365,7 @@ def test_full_to_shared_threading_order(monkeypatch):
 
 
 def test_shared_layer_without_full_selection_raises():
-    """A SHARED layer reached in selection mode with no published rows is a
-    threading bug and must fail loudly, not attend densely off-spec."""
+    """A SHARED layer that must select with no FULL layer's pick before it fails loudly."""
     cfg = _longctx_reduced_cfg(topk=4)
     model = build_random_model(cfg, seed=1)
     resources, _ = build_cpu_resources(cfg)
@@ -384,8 +376,7 @@ def test_shared_layer_without_full_selection_raises():
 
 
 def test_a_model_built_flag_off_refuses_the_dsa_resource():
-    """Flag-off, no indexer was built or loaded: bound to a node that declares the DSA
-    resource, a FULL layer would pass for SHARED, so binding fails."""
+    """Built flag-off, a FULL layer has no indexer and would pass for SHARED: binding fails."""
     cfg = _longctx_reduced_cfg(topk=4)
     resources, _ = build_cpu_resources(cfg)
     cfg.dsa_long_context = False

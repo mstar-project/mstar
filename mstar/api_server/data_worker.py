@@ -189,8 +189,8 @@ def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
 
 
 def _text_usage(tokens: torch.Tensor, stop_ids, prompt_tokens: int | None) -> dict:
-    """A text chunk's share of the API's usage: its token count, the prompt's,
-    and whether it ends on a stop token (the last chunk's says why the reply ended)."""
+    """A text chunk's usage metadata: its token count, the prompt's, and whether
+    its last token is a stop id."""
     usage = {"tokens": tokens.numel()}
     if prompt_tokens is not None:
         usage["prompt_tokens"] = prompt_tokens
@@ -1238,9 +1238,8 @@ class PreprocessWorkerThread:
 
     @cached_property
     def _text_stop_ids(self) -> Container[int] | None:
-        """The ids that end a text reply, as the model's ``text_output`` declares
-        them, read on the first text chunk. None for a model that names none,
-        whose replies are all reported as stopped."""
+        """The stop ids the model's ``text_output`` declares, read on the first
+        text chunk; None when it names none."""
         text = self.model.text_output() if self.model is not None else None
         return (text.stop_token_ids or None) if text is not None else None
 

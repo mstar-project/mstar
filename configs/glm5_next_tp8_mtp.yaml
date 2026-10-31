@@ -1,45 +1,27 @@
 model: "glm5_next"
-# GLM-5.3-Flash with MTP speculative decoding (k=3); otherwise glm5_next_tp8.yaml.
-# GLM-5.3-Flash on 8 GPUs of 80 GB. The fp8 checkpoint is 306 GB, so weights
-# are ~38 GB/rank at TP8; the KV and KDA budgets below leave headroom for
-# activations, graphs and NCCL. Resolve the checkpoint through the HF cache
-# (HF_HOME) or pass model_kwargs.checkpoint_path.
+# glm5_next_tp8.yaml with MTP speculative decoding, k=3; its comments cover the
+# keys the two share.
 max_seq_len: 2048
-# One request per KDA slot below: past them a prefill waits in the worker
-# for a slot, and its wait broke the decode speculation chain every step.
 max_concurrent_requests: 64
-# FlashInfer's one-kernel all-reduce: 3.7-5.9 us a decode call on 8x H200,
-# against symm_multimem's 5.8-9.6 (slower above 2 MB, at prefill sizes).
 tp_allreduce: "flashinfer"
-# Prefill's all-reduces too: a 4096-token bucket moves 32 MiB per call.
 tp_allreduce_max_kb: 32768
 tp_async_sched: true
 model_kwargs:
-  # "auto" takes the fused fp8 MoE kernel when one is available, which is
-  # what lets decode capture; "reference" is an eager, uncapturable fallback.
   moe_quant_kernel: "auto"
-  # Drafts per step from the layer-45 MTP module. Greedy requests only: a
-  # temperature > 0 or a repetition penalty is refused.
+  # drafts per step from the layer-45 MTP module; a request with a temperature
+  # > 0 or a repetition penalty is refused
   mtp_num_draft_tokens: 3
-  # Capture the prefill per (rows, token bucket); an uncaptured shape runs
-  # eager. Adds ~40 s of capture at startup.
   prefill_graphs: true
-# Per-resource overrides, keyed by what get_node_resources declares.
 resources:
   kv_cache:
-    # The 11 MLA layers and the MTP layer are paged, one 576-wide latent
-    # (512 + the rope slot that masks rejected drafts) per token per layer:
-    # ~13.8 KB/token/rank. A request holds up to 8192 rows (2048 tokens plus
-    # up to 3 rejected drafts each), so 4096 pages x 128 = 64 of them, plus
-    # the sink page, ~7.2 GB/rank. Sized to the slot pool below, which is the
-    # real concurrency limit.
+    # The 11 MLA layers and the MTP layer are paged, a 576-wide latent each (512
+    # + the rope slot that masks rejected drafts): ~13.8 KB/token. Every verify
+    # step keeps its rejected drafts, so a request holds up to 2048 x 4 = 8192
+    # rows; 4096 pages x 128 hold one per KDA slot, plus the sink page: ~7.2 GB/rank.
     max_num_pages: 4097
     page_size: 128
   kda_state:
-    # One slot per in-flight request plus the pool's sink, head-sharded
-    # across TP like the KDA layers: ~22 MB/slot/rank with the last verify
-    # block's inputs, ~1.4 GB/rank here. The 64 real slots are also the
-    # decode batch cap, since the captured buckets are bounded by them.
+    # as in glm5_next_tp8.yaml, at ~22 MB/slot/rank with the last verify block's inputs
     max_slots: 65
 node_groups:
   - node_names: [LLM]

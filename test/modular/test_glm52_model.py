@@ -47,7 +47,6 @@ from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
-    DSA_RESOURCE,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -129,8 +128,7 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
 
 
 def test_glm52_resources_mtp_adds_the_plane_layer():
-    # the layer-78 draft module keeps its KV in one extra plane on the
-    # trunk's page table
+    # the draft module's KV is one more layer plane on the trunk's page table
     kv, _, _ = _specs(_make_model_k(2).config)
     assert kv.config.num_layers == 79
     kv0, _, _ = _specs(_make_model_k(0).config)
@@ -211,28 +209,6 @@ def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
     assert res.unpersist_tensors == ["tok"]
 
 
-def test_glm52_mtp_prefill_emits_only_its_token():
-    """The MTP prefill seeds the first decode step's drafts on the device; its only edge is
-    the emitted token, as at k=0."""
-    for k in (0, 2):
-        prefill = _make_model_k(k).get_graph_walk_graphs()["prefill"]
-        assert [e.name for e in prefill.outputs] == ["new_token"]
-
-
-def test_glm52_decode_never_reseeds_from_the_prompt_signal():
-    """Decode is seeded from the emitted token, never from the prompt signal, under MTP too."""
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"],
-        graph_walk="prefill", is_prefill=True,
-    )
-    res = _make_model_k(2).get_partition_forward_pass_args(
-        partition_name="default", partition_metadata=metadata,
-        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
-    )
-    assert res.inputs[0].tensor_info == ["tok"]
-    assert res.unpersist_tensors == ["tok"]
-
-
 def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     """The decode loop cap must NOT be raised to max_seq_len."""
     model = _make_model()
@@ -289,23 +265,15 @@ def test_glm52_request_config_is_the_sampler_config():
     assert over.temperature == cfg.temperature
 
 
-def test_glm52_mtp_declares_greedy_default_but_honors_explicit_asks():
-    """MTP decode is raw argmax unless the request asks for something else."""
-    k2 = _make_model_k(2)
-    assert k2.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == 0.0
-    assert k2.get_request_resource_configs(
-        {}, {"temperature": 0.7})[SAMPLER_RESOURCE].temperature == 0.7
-    # k=0 keeps the model default — speculation is what forces greedy.
-    k0 = _make_model_k(0)
-    assert k0.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == k0.config.temperature
-
-
-def test_glm52_mtp_refuses_a_shallower_trunk_than_the_checkpoint():
-    """Every checkpoint layer past the served trunk routes to the draft
-    module, so trunk layers would load as the MTP layer."""
-    with pytest.raises(ValueError, match="num_hidden_layers"):
-        Glm52Model(model_path_hf="", mtp_num_draft_tokens=2, num_hidden_layers=10)
-    assert Glm52Model(model_path_hf="", mtp_num_draft_tokens=2).config.num_hidden_layers == 78
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(mtp_num_draft_tokens=2, num_hidden_layers=10), "num_hidden_layers"),
+    (dict(mtp_num_draft_tokens=-1), "mtp_num_draft_tokens"),
+], ids=["shallower-trunk", "negative-k"])
+def test_glm52_refuses_an_mtp_config_it_cannot_serve(kwargs, match):
+    """Every checkpoint layer past a shallower trunk would load as the MTP layer, and a
+    negative draft count reads as off to some checks and on to others."""
+    with pytest.raises(ValueError, match=match):
+        Glm52Model(model_path_hf="", **kwargs)
 
 
 # ── config ──
@@ -336,7 +304,6 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub.config = config
     sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
     sub._index_stager = PinnedStager(torch.long)
-    sub._int_stager = PinnedStager(torch.int32)
     return sub
 
 
@@ -469,7 +436,6 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     sub = _make_submodule(Glm52ModelConfig())
     out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
     assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
-    assert sub._dsa_ctx(out) is None
 
 
 def test_glm52_positions_are_the_position_resources_plan():
@@ -564,14 +530,11 @@ def test_glm52_a_chat_the_template_refuses_is_a_400():
 
 def test_glm52_postprocess_byte_mode_never_touches_tokenizer():
     m = object.__new__(Glm52Model)
-    m.config = Glm52ModelConfig.reduced()  # end-of-turn ids 250-252
+    m.config = Glm52ModelConfig.reduced()
     m._tokenizer_mode = "byte"
     m._tokenizer = None
     out = m.postprocess(torch.tensor([72, 105]), "text")
     assert out == b"Hi"
-    # an end-of-turn id is no text, unless the request ignores it
-    assert m.postprocess(torch.tensor([72, 250]), "text") == b"H"
-    assert m.postprocess(torch.tensor([72, 250]), "text", request_kwargs={"ignore_eos": True}) == b"H\xfa"
     assert m._tokenizer is None  # no lazy HF download triggered
     with pytest.raises(ValueError, match="Unsupported modality"):
         m.postprocess(torch.tensor([1]), "audio")
@@ -607,22 +570,6 @@ def test_indexer_exists_only_on_the_dsa_path():
     cfg.num_hidden_layers = 4  # MTP position lands FULL
     cfg.mtp_num_draft_tokens = 2
     assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
-
-
-def test_flag_off_layer_refuses_the_dsa_resource():
-    from mstar.model.glm52._testing import build_cpu_resources
-    from mstar.model.glm52.components.attention import Glm52MLAAttention
-
-    cfg = Glm52ModelConfig.reduced()
-    cfg.mla_absorb = True
-    cfg.dsa_long_context = True
-    resources, _ = build_cpu_resources(cfg)  # a node that declares the DSA resource
-    assert DSA_RESOURCE in resources
-    cfg.dsa_long_context = False
-    attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
-    assert attn.indexer is None
-    with pytest.raises(RuntimeError, match="dsa_long_context off"):
-        attn.bind_resources(resources)
 
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():

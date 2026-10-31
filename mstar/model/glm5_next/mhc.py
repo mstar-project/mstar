@@ -11,16 +11,11 @@ from mstar.model.glm5_next.sinkhorn_kernel import (
     sinkhorn_normalize_fused,
 )
 
-# GLM-5.3-Flash checkpoint constants (config.json). Layers 0-44 carry mHC
-# params; the MTP layer 45 is plain-residual and never touches this file.
+# GLM-5.3-Flash's config.json values; the MTP layer has no mHC
 GLM5_NEXT_HC_MULT = 4
 GLM5_NEXT_HC_EPS = 1e-6
 GLM5_NEXT_HC_SINKHORN_ITERS = 20
 GLM5_NEXT_RMS_NORM_EPS = 1e-5
-
-# Collapse the mHC Sinkhorn iterations into one CUDA launch. Set =0 to force the
-# pure-torch reference (also the CPU path). sinkhorn_kernel guards its own triton
-# import, so this module still imports where triton is absent.
 
 
 class UnweightedRMSNorm(nn.Module):
@@ -76,10 +71,8 @@ class Glm5NextHyperConnection(nn.Module):
         self.base = nn.Parameter(torch.empty(mix))
         # One learned scale per mapping output: pre, post, comb.
         self.scale = nn.Parameter(torch.empty(3))
-        # fp32 copy of ``fn`` built once by ``process_weights_after_loading``.
-        # A plain attribute, not a buffer, so ``model.to(bf16)`` cannot
-        # downcast it; ``forward`` falls back to an equivalent per-call
-        # ``.float()`` until it exists or after a device move.
+        # fp32 copy of ``fn`` from process_weights_after_loading; a plain attribute, not a
+        # buffer, so model.to(bf16) leaves it fp32
         self._fn_fp32: torch.Tensor | None = None
         self.reset_parameters()
 
@@ -95,8 +88,6 @@ class Glm5NextHyperConnection(nn.Module):
         self._fn_fp32 = self.fn.detach().float()
 
     def process_weights_after_loading(self, device) -> None:
-        """Post-load hook the generic module walk invokes (quantization
-        ``process_weights_after_loading`` protocol)."""
         del device  # fn already carries the right device
         self.finalize_weights()
 

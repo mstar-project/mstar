@@ -138,14 +138,11 @@ class _KDALayerBlocks(NamedTuple):
 
 
 class KDACallable:
-    """:class:`LinearAttnCallable` for Kimi delta attention: the layer hands over
-    its projections and ``KDAParams``, and this resolves the layer's conv and state
-    blocks and, for a verify step, its speculative blocks, so neither the layer
-    nor the manager holds the pool. ``set_prefix_len`` settles a verify step.
-
-    Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per KDA
-    layer, counting KDA layers only); a ``layer_idx`` argument supersedes the
-    cursor.
+    """:class:`LinearAttnCallable` for Kimi delta attention. The layer passes its
+    projections and ``KDAParams``; this resolves the layer's conv, state and, for a
+    verify step, speculative blocks, so neither the layer nor the manager holds the
+    pool. The same cursor protocol, counting KDA layers only; a ``layer_idx``
+    argument overrides the cursor.
     """
 
     def __init__(self, pool: RecurrentStatePool, attn: KDAManager | None = None):

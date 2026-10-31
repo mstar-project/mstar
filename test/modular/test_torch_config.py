@@ -22,6 +22,29 @@ def test_executor_thread_gets_torch_config():
     assert (limit, unspec) == (recompile_limit(), True)
 
 
+def test_a_submodules_recompile_limit_holds_inside_its_calls_only():
+    from mstar.engine import with_recompile_limit
+    from mstar.model.submodule_base import NodeSubmodule
+
+    class _Wide:
+        def dynamo_recompile_limit(self):
+            return 500
+
+    class _Default:  # a submodule that keeps the base hook
+        dynamo_recompile_limit = NodeSubmodule.dynamo_recompile_limit
+
+    seen = []
+    before = torch._dynamo.config.recompile_limit
+    wrapped = with_recompile_limit(lambda: seen.append(torch._dynamo.config.recompile_limit), _Wide())
+    wrapped()
+    assert seen == [500] and torch._dynamo.config.recompile_limit == before
+
+    def plain():
+        return None
+
+    assert with_recompile_limit(plain, _Default()) is plain
+
+
 @pytest.mark.parametrize(
     "raw, expected",
     [(None, 84), ("", 84), ("123", 123), ("2", 8), ("5000", 256), ("lots", 84)],

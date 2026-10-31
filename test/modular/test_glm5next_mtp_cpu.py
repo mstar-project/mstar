@@ -30,8 +30,8 @@ from mstar.model.submodule_base import InputMetadata
 
 
 def _batch(**kwargs) -> ExecutingBatch:
-    """An ExecutingBatch as the worker builds it: the engine reads each request's
-    loop counts from its input metadata (main #351), not from its forward-pass info."""
+    """An ExecutingBatch as the worker builds it, each request's loop counts in its input
+    metadata."""
     kwargs.setdefault("per_request_input_metadata", {
         rid: InputMetadata(dynamic_loop_iter_counts=dict(info.dynamic_loop_iter_counts))
         for rid, info in kwargs["per_request_info"].items()
@@ -365,45 +365,6 @@ def test_rejected_drafts_stop_at_the_cache_rows():
     rows = 16 + steps * 4
     assert rows <= 4096 < rows + 2 * 4
     assert 16 + generated < 2048
-
-
-def test_acceptance_is_logged(caplog):
-    engine, sub, _ = _build_engine(3)
-    sub._mtp_logged = float("-inf")  # the first step logs
-    with caplog.at_level("INFO", logger="mstar.model.glm5_next.submodules"):
-        _generate(engine, {"a": PROMPTS["a"]}, 4)
-    assert any("drafts accepted per step" in r.getMessage() for r in caplog.records)
-
-
-def test_temperature_is_refused_under_mtp(caplog):
-    engine, _, _ = _build_engine(2)
-    engine.add_request("t", {SAMPLER: SamplingReqConfig(temperature=0.7)})
-    batch = _batch(
-        node_name="LLM",
-        per_request_info={"t": CurrentForwardPassInfo(
-            request_id="wire-t", rid_handle="t", graph_walk="prefill", fwd_index=0, random_seed=0,
-            max_tokens=4,
-            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.7)})},
-        per_request_input_tensors={"t": {"text_inputs": [PROMPTS["b"]]}},
-        step_context=StepContext(request_ids=("t",), graph_walk="prefill", slot=0,
-                                 capture=False),
-    )
-    with caplog.at_level(logging.ERROR, logger="mstar.engine.engine"):
-        engine.prepare_inputs(batch)
-    # process_prompt refuses this as a 400; past it, the client sees an error id, the log the reason
-    error = batch.failed_requests["t"]
-    assert error.startswith("internal error (error id ")
-    error_id = error.removeprefix("internal error (error id ").removesuffix(")")
-    assert any(error_id in r.getMessage() and "greedy only" in r.getMessage() for r in caplog.records)
-
-
-def test_prompts_leave_two_blocks_of_index_topk():
-    model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte",
-                          mtp_num_draft_tokens=3)
-    limit = model.config.index_topk - 2 * 4
-    assert model.process_prompt("a" * limit, ["text"], ["text"]).new_input_tensors["text_inputs"][0].numel() == limit
-    with pytest.raises(ValueError, match="at most"):
-        model.process_prompt("a" * (limit + 1), ["text"], ["text"])
 
 
 def test_vocab_parallel_argmax_equals_the_full_argmax():

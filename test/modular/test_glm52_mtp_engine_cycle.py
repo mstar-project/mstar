@@ -141,11 +141,8 @@ def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.T
 
 
 def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
-    """Every parameter randomized: the MoE expert containers are raw
-    ``torch.empty`` at construction (the loader fills them), and garbage
-    there NaNs the logits — a NaN model emits an all-zero argmax stream on
-    every path, which makes a stream comparison vacuous.
-    """
+    """Every parameter randomized: the expert containers are ``torch.empty`` until a load, and
+    a NaN model's all-zero argmax stream would make every stream comparison vacuous."""
     torch.manual_seed(seed)
     model = Glm52ForCausalLM(cfg)
     for name, p in model.named_parameters():
@@ -246,27 +243,21 @@ def test_mtp_keys_request_state_by_handle():
     assert torch.equal(streams[0], streams[1])
 
 
+@pytest.mark.parametrize("k", [2, 3])
 @pytest.mark.parametrize("mla_absorb", [True, False], ids=["absorbed", "naive"])
-def test_mtp_stream_matches_baseline_bitwise(mla_absorb):
-    (base, spec), _ = _run_pair(k=2, max_tokens=24, ignore_eos=True, mla_absorb=mla_absorb)
+def test_mtp_stream_matches_baseline_bitwise(mla_absorb, k):
+    (base, spec), _ = _run_pair(k=k, max_tokens=20, ignore_eos=True, mla_absorb=mla_absorb)
     assert torch.equal(base, spec), f"{base.tolist()} vs {spec.tolist()}"
-    assert base.numel() == 24
+    assert base.numel() == 20
     # a real stream, not a degenerate one (an uninitialized model emits 0s)
     assert torch.isfinite(base.float()).all() and len(set(base.tolist())) > 3
-
-
-@pytest.mark.parametrize("mla_absorb", [True, False], ids=["absorbed", "naive"])
-def test_mtp_stream_matches_with_k3(mla_absorb):
-    (base, spec), _ = _run_pair(k=3, max_tokens=20, ignore_eos=True, mla_absorb=mla_absorb)
-    assert torch.equal(base, spec)
 
 
 @pytest.mark.parametrize("k", [1, 3])
 @pytest.mark.parametrize("wrong_every", [0, 3], ids=["oracle", "oracle_partial"])
 def test_accepted_drafts_keep_the_stream(k, wrong_every):
-    """Drafts that the verify accepts (all of them, or all but every third) emit the
-    plain stream: random weights reject nearly every MTP draft, so only an oracle reaches
-    the accepted rows, the KV trim at the next declare and the seed at the accepted row."""
+    """Accepted drafts (all, or all but every third) emit the plain stream; random weights
+    reject nearly every draft, so only an oracle reaches the accepted rows."""
     (base, spec), _ = _run_pair(k=k, max_tokens=20, ignore_eos=True, mla_absorb=True,
                                 oracle=wrong_every)
     assert torch.equal(base, spec), f"{base.tolist()} vs {spec.tolist()}"
@@ -291,10 +282,13 @@ def test_oracle_drafts_are_all_accepted():
         assert got == base.tolist()[:len(got)]
 
 
-def test_mtp_stops_exactly_at_max_tokens():
-    for k in (1, 2, 3):
-        (base, spec), _ = _run_pair(k=k, max_tokens=11, ignore_eos=True, mla_absorb=True)
-        assert base.numel() == 11 and torch.equal(base, spec)
+@pytest.mark.parametrize("k", [1, 2, 3])
+@pytest.mark.parametrize("max_tokens", [1, 2, 3, 11])
+def test_mtp_stops_exactly_at_max_tokens(max_tokens, k, caplog):
+    """Short budgets too: the cut is exact, and no stop names a loop the walk lacks."""
+    (base, spec), _ = _run_pair(k=k, max_tokens=max_tokens, ignore_eos=True, mla_absorb=True)
+    assert spec.numel() == max_tokens and torch.equal(base, spec)
+    assert _errors(caplog) == []
 
 
 def test_mtp_eos_truncation_matches_baseline():
@@ -318,9 +312,8 @@ def test_mtp_eos_truncation_matches_baseline():
 
 @pytest.mark.parametrize("wrong_every", [None, 0], ids=["mtp", "oracle"])
 def test_kv_length_tracks_the_verified_stream(wrong_every):
-    """Every step commits its whole block; the next declare takes back the rows the verdict
-    rejected, from the KV length and the position alike, so each step starts from the prompt
-    plus the emitted tokens but the last."""
+    """The next declare takes the rejected rows back from the KV length and the position, so
+    each step starts at the prompt plus the emitted tokens but the last."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=20, ignore_eos=True, mla_absorb=True)
     cfg = _cfg(k, True)
@@ -353,9 +346,8 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
 
 
 def test_every_rank_keeps_rank_0s_verdict(monkeypatch):
-    """The verdict is broadcast from rank 0 before anything reads it: here rank 0 accepted no
-    draft where this rank's oracle drafts were all right, and the step still trims, emits
-    and seeds by rank 0's, so the stream stays the plain one, a token a step."""
+    """Every rank trims, emits and seeds by rank 0's broadcast verdict: here rank 0 accepts
+    none while this rank's drafts were all right."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=12, ignore_eos=True, mla_absorb=True)
     calls = []
@@ -422,29 +414,6 @@ def test_non_greedy_request_is_refused_under_mtp():
         sub.prepare_inputs("prefill", info, {"text_inputs": [torch.tensor([1, 2, 3])]})
 
 
-def test_declare_step_shapes():
-    cfg = _cfg(0, True)
-    sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    prompt = {"text_inputs": [torch.tensor([1, 2, 3])]}
-    inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), prompt)]
-    step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
-    assert step.segments[0].span == 3
-    cfg.mtp_num_draft_tokens = 2
-    sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    sub.bind_node_resources(build_cpu_resources(cfg, ["r0"])[0])
-    inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), prompt)]
-    step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
-    assert step.segments[0].span == 3
-    # one id in, the block of k+1 rows planned; the verify and drafts are argmaxes
-    inputs = [sub.prepare_inputs("decode", _fwd_info("r0", 8, True),
-                                 {"text_inputs": [torch.tensor([4])]})]
-    step = sub.declare_step("decode", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "pos"}
-    assert step.segments[0].span == 3
-
-
 def test_seed_slots_are_reused():
     cfg = _cfg(2, True)
     model = _model(cfg)
@@ -489,11 +458,8 @@ def _window_stream(model, cfg, mode_k: int, prompt_len: int, max_tokens: int):
 
 @pytest.mark.parametrize("k", [2, 3])
 def test_stream_stops_cleanly_at_the_context_limit(k):
-    """A request sized to the window, the most the conductor admits (limit - prompt + 1
-    tokens: the last is never stored), fills it exactly without MTP. Under MTP the
-    prefill's preprocess caps its budget two blocks short of that (every step writes a
-    whole block, and the next may run before the stop lands), so the trunk guard never
-    fires and no step writes past the limit (no third KV page)."""
+    """A request sized to the window: MTP caps its budget two verify blocks short, so no step
+    writes past the limit, and the stream is plain decode's cut there."""
     limit, prompt_len = 24, 5
     fits = limit - prompt_len + 1
     cfg = _window_cfg(k, limit)
@@ -508,24 +474,11 @@ def test_stream_stops_cleanly_at_the_context_limit(k):
     assert stored <= limit and pages <= limit // 8, (stored, pages)
 
 
-def test_budget_within_the_window_is_untouched():
-    cfg = _window_cfg(2, 64)
-    model = _model(cfg)
-    sub = Glm52LLMSubmodule(model, cfg)
-    driver = _Driver(sub, cfg, ["r0"])
-    prompt = torch.arange(5, dtype=torch.long) + 3
-    stream = _drive(driver, prompt, _fwd_info("r0", 9, True))
-    assert sub.request_state("r0")["token_budget"] == 9
-    assert stream.numel() == 9
-
-
 # ── KV exhaustion ────────────────────────────────────────────────────────
 
 
 def test_the_forward_allocates_no_pages():
-    """Every page an MTP step writes (the trunk's block and the MTP plane's, on one page
-    table) is admitted with the step, so running out refuses the step instead of raising
-    inside forward_batched and failing the whole batch. With the arena refusing every
+    """Every page an MTP step writes is admitted with the step: with the arena refusing every
     allocation inside the forward, the stream is unchanged."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=16, ignore_eos=True, mla_absorb=True)
@@ -549,12 +502,8 @@ def test_the_forward_allocates_no_pages():
 
 
 def test_exhaustion_refuses_the_step_and_the_pool_recovers():
-    """merceod's small-pool run on CPU. The refusal comes from the step's
-    admission as ``AllocationFailed``, which the worker re-queues, not from
-    inside the forward, and nothing the refused step would have written
-    moves. Here the refused batch's second request fails and is removed: the
-    first completes as it would alone, the pool ends where it started, and a
-    new request on it completes too."""
+    """A pool too small for two: admission refuses with ``AllocationFailed`` and moves nothing;
+    with the second request removed, the first completes as alone and the pool recovers."""
     k, max_tokens = 2, 14
     cfg = _cfg(k, True)
     model = _model(cfg)
@@ -645,13 +594,13 @@ def _stored_index_rows(kv, rid: str) -> torch.Tensor:
     return kv.aux_view(INDEX_PLANES, 0)[pages, pos % kv.config.page_size]
 
 
-@pytest.mark.parametrize("wrong_every", [None, 0, 3], ids=["mtp", "oracle", "oracle_partial"])
-@pytest.mark.parametrize("chunk", [8192, 3], ids=["one-pass", "row-chunks"])
+# random weights reject nearly every draft, the partial oracle accepts some; row chunks
+# change only the prefill, so one acceptance pattern covers them
+@pytest.mark.parametrize("chunk, wrong_every", [(8192, None), (8192, 3), (3, 3)],
+                         ids=["mtp", "oracle_partial", "row-chunks"])
 def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
-    """MTP on paged DSA, every context past index_topk: the verify and the seed pass select
-    per row, a rejected row's index keys are trimmed with its latents, and the emitted
-    stream is plain decode's. Row chunks: the prompt's trunk and MTP passes run in pieces.
-    Random weights reject nearly every draft; the oracle reaches the accepted rows."""
+    """MTP on paged DSA past index_topk emits plain decode's stream, and a rejected row's
+    index keys are trimmed with its latents."""
     cfg = _cfg(2, True)
     cfg.dsa_long_context, cfg.index_topk = True, 4
     cfg.prefill_chunk_tokens = chunk
@@ -672,6 +621,8 @@ def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
     cfg.mtp_num_draft_tokens = 2
     assert torch.equal(streams[0], streams[1]), f"{streams[0].tolist()} vs {streams[1].tolist()}"
     assert len(set(streams[0].tolist())) > 3
+
+
 # ── a stop on the prefill walk ──────────────────────────────────────────
 
 
@@ -695,13 +646,4 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
     sampler.sample = eos_once
     stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", 10, False))
     assert stream.tolist() == [eos]
-    assert _errors(caplog) == []
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 3])
-def test_short_budgets_are_exact_and_name_no_missing_loop(max_tokens, caplog):
-    cfg = _cfg(3, True)
-    driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
-    stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", max_tokens, True))
-    assert stream.numel() == max_tokens
     assert _errors(caplog) == []

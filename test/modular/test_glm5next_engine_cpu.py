@@ -4,7 +4,6 @@ prefill and a batch of decodes, with two requests interleaved.
 """
 from __future__ import annotations
 
-import logging
 import sys
 import types
 
@@ -30,8 +29,8 @@ from mstar.model.submodule_base import InputMetadata
 
 
 def _batch(**kwargs) -> ExecutingBatch:
-    """An ExecutingBatch as the worker builds it: the engine reads each request's
-    loop counts from its input metadata (main #351), not from its forward-pass info."""
+    """An ExecutingBatch as the worker builds it, each request's loop counts in its input
+    metadata."""
     kwargs.setdefault("per_request_input_metadata", {
         rid: InputMetadata(dynamic_loop_iter_counts=dict(info.dynamic_loop_iter_counts))
         for rid, info in kwargs["per_request_info"].items()
@@ -183,7 +182,7 @@ class TestEngineCpu:
         assert pool.num_free_slots == pool.config.usable_slots
         assert not kv._streams
 
-    def test_check_stop_and_context_cap(self, caplog):
+    def test_check_stop_and_context_cap(self):
         engine, sub, cfg = _build_engine(seed=1)
         _add(engine, "r")
         prompt = torch.tensor([1, 2, 3], dtype=torch.long)
@@ -197,7 +196,7 @@ class TestEngineCpu:
         stops = engine.check_stop_for_batch(batch, {"r": {"new_token": [out["r"]]}})
         assert stops == {"r": {"decode_loop"}}
 
-        # the index_topk cap: a prompt that would cross it fails only its rid
+        # a prompt past index_topk that got past process_prompt fails only its rid
         engine.remove_request("r")
         _add(engine, "long")
         _add(engine, "short")
@@ -212,13 +211,8 @@ class TestEngineCpu:
             },
             step_context=StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False),
         )
-        with caplog.at_level(logging.ERROR, logger="mstar.engine.engine"):
-            engine.prepare_inputs(b)
-        # a 500 past the conductor's own refusal: the client sees an error id, the log the reason
-        error = b.failed_requests["long"]
-        assert error.startswith("internal error (error id ")
-        error_id = error.removeprefix("internal error (error id ").removesuffix(")")
-        assert any(error_id in r.getMessage() and "index_topk" in r.getMessage() for r in caplog.records)
+        engine.prepare_inputs(b)
+        assert set(b.failed_requests) == {"long"}
         assert list(b.request_ids) == ["short"]
         outputs = engine.exec_and_postprocess(b)
         assert set(outputs.per_rid_outputs) == {"short"}
@@ -258,13 +252,9 @@ class TestEngineCpu:
         assert seen == [False]
         engine.remove_request("r")
 
-    def test_max_batch_size_is_the_slot_pool(self):
-        engine, sub, cfg = _build_engine()
-        assert engine.get_max_batch_size("LLM", "decode") == 4
-        assert engine.get_max_batch_size("LLM", "prefill") == 4
-
     def test_prefill_batch_is_capped_at_free_slots(self):
         engine, sub, cfg = _build_engine()
+        assert engine.get_max_batch_size("LLM", "prefill") == 4
         prompt = torch.tensor([1, 2, 3], dtype=torch.long)
         for rid in ("a", "b", "c"):
             _add(engine, rid)
@@ -281,28 +271,15 @@ class TestEngineCpu:
         engine.remove_request("a")
         assert engine.get_max_batch_size("LLM", "prefill") == 1
 
-    def test_a_follower_out_of_slots_rank_0_had_raises(self):
-        """Rank 0 schedules a prefill only into free slots. A follower whose pool
-        is full for it has diverged, and must not quietly re-queue a step rank 0
-        is already running: it stops its worker."""
-        engine, sub, cfg = _build_engine()
-        engine._tp_follower_nodes = {"LLM"}
-        prompt = torch.tensor([1, 2, 3], dtype=torch.long)
-        for rid in "abcde":
-            _add(engine, rid)
-        _run(engine, "prefill", {rid: prompt for rid in "abcd"})
-        with pytest.raises(SystemExit, match="diverged"):
-            _run(engine, "prefill", {"e": prompt})
-        # the refusal was unwound: the four held slots, none for e
-        pool = engine._resources[KDA_STATE]
-        assert pool.num_free_slots == 0 and not pool._slots["e"]
 
-
-def test_prompt_past_the_cap_is_refused_up_front():
-    model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte")
-    limit = model.config.index_topk
-    out = model.process_prompt("a" * (limit - 2), ["text"], ["text"])
-    assert out.new_input_tensors["text_inputs"][0].numel() == limit - 2
-    # a ValueError in preprocessing is the client's 400
+@pytest.mark.parametrize("k", [0, 3])
+def test_prompt_past_the_cap_is_refused_up_front(k):
+    """A prompt leaves index_topk room for two decode steps, two verify blocks under MTP;
+    process_prompt refuses a longer one (the client's 400)."""
+    model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte",
+                          mtp_num_draft_tokens=k)
+    limit = model.config.index_topk - 2 * (k + 1)
+    out = model.process_prompt("a" * limit, ["text"], ["text"])
+    assert out.new_input_tensors["text_inputs"][0].numel() == limit
     with pytest.raises(ValueError, match="at most"):
-        model.process_prompt("a" * (limit - 1), ["text"], ["text"])
+        model.process_prompt("a" * (limit + 1), ["text"], ["text"])

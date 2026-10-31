@@ -65,6 +65,9 @@ class LinearAttnSpec(NodeResourceSpec):
     def depends_on(self) -> set[str]:
         return {self.config.recurrent_state}
 
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
+
     @property
     def writes_prefix_snapshots(self) -> bool:
         # only the GDN wrapper writes state checkpoints into the pool's snapshot slots

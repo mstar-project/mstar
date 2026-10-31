@@ -11,8 +11,7 @@ the members of ``gate + ape`` (fp32, rounded to bf16), times the member keys (ea
 rounded to bf16), summed in fp32 and rounded to bf16, the reference's bf16 arithmetic.
 
 ``decode_scores`` / ``prefill_scores``: ``score[r, j] = sum_h w[r, h] * relu(q[r, h] . key_j)``
-over the pools row ``r`` sees (``(pos[r] + 1) // KP``), bf16 dots with fp32 accumulation. ``w``
-carries the softmax scale and the head-count scale (relu commutes with a positive scale).
+over the pools row ``r`` sees (``(pos[r] + 1) // KP``), bf16 dots with fp32 accumulation.
 Columns past a row's pools are left unwritten: the top-k reads only ``[0, pools)``.
 """
 from __future__ import annotations
@@ -187,8 +186,7 @@ def prefill_scores(q: torch.Tensor, w: torch.Tensor, plane: torch.Tensor, pages:
     out = torch.empty(rows, max_pools, dtype=torch.float32, device=q.device)
     br, bp = 4, 64
     blocks = triton.cdiv(rows, br)
-    # enough programs to fill the GPU: splits per row block, more for few rows (a runtime
-    # argument, as in decode_scores)
+    # enough programs to fill the GPU, more splits for few rows (a runtime argument, as in decode_scores)
     splits = max(1, min(triton.cdiv(max_pools, bp), triton.cdiv(1024, blocks)))
     _prefill_scores_kernel[(blocks, splits)](
         q, w, plane, pages, start, pos, out, rows, max_pools, splits,

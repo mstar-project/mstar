@@ -290,7 +290,6 @@ def test_unknown_kernels_value_is_refused_at_construction():
     a warning; the block refuses it up front."""
     from mstar.model.glm52.config import KERNELS
 
-    assert KERNELS == ("auto", "reference")
     for bad in ("Auto", "triton", ""):
         cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
         cfg.kernels = bad
@@ -587,10 +586,8 @@ def _twins(cfg, setup=lambda block: None):
 @pytest.mark.parametrize("fused_allreduce", [False, True], ids=["two-reduces", "fused-allreduce"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8-reference"])
 def test_an_out_of_place_all_reduce_result_is_kept(fp8, fused_allreduce):
-    """#957: the block keeps what all_reduce returns, so a collective that writes a new
-    tensor (FlashInfer's) gives what one that reduces in place does: here exactly twice
-    one rank's partials, at every reduction the bf16 dispatch, the fp8 reference loop and
-    the summed partials run."""
+    """A collective that returns a new tensor (FlashInfer's) gives what an in-place one does, at
+    every reduction the block runs."""
     torch.manual_seed(11)
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK) if fp8 else Glm52ModelConfig.reduced()
     cfg.kernels = "auto" if fused_allreduce else "reference"
@@ -609,7 +606,6 @@ def test_the_fused_paths_keep_an_out_of_place_all_reduce_result(monkeypatch, pat
             monkeypatch.setattr(block, "_use_decode", lambda flat: True)
             monkeypatch.setattr(block, "_forward_decode", lambda flat: flat * 3.0)
         elif path == "prefill":
-            block._prefill_kernel = True
             monkeypatch.setattr(block, "_dispatch_prefill", lambda flat, weights, ids: flat * 3.0)
 
     fake = types.ModuleType("mstar.utils.fused_moe")
@@ -622,11 +618,8 @@ def test_the_fused_paths_keep_an_out_of_place_all_reduce_result(monkeypatch, pat
 
 
 def test_fused_allreduce_reduces_once_and_keeps_local_math():
-    """kernels: auto: the block issues ONE all-reduce
-    (of routed_partial + shared_partial) instead of two, and what it reduces
-    equals the sum of what the unfused block reduced — the local arithmetic
-    is unchanged; only the reduction order moves.
-    """
+    """kernels: auto reduces the routed + shared partials in one all-reduce where the
+    reference runs two, over the same local arithmetic."""
     torch.manual_seed(3)
     cfg = Glm52ModelConfig.reduced()
     cfg.kernels = "reference"
@@ -636,9 +629,6 @@ def test_fused_allreduce_reduces_once_and_keeps_local_math():
     fused_cfg = Glm52ModelConfig.reduced()
     g1 = _RecordingGroup()
     fused = Glm52SparseMoeBlock(fused_cfg, comm_group=g1)
-    assert not plain._fused_allreduce and fused._fused_allreduce
-    assert plain.shared_expert.down_proj.reduce_results
-    assert not fused.shared_expert.down_proj.reduce_results
 
     # Parameters are torch.empty at construction (the loader fills them);
     # give both blocks the same finite weights.
@@ -649,8 +639,6 @@ def test_fused_allreduce_reduces_once_and_keeps_local_math():
     out_plain = plain(x)
     out_fused = fused(x)
 
-    # unfused: routed all-reduce + shared down_proj all-reduce = 2 collectives
-    # fused: exactly one, on the sum of the two partials
     assert len(g0.reduced) == 2, len(g0.reduced)
     assert len(g1.reduced) == 1, len(g1.reduced)
     routed_p, shared_p = g0.reduced

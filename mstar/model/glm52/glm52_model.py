@@ -5,8 +5,8 @@ import logging
 from pathlib import Path
 
 import torch
-from jinja2 import TemplateError
 
+from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
@@ -40,7 +40,7 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.multimodal import TEXT, PromptPart, chat_turns
+from mstar.model.multimodal import PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # kernels: auto fuses all-reduces up to this size into the next add + RMSNorm; larger ones
 # reduce, add and norm apart
 AR_FUSION_MAX_BYTES = 1 << 20
-# the switches kernels and the checkpoint's quantization replaced
+# model_kwargs that kernels and the checkpoint's quantization replaced, refused rather than ignored
 _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
@@ -86,6 +86,11 @@ class Glm52Model(Model):
         if "num_hidden_layers" in kwargs:
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
+        long_only = sorted(k for k in ("max_seq_len", "prefill_chunk_tokens", "dsa_shard_prefill")
+                           if k in kwargs)
+        if long_only and not kwargs.get("dsa_long_context", False):
+            # they size and split the long-context path only; without it they would be dropped
+            raise ValueError(f"{long_only} apply only with dsa_long_context")
         if kwargs.get("dsa_long_context", False):
             # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
             # attention reads the paged latent cache, so the naive
@@ -121,7 +126,6 @@ class Glm52Model(Model):
         if "mtp_num_draft_tokens" in kwargs:
             k = int(kwargs["mtp_num_draft_tokens"])
             if k < 0:
-                # a negative k read as off in some places and on in others
                 raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
             self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
@@ -135,10 +139,8 @@ class Glm52Model(Model):
         if self._config_variant in ("reduced", "reduced_fp8"):
             from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
-            # reduced() sizes 2 trunk layers, landing the MTP position
-            # (layer_idx = num_hidden_layers) on a SHARED indexer slot. Grow
-            # the trunk so it lands FULL, as the real 78 = 2 + 19·freq
-            # geometry does; real variants keep the MTP constructor's guard.
+            # reduced() has 2 trunk layers, which puts the MTP layer on a SHARED indexer
+            # slot; grow the trunk so it lands FULL, as layer 78 does in the real geometry
             if not is_full_indexer_layer(self.config, self.config.num_hidden_layers):
                 self.config.num_hidden_layers = (
                     self.config.index_skip_topk_offset - 1 + self.config.index_topk_freq
@@ -414,7 +416,7 @@ class Glm52Model(Model):
         if prompt is None:
             return {}
         if self.config.mtp_num_draft_tokens > 0:
-            # what prepare_inputs refuses, as a 500 once every rank had the request
+            # refused here as a 400; prepare_inputs would refuse it as a 500
             sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
@@ -427,7 +429,7 @@ class Glm52Model(Model):
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
         elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = self._render_chat(prompt, prompt_parts, kwargs)
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, TEMPLATE_KWARGS)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
@@ -442,40 +444,6 @@ class Glm52Model(Model):
         return ProcessPromptOutput(
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_RESOURCE: {"main": layout}}},
         )
-
-    def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None, kwargs: dict) -> torch.Tensor:
-        """The chat through the checkpoint's template, which adds ``[gMASK]<sop>`` and opens
-        the assistant turn: the chat API's messages, tools and template switches
-        (GlmChatAdapter), else the prompt's turns, each in its own role. An entrypoint with
-        no messages sends the prompt as one user turn."""
-        messages = kwargs.get("messages")
-        if messages and not isinstance(messages, list):
-            raise ValueError("messages must be a list of chat messages")
-        if not messages:
-            parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
-            messages = [
-                {"role": turn.role,
-                 "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
-                for turn in chat_turns(parts)
-            ]
-        # the template's switches only: others collide with apply_chat_template's own
-        switches = {k: v for k, v in (kwargs.get("chat_template_kwargs") or {}).items()
-                    if k in ("enable_thinking", "reasoning_effort", "clear_thinking")}
-        try:
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                tools=kwargs.get("tools"),
-                add_generation_prompt=True,
-                return_tensors="pt",
-                # transformers 5.x defaults return_dict=True (a BatchEncoding);
-                # keep the bare-tensor return so [0] selects the row
-                return_dict=False,
-                **switches,
-            )
-        except TemplateError as exc:
-            # a chat the template refuses is the client's to fix: a 400, not a 500
-            raise ValueError(f"GLM-5.2's chat template refused the chat: {exc}") from exc
-        return input_ids[0]
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
@@ -493,10 +461,8 @@ class Glm52Model(Model):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP is greedy-only, so greedy is the declared default on MTP
-            # configs: a bare request serves instead of inheriting the config
-            # temperature and being refused by prepare_inputs. An explicit
-            # temperature > 0 still refuses.
+            # greedy by default under MTP, so a request that names no temperature serves
+            # rather than being refused; an explicit temperature > 0 still is
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 
@@ -531,11 +497,7 @@ class Glm52Model(Model):
 
     def text_output(self) -> TextOutput:
         if self._text_output is None:
-            # Synthetic reduced models emit byte ids, which never touch the HF
-            # tokenizer. Otherwise the tokens' raw bytes (byte-level BPE), so a
-            # character split across tokens reaches the client whole, where decoding
-            # each token alone gives U+FFFD; special tokens drop, as with
-            # skip_special_tokens.
+            # a reduced model's byte ids never touch the HF tokenizer
             detokenizer = (
                 ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
             )

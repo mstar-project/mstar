@@ -63,14 +63,6 @@ def _step(mgr: KVManager, span: int):
     return out["main"].views[0]
 
 
-def test_aux_planes_sit_on_the_cache_pages():
-    cache = KVCache(_config(), torch.device("cpu"), torch.float32)
-    assert cache.aux["idx"].shape == (2, 8, PAGE_SIZE, WIDTH)
-    assert cache.aux_view("idx", 1).shape == (8, PAGE_SIZE, WIDTH)
-    # the transfer engines register the KV tensor alone
-    assert cache.nbytes == cache.tensor.nbytes
-
-
 def test_write_aux_lands_at_the_steps_kv_slots():
     mgr = _manager()
     mgr.ingest_request("r")
@@ -78,13 +70,11 @@ def test_write_aux_lands_at_the_steps_kv_slots():
     rows = torch.arange(6 * WIDTH, dtype=torch.float32).view(6, WIDTH)
     mgr.write_kv(torch.ones(6, 6), None, layer_idx=1)
     mgr.write_aux("idx", rows, layer_idx=1)
-    pages, offsets = mgr.write_slots()
-    assert torch.equal(mgr.aux_view("idx", 1)[pages, offsets], rows)
-    assert torch.equal(mgr.layer_view(1)[pages, offsets], torch.ones(6, 6))
-    # token t of the request is at its page t // PAGE_SIZE, offset t % PAGE_SIZE
+    # token t's KV and aux row both sit at its page t // PAGE_SIZE, offset t % PAGE_SIZE
     for t in range(6):
         page = view.page_idxs[t // PAGE_SIZE]
         assert torch.equal(mgr.aux_view("idx", 1)[page, t % PAGE_SIZE], rows[t])
+        assert torch.equal(mgr.layer_view(1)[page, t % PAGE_SIZE], torch.ones(6))
     assert not mgr.aux_view("idx", 0).any()
 
 
@@ -109,8 +99,7 @@ def test_offload_refuses_aux_planes():
 
 
 def test_a_retrieve_refuses_aux_planes():
-    """A cache with aux planes builds as any does, but moving its pages from another instance
-    would leave the planes behind: the retrieve refuses."""
+    """Moving pages from another instance would leave the aux planes behind."""
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 

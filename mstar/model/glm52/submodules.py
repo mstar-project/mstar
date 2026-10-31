@@ -53,7 +53,6 @@ from mstar.utils.h2d import PinnedStager
 logger = logging.getLogger(__name__)
 
 _MAIN = "main"
-# How long the host waits for an MTP step to stage its verdict before giving up.
 _VERDICT_TIMEOUT_S = 120.0
 
 
@@ -79,11 +78,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # MTP: a decode step drafts k tokens, verifies them with the last emitted token and
-        # seeds the next step, all in one captured graph; the eager fallback stays uncompiled
+        # an MTP decode step is one captured graph; the uncaptured fallback runs eager
         self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
-        # dsa_long_context: requests whose prefill starts past a cached prefix, which no
-        # prefill bucket's capture can hold (cg_key_info runs their step eager)
+        # dsa_long_context: handles whose prefill starts past a cached prefix; their step runs
+        # eager (_cg_key), since a bucket's capture scores only its own rows
         self._prefix_hits: set[int] = set()
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
@@ -97,8 +95,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_ignore_eos: dict[str, bool] = {}
         # the step's per-step indices, in one pinned H2D
         self._index_stager = PinnedStager(torch.long)
-        # paged DSA: rows' requests and lengths, page tables
-        self._int_stager = PinnedStager(torch.int32)
         # Per request, in its request_state: "token_budget", under MTP, max_tokens capped at
         # the context limit less two verify blocks (prompt-aware, set by the prefill's
         # preprocess, read by check_stop); "ended_at_prefill", the prefill sampled a stop token:
@@ -116,8 +112,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_trimmed: dict[str, int] = {}
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Acceptance instrumentation: raw emitted tokens (n_accepted + 1,
-        # pre-truncation), request-step count, n_accepted histogram.
+        # acceptance stats for the periodic log line, before the max_tokens and stop cuts
         self._mtp_stat_emitted = 0
         self._mtp_stat_steps = 0
         self._mtp_stat_logged = 0
@@ -378,9 +373,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return configs
 
     def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
-        """Raise dynamo's recompile limit to what these captures take: a decoder layer's
-        frames hold an entry per captured token count and layer kind (dense, MoE, the last
-        one on sampled rows), and the shapes past the limit capture uncompiled."""
+        """The recompile limit these captures take: a decoder layer's frames hold an entry per
+        captured token count and layer kind (dense, MoE, the last one on sampled rows), and
+        the shapes past the limit capture uncompiled."""
         tokens = {
             n for config in configs
             for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
@@ -388,16 +383,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         }
         need = 3 * len(tokens) + 16  # and the engine's compiled fallback
         if torch._dynamo.config.recompile_limit < need:
-            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d -> %d for %d "
-                        "captured token counts", torch._dynamo.config.recompile_limit, need,
-                        len(tokens))
+            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d for %d captured token counts "
+                        "(the engine's is %d)", need, len(tokens), torch._dynamo.config.recompile_limit)
         self._recompile_limit = need
-        self._apply_recompile_limit()
 
-    def _apply_recompile_limit(self) -> None:
-        # dynamo's config is per thread, and the engine's step thread starts at its default
-        need = getattr(self, "_recompile_limit", 0)
-        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, need)
+    def dynamo_recompile_limit(self) -> int | None:
+        return getattr(self, "_recompile_limit", None)
 
     # ── per-step contract ──
 
@@ -420,9 +411,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # the handle, which the batch, check_stop and cleanup_request key by
             rid = fwd_info.rid_handle
             sampling = fwd_info.resource_configs[SAMPLER_RESOURCE]
-            # Greedy-only: decode drafts and verification bypass the sampler,
-            # so a temperature would be silently ignored and a repetition
-            # penalty would move even the prefill argmax. Refuse this rid.
+            # greedy only: the drafts and the verify bypass the sampler, so a temperature
+            # would be ignored, and a repetition penalty would move even the prefill's argmax
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise RuntimeError(
                     f"request {fwd_info.request_id}: MTP speculative decoding is greedy-only "
@@ -451,12 +441,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
 
     def _clamp_token_budget(self, engine_inputs: ModelInputsFromEngine, rid: str, room: int) -> None:
-        """Under MTP, cap the request's max_tokens at what fits before the
-        context limit, so decode stops there (check_stop, the verify
-        truncation) instead of tripping preprocess's guard mid-batch. The
-        conductor holds prompt plus max_tokens to the window at one row per
-        decode step; a verify step writes a whole block. ``room`` is the
-        prompt-aware count, known only once the prefill rows are declared."""
+        """Under MTP, cap max_tokens at what fits before the context limit, so decode stops
+        there rather than tripping preprocess's guard mid-batch: the conductor budgets one row
+        per decode step, a verify step writes a whole block. ``room`` counts from the prompt,
+        known once the prefill is declared."""
         info = (getattr(engine_inputs, "per_request_info", None) or {}).get(rid)
         asked = getattr(info, "max_tokens", None)
         if asked is None:
@@ -478,7 +466,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        self._apply_recompile_limit()
         pos = self._pos(engine_inputs)
         request_ids = list(engine_inputs.request_ids)
         seq_lens = [inp.input_seq_len for inp in inputs]
@@ -510,10 +497,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 # running when the stop lands
                 self._clamp_token_budget(engine_inputs, rid, limit - (start + sl) - 2 * self.mtp_block)
         # Every per-step index in one pinned H2D (a pageable torch.tensor(..., device=cuda)
-        # drains the stream before the step even starts): on prefill each request's last row
-        # (for an eager prefill, when no plan buffer carries qo_indptr); under MTP the seed
-        # slots (padding and capture rows read and write the sink) and, on decode, the
-        # step's number.
+        # drains the stream before the step starts): each prefill request's last row, the MTP
+        # seed slots (padding and capture rows use the sink) and an MTP decode's step number.
         fields = {}
         if graph_walk == "prefill":
             fields["last_token_indices"] = [end - 1 for end in itertools.accumulate(seq_lens)]
@@ -616,10 +601,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self, input_ids: torch.Tensor, position_ids: torch.Tensor,
         dsa_ctx: DSAContext, rows: list[int],
     ) -> torch.Tensor:
-        """The trunk's final hidden state at ``rows`` (ascending) of a paged-DSA prefill longer
-        than ``prefill_chunk_tokens``: the trunk runs over row chunks in turn, each writing its
-        keys and latents (at its own slots: ``token_window``) before the next one selects over
-        them, so only a chunk's activations are ever live."""
+        """The trunk's final hidden state at ``rows`` (ascending) of a prefill longer than
+        ``prefill_chunk_tokens``, run over row chunks in turn: each writes its keys and latents
+        (``token_window``) before the next selects over them."""
         chunk, kv = self.config.prefill_chunk_tokens, self._kv()
         picked = []
         for c0 in range(0, input_ids.shape[0], chunk):
@@ -1056,8 +1040,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # in-step truncation (MTP) leaves a stop id only as the LAST element
         is_eos = tokens[-1] in self.config.eos_token_ids
         if self.mtp_k > 0:
-            # multi-token emission: totals live in the per-request counter (loop iters no
-            # longer count tokens)
+            # a verify step emits several tokens: count them, not the loop's iterations
             generated = self._mtp_checked.get(request_id, 0) + len(tokens)
             self._mtp_checked[request_id] = generated
         else:

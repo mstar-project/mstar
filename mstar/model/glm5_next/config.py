@@ -5,9 +5,6 @@ import functools
 from dataclasses import dataclass, field
 
 from mstar.engine.resources.kv.config import AuxPlanes
-
-# fp8 e4m3 with [128, 128] `weight_scale_inv` block scales and dynamic
-# activation scaling: the checkpoint's quantization scheme.
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 LINEAR_ATTENTION = "linear_attention"
@@ -17,7 +14,7 @@ SPARSE_MLP = "sparse"
 
 # Resource keys the model declares in get_node_resources and the layers
 # bind by (bind_resources); the serving YAML tunes them under `resources:`.
-KV_CACHE = "kv_cache"      # MLA latent pages of the 11 full-attention layers
+KV_CACHE = "kv_cache"      # MLA latent pages of the full-attention layers and the MTP layer
 ATTN = "attn"              # the absorbed-MLA attention backend over KV_CACHE
 SAMPLER = "sampler"
 KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of the 34 KDA layers
@@ -31,9 +28,8 @@ MTP_LEN = "mtp_len"
 # The one cache stream label glm5_next uses (single-label model).
 LABEL = "main"
 
-# Full attention sits at every 4th layer starting at 3 (idx % 4 == 3); all
-# other layers are KDA. A package invariant, validated against the schedule
-# lists — reduced test configs must keep it so the layer mix is exercised.
+# Full attention at idx % 4 == 3, KDA elsewhere; _validate holds every config,
+# reduced ones included, to it.
 _FULL_ATTN_PERIOD = 4
 _FULL_ATTN_OFFSET = 3
 
@@ -87,9 +83,8 @@ class Glm5NextModelConfig:
     hidden_act: str = "silu"
     tie_word_embeddings: bool = False
 
-    # --- layer schedule (from config.json, not formulas) ---
-    # 34 x linear_attention + 11 x deepseek_sparse_attention (3, 7, ..., 43);
-    # dense MLP on layers 0..2, 288+1-expert MoE everywhere else.
+    # --- layer schedule ---
+    # 34 KDA + 11 MLA layers (3, 7, ..., 43); dense MLP on 0..2, MoE elsewhere
     layer_types: tuple[str, ...] = field(
         default_factory=lambda: build_layer_types(45)
     )
@@ -101,7 +96,7 @@ class Glm5NextModelConfig:
     )
 
     # --- KDA linear attention (config.json linear_attn_config) ---
-    # Per-request fixed-size recurrent + short-conv state, NOT paged KV.
+    # fixed-size recurrent and short-conv state per request, not paged KV
     linear_num_heads: int = 64
     linear_head_dim: int = 128
     linear_conv_kernel_size: int = 4  # HF short_conv_kernel_size
@@ -110,22 +105,17 @@ class Glm5NextModelConfig:
     gate_lower_bound: float = -5.0
 
     # --- mHC manifold-constrained hyper-connections ---
-    # The residual is hc_mult parallel streams [B, S, 4, hidden]; each
-    # sublayer site (attn_hc / ffn_hc) collapses them through learned pre
-    # weights and writes back through post weights + a Sinkhorn-projected
-    # doubly-stochastic mixing matrix. Sinkhorn runs at forward time (the
-    # comb logits depend on the live streams — nothing to precompute).
-    # hc_eps floors pre/comb and guards Sinkhorn denominators; the input
-    # RMSNorm uses rms_norm_eps — two distinct epsilons.
+    # The residual is hc_mult streams. Each sublayer site collapses them with learned pre
+    # weights and writes back with post weights and a Sinkhorn-projected mixing matrix, all
+    # computed from the live streams. hc_eps floors pre/comb and the Sinkhorn denominators;
+    # the site's input RMSNorm uses rms_norm_eps.
     mhc: bool = True
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
     # --- MLA (multi-head latent attention), NoPE ---
-    # mla_use_nope: qk_rope_head_dim == 0 — no RoPE anywhere in the text
-    # model, so the cache latent is exactly kv_lora_rank (512) and there is
-    # no cos/sin threading. qk_head_dim = 256 either way, scale 256**-0.5.
+    # NoPE: no RoPE anywhere in the text model, so the cached latent is kv_lora_rank wide
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 256
@@ -133,15 +123,13 @@ class Glm5NextModelConfig:
     v_head_dim: int = 256
     mla_use_nope: bool = True
 
-    # Absorbed MLA stores one compressed latent KV head per token in the
-    # engine's MLA cache layout. This is the only path served (the engine's
-    # MLA backend has an fp32 SDPA fallback, so reduced CPU configs run the
-    # same path); the flag is kept for config parity and must stay True.
+    # The only path served (reduced CPU configs take the MLA backend's SDPA fallback);
+    # Glm5NextMLAAttention refuses False.
     mla_absorb: bool = True
 
     # --- DSA sparse-attention indexer (k-pool compression) ---
-    # Scoring runs over pools of index_kpool consecutive tokens (learned
-    # softmax over members + additive prior), top-(index_topk/index_kpool)
+    # The indexer scores pools of index_kpool consecutive tokens and keeps the top
+    # index_topk / index_kpool of them.
     index_n_heads: int = 32
     index_head_dim: int = 128
     index_topk: int = 2048
@@ -150,8 +138,7 @@ class Glm5NextModelConfig:
     index_kpool_always_select_tail: bool = True
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True  # vestigial: rope_dim is 0 here
-    # 0 = MTP off; k > 0 = draft k tokens per step with the layer-45 MTP
-    # module. Gates both MTP construction and the layer-45 weight load.
+    # drafts per step from the layer-45 MTP module; 0 builds and loads no MTP
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA. Off: serving holds every context to index_topk,
     # where dense MLA computes exactly what DSA would (selecting
@@ -178,23 +165,19 @@ class Glm5NextModelConfig:
     topk_method: str = "noaux_tc"
     norm_topk_prob: bool = True  # denominator carries +1e-20 (HF parity)
     moe_router_dtype: str = "float32"
-    # SwiGLU clamp on every MLP (dense, shared, routed experts alike):
-    # gate.clamp(max=limit), up.clamp(-limit, limit), then silu(gate) * up.
+    # the SwiGLU clamp on every MLP, experts included:
+    # silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
     swiglu_limit: float = 10.0
 
     # --- lengths (NoPE: no rope_theta / interleave fields) ---
     max_position_embeddings: int = 1_048_576
-    # Serving cap, consumed by get_node_resources. Held to index_topk
-    # while dsa_long_context is off: dense MLA is exactly the DSA
-    # computation only within the top-2048 window, and the submodule's
-    # preprocess guard enforces the same bound.
+    # Held to index_topk while dsa_long_context is off: only within it is dense MLA exactly
+    # DSA, and the submodule's prepare_inputs refuses past it.
     max_seq_len: int = 2048
 
     # --- MTP (speculative decoding) ---
-    # Layer 45 in the checkpoint: DeepSeek-V3 glue (enorm/hnorm/eh_proj/
-    # shared_head.norm) + one full MLA+DSA+MoE decoder layer with NO mHC
-    # tensors — the draft layer runs plain-residual on the collapsed
-    # stream.
+    # Layer 45: DeepSeek-V3 glue (enorm, hnorm, eh_proj, shared_head.norm) and one MLA + MoE
+    # layer without mHC, run plain-residual on the collapsed stream.
     num_nextn_predict_layers: int = 1
 
     # --- tokens / generation defaults ---
@@ -209,8 +192,7 @@ class Glm5NextModelConfig:
     ignore_eos: bool = False
 
     # --- quantization / serving knobs ---
-    # The official checkpoint is FP8 e4m3 with [128, 128] block scales
-    # (`weight_scale_inv`). Populated from config.json by from_hf_config.
+    # the checkpoint's fp8 e4m3 [128, 128] block scales (``weight_scale_inv``), from config.json
     quantization_config: Fp8BlockQuantConfig | None = None
     # Keep routed experts FP8-resident (uint8 container + block scales);
     # everything else dequantizes to bf16 on load. 288 experts x 43 layers
@@ -224,9 +206,7 @@ class Glm5NextModelConfig:
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
-    # Derived MLA cache geometry: with NoPE the paged cache stores one
-    # 512-dim latent per token per FULL layer (kv_lora_rank + 0 rope dims),
-    # and only the 11 full-attention layers have planes at all.
+    # the latent width, kv_lora_rank + qk_rope_head_dim (0 here)
     cache_latent_dim: int = field(init=False)
 
     def __post_init__(self):
@@ -266,8 +246,7 @@ class Glm5NextModelConfig:
                 )
         if any(t != "full" for t in self.indexer_types):
             raise ValueError(
-                "indexer_types must be all 'full' — GLM-5.3-Flash has no "
-                "IndexShare; do not port the glm52 formula"
+                "indexer_types must be all 'full': GLM-5.3-Flash has no IndexShare"
             )
         if self.num_attention_heads != self.num_key_value_heads:
             raise ValueError(
@@ -423,9 +402,7 @@ class Glm5NextModelConfig:
 
     @property
     def padded_head_dim(self) -> int:
-        """Naive-MLA q/k/v pad target; FlashInfer paged kernels require
-        64/128/256. The full model's qk_head_dim is exactly 256 so padding
-        is a no-op; reduced configs exercise the pad path."""
+        """qk_head_dim rounded up to a FlashInfer paged-kernel head dim (64, 128 or 256)."""
         for supported in (64, 128, 256):
             if supported >= self.qk_head_dim:
                 return supported
@@ -534,7 +511,6 @@ class Glm5NextModelConfig:
             ),
         )
 
-        # The linear_attn_config layer lists must agree with layer_types.
         if tuple(linear["kda_layers"]) != config.kda_layer_indices:
             raise ValueError(
                 "linear_attn_config.kda_layers disagrees with layer_types"
@@ -543,8 +519,6 @@ class Glm5NextModelConfig:
             raise ValueError(
                 "linear_attn_config.full_attn_layers disagrees with layer_types"
             )
-        # Group routing must be the identity; the expert-group machinery
-        # is not implemented.
         if int(text.get("n_group", 1)) != 1 or int(text.get("topk_group", 1)) != 1:
             raise ValueError(
                 "n_group/topk_group != 1: expert-group routing is not ported"
@@ -647,7 +621,7 @@ class Glm5NextModelConfig:
 
     @classmethod
     def reduced_long_context(cls, max_seq_len: int = 512) -> "Glm5NextModelConfig":
-        """``reduced`` with dsa_long_context: a latent wide enough for the index planes."""
+        """``reduced`` with dsa_long_context and a window past its index_topk."""
         cfg = cls.reduced()
         return dataclasses.replace(cfg, kv_lora_rank=3 * cfg.index_head_dim,
                                    dsa_long_context=True, max_seq_len=max_seq_len)

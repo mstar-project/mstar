@@ -16,7 +16,7 @@ try:
     from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait, libdevice
 
     _HAS_TRITON = True
-except ModuleNotFoundError:  # no triton: the torch reference covers this install
+except ImportError:  # no triton, or one without CUDA extras: the torch reference serves
     _HAS_TRITON = False
 
 # tests switch this off to run the torch reference
@@ -24,7 +24,8 @@ _ENABLED = True
 
 
 def fused_available(t: torch.Tensor) -> bool:
-    return _ENABLED and _HAS_TRITON and t.is_cuda
+    # the kernels use NVIDIA's libdevice and PDL intrinsics
+    return _ENABLED and _HAS_TRITON and t.is_cuda and not current_platform.is_rocm()
 
 
 if _HAS_TRITON:
@@ -172,7 +173,7 @@ if _HAS_TRITON:
         streams with it and applies the site's weighted RMSNorm; role 1 builds post and the
         Sinkhorn comb, which only the next ``update_streams`` reads. PDL: a dependent launch
         that loads its weights before waiting on the mix kernel ahead and unrolls the
-        Sinkhorn loop (both measured at decode sizes with PDL only)."""
+        Sinkhorn loop."""
         if PDL:
             gdc_launch_dependents()
         t = tl.program_id(0).to(tl.int64)

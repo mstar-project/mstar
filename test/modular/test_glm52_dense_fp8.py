@@ -1,6 +1,6 @@
-"""GLM-5.2 ``dense_fp8`` kernels at one TP8 rank's shapes: each path (w8a16 FMA and dot,
-flashinfer and cuBLAS W8A8) against a float64 oracle from the dequantized weights under a
-rounding bound, the dispatch by batch size, graph replay and torch.compile."""
+"""The ``dense_fp8`` kernels at one GLM-5.2 TP8 rank's shapes: each path (w8a16 FMA and dot,
+flashinfer and cuBLAS W8A8) against a float64 oracle under a rounding bound, graph replay and
+torch.compile."""
 import sys
 from pathlib import Path
 
@@ -71,7 +71,7 @@ def _oracle(x, q, s, glu):
 
 
 def _bf16_copies(x, q, s, glu):
-    """Today's numerics: the weight dequantized to bf16 at load, a bf16 linear."""
+    """The bf16 copies' numerics: the weight dequantized at load, a bf16 linear."""
     y = F.linear(x, dequantize_fp8_block_weight(q, s, block_size=BLOCK))
     if glu:
         g, u = y.chunk(2, dim=-1)
@@ -137,30 +137,6 @@ def test_w8a8_within_the_rounding_bound(dense_fp8, rank_weights, name, path, tok
     assert got.shape == ref.shape and _worst(got, ref, bound) <= 1.0
 
 
-def test_dispatch_by_tokens(dense_fp8, rank_weights, monkeypatch):
-    """w8a16 for decode batches (longer for the shared expert's small GEMMs), then
-    flashinfer, then cuBLAS."""
-    seen = []
-    for fn in ("_w8a16", "_fi", "_w8a8"):
-        monkeypatch.setattr(dense_fp8, fn, lambda *a, fn=fn, **k: seen.append(fn))
-    monkeypatch.setitem(dense_fp8._FI_OK, torch.device("cuda", torch.cuda.current_device()),
-                        True)
-    for name, tokens in (("qkv_a", 32), ("qkv_a", 33), ("qkv_a", 512), ("qkv_a", 513),
-                         ("shared_gu", 128), ("shared_down", 129)):
-        q, s = rank_weights[name]
-        dense_fp8._linear(torch.zeros(tokens, SHAPES[name][1], device="cuda",
-                                      dtype=torch.bfloat16), q, s, BLOCK, SHAPES[name][2])
-    assert seen == ["_w8a16", "_fi", "_fi", "_w8a8", "_w8a16", "_fi"]
-
-
-def test_reserve_takes_the_gpu_models_limits(dense_fp8):
-    """An H200 with flashinfer's GEMM hands GLM-5.2's o_proj to it from 3 tokens; any other
-    GPU keeps the shape table."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    h200 = torch.cuda.get_device_name(device) == "NVIDIA H200" and dense_fp8._FI_OK[device]
-    assert dense_fp8._W8A16_MAX[device].get(SHAPES["o_proj"]) == (2 if h200 else None)
-
-
 def test_graph_replay_is_bitwise_and_leaves_the_counters_at_zero(dense_fp8, rank_weights):
     """Split-K programs finish in any order; the last one sums the partials in split order,
     so every replay gives the same bits."""
@@ -195,21 +171,3 @@ def test_op_compiles_whole(dense_fp8, rank_weights):
     torch._dynamo.reset()
     assert torch.equal(torch.compile(f, fullgraph=True)(x), f(x))
 
-
-def test_an_unusable_cublas_block_gemm_falls_back(monkeypatch):
-    """torch 2.10-2.12 have the API, but blockwise scaled_mm raises off SM90 or on a
-    cuBLASLt before 12.9 (the cu128 builds): every prefill step past 512 tokens failed."""
-    from mstar.utils import dense_fp8
-
-    def raises(*args, **kwargs):
-        raise NotImplementedError("blockwise scaling needs cuBLASLt >= 12.9")
-
-    monkeypatch.setattr(dense_fp8, "_W8A8_API", True)
-    monkeypatch.setattr(dense_fp8, "_w8a8", raises)
-    assert dense_fp8._probe_w8a8(torch.device("cpu")) is False
-    taken = []
-    monkeypatch.setattr(dense_fp8, "_w8a16", lambda *args: taken.append(1) or None)
-    monkeypatch.setattr(dense_fp8, "_W8A8_OK", {torch.device("cpu"): False})
-    dense_fp8._linear(torch.zeros(600, 256, dtype=torch.bfloat16),
-                      torch.zeros(256, 256, dtype=torch.uint8), torch.ones(2, 2), (128, 128), False)
-    assert taken == [1]

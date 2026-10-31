@@ -1,23 +1,15 @@
-"""Long-context decode and passkey retrieval against a running server, prompt length by length.
+"""Long-context decode speed and passkey retrieval against a running server, by prompt length.
 
-Per length, the prompt is filler text with a five-digit pass key in its middle and a question at
-its end, sized to about that many tokens with the model's tokenizer. Each request streams from
-``/v1/chat/completions`` with greedy decoding and reports its time to first token, its decode
-time per token ((last chunk - first chunk) / (tokens - 1)), the median gap between chunks, its
-prompt and completion tokens, and whether the reply names the key. A request the server refuses
-(say, a prompt past its window) is recorded with its status and message.
+Each prompt is filler with a five-digit pass key in its middle and a question at its end, sized
+with the model's tokenizer, and streams greedily from ``/v1/chat/completions``. Per request:
+time to first token, decode time per token ((last chunk - first chunk) / (tokens - 1)), the
+median chunk gap, token counts and whether the reply names the key, or a refusal's status.
 
-``--ignore-eos`` decodes all of ``--max-tokens`` at every length, so the decode times compare;
-without it the reply ends where the model stops, which is how retrieval is judged. The same
-command against vLLM or SGLang (their ``--url``, and ``--model`` if the name differs) gives
-numbers to compare with.
-
-Start the server, e.g. GLM-5.3-Flash on 8 GPUs with its 1M-token window::
+``--ignore-eos`` decodes all of ``--max-tokens`` so decode times compare across lengths;
+without it the reply ends where the model stops, which is how retrieval is judged. Pointed at
+vLLM or SGLang (``--url``, ``--model``) it gives numbers to compare. For example::
 
     mstar-serve --config configs/glm5_next_tp8_longctx.yaml
-
-then::
-
     python -m benchmark.glm.longctx_probe --tokenizer zai-org/GLM-5.3-Flash \\
         --lengths 4000,32000,128000 --reps 2 --max-tokens 256 --ignore-eos --output probe.jsonl
 """

@@ -1,9 +1,5 @@
-"""Every TP rank's recurrent pool starts serving with the same free slots.
-
-Each rank admits from its own pool, so a divergence here is a divergence in
-every later verdict. The check runs once, after warmup, over both comm groups.
-
-CPU-only: the all-gather is a stub.
+"""Every TP rank's recurrent pool starts serving with the same free slots: each rank admits
+from its own pool, so a divergence here is one in every later verdict. The all-gather is a stub.
 """
 
 from __future__ import annotations
@@ -55,22 +51,17 @@ def build_pool(comm_group) -> RecurrentStatePool:
     return RecurrentStatePool.build(spec, info)
 
 
-def test_matching_ranks_pass():
-    build_pool(_Joint(tp=[4, 4])).post_warmup_validate()
-
-
-def test_a_rank_with_fewer_free_slots_fails_loudly():
-    pool = build_pool(_Joint(tp=[4, 3]))
-    with pytest.raises(RuntimeError, match=r"asymmetric free slots.*\[4, 3\]"):
+@pytest.mark.parametrize("group, diverged", [
+    (None, False),
+    (_Joint(tp=None), False),
+    (_Joint(tp=[4, 4]), False),
+    (_Joint(tp=[4, 3]), True),
+    (_Joint(tp=[4, 4], sp=[4, 2]), True),
+], ids=["no-group", "one-rank", "matching", "tp-diverged", "sp-diverged"])
+def test_post_warmup_validate(group, diverged):
+    pool = build_pool(group)
+    if not diverged:
         pool.post_warmup_validate()
-
-
-def test_the_sp_group_is_checked_too():
-    pool = build_pool(_Joint(tp=[4, 4], sp=[4, 2]))
-    with pytest.raises(RuntimeError, match="asymmetric"):
+        return
+    with pytest.raises(RuntimeError, match="asymmetric free slots"):
         pool.post_warmup_validate()
-
-
-def test_a_single_rank_has_nothing_to_compare():
-    build_pool(None).post_warmup_validate()
-    build_pool(_Joint(tp=None)).post_warmup_validate()

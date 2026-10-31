@@ -1,9 +1,5 @@
-"""``Worker.__init__`` tells the graph runtime which of its nodes are lockstep-parallel.
-
-The runtime's speculation filter holds a parallel node to a same-node loop-back on the
-TP leader under TP async; a transition into one gives a follower no in-flight batch to
-rebuild the step from. Without the worker's metadata the runtime sees no parallel node,
-and that filter never fires.
+"""``Worker.__init__`` tells the graph runtime which of its nodes are lockstep-parallel, so
+the runtime's speculation filter never speculates a transition into one.
 """
 
 import sys
