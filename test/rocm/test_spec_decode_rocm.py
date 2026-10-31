@@ -57,7 +57,7 @@ GEO = DeltaNetGeometry(num_k_heads=4, num_v_heads=8, head_k_dim=128, head_v_dim=
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
 STATE_TOL = dict(atol=1e-2, rtol=1e-2)
 PAGE = 16
-VOCAB = 64
+VOCAB = sampled.CANDIDATES
 
 
 @pytest.fixture(autouse=True)
@@ -246,8 +246,7 @@ def _spec(k: int, rows: int, width: int):
     """The speculative resource with a verify plan over fake attention and KV
     buffers: a block table of distinct pages per row."""
     spec = SpecDecodeResource(device=DEV, num_draft_tokens=k, max_requests=rows, page_size=PAGE,
-                              kv_key="kv", attn_key="attn", stop_token_ids=(7,), sampling=True,
-                              vocab_size=VOCAB)
+                              kv_key="kv", attn_key="attn", stop_token_ids=(7,), sampling=True)
     for r in range(rows):
         spec.ingest_request(r)
     t = k + 1
@@ -301,6 +300,7 @@ def test_a_verify_step_issues_no_host_sync(k, sample):
     spec._temperature[1:rows + 1] = 0.7
     spec._top_p[1:rows + 1], spec._top_k[1:rows + 1] = 0.9, 40
     spec._draft_probs[1:rows + 1] = 1.0 / vocab
+    spec._draft_ids[1:rows + 1] = torch.arange(vocab, device=DEV)
     rids = list(range(rows))
     t = k + 1
     step(pool, manager, rids, 5)
@@ -417,6 +417,7 @@ def _reset(spec, regs, offset):
     spec._num_acc[regs] = 1
     spec._tokens[:, regs] = torch.tensor([[5, 6, 7], [1, 2, 3]], device=DEV).T
     spec._draft_probs[regs] = 1.0 / VOCAB
+    spec._draft_ids[regs] = torch.arange(VOCAB, device=DEV)
     spec._rng_offset[regs] = offset
 
 
@@ -461,19 +462,23 @@ def test_a_replay_equals_the_eager_step_at_the_same_registers():
         _reset(spec, regs, offset)
         eager = _verify_step(spec, flat, VOCAB, 2, sample=True)
         torch.cuda.synchronize()
-        want = tuple(x.clone() for x in eager) + (spec._tokens[:, regs].clone(), spec._draft_probs[regs].clone())
+        want = tuple(x.clone() for x in eager) + (
+            spec._tokens[:, regs].clone(), spec._draft_ids[regs].clone(), spec._draft_probs[regs].clone(),
+        )
         _reset(spec, regs, offset)
         graph.replay()
         torch.cuda.synchronize()
-        got = tuple(out) + (spec._tokens[:, regs], spec._draft_probs[regs])
+        got = tuple(out) + (spec._tokens[:, regs], spec._draft_ids[regs], spec._draft_probs[regs])
         for a, b in zip(got, want, strict=True):
             assert torch.equal(a, b)
         assert spec._rng_offset[1:3].tolist() == [offset + 5, offset + 5]
 
 
-@pytest.mark.parametrize("settings", [(0.7, 40, 0.9), (0.7, 0, 0.9), (1.0, 5, 1.0), (0.0, 0, 1.0), (0.8, 3, 0.5)])
+@pytest.mark.parametrize("settings", [(0.7, 40, 0.9), (0.7, 0, 0.9), (1.0, 5, 1.0), (0.0, 0, 1.0), (0.8, 3, 0.5),
+                                      (3.0, 0, 0.9), (1.0, 100, 1.0), (1.0, 0, 1.0)])
 def test_the_filter_matches_its_reference(settings):
-    """The kernels and the torch path keep the same tokens and renormalise alike."""
+    """The kernels and the torch path keep the same tokens and renormalise alike,
+    whether the filter's kept set fits the candidates or not (the last three)."""
     temperature, top_k, top_p = settings
     rows, vocab = 8, 512
     logits = (torch.randn(rows, vocab, generator=torch.Generator().manual_seed(2)) * 3).to(DEV)
@@ -484,6 +489,25 @@ def test_the_filter_matches_its_reference(settings):
     want = sampled.filtered_probs(logits.cpu(), *(a.cpu() for a in args))
     assert torch.equal(got > 0, want > 0)
     assert torch.allclose(got, want, atol=1e-5, rtol=1e-3)
+
+
+def test_topk_replays_on_new_inputs():
+    """The selection under the filters, captured on one input and replayed on others."""
+    rows, vocab = 3, 2048
+    gen = torch.Generator().manual_seed(8)
+    x = torch.zeros(rows, vocab, device=DEV)
+    y = torch.topk(x, sampled.CANDIDATES, dim=-1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = torch.topk(x, sampled.CANDIDATES, dim=-1)
+    for _ in range(5):
+        x.copy_(torch.rand(rows, vocab, generator=gen).to(DEV))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        want = torch.sort(x.cpu(), dim=-1, descending=True)
+        assert torch.equal(y.values.cpu(), want.values[:, :sampled.CANDIDATES])
+        assert torch.equal(x.cpu().gather(1, y.indices.cpu()), y.values.cpu())
 
 
 def test_the_filter_matches_the_plain_sampler():
@@ -513,9 +537,10 @@ def test_the_chain_kernel_is_speculative_sampling():
     vocab, k, rows = 32, 2, 100_000
     g = torch.Generator().manual_seed(5)
     q = torch.softmax(torch.randn(k + 1, vocab, generator=g) * 2, -1).to(DEV)
-    p = torch.softmax(torch.randn(k, vocab, generator=g) * 2, -1).to(DEV) * sampled.DRAFT_MARGIN
+    p = torch.softmax(torch.randn(k, vocab, generator=g) * 2, -1).to(DEV)
     d = torch.multinomial(p.cpu(), rows, replacement=True, generator=g).T.contiguous().to(DEV)
     tokens, kept = sampled.accept_chain(
+        torch.arange(vocab, device=DEV).expand(rows, k, vocab).contiguous(),
         p[None].expand(rows, k, vocab).contiguous(), d, q[None].expand(rows, k + 1, vocab).contiguous(),
         torch.arange(rows, device=DEV), torch.full((rows,), RNG_START, device=DEV),
     )
@@ -532,13 +557,11 @@ def test_the_margin_leaves_a_residual_for_every_rejection():
     vocab, k, rows = 64, 1, 1024
     q = torch.zeros(rows, k + 1, vocab, device=DEV)
     q[:, 0, 9], q[:, 1, 3] = 1.0, 1.0
-    p = torch.zeros(rows, k, vocab, device=DEV)
     right = torch.arange(rows, device=DEV) % 2 == 0
-    p[:, 0, 9] = sampled.DRAFT_MARGIN
-    d = torch.full((rows, k), 9, device=DEV)
-    d[~right] = 8
-    p[~right, 0, 9], p[~right, 0, 8] = 0.0, sampled.DRAFT_MARGIN
-    tokens, kept = sampled.accept_chain(p, d, q, torch.arange(rows, device=DEV),
+    d = torch.where(right, 9, 8)[:, None]
+    ids, mass = d[:, :, None].expand(rows, k, 4).contiguous(), torch.zeros(rows, k, 4, device=DEV)
+    mass[:, :, 0] = 1.0
+    tokens, kept = sampled.accept_chain(ids, mass, d, q, torch.arange(rows, device=DEV),
                                         torch.zeros(rows, device=DEV, dtype=torch.long))
     assert (tokens[:, 0] == 9).all()
     assert (kept[right] == 1).all() and (kept[~right] == 0).all()
