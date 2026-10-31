@@ -62,7 +62,6 @@ class DSAContext:
     decode_rows: bool = False
     sparse_plan: sparse_mla.SparseGraphPlan | sparse_mla.EagerSparsePlan | None = None
     last_selection: torch.Tensor | None = None
-    last_selection_layer: int | None = None
     # row_meta's, for the rows it was built from
     _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -113,7 +112,7 @@ class DSAContext:
         return dataclasses.replace(
             self, pos=self.pos[idx], row_req=self.row_req[idx], host_pos=host_pos, spans=spans,
             max_pools=max(1, (max(host_pos) + 1) // self.kpool), needs_selection=True,
-            decode_rows=False, sparse_plan=None, last_selection=None, last_selection_layer=None)
+            decode_rows=False, sparse_plan=None, last_selection=None)
 
 
 def attn_lens(positions: list[int], topk: int, kpool: int) -> list[int]:

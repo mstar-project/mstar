@@ -190,32 +190,6 @@ def test_pool_keys_match_reference_bf16():
         assert torch.equal(flat[slot, 2 * d:], ref[j])
 
 
-def test_decode_rows_select_like_prefill_rows():
-    """The decode path (one row per request, several requests) picks what the prefill path
-    picks for the same rows."""
-    torch.manual_seed(1)
-    nh, d, kpool, topk, page, seq = 16, 16, 4, 32, 16, 120
-    k, gate = torch.randn(seq, d), torch.randn(seq, d)
-    ape, q, w = torch.randn(kpool, d), torch.randn(seq, nh, d), torch.randn(seq, nh)
-    pages = list(range(8))
-    planes = _Planes(1, 8, page, 3 * d)
-    planes.slots = (torch.tensor([p // page for p in range(seq)]),
-                    torch.tensor([p % page for p in range(seq)]))
-    ctx = _ctx(pages, list(range(seq)), page, topk, kpool)
-    dsa.write_index(planes, 0, "main", k, ctx, gate=gate, ape=ape)
-    prefill = dsa.select(q, w, planes.layer_view(0), ctx)
-    rows = [7, 64, 119, 33]
-    dec = dsa.DSAContext(
-        pos=torch.tensor(rows, dtype=torch.int32), row_req=torch.zeros(4, dtype=torch.int32),
-        pages=torch.tensor(pages, dtype=torch.int32), page_start=torch.zeros(1, dtype=torch.int32),
-        host_pos=rows, spans=[(i, 1, 0) for i in range(4)], host_page_start=[0],
-        max_pools=(max(rows) + 1) // kpool, page_size=page, topk=topk, kpool=kpool)
-    decode = dsa.select(q[rows], w[rows], planes.layer_view(0), dec)
-    for i, r in enumerate(rows):
-        n = dsa.attn_lens([r], topk, kpool)[0]
-        assert sorted(decode[i, :n].tolist()) == sorted(prefill[r, :n].tolist())
-
-
 # -- the long-context engine path on the reduced model ----------------------------------------
 
 

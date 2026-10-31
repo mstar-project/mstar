@@ -95,8 +95,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_ignore_eos: dict[str, bool] = {}
         # the step's per-step indices, in one pinned H2D
         self._index_stager = PinnedStager(torch.long)
-        # paged DSA: rows' requests and lengths, page tables
-        self._int_stager = PinnedStager(torch.int32)
         # Per request, in its request_state: "token_budget", under MTP, max_tokens capped at
         # the context limit less two verify blocks (prompt-aware, set by the prefill's
         # preprocess, read by check_stop); "ended_at_prefill", the prefill sampled a stop token:

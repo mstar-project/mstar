@@ -82,6 +82,11 @@ class Glm52Model(Model):
         if "num_hidden_layers" in kwargs:
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
+        long_only = sorted(k for k in ("max_seq_len", "prefill_chunk_tokens", "dsa_shard_prefill")
+                           if k in kwargs)
+        if long_only and not kwargs.get("dsa_long_context", False):
+            # they size and split the long-context path only; without it they would be dropped
+            raise ValueError(f"{long_only} apply only with dsa_long_context")
         if kwargs.get("dsa_long_context", False):
             # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
             # attention reads the paged latent cache, so the naive

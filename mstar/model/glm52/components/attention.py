@@ -175,7 +175,6 @@ class Glm52MLAAttention(MLAAttention):
             q, w, self._kv.aux_view(INDEX_PLANES, self.index_layer_idx), dsa_ctx,
             self.dsa_group)
         dsa_ctx.last_selection = selection
-        dsa_ctx.last_selection_layer = self.layer_idx
         return selection
 
     @torch.compiler.disable

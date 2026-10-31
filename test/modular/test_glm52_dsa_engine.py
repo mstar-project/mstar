@@ -227,6 +227,8 @@ def test_model_kwarg_dsa_long_context():
 
     with pytest.raises(ValueError, match="mla_absorb"):
         Glm52Model(model_path_hf="", config_variant="reduced", dsa_long_context=True)
+    with pytest.raises(ValueError, match="dsa_long_context"):
+        Glm52Model(model_path_hf="", max_seq_len=4096)
     mtp = Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
     assert mtp.config.dsa_long_context and mtp.config.mtp_num_draft_tokens == 2
 
