@@ -2662,6 +2662,15 @@ class Worker:
         # TODO: use the microscheduler to break ties when ready_for_spec
         # contains multiple ready nodes or walks
         info = ready_for_spec[0]
+        if len(ready_for_spec) > 1 and (info.node_name, info.graph_walk) in self.chunk_loops.walks:
+            # After a mixed step, prefer another walk's loop-back (decode) to
+            # a chunk Loop's tick: the chain continues only its target walk's
+            # rows, a mixing chain takes the rows mid-prefill along too, and
+            # a prompt otherwise lets other ready work go first after each step.
+            info = next(
+                (i for i in ready_for_spec if (i.node_name, i.graph_walk) not in self.chunk_loops.walks),
+                info,
+            )
         return SpeculationTarget(info, groups[info.graph_walk])
 
     def _teardowns_pending(self) -> bool:

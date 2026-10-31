@@ -203,3 +203,18 @@ def test_a_cache_served_row_is_ended_even_beside_a_chunked_one():
     assert _strides(
         {1: "prefill", 2: "prefill"}, {2: ChunkRange(0, 4, 10, 4)},
     ) == [CHUNK_LOOP_END, 4]
+
+
+def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tick():
+    """A chain continues only its target walk's rows, so a chunk-tick target
+    would sit N's decode rows out of N+1."""
+    from types import SimpleNamespace
+
+    ready = [SimpleNamespace(node_name=NODE, graph_walk=walk) for walk in ("prefill", "decode")]
+    w = Worker.__new__(Worker)
+    w._graph_runtime = SimpleNamespace(speculate_node=lambda *args: ready)
+    w.chunk_loops = ChunkLoops([(NODE, "prefill")])
+
+    target = w._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}))
+
+    assert target.info.graph_walk == "decode" and target.walk_rids == [2]
