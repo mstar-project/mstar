@@ -15,6 +15,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
+from mstar.engine import with_recompile_limit
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
@@ -653,16 +654,16 @@ class Engine:
             dynamic = True if item_encoder and not getattr(submodule, "marks_dynamic_dims", False) else None
             try:
                 # no token count, these serve eager batches of any size
-                submodule_mgmt.forward = with_inductor_overrides(torch.compile(
+                submodule_mgmt.forward = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=dynamic,
-                ))
-                submodule_mgmt.forward_batched = with_inductor_overrides(torch.compile(
+                )), submodule)
+                submodule_mgmt.forward_batched = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=dynamic,
-                ))
+                )), submodule)
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(

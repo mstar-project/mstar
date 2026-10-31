@@ -12,6 +12,7 @@ from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
+from mstar.engine import with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
@@ -1215,9 +1216,9 @@ class AcceleratorGraphRunner:
             self._compiled_forwards[spec.config_idx] = torch.compile(
                 forward, **compile_kwargs(spec.config.compile_mode),
             )
-        return with_inductor_overrides(
+        return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
-        )
+        ), self._submodule)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,

@@ -294,51 +294,20 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     torch.testing.assert_close(logits[1], logits[0], rtol=1e-5, atol=1e-5)
 
 
-def test_capture_configs_raise_the_recompile_limit_to_fit(torch_flag):
+def test_capture_configs_ask_for_the_recompile_limit_they_need():
     # every captured token count costs a decoder layer's frames up to three entries
-    torch_flag(torch._dynamo.config, "recompile_limit", 84)
     buckets = list(range(64, 2049, 64))
     cfg = Glm52ModelConfig(prefill_token_buckets=buckets,
                            prefill_batched_token_buckets=[2304, 2560, 3072, 3584, 4096],
                            prefill_capture_batch_sizes=[1, 4, 16])
-    _submodule(cfg).get_accelerator_graph_configs(torch.device("cpu"))
-    shapes = len(buckets) + 5 + 7  # + the decode batch sizes
-    assert torch._dynamo.config.recompile_limit >= 3 * shapes
-    torch_flag(torch._dynamo.config, "recompile_limit", 84)
-    _submodule(Glm52ModelConfig()).get_accelerator_graph_configs(torch.device("cpu"))
-    assert torch._dynamo.config.recompile_limit == 84  # the default buckets fit
-
-
-def test_recompile_limit_reaches_the_thread_that_runs_steps(torch_flag):
-    # dynamo's config is per thread, and the engine runs steps on a thread of its own
-    import threading
-
-    from mstar.engine import apply_torch_config
-
-    torch_flag(torch._dynamo.config, "recompile_limit", 84)
-    cfg = Glm52ModelConfig(prefill_token_buckets=list(range(64, 2049, 64)),
-                           prefill_capture_batch_sizes=[1, 4, 16])
+    before = torch._dynamo.config.recompile_limit
     sub = _submodule(cfg)
     sub.get_accelerator_graph_configs(torch.device("cpu"))
-    need = torch._dynamo.config.recompile_limit
-    assert need > 84
+    shapes = len(buckets) + 5 + 7  # + the decode batch sizes
+    assert sub.dynamo_recompile_limit() >= 3 * shapes
+    assert torch._dynamo.config.recompile_limit == before  # the engine applies it, per call
+    default = _submodule(Glm52ModelConfig())
+    default.get_accelerator_graph_configs(torch.device("cpu"))
+    assert default.dynamo_recompile_limit() <= 84  # the default buckets fit
 
-    class _StopError(Exception):
-        pass
 
-    def _pos(engine_inputs=None):  # preprocess's first resource read, right after the limit
-        raise _StopError
-
-    sub._pos = _pos
-    seen = []
-
-    def step():
-        apply_torch_config()
-        with pytest.raises(_StopError):
-            sub.preprocess("prefill", None, [])
-        seen.append(torch._dynamo.config.recompile_limit)
-
-    thread = threading.Thread(target=step)
-    thread.start()
-    thread.join()
-    assert seen == [need]

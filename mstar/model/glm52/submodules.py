@@ -316,9 +316,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return configs
 
     def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
-        """Raise dynamo's recompile limit to what these captures take: a decoder layer's
-        frames hold an entry per captured token count and layer kind (dense, MoE, the last
-        one on sampled rows), and the shapes past the limit capture uncompiled."""
+        """The recompile limit these captures take: a decoder layer's frames hold an entry per
+        captured token count and layer kind (dense, MoE, the last one on sampled rows), and
+        the shapes past the limit capture uncompiled."""
         tokens = {
             n for config in configs
             for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
@@ -326,16 +326,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         }
         need = 3 * len(tokens) + 16  # and the engine's compiled fallback
         if torch._dynamo.config.recompile_limit < need:
-            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d -> %d for %d "
-                        "captured token counts", torch._dynamo.config.recompile_limit, need,
-                        len(tokens))
+            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d for %d captured token counts "
+                        "(the engine's is %d)", need, len(tokens), torch._dynamo.config.recompile_limit)
         self._recompile_limit = need
-        self._apply_recompile_limit()
 
-    def _apply_recompile_limit(self) -> None:
-        # dynamo's config is per thread, and the engine's step thread starts at its default
-        need = getattr(self, "_recompile_limit", 0)
-        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, need)
+    def dynamo_recompile_limit(self) -> int | None:
+        return getattr(self, "_recompile_limit", None)
 
     # ── per-step contract ──
 
@@ -413,7 +409,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        self._apply_recompile_limit()
         pos = self._pos(engine_inputs)
         request_ids = list(engine_inputs.request_ids)
         seq_lens = [inp.input_seq_len for inp in inputs]

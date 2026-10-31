@@ -1093,7 +1093,10 @@ methods are:
    class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
    prefix cache layout walk compiles with dynamic shapes instead. One that marks every
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
-   ``marks_dynamic_dims = True`` and compiles as any other submodule. Keep the compiled
+   ``marks_dynamic_dims = True`` and compiles as any other submodule. A submodule whose
+   captures keep more compiled entries per frame than ``MSTAR_RECOMPILE_LIMIT`` allows
+   returns the number from ``dynamo_recompile_limit()``; the engine raises the limit
+   around that submodule's compiled calls only. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
    data-dependent Python control flow or forces a host synchronization, exclude it
    explicitly with ``@torch.compiler.disable``.
