@@ -1,6 +1,6 @@
-"""``mstar::decode_linear`` on AMD GPUs: every shape the device's table names runs its hipBLASLt solution and
+"""``mstar::decode_linear`` on AMD GPUs: every shape the device's table holds a tuned solution for runs it and
 matches F.linear within a GEMM's rounding, eagerly and replayed from a captured graph; a shape the table does
-not name falls back to F.linear."""
+not tune falls back to F.linear."""
 
 import pytest
 import torch
@@ -11,14 +11,16 @@ from mstar.platforms import current_platform
 pytestmark = pytest.mark.skipif(not current_platform.is_rocm(), reason="needs an AMD GPU")
 
 
-def _table():
-    from mstar.platforms.rocm_gemm import decode_linear_table
+def _tuned_shapes():
+    """Every (rows, n, k) the table holds a solution for, chosen or not, as "k{k}-n{n}-rows{rows}" keys."""
+    from mstar.platforms.rocm_gemm import DECODE_GEMM
 
-    return decode_linear_table(torch.cuda.current_device())
+    shapes = (DECODE_GEMM.table() or {}).get("shapes", {})
+    return sorted(key for key, entry in shapes.items() if "hipblaslt_tuned" in entry.get("candidates", {}))
 
 
 def _shape(key):
-    rows, n, k = (int(part[len(tag):]) for part, tag in zip(key.split("-"), ("rows", "n", "k"), strict=True))
+    k, n, rows = (int(part[len(tag):]) for part, tag in zip(key.split("-"), ("k", "n", "rows"), strict=True))
     return rows, n, k
 
 
@@ -27,9 +29,13 @@ def _check(out, want):
     assert (out.float() - want.float()).abs().max().item() <= 1.6e-2 * scale + 1e-2 * scale
 
 
-@pytest.mark.parametrize("key", sorted(_table()) if current_platform.is_rocm() else [])
-def test_each_tuned_shape_matches_f_linear(key):
+@pytest.mark.parametrize("key", _tuned_shapes() if current_platform.is_rocm() else [])
+def test_each_tuned_solution_matches_f_linear(key, monkeypatch):
+    from mstar.platforms import rocm_gemm
+
     rows, n, k = _shape(key)
+    solution = int(rocm_gemm.DECODE_GEMM.params({"rows": rows, "n": n, "k": k}, "hipblaslt_tuned")["solution"])
+    monkeypatch.setattr(rocm_gemm, "_decode_solution", lambda *shape: solution)
     g = torch.Generator(device="cuda").manual_seed(rows + n + k)
     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16, generator=g)
     w = (torch.randn(n, k, device="cuda", dtype=torch.bfloat16, generator=g) * k ** -0.5).contiguous()
