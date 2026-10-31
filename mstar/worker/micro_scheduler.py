@@ -3,13 +3,13 @@ import itertools
 import logging
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec, RequestWalks
 from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
@@ -931,9 +931,9 @@ class MicroScheduler:
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
         exclude = self.failed_rids.union(self.pending_removes, self.held_until)
-        for spec in self._ready_specs(exclude, target, exclude_target):
-            if spec.node_name not in self.parallel_leader_nodes:
-                continue  # only rank 0 can initiate scheduling!
+        # only rank 0 can initiate scheduling: a followed node's head is
+        # served by _try_schedule_tp_follow
+        for spec in self._rows_here(self._ready_specs(exclude, target, exclude_target)):
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
@@ -976,6 +976,23 @@ class MicroScheduler:
         return self.runtime.get_ready_nodes(
             exclude, target=target, exclude_target=exclude_target,
         )
+
+    def _rows_here(
+        self, specs: Iterable[ReadyNodeSpec],
+        head_node: str | None = None, head_rids: Collection[int] = (),
+    ) -> Iterator[ReadyNodeSpec]:
+        """Of graph-ready ``specs``, the rows that are work this rank can take:
+        every row of a node it leads, and of a node rank 0 leads only the rows
+        of rank 0's FIFO head (``head_node``'s ``head_rids``), since such a node
+        runs here only as rank 0 sends it."""
+        leads = self.parallel_leader_nodes
+        for spec in specs:
+            if leads is None or spec.node_name in leads:
+                yield spec
+            elif spec.node_name == head_node:
+                rids = [rid for rid in spec.rids if rid in head_rids]
+                if rids:
+                    yield spec._replace(rids=rids)
 
     def _schedule_key(
         self, request_state: RequestStateManager,
@@ -1510,10 +1527,12 @@ class MicroScheduler:
         # head TP follow batch: get_next_batch *will* schedule that one (rank 0
         # is waiting on it), so it counts as real ready work.
         tp_pend_rids: set[int] = set()
+        head_node: str | None = None
         if self.tp_batches_pending_schedule:
             pend: ScheduleTPNode = self.tp_batches_pending_schedule[0]
             if self._key(pend.node_name, pend.graph_walk) != exclude_target:
                 tp_pend_rids = set(self.tp_rids(pend))
+                head_node = pend.node_name
         # Don't bother expiring held_until here — we only read it; the next
         # get_next_batch call will refresh.
         now = time.monotonic()
@@ -1527,7 +1546,7 @@ class MicroScheduler:
         # final and skips the engine pass.
         if not self.runtime.has_ready_excluding(exclude, scan_exclude):
             return False
-        for spec in self._ready_specs(exclude, None, scan_exclude):
+        for spec in self._rows_here(self._ready_specs(exclude, None, scan_exclude), head_node, tp_pend_rids):
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
@@ -1596,9 +1615,8 @@ class MicroScheduler:
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
         for (node, _), queued in self.rebuilds.items():
             rows[node] += sum(1 for rid in queued if rid not in exclude)
-        for spec in self.runtime.get_ready_nodes(exclude):
-            if spec.node_name in self.parallel_leader_nodes:
-                rows[spec.node_name] += len(spec.rids)
+        for spec in self._rows_here(self.runtime.get_ready_nodes(exclude)):
+            rows[spec.node_name] += len(spec.rids)
         return rows
 
     def take_admit_errors(self) -> dict[int, str]:

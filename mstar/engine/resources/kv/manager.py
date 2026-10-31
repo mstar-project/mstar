@@ -34,6 +34,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
+from mstar.engine.resources.kv.host_writes import HostWrites
 from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -101,6 +102,8 @@ class PageArena:
     sealed: list[bool] = field(init=False, repr=False)
     index: PrefixIndex | None = field(default=None, init=False, repr=False)
     trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    # queues each page a release leaves to the index alone, for a copy to the host
+    writes: HostWrites | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -138,6 +141,8 @@ class PageArena:
                 freed.append(page)
             elif self.num_owners[page] == 1 and self.index is not None:
                 self.index.set_shared(page, False)
+                if self.writes is not None:
+                    self.writes.queue(self.index.key_of(page))
         self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
@@ -594,10 +599,16 @@ class KVManager(AttentionResource):
             needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
+        # requests whose every stream has been looked up for a copy from the host, with none arriving, so
+        # `_fetch_from_host` returns before reading their streams. Giving one of a request's streams a new chain
+        # takes the request out of the set.
+        self._looked_up: set[str] = set()
         # A copy is listed with `event` None until it is queued, since an event
         # that was never recorded reads as done.
         self._host_copies: list[HostCopy] = []
         self._arriving: dict[bytes, HostCopy] = {}
+        # set once both the prefix cache and the host pool are on
+        self._host_writes: HostWrites | None = None
         if cfg.cpu_offload_pages > 0:
             self._cpu_pool = CPUPagePool(
                 config=cfg, kv_cache=self.kv_cache,
@@ -686,12 +697,16 @@ class KVManager(AttentionResource):
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         # A read-only step (every segment span 0, e.g. a decoder attending an
         # encoder context it wrote at prefill) plans the same as the last one
-        # while its segments are the same and nothing touched their streams:
-        # (key, plan). The epoch moves with `_plan_epoch`, and when a stream of
-        # one of the cached step's real rows changes (`_readonly_rows`).
+        # on its slot with the same segments and bucket while nothing touched
+        # their streams: slot -> ((segments, bucket), epochs, plan). One entry
+        # per replay slot, as `_staged_outputs` keeps, so the slot count bounds
+        # the cache; replay slots pad with rows of their own, and an unpadded
+        # batch builds its plan once per slot. The epoch moves with
+        # `_plan_epoch`, and when a stream of a cached step's real row changes
+        # (`_readonly_rows`).
         self._readonly_epoch = 0
-        self._readonly_plan: tuple | None = None
-        self._readonly_rows: frozenset | None = None
+        self._readonly_plans: dict[int | None, tuple] = {}
+        self._readonly_rows: frozenset = frozenset()
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
         self._staged_outputs: dict[tuple, KVPlanOutput] = {}
@@ -787,7 +802,13 @@ class KVManager(AttentionResource):
             # The evictable set is counted only at one rank. When the arena reports to the index, `insert`
             # reads owner counts to decide a page's parent, and those counts can differ between ranks.
             self._arena.index = self._index
+        if self._cpu_pool is not None:
+            self._open_host_writes()
         return True
+
+    def _open_host_writes(self) -> None:
+        self._host_writes = HostWrites(self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes)
+        self._arena.writes = self._host_writes
 
     def close_prefix_cache(self) -> None:
         self._index = None
@@ -854,6 +875,7 @@ class KVManager(AttentionResource):
             if self._streams.get(rid, {}).get(label) is not stream:
                 return False
             chain.looked_up = True
+            self._note_looked_up(rid)
             rooted, ends = chain.rooted, chain.rooted_ends
             total = sum(span.length for span in chain.spans)
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
@@ -1159,11 +1181,26 @@ class KVManager(AttentionResource):
             self._cache_image_end(stream, chain, *ended)
 
     def _evict(self, n: int) -> int:
-        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host."""
-        dropped = self._index.evict(n)
+        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host. Pages still waiting
+        for their copy to the host go last."""
+        writes = self._host_writes
+        dropped = self._index.evict(n, None if writes is None else writes.awaits)
+        if writes is not None:
+            writes.evicted(dropped)
         if self._cpu_pool is not None:
             self._cpu_pool.count_dropped(dropped)
         return len(dropped)
+
+    def after_output_copy(self, step: KVStep) -> None:
+        """Copy up to a step's share of the queued pages to the host. The worker has seen ``step`` finish on the
+        device, so every page queued by its commit or an earlier one is final. Nothing waits on the copy."""
+        writes = self._host_writes
+        if writes is None or not writes.queued:
+            return
+        with self._lock:
+            write = writes.take(step.commits)
+        if write is not None:
+            writes.launch(write, self.kv_cache.tensor, self._lock)
 
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
         """Cache the page up to the image's end. When the text after the image changes,
@@ -1183,6 +1220,8 @@ class KVManager(AttentionResource):
             return
         self.kv_cache.copy_slots(stream.page_indices[page], copy[0], end % self.config.page_size)
         self._index.insert(rooted, copy[0], parent)
+        if self._host_writes is not None:
+            self._host_writes.add_image_end(rooted)
         # drop our reference, so the index is the page's one owner and can evict it
         self._arena.release(copy)
 
@@ -1337,6 +1376,7 @@ class KVManager(AttentionResource):
         stream.chain = PrefixChain.seed(
             keys, tail, layout.spans[:layout.keyed_spans], self.config.page_size,
         )
+        self._looked_up.discard(rid)
 
     @property
     def keys_prefix_chains(self) -> bool:
@@ -1784,6 +1824,8 @@ class KVManager(AttentionResource):
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
+        if rid in self._looked_up:
+            return None
         # Readiness is checked for every row on every pass, so return before
         # taking the lock when no stream still needs a lookup or waits on a copy.
         streams = self._streams.get(rid, {})
@@ -1813,6 +1855,7 @@ class KVManager(AttentionResource):
                 # The engine doesn't probe a walk that writes two labels, so no probe would read a copy.
                 # The chain is marked looked up, so later readiness checks return before taking the lock.
                 chain.looked_up = True
+                self._note_looked_up(rid)
                 return None
         self._root_chain(chain)
         with self._lock:
@@ -1839,6 +1882,7 @@ class KVManager(AttentionResource):
                 budget = self._allowance(rid) - sum(page in evictable for page in run)
             host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
+                self._note_looked_up(rid)
                 return None
             # retained before the grant, whose eviction could drop the run's index-only pages
             held = self._retain_cached(rid, stream, run)
@@ -1857,6 +1901,16 @@ class KVManager(AttentionResource):
         self._cpu_pool.copy_in(self.kv_cache.tensor, PageCopies(gpu=fresh, cpu=host))
         copy.event = self._cpu_pool.record()
         return label
+
+    def _note_looked_up(self, rid: str) -> None:
+        """Add ``rid`` to `_looked_up` once each of its streams has been looked up for a copy from the
+        host and none waits on one. Callers hold the lock."""
+        streams = self._streams.get(rid)
+        if streams and all(
+            (stream.chain is None or stream.chain.looked_up) and stream.host_copy is None
+            for stream in streams.values()
+        ):
+            self._looked_up.add(rid)
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
@@ -1877,6 +1931,9 @@ class KVManager(AttentionResource):
                 self._forget_step_reservations(ctx)
             if self._host_copies:
                 self._land_host_copies()
+            # once a step, never in a readiness check
+            if self._host_writes is not None and self._host_writes.landing:
+                self._host_writes.land()
         if _DEBUG_ASSERTS and not step.commit:
             self._assert_scratch(step, ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
@@ -2341,56 +2398,62 @@ class KVManager(AttentionResource):
                 self._current_plan_states[label] = plan_state
 
 
-    def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
+    def _plan_output(self, views: list[SequenceView], ring: PinnedIndexRing | None) -> KVPlanOutput:
         return KVPlanOutput(
-            cpu_indptrs=build_paged_indptrs(
-                views, self.kv_cache.page_size, ring=self._indptr_ring,
-            ),
+            cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size, ring=ring),
             views=views,
         )
 
     @staticmethod
     def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
         # no sink rows: they change the views without changing the segments
-        # the reuse key holds; the read-only steps that repeat have none
+        # the reuse key holds; the read-only steps that repeat have none.
+        # Pre-planned steps too: a decoder that pre-plans gets most of its
+        # steps there.
         return (
-            not ctx.is_preplan and not ctx.capture and bool(step.segments)
+            not ctx.capture and bool(step.segments)
             and not step.pre_forks and not step.post_forks and not step.sink
             and all(seg.span == 0 for seg in step.segments)
         )
 
-    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple:
+    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple[tuple, tuple]:
+        """(segments, bucket), and the epochs a plan under that key holds for."""
         lease = ctx.slot_lease
         return (
-            tuple(step.segments), lease.bucket if lease is not None else None,
-            self._plan_epoch, self._readonly_epoch,
+            (tuple(step.segments), lease.bucket if lease is not None else None),
+            (self._plan_epoch, self._readonly_epoch),
         )
 
-    def _reuse_readonly_plan(self, step: KVStep, ctx: StepContext) -> "KVPlanOutputs | None":
-        """The last read-only step's plan, when this step is the same read-only
-        step over untouched streams. Its views and indptrs are reused as they
-        are, and a slot whose static buffers already hold it is not re-staged."""
-        cached = self._readonly_plan
-        if cached is None or not self._is_readonly(step, ctx) or cached[0] != self._readonly_key(step, ctx):
-            return None
-        res = cached[1]
+    def _reuse_readonly_plan(self, res: "KVPlanOutputs", step: KVStep, ctx: StepContext) -> "KVPlanOutputs":
+        """A cached read-only plan for this step, its views and indptrs as they
+        are; a slot whose static buffers already hold it is not re-staged."""
         lease = ctx.slot_lease
         if lease is not None and all(
             self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items()
         ):
+            states = self._preplan_states if ctx.is_preplan else self._current_plan_states
             for label in res:
-                self._current_plan_states[label] = self._static_plan_state(lease.slot, label)
+                states[label] = self._static_plan_state(lease.slot, label)
         else:
             self._setup_plan_states(res, ctx, lease)
+        self._mark_preplanned(step, ctx, res)
         return res
+
+    def _drop_readonly_plans(self) -> None:
+        self._readonly_epoch += 1
+        # The epochs are what retire an entry: a plan thread mid-build stores
+        # the epochs it read before this bump, which never match again. The
+        # dict is rebound rather than cleared only so that thread keeps a
+        # consistent one to write into.
+        self._readonly_plans = {}
+        self._readonly_rows = frozenset()
 
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
         commit: the plan caches no longer describe the streams if they hold
         that request. A padding row's reset after a replay holds nothing."""
-        rows = self._readonly_rows
-        if rows is not None and (rid is None or rid in rows):
-            self._readonly_epoch += 1
+        if rid is None or rid in self._readonly_rows:
+            self._drop_readonly_plans()
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -2717,9 +2780,20 @@ class KVManager(AttentionResource):
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
 
-        reused = self._reuse_readonly_plan(step, ctx)
-        if reused is not None:
-            return reused
+        readonly = self._is_readonly(step, ctx)
+        if readonly:
+            key, epochs = self._readonly_key(step, ctx)
+            slot = ctx.slot_lease.slot if ctx.slot_lease is not None else None
+            cached = self._readonly_plans.get(slot)
+            if cached is not None and cached[0] == key and cached[1] == epochs:
+                return self._reuse_readonly_plan(cached[2], step, ctx)
+            # The epochs and rows before the views: a touch from here on moves
+            # an epoch, so a plan built across it is never reused. A pre-plan
+            # builds on the plan thread while the main thread can tear
+            # requests down.
+            self._readonly_rows = self._readonly_rows | frozenset(
+                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+            )
 
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
@@ -2730,8 +2804,10 @@ class KVManager(AttentionResource):
             self._maybe_apply_forks(step, ctx)
             self._copy_image_ends()
 
-        if self._indptr_ring is not None:
-            self._indptr_ring.begin_plan()
+        # a cached read-only plan outlives the ring's turn, so it takes none
+        ring = None if readonly else self._indptr_ring
+        if ring is not None:
+            ring.begin_plan()
         laps.lap("forks")
         res = None
         if self._plan_cache_mode and not pending:
@@ -2741,7 +2817,7 @@ class KVManager(AttentionResource):
             full = KVPlanOutputs(
                 {
                     plan_label: self._plan_output(
-                        self._sequence_views(segments, pending, ctx, step.sink)
+                        self._sequence_views(segments, pending, ctx, step.sink), ring,
                     )
                     for plan_label, segments in group_by_plan_label(
                         step.segments, step.combined_labels
@@ -2765,17 +2841,16 @@ class KVManager(AttentionResource):
             laps.lap("full")
         self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         laps.lap("setup_states")
-        if self._is_readonly(step, ctx):
-            # the rows first: a touch from here on invalidates the entry
-            self._readonly_rows = frozenset(
-                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
-            )
-            self._readonly_plan = (self._readonly_key(step, ctx), res)
+        if readonly:
+            self._readonly_plans[slot] = (key, epochs, res)
+        self._mark_preplanned(step, ctx, res)
+        return res
+
+    def _mark_preplanned(self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs") -> None:
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
             self._cached_plan_output = res
-        return res
 
     @property
     def supports_preplan(self):
@@ -2864,12 +2939,17 @@ class KVManager(AttentionResource):
         if not step.commit:
             self._plan_epoch += 1
         rows = self._readonly_rows
-        if rows is not None and any(seg.span and seg.request_id in rows for seg in step.segments):
-            self._readonly_epoch += 1
+        if rows and any(seg.span and seg.request_id in rows for seg in step.segments):
+            self._drop_readonly_plans()
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
+            writes = self._host_writes
+            if writes is not None:
+                writes.commits += 1
+                # read by `after_output_copy` once the worker has seen this step finish
+                object.__setattr__(step, "commits", writes.commits)
             # committed, so there is nothing left to unwind
             if self._admit_reserved_pages:
                 self._forget_step_reservations(ctx)
@@ -3546,6 +3626,7 @@ class KVManager(AttentionResource):
                     copy.stream.chain.from_host += linked
                 copy.stream.host_copy = None
                 copy.stream.read_pending = copy.stream.read_future is not None
+                self._note_looked_up(copy.rid)
                 landed.append(copy)
             copy.landed = True
         self._host_copies = pending
@@ -3826,6 +3907,7 @@ class KVManager(AttentionResource):
             # unwound against whichever request is given this handle next
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
+            self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
             self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
@@ -3963,6 +4045,8 @@ class KVManager(AttentionResource):
                 refs.update(state.cpu_page_indices)
         for copy in self._host_copies:
             refs.update(copy.host_pages)
+        if self._host_writes is not None:
+            refs.update(self._host_writes.host_pages_held())
         counts = {page: host.num_owners[page] for page in owned}
         assert counts == dict(refs), (
             "host owner counts disagree with the index and requests naming the pages: "
@@ -4406,6 +4490,7 @@ class KVManager(AttentionResource):
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
+            self._note_looked_up(rid)
         if stream.read_error is not None:
             return False, AdmitRuntimeError(
                 f"KV retrieve for request {rid} label {label!r} failed: {stream.read_error_text}"

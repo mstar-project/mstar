@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.api_server.data_worker import InlineTokens, PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model
 from mstar.model.submodule_base import HostRows
@@ -103,8 +104,8 @@ class _TM:
 def _thread():
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
-        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop, communicator=_Comm(),
         tensor_manager=_TM(), model=_Model(),

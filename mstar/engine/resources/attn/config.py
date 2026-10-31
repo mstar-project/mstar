@@ -36,9 +36,10 @@ class AttentionConfig:
     # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
     # backend reads it; the others refuse it at build
     sm_scale: float | None = None
-    # FlashInfer only: combined walks whose captured steps plan their
-    # one-token rows on the decode wrapper and their prompt rows on a prefill
-    # wrapper sized to them (`FlashInferMixedWrapper`)
+    # FlashInfer only: combined walks whose captured steps run their leading
+    # one-token rows on a decode half and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
+    # every step of those walks decode first
     splits: tuple[CombinedSplit, ...] = ()
     # FlashInfer only: run one-token decode rows on the tensor-core kernel.
     # False picks the CUDA-core decode kernel, which can win for MHA and
@@ -62,6 +63,9 @@ class AttentionSpec(NodeResourceSpec):
         # the wrappers are planned against the cache's geometry, and it has to
         # be the same KVConfig the KV resource holds
         return {self.config.kv_cache}
+
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
 
     @property
     def resource_class(self) -> "type[Resource]":

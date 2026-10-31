@@ -52,6 +52,17 @@ class BaseCommunicator(ABC):
     def get_all_new_messages(self) -> list:
         pass
 
+    @abstractmethod
+    def register_event_for_poll(self, event: EventWakeup) -> None:
+        """Have ``poll_for_messages`` (and ``wait_for_work``) also end when
+        ``event`` is signalled."""
+
+    @abstractmethod
+    def poll_for_messages(self, timeout_ms: int = 20) -> bool:
+        """Block until a message is readable, the registered event fires, or
+        ``timeout_ms`` elapses, whichever comes first. True when a message is
+        waiting for ``get_all_new_messages``; a fired event is drained."""
+
     # -- endpoint scheme (shared by every ZMQ-based communicator) ------------
     # Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.
 

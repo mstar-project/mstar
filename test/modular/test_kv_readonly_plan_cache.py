@@ -14,6 +14,7 @@ import torch  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
+from mstar.engine.resources.kv.plan import PinnedIndexRing  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
 
 PAGE = 4
@@ -66,19 +67,34 @@ def _write(kv: KVManager, rid: str, n: int, ingest: bool = True, **step_kw) -> N
     kv.commit(step, ctx)
 
 
-def _read(kv: KVManager, rids: tuple[str, ...], pad: int = 2, slot: int = 0, sink=frozenset()):
-    """A captured read-only step over ``rids`` plus ``pad`` padding rows."""
-    padded = rids + tuple(f"pad{i}" for i in range(pad))
+def _read(
+    kv: KVManager, rids: tuple[str, ...], pad: int = 2, slot: int = 0, sink=frozenset(),
+    pad_name: str = "pad", preplan: bool = False,
+):
+    """A captured read-only step over ``rids`` plus ``pad`` padding rows. A
+    pre-plan is promoted by the step's own plan before the commit, as the
+    worker's GPU thread does."""
+    padded = rids + tuple(f"{pad_name}{i}" for i in range(pad))
     step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded), sink=sink)
     bucket = BucketKey(graph_walk="decode", bs=len(padded), num_tokens=len(padded))
-    ctx = StepContext(
-        request_ids=rids, graph_walk="decode", slot=slot, capture=False,
-        slot_lease=SlotLease(slot=slot, bucket=bucket),
-    )
-    ctx.set_padded_rids(padded)
-    assert kv.admit(step, ctx).ok
-    res = kv.plan(step, ctx)
-    kv.commit(step, ctx)
+
+    def ctx(is_preplan: bool) -> StepContext:
+        c = StepContext(
+            request_ids=rids, graph_walk="decode", slot=slot, capture=False,
+            slot_lease=SlotLease(slot=slot, bucket=bucket), is_preplan=is_preplan,
+        )
+        c.set_padded_rids(padded)
+        return c
+
+    first = ctx(preplan)
+    assert kv.admit(step, first).ok
+    res = kv.plan(step, first)
+    if preplan:
+        assert kv._preplanned
+        promoted = ctx(False)
+        assert kv.plan(step, promoted) is res and not kv._preplanned
+        first = promoted
+    kv.commit(step, first)
     return res
 
 
@@ -157,14 +173,84 @@ def test_a_step_with_sink_rows_plans_its_own_views(kv):
     assert kv._staged_outputs[(0, "main")] is first["main"]
 
 
-def test_another_slot_stages_the_reused_plan(kv):
+def test_each_slot_keeps_a_plan_of_its_own(kv):
+    """One entry per slot, as the staged outputs: the same step on another
+    slot builds and stages its own plan once, then reuses it there."""
     first = _read(kv, ("a", "b"), slot=0)
-    # the same step on slot 1 reuses the plan, but slot 1's static buffers
-    # do not hold it yet, so it is staged there
     assert (1, "main") not in kv._staged_outputs
-    assert _read(kv, ("a", "b"), slot=1) is first
-    assert kv._staged_outputs[(1, "main")] is first["main"]
+    other = _read(kv, ("a", "b"), slot=1)
+    assert other is not first
+    assert kv._staged_outputs[(1, "main")] is other["main"]
     assert kv._current_plan_states["main"] is kv._static_plan_state(1, "main")
+    assert _read(kv, ("a", "b"), slot=1) is other
+    assert _read(kv, ("a", "b"), slot=0) is first
+
+
+def test_slots_that_pad_with_rows_of_their_own_keep_a_plan_each(kv):
+    """Replay slots pad with their own rows, so steps that alternate slots
+    (the pre-plan's double buffer) are two keys; neither evicts the other."""
+    for pad in ("s0_", "s1_"):
+        for i in range(2):
+            kv.ingest_capture_row(f"{pad}{i}")
+    first = _read(kv, ("a", "b"), slot=0, pad_name="s0_")
+    other = _read(kv, ("a", "b"), slot=1, pad_name="s1_")
+    assert other is not first
+    assert _read(kv, ("a", "b"), slot=0, pad_name="s0_") is first
+    assert _read(kv, ("a", "b"), slot=1, pad_name="s1_") is other
+
+
+def test_a_preplanned_read_only_step_reuses_the_plan(kv):
+    first = _read(kv, ("a", "b"), preplan=True)
+    again = _read(kv, ("a", "b"), preplan=True)
+    assert again is first
+    assert kv._current_plan_states["main"] is kv._static_plan_state(0, "main")
+    # a plan made inline and one made ahead are the same entry
+    assert _read(kv, ("a", "b")) is first
+
+
+def test_a_preplan_that_is_not_promoted_plans_again(kv):
+    first = _read(kv, ("a", "b"), preplan=True)
+    padded = ("a", "b", "pad0", "pad1")
+    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded))
+    bucket = BucketKey(graph_walk="decode", bs=4, num_tokens=4)
+    ctx = StepContext(
+        request_ids=("a", "b"), graph_walk="decode", slot=1, capture=False,
+        slot_lease=SlotLease(slot=1, bucket=bucket), is_preplan=True,
+    )
+    ctx.set_padded_rids(padded)
+    assert kv.admit(step, ctx).ok
+    second = kv.plan(step, ctx)
+    assert second is not first  # slot 1 keeps an entry of its own
+    kv.clear_preplan()
+    assert _read(kv, ("a", "b")) is not first
+    assert _read(kv, ("a", "b"), slot=1) is not second
+
+
+def test_the_cached_plan_keeps_its_indptrs_while_the_ring_turns(kv):
+    """Index arrays from the pinned ring are rewritten two plans later; a
+    cached plan reads its own."""
+    kv._indptr_ring = PinnedIndexRing(numel=256, depth=2)
+    first = _read(kv, ("a", "b"))
+    qo = first["main"].cpu_indptrs.qo_indptr.clone()
+    _write(kv, "c", 5)
+    _write(kv, "d", 7)
+    assert _read(kv, ("a", "b")) is first
+    assert torch.equal(first["main"].cpu_indptrs.qo_indptr, qo)
+
+
+def test_a_plan_built_across_a_touch_of_its_rows_is_not_reused(kv, monkeypatch):
+    """A pre-plan builds on the plan thread while the main thread can tear a
+    request down: the entry keeps the epochs from before the views."""
+    build = kv._sequence_views
+
+    def touched(*args, **kwargs):
+        kv._touch_plan_cache("b")
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(kv, "_sequence_views", touched)
+    first = _read(kv, ("a", "b"))
+    monkeypatch.setattr(kv, "_sequence_views", build)
+    assert _read(kv, ("a", "b")) is not first
 
 
 def test_an_eager_write_step_is_not_staged_and_write_target_addresses_it():
