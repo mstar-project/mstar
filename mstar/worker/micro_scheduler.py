@@ -866,12 +866,8 @@ class MicroScheduler:
             exclude_target: If set, skip this (node_name, graph_walk) pair:
                 a yield-away from the speculation chain running it.
         """
-        # Expire stale hold entries; done before any early returns
-        now = time.monotonic()
-        self.held_until = {
-            rid: t for rid, t in self.held_until.items() if t > now
-        }
-        self._unpark(request_state)
+        # done before any early returns
+        self._let_rows_back(request_state)
 
         # Note: a TP follow batch has to be scheduled irrespective of failure.
         # Rank 0 already committed to this batch and will sit on the collective
@@ -1067,6 +1063,7 @@ class MicroScheduler:
         runs. Unless the chain mixes walks (`speculation_mixes`), only rows of
         its own walk are in it; another walk's rows make it yield instead.
         """
+        self._let_rows_back(request_state)
         key = self._key(*target)
         own_walk = None if self.speculation_mixes(*target) else target[1]
         backlogged = self.backlog.get(key)
@@ -1078,10 +1075,10 @@ class MicroScheduler:
         if len(request_state.per_request_info) > len(continuing):
             exclude = self.failed_rids.union(self.pending_removes, self.held_until)
             specs = [
-                spec for spec in self._ready_specs(
+                spec for spec in self._rows_here(self._ready_specs(
                     exclude, target if own_walk is not None else key, None,
-                )
-                if spec.node_name in self.parallel_leader_nodes and spec.rids
+                ))
+                if spec.rids
             ]
         queued = specs[0].rids if len(specs) == 1 else [rid for spec in specs for rid in spec.rids]
         walk_of = None
@@ -1555,6 +1552,15 @@ class MicroScheduler:
                 if self._check_ready(spec.node_name, rid, fwd_info):
                     return True
         return False
+
+    def _let_rows_back(self, request_state: RequestStateManager) -> None:
+        """Before a scan: drop the holds that have run out, and unpark the
+        rows whose capacity has freed."""
+        now = time.monotonic()
+        self.held_until = {
+            rid: t for rid, t in self.held_until.items() if t > now
+        }
+        self._unpark(request_state)
 
     def _unpark(self, request_state: RequestStateManager) -> None:
         """Let readiness ask the engine again about each parked request it has since admitted."""

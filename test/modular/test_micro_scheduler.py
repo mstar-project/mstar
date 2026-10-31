@@ -508,6 +508,40 @@ def test_the_hold_backoff_expires_before_the_backlog_is_taken():
     assert "r0" not in sched.held_until
 
 
+def test_a_row_whose_hold_ran_out_joins_the_chains_next_step():
+    """The queue scan leaves out every key of ``held_until``, so only the
+    expiry lets the row back in, and the fairness peek doesn't break the chain
+    for it. One whose hold is still running stays out."""
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.hold_requests(["r1", "r2"])
+    sched.held_until["r1"] = 0.0  # already elapsed
+    manager = _Manager(["r1", "r2"])
+
+    pick, fresh = _chain(sched, manager, ["r0"])
+
+    assert pick.taken == ["r0", "r1"]
+    assert list(fresh.request_to_worker_graph) == ["r1"]
+    assert "r1" not in sched.held_until and "r2" in sched.held_until
+
+
+def test_a_parked_row_whose_capacity_freed_joins_the_chains_next_step():
+    """Readiness answers for a parked row without asking the engine, so only
+    the unpark lets it back in, and the fairness peek reads it as not ready.
+    One the engine has yet to admit stays parked."""
+    engine = _Engine(max_bs=8)
+    engine.admit_waiting = lambda published_of: [(NODE, "r1")]
+    sched = _scheduler(engine)
+    sched.parked = {NODE: {"r1", "r2"}}
+    manager = _Manager(["r1", "r2"])
+    manager.get_fwd_info = lambda rid, partition: SimpleNamespace(resource_publish_info=None)
+
+    pick, fresh = _chain(sched, manager, ["r0"])
+
+    assert pick.taken == ["r0", "r1"]
+    assert list(fresh.request_to_worker_graph) == ["r1"]
+    assert sched.parked[NODE] == {"r2"}
+
+
 @pytest.mark.parametrize("park", ["held", "pending_remove"])
 def test_a_held_or_removed_backlog_row_waits_without_a_readiness_check(park):
     """Asking the engine reloads an offloaded row, which would OOM it again
