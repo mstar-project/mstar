@@ -21,6 +21,7 @@ a request is torn down, or a while.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 from contextlib import nullcontext
@@ -101,6 +102,12 @@ class _Scheduler:
     def take_admit_errors(self):
         return {}
 
+    def note_ran(self, batch):
+        del batch
+
+    def remember_ready(self):
+        return contextlib.nullcontext()
+
     def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
         # an admitted step lifts its refusal limit; this stub has none
         del node_name, graph_walk, rows, walks
@@ -132,7 +139,7 @@ def _rank(
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w.streaming_buffers, w._last_active = {}, {}
+    w.streaming_buffers = {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -156,7 +163,7 @@ def _rank(
             log.append(("forward", msg.body.request_id, msg.body.after_tp_seq))
 
     w.engine_manager = SimpleNamespace(
-        warmup_all=lambda: None, remove_request=_tear_down, evictable_nodes=lambda: (),
+        warmup_all=lambda: None, remove_request=_tear_down,
     )
     w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
     w.request_state = SimpleNamespace(

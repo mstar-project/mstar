@@ -2,8 +2,9 @@
 
 Whisper-family log-mel features to ~1e-4 for 80- and 128-bin banks, the
 frame-count convention (``samples // hop``), padding/trimming to the 30 s
-window, the sinusoidal position table, the FFmpeg-free file loader, and the
-FastConformer (NeMo) front end with its librosa filter bank.
+window, the sinusoidal position table, the FFmpeg-free file loader, the
+FastConformer (NeMo) front end with its librosa filter bank in both of NeMo's
+conventions, and the STFT as a matmul that captured graphs run.
 """
 
 import numpy as np
@@ -21,6 +22,7 @@ from mstar.model.components.audio_features import (
     sinusoid_positions,
     slaney_mel_filter_bank,
 )
+from mstar.model.components.fastconformer import FastConformerConfig
 
 
 def test_mel_filter_bank_matches_hf():
@@ -152,18 +154,20 @@ def test_nemo_log_mel_refuses_clips_under_two_frames():
 
 
 
+@pytest.mark.parametrize("reflect_edges", [False, True])
 @pytest.mark.parametrize("normalize", [True, False])
-def test_nemo_log_mel_batch_gives_each_clip_what_it_gets_alone(normalize):
+def test_nemo_log_mel_batch_gives_each_clip_what_it_gets_alone(normalize, reflect_edges):
     """The encoder node computes a batch's features in one pass: padding a
-    clip, and the preemphasis reaching past its end, must not change it."""
+    clip, and the preemphasis reaching past its end, must not change it; nor,
+    before NeMo 2.5, the reflection at its end, which is of its own samples."""
     torch.manual_seed(7)
     clips = [torch.randn(n) * 0.2 for n in (16_000, 5_123, 40_000, 321)]
     clips.append(torch.zeros(8_000))  # digital silence stays zero in a batch too
-    log_mel = NemoLogMel(normalize=normalize)
+    log_mel = NemoLogMel(normalize=normalize, reflect_edges=reflect_edges)
     batch = log_mel.batch(clips)
     for clip, feats in zip(clips, batch, strict=True):
         alone = log_mel.batch([clip])[0]
-        assert feats.shape == alone.shape == (clip.numel() // 160, 128)
+        assert feats.shape == alone.shape == (clip.numel() // 160 + reflect_edges, 128)
         torch.testing.assert_close(feats, alone, rtol=1e-5, atol=1e-5)
     assert torch.equal(batch[-1], torch.zeros_like(batch[-1])) or not normalize
 
@@ -171,6 +175,66 @@ def test_nemo_log_mel_batch_gives_each_clip_what_it_gets_alone(normalize):
 def test_nemo_log_mel_batch_refuses_a_clip_under_two_frames():
     with pytest.raises(ValueError, match="300 samples"):
         NemoLogMel().batch([torch.randn(16_000), torch.randn(300)])
+
+
+# 32160 samples is 201 hops, 1 mod 8: there the extra mel frame adds an encoder frame
+@pytest.mark.parametrize("n", [32_000, 32_160, 1_281])
+def test_nemo_log_mel_before_2_5_reflects_its_edges_and_keeps_the_last_frame(n):
+    """Nemotron VoiceChat's reference featurizer predates NeMo 2.5: torch.stft's
+    default reflect padding and ``samples // hop + 1`` frames, which can be one
+    more encoder frame than the 2.5 convention gives the same audio."""
+    torch.manual_seed(8)
+    wave, filters = torch.randn(n) * 0.1, torch.rand(128, 257)
+    ours = NemoLogMel(normalize=False, reflect_edges=True, mel_filters=filters)(wave)
+    # the reference's (``nemotron-labs-voicechat`` features.py): preemphasis, a centred reflect-padded STFT
+    x = torch.cat([wave[:1], wave[1:] - 0.97 * wave[:-1]])[None]
+    window = torch.hann_window(400, periodic=False)
+    spec = torch.view_as_real(torch.stft(x, 512, hop_length=160, win_length=400, window=window, return_complex=True))
+    reference = torch.log(filters @ spec.pow(2).sum(-1).sqrt().pow(2) + 2.0 ** -24)[0].T
+    assert ours.shape == reference.shape == (n // 160 + 1, 128)
+    assert torch.allclose(ours, reference, atol=1e-5)
+    after = NemoLogMel(normalize=False, mel_filters=filters)(wave)
+    assert after.shape[0] == n // 160
+    encoder = FastConformerConfig(causal=True)
+    assert (encoder.output_lengths(ours.shape[0]) > encoder.output_lengths(after.shape[0])) == (n // 160 % 8 == 1)
+
+
+@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize(("n_fft", "win", "samples"), [(512, 400, 1632), (512, 400, 1700), (512, 512, 2000),
+                                                        (256, 101, 900)])
+def test_stft_as_a_matmul_is_torch_stft(n_fft, win, samples, autocast):
+    """The matmul STFT is torch.stft's to fp32 rounding, measured against
+    float64; bf16 autocast leaves it in full precision."""
+    from mstar.model.components.dft import stft_as_real, stft_basis
+
+    torch.manual_seed(0)
+    x, window = torch.randn(3, samples), torch.hann_window(win, periodic=False)
+
+    def stft(signal):
+        return torch.view_as_real(torch.stft(signal, n_fft, hop_length=160, win_length=win, center=False,
+                                             window=window.to(signal.dtype), return_complex=True))
+
+    exact = stft(x.double())
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        got = stft_as_real(x, stft_basis(window, n_fft), n_fft, 160)
+    assert got.dtype == torch.float32 and got.shape == exact.shape
+    fp32_fft = (stft(x) - exact).abs().max()
+    assert (got - exact).abs().max() <= fp32_fft + 1e-7 * exact.abs().max()
+
+
+@pytest.mark.parametrize("n", [16, 15])
+def test_irfft_as_a_matmul_is_torch_irfft(n):
+    """The matmul inverse DFT is torch.fft.irfft's to fp32 rounding, measured
+    against float64, imaginary DC and Nyquist parts ignored as irfft ignores them."""
+    from mstar.model.components.dft import irfft_dim1
+
+    torch.manual_seed(0)
+    spec = torch.randn(4, n // 2 + 1, 50, dtype=torch.complex64)
+    exact = torch.fft.irfft(spec.to(torch.complex128), n=n, dim=-2)
+    got = irfft_dim1(spec, n)
+    assert got.dtype == torch.float32 and got.shape == exact.shape
+    fp32_fft = (torch.fft.irfft(spec, n=n, dim=-2) - exact).abs().max()
+    assert (got - exact).abs().max() <= fp32_fft + 1e-7 * exact.abs().max()
 
 def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
     from mstar.model.components import audio_features

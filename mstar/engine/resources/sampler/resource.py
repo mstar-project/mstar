@@ -8,6 +8,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.sampler.config import (
+    SAMPLED_LOGPROB,
     LoopbackState,
     SamplerSpec,
     SamplerStep,
@@ -46,10 +47,12 @@ class SamplerResource(Resource):
         max_repetition_window: int = 0,
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
+        enable_logprobs: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
+        self._enable_logprobs = enable_logprobs
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         self._max_repetition_window = max_repetition_window
         self._enable_top_p_first = enable_top_p_first
@@ -97,6 +100,10 @@ class SamplerResource(Resource):
         # recomputed per step: `admit` is on the per-step path and this only
         # moves on ingest/remove.
         self._penalty_rids: set[str] = set()
+        # Resident requests that asked for log-probs: with none, no step's
+        # log-prob rows are copied to the host.
+        self._logprob_rids: set[str] = set()
+        self._sampled_this_step = False
         self._device = device
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
@@ -149,6 +156,7 @@ class SamplerResource(Resource):
             max_repetition_window=spec.max_repetition_window,
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
+            enable_logprobs=spec.enable_logprobs,
         )
 
     def build_accelerator_graph_buffers(
@@ -181,6 +189,7 @@ class SamplerResource(Resource):
             ) if self._device.type == "cuda" else {}),
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
             loopback_state=self._loopback_state,
+            enable_logprobs=self._enable_logprobs,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -219,6 +228,8 @@ class SamplerResource(Resource):
         # after the refusals, so a refused request leaves no stale entry
         if resolved.presence_penalty != 1.0:
             self._penalty_rids.add(rid)
+        if resolved.return_logprobs:
+            self._logprob_rids.add(rid)
         if self._history is not None:
             self._history.register(rid)
         if self._cg_buffers is not None:
@@ -255,6 +266,8 @@ class SamplerResource(Resource):
                 f"{cfg.top_p_min_keep} but the node's SamplerSpec has "
                 "enable_top_p_first=False"
             )
+        if cfg.return_logprobs and not self._enable_logprobs:
+            return "asks for return_logprobs but the node's SamplerSpec has enable_logprobs=False"
         if (cfg.uses_history or cfg.uses_filter_order) and self._sampler.device.type != "cuda":
             return (
                 "asks for repetition_window, min_tokens, top_p_first or "
@@ -294,6 +307,7 @@ class SamplerResource(Resource):
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
+        self._logprob_rids.discard(rid)
         self._cached_prefix.pop(rid, None)
         if self._history is not None:
             self._history.unregister(rid)
@@ -373,6 +387,7 @@ class SamplerResource(Resource):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
             self._kept_rids = self._kept_rids_of(step, ctx)
+            self._sampled_this_step = False
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -414,6 +429,7 @@ class SamplerResource(Resource):
         if not ctx.is_preplan:
             self._cg_sampler = None
             self._step_slot = None
+            self._sampler.logprobs = None
         lease = ctx.slot_lease
         if self._cg_buffers is None or lease is None:
             return
@@ -515,6 +531,11 @@ class SamplerResource(Resource):
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
         """
+        if self._enable_logprobs:
+            # under capture this fires once, at capture; a replay never calls in
+            if self._sampled_this_step:
+                raise RuntimeError("log-probs need one sample() per step, and this node's forward samples again")
+            self._sampled_this_step = True
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
@@ -539,6 +560,17 @@ class SamplerResource(Resource):
         ):
             bufs.write_last_tokens(request_ids, tokens)
         return tokens
+
+    def step_host_rows(self) -> dict[str, torch.Tensor]:
+        """The step's log-prob rows. They assume one ``sample`` per step whose
+        token is the row's emitted one, which ``sample`` enforces while
+        log-probs are on; a node that samples more than once (a code
+        predictor) needs its own path."""
+        if not self._logprob_rids:
+            return {}
+        # a replay never calls `sample`: its rows are the slot's static ones
+        rows = self._cg_sampler.logprob_buf if self._cg_sampler is not None else self._sampler.logprobs
+        return {} if rows is None else {SAMPLED_LOGPROB: rows}
 
     def enable_device_loopback_reader(self) -> None:
         """A node of this sampler declares it reads its last sampled tokens

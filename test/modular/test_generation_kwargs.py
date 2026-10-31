@@ -26,7 +26,7 @@ def test_null_is_unset():
 @pytest.mark.parametrize("kwargs", [
     {"temperature": 0}, {"temperature": 1e6}, {"top_p": 1}, {"top_p": 1e-6},
     {"min_p": 0}, {"min_p": 1}, {"repetition_penalty": 0.5}, {"top_k": 0},
-    {"max_output_tokens": 1}, {"seed": -(2**63)}, {"ignore_eos": False},
+    {"max_output_tokens": 1}, {"seed": -(2**63)}, {"ignore_eos": False}, {"return_token_ids": True},
     {"talker_temperature": 0.9}, {"code_predictor_top_k": 50},
     {"class_temperature": 0}, {"cfg_weight": "anything: not a knob"},
 ])
@@ -55,6 +55,7 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 2**64}, "seed"),
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
+    ({"return_token_ids": 1}, "return_token_ids"),
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
@@ -188,7 +189,9 @@ def test_an_unread_key_warns_on_every_request(caplog):
     with caplog.at_level("DEBUG", logger=entrypoint.logger.name):
         for _ in range(3):
             server._report_ignored_params({"initial_prompt": "x"})
-        server._report_ignored_params({"seed": 1, "prefix_cache": True, "max_output_tokens": 4})
+        server._report_ignored_params(
+            {"seed": 1, "prefix_cache": True, "max_output_tokens": 4, "return_token_ids": True},
+        )
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
     # keys the conductor reads are never reported
     assert levels == ["WARNING"] * 3

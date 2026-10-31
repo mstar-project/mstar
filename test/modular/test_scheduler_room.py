@@ -13,8 +13,9 @@ sys.path.insert(0, ".")
 
 from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, PopRidsOutput, ReadyNodeSpec
+from mstar.model.submodule_base import StepOrder
 from mstar.utils.containers import ParallelList
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 NODE = "LLM"
 
@@ -29,6 +30,8 @@ class _Runtime:
     def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
         grouped: dict[str, list[str]] = {}
         for rid in self.walks:  # arrival order
+            if target is not None and self.walks[rid] != target[1]:
+                continue
             if rid in self.ready and rid not in exclude_rids:
                 grouped.setdefault(self.walks[rid], []).append(rid)
         return [ReadyNodeSpec(NODE, walk, rids) for walk, rids in grouped.items()]
@@ -83,6 +86,9 @@ class _Engine:
     def get_max_batch_tokens(self, node_name, graph_walk):
         return None  # no chunking
 
+    def get_step_order(self, node_name, graph_walk):
+        return StepOrder.ARRIVAL
+
     def splits_by_capture_key(self, node_name, graph_walk):
         return False
 
@@ -121,9 +127,13 @@ def test_a_walk_with_no_room_does_not_starve_the_others():
     assert "p0" in runtime.ready, "the prefill stays ready for when a slot frees"
 
 
-def test_a_full_caller_batch_still_takes_nothing():
-    """The other zero: a caller already holding a full batch for its target gets
-    None, not a batch of some other walk."""
-    sched, _, state = _setup(dict.fromkeys(("d0", "d1"), "decode"), max_bs=2)
+def test_a_chain_holding_its_full_step_still_takes_nothing():
+    """The other zero: a speculation chain whose rows hold the whole step gets
+    no rows, not a batch of some other walk."""
+    sched, _, state = _setup({"d0": "decode", "d1": "decode", "p0": "prefill"}, max_bs=2)
+    sched.note_ran(ScheduledBatch(NODE, "decode", request_to_worker_graph={"c0": 0, "c1": 0}))
 
-    assert sched.get_next_batch(state, target=(NODE, "decode"), pre_existing_batch_size=2) is None
+    chain = sched.pick_chain_step(state, (NODE, "decode"), ["c0", "c1"])
+
+    assert chain.pick.room == 2
+    assert sched.take_chain_step(state, chain) is None

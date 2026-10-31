@@ -12,7 +12,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.batch_builder import StepPick
+from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.worker import SpeculationTarget, Worker
 
 
@@ -31,7 +32,12 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
     worker._pending_removes, worker._pending_drains, worker._draining_rids = {}, {}, set()
     worker.scheduler = SimpleNamespace(
         failed_rids=set(),
-        backlog_splits_from=lambda *_: False, room_for_continuing=lambda target: None,
+        backlog_splits_from=lambda *_: False,
+        # an uncapped target: the chain keeps every row it brings
+        pick_chain_step=lambda state, target, continuing, mid_prefill=(): ChainPick(target, StepPick(
+            taken=list(continuing), continuing=list(continuing), room=None,
+            held_back=set(), ordered=False,
+        ), []),
         # the decoder isn't ready to run request 2
         _check_ready=lambda node, rid, info: rid != 2,
     )
