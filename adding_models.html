@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 30, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 31, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -2964,6 +2964,15 @@ attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under
 <code class="docutils literal notranslate"><span class="pre">text_encoder.py</span></code> (native Qwen3 hidden-state taps), <code class="docutils literal notranslate"><span class="pre">autoencoder_kl.py</span></code> (the KL VAE
 family), <code class="docutils literal notranslate"><span class="pre">image_io.py</span></code> (latent packing, PNG) and <code class="docutils literal notranslate"><span class="pre">lora.py</span></code> (static LoRA merge at load,
 also into fused <code class="docutils literal notranslate"><span class="pre">q</span></code>/<code class="docutils literal notranslate"><span class="pre">k</span></code>/<code class="docutils literal notranslate"><span class="pre">v</span></code> shards via <code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.shard_slice</span></code>).</p>
+<p>Two pieces swap a one-pass kernel in for what Inductor would emit, inside a compiled
+transformer only; eager calls run the plain PyTorch formulation, which is what a port’s
+bit-exact tests hold. <code class="docutils literal notranslate"><span class="pre">modulation.ada_layer_norm</span></code> is a block’s gated residual add,
+LayerNorm and shift/scale modulation, with the modulation given per group of tokens
+(<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">G,</span> <span class="pre">D]</span></code>: one group per sample, or per latent frame as in Wan2.2); Inductor reads a
+LayerNorm row wider than 1024 twice. <code class="docutils literal notranslate"><span class="pre">qk_norm_rope.rms_norm_rope</span></code> is the q/k RMSNorm
+across heads followed by the interleaved-pair RoPE, q and k in one launch. Both agree
+with eager to bf16 rounding rather than bitwise. Wan2.2 is the first user;
+<code class="docutils literal notranslate"><span class="pre">test/modular/test_diffusion_dit_kernels.py</span></code> holds them to the eager form.</p>
 <p>On the API side <code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>) serves
 <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for any such model (<code class="docutils literal notranslate"><span class="pre">size</span></code> becomes
 <code class="docutils literal notranslate"><span class="pre">width</span></code>/<code class="docutils literal notranslate"><span class="pre">height</span></code>, <code class="docutils literal notranslate"><span class="pre">seed</span></code> and other knobs pass through); register it under the
@@ -3276,7 +3285,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 30, 2026.
+  Last updated on Oct 31, 2026.
   <br/>
 </p>
   </div>

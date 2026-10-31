@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 30, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 31, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -1048,7 +1048,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># torch.compile the inner DiT region (patchify -&gt; blocks -&gt; head). The UniPC</span>
     <span class="c1"># solver stays eager — its CPU-resident sigma trips Inductor (see</span>
     <span class="c1"># Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates</span>
-    <span class="c1"># build with this False so the eager path stays the bit-exact reference.</span>
+    <span class="c1"># build with this False to hold the eager path against the reference.</span>
     <span class="n">compile_dit</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># "WxHxF" request shapes (width x height x num_frames) the compiled DiT</span>
     <span class="c1"># serves; None is the default shape (1280x704x81). Every other shape runs</span>
@@ -1202,7 +1202,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 30, 2026.
+  Last updated on Oct 31, 2026.
   <br/>
 </p>
   </div>

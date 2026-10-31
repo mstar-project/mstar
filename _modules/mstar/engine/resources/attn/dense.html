@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 30, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 31, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -1176,6 +1176,8 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_class</span> <span class="o">=</span> <span class="n">wrapper_class</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_wrappers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">PrefixedPrefillWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># wrapper -&gt; the (cu_q, cu_k, causal) it was last planned with</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
             <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
@@ -1297,12 +1299,12 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plans</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">plan_label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span><span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">))</span>
+            <span class="n">plan_label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_plan</span><span class="p">(</span><span class="n">kv_out</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">))</span>
             <span class="k">for</span> <span class="n">plan_label</span><span class="p">,</span> <span class="n">kv_out</span> <span class="ow">in</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
         <span class="p">}</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_build_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_out</span><span class="p">:</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">wrapper</span><span class="p">:</span> <span class="n">PrefixedPrefillWrapper</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DensePlan</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_build_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv_out</span><span class="p">:</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">slot_key</span><span class="p">:</span> <span class="n">EagerSlotKey</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DensePlan</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The per-segment gather layout plus the cumulative lengths one varlen</span>
 <span class="sd">        kernel needs, in the packed order the KV plan defined."""</span>
         <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">page_size</span>
@@ -1331,15 +1333,23 @@ window.runMermaid = runMermaid;</script>
             <span class="n">max_q</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_q</span><span class="p">,</span> <span class="n">view</span><span class="o">.</span><span class="n">to_compute</span><span class="p">)</span>
             <span class="n">max_k</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_k</span><span class="p">,</span> <span class="n">view</span><span class="o">.</span><span class="n">length</span><span class="p">)</span>
 
-        <span class="c1"># Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them</span>
-        <span class="c1"># non-blocking (from pageable memory that copy would sync the stream),</span>
-        <span class="c1"># FlashInfer's plan reads them on the host.</span>
-        <span class="n">pin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span>
-        <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">),</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_k</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">),</span>
-            <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span>
-        <span class="p">)</span>
+        <span class="c1"># A wrapper holds the schedule of its last plan until it is planned</span>
+        <span class="c1"># again (``run`` only reads it), and a denoising request keeps its</span>
+        <span class="c1"># layout from step to step, so an unchanged layout is not replanned:</span>
+        <span class="c1"># FlashInfer's plan is a device kernel plus a stream sync.</span>
+        <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">slot_key</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="n">slot_key</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
+        <span class="n">layout</span> <span class="o">=</span> <span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">cu_q</span><span class="p">),</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">cu_k</span><span class="p">),</span> <span class="n">causal</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planned</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">slot_key</span><span class="p">)</span> <span class="o">!=</span> <span class="n">layout</span><span class="p">:</span>
+            <span class="c1"># Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them</span>
+            <span class="c1"># non-blocking (from pageable memory that copy would sync the</span>
+            <span class="c1"># stream), FlashInfer's plan reads them on the host.</span>
+            <span class="n">pin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span>
+            <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_q</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">),</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu_k</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">),</span>
+                <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_planned</span><span class="p">[</span><span class="n">slot_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">layout</span>
         <span class="k">return</span> <span class="n">DensePlan</span><span class="p">(</span>
             <span class="n">segments</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">segments</span><span class="p">),</span>
             <span class="n">cu_q</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">cu_q</span><span class="p">),</span>
@@ -1474,7 +1484,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 30, 2026.
+  Last updated on Oct 31, 2026.
   <br/>
 </p>
   </div>
