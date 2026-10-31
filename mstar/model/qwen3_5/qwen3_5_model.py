@@ -179,6 +179,7 @@ class Qwen3_5DenseModel(Model):
         cache_dir: str | None = None,
         num_draft_tokens: int = 0,
         spec_sampling: bool = False,
+        draft_head: str = "bf16",
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
@@ -203,6 +204,11 @@ class Qwen3_5DenseModel(Model):
         # verify steps can also sample the target (`spec_sampling: true`),
         # at the cost of a second decode capture
         self.spec_sampling = bool(spec_sampling and num_draft_tokens)
+        # the vocabulary head a draft pass reads (`draft_head: fp8` keeps a copy
+        # in fp8, see `Fp8DraftHead`); verification always reads the checkpoint's
+        if draft_head not in ("bf16", "fp8"):
+            raise ValueError(f"draft_head={draft_head!r}: expected 'bf16' or 'fp8'")
+        self.draft_head = draft_head
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
@@ -965,6 +971,12 @@ class Qwen3_5DenseModel(Model):
         if tp_group is not None and tp_group.world_size > 1:
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
+        if self.num_draft_tokens and self.draft_head == "fp8":
+            from mstar.engine.resources.spec_decode.draft_head import Fp8DraftHead
+
+            if tp_group is not None and tp_group.world_size > 1:
+                raise ValueError("draft_head: fp8 reads one rank's whole head; serve it without TP")
+            model.draft_head = Fp8DraftHead(model.lm_head.weight)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
         return LLMSubmodule(
             model, self.config, self.vision_config,
