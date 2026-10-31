@@ -145,7 +145,7 @@ class _Serve:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(
             my_entity_id="glm52_dsa_serve", my_session_id="glm52_dsa_serve",
             transfer_engine=LocalTransferEngine("localhost"),

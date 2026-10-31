@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -69,7 +70,8 @@ def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
     kv = _specs(0)["kv"]
     kv.config.prefix_cache = prefix_cache
-    group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
+    tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(world_size)))
+    group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if world_size > 1 else None
     return RecurrentStatePool.build(
         RecurrentStateSpec(resource_key="state", nodes={NODE}, config=config),
         EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv}),

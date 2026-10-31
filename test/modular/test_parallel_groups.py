@@ -44,8 +44,8 @@ def test_shared_tp_group_with_no_sp():
     identity check saw two different objects and rejected a valid spec."""
     groups = _groups()
     tp = _tp([0, 1])
-    groups.add("llm", tp)
-    groups.add("llm_cfg", tp)
+    groups.add("llm", tp, "tp")
+    groups.add("llm_cfg", tp, "tp")
 
     assert groups.all_in_same_group(["llm", "llm_cfg"]) is True
 
@@ -53,25 +53,25 @@ def test_shared_tp_group_with_no_sp():
 def test_equivalent_tp_groups_registered_separately():
     """Same membership, distinct objects — still the same group."""
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
-    groups.add("llm_cfg", _tp([0, 1]))
+    groups.add("llm", _tp([0, 1]), "tp")
+    groups.add("llm_cfg", _tp([0, 1]), "tp")
 
     assert groups.all_in_same_group(["llm", "llm_cfg"]) is True
 
 
 def test_different_tp_groups_are_rejected():
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
-    groups.add("codec", _tp([2, 3]))
+    groups.add("llm", _tp([0, 1]), "tp")
+    groups.add("codec", _tp([2, 3]), "tp")
 
     assert groups.all_in_same_group(["llm", "codec"]) is False
 
 
 def test_remote_replicas_are_excluded_before_group_validation():
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
-    groups.add("llm_cfg_text", _tp([2, 3]))
-    groups.add("llm_cfg_img", _tp([4, 5]))
+    groups.add("llm", _tp([0, 1]), "tp")
+    groups.add("llm_cfg_text", _tp([2, 3]), "tp")
+    groups.add("llm_cfg_img", _tp([4, 5]), "tp")
 
     spec_nodes = {"llm", "llm_cfg_text", "llm_cfg_img"}
     local_nodes = spec_nodes & {"llm"}
@@ -82,7 +82,7 @@ def test_remote_replicas_are_excluded_before_group_validation():
 
 def test_tp_node_and_unparallelized_node_are_rejected():
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
+    groups.add("llm", _tp([0, 1]), "tp")
 
     assert groups.all_in_same_group(["llm", "codec"]) is False
 
@@ -90,10 +90,10 @@ def test_tp_node_and_unparallelized_node_are_rejected():
 def test_sp_is_checked_too():
     groups = _groups()
     tp = _tp([0, 1])
-    groups.add("a", tp)
-    groups.add("b", tp)
-    groups.add_sp("a", _tp([0, 1]))
-    groups.add_sp("b", _tp([2, 3]))
+    groups.add("a", tp, "tp")
+    groups.add("b", tp, "tp")
+    groups.add("a", _tp([0, 1]), "sp")
+    groups.add("b", _tp([2, 3]), "sp")
 
     assert groups.all_in_same_group(["a", "b"]) is False
 
@@ -102,19 +102,19 @@ def test_the_check_does_not_cache_groups_for_remote_nodes():
     """``spec.nodes`` names nodes this worker may not host; asking about them
     must not leave a trivial group behind for one that registers later."""
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
+    groups.add("llm", _tp([0, 1]), "tp")
 
     groups.all_in_same_group(["llm", "elsewhere"])
 
-    assert "elsewhere" not in groups.node_to_tp_group
-    assert "elsewhere" not in groups.node_to_sp_group
+    assert "elsewhere" not in groups.axis_groups["tp"]
+    assert "elsewhere" not in groups.axis_groups["sp"]
 
 
 def test_remote_replicas_with_matching_parallel_shapes_are_compatible():
     groups = _groups()
     groups.node_to_parallel_shapes = {
-        "llm": frozenset({(2, 1)}),
-        "llm_cfg": frozenset({(2, 1)}),
+        "llm": frozenset({(1, 2)}),
+        "llm_cfg": frozenset({(1, 2)}),
     }
 
     assert groups.all_have_compatible_parallel_shape({"llm", "llm_cfg"})
@@ -123,8 +123,8 @@ def test_remote_replicas_with_matching_parallel_shapes_are_compatible():
 def test_remote_replicas_with_different_parallel_shapes_are_rejected():
     groups = _groups()
     groups.node_to_parallel_shapes = {
-        "llm": frozenset({(2, 1)}),
-        "llm_cfg": frozenset({(4, 1)}),
+        "llm": frozenset({(1, 2)}),
+        "llm_cfg": frozenset({(1, 4)}),
     }
 
     assert not groups.all_have_compatible_parallel_shape({"llm", "llm_cfg"})
@@ -168,6 +168,57 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     )
 
 
+@pytest.mark.parametrize(("sizes", "groups", "rank_1"), [
+    ({"tp_size": 2}, [(0, 1), (2, 3)], {"tp": [0, 1]}),
+    ({"tp_size": 2, "sp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)], {"tp": [0, 1], "sp": [1, 3]}),
+    # cfg is outermost: [cfg][sp][tp]
+    ({"cfg_size": 2, "sp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)], {"sp": [0, 1], "cfg": [1, 3]}),
+    ({"cfg_size": 2, "tp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)], {"tp": [0, 1], "cfg": [1, 3]}),
+])
+def test_every_rank_of_an_instance_holds_the_whole_instance_as_one_group(sizes, groups, rank_1):
+    """Every agreement site (barriers, capture votes, the KV symmetry check,
+    the read-check vote) runs one host-side collective on
+    ``JointGroups.instance``, so it must span every axis, cfg included, and
+    rank it in the order the conductor and the leader election use: the
+    instance's ranks as listed. The instance is not one of the world's device
+    groups: it takes no NCCL communicator."""
+    wg = WorkerGraph(
+        section=SimpleNamespace(get_nodes=lambda: {"dit": None}),
+        graph_walks=set(), ranks=[0, 1, 2, 3], **sizes,
+    )
+    config = GlobalParallelConfig({"dit": wg}, [f"worker-{r}" for r in range(4)])
+
+    for rank in range(4):
+        view = config.per_worker_config[f"worker-{rank}"]
+        joint = view.get_joint_group_for_node("dit")
+        block = next(block for block in wg.replica_ranks if rank in block)
+        assert joint.instance.group_members == block
+        assert joint.rank == block.index(rank)
+        assert view.world_parallel_groups == groups
+    joint = config.per_worker_config["worker-1"].get_joint_group_for_node("dit")
+    for axis in ("cfg", "sp", "tp"):
+        assert getattr(joint, f"{axis}_group").group_members == rank_1.get(axis, [1])
+
+
+def test_a_lockstep_instance_refuses_a_device_collective():
+    """The instance has no device group, and torch would run ``group=None`` on
+    the whole world: a hang when the world is wider than the instance."""
+    wg = WorkerGraph(
+        section=SimpleNamespace(get_nodes=lambda: {"dit": None}),
+        graph_walks=set(), ranks=[0, 1, 2, 3], tp_size=2, sp_size=2,
+    )
+    config = GlobalParallelConfig({"dit": wg}, [f"worker-{r}" for r in range(4)])
+    instance = config.per_worker_config["worker-0"].get_joint_group_for_node("dit").instance
+    with pytest.raises(ValueError, match="host-only"):
+        instance.all_gather(torch.zeros(2))
+
+
+def test_a_group_init_dist_has_not_set_up_refuses_a_barrier():
+    """torch reads ``group=None`` as the whole world, which may be wider."""
+    with pytest.raises(ValueError, match="cpu_group"):
+        _tp([0, 1]).barrier()
+
+
 @pytest.mark.parametrize(
     ("device_type", "device_backend", "expected_backend"),
     [
@@ -187,11 +238,15 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     )
     tp = _tp([0, 1])
     sp = _tp([0, 1])
-    groups.add("llm", tp)
-    groups.add("llm_cfg", tp)
-    groups.add_sp("llm", sp)
+    groups.add("llm", tp, "tp")
+    groups.add("llm_cfg", tp, "tp")
+    groups.add("llm", sp, "sp")
     singleton = CommGroup.trivial()
-    groups.add("codec", singleton)
+    groups.add("codec", singleton, "tp")
+    # a one-axis instance shares its axis's gloo group; a wider one gets its own
+    pair, block = _tp([0, 1]), _tp([0, 1, 2, 3])
+    groups.node_to_instance_comm.update(llm_cfg=pair, llm=block)
+    groups.node_to_instance_groups.update(llm_cfg=frozenset({(0, 1)}), llm=frozenset({(0, 1, 2, 3)}))
     calls = []
     handles = {}
     devices = []
@@ -223,10 +278,15 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     timeout = communication.default_group_timeout(expected_backend)
     assert store_calls == [("test://world", 0, 4, timeout)]
 
-    # gloo twins first, then the device groups. Rank 0 isn't in (2, 3), so it
-    # makes a gloo group of just itself there.
+    # The gloo groups first, axis twins and the instance in one sorted order,
+    # then the device groups. Rank 0 isn't in (2, 3), so it makes a gloo group
+    # of just itself there. On XPU the instance is the world's mixed group and
+    # an axis's device group is its cpu group.
     gloo = {"backend": "gloo", "use_local_synchronization": True}
-    expected_group_calls = [] if device_type == "xpu" else [((0, 1), gloo), ((0,), gloo)]
+    if device_type == "xpu":
+        expected_group_calls = [((0, 1, 2, 3), {})]
+    else:
+        expected_group_calls = [((0, 1), gloo), ((0, 1, 2, 3), gloo), ((0,), gloo)]
     expected_group_calls += [((0, 1), {}), ((2, 3), {})]
     assert calls == [
         {
@@ -236,6 +296,9 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
         },
         *expected_group_calls,
     ]
+    instance_backend = None if device_type == "xpu" else "gloo"
+    assert pair.cpu_group is tp.cpu_group and pair.device_group is None
+    assert block.cpu_group is handles[((0, 1, 2, 3), instance_backend)] and block.device_group is None
     assert devices == ([] if device_type == "cpu" else [device])
     for group in (tp, sp):
         assert group.initialized

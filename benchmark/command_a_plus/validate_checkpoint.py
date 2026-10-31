@@ -167,7 +167,7 @@ class Runtime:
         transfer = TransferEngineInfo(f"validation_{group.rank}", "validation", LocalTransferEngine("localhost"))
         self.resources = {key: build_resource(spec, EngineResourceInfo(
             device=torch.device("cuda", group.rank), kv_dtype=torch.bfloat16,
-            joint_comm_group=JointGroups(group, CommGroup.trivial()), transfer_engine_info=transfer,
+            joint_comm_group=JointGroups(group, CommGroup.trivial(), group), transfer_engine_info=transfer,
             dependencies={dep: specs[dep] for dep in spec.depends_on()},
         )) for key, spec in specs.items()}
         self.runner = StepRunner(self.resources)

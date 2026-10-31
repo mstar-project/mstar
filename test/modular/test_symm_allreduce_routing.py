@@ -3,8 +3,11 @@ go through symmetric memory."""
 
 from __future__ import annotations
 
+import gc
 import logging
+import pickle
 import sys
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -37,8 +40,8 @@ class _FakeSymm(AllReduce):
 
     instances: list[_FakeSymm] = []
 
-    def __init__(self, device_group, device, max_bytes):
-        super().__init__(device_group)
+    def __init__(self, group, device, max_bytes):
+        self.group = group
         self.device = device
         self.max_bytes = max_bytes
         _FakeSymm.instances.append(self)
@@ -117,7 +120,18 @@ def test_symm_modes_build_it_with_default_cutoff(fake_cuda, mode):
     assert backend is _FakeSymm.instances[0]
     assert backend.max_bytes == 512 * 1024
     assert backend.mode == mode.strip().lower()
-    assert backend.device_group is g.device_group
+    assert backend.group is g
+
+
+def test_a_dropped_group_is_freed_without_gc():
+    # a cycle with its backend would keep the process group, and gloo's threads, alive
+    gc.disable()
+    try:
+        # in a local, as pytest's assert rewriting would hold the group itself
+        ref = weakref.ref(_group())
+        assert ref() is None
+    finally:
+        gc.enable()
 
 
 def test_single_rank_and_no_cuda_skip(monkeypatch):
@@ -168,14 +182,14 @@ def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
     )
     tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
     sp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3])
-    groups.add("llm", tp)
-    groups.add("llm_cfg", tp)  # same object twice: set up once
-    groups.add_sp("llm", sp)
+    groups.add("llm", tp, "tp")
+    groups.add("llm_cfg", tp, "tp")  # same object twice: set up once
+    groups.add("llm", sp, "sp")
     groups.init_dist(device=torch.device("cpu"))
 
     assert len(_FakeSymm.instances) == 2
-    assert tp._all_reduce.device_group is pgs[0]
-    assert sp._all_reduce.device_group is pgs[1]
+    assert tp._all_reduce.group is tp and tp.device_group is pgs[0]
+    assert sp._all_reduce.group is sp and sp.device_group is pgs[1]
 
 
 # --- the deployment config's tp_allreduce -----------------------------------
@@ -215,7 +229,7 @@ def test_init_dist_takes_the_config_mode(monkeypatch, fake_cuda):
         world_parallel_groups=[(0, 1)], tp_allreduce="symm_multimem",
     )
     tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
-    groups.add("llm", tp)
+    groups.add("llm", tp, "tp")
     groups.init_dist(device=torch.device("cpu"))
     assert tp._all_reduce.mode == "symm_multimem"
 
@@ -230,6 +244,9 @@ def test_global_config_hands_it_to_every_worker(tp_allreduce):
         {"wg": wg}, ["worker_0", "worker_1"], tp_allreduce=tp_allreduce
     )
     assert [w.tp_allreduce for w in cfg.per_worker_config.values()] == [tp_allreduce] * 2
+    # the conductor hands each worker its config through a spawned process
+    assert all(pickle.loads(pickle.dumps(w)).tp_allreduce == tp_allreduce
+               for w in cfg.per_worker_config.values())
 
 
 @pytest.fixture
@@ -272,7 +289,7 @@ def _multimem(monkeypatch, fake_symm_mem, calls: list) -> MultimemAllReduce:
         multimem_all_reduce_=lambda buf, op, group: calls.append(("multimem_all_reduce_", buf)),
     )
     monkeypatch.setattr(torch.ops, "symm_mem", ops, raising=False)
-    return MultimemAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024)
+    return MultimemAllReduce(_group(), torch.device("cpu"), 512 * 1024)
 
 
 @pytest.mark.parametrize("extra_bytes, kernel", [
@@ -311,7 +328,7 @@ def test_one_shot_writes_the_sum_into_the_input(monkeypatch, fake_symm_mem):
     monkeypatch.setattr(torch.ops, "symm_mem", SimpleNamespace(
         one_shot_all_reduce=lambda buf, op, group: torch.full_like(buf, 7),
     ), raising=False)
-    symm = OneShotAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024)
+    symm = OneShotAllReduce(_group(), torch.device("cpu"), 512 * 1024)
     x = torch.ones(8, dtype=torch.bfloat16)
     assert symm._reduce(x) is x
     assert bool((x == 7).all())
@@ -325,7 +342,7 @@ def _multimem_group(monkeypatch, fake_symm_mem, calls: list) -> CommGroup:
         multimem_all_reduce_=lambda buf, op, group: calls.append(("split", None)),
     ), raising=False)
     g = _group()
-    g._all_reduce = MultimemAllReduce(g.device_group, torch.device("cpu"), 512 * 1024)
+    g._all_reduce = MultimemAllReduce(g, torch.device("cpu"), 512 * 1024)
     return g
 
 
@@ -403,7 +420,7 @@ def symm_group(monkeypatch, fake_symm_mem):
 
     def make(max_bytes: int = 1024) -> tuple[CommGroup, list]:
         g = _group()
-        backend = OneShotAllReduce(g.device_group, torch.device("cpu"), max_bytes)
+        backend = OneShotAllReduce(g, torch.device("cpu"), max_bytes)
         routed: list = []
         monkeypatch.setattr(backend, "_reduce", lambda t: routed.append(t) or t)
         g._all_reduce = backend

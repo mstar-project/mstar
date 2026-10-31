@@ -27,6 +27,5 @@ node_groups:
   - node_names:
       - dit
     ranks: [0, 1]
-    # a two-rank lockstep instance; Wan2.2's dit uses it for the CFG branches,
-    # not to split the sequence
-    sp_size: 2
+    # one classifier-free-guidance branch per rank
+    cfg_size: 2
