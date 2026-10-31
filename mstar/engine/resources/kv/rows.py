@@ -156,7 +156,7 @@ class KVRows(RowFills):
                     raise ValueError(
                         f"{rid}/{label} holds {held.n} pages, more than a row's {self.max_pages}"
                     )
-                out[i, :held.n] = held.array()
+                out[i, :held.n] = held.tolist()
             rows.write(lens, d.join_slots, stored)
             rows.write(pages, d.join_slots, out)
 
