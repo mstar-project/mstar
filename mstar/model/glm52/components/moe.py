@@ -83,10 +83,9 @@ class Glm52SparseMoeBlock(nn.Module):
         # Resolved on the real device by process_weights_after_loading;
         # blocks used without the load hook (CPU tests) stay on reference.
         self._use_fused = False
-        # on the fused path: the decode chain up to _DECODE_MAX_TOKENS (w8a16, fp32 routing
-        # weights) and the router kernel (ids can differ at exact ties, weights by an ulp)
-        # change numerics, so only kernels: auto takes them; the prefill kernels above it are
-        # the runner's bits with wider tiles, so every fused block does
+        # the decode chain (w8a16, fp32 routing weights) and the router kernel (ids can differ
+        # at exact ties, weights by an ulp) change numerics, so only kernels: auto takes them;
+        # the prefill kernels keep the runner's bits, so every fused block does
         self._decode_kernel = tuned
         self._router_kernel = tuned
         self._prefill_kernel = True
@@ -145,9 +144,8 @@ class Glm52SparseMoeBlock(nn.Module):
             )
         self._attach_expert_weight_loaders()
 
-        # One all-reduce per block instead of two under kernels: auto: the shared expert's
-        # per-rank partial is summed with the routed partial and reduced once. Sum-then-reduce
-        # rounds differently from reduce-then-sum in bf16, so the reference reduces each.
+        # kernels: auto sums the shared and routed partials and reduces once; sum-then-reduce
+        # rounds differently from reduce-then-sum in bf16, so the reference reduces each
         self._fused_allreduce = self.tp_size > 1 and tuned
         # the two partials are summed before any reduce: one here, or none
         self._sum_partials = self.tp_size > 1 and (self._fused_allreduce or not reduce_results)
@@ -258,7 +256,6 @@ class Glm52SparseMoeBlock(nn.Module):
         shared = self.shared_expert(flat)
         out = routed + shared
         if self._sum_partials and self.reduce_results:
-            # Both terms are per-rank partials here; one reduce for the sum.
             out = self.comm_group.all_reduce(out)
         return out.view(input_shape)
 
@@ -364,9 +361,8 @@ class Glm52SparseMoeBlock(nn.Module):
         return final
 
     def process_weights_after_loading(self, device) -> None:
-        """Resolve reference-vs-fused dispatch on the real device: kernels: auto probes for
-        the fused path (and serves the reference loop where it can't run, with a warning and
-        no CUDA graphs), kernels: reference keeps the bitwise loop."""
+        """Resolve the dispatch on the real device: kernels: auto takes the fused path where
+        it runs (else the reference loop, eager, with a warning), kernels: reference the loop."""
         self.gate.finalize_weights()
         if not self.fp8_experts:
             return

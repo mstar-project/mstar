@@ -1,19 +1,13 @@
-"""fp8 block-scale linears for a checkpoint's non-expert weights: ``x @ (w * s).T``.
+"""fp8 block-scale linears, ``x @ (w * s).T``, for the non-expert weights a checkpoint stores as
+e4m3 with one fp32 scale per 128 x 128 block: a decode step reads half the bytes of bf16 copies.
 
-The checkpoint stores the attention projections, the shared expert and the dense-layer MLPs
-as e4m3 with one fp32 scale per 128 x 128 block. Kept that way, a decode step reads half the
-bytes of the bf16 copies.
+Decode batches meet the weights as bf16 (w8a16): a few tokens as fp32 FMAs on weights converted
+in registers (fused_moe.decode's per-pair GEMV), more as a bf16 ``tl.dot`` per scale block
+(e4m3 to bf16 is exact). The last program of an output tile sums its split-K partials in split
+order, so the result does not depend on scheduling. Larger batches quantize x to e4m3 per 128
+columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's.
 
-Decode batches (up to ``_W8A16_MAX_TOKENS`` tokens) meet the weights as bf16 (w8a16): up to
-2-4 tokens as fused_moe.decode's per-pair GEMV, fp32 FMAs on weights converted in registers with
-each block's scale folded into x; above that a bf16 ``tl.dot`` per 128-column block with the
-weight rows on its M side (e4m3 to bf16 is exact), scaled per block in fp32. Narrow outputs
-split K across programs; the last program of an output tile to finish sums the partials in
-split order, so the result does not depend on scheduling. Larger batches quantize x to e4m3
-per 128 columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's for prefill.
-
-With ``glu`` the weight is ``[gate; up]`` stacked on its rows and the output is
-``silu(x @ gate.T) * (x @ up.T)``.
+With ``glu`` the weight is ``[gate; up]`` on its rows and the output ``silu(x @ gate.T) * (x @ up.T)``.
 """
 from __future__ import annotations
 
@@ -29,15 +23,13 @@ from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
 
-# Tokens up to which w8a16 is the fastest (H100): the shared expert's small GEMMs keep it
-# longer. Above, W8A8: flashinfer's SM90 block-scale GEMM up to _FI_MAX_TOKENS, cuBLAS's
-# block-scaled GEMM beyond.
+# Tokens up to which w8a16 is the fastest (H100); the shared expert's small GEMMs keep it
+# longer. Above, flashinfer's GEMM up to _FI_MAX_TOKENS, cuBLAS's beyond.
 _W8A16_MAX_TOKENS = 32
 _W8A16_MAX_TOKENS_BY_SHAPE = {(256, 6144, True): 128, (6144, 256, False): 128}
 # The same per GPU model where it differs (H100 and H200 are both SM90), applied only where
-# flashinfer's GEMM runs. GLM-5.2's o_proj and dense-layer down on one H200, cold weights, us a
-# call at 4 / 8 / 16 tokens: w8a16 10.3 / 11.1 / 9.8 and 9.3 / 9.3 / 8.7, flashinfer
-# 8.0 / 8.0 / 8.1 and 7.5 / 7.6 / 7.6.
+# flashinfer's GEMM runs: on an H200 it beats w8a16 at 4-16 tokens on GLM-5.2's o_proj and
+# dense-layer down (~8 vs ~10 us a call, cold weights).
 _W8A16_MAX_TOKENS_BY_GPU = {
     "NVIDIA H200": {(6144, 2048, False): 2, (6144, 1536, False): 2},
 }
@@ -289,8 +281,8 @@ def _counters(device: torch.device) -> torch.Tensor:
     return _COUNTERS[device]
 
 
-# One TP8 rank's linears, (output columns, K, glu) -> tokens bucket -> (DOT, BN, BK, SPLIT,
-# STAGES, warps[, TB]), the fastest of a sweep on H100 (cold graph replay).
+# GLM-5.2's linears at one TP8 rank, (output columns, K, glu) -> tokens bucket -> (DOT, BN, BK,
+# SPLIT, STAGES, warps[, TB]), the fastest of a sweep on H100 (cold graph replay).
 _FMA, _DOT = False, True
 _TILES = {
     (2624, 6144, False): {  # q_a + kv_a, replicated

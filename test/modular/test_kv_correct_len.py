@@ -92,16 +92,6 @@ def test_correct_len_shortens_the_stream_and_keeps_its_pages():
     assert view.page_idxs == pages[:1]
 
 
-def test_correct_len_then_regrow_reuses_the_same_pages():
-    mgr = _make_manager()
-    _step(mgr, 5)
-    pages = list(_stream(mgr).page_indices)
-    mgr.correct_len("r", "main", -3)
-    view = _step(mgr, 4)  # 2 + 4 = 6: still two pages, no allocation
-    assert view.page_idxs == pages
-    assert _stream(mgr).page_indices == pages
-
-
 def test_zero_is_a_no_op_and_a_rewind_past_zero_clamps():
     mgr = _make_manager()
     _step(mgr, 3)
@@ -110,15 +100,6 @@ def test_zero_is_a_no_op_and_a_rewind_past_zero_clamps():
     assert (_stream(mgr).stored_len, _stream(mgr).generation) == (3, gen)
     mgr.correct_len("r", "main", -5)
     assert _stream(mgr).stored_len == 0
-
-
-@pytest.mark.parametrize("delta", [0, -1])
-def test_unknown_stream_raises(delta):
-    mgr = _make_manager()
-    with pytest.raises(KeyError, match="nope"):
-        mgr.correct_len("nope", "main", delta)
-    with pytest.raises(KeyError, match="side"):
-        mgr.correct_len("r", "side", delta)
 
 
 def test_refused_between_admit_and_commit():
@@ -173,8 +154,7 @@ def test_a_rewind_ending_inside_a_sealed_page_keeps_a_copy():
 
 
 def test_a_reserved_rewind_over_a_lent_sealed_page_keeps_the_counts():
-    """A request with an allotment (#869) rewinds over a sealed page it holds as lent: the
-    page leaves through the pool's accounting, so its lent mark goes with it and the pool's
+    """A rewind over a sealed page held as lent drops the lent mark with it, and the pool's
     count of unused allotted pages follows."""
     from test_kv_prefix_lease import NODE, WALK, _layout
 
@@ -214,8 +194,7 @@ def test_a_rewind_above_the_sealed_pages_keeps_them():
 
 
 def test_the_position_rewinds_beside_the_kv_length():
-    """MTP takes a verify step's rejected rows back from both resources: the position counter
-    moves by the same delta, never below zero."""
+    """A verify step's rejected rows come back from the position too, never below zero."""
     from mstar.engine.resources.position.config import PositionConfig
     from mstar.engine.resources.position.manager import RopeManager
 

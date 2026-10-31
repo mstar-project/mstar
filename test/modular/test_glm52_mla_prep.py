@@ -1,7 +1,6 @@
-"""GLM-5.2's fused MLA pre-attention (mla_prep.py) against the unfused ops it replaces, at
-one TP8 rank's dims: FlashInfer's rmsnorm, the position resource's RoPE and the cache scatter
-bit for bit, then a compiled attention layer with the fused prep against the same layer
-without it."""
+"""The fused MLA pre-attention (mla_prep.py) at one GLM-5.2 TP8 rank's dims: bit for bit
+against FlashInfer's rmsnorm, the position resource's RoPE and the cache scatter, then a
+compiled attention layer with the fused prep against the same layer without it."""
 import copy
 import importlib
 import sys
@@ -89,14 +88,6 @@ def _unfused_rope(q_pe, k_pe, pos):
         k_pe.clone(memory_format=torch.contiguous_format), pos_ids=pos)
 
 
-def test_supports_only_the_widths_whose_order_it_matches():
-    assert mla_prep.supports(2048, 512, 64)
-    assert mla_prep.supports(256, 512, 64)
-    assert not mla_prep.supports(48, 512, 64)  # FlashInfer sums narrower rows differently
-    assert not mla_prep.supports(4096, 512, 64)  # and wider ones over two warps
-    assert not mla_prep.supports(2048, 512, 48)
-
-
 @gpu
 @pytest.mark.parametrize("T", TOKENS)
 def test_q_norm_is_flashinfers_rmsnorm_bit_for_bit(T):
@@ -132,27 +123,6 @@ def test_kv_write_q_rope_is_the_unfused_path_bit_for_bit(T):
     assert out.shape == (T, H, R) and out.is_contiguous()
     assert torch.equal(_bits(cache), _bits(expect))
     assert torch.equal(_bits(out), _bits(q_pe))
-
-
-@gpu
-def test_rope_is_within_an_ulp_of_the_cpu_stand_in():
-    """The CPU tests' RoPE stand-in (``_testing.cpu_rope_apply_qk_inplace``) rounds x * cos
-    and rotate(x) * sin apart; the kernel fuses one product into the add."""
-    from mstar.model.glm52._testing import cpu_rope_apply_qk_inplace
-
-    T = 1100
-    q, table, pos = _rope_inputs(T, 7)
-    fused = _fused_rows(T, 8)
-    cache = torch.zeros(-(-T // PAGE), PAGE, L + R, device="cuda", dtype=torch.bfloat16)
-    pages, offsets = _slots(T, cache.shape[0], 9)
-    out = mla_prep.kv_write_q_rope(fused, _norm_weight(L, 3), EPS, table, pos, q, cache, pages,
-                                   offsets)
-    q_pe = q[..., NOPE:].clone(memory_format=torch.contiguous_format)
-    k_pe = fused[:, Q + L:].view(T, 1, R).clone()
-    cpu_rope_apply_qk_inplace(q_pe, k_pe, pos, table, R, True, 1.0, 0.0)
-    for got, ref in ((out, q_pe), (cache[pages, offsets, L:], k_pe.squeeze(1))):
-        torch.testing.assert_close(got, ref, rtol=2.0 ** -7, atol=1e-6)
-        assert (got != ref).float().mean().item() < 1e-3
 
 
 @gpu

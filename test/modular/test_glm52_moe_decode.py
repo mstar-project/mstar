@@ -1,6 +1,7 @@
-"""GLM-5.2 small-batch MoE decode kernels (moe_decode): what kernels picks and the block
-wiring on CPU; accuracy vs an fp32 dequantized oracle, routing and graph replay on CUDA, at one TP8
-rank's shapes (H 6144, 256 experts, top-8, 256 intermediate per rank)."""
+"""GLM-5.2's MoE block on the fused paths at one TP8 rank's shapes (H 6144, 256 experts, top-8,
+256 intermediate per rank), on CUDA: the decode chain against an fp32 dequantized oracle, its
+routing and graph replay, and the prefill kernels against the runner. On CPU, the switches
+kernels replaced are refused."""
 import importlib.util
 import sys
 import types
@@ -29,69 +30,23 @@ def _cpu_flashinfer_without_the_real_one(monkeypatch):
 
 
 from mstar.model.components.moe import NoAuxTcRouter  # noqa: E402
-from mstar.model.glm52.components import moe as moe_module  # noqa: E402
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
+from mstar.model.glm52.glm52_model import _RETIRED_KWARGS, Glm52Model  # noqa: E402
 from mstar.utils.fp8_block import Fp8BlockQuantConfig, dequantize_fp8_block_weight  # noqa: E402
 
 BLOCK = (128, 128)
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="moe_decode kernels need CUDA")
 
 
-def test_kernels_pick_the_decode_and_router_kernels():
-    """kernels: auto (the default) takes the decode chain and the router kernel on the fused
-    path, the reference neither; the prefill kernels, the runner's bits, serve both."""
-    from mstar.model.glm52.glm52_model import Glm52Model
-
-    assert Glm52ModelConfig().kernels == "auto"
-    assert Glm52Model("unused", config_variant="reduced_fp8", kernels="reference").config.kernels == "reference"
-    for retired in ("moe_decode_kernel", "moe_quant_kernel", "moe_prefill_kernel"):
-        with pytest.raises(ValueError, match=retired):
-            Glm52Model("unused", config_variant="reduced_fp8", **{retired: True})
-    with pytest.raises(ValueError, match="kernels"):
-        Glm52Model("unused", config_variant="reduced_fp8", kernels="triton")
-    cfg = Glm52ModelConfig.reduced_fp8(block=(16, 16))
-    block = Glm52SparseMoeBlock(cfg)
-    assert block._decode_kernel and block._router_kernel and block._prefill_kernel
-    cfg.kernels = "reference"
-    block = Glm52SparseMoeBlock(cfg)
-    assert not block._decode_kernel and not block._router_kernel and block._prefill_kernel
-
-
-def test_use_decode_needs_the_fused_path_and_a_cuda_batch():
-    cfg = Glm52ModelConfig.reduced_fp8(block=(16, 16))
-    block = Glm52SparseMoeBlock(cfg)
-    for p in block.parameters():
-        if p.dtype == torch.uint8:
-            p.data.copy_((torch.randn(p.shape) * 0.1).to(torch.float8_e4m3fn).view(torch.uint8))
-        else:
-            p.data.normal_(0, 0.05)
-    block.process_weights_after_loading("cpu")  # reference: no fused path
-    x = torch.randn(2, cfg.hidden_size) * 0.1
-    assert not block._use_decode(x.bfloat16())
-    assert torch.isfinite(block(x)).all()
-    block._use_fused = True
-    assert not block._use_decode(x.bfloat16())  # host tensor
-
-
-def test_dispatch_prefill_is_compiler_disabled():
-    fn = Glm52SparseMoeBlock._dispatch_prefill
-    assert hasattr(fn, "_torchdynamo_disable") or hasattr(fn, "_torchdynamo_orig_callable")
-
-
-def test_forward_decode_is_compiler_disabled():
-    """The PDL launch chain stays outside dynamo (the captured decode is compiled)."""
-    fn = Glm52SparseMoeBlock._forward_decode
-    assert hasattr(fn, "_torchdynamo_disable") or hasattr(fn, "_torchdynamo_orig_callable")
-
-
-def test_router_split_fits_glm52_hidden():
-    moe_decode = pytest.importorskip("mstar.utils.fused_moe.decode")
-    for tuning in (moe_decode._H100, moe_decode._H200):
-        for h in (6144, 4096, 512, 384, 128):
-            splits, bk = moe_decode._router_split(h, tuning)
-            assert h % (splits * bk) == 0 and bk >= 16
-    assert moe_decode._router_split(6144, moe_decode._H100) == (12, 128)
+@pytest.mark.parametrize("kwargs", [*({k: True} for k in _RETIRED_KWARGS), {"kernels": "triton"}],
+                         ids=[*_RETIRED_KWARGS, "unknown-kernels"])
+def test_retired_switches_and_unknown_kernels_are_refused(kwargs):
+    """A config naming a switch that kernels replaced, or an unknown kernels value, would
+    otherwise serve without what it asks for."""
+    (key,) = kwargs
+    with pytest.raises(ValueError, match=key):
+        Glm52Model("unused", config_variant="reduced_fp8", **kwargs)
 
 
 # ---------------------------------------------------------------- CUDA
@@ -237,7 +192,6 @@ def test_decode_matches_oracle_at_rank_shapes(rank_block, tokens, fp32_matmul):
     grouped = tokens > _pair_max()
     _assert_near_oracle(got, oracle, grouped)
     new_err, old_err = _rel_err(got, oracle[0]), _rel_err(old, oracle[0])
-    print(f"tokens {tokens}: max|err|/max|ref| current {old_err:.2e} decode {new_err:.2e}")
     assert new_err * 4 <= old_err
     # the chained forward routes with the kernel router: same experts, weights to ~1e-7
     _assert_near_oracle(chained, oracle, grouped)
@@ -299,29 +253,6 @@ def test_odd_expert_count_and_top_k(tokens, fp32_matmul):
 
 
 @gpu
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16, 32, 64])
-def test_router_matches_the_fp32_gate(rank_block, tokens, fp32_matmul):
-    from mstar.utils.fused_moe import decode as moe_decode
-
-    gate = rank_block.gate
-    for seed in range(3):
-        torch.manual_seed(seed)
-        x = torch.randn(tokens, gate.hidden_size, device="cuda", dtype=torch.bfloat16)
-        with torch.no_grad():
-            w, ids = moe_decode.route(
-                x, gate.weight, gate.e_score_correction_bias, top_k=gate.top_k,
-                scale=gate.routed_scaling_factor, normalize=gate.norm_topk_prob)
-            w_r, ids_r, _ = gate(x)
-        assert w.dtype == torch.float32 and ids.dtype == torch.int64
-        # same experts per token (the reference's topk order is unspecified)
-        ids, order = ids.sort(dim=-1)
-        ids_r, order_r = ids_r.sort(dim=-1)
-        torch.testing.assert_close(ids, ids_r, rtol=0, atol=0)
-        torch.testing.assert_close(w.gather(1, order), w_r.gather(1, order_r),
-                                   rtol=1e-5, atol=1e-6)
-
-
-@gpu
 def test_router_fp32_operands_and_odd_sizes(fp32_matmul):
     from mstar.utils.fused_moe import decode as moe_decode
 
@@ -361,28 +292,6 @@ def test_routing_weights_stay_fp32(rank_block, tokens):
         chained = block(x)
     assert not torch.equal(exact, rounded)
     torch.testing.assert_close(chained, exact, rtol=0, atol=0)
-
-
-@gpu
-def test_large_batch_and_flag_off_take_the_current_path(rank_block):
-    from mstar.utils.fused_moe import fused_experts_fp8
-
-    block = rank_block
-    for tokens in (moe_module._DECODE_MAX_TOKENS + 1, 4):
-        x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
-        with torch.no_grad():
-            if tokens > moe_module._DECODE_MAX_TOKENS:
-                assert not block._use_decode(x)
-                got = block(x)
-            else:
-                got = _current(block, x)
-            topk_w, topk_ids, _ = block.gate(x)
-            exp = block.experts
-            old = fused_experts_fp8(
-                x, exp.gate_up_proj_fp8, exp.down_proj_fp8, exp.gate_up_proj_scale_inv,
-                exp.down_proj_scale_inv, topk_w, topk_ids,
-                block_size=block.block_size) + block.shared_expert(x)
-        torch.testing.assert_close(got, old, rtol=0, atol=0)
 
 
 @gpu

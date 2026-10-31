@@ -50,7 +50,6 @@ from mstar.utils.h2d import PinnedStager
 logger = logging.getLogger(__name__)
 
 _MAIN = "main"
-# How long the host waits for an MTP step to stage its verdict before giving up.
 _VERDICT_TIMEOUT_S = 120.0
 
 
@@ -76,8 +75,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # MTP: a decode step drafts k tokens, verifies them with the last emitted token and
-        # seeds the next step, all in one captured graph; the eager fallback stays uncompiled
+        # an MTP decode step is one captured graph; the uncaptured fallback runs eager
         self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
@@ -108,8 +106,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_trimmed: dict[str, int] = {}
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Acceptance instrumentation: raw emitted tokens (n_accepted + 1,
-        # pre-truncation), request-step count, n_accepted histogram.
+        # acceptance stats for the periodic log line, before the max_tokens and stop cuts
         self._mtp_stat_emitted = 0
         self._mtp_stat_steps = 0
         self._mtp_stat_logged = 0
@@ -361,9 +358,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # the handle, which the batch, check_stop and cleanup_request key by
             rid = fwd_info.rid_handle
             sampling = fwd_info.resource_configs[SAMPLER_RESOURCE]
-            # Greedy-only: decode drafts and verification bypass the sampler,
-            # so a temperature would be silently ignored and a repetition
-            # penalty would move even the prefill argmax. Refuse this rid.
+            # greedy only: the drafts and the verify bypass the sampler, so a temperature
+            # would be ignored, and a repetition penalty would move even the prefill's argmax
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise RuntimeError(
                     f"request {fwd_info.request_id}: MTP speculative decoding is greedy-only "
@@ -392,12 +388,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
 
     def _clamp_token_budget(self, engine_inputs: ModelInputsFromEngine, rid: str, room: int) -> None:
-        """Under MTP, cap the request's max_tokens at what fits before the
-        context limit, so decode stops there (check_stop, the verify
-        truncation) instead of tripping preprocess's guard mid-batch. The
-        conductor holds prompt plus max_tokens to the window at one row per
-        decode step; a verify step writes a whole block. ``room`` is the
-        prompt-aware count, known only once the prefill rows are declared."""
+        """Under MTP, cap max_tokens at what fits before the context limit, so decode stops
+        there rather than tripping preprocess's guard mid-batch: the conductor budgets one row
+        per decode step, a verify step writes a whole block. ``room`` counts from the prompt,
+        known once the prefill is declared."""
         info = (getattr(engine_inputs, "per_request_info", None) or {}).get(rid)
         asked = getattr(info, "max_tokens", None)
         if asked is None:
@@ -456,10 +450,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     "decode-only."
                 )
         # Every per-step index in one pinned H2D (a pageable torch.tensor(..., device=cuda)
-        # drains the stream before the step even starts): on prefill each request's last row
-        # (for an eager prefill, when no plan buffer carries qo_indptr); under MTP the seed
-        # slots (padding and capture rows read and write the sink) and, on decode, the
-        # step's number.
+        # drains the stream before the step starts): each prefill request's last row, the MTP
+        # seed slots (padding and capture rows use the sink) and an MTP decode's step number.
         fields = {}
         if graph_walk == "prefill":
             fields["last_token_indices"] = [end - 1 for end in itertools.accumulate(seq_lens)]
@@ -882,8 +874,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # in-step truncation (MTP) leaves a stop id only as the LAST element
         is_eos = tokens[-1] in self.config.eos_token_ids
         if self.mtp_k > 0:
-            # multi-token emission: totals live in the per-request counter (loop iters no
-            # longer count tokens)
+            # a verify step emits several tokens: count them, not the loop's iterations
             generated = self._mtp_checked.get(request_id, 0) + len(tokens)
             self._mtp_checked[request_id] = generated
         else:

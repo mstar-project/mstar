@@ -1,7 +1,6 @@
 """Which GPUs the GLM-5.2 kernels' paths apply to. The GPU checks go through
 ``current_platform``: an AMD GPU reports a CUDA-style capability (an MI300X is 9.4), which a raw
-capability read takes for Hopper. dense_fp8's per-GPU token limits apply only on the GPU model
-they were measured on, and only where flashinfer's GEMM runs."""
+capability read takes for Hopper."""
 from types import SimpleNamespace
 
 import pytest
@@ -9,8 +8,8 @@ import torch
 
 pytest.importorskip("triton")
 
-# GLM-5.2's linears at one TP8 rank, (N, K): o_proj, dense-layer down, q_b
-O_PROJ, DENSE_DOWN, Q_B = (6144, 2048), (6144, 1536), (2048, 2048)
+# GLM-5.2's o_proj at one TP8 rank, (N, K)
+O_PROJ = (6144, 2048)
 
 
 def test_an_amd_gpu_gets_neither_pdl_nor_the_sm90_gemm(monkeypatch):
@@ -46,18 +45,34 @@ def _paths(monkeypatch, gpu, fi_ok, calls):
     return seen
 
 
-def test_the_h200_takes_flashinfer_from_3_tokens_for_glm52s_o_proj_and_dense_down(monkeypatch):
-    calls = [(*O_PROJ, 2), (*O_PROJ, 3), (*O_PROJ, 32), (*DENSE_DOWN, 2), (*DENSE_DOWN, 3),
-             (*Q_B, 3), (*Q_B, 32), (*Q_B, 33)]
-    assert _paths(monkeypatch, "NVIDIA H200", True, calls) == [
-        "_w8a16", "_fi", "_fi", "_w8a16", "_fi", "_w8a16", "_w8a16", "_fi"]
+@pytest.mark.parametrize("gpu, fi_ok, own_rows", [
+    ("NVIDIA H200", True, True), ("NVIDIA H200", False, False),
+    ("NVIDIA H200 NVL", True, False), ("NVIDIA H100 80GB HBM3", True, False)])
+def test_a_gpus_own_token_limits_apply_only_there(monkeypatch, gpu, fi_ok, own_rows):
+    """A GPU model's measured w8a16 limits apply to that model alone, and only where
+    flashinfer's GEMM runs: without it those sizes would go to cuBLAS's, slower at decode."""
+    from mstar.utils import dense_fp8
 
-
-@pytest.mark.parametrize("gpu, fi_ok", [("NVIDIA H100 80GB HBM3", True), ("NVIDIA H200 NVL", True),
-                                        ("NVIDIA H200", False)])
-def test_other_gpus_keep_w8a16_to_32_tokens(monkeypatch, gpu, fi_ok):
-    """A GPU model without measured rows keeps the shape table; an H200 without flashinfer's
-    GEMM keeps w8a16 rather than sending decode sizes to cuBLAS's GEMM."""
-    calls = [(*O_PROJ, 3), (*O_PROJ, 32), (*DENSE_DOWN, 3), (*O_PROJ, 33)]
+    own = dense_fp8._W8A16_MAX_TOKENS_BY_GPU["NVIDIA H200"][(*O_PROJ, False)]
+    calls = [(*O_PROJ, own + 1), (*O_PROJ, dense_fp8._W8A16_MAX_TOKENS + 1)]
     assert _paths(monkeypatch, gpu, fi_ok, calls) == [
-        "_w8a16", "_w8a16", "_w8a16", "_fi" if fi_ok else "_w8a8"]
+        "_fi" if own_rows else "_w8a16", "_fi" if fi_ok else "_w8a8"]
+
+
+def test_an_unusable_cublas_block_gemm_falls_back(monkeypatch):
+    """torch 2.10-2.12 have the blockwise scaled_mm API, but it raises off SM90 or on a cuBLASLt
+    before 12.9 (the cu128 builds): the probe says so, and the large batches take w8a16."""
+    from mstar.utils import dense_fp8
+
+    def raises(*args, **kwargs):
+        raise NotImplementedError("blockwise scaling needs cuBLASLt >= 12.9")
+
+    monkeypatch.setattr(dense_fp8, "_W8A8_API", True)
+    monkeypatch.setattr(dense_fp8, "_w8a8", raises)
+    assert dense_fp8._probe_w8a8(torch.device("cpu")) is False
+    taken = []
+    monkeypatch.setattr(dense_fp8, "_w8a16", lambda *args: taken.append(1) or None)
+    monkeypatch.setattr(dense_fp8, "_W8A8_OK", {torch.device("cpu"): False})
+    dense_fp8._linear(torch.zeros(600, 256, dtype=torch.bfloat16),
+                      torch.zeros(256, 256, dtype=torch.uint8), torch.ones(2, 2), (128, 128), False)
+    assert taken == [1]

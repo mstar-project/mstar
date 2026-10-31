@@ -32,12 +32,8 @@ class Glm52MTPModule(nn.Module):
         self, config: Glm52ModelConfig, comm_group: CommGroup | None = None
     ) -> None:
         super().__init__()
-        # The MTP layer must be FULL under the IndexShare formula: the
-        # checkpoint ships indexer weights at layer 78 (GLM placed 78 =
-        # offset-1 + 19·freq deliberately), and index_share_for_mtp_iteration
-        # reuses THIS layer's selection across draft iterations. A config
-        # whose MTP position lands SHARED would construct indexer-less and
-        # desync from the checkpoint — fail loudly instead.
+        # the checkpoint ships an indexer at layer 78: a config that puts the MTP layer on a
+        # SHARED slot would build it without one and miss those weights
         from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
         if not is_full_indexer_layer(config, config.num_hidden_layers):
@@ -72,13 +68,10 @@ class Glm52MTPModule(nn.Module):
         prev_hidden: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns ``(head_input, raw_hidden)``: the shared_head-normed
-        state, which ``lm_head`` reads (applied by the caller that owns the
-        head) and the next draft iteration chains, and the layer output under
-        that norm. ``prev_hidden`` is the trunk's post-final-norm state, as the
-        reference pairs it (``hnorm`` normalizes it again), or the previous
-        draft's head input, as the reference chains it.
-        """
+        """Returns ``(head_input, raw_hidden)``: the shared_head-normed state, which the caller's
+        ``lm_head`` reads and the next draft chains, and the layer output under that norm.
+        ``prev_hidden`` is the trunk's post-final-norm state or the previous draft's head input,
+        as the reference pairs and chains them (``hnorm`` normalizes it again)."""
         hidden_states = self.fuse(token_embeds, prev_hidden)
         hidden_states = self.transformer_layer(hidden_states, position_ids)
         return self.shared_head(hidden_states), hidden_states
@@ -100,10 +93,8 @@ class Glm52MTPModule(nn.Module):
         return self.shared_head(hidden_states), hidden_states
 
 
-# Checkpoint sub-keys under ``model.layers.78.`` that belong to the MTP glue
-# and map 1:1 onto Glm52MTPModule attributes; everything else under the
-# prefix routes into ``transformer_layer.``. The loader remap and its test
-# both import this so the contract lives in exactly one place.
+# Checkpoint sub-keys under ``model.layers.78.`` that map 1:1 onto Glm52MTPModule's glue;
+# everything else under the prefix routes into ``transformer_layer.``.
 MTP_GLUE_PREFIXES = ("enorm", "hnorm", "eh_proj", "shared_head")
 
 

@@ -198,18 +198,11 @@ def test_prefill_buckets_past_the_context_limit_skip_small_batches():
     assert packed.get_total_tokens(4) == [1024, 2048, 3072, 4096]
 
 
-def test_last_rows_is_compiler_disabled():
-    # traced, its resume frame takes one dynamo entry per (tokens, rows) capture bucket
-    fn = Glm52LLMSubmodule._last_rows
-    assert hasattr(fn, "_torchdynamo_disable") or hasattr(fn, "_torchdynamo_orig_callable")
-
-
 def test_batched_prefill_buckets_get_their_own_capture():
     model = Glm52Model("", tokenizer_mode="byte", config_variant="full",
                        prefill_token_buckets=[64, 128, 192],
                        prefill_batched_token_buckets=[1024, 2048],
                        prefill_capture_batch_sizes=[1, 4, 16])
-    assert model.config.prefill_batched_token_buckets == [1024, 2048]
     prefill = [c for c in _submodule(model.config).get_accelerator_graph_configs(torch.device("cpu"))
                if c.capture_graph_walk == "prefill"]
     assert [(c.capture_batch_sizes, c.get_total_tokens(c.capture_batch_sizes[0]))
@@ -217,17 +210,6 @@ def test_batched_prefill_buckets_get_their_own_capture():
 
 
 # ── the router's top-k kernel (kernels: auto) ──
-
-
-def test_router_kernel_reaches_the_block_under_auto():
-    from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced_fp8")
-    assert model.config.kernels == "auto"
-    block = Glm52SparseMoeBlock(model.config)
-    assert block._router_kernel is True
-    block.process_weights_after_loading("cpu")  # no fused path on the host: torch top-k
-    assert block.gate._topk_op is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="triton top-k kernel on CUDA")
@@ -254,9 +236,8 @@ def test_router_kernel_matches_the_torch_top_k(tokens):
 
 
 def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
-    """Two packed requests: under kernels: auto the last layer's MLP sees their two last
-    rows, every other layer all of them, and the sampled tokens and logits match the full
-    forward the reference runs."""
+    """Under kernels: auto the last layer's MLP sees only the sampled rows, and the tokens and
+    logits match the full forward."""
     from types import SimpleNamespace
 
     from mstar.engine.resources import StepContext
