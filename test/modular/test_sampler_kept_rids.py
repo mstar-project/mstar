@@ -121,6 +121,19 @@ def test_dropped_steps_do_not_shift_the_kept_stream(graph, device):
     assert got == want
 
 
+def test_an_eager_step_leaves_a_dropped_rows_last_token(device):
+    res = _resource(True, device)
+    res.enable_device_loopback_reader()
+    bufs = res._cg_buffers
+    # past the vocab, so no draw can equal them
+    bufs.write_last_tokens([KEPT, DROPPED], torch.tensor([V + 1, V + 2], device=device))
+
+    _step(res, SamplerStep(kept_rids=frozenset({KEPT})), graph=False)
+
+    assert bufs.last_tokens_for([KEPT]).item() < V, "the kept row's sample never reached the token its next step reads"
+    assert bufs.last_tokens_for([DROPPED]).item() == V + 2, "a discarded sample overwrote the token its next step reads"
+
+
 @pytest.mark.parametrize(
     "kept_rids",
     [None, frozenset({KEPT, DROPPED}), frozenset({KEPT}), frozenset()],

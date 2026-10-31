@@ -23,6 +23,7 @@ class _Batch:
         self.per_request_input_metadata = {}
         self.final_stream_rids = set()
         self.skipped_rids = set()
+        self.rebuild_rids = frozenset()
         self.failed_requests = {}
         self.inputs = None
         self.running_batched = None

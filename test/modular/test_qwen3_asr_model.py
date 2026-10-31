@@ -458,7 +458,7 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
     failures = {}
     batch = SimpleNamespace(
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
-        register_failure=failures.setdefault,
+        register_failure=failures.setdefault, rebuild_rids=frozenset(),
         step_context=SimpleNamespace(
             graph_walk=DECODE_WALK,
             request_walks=None if step_walk else {"end": DECODE_WALK, "word": DECODE_WALK},

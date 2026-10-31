@@ -36,6 +36,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -135,6 +136,9 @@ class _Resource:
     def is_offloaded(self, rid):
         return rid in self.offloaded
 
+    def is_resident(self, rid):
+        return rid not in self.offloaded
+
     def reclaimable(self, rid):
         return 0 if rid in self.holds_nothing else 1
 
@@ -190,6 +194,7 @@ class _Engine:
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
     is_offloaded = Engine.is_offloaded
+    is_resident = Engine.is_resident
     offload_request = Engine.offload_request
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
@@ -934,6 +939,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
+        self._rebuilds = Rebuilds({}, {})
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it

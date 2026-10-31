@@ -136,7 +136,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     released = []
     node_batch = SimpleNamespace(
         node_name="dit", launch_started_event=None, preplanned_rids=("a",), read_check_rids=None,
-        request_ids=("a",), release_waiters=lambda: released.append(True),
+        request_ids=("a",), rebuild_rids=frozenset(), release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )
     batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=(),
