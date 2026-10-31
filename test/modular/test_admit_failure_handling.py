@@ -475,7 +475,7 @@ class _EvictingWorker(_HoldingWorker):
     def __init__(self, holders, sched=None):
         super().__init__()
         self.offloaded: list[str] = []
-        self.eviction_policy = SimpleNamespace(value="last_ran")
+        self.eviction_policy = SimpleNamespace(value="last_in_line")
         self.scheduler = sched or _scheduler(_SchedEngine())
         for rid in holders:
             self.scheduler.note_arrival(rid)
@@ -535,7 +535,7 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
 def test_a_batch_too_big_alone_still_evicts_its_own_rows():
     """Running requests that outgrow the pool together: evicting one of
     them is what lets the rest step, as before."""
-    # the request outside the batch is the least recently run
+    # the request outside the batch arrived first, and it isn't asked about
     worker = _EvictingWorker(["outside", "r0", "r1"])
     worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
     batch, node_batch = _batches(_sized_refusal("r1", rows_fit=1, rows_fit_alone=1))
@@ -544,15 +544,15 @@ def test_a_batch_too_big_alone_still_evicts_its_own_rows():
 
     worker._handle_allocation_failure(batch, node_batch)
 
-    assert worker.offloaded == ["r0"], "an outside request was evicted for a batch it cannot help"
+    assert worker.offloaded == ["r1"], "an outside request was evicted for a batch it cannot help"
 
 
-@pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "r3"), (StepOrder.ARRIVAL, "r0")])
-def test_a_refused_step_offloads_by_the_nodes_order(order, victim):
+@pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "r3"), (StepOrder.ARRIVAL, "r2")])
+def test_a_refused_step_offloads_the_row_last_in_its_line(order, victim):
     """A step of r4 is refused, and r0 to r3 hold pages, r0 having run first.
     While rows take turns r0 runs right after the retry, so offloading it only
-    makes it reload, and r3's next turn is the furthest away. Under ARRIVAL the
-    row that has waited longest goes."""
+    makes it reload, and r3's next turn is the furthest away. Under ARRIVAL r3
+    holds the step, then r0 to r2 by arrival."""
     worker = _EvictingWorker([f"r{i}" for i in range(4)], _scheduler(_SchedEngine(order=order)))
     worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
     batch = _sched_batch(["r4"])
@@ -564,15 +564,48 @@ def test_a_refused_step_offloads_by_the_nodes_order(order, victim):
 
 
 @pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "ran"), (StepOrder.ARRIVAL, "never_ran")])
-def test_a_row_that_never_ran_at_the_node_sorts_oldest(order, victim):
+def test_a_row_that_never_ran_at_the_key_takes_its_place_in_line(order, victim):
     """Its pages came some other way (a KV retrieve from another worker):
-    under TURNS it is first in line, and under ARRIVAL it has waited longest."""
+    under TURNS it is first in line, and under ARRIVAL behind the row holding
+    the step."""
     worker = _EvictingWorker(["ran"], _scheduler(_SchedEngine(order=order)))
     worker.scheduler.note_arrival("never_ran")
     holders = {"ran", "never_ran"}
     worker.engine_manager.get_engine(SCHED_NODE).reclaimable = lambda node, rid, resources: rid in holders
 
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == victim
+
+
+def _decode_waiters(order, ran):
+    """The worker's eviction over ``ran``'s steps: (rid, walk), oldest first,
+    with every rid holding pages. Prefill and decode are separate keys here."""
+    worker = _EvictingWorker([], _scheduler(_SchedEngine(order=order)))
+    holders = list(dict.fromkeys(rid for rid, _ in ran))
+    for rid in holders:
+        worker.scheduler.note_arrival(rid)
+    for rid, walk in ran:
+        worker.scheduler.note_ran(_sched_batch([rid], walk=walk))
+    worker.engine_manager.get_engine(SCHED_NODE).reclaimable = lambda node, rid, resources: rid in holders
+    return worker
+
+
+def test_under_arrival_the_row_that_prefilled_first_is_next_and_not_the_victim():
+    """Two prefilled rows wait for decode. p0's stamp is the oldest here, but
+    it is next in line for decode; p1 waits behind it."""
+    worker = _decode_waiters(StepOrder.ARRIVAL, [("p0", "prefill"), ("p1", "prefill")])
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "p1"
+
+
+def test_under_turns_a_row_new_to_decode_is_first_in_its_line_and_not_the_victim():
+    """p prefilled on its own walk after d0 and d1 decoded, so it has the
+    newest stamp at the node, but it has yet to decode: it leads the decode
+    line, and d1, which decoded last, is furthest from another step."""
+    worker = _decode_waiters(
+        StepOrder.TURNS, [("d0", SCHED_WALK), ("d1", SCHED_WALK), ("p", "prefill")],
+    )
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "d1"
 
 
 def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():

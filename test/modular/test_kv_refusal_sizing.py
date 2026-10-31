@@ -376,7 +376,7 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
     refuser._handle_allocation_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, failed_resource="kv", admit_error=outcome.reason,
     ))
-    assert refuser.offloaded == ["d0"]
+    assert refuser.offloaded == ["d14"]  # d15 ran last, so it holds the step
 
     for _ in range(4):
         step = list(_next_batch(sched, manager).request_to_worker_graph)

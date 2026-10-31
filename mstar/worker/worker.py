@@ -272,11 +272,10 @@ class PendingBatch:
 
 class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
-    LAST_RAN = "last_ran"  # by when each row last ran at the node, read through its StepOrder
+    LAST_IN_LINE = "last_in_line"  # the row a step of the refused key would reach last
     # TODO: PRIORITY — ask a named resource how much it wants each candidate
-    # gone (``Engine.offload_priority``), for cases where "least recently used"
-    # is the wrong question. Needs eviction-policy metadata naming which
-    # resource to consult.
+    # gone (``Engine.offload_priority``), for cases where the line is the wrong
+    # question. Needs eviction-policy metadata naming which resource to consult.
 
 
 class SpeculationTarget(NamedTuple):
@@ -608,7 +607,7 @@ class Worker:
         # dropped instead of parked. Keyed by the string: the handle is gone.
         self._removed_rids: RecentSet[str] = RecentSet(_REMOVED_RIDS_KEEP)
 
-        self.eviction_policy = EvictionPolicy.LAST_RAN
+        self.eviction_policy = EvictionPolicy.LAST_IN_LINE
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
@@ -1646,17 +1645,11 @@ class Worker:
     def _select_eviction_victim(
         self, node_name: str, graph_walk: str, candidates: list[int],
     ) -> int:
-        """Pick a victim from *candidates* by when each last ran at the node
-        (``MicroScheduler.last_ran_at``; one that never ran there sorts oldest).
-
-        While the refused step's rows take turns the oldest stamp is next in
-        line, so take the newest: its next turn is furthest away. Otherwise the
-        row that has waited longest. Nothing is in flight here (no step is
-        built on a refusal), so the row that ran last has finished running.
-        """
-        ran_at = partial(self.scheduler.last_ran_at, node_name)
-        pick = max if self.scheduler.takes_turns(node_name, graph_walk) else min
-        return pick(candidates, key=ran_at)
+        """The candidate furthest from a step of the refused key: last in
+        the line the pick reads, whatever the node's order, so what goes next
+        is never what the next steps reload. Nothing is in flight here (no
+        step is built on a refusal)."""
+        return self.scheduler.last_in_line(node_name, graph_walk, candidates)
 
     # ------------------------------------------------------------------
     # Batch building

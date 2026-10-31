@@ -301,7 +301,8 @@ def test_a_refusal_under_turns_keeps_the_next_row_in_line_on_the_device():
     assert list(sched.get_next_batch(state).request_to_worker_graph) == [0]
 
 
-def test_a_refusal_under_arrival_takes_the_row_that_waited_longest():
+def test_a_refusal_under_arrival_takes_the_row_last_in_line():
+    """2 ran the latest step, so it holds the step; then 0, then 1."""
     runtime = _Runtime()
     sched, _ = _scheduler(runtime, ARRIVAL)
     for rid in range(3):
