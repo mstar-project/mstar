@@ -42,6 +42,7 @@ from mstar.model.components.diffusion.image_io import (
     unpatchify_latents,
 )
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
+from mstar.model.components.fp8_linear import StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
@@ -194,10 +195,11 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
         self.config = config

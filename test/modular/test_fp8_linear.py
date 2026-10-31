@@ -15,7 +15,15 @@ from torch import nn
 from mstar import platforms
 from mstar.kernels.fp8_gemm import FP8_ROWWISE_MM, quantize_rows
 from mstar.model.components import fp8_linear
-from mstar.model.components.fp8_linear import Fp8Linear, apply_linear_dtype, check_linear_dtype, quantize_linears
+from mstar.model.components.fp8_linear import (
+    Fp8Linear,
+    StepDtypes,
+    SteppedFp8Linear,
+    apply_linear_dtype,
+    check_linear_dtype,
+    check_linear_dtype_steps,
+    quantize_linears,
+)
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform
 
@@ -230,6 +238,78 @@ def _wan_dit():
     config = Wan22Config()
     return Wan22DiT(config), config.num_layers * 8, (
         "condition_embedder.", "proj_out", "patch_embedding", "cross_attn.k_proj", "cross_attn.v_proj")
+
+
+def test_step_dtypes_index_steps_and_past_the_list_take_its_last_entry():
+    policy = StepDtypes(["bf16", "bf16", "fp8", "bf16"])
+    assert [policy.at(k) for k in range(6)] == ["bf16", "bf16", "fp8", "bf16", "bf16", "bf16"]
+    assert policy.dtypes == ("bf16", "fp8")
+    assert policy.active == "bf16"
+
+
+@pytest.mark.parametrize(
+    ("steps", "dtype", "message"),
+    [
+        (["bf16", "fp8"], "bf16", "needs linear_dtype: fp8"),
+        (["bf16", "fp16"], "fp8", "are not in"),
+        (["fp8", "fp8"], "fp8", "name one dtype"),
+        (["bf16"], "fp8", "name one dtype"),
+    ],
+)
+def test_linear_dtype_steps_are_checked_when_the_model_is_built(steps, dtype, message):
+    with pytest.raises(ValueError, match=message):
+        check_linear_dtype_steps(steps, dtype)
+
+
+@pytest.mark.parametrize("steps", [None, []])
+def test_no_linear_dtype_steps_is_no_policy(steps):
+    assert check_linear_dtype_steps(steps, "fp8") is None
+    assert check_linear_dtype_steps(steps, "bf16") is None
+
+
+def _stepped_net(monkeypatch) -> tuple[_Net, StepDtypes]:
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: _Rocm("gfx942"))
+    monkeypatch.setattr(fp8_linear, "fp8_unavailable_reason", lambda: None)
+    net = _Net()
+    policy = check_linear_dtype_steps(["bf16", "fp8"], "fp8")
+    apply_linear_dtype(net, "fp8", ("blocks.*.out",), "test", policy=policy)
+    return net, policy
+
+
+def test_a_policy_keeps_both_sets_of_weights_and_runs_the_active_one(monkeypatch):
+    net, policy = _stepped_net(monkeypatch)
+    stepped = net.blocks[0].out
+    assert isinstance(stepped, SteppedFp8Linear)
+    assert stepped.fp8.weight.dtype == torch.float8_e4m3fnuz
+    assert type(stepped.bf16) is nn.Linear
+    x = torch.randn(32, 32)
+    policy.active = "bf16"
+    bf16_out = F.linear(x, stepped.bf16.weight, stepped.bf16.bias)
+    assert torch.equal(stepped(x), bf16_out)
+    policy.active = "fp8"
+    fp8_out = stepped(x)
+    assert torch.equal(fp8_out, stepped.fp8(x))
+    assert not torch.equal(fp8_out, bf16_out)
+
+
+def test_a_compiled_forward_follows_the_policy(monkeypatch):
+    # dynamo guards on the switch: the graph traced for one dtype must not serve the other
+    net, policy = _stepped_net(monkeypatch)
+    stepped = net.blocks[0].out
+    x = torch.randn(32, 32)
+    compiled = torch.compile(stepped.forward, backend="eager")
+    for active in ("bf16", "fp8", "bf16", "fp8"):
+        policy.active = active
+        want = stepped.bf16(x) if active == "bf16" else stepped.fp8(x)
+        assert torch.equal(compiled(x), want)
+
+
+def test_without_an_fp8_gemm_a_policy_changes_nothing(monkeypatch):
+    monkeypatch.setattr(fp8_linear, "fp8_unavailable_reason", lambda: "no fp8 GEMM here")
+    net = _Net()
+    policy = check_linear_dtype_steps(["bf16", "fp8"], "fp8")
+    assert apply_linear_dtype(net, "fp8", ("blocks.*.out",), "test", policy=policy) == []
+    assert type(net.blocks[0].out) is nn.Linear
 
 
 @pytest.mark.parametrize("build", [_flux_dit, _z_image_dit, _wan_dit], ids=["flux2_klein", "z_image", "wan22"])
