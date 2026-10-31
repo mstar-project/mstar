@@ -218,6 +218,9 @@ class TorchKDAKernels:
     on K-first copies. Takes the fused bundle's arguments, or a full-rank forget gate.
     """
 
+    # the prefill loops over the spans on the host
+    prefill_capturable = False
+
     def layout(self, spans, num_tokens, fixed):
         return None
 

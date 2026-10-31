@@ -710,7 +710,9 @@ The spec types are:
        settles each one's accepted drafts. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
        (``mstar/model/components/distributed/``, over ``KDAConfig``; Kimi K3's full-rank
-       output gate is ``full_rank_output_gate``).
+       output gate is ``full_rank_output_gate``, which the ``LinearAttnConfig`` declares
+       too: the resource then runs the torch reference, as the fused kernels apply only
+       the low-rank gate).
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
