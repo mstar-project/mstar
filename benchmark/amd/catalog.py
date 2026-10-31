@@ -141,7 +141,7 @@ ROWS: dict[str, Row] = {r.name: r for r in [
         i2v_frames=f"{REFERENCES}/diffusers-nvidia--Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning"),
     # Two GPUs, one guidance branch per rank (configs/cosmos3_nano_cfg2.yaml).
     Row("cosmos3_nano_cfg2", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", gpus=2, cost=4.0,
-        generator_device="cuda", workloads=("video-t2v",),
+        generator_device="cuda",
         i2v_frames=f"{REFERENCES}/diffusers-nvidia--Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning"),
     Row("cosmos3_edge", "video", "nvidia/Cosmos3-Edge", "cosmos3_edge", cost=3.0, generator_device="cuda",
         workloads=("video-t2v",),
