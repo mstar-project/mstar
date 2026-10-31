@@ -261,7 +261,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
         # the row's place in the step's packed canvas, built once here
         item = CanvasItem(
-            request_id=fwd_info.request_id,
             prefix_ids=prefix_ids,
             prefix_audio_mask=prefix_audio_mask,
             tokens=tokens.unsqueeze(0),
@@ -276,7 +275,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             },
             # the iteration, for postprocess: at iteration 0 the loop counter
             # is not there yet, and reading the step edge would sync
-            kwargs={"request_id": fwd_info.request_id, "item": item, "step": k},
+            kwargs={"item": item, "step": k},
             # The row's packed contribution: its conditional document plus,
             # with CFG on, the target again as the unconditional one.
             input_seq_len=sum(item.doc_pair),
@@ -447,7 +446,9 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         )
         logits = self._logits(engine_inputs, canvas)
         outputs: dict[str, NameToTensorList] = {}
-        for item in items:
+        # keyed by the engine's row ids (worker-local handles), never by the
+        # request id prepare_inputs saw on the wire
+        for rid, item in zip(engine_inputs.request_ids, items, strict=True):
             c_logits, u_logits = canvas.slice_logits(logits, item)
             row: NameToTensorList = {"c_logits": [c_logits[0].to(torch.float32)]}
             # An item with CFG off has no unconditional document. Echo the
@@ -458,7 +459,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 if u_logits is not None
                 else row["c_logits"]
             )
-            outputs[item.request_id] = row
+            outputs[rid] = row
         return outputs
 
     def postprocess(
