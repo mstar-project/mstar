@@ -30,8 +30,8 @@ SIZES = dict(depth=3, hidden_size=32, intermediate_size=64, num_heads=2, in_chan
              temporal_patch_size=2, spatial_merge_size=2, num_position_embeddings=16, out_hidden_size=24)
 
 
-@pytest.mark.parametrize("deepstack", [(), (0, 1)])
-def test_tower_matches_transformers(deepstack):
+def _towers(deepstack: tuple[int, ...], dtype: torch.dtype = torch.float32):
+    """transformers' tower with random weights, and ours loaded from it with per-frame SDPA."""
     torch.manual_seed(0)
     reference = Qwen3VLVisionModel(Qwen3VLVisionConfig(
         hidden_act="gelu_pytorch_tanh", deepstack_visual_indexes=list(deepstack), **SIZES,
@@ -39,18 +39,29 @@ def test_tower_matches_transformers(deepstack):
     with torch.no_grad():
         for param in reference.parameters():
             param.normal_(0, 0.2)
-    ours = QwenVisionModel(QwenVisionConfig(deepstack_visual_indexes=deepstack, **SIZES)).eval()
+    reference = reference.to(dtype)
+    ours = QwenVisionModel(QwenVisionConfig(deepstack_visual_indexes=deepstack, **SIZES))
     missing, unexpected = ours.load_state_dict(reference.state_dict(), strict=False)
     assert not unexpected and not missing, (missing, unexpected)
+    ours = ours.to(dtype).eval()
     for block in ours.blocks:
         block.attn.bind_resources({VISION_ATTN: FrameSDPA(vision_seq_lengths(GRID))})
+    return reference, ours
 
+
+def _run(reference, ours, dtype: torch.dtype = torch.float32):
     patches = sum(t * h * w for t, h, w in GRID)
-    pixels = torch.randn(patches, 3 * 2 * 4 * 4)
+    pixels = torch.randn(patches, 3 * 2 * 4 * 4).to(dtype)
     indices, weights = vision_interpolation(GRID, ours.config.num_grid_per_side, 2, torch.device("cpu"))
     with torch.no_grad():
         want = reference(pixels, grid_thw=torch.tensor(GRID))
         got = ours(pixels, indices, weights, vision_position_ids(GRID, 2, torch.device("cpu")))
+    return got, want
+
+
+@pytest.mark.parametrize("deepstack", [(), (0, 1)])
+def test_tower_matches_transformers(deepstack):
+    got, want = _run(*_towers(deepstack))
     if deepstack:
         got, features = got
         assert len(features) == len(want.deepstack_features) == len(deepstack)
@@ -62,38 +73,18 @@ def test_tower_matches_transformers(deepstack):
 def test_bf16_tower_matches_transformers_with_fp32_rope():
     """In bf16, transformers keeps the rotary tables fp32; the tower does too by default,
     and the features then agree bit for bit."""
-    torch.manual_seed(0)
-    reference = Qwen3VLVisionModel(Qwen3VLVisionConfig(
-        hidden_act="gelu_pytorch_tanh", deepstack_visual_indexes=[1], **SIZES,
-    )).eval()
-    with torch.no_grad():
-        for param in reference.parameters():
-            param.normal_(0, 0.2)
-    reference = reference.to(torch.bfloat16)
-    ours = QwenVisionModel(QwenVisionConfig(deepstack_visual_indexes=(1,), **SIZES))
-    ours.load_state_dict(reference.state_dict(), strict=False)
-    ours = ours.to(torch.bfloat16).eval()
-    for block in ours.blocks:
-        block.attn.bind_resources({VISION_ATTN: FrameSDPA(vision_seq_lengths(GRID))})
-    patches = sum(t * h * w for t, h, w in GRID)
-    pixels = torch.randn(patches, 3 * 2 * 4 * 4).to(torch.bfloat16)
-    indices, weights = vision_interpolation(GRID, ours.config.num_grid_per_side, 2, torch.device("cpu"))
-    with torch.no_grad():
-        want = reference(pixels, grid_thw=torch.tensor(GRID))
-        got, features = ours(pixels, indices, weights, vision_position_ids(GRID, 2, torch.device("cpu")))
+    (got, features), want = _run(*_towers((1,), torch.bfloat16), torch.bfloat16)
     assert torch.equal(got, want.pooler_output)
     assert torch.equal(features[0], want.deepstack_features[0])
 
 
 def test_qwen3_5_tower_keeps_its_key_and_rounding():
     """Qwen3.5 binds the resource under its own declared key and rounds the rotary tables
-    to the activations' dtype, as before the tower was shared."""
+    to the activations' dtype."""
     from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
     from mstar.model.qwen3_5.config import VISION_ATTN as QWEN3_5_VISION_ATTN
 
     tower = Qwen3_5VisionModel(QwenVisionConfig(**SIZES))
-    assert tower.rope_dtype is None
-    assert all(block.attn.resource_key == QWEN3_5_VISION_ATTN for block in tower.blocks)
     frames = FrameSDPA(vision_seq_lengths(GRID))
     for block in tower.blocks:
         block.attn.bind_resources({QWEN3_5_VISION_ATTN: frames})

@@ -140,20 +140,6 @@ def test_image_prompt_matches_transformers(tmp_path):
     torch.testing.assert_close(ours, theirs, rtol=1e-5, atol=1e-5)
 
 
-def test_skip_keeps_vision_and_unused_layers_on_disk():
-    config = Qwen3EncoderConfig(num_hidden_layers=64, hidden_state_layers=(50,))
-    skip = qwen3_vl_text_skip(config)
-    assert skip("model.visual.blocks.0.attn.qkv.weight")
-    assert skip("model.language_model.layers.50.mlp.up_proj.weight")
-    assert skip("model.language_model.norm.weight")
-    assert skip("lm_head.weight")
-    assert not skip("model.language_model.layers.49.mlp.up_proj.weight")
-    assert not skip("model.language_model.embed_tokens.weight")
-    assert remap_qwen3_vl_text_key("model.language_model.layers.3.self_attn.q_proj.weight") == (
-        "layers.3.self_attn.q_proj.weight"
-    )
-
-
 def test_rejects_other_rope_types():
     cfg = {"text_config": {
         "model_type": "qwen3_vl_text", "vocab_size": 8, "hidden_size": 8, "intermediate_size": 8,

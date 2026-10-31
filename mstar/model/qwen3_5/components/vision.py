@@ -1,6 +1,6 @@
 """Qwen3.5's vision tower: the shared Qwen tower (``components/qwen_vision.py``)
 under its Qwen3.5 names. Qwen3.5 has no deepstack, and a checkpoint that sets it is
-refused here, as before."""
+refused here."""
 from __future__ import annotations
 
 from mstar.model.components.qwen_vision import (  # noqa: F401
