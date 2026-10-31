@@ -3,8 +3,11 @@ go through symmetric memory."""
 
 from __future__ import annotations
 
+import gc
 import logging
+import pickle
 import sys
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -38,7 +41,7 @@ class _FakeSymm(AllReduce):
     instances: list[_FakeSymm] = []
 
     def __init__(self, group, device, max_bytes):
-        super().__init__(group)
+        self.group = group
         self.device = device
         self.max_bytes = max_bytes
         _FakeSymm.instances.append(self)
@@ -118,6 +121,17 @@ def test_symm_modes_build_it_with_default_cutoff(fake_cuda, mode):
     assert backend.max_bytes == 512 * 1024
     assert backend.mode == mode.strip().lower()
     assert backend.group is g
+
+
+def test_a_dropped_group_is_freed_without_gc():
+    # a cycle with its backend would keep the process group, and gloo's threads, alive
+    gc.disable()
+    try:
+        # in a local, as pytest's assert rewriting would hold the group itself
+        ref = weakref.ref(_group())
+        assert ref() is None
+    finally:
+        gc.enable()
 
 
 def test_single_rank_and_no_cuda_skip(monkeypatch):
@@ -230,6 +244,9 @@ def test_global_config_hands_it_to_every_worker(tp_allreduce):
         {"wg": wg}, ["worker_0", "worker_1"], tp_allreduce=tp_allreduce
     )
     assert [w.tp_allreduce for w in cfg.per_worker_config.values()] == [tp_allreduce] * 2
+    # the conductor hands each worker its config through a spawned process
+    assert all(pickle.loads(pickle.dumps(w)).tp_allreduce == tp_allreduce
+               for w in cfg.per_worker_config.values())
 
 
 @pytest.fixture
