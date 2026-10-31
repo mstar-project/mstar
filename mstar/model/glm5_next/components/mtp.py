@@ -9,10 +9,8 @@ from mstar.model.glm5_next.components.decoder_layer import Glm5NextPlainDecoderL
 from mstar.model.glm5_next.components.language_model import build_rmsnorm
 from mstar.model.glm5_next.config import Glm5NextModelConfig
 
-# Glue sub-keys under ``layers.45.`` that map 1:1 onto module attributes;
-# the loader's remap keeps its own copy (it must import without this
-# package's engine-touching modules) — ``weight_loader.MTP_GLUE_PREFIXES``
-# is asserted equal here so the two cannot drift.
+# Sub-keys under ``layers.45.`` that map 1:1 onto attributes here. weight_loader keeps a
+# copy, since it imports without the engine; the two are asserted equal.
 MTP_GLUE_PREFIXES = ("enorm", "hnorm", "eh_proj", "shared_head")
 
 
@@ -27,9 +25,8 @@ def _assert_loader_glue_contract() -> None:
 
 
 class Glm5NextSharedHead(nn.Module):
-    """Named to mirror the checkpoint's ``shared_head.norm`` key: the MTP
-    module's final norm. The actual head weight is the trunk's ``lm_head``
-    (not duplicated in the checkpoint), applied by the caller."""
+    """The MTP module's final norm, named for the checkpoint's ``shared_head.norm``.
+    The head itself is the trunk's ``lm_head``, which the caller applies."""
 
     def __init__(self, config: Glm5NextModelConfig) -> None:
         super().__init__()
@@ -40,9 +37,8 @@ class Glm5NextSharedHead(nn.Module):
 
 
 class Glm5NextMTPModule(nn.Module):
-    """One draft iteration: fuse (token embedding, previous hidden) and run
-    the layer-45 plain-residual decoder layer.
-    """
+    """One draft iteration: fuse (token embedding, previous hidden), then run the
+    MTP decoder layer."""
 
     def __init__(
         self, config: Glm5NextModelConfig, comm_group: CommGroup | None = None

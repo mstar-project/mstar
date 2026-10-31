@@ -75,12 +75,8 @@ class Glm5NextMoEGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
-        # fp32 copy of ``weight`` built once by ``finalize_weights`` (called
-        # from the MoE block's process_weights_after_loading): the forward
-        # would otherwise cast the (E, hidden) bf16 router to fp32 on every
-        # layer of every step. Plain attribute, not a buffer, so
-        # model.to(bf16) cannot downcast it. Bit-identical: the same fp32
-        # values, computed once.
+        # fp32 copy of ``weight`` from ``finalize_weights``, so the forward does not cast the
+        # router every step. A plain attribute, not a buffer, so model.to(bf16) leaves it fp32.
         self._weight_fp32: torch.Tensor | None = None
 
     def finalize_weights(self) -> None:
@@ -152,13 +148,11 @@ class Glm5NextSparseMoeBlock(nn.Module):
         )
         self.quant_kernel = getattr(config, "moe_quant_kernel", "reference")
         if self.quant_kernel not in MOE_QUANT_KERNELS:
-            # an unknown value would otherwise resolve to the uncapturable
-            # reference loop and serve eager behind a healthy /health
+            # an unknown value would otherwise serve the eager reference loop silently
             raise ValueError(
                 f"moe_quant_kernel={self.quant_kernel!r} is not one of {MOE_QUANT_KERNELS}"
             )
-        # Resolved on the real device by process_weights_after_loading;
-        # blocks used without the load hook (CPU tests) stay on reference.
+        # set by process_weights_after_loading; without it (CPU tests) the reference path runs
         self._use_fused = False
 
         self.gate = Glm5NextMoEGate(
@@ -262,10 +256,8 @@ class Glm5NextSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
-        # Combine weights stay fp32 all the way into the dispatch: the
-        # reference path's per-expert multiply promotes and index_add_
-        # downcasts once, and the fused kernels fold the same fp32 weights
-        # into their GEMM-2 accumulator. No path downcasts topk_weights.
+        # topk_weights stay fp32 into every dispatch: the reference loop downcasts once, at
+        # index_add_, and the fused kernels fold them into their fp32 accumulator.
         if self._use_decode(flat):
             out = self._forward_decode(flat)
         else:
@@ -335,8 +327,8 @@ class Glm5NextSparseMoeBlock(nn.Module):
         topk_ids: torch.Tensor,
         shared: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Clamped fp8 fused dispatch -- the fast, capture-safe production path;
-        ``shared`` (the shared expert's output) is added in the top-k sum."""
+        """The clamped fp8 fused dispatch, which captures; ``shared``, the shared expert's
+        output, is added in the top-k sum."""
         from mstar.utils.fused_moe import prefill as moe_prefill
 
         return moe_prefill.experts(

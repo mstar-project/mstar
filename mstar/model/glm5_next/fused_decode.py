@@ -172,7 +172,7 @@ if _HAS_TRITON:
         streams with it and applies the site's weighted RMSNorm; role 1 builds post and the
         Sinkhorn comb, which only the next ``update_streams`` reads. PDL: a dependent launch
         that loads its weights before waiting on the mix kernel ahead and unrolls the
-        Sinkhorn loop (both measured at decode sizes with PDL only)."""
+        Sinkhorn loop."""
         if PDL:
             gdc_launch_dependents()
         t = tl.program_id(0).to(tl.int64)

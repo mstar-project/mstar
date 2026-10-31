@@ -910,8 +910,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def batch_cap_varies(self, graph_walk: str) -> bool:
         """Whether ``max_batch_size(graph_walk)`` follows state that changes while
-        serving (free slots, say). The scheduler asks such a cap every pass and
-        caches every other one, so a cap that moves must say so here."""
+        serving (free slots, say). The scheduler caches every other cap."""
         del graph_walk
         return False
 

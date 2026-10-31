@@ -109,8 +109,7 @@ class Glm5NextModel(Model):
             self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
         if "prefill_graphs" in kwargs:
             self.config.prefill_graphs = bool(kwargs["prefill_graphs"])
-        # documented overrides of the submodule's buckets; swallowed by **kwargs,
-        # a YAML that set them still captured all 192 graphs
+        # overrides of the submodule's buckets, which **kwargs would otherwise swallow
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if kwargs.get(key) is not None:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
@@ -118,9 +117,8 @@ class Glm5NextModel(Model):
         # pool holds one more slot, its sink; a serve YAML sets the pool's
         # size, sink included, under ``resources: kda_state: {max_slots: N}``.
         self.kda_max_requests = int(kwargs.get("kda_max_requests", 32))
-        # The KDA conv tail's dtype: the projection dtype at serve. bf16 is
-        # the autocast dtype every serve config uses; the reduced CPU tests
-        # build the model in fp32 and pass the matching dtype here.
+        # the KDA conv tail's dtype, which must match the projections' (bf16 at serve; CPU
+        # tests pass fp32)
         self.kda_conv_dtype = kwargs.get("kda_conv_dtype", torch.bfloat16)
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
@@ -130,9 +128,7 @@ class Glm5NextModel(Model):
 
     @property
     def tokenizer(self):
-        # Lazy: weights AND tokenizer load on demand so the conductor
-        # process never touches the 306 GB checkpoint or HF IO in
-        # dummy/byte mode.
+        # loaded on first use, so byte mode never touches HF
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
@@ -264,9 +260,8 @@ class Glm5NextModel(Model):
         if "top_k" in model_kwargs:
             params["top_k"] = int(model_kwargs["top_k"])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP drafting is greedy-only: greedy is the DECLARED default
-            # on MTP configs so a bare request serves coherently; an EXPLICIT
-            # temperature > 0 still reaches the refusal.
+            # MTP verifies greedily: a request that names no temperature gets 0, and an
+            # explicit one > 0 is refused in process_prompt
             params["temperature"] = 0.0
         return {SAMPLER: SamplingReqConfig(**params)}
 
@@ -275,9 +270,8 @@ class Glm5NextModel(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # MTP keeps this shape: each request's draft seed lives in its KDA slot
-        # (MTP_HIDDEN, MTP_DRAFT), and a verify step's accepted tokens leave on
-        # new_token like a decode step's one.
+        # MTP keeps this graph: the draft seed lives in the request's KDA slot, and a
+        # verify step's tokens leave on new_token like a decode step's
         prefill = GraphNode(
             name="LLM",
             input_names=["text_inputs"],
@@ -373,10 +367,7 @@ class Glm5NextModel(Model):
                 request_done=True,
             )
 
-        # Seed decode from the persisted emitted token. A draft-bundle seed
-        # belongs here too, under a DEDICATED name — never "text_inputs",
-        # which the conductor pre-seeds with the PROMPT, so reusing the name
-        # feeds the whole prompt back into every decode step.
+        # seed decode from the persisted emitted token
         graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
         graph_edge.tensor_info = persist_signals.get("new_token", [])
         unpersist_tensors = list(graph_edge.tensor_info)
@@ -413,8 +404,8 @@ class Glm5NextModel(Model):
             raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
 
         if self.config.mtp_num_draft_tokens > 0:
-            # MTP verifies by argmax. Refused here it is the client's 400; the worker's
-            # refusal was a 500, after the request had reached every rank
+            # MTP verifies by argmax; refused here, it is the client's 400 rather than a
+            # worker's 500
             temperature = float(kwargs.get("temperature", 0.0))
             penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
             if temperature > 0.0 or penalty != 1.0:
@@ -457,9 +448,8 @@ class Glm5NextModel(Model):
         block = self.config.mtp_num_draft_tokens + 1
         budget = kwargs.get("max_output_tokens")
         if block > 1 and budget is not None:
-            # MTP decode stops two blocks short of the window (_mtp_check_stop), inside the
-            # cache rows the conductor checks, so a max_tokens past that is refused here, as
-            # one past the context is without MTP, rather than cut short
+            # MTP decode stops two blocks short of the window (_mtp_check_stop), so a max_tokens
+            # past that is refused here rather than cut short
             room = self.config.index_topk - 2 * block + 1 - n
             if budget > room:
                 raise ValueError(
@@ -562,19 +552,13 @@ class Glm5NextModel(Model):
             )
             return None
 
-        # Detect the checkpoint's fp8-block quant config if the config did not
-        # already carry one (the official checkpoint is fp8 e4m3 [128,128]).
         self._maybe_apply_checkpoint_quant_config(source)
 
         from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
         from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 
-        # Build on meta -> optional autocast narrow -> to_empty(device) ->
-        # fast read-plan load (restore_fp32_params runs inside load_weights) ->
-        # process_weights_after_loading -> eval -> wrap. Building on meta
-        # first keeps the 306 GB allocation lazy until to_empty. The KDA
-        # state is the engine's recurrent pool (get_node_resources), built by
-        # the engine after this.
+        # built on meta, so nothing is allocated before to_empty; load_weights re-widens the
+        # fp32 params (restore_fp32_params)
         with torch.device("meta"):
             language_model = Glm5NextForCausalLM(self.config, comm_group=tp_group)
         if autocast_dtype is not None:

@@ -54,8 +54,8 @@ def build_dense_mlp(
 def build_mlp_for_layer(
     config: Glm5NextModelConfig, layer_idx: int, comm_group: CommGroup | None = None
 ):
-    """Dense on the ``mlp_layer_types`` "dense" entries (layers 0..2), MoE
-    everywhere else — the MTP layer (idx == num_hidden_layers) is MoE."""
+    """Dense on the ``mlp_layer_types`` "dense" layers (0..2), MoE elsewhere, the
+    MTP layer (idx == num_hidden_layers) included."""
     if config.is_dense_mlp_layer(layer_idx):
         return build_dense_mlp(config, comm_group=comm_group)
     return Glm5NextSparseMoeBlock(config, comm_group=comm_group)
