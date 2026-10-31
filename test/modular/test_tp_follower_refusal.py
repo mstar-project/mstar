@@ -1,12 +1,5 @@
-"""A TP follower refusing a step rank 0 cannot have refused stops its worker.
-
-Each rank admits from its own pools, and rank 0 schedules within
-``get_max_batch_size``. The guard relies on a cap that follows free state, as
-GLM-5.3's prefill cap follows the free KDA slots: a follower that refuses a batch
-past its own such cap has capacity rank 0 does not, while rank 0 admitted the step
-and is running its collectives. Re-queueing it or failing its requests would leave
-rank 0 in them until the watchdog, so the worker exits. Refusals within that cap
-are ones rank 0 made too, and are retried.
+"""A TP follower that refuses, for capacity, a batch past its own batch cap exits; every
+other refusal is left to retry.
 """
 
 from __future__ import annotations

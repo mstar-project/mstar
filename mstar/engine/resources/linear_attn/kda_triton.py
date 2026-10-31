@@ -1,28 +1,24 @@
 """Fused Triton kernels for Kimi delta attention against a recurrent state pool.
 
-Both entry points take the layer's merged in-projection row, q | k | v | beta | f_a | g_a,
-and fuse the whole layer between that projection and ``o_proj``: the causal conv, the
-forget gate's up-projection, the delta rule on the pooled fp32 state and the gated
-RMSNorm. ``kda_decode`` is one program per (token, head). ``kda_prefill`` runs every span
-of a step in one varlen pass per layer. ``kda_verify`` runs a speculative verify block per
-row: it replays the accepted part of the row's last block from the state before it, then the
-new block. The pool holds each head's state V-first, ``[V, K]``, as ``DeltaNetGeometry``
-declares it and fla's kernels read it.
+Each entry point reads the layer's merged in-projection row, q | k | v | beta | f_a | g_a,
+and fuses everything up to ``o_proj``: the causal conv, the forget gate's up-projection, the
+delta rule on the pooled fp32 state and the gated RMSNorm. ``kda_decode`` is one program per
+(token, head); ``kda_prefill`` runs a step's spans in one varlen pass; ``kda_verify`` replays
+each row's accepted drafts from the state before them, then runs the new block. The pool
+holds each head's state V-first, ``[V, K]``, as ``DeltaNetGeometry`` declares it.
 
-Prefill, per head: a span is cut into chunks of C tokens. With G the in-chunk cumsum of the
-log-decay and S the ``[K, V]`` fp32 state, the chunked delta rule is
+Prefill cuts each span into chunks of C tokens. With G the in-chunk cumsum of the log-decay
+and S the ``[K, V]`` fp32 state:
 
     A[i, j]   = beta_i * sum_d k_i k_j exp(G_i - G_j)   (j < i)
     Aqk[i, j] = sum_d q_i k_j exp(G_i - G_j)           (j <= i)
     [W U]     = (I + A)^-1 [beta K exp(G), beta V]
     per chunk: V' = U - W S;  O = (Q exp(G)) S + Aqk V';  S = exp(G_last) S + (K exp(G_last - G))^T V'
 
-Four kernels, the first two chunk-parallel: ``_kda_conv_kernel`` (the causal conv, the
-l2norm factors and the gates' in-chunk cumsum), ``_kda_intra_kernel`` (A, Aqk, the solve, W, U),
-``_kda_scan_kernel`` (serial over each span's chunks, state in place in the slot pool) and
-``_kda_out_norm_kernel`` (output gate + gated RMSNorm). The math and the bf16 rounding points
-follow the torch reference in ``kda_torch``; ``PrefillConfig`` holds the
-tile and precision choices.
+``_kda_conv_kernel`` (conv, gate cumsum, beta) and ``_kda_intra_kernel`` (l2norm factors, A,
+Aqk, the solve, W, U) run per chunk, ``_kda_scan_kernel`` serially over each span's chunks with
+the state in place in its slot, and ``_kda_out_norm_kernel`` applies the output gate and norm.
+The bf16 rounding points follow ``kda_torch``.
 """
 from __future__ import annotations
 
@@ -45,9 +41,9 @@ if _HAS_TRITON:
 
     @triton.jit
     def _conv_silu(row, cstate, conv_w, c):
-        """Width-4 causal conv + SiLU for channels ``c``. Returns the output and the rolled
-        state; the caller stores the state after a barrier (the vectors are replicated
-        across warps, so an early store would race with another warp's load)."""
+        """Width-4 causal conv + SiLU for channels ``c``, and the rolled state, which the
+        caller stores after a barrier: the vectors are replicated across warps, so an early
+        store races another warp's load."""
         s0 = tl.load(cstate + c * 3 + 0).to(tl.float32)
         s1 = tl.load(cstate + c * 3 + 1)
         s2 = tl.load(cstate + c * 3 + 2)
@@ -70,9 +66,7 @@ if _HAS_TRITON:
         lower_bound, scale, norm_eps,
         H: tl.constexpr, D: tl.constexpr,
     ):
-        """One program per (token, head): conv, gates, l2norm, the delta-rule step on the
-        pooled fp32 state ``[v][k]``, and the gated RMSNorm. ``proj`` rows are
-        q | k | v | b | f_a | g_a from the merged in-projection."""
+        """One program per (token, head)."""
         n = tl.program_id(0).to(tl.int64)
         h = tl.program_id(1)
         P = H * D
@@ -81,8 +75,8 @@ if _HAS_TRITON:
         row = proj + n * stride_proj
         cstate = conv_pool + slot * stride_conv
 
-        # Every load that depends on no other result is issued first, the state included, so
-        # their latencies overlap: at decode sizes the kernel is bound by its load chain.
+        # independent loads first, the state included, so their latencies overlap: at
+        # decode sizes the kernel is bound by its load chain
         # s[v, k]: the decay runs along k, the reads and the update reduce over it
         sp = state_pool + slot * stride_state + h * D * D + d[:, None] * D + d[None, :]
         s = tl.load(sp)
@@ -94,7 +88,6 @@ if _HAS_TRITON:
         a_exp = tl.exp(tl.load(a_log + h))
         norm = tl.load(norm_w + d).to(tl.float32)
         b = tl.load(row + 3 * P + h).to(tl.float32)
-        # Forget gate: f_b(f_a) per head, + dt_bias, lower_bound * sigmoid(exp(A) * g).
         g = tl.sum(fb * f_a[None, :], 1).to(tl.bfloat16).to(tl.float32)
         g = g + bias
         decay = tl.exp(lower_bound * tl.sigmoid(a_exp * g))
@@ -118,7 +111,6 @@ if _HAS_TRITON:
         o = tl.sum(s * q[None, :], 1).to(tl.bfloat16).to(tl.float32)
         tl.store(sp, s)
 
-        # The gated RMSNorm over the head.
         y = o * tl.rsqrt(tl.sum(o * o, 0) / D + norm_eps)
         y = y * norm * tl.sigmoid(gate)
         tl.store(out + n * stride_out + h * D + d, y.to(out.dtype.element_ty))
@@ -144,8 +136,8 @@ def kda_decode(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state_
 
 @dataclass
 class PrefillConfig:
-    """Tile and precision choices; the defaults are tuned on H200 at one TP8 rank of
-    GLM-5.3 (8 heads of 128)."""
+    """Tile and precision choices; the defaults are tuned on H200 for 8 heads of 128 (one
+    TP8 rank of GLM-5.3)."""
     chunk: int = 64
     # rows per decay-reference block of A; exp(|lower_bound| * row_block / 2) must fit fp32
     row_block: int = 32
@@ -153,8 +145,8 @@ class PrefillConfig:
     conv_groups: int = 16  # row groups the conv walks in parallel, C / groups rows each
     conv_warps: int = 4
     intra_warps: int = 4
-    # V columns of the state per scan program; 0 picks 32 while the grid fits one wave of
-    # SMs (few spans: more programs on the serial path) and 64 above it
+    # V columns per scan program; 0 picks 32 while the grid fits one wave of SMs, for more
+    # programs on the serial path, and 64 above it
     scan_bv: int = 0
     scan_warps: int = 4
     scan_stages: int = 3
@@ -176,7 +168,7 @@ def _num_sms(device) -> int:
 
 def supported(head_dim: int) -> bool:
     """Head dims the fused prefill is validated for. At 16, Triton 3.7 miscompiles the bf16
-    T @ X dot that follows the tf32 solve (rows past 16 come out wrong); GLM-5.3 uses 128."""
+    T @ X dot that follows the tf32 solve (rows past 16 come out wrong)."""
     return head_dim >= 32 and head_dim & (head_dim - 1) == 0
 
 
@@ -280,8 +272,8 @@ if _HAS_TRITON:
                       mask=(live & (src < 0))[None, :], other=0.0)
         return x + old
 
-    # T (the step's token count) is not specialized on: one binary per config, never a
-    # recompile when a step's T changes divisibility (every T-derived address is scaled by D).
+    # T, the step's token count, is not specialized on, so a step whose T changes
+    # divisibility doesn't recompile; every T-derived address is scaled by D
     @triton.jit(do_not_specialize=["T"])
     def _kda_conv_kernel(
         proj, stride_proj, conv_pool, stride_conv, conv_w, f_b, dt_bias, a_log,
@@ -328,7 +320,6 @@ if _HAS_TRITON:
             n, c, pos, valid, tok = _chunk_rows(chunks, starts, lens, ic, C)
             vmask = valid[:, None]
             row = proj + tok * stride_proj
-            # f_b(f_a) + dt_bias -> lower_bound * sigmoid(exp(A) g), summed down the chunk.
             f_a = tl.load(row[:, None] + 3 * P + H + d[None, :], mask=vmask, other=0.0)
             fb = tl.load(f_b + (h * D + d)[:, None] * D + d[None, :])
             g = tl.dot(f_a, tl.trans(fb)).to(tl.bfloat16).to(tl.float32)
@@ -619,8 +610,8 @@ if _HAS_TRITON:
         vw2 = tl.load(conv_w + cv * 4 + 2)
         vw3 = tl.load(conv_w + cv * 4 + 3)
 
-        # The conv window before the prefix: the pool's on a request's first verify step
-        # (right after its prefill, the only time the prefix is empty), else the cached one.
+        # the conv window before the prefix: the pool's on a request's first verify step,
+        # just after its prefill and the only time the prefix is empty; else the cached one
         if plen == 0:
             cw = conv_pool + slot * stride_conv
         else:
@@ -768,10 +759,9 @@ def _merged_row(qkv, g, beta, gate, p) -> torch.Tensor:
 class TritonKDAKernels:
     """``kda_decode``, ``kda_prefill`` and ``kda_verify`` as a ``KDAManager`` kernel bundle.
 
-    Both fuse the forget gate's up-projection and the output gate with the gated RMSNorm, so
-    they need ``params.f_b``, ``g_b`` and ``norm_weight``, take the low-rank gates, and return
-    the normed ``[T, P]``. Every address comes from the plan's tensors, so a captured step
-    replays with new slots and spans.
+    They apply both gates' up-projections and the gated RMSNorm, so they need ``params.f_b``,
+    ``g_b`` and ``norm_weight`` and return the normed ``[T, P]``. Every address comes from the
+    plan's tensors, so a captured step replays with new slots and spans.
     """
 
     def __init__(self, config: PrefillConfig | None = None):

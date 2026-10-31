@@ -207,9 +207,8 @@ class RopeManager(PositionManager):
         self._counters[rid].clear()
 
     def correct_len(self, rid: str, label: str, delta: int) -> None:
-        """Move a stream's position by ``delta``, beside ``KVManager.correct_len``: a speculative
-        verify step advances by its whole block, and its rejected tail is taken back from both
-        once the acceptance is known."""
+        """Move a stream's position by ``delta``, as ``KVManager.correct_len`` moves its KV
+        length after a speculative verify step."""
         counters = self._counters.setdefault(rid, {})
         counters[label] = max(0, counters.get(label, 0) + delta)
 
@@ -483,9 +482,9 @@ class RopeManager(PositionManager):
 
     @property
     def cos_sin_table(self) -> torch.Tensor | None:
-        """The fp32 ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
+        """The ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
         ``rotary_dim / 2`` cosines then as many sines, for a kernel that rotates inside a
-        larger fusion (GLM-5.2's MLA prep); None without ``rope_table_dtype``."""
+        larger fusion; None without ``rope_table_dtype``."""
         return self._rope_table
 
     def _check_rope_table_args(

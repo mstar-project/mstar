@@ -69,10 +69,9 @@ logger = logging.getLogger(__name__)
 # request after each admit, commit, reset and remove, and after each change to
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
-# A step whose rows each write at most HOST_PLAN_MAX_SPAN tokens (decode, an MTP
-# verify's k + 1), up to HOST_PLAN_MAX_TOKENS in all, builds its write addressing
-# on the host: a Python loop per token beats the packed path's kernels there.
-# Wider rows (prefills) keep the packed path.
+# A step whose rows each write at most HOST_PLAN_MAX_SPAN tokens (decode, a
+# speculative verify), HOST_PLAN_MAX_TOKENS in all, builds its write addressing on
+# the host, where a loop per token beats the packed path's kernels.
 HOST_PLAN_MAX_TOKENS = 512
 HOST_PLAN_MAX_SPAN = 8
 
@@ -2911,11 +2910,9 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def _drop_sealed_tail(self, rid: str, label: str, stream: CacheStream) -> None:
-        """#279's rule for a rewind: the next write must not land on a sealed
-        page its other owners still read. Pages from the write position on are
-        dropped, and the one the length ends inside is replaced by a copy. The
-        dropped pages leave through `_release` and the request is recounted, as
-        for any page a stream gives up."""
+        """After a rewind the next write must not land on a sealed page other owners
+        still read: the pages from the write position on leave through `_release`, and
+        the one the length ends inside is replaced by a copy."""
         page_size = self.config.page_size
         first = stream.stored_len // page_size
         tail = stream.page_indices[first:]

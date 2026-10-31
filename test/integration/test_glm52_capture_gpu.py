@@ -253,18 +253,16 @@ def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
 
 
 def _fused_prep(submodule, on: bool) -> None:
-    """The fused MLA prep on every layer (kernels: auto takes it where it runs), or the
-    op-by-op path (the reference's)."""
+    """The fused MLA prep on every layer, or the op-by-op path."""
     for layer in submodule.language_model.model.layers:
         layer.self_attn.mla_fused_prep = on
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeypatch, fp8):
-    """The fused MLA prep: the captured streams equal the eager ones and the op-by-op path's
-    captured ones (q_lora_rank 256, a width the fused norms take). The bf16 arm runs the
-    reference otherwise: under kernels: auto its captured stream left the eager one at the
-    fourth token (H200, not diagnosed); the fp8 arm needs auto's fused MoE to capture."""
+    """Captured with the fused MLA prep == eager == captured op by op. The bf16 arm runs
+    kernels: reference otherwise, since under auto its captured stream leaves the eager one
+    (undiagnosed); the fp8 arm needs auto's fused MoE to capture."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     prompts = BUCKET_PROMPTS if fp8 else PROMPTS
     kernels = {} if fp8 else {"kernels": "reference"}
