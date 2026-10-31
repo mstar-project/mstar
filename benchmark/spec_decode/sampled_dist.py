@@ -4,12 +4,13 @@ draws at a seed (speculative decoding consumes its random numbers differently fr
     python -m benchmark.spec_decode.sampled_dist save --url http://127.0.0.1:8100 --out spec.json
     python -m benchmark.spec_decode.sampled_dist compare base.json spec.json [--tokenizer Qwen/Qwen3.5-0.8B]
 
-``save`` sends each of the first ``--prompts`` chat prompts ``--samples`` times (one seed per sample) at temperature
-0.7, top-p 0.9 and top-k 20 for ``--max-tokens`` tokens. ``compare`` re-tokenizes every completion and, per prompt and
-position 1..N-1 (position 0 is the prompt's own token, sampled the same way on both paths), tests the two token
-marginals with a permutation test of their total-variation distance. Under the null each p-value is uniform, so the
-fraction below 0.01 should be near 1%. The same test between two halves of the first run (``--null``) shows the
-level the harness reaches on identical servers.
+``save`` sends each of the first ``--prompts`` of T2's 48 prompts ``--samples`` times (one seed per sample) at
+temperature 0.7, top-p 0.9 and top-k 40 for ``--max-tokens`` tokens. ``compare`` re-tokenizes every completion and, per
+prompt and position 1..N-1 (position 0 is the prompt's own token, sampled the same way on both paths), tests the two
+token marginals with a permutation test of their total-variation distance, and the same for the whole prefix up to that
+position, which also sees how positions depend on each other (a draw reused between positions leaves the marginals
+alone). Under the null each p-value is uniform, so the fraction below 0.01 should be near 1%. The same test between two
+halves of the first run (``--null``) shows the level the harness reaches on identical servers.
 """
 
 from __future__ import annotations
@@ -50,12 +51,12 @@ def save(args) -> int:
     return 0
 
 
-def tv(a: list[int], b: list[int]) -> float:
+def tv(a: list, b: list) -> float:
     ca, cb = collections.Counter(a), collections.Counter(b)
     return 0.5 * sum(abs(ca[t] / len(a) - cb[t] / len(b)) for t in set(ca) | set(cb))
 
 
-def perm_p(a: list[int], b: list[int], rounds: int, rng: random.Random) -> float:
+def perm_p(a: list, b: list, rounds: int, rng: random.Random) -> float:
     observed, pooled, n = tv(a, b), a + b, len(a)
     hits = 0
     for _ in range(rounds):
@@ -64,13 +65,16 @@ def perm_p(a: list[int], b: list[int], rounds: int, rng: random.Random) -> float
     return (hits + 1) / (rounds + 1)
 
 
-def tests(xs: list[list[list[int]]], ys: list[list[list[int]]], positions: int, rounds: int, seed: int):
+def tests(xs: list[list[list[int]]], ys: list[list[list[int]]], positions: int, rounds: int, seed: int,
+          joint: bool = False):
+    """One row per (prompt, position): the two runs' tokens there, or with ``joint`` their prefixes through it."""
     rng = random.Random(seed)
     rows = []
+    pick = (lambda s, p: tuple(s[1:p + 1])) if joint else (lambda s, p: s[p])
     for i, (x, y) in enumerate(zip(xs, ys, strict=True)):
         for p in range(1, positions):
-            a = [s[p] for s in x if len(s) > p]
-            b = [s[p] for s in y if len(s) > p]
+            a = [pick(s, p) for s in x if len(s) > p]
+            b = [pick(s, p) for s in y if len(s) > p]
             if len(a) < 10 or len(b) < 10:
                 continue
             rows.append((i, p, tv(a, b), perm_p(a, b, rounds, rng)))
@@ -107,15 +111,16 @@ def compare(args) -> int:
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     a, b = (json.loads(Path(p).read_text()) for p in (args.a, args.b))
     enc = [[[tok.encode(t, add_special_tokens=False) for t in prompt] for prompt in run["texts"]] for run in (a, b)]
-    rows = tests(enc[0], enc[1], args.positions, args.rounds, 0)
-    print(summary("a vs b", rows))
-    for r in rows:
-        if r[3] < 0.01:
-            print(f"  prompt {r[0]} position {r[1]}: TV {r[2]:.3f} p {r[3]:.4f}")
-    if args.null:
-        half = len(enc[0][0]) // 2
-        print(summary("a vs a (halves)", tests([p[:half] for p in enc[0]], [p[half:] for p in enc[0]],
-                                              args.positions, args.rounds, 1)))
+    for name, joint in (("marginal", False), ("prefix", True)):
+        rows = tests(enc[0], enc[1], args.positions, args.rounds, 0, joint)
+        print(summary(f"{name} a vs b", rows))
+        for r in rows:
+            if r[3] < 0.01:
+                print(f"  prompt {r[0]} position {r[1]}: TV {r[2]:.3f} p {r[3]:.4f}")
+        if args.null:
+            half = len(enc[0][0]) // 2
+            print(summary(f"{name} a vs a (halves)", tests([p[:half] for p in enc[0]], [p[half:] for p in enc[0]],
+                                                           args.positions, args.rounds, 1, joint)))
     return 0
 
 
@@ -126,12 +131,12 @@ def main(argv=None) -> int:
     s.add_argument("--url", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--model", default="qwen3_5")
-    s.add_argument("--prompts", type=int, default=8)
+    s.add_argument("--prompts", type=int, default=48)
     s.add_argument("--samples", type=int, default=200)
     s.add_argument("--max-tokens", type=int, default=6)
     s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--top-p", type=float, default=0.9)
-    s.add_argument("--top-k", type=int, default=20)
+    s.add_argument("--top-k", type=int, default=40)
     s.add_argument("--concurrency", type=int, default=32)
     s.add_argument("--timeout", type=float, default=300)
     c = sub.add_parser("compare")
