@@ -28,11 +28,8 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.convenience import KDACallable
-from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import (
     ATTN,
     KDA,
@@ -64,12 +61,6 @@ PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 # The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
 HOLE_KPE = -1.0e4
 _VERDICT_TIMEOUT_S = 120.0
-
-
-def _fused_kda(config: Glm5NextModelConfig) -> bool:
-    """The KDA layers run the fused kernels, whose prefill is the only capturable one."""
-    return (fused_decode._ENABLED and kda_triton._HAS_TRITON
-            and kda_triton.supported(config.linear_head_dim))
 
 
 def _real_row_values(last: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -131,10 +122,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def bind_node_resources(self, resources: dict) -> None:
         super().bind_node_resources(resources)
-        # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
-        if kda is not None and not _fused_kda(self.config):
-            kda.set_kernels(TorchKDAKernels())
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
 
     # -- CUDA-graph configs ----------------------------------------------
@@ -166,6 +154,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         pool = self.node_resources.get(KDA_STATE) if self.node_resources else None
         return None if pool is None else pool.config.usable_slots
 
+    def _kda_prefill_capturable(self) -> bool:
+        kda = self.node_resources.get(KDA) if self.node_resources else None
+        return kda is not None and kda.prefill_capturable
+
     def max_batch_size(self, graph_walk: str) -> int | None:
         # one KDA slot per row: the scheduler splits a larger step rather than fail its admit
         pool = self.node_resources.get(KDA_STATE) if self.node_resources else None
@@ -186,7 +178,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _captured_prefill_rows(self) -> int | None:
         """The most rows a captured prefill takes, or None while prefill runs eager."""
-        if not self.config.prefill_graphs or not _fused_kda(self.config):
+        if not self.config.prefill_graphs or not self._kda_prefill_capturable():
             return None
         # no prefill graph (reference MoE, the MLA fallback): an eager prefill is not held
         # to the captured rows
@@ -232,7 +224,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 compile=False,
             ),
         ]
-        if self.config.prefill_graphs and not _fused_kda(self.config):
+        if self.config.prefill_graphs and not self._kda_prefill_capturable():
             # The reference KDA prefill loops over spans on the host, so a
             # captured replay would run the capture's dummy spans.
             logger.warning("glm5_next: fused KDA prefill off; prefill runs eager")

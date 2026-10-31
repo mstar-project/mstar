@@ -11,7 +11,6 @@ import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.components.distributed import ParallelKimiDeltaAttention
@@ -49,7 +48,6 @@ def _resources(max_requests: int = 3):
     kda = build_resource(specs[KDA], EngineResourceInfo(
         device=cpu, dependencies={KDA_STATE: specs[KDA_STATE]},
     ))
-    kda.set_kernels(TorchKDAKernels())
     return pool, kda
 
 
