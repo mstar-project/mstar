@@ -409,7 +409,7 @@ def _captured_on_cpu(config, label, resources=None, step_runner=None, bs=(1, 2, 
     # memory readings are the accelerator's, which a CPU device has none of
     no_memory_stats = dict(memory_allocated=lambda device=None: 0, max_memory_allocated=lambda device=None: 0,
                            reset_peak_memory_stats=lambda device=None: None, empty_cache=lambda: None)
-    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a: (_Replay(fn), fn())), \
+    with mock.patch.object(cgr, "capture_into_graph", lambda fn, *a, **_: (_Replay(fn), fn())), \
             mock.patch.multiple(torch.accelerator, **no_memory_stats):
         runner.prepare_for_capture()
         runner.warmup_and_capture(None)

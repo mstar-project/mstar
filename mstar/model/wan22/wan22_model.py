@@ -445,7 +445,7 @@ class Wan22Model(Model):
             )
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Mux the emitted uint8 ``[1, 3, F, H, W]`` video tensor to mp4 bytes.
+        """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
 
         PyAV is the encoder because it bundles its own FFmpeg; torchcodec needs
         system FFmpeg libraries. ``fps`` is a PLAYBACK rate, not a generation knob:
@@ -467,7 +467,7 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output[0].permute(1, 2, 3, 0).cpu().numpy()
+        frames = output.cpu().numpy()
         buffer = io.BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
         # PyAV rejects float rates, so the rate is handed over as an exact

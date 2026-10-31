@@ -107,7 +107,7 @@ def measured(monkeypatch):
     monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", capture)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
     monkeypatch.setattr(
-        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype, **_: (None, run()),
     )
     return runs
 
@@ -287,7 +287,7 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
     runner.size_captures()
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, {}),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype, **_: (None, {}),
     )
 
     for spec in runner.prepare_for_capture():

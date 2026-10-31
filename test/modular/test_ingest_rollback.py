@@ -53,6 +53,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: [],
         add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
     )

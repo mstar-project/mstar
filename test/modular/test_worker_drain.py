@@ -30,6 +30,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ def _worker(
         has_inflight_reads=lambda rid: inflight_reads,
         force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
     )
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     return w
 
 
@@ -210,6 +212,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     )
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
+        after_output_copy=lambda batch: None,
         extend_prefix_chains=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     )
@@ -477,7 +480,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._draining_rids = set()
     w._reads_done_sent = set()
     w._unprocessed_messages = {}
-    w._my_consumer_connections = []
     w._last_active = {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
@@ -498,6 +500,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         per_request_info={}, add_request=_state_add,
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: ["n"],
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
@@ -506,6 +509,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],

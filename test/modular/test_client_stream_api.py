@@ -1243,11 +1243,11 @@ class _FailingOutputModel(_ListeningModel):
 def test_an_output_failure_aborts_a_request_that_may_still_take_input():
     """The client's stream ends with the error, but a live call's engine
     request would never end on its own: the data worker aborts it."""
-    from mstar.api_server.data_worker import InlineToken
+    from mstar.api_server.data_worker import InlineTokens
 
     wt, sent, _tm = _thread(_FailingOutputModel())
     _open(wt)
-    wt._emit_inline_token(InlineToken(request_id="r", value=5, loop_indices=None, modality="text"))
+    wt._emit_inline_tokens(InlineTokens(["r"], [5], "text"))
 
     assert wt.out_queue.get(timeout=5).modality == "error"
     (abort,) = _bodies(sent, ConductorMessageType.ABORT_REQUEST)
@@ -1373,7 +1373,7 @@ def test_a_new_request_under_a_live_calls_id_is_refused_and_the_call_goes_on(mon
         {"request_id": "call", "text": "a separate question", "end_input": True},
         {"request_id": "other", "end_input": True},
     ])
-    asyncio.run(_serve(ws, until=lambda: len(ws.sent) >= 3))
+    asyncio.run(_serve(ws, until=lambda: len(ws.sent) >= 3 and server.preprocess_worker.items))
 
     retried, one_shot, stray_end = sorted(ws.sent, key=lambda r: r["request_id"])
     assert retried["status"] == 409 and one_shot["status"] == 409
