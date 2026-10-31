@@ -33,6 +33,10 @@ over-counted, ``(k + 1) - (n + 1)``.
 A row also stops itself: tokens past a stop id or past the request's budget
 are emitted as -1, and ``done`` tells the host, so a step never needs the host
 to cut its output.
+
+A sampled step (see `sampled`) keeps what greedy acceptance keeps, and also the
+draft distribution each draft came from, here per request, until the next step
+judges the draft against the target's.
 """
 
 from __future__ import annotations
@@ -47,8 +51,8 @@ import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.kv.plan import SINK_PAGE
-from mstar.engine.resources.sampler import utils as sampling
 from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources.spec_decode import sampled
 from mstar.engine.resources.spec_decode.config import (
     AcceptedTokens,
     SpecDecodeSpec,
@@ -69,6 +73,19 @@ logger = logging.getLogger(__name__)
 SINK_ROW = 0
 # Fields of the per-step image staged in one H2D copy, each `rows` long.
 _FIELDS = ("rows", "real", "base", "budget", "stop_on", "top_k")
+# Where a request's sampled steps start in its Philox stream. The sampler resource
+# counts from 0 for the prompt's first token, under the same seed, in the same word
+# stream of the row; this is far enough up that the two cannot meet.
+RNG_START = 1 << 31
+
+
+class _RowSampling(NamedTuple):
+    """This step's sampling settings, one entry per step row."""
+    temperature: torch.Tensor
+    top_k: torch.Tensor          # the vocabulary where the request's is off
+    top_p: torch.Tensor
+    seed: torch.Tensor
+    draft_offset: torch.Tensor   # stream offset of the step's first draft draw
 
 
 class _StepImage(NamedTuple):
@@ -120,6 +137,7 @@ class SpecDecodeResource(Resource):
             device=info.device,
             num_draft_tokens=spec.config.num_draft_tokens,
             sampling=spec.config.sampling,
+            vocab_size=spec.config.vocab_size,
             max_requests=spec.config.max_requests,
             page_size=page_size,
             kv_key=spec.kv_cache,
@@ -137,6 +155,7 @@ class SpecDecodeResource(Resource):
         attn_key: str,
         stop_token_ids: Sequence[int] = (),
         sampling: bool = False,
+        vocab_size: int | None = None,
     ):
         self._device = device
         self.num_draft_tokens = num_draft_tokens
@@ -162,6 +181,11 @@ class SpecDecodeResource(Resource):
         # the request's seed, and the Philox offset its next verify step draws at
         self._seed = torch.zeros(rows, dtype=torch.long, device=device)
         self._rng_offset = torch.zeros(rows, dtype=torch.long, device=device)
+        self._rng_stride = sampled.words_per_step(num_draft_tokens)
+        # per request and draft: the distribution the next verify judges it by
+        self._draft_probs = torch.zeros(
+            rows, num_draft_tokens, vocab_size, dtype=torch.float32, device=device,
+        ) if sampling else None
         self._stop_ids = torch.tensor(
             sorted(set(stop_token_ids)) or [-2], dtype=torch.long, device=device,
         )
@@ -189,6 +213,7 @@ class SpecDecodeResource(Resource):
         self._ids: torch.Tensor | None = None
         self._base: torch.Tensor | None = None
         self._accepted: torch.Tensor | None = None
+        self._row_sampling: _RowSampling | None = None
         # draft passes 1 .. k-1: their KV write slots and attention lengths,
         # computed together once the step knows what it accepted
         self._draft_pages: torch.Tensor | None = None
@@ -433,7 +458,12 @@ class SpecDecodeResource(Resource):
             self._top_p.index_copy_(0, rows, image.params[width: width + b])
             self._top_k.index_copy_(0, rows, image.top_k[:b])
             self._seed.index_copy_(0, rows, image.seeds[:b])
-            self._rng_offset.index_fill_(0, rows, 0)
+            self._rng_offset.index_fill_(0, rows, RNG_START)
+            # the first drafts are the head's argmax, a point mass each
+            k, vocab = self.num_draft_tokens, self._draft_probs.shape[-1]
+            point = torch.zeros(b, k, vocab, dtype=torch.float32, device=self._device)
+            at = first_draft.view(b, 1, 1).long().expand(b, k, 1)
+            self._draft_probs.index_copy_(0, rows, point.scatter_(2, at, sampled.DRAFT_MARGIN))
 
     @torch.compiler.disable
     def verify_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -453,57 +483,57 @@ class SpecDecodeResource(Resource):
     @torch.compiler.disable
     def accept(self, logits: torch.Tensor, sample: bool = False) -> AcceptedTokens:
         """Verification of this step's drafts against ``logits`` (``[rows *
-        (k + 1), vocab]``, the target's at each verify position): its argmax,
-        or with ``sample`` a draw from each row's top-k/top-p distribution at
-        its temperature (greedy where the row's temperature is 0).
-
-        The drafts are the draft head's argmax, a point mass, for which
-        rejection sampling is: draw the target's token at every position
-        independently and accept while it equals the next draft. A rejected
-        position then holds a draw from the target's distribution with the
-        draft taken out, which is the residual the rule prescribes, so the
-        emitted tokens follow the target exactly. The draws use the
-        request's seed (see `_sample`), so they repeat for it, but they are not
-        the draws a non-speculative step would make with that seed.
-        """
+        (k + 1), vocab]``, the target's at each verify position): acceptance
+        while they equal its argmax, or with ``sample`` speculative sampling
+        (see `sampled`) on each row's top-k/top-p distribution at its
+        temperature, where a temperature of 0 is the argmax again."""
         if not sample:
             return self.accept_tokens(logits.argmax(dim=-1))
         if not self.sampling:
             raise RuntimeError("this speculative node was declared without sampling")
-        return self.accept_tokens(self._sample(logits))
-
-    def _sample(self, logits: torch.Tensor) -> torch.Tensor:
-        """One draw per row of ``logits``: top-k, then top-p over what is
-        left, at the row's temperature (argmax at temperature 0), by the
-        sampler's captured kernel (`draw_tokens`). Each verify position draws
-        from its own stream (the request's seed, offset per position), so the
-        positions are independent; the offset advances once a step, so steps
-        are too, and a request's draws repeat for its seed."""
         plan = self._plan_now(SpecPhase.VERIFY)
         rows, _ = self._rows(plan)
-        t, vocab = self.tokens_per_row, logits.shape[-1]
-        temperature = self._temperature[rows].repeat_interleave(t)
-        top_p = self._top_p[rows].repeat_interleave(t)
-        # 0 is off for the request, which the kernel would read as k = 0
-        top_k = self._top_k[rows].repeat_interleave(t)
-        top_k = torch.where(top_k > 0, top_k, vocab)
+        b, t, vocab = plan.num_rows, self.tokens_per_row, logits.shape[-1]
+        row = self._begin_sampling(rows, vocab)
+        target = sampled.filtered_probs(
+            logits, row.temperature.repeat_interleave(t), row.top_k.repeat_interleave(t),
+            row.top_p.repeat_interleave(t),
+        ).view(b, t, vocab)
+        tokens, kept = sampled.accept_chain(
+            self._draft_probs.index_select(0, rows), self._ids.view(b, t)[:, 1:], target,
+            row.seed, row.draft_offset - t,
+        )
+        # -1 past the first rejection, which nothing emits but the draft embeds
+        return self.accept_tokens(tokens.long().clamp(0, vocab - 1), accepted=kept + 1)
+
+    def _begin_sampling(self, rows: torch.Tensor, vocab: int) -> _RowSampling:
+        """Read this step's settings and take its words of each request's
+        stream: the accept chain's, then one for each draft draw."""
+        top_k = self._top_k[rows]
         offset = self._rng_offset[rows]
-        position = torch.arange(t, dtype=torch.long, device=logits.device)
-        seed = self._seed[rows].repeat_interleave(t)
-        offsets = (offset[:, None] * t + position[None, :]).reshape(-1)
-        self._rng_offset.index_copy_(0, rows, offset + 1)
-        return sampling.draw_tokens(logits, temperature, top_k, top_p, seed, offsets).long()
+        self._rng_offset.index_copy_(0, rows, offset + self._rng_stride)
+        self._row_sampling = _RowSampling(
+            temperature=self._temperature[rows],
+            # 0 is off for the request, which the kernels would read as k = 0
+            top_k=torch.where(top_k > 0, top_k, vocab),
+            top_p=self._top_p[rows],
+            seed=self._seed[rows],
+            draft_offset=offset + self.tokens_per_row,
+        )
+        return self._row_sampling
 
     @torch.compiler.disable
-    def accept_tokens(self, target: torch.Tensor) -> AcceptedTokens:
+    def accept_tokens(self, target: torch.Tensor, accepted: torch.Tensor | None = None) -> AcceptedTokens:
         """Verification against the target's own token at each verify position
-        (``[rows * (k + 1)]``): its argmax, or what a sampler drew there."""
+        (``[rows * (k + 1)]``), kept while it equals the next draft, or as far
+        as ``accepted`` (``[rows]``) says when a sampler has decided that."""
         plan = self._plan_now(SpecPhase.VERIFY)
         rows, _ = self._rows(plan)
         b, t = plan.num_rows, self.tokens_per_row
         y = target.view(b, t).long()
         x = self._ids.view(b, t)
-        accepted = (x[:, 1:] == y[:, :-1]).int().cumprod(dim=1).sum(dim=1) + 1
+        if accepted is None:
+            accepted = (x[:, 1:] == y[:, :-1]).int().cumprod(dim=1).sum(dim=1) + 1
         self._accepted = accepted
         self._seq_len.index_copy_(0, rows, (self._base + accepted).int())
         self._num_acc.index_copy_(0, rows, accepted.int())
@@ -571,6 +601,18 @@ class SpecDecodeResource(Resource):
         t = self.tokens_per_row
         base = torch.arange(plan.num_rows, device=self._device) * t
         return base + (self._accepted - 1).long()
+
+    @torch.compiler.disable
+    def draw_draft(self, j: int, logits: torch.Tensor) -> torch.Tensor:
+        """Pass ``j``'s token for a sampled step, from the draft's ``logits``
+        (``[rows, vocab]``, read at `draft_slots`), under the row's own sampling
+        settings; keeps the distribution for the next step to judge it by."""
+        plan = self._plan_now(SpecPhase.VERIFY)
+        rows, _ = self._rows(plan)
+        row = self._row_sampling
+        probs = sampled.filtered_probs(logits, row.temperature, row.top_k, row.top_p)
+        self._draft_probs[:, j].index_copy_(0, rows, probs * sampled.DRAFT_MARGIN)
+        return sampled.draw(probs, row.seed, row.draft_offset + j)
 
     @torch.compiler.disable
     def record_draft(self, j: int, draft: torch.Tensor) -> torch.Tensor:

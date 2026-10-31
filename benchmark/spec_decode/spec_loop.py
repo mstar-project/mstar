@@ -9,6 +9,7 @@ the step's tokens are known, as a serving engine's draft pass does.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -123,9 +124,11 @@ def run_speculative(
     max_new_tokens: int,
     stop_ids: frozenset[int] = frozenset(),
     generator: torch.Generator | None = None,
+    observe: Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], None] | None = None,
 ) -> tuple[list[int], RunStats]:
     """Generate up to max_new_tokens after the prompt with k drafts per step. Returns the generated tokens (the stop
-    token included when one was reached) and the step statistics."""
+    token included when one was reached) and the step statistics. ``observe(position, draft_probs, target_probs,
+    draft_logits)`` sees each judged position's distributions."""
     stats = RunStats(k=k, prompts=1)
     logits, hiddens = target.prefill(prompt)
     first = sample(sampling_probs(logits, params), params, generator)
@@ -141,10 +144,12 @@ def run_speculative(
     while not finished():
         drafts: list[int] = []
         draft_dists: list[torch.Tensor] = []
+        draft_logits: list[torch.Tensor] = []
         for j in range(k):
             q = sampling_probs(q_logits, params)
             drafts.append(sample(q, params, generator))
             draft_dists.append(q)
+            draft_logits.append(q_logits)
             if j + 1 < k:
                 q_logits = draft.chain(drafts[j])
 
@@ -153,7 +158,10 @@ def run_speculative(
         n_accepted = 0
         next_token: int | None = None
         for j in range(k):
-            decision = accept_draft(drafts[j], draft_dists[j], sampling_probs(logits, params), generator)
+            target_dist = sampling_probs(logits, params)
+            if observe is not None:
+                observe(j, draft_dists[j], target_dist, draft_logits[j])
+            decision = accept_draft(drafts[j], draft_dists[j], target_dist, generator)
             stats.record(j, decision)
             if not decision.accepted:
                 next_token = decision.replacement

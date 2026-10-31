@@ -734,7 +734,8 @@ class LLMSubmodule(ARNodeSubmodule):
         cos, sin = cos.view(k, positions.shape[0], -1), sin.view(k, positions.shape[0], -1)
         hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=(cos[0], sin[0]))
         step = engine_inputs.step
-        accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
+        sample = bool(step is not None and step.cg_key_info)
+        accepted = spec.accept(head(hidden), sample=sample)
         ids = accepted.target.reshape(-1)
         rows = positions.shape[0] // (k + 1)
         for j in range(k):
@@ -746,7 +747,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 hidden, lm.embed_tokens(ids), label="main", cos_sin=(cos[j], sin[j]),
                 keep=spec.draft_slots(),
             )
-            ids = spec.record_draft(j, head(out).argmax(dim=-1))
+            logits = head(out)
+            ids = spec.record_draft(j, spec.draw_draft(j, logits) if sample else logits.argmax(dim=-1))
             hidden = out[:, None, :].expand(rows, k + 1, out.shape[-1]).reshape(rows * (k + 1), -1)
         return accepted
 
