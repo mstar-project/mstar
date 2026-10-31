@@ -486,9 +486,10 @@ Loading fails if a node is not in any node group, if a walk is one the model nev
 the model sets no budget for that walk, or if the walk is inside a combined walk and its
 node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
 
-Chunked prefill is not supported under tensor or sequence parallelism yet. A node whose
-node group spans more than one rank runs its prefills whole, whatever the model and these
-budgets say, and logs a warning at load.
+Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same
+ones. Chunked prefill is not supported under sequence parallelism yet: a node with an SP
+degree above one runs its prefills whole, whatever the model and these budgets say, and
+logs a warning at load.
 
 **Single GPU.** Everything on rank 0:
 
