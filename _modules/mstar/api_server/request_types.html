@@ -1151,8 +1151,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># this append's own model_kwargs; the opening's stay the request's</span>
     <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Answers the append as late, with an error naming why; called from the</span>
-    <span class="c1"># preprocess thread when the model routes items to a stream the client</span>
-    <span class="c1"># already ended. None: nobody to answer.</span>
+    <span class="c1"># preprocess thread when the model routes items to a stream that has</span>
+    <span class="c1"># ended (by the client, or with its consuming partition). None: nobody</span>
+    <span class="c1"># to answer.</span>
     <span class="n">on_late</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></div>
 
 </pre></div>

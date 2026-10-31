@@ -773,7 +773,7 @@
 <td><p>Per-partition conductor-level state for a request.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.conductor.request_info.StreamingConnectionState" title="mstar.conductor.request_info.StreamingConnectionState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingConnectionState</span></code></a>(from_partition, ...)</p></td>
-<td><p>Per-connection streaming state tracked by the conductor.</p></td>
+<td><p>Per-connection streaming state tracked by the conductor, for a stream between two partitions.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1040,7 +1040,9 @@ and can run asynchronously relative to other partitions.</p>
 <dt class="sig sig-object py" id="mstar.conductor.request_info.StreamingConnectionState">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.conductor.request_info.</span></span><span class="sig-name descname"><span class="pre">StreamingConnectionState</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">to_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">consumed_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">producer_done</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">items_sent</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/conductor/request_info.html#StreamingConnectionState"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.conductor.request_info.StreamingConnectionState" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Per-connection streaming state tracked by the conductor.</p>
+<p>Per-connection streaming state tracked by the conductor, for a stream
+between two partitions. A client stream has none: the data worker sends
+and ends it itself.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

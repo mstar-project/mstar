@@ -1069,8 +1069,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">_num_tensors_registered</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">_num_buffer_writes</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># Items the producer sent this worker in total, as the done signal reports</span>
-    <span class="c1"># it. The signal comes through the conductor and the items come straight</span>
-    <span class="c1"># from the producer, so the signal can arrive first.</span>
+    <span class="c1"># it. A partition's end comes through the conductor and its items straight</span>
+    <span class="c1"># from the producer, so the signal can arrive first. (A client stream's end</span>
+    <span class="c1"># follows its items on the data worker's own FIFO.)</span>
     <span class="n">_num_items_expected</span> <span class="o">=</span> <span class="mi">0</span>
 
 <div class="viewcode-block" id="StreamBuffer.prime_context">

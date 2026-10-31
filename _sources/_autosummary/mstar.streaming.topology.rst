@@ -14,6 +14,8 @@ mstar.streaming.topology
    .. autosummary::
    
       client_stream_limits
+      find_client_stream
+      find_client_streams
    
    
 
@@ -23,6 +25,7 @@ mstar.streaming.topology
 
    .. autosummary::
    
+      ClientStream
       ClientStreamLimits
       Connection
       PartitionTopology

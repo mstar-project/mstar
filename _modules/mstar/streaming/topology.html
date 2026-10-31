@@ -970,13 +970,18 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.streaming.topology</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">NamedTuple</span>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">NamedTuple</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span> <span class="n">PartitionDefinition</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">GraphSection</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChunkPolicy</span><span class="p">,</span> <span class="n">FixedChunkPolicy</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Model</span>
 
 
 <div class="viewcode-block" id="StreamingGraphEdge">
@@ -999,8 +1004,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># The producer of a stream the client feeds into a running request:</span>
 <span class="c1"># ``Connection(from_partition=CLIENT, ...)``. It names no partition, so it has</span>
-<span class="c1"># no walks, worker or partition state; the API server appends its chunks and</span>
-<span class="c1"># ends it when the client's input ends.</span>
+<span class="c1"># no walks, worker or partition state; the API server's data worker sends its</span>
+<span class="c1"># items to the consumer's ranks and ends it when the client's input ends.</span>
 <span class="n">CLIENT</span> <span class="o">=</span> <span class="s2">"client"</span>
 
 
@@ -1161,6 +1166,58 @@ window.runMermaid = runMermaid;</script>
         <span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">:</span> <span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">limits</span> <span class="ow">or</span> <span class="n">ClientStreamLimits</span><span class="p">())</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="o">**</span><span class="p">(</span><span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}))</span>
         <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="n">topology</span><span class="o">.</span><span class="n">client_connections</span><span class="p">()</span>
     <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="ClientStream">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.ClientStream">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ClientStream</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Where a client stream's items go: the node that consumes the edge, a</span>
+<span class="sd">    walk it runs in (for routing to its workers) and its partition."""</span>
+    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">partition</span><span class="p">:</span> <span class="nb">str</span></div>
+
+
+
+<div class="viewcode-block" id="find_client_streams">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.find_client_streams">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">find_client_streams</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">Model</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ClientStream</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Each client stream's consumer (``find_client_stream``). The conductor</span>
+<span class="sd">    reads it after the worker graphs are built (a model may shape its walks</span>
+<span class="sd">    from the deployment, as BAGEL does), and names each node in its route to</span>
+<span class="sd">    the data worker, whose copy of the model is unshaped."""</span>
+    <span class="n">connections</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_partition_topology</span><span class="p">()</span><span class="o">.</span><span class="n">client_connections</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">connections</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">{}</span>
+    <span class="n">walks</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_graph_walk_graphs</span><span class="p">()</span>
+    <span class="n">partitions</span> <span class="o">=</span> <span class="p">{</span><span class="n">p</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">p</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">get_partitions</span><span class="p">()}</span>
+    <span class="k">return</span> <span class="p">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">:</span> <span class="n">find_client_stream</span><span class="p">(</span><span class="n">conn</span><span class="p">,</span> <span class="n">walks</span><span class="p">,</span> <span class="n">partitions</span><span class="p">)</span> <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="n">connections</span><span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="find_client_stream">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.find_client_stream">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">find_client_stream</span><span class="p">(</span>
+    <span class="n">conn</span><span class="p">:</span> <span class="n">Connection</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">],</span> <span class="n">partitions</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PartitionDefinition</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ClientStream</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``conn``'s consumer: the one node, over every walk, that takes the edge</span>
+<span class="sd">    (as ``mstar.worker.stream_buffers.consumer_nodes`` resolves it), in a walk of the</span>
+<span class="sd">    partition it flows into; ``ValueError`` for a stream without one."""</span>
+    <span class="n">name</span><span class="p">,</span> <span class="n">partition</span> <span class="o">=</span> <span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">,</span> <span class="n">partitions</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">partition</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"client stream </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> flows into </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span><span class="si">!r}</span><span class="s2">, which is not a partition"</span><span class="p">)</span>
+    <span class="n">consumers</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">node</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">walks</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">walk</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">input_names</span>
+    <span class="p">}</span>
+    <span class="n">in_partition</span> <span class="o">=</span> <span class="p">[</span><span class="n">walk</span> <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">partition</span><span class="o">.</span><span class="n">graph_walks</span> <span class="k">if</span> <span class="n">consumers</span> <span class="o">&amp;</span> <span class="n">walks</span><span class="p">[</span><span class="n">walk</span><span class="p">]</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()</span><span class="o">.</span><span class="n">keys</span><span class="p">()]</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">consumers</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">in_partition</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"client stream </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> needs exactly one consuming node, in "</span>
+            <span class="sa">f</span><span class="s2">"partition </span><span class="si">{</span><span class="n">partition</span><span class="o">.</span><span class="n">name</span><span class="si">!r}</span><span class="s2">; found </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">consumers</span><span class="p">)</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="s1">'none'</span><span class="si">}</span><span class="s2">"</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">ClientStream</span><span class="p">(</span><span class="n">consumers</span><span class="o">.</span><span class="n">pop</span><span class="p">(),</span> <span class="nb">max</span><span class="p">(</span><span class="n">in_partition</span><span class="p">),</span> <span class="n">partition</span><span class="o">.</span><span class="n">name</span><span class="p">)</span></div>
 
 </pre></div>
 

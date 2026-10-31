@@ -1026,7 +1026,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">SCHEDULE_TP</span> <span class="o">=</span> <span class="s2">"schedule_tp"</span>
     <span class="n">STOP_LOOPS</span> <span class="o">=</span> <span class="s2">"stop_loops"</span>
     <span class="n">TP_NO_SPEC</span> <span class="o">=</span> <span class="s2">"tp_no_spec"</span>
-    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span></div>
+    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span>
+    <span class="n">CLIENT_STREAM_ROUTE</span> <span class="o">=</span> <span class="s2">"client_stream_route"</span></div>
 
 
 
@@ -1068,8 +1069,10 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.DrainRequest">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">DrainRequest</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
-    <span class="c1"># Phase-1 teardown: stop reading this request and confirm no reads remain.</span>
-    <span class="c1"># Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.</span>
+    <span class="c1"># Phase-1 teardown: stop scheduling this request, and ACK READS_DONE once no</span>
+    <span class="c1"># read of it is in flight, starting none after (the data worker also stops</span>
+    <span class="c1"># reading its results and sending its client stream items). Hard cleanup</span>
+    <span class="c1"># (RemoveRequest) follows once every reader has ACKed.</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">source</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MessageSource</span><span class="o">.</span><span class="n">CONDUCTOR</span></div>
 
@@ -1081,7 +1084,8 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">InputSignals</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span>
-    <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span>
+    <span class="c1"># None for a signal with no non-streaming input, which reads none</span>
+    <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span> <span class="o">|</span> <span class="kc">None</span>
     <span class="n">partition_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"default"</span>
     <span class="c1"># Producer partition names. Declared, not a bare ``set``: a bare one is</span>
     <span class="c1"># untyped on the wire, so an empty set a Rust sender writes came back a</span>
@@ -1109,6 +1113,24 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">UnpersistTensors</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">uuid_to_ref_count</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="ClientStreamRoute">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ClientStreamRoute">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ClientStreamRoute</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The conductor telling the API server's data worker, the producer of a</span>
+<span class="sd">    request's client streams, where each one goes: once at dispatch, and</span>
+<span class="sd">    again with no ranks for a stream whose consuming partition has ended,</span>
+<span class="sd">    which then takes no more items."""</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># client stream edge -&gt; the consuming node's ranks for this request</span>
+    <span class="n">workers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span>
+    <span class="c1"># client stream edge -&gt; that node, from the walks as the deployment shaped</span>
+    <span class="c1"># them; the data worker's copy of the model is the unshaped one</span>
+    <span class="n">nodes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span></div>
+
 
 
 <div class="viewcode-block" id="StopLoops">
@@ -1275,21 +1297,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span>
     <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span>
     <span class="n">WORKER_STATUS</span> <span class="o">=</span> <span class="s2">"worker_status"</span>
-    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span>
-    <span class="n">CLIENT_STREAM_INPUT</span> <span class="o">=</span> <span class="s2">"client_stream_input"</span></div>
-
-
-
-<div class="viewcode-block" id="ClientStreamInput">
-<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ClientStreamInput">[docs]</a>
-<span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">ClientStreamInput</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""The next chunk of a running request's client streams (see</span>
-<span class="sd">    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and</span>
-<span class="sd">    the streams that end after it. An ended stream takes no more chunks."""</span>
-    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">signals</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
-    <span class="n">ended</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
+    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span></div>
 
 
 
@@ -1306,10 +1314,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># The client's request_id. ``request_id`` is the API server's key for this</span>
     <span class="c1"># one submission, never reused; the seed still derives from the client's.</span>
     <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="c1"># For a model with client streams, the opening's own client input: its</span>
-    <span class="c1"># first chunk and the streams it ends, forwarded once the request is</span>
-    <span class="c1"># admitted. A stream it leaves open makes it a live call.</span>
-    <span class="n">client_input</span><span class="p">:</span> <span class="n">ClientStreamInput</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="c1"># A client stream the opening leaves open: a live call, which is refused</span>
+    <span class="c1"># rather than queued at max_concurrent_requests.</span>
+    <span class="n">input_open</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 
 

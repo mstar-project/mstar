@@ -1093,7 +1093,9 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.StreamingConnectionState">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">StreamingConnectionState</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Per-connection streaming state tracked by the conductor."""</span>
+<span class="w">    </span><span class="sd">"""Per-connection streaming state tracked by the conductor, for a stream</span>
+<span class="sd">    between two partitions. A client stream has none: the data worker sends</span>
+<span class="sd">    and ends it itself."""</span>
     <span class="n">from_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">to_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span>

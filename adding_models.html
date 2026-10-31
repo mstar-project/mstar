@@ -3005,8 +3005,9 @@ partition.</p></li>
 <span class="pre">target_partition=...)</span></code> instead of a plain <code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code>.</p></li>
 </ul>
 <p>The consuming partition’s <code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args</span></code> reads
-<code class="docutils literal notranslate"><span class="pre">incoming_connections</span></code>, which provides token counts and a <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> flag, and
-uses them to decide when to run.</p>
+<code class="docutils literal notranslate"><span class="pre">incoming_connections</span></code>, which provides token counts and a <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> flag for
+each stream from another partition, and uses them to decide when to run. A stream from the
+client (below) has no entry there.</p>
 <p>Keep a walk that consumes a stream to one node or one <code class="docutils literal notranslate"><span class="pre">Loop</span></code> on one node group, and move
 later work into a downstream partition fed by its own <code class="docutils literal notranslate"><span class="pre">StreamingGraphEdge</span></code>. A consumer
 whose every input is streamed runs again as soon as the next chunk arrives, and the
@@ -3087,6 +3088,12 @@ and a final chunk, and a loop fed by the stream ends as any stream-terminated lo
 Over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> the client appends and ends input explicitly (see
 <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>); every other route ends the input as soon as the request is submitted.
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> is on the Python frontend only, not <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>.</p></li>
+<li><p>The API server’s data worker is the stream’s producer. The conductor tells it the
+consuming node and its ranks once per call, when it dispatches the request, and the data
+worker sends each append’s items to every one of those ranks itself, and then the
+stream’s end with how many items it carried. Every rank gets each item whole, so a client
+stream can’t take a <code class="docutils literal notranslate"><span class="pre">sharding_config.shard_dim</span></code> entry (startup refuses one). Once the
+consuming partition ends, later appends for its streams are answered as late.</p></li>
 </ul>
 </section>
 </section>
