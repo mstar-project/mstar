@@ -1366,6 +1366,10 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.RingKVConfig.apply_yaml_overrides">(mstar.engine.resources.RingKVConfig method)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.sampler.config.SamplerSpec.apply_yaml_overrides">(mstar.engine.resources.sampler.config.SamplerSpec method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.SamplerSpec.apply_yaml_overrides">(mstar.engine.resources.SamplerSpec method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides">(mstar.engine.resources.spec.NodeResourceSpec method)</a>
 </li>
       </ul></li>
@@ -3503,6 +3507,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.enable_gqa">enable_gqa (mstar.model.waypoint.config.WaypointConfig property)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.sampler.config.SamplerSpec.enable_logprobs">enable_logprobs (mstar.engine.resources.sampler.config.SamplerSpec attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.SamplerSpec.enable_logprobs">(mstar.engine.resources.SamplerSpec attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS">ENABLE_METRICS (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
 
       <ul>
@@ -5953,12 +5963,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection.limits">limits (mstar.streaming.topology.Connection attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.linear_conv_kernel_dim">linear_conv_kernel_dim (mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.linear_key_head_dim">linear_key_head_dim (mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.linear_layer_indices">linear_layer_indices (mstar.model.qwen3_5.config.Qwen3_5Config property)</a>
 </li>
       <li><a href="_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.linear_num_key_heads">linear_num_key_heads (mstar.model.qwen3_5.config.Qwen3_5Config attribute)</a>
@@ -6059,6 +6069,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusTextConfig.logit_scale">logit_scale (mstar.model.command_a_plus.config.CommandAPlusTextConfig attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTokens.logprobs">logprobs (mstar.api_server.request_types.ResultTokens attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.sampler.config.SamplingReqConfig.logprobs_mode">logprobs_mode (mstar.engine.resources.sampler.config.SamplingReqConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.SamplingReqConfig.logprobs_mode">(mstar.engine.resources.SamplingReqConfig attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup">lookup() (mstar.engine.resources.kv.prefix_index.PrefixIndex method)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop">Loop (class in mstar.graph.base)</a>
@@ -11518,8 +11536,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.reserve">(mstar.engine.resources.Resource method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.StreamResampler.reset">reset() (mstar.api_server.media_io.StreamResampler method)</a>
 
       <ul>
@@ -11538,6 +11554,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.ring.html#mstar.engine.resources.kv.ring.LayerRingCache.reset">(mstar.engine.resources.kv.ring.LayerRingCache method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.AttentionResource.reset_default_cursors">reset_default_cursors() (mstar.engine.resources.base.AttentionResource method)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.streams.html#mstar.utils.streams.reset_device_scheduling">reset_device_scheduling() (in module mstar.utils.streams)</a>
@@ -11778,6 +11796,12 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.model.waypoint.components.html#mstar.model.waypoint.components.WaypointDiT.retie_cond_proj">(mstar.model.waypoint.components.WaypointDiT method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.sampler.config.SamplingReqConfig.return_logprobs">return_logprobs (mstar.engine.resources.sampler.config.SamplingReqConfig attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.SamplingReqConfig.return_logprobs">(mstar.engine.resources.SamplingReqConfig attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.WarmedSpec.returned">returned (mstar.engine.accelerator_graph_runner.WarmedSpec attribute)</a>
@@ -12724,14 +12748,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.bounded.config.html#mstar.engine.resources.kv.bounded.config.BoundedKVConfig.slot_tokens">(mstar.engine.resources.kv.bounded.config.BoundedKVConfig property)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.SlotLease">SlotLease (class in mstar.engine.resources)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.SlotLease">(class in mstar.engine.resources.step)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket.slots">slots (mstar.engine.accelerator_graph_runner.AcceleratorGraphBucket attribute)</a>
 
       <ul>
@@ -13116,6 +13140,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.worker.worker_metrics.html#mstar.worker.worker_metrics.WorkerMetrics.step_done">step_done() (mstar.worker.worker_metrics.WorkerMetrics method)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.step_host_rows">step_host_rows() (mstar.engine.resources.base.Resource method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.step_host_rows">(mstar.engine.resources.Resource method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner.step_ids">step_ids() (mstar.engine.accelerator_graph_runner.AcceleratorGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.step_is_input_free">step_is_input_free() (mstar.model.submodule_base.NodeSubmodule method)</a>

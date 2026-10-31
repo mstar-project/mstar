@@ -1391,6 +1391,14 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span></div>
 
 
+<div class="viewcode-block" id="Resource.step_host_rows">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.step_host_rows">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step_host_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Row-addressed tensors of the step just run, copied to the host with</span>
+<span class="sd">        the stop buffers. Read right after the forward and not cloned."""</span>
+        <span class="k">return</span> <span class="p">{}</span></div>
+
+
 <div class="viewcode-block" id="Resource.publish">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">publish</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedInfo | None"</span><span class="p">:</span>

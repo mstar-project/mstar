@@ -999,6 +999,16 @@ occurrences in the last N generated tokens, <code class="docutils literal notran
 <li><p><code class="docutils literal notranslate"><span class="pre">top_p_first</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p_min_keep</span></code> (<code class="docutils literal notranslate"><span class="pre">enable_top_p_first</span></code>): HF’s order (top-p,
 then top-k) instead of FlashInfer’s, and HF’s <code class="docutils literal notranslate"><span class="pre">min_tokens_to_keep</span></code>.</p></li>
 </ul>
+<p><code class="docutils literal notranslate"><span class="pre">return_logprobs</span></code> (<code class="docutils literal notranslate"><span class="pre">enable_logprobs</span></code>, any device) reports each sampled token’s
+log-prob under <code class="docutils literal notranslate"><span class="pre">softmax(logits</span> <span class="pre">/</span> <span class="pre">T)</span></code>, before the penalty and filters, with T = 1
+for greedy requests; it reaches the client as <code class="docutils literal notranslate"><span class="pre">{&quot;logprobs&quot;:</span> <span class="pre">[...]}</span></code> in the chunk’s
+metadata. The model passes <code class="docutils literal notranslate"><span class="pre">return_logprobs</span></code> into its <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> (the
+conductor refuses the request otherwise), its forward samples once per step and
+hands over row-addressed stop buffers (<code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.check_stop_buffers</span></code>):
+the log-probs ride the same copy to the host. <code class="docutils literal notranslate"><span class="pre">logprobs_mode</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;raw&quot;</span></code> only
+for now. The captured sampler scores every step once it is on, so it is off by
+default and a deployment turns it on with
+<code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{&lt;sampler</span> <span class="pre">key&gt;:</span> <span class="pre">{enable_logprobs:</span> <span class="pre">true}}</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">SamplerStep(apply_filters=False)</span></code> samples a step with top-k/top-p off (e.g. a
 TTS’s first code); declare it the same way on every step of a walk.</p>
 </li>

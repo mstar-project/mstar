@@ -1028,7 +1028,7 @@ window.runMermaid = runMermaid;</script>
     <span class="o">**</span><span class="n">INT_KNOB_RULES</span><span class="p">,</span>
     <span class="s2">"max_output_tokens"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"&gt;= 1"</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="n">v</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">),</span>
 <span class="p">}</span>
-<span class="n">_BOOL_KNOBS</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">BOOL_KNOBS</span><span class="p">,</span> <span class="s2">"do_sample"</span><span class="p">)</span>
+<span class="n">_BOOL_KNOBS</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">BOOL_KNOBS</span><span class="p">,</span> <span class="s2">"do_sample"</span><span class="p">,</span> <span class="s2">"return_token_ids"</span><span class="p">)</span>
 
 <span class="c1"># other names for max_output_tokens, in precedence order after it</span>
 <span class="n">MAX_OUTPUT_TOKENS_ALIASES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"max_new_tokens"</span><span class="p">,</span> <span class="s2">"max_completion_tokens"</span><span class="p">,</span> <span class="s2">"max_tokens"</span><span class="p">)</span>
