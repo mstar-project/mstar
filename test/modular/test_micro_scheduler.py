@@ -219,10 +219,10 @@ class _Manager:
 class _Engine:
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
-        groups=None, row_caps=None, offloaded=frozenset(), order=None,
+        groups=None, row_caps=None, offloaded=frozenset(), order=StepOrder.ARRIVAL,
     ):
         self._max_bs = max_bs
-        # the submodule's `step_order`: None leaves it to the graph
+        # the submodule's `step_order`
         self.order = order
         # rids whose pages are off the device: ready only once a reload runs
         self.offloaded = set(offloaded)
@@ -967,33 +967,40 @@ def test_a_row_that_ran_another_node_keeps_its_place_at_a_capped_one():
     assert list(batch.request_to_worker_graph) == ["r0"]
 
 
-def test_last_ran_at_is_the_rows_latest_turn_at_that_node_on_any_walk():
-    sched = _scheduler(_Engine())
+@pytest.mark.parametrize("order, last", [(StepOrder.TURNS, "r1"), (StepOrder.ARRIVAL, "r2")])
+def test_last_in_line_is_the_row_the_pick_would_reach_last(order, last):
+    """Each ran a step here, r1 after r0, and r2 ran another node. Under
+    TURNS r2 is new to the key, so first; under ARRIVAL r1 holds the step and
+    r2 arrived last."""
+    sched = _scheduler(_Engine(order=order))
+    for rid in ("r0", "r1", "r2"):
+        sched.note_arrival(rid)
     _turns(sched, ["r0"], ["r1"])
-    sched.note_ran(_batch(["r0"], walk="other"))
-    sched.note_ran(_batch(["r1"], node="talker", walk="stream"))
+    sched.note_ran(_batch(["r2"], node="talker", walk="stream"))
 
-    assert sched.last_ran_at(NODE, "r0") == 3
-    assert sched.last_ran_at(NODE, "r1") == 2, "a turn at another node counted here"
-    assert sched.last_ran_at(NODE, "r2") == 0
-
-    sched.clear_rid("r0", "wire-r0")
-    assert sched.last_ran_at(NODE, "r0") == 0
+    assert sched.last_in_line(NODE, WALK, ["r0", "r1", "r2"]) == last
 
 
-def test_a_refused_step_of_a_real_walk_reads_its_combined_walks_order():
+def test_a_refused_step_of_a_real_walk_reads_its_combined_walks_line():
     """Eviction asks with the step's label, which may be a real walk's."""
-    sched = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda name: _Engine()),
-        parallel_leader_nodes={NODE},
-        combined_walk_of={(NODE, "prefill"): MIXED, (NODE, WALK): MIXED},
-        streaming_node_walks={(NODE, WALK)},
-    )
+    sched = _combined_scheduler(_Engine(order=StepOrder.TURNS))
+    sched.note_ran(_batch(["r0"], walk="prefill"))
+    sched.note_ran(_batch(["r1"], walk=WALK))
 
-    assert sched.takes_turns(NODE, "prefill")
-    assert sched.takes_turns(NODE, WALK)
-    assert sched.takes_turns(NODE, MIXED)
-    assert not sched.takes_turns(NODE, "unrelated")
+    assert sched.last_in_line(NODE, "prefill", ["r0", "r1"]) == "r1"
+    assert sched.last_in_line(NODE, WALK, ["r0", "r1"]) == "r1"
+    assert sched.last_in_line(NODE, MIXED, ["r0", "r1"]) == "r1"
+
+
+def test_a_combined_walk_takes_turns_if_any_of_its_walks_does():
+    engine = _Engine()
+    engine.get_step_order = lambda node, walk: StepOrder.TURNS if walk == WALK else StepOrder.ARRIVAL
+    sched = _combined_scheduler(engine)
+
+    assert sched._order_of(sched._key(NODE, "prefill")) is StepOrder.TURNS
+    assert sched._order_of(sched._key(NODE, WALK)) is StepOrder.TURNS
+    assert sched._order_of((NODE, MIXED)) is StepOrder.TURNS
+    assert sched._order_of((NODE, "unrelated")) is StepOrder.ARRIVAL
 
 
 def test_rows_that_all_fit_keep_the_scan_order():

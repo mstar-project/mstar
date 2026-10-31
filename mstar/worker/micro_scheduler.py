@@ -265,12 +265,8 @@ class MicroScheduler:
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         speculation_mixes_walks: Mapping[str, Any] | None = None,
-        streaming_node_walks: Collection[tuple[str, str]] = (),
     ):
         self.engine_manager = engine_manager
-        # (node, real walk) whose passes stream outputs: TURNS unless the
-        # submodule declares otherwise (`NodeSubmodule.step_order`)
-        self.streaming_node_walks = frozenset(streaming_node_walks)
         self._orders: dict[tuple[str, str], StepOrder] = {}
         # (node, real walk) -> combined walk; scheduling keys use the combined one
         self.combined_walk_of = combined_walk_of or {}
@@ -467,25 +463,16 @@ class MicroScheduler:
             self.arrival[rid] = self._arrivals
 
     def _order_of(self, key: tuple[str, str]) -> StepOrder:
-        """``key``'s `StepOrder`: the submodule's, else from the graph. A
-        combined walk's step holds its walks' rows, so it takes turns if any
-        of its walks does."""
+        """``key``'s `StepOrder`, as its submodule declares it. A combined
+        walk's step holds its walks' rows, so it takes turns if any of its
+        walks does."""
         order = self._orders.get(key)
-        if order is not None:
-            return order
-        node, walk = key
-        engine = self.engine_manager.get_engine(node)
-        order = engine.get_step_order(node, walk)
         if order is None:
-            orders = [
-                engine.get_step_order(node, real) or (
-                    StepOrder.TURNS if (node, real) in self.streaming_node_walks
-                    else StepOrder.ARRIVAL
-                )
-                for real in self._walks_of_key.get(key) or (walk,)
-            ]
+            node, walk = key
+            engine = self.engine_manager.get_engine(node)
+            orders = [engine.get_step_order(node, real) for real in self._walks_of_key.get(key) or (walk,)]
             order = StepOrder.TURNS if StepOrder.TURNS in orders else StepOrder.ARRIVAL
-        self._orders[key] = order
+            self._orders[key] = order
         return order
 
     def _line_order(self, key: tuple[str, str]) -> LineOrder:

@@ -1472,19 +1472,16 @@ into one GPU call. A submodule controls this behavior with these methods:
   When a batch runs, the engine calls this method instead of the single-request
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
-- ``step_order(self, graph_walk) -> StepOrder | None`` says who runs first when more rows are
-  ready than ``max_batch_size`` allows. ``StepOrder.ARRIVAL`` is first come, first served to
-  completion: the requests holding the step keep it, then the request that arrived first, so a
-  loop whose output only matters at the end (a denoising loop) finishes each request as early as
-  it can. ``StepOrder.TURNS`` is longest-waiting first: a request that just ran gives way to one
-  that waited, so a node capped at one row advances its requests a step each in rotation, and
-  every stream keeps moving. The default (``None``) takes it from the graph: ``TURNS`` for a node
-  whose passes stream outputs while the request runs, to the client or over a streaming
-  connection to another partition (``Model.streaming_node_walks``), else ``ARRIVAL``. A combined
-  walk takes turns if any of its walks does. The order applies to the rows a speculation chain
-  continues, the backlog and the queued rows alike; when every ready row fits, it doesn't matter.
-  It also sets who is offloaded when an admit runs out of KV pages: under ``TURNS`` the row that
-  ran last, whose next turn is furthest away; under ``ARRIVAL`` the one that has waited longest.
+- ``step_order(self, graph_walk) -> StepOrder`` says who runs first when more rows are ready
+  than ``max_batch_size`` allows. The default, ``StepOrder.ARRIVAL``, is first come, first served
+  to completion: the requests holding the step keep it, then the request that arrived first.
+  ``StepOrder.TURNS`` is longest-waiting first: a request that just ran gives way to one that
+  waited, so a node capped at one row advances its requests a step each in rotation. Declare it
+  on a walk whose sessions have to keep moving while others run, as LingBot's rollout and
+  Cosmos3's chained windows do. A combined walk takes turns if any of its walks does. The order
+  applies to the rows a speculation chain continues, the backlog and the queued rows alike; when
+  every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
+  last in that same line.
 
 .. _combined-walks:
 

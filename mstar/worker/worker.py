@@ -591,7 +591,6 @@ class Worker:
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
-            streaming_node_walks=model.streaming_node_walks() if model is not None else (),
         )
 
         # Request ids are strings on the wire and ints (handles) inside this
