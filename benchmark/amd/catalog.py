@@ -129,12 +129,20 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0, generator_device="cpu",
         concurrency={"video-t2v": (1, 2, 4)},
         i2v_frames=f"{REFERENCES}/diffusers-Wan-AI--Wan2.2-TI2V-5B-Diffusers-480x832x33-s20-i2v/video_v1/conditioning"),
+    # Two GPUs, one guidance branch per rank (configs/wan22_cfg2.yaml): the latency row beside the one-GPU row.
+    Row("wan22_cfg2", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", gpus=2, cost=4.0, generator_device="cpu",
+        concurrency={"video-t2v": (1, 2, 4)},
+        i2v_frames=f"{REFERENCES}/diffusers-Wan-AI--Wan2.2-TI2V-5B-Diffusers-480x832x33-s20-i2v/video_v1/conditioning"),
     # vllm-omni's Cosmos3 recipe serves without the guardrail models (recipes/cosmos3/Cosmos3-Nano.md).
     # i2v sends the reference's 480x832 conditioning frames (diffusers' cover-crop of the 320x180 set frames):
     # engines bring a frame of another size to the request size their own way (vllm-omni's LANCZOS stretch, mstar's
     # and SGLang's crop), and one already at the request size passes through all of them unchanged.
     Row("cosmos3_nano", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", cost=4.0, generator_device="cuda",
         engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)},
+        i2v_frames=f"{REFERENCES}/diffusers-nvidia--Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning"),
+    # Two GPUs, one guidance branch per rank (configs/cosmos3_nano_cfg2.yaml).
+    Row("cosmos3_nano_cfg2", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", gpus=2, cost=4.0,
+        generator_device="cuda", workloads=("video-t2v",),
         i2v_frames=f"{REFERENCES}/diffusers-nvidia--Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning"),
     Row("cosmos3_edge", "video", "nvidia/Cosmos3-Edge", "cosmos3_edge", cost=3.0, generator_device="cuda",
         workloads=("video-t2v",),

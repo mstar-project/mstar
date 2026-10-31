@@ -470,7 +470,7 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - config's ``tp_async_sched``, else ``0`` (on for TP nodes on ROCm)
+     - config's ``tp_async_sched``, else ``0`` (on for TP nodes on ROCm, unless they are guidance-parallel)
      - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
