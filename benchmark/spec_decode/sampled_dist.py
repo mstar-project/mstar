@@ -41,6 +41,8 @@ def one(url: str, model: str, prompt: str, seed: int, args) -> str:
 
 def save(args) -> int:
     prompts = [p for _, p, _ in prompt_set()][: args.prompts]
+    if args.indices:
+        prompts = [prompts[int(i)] for i in args.indices.split(",")]
     jobs = [(i, s) for i in range(len(prompts)) for s in range(args.samples)]
     with cf.ThreadPoolExecutor(args.concurrency) as pool:
         texts = list(pool.map(lambda js: one(args.url, args.model, prompts[js[0]], 1000 * js[0] + js[1], args), jobs))
@@ -132,6 +134,7 @@ def main(argv=None) -> int:
     s.add_argument("--out", required=True)
     s.add_argument("--model", default="qwen3_5")
     s.add_argument("--prompts", type=int, default=48)
+    s.add_argument("--indices", default=None, help="comma list: only these of the prompts, more samples on a suspect")
     s.add_argument("--samples", type=int, default=200)
     s.add_argument("--max-tokens", type=int, default=6)
     s.add_argument("--temperature", type=float, default=0.7)
