@@ -24,9 +24,9 @@
  "product": "mi325x",
  "provenance": {
   "margin": 0.02,
-  "note": "benchmark.kernels.search on one MI325X VF per model, shared node, rankings: jobs 377, 378, 415 (5 replays of 256 calls) and 416, 417 (9 of 64 calls, 9B and 2B only), each candidate's fastest replay over both passes, since replays carry stalls of multiples of 8.3 ms",
+  "note": "benchmark.kernels.search on one MI325X VF per model, shared node, rankings: jobs 377, 378, 415 (5 replays of 256 calls) and 416, 417 (9 of 64 calls, 9B and 2B only), each candidate's fastest replay over both passes, since replays carry stalls of multiples of 8.3 ms; a shape leaves what the tip serves only for a gain of 2% and one node, a fused gate/up for 2%",
   "stack": "torch-2.12.1_rocm7.2-hip-7.2.53211-triton-3.7.1",
-  "store": "/work/amd/results/innovation/f4-gemm-arbitration/store-final"
+  "store": "/work/amd/results/innovation/f4-gemm-arbitration/store-final-served"
  },
  "shapes": {
   "gated1-k1024-n7168-rows1": {
@@ -45,7 +45,7 @@
      "us": 6.96
     }
    },
-   "impl": "fused"
+   "impl": "unfused"
   },
   "gated1-k1024-n7168-rows16": {
    "candidates": {
@@ -61,7 +61,7 @@
      "xcd_remap": true
     },
     "unfused": {
-     "us": 8.91
+     "us": 8.99
     }
    },
    "impl": "unfused"
@@ -79,7 +79,7 @@
      "xcd_remap": false
     },
     "unfused": {
-     "us": 7.26
+     "us": 7.31
     }
    },
    "impl": "unfused"
@@ -98,10 +98,10 @@
      "xcd_remap": false
     },
     "unfused": {
-     "us": 8.36
+     "us": 8.92
     }
    },
-   "impl": "fused"
+   "impl": "unfused"
   },
   "gated1-k1024-n7168-rows8": {
    "candidates": {
@@ -117,10 +117,10 @@
      "xcd_remap": false
     },
     "unfused": {
-     "us": 8.94
+     "us": 9.08
     }
    },
-   "impl": "fused"
+   "impl": "unfused"
   },
   "gated1-k2048-n12288-rows1": {
    "candidates": {
@@ -173,7 +173,7 @@
      "xcd_remap": false
     },
     "unfused": {
-     "us": 15.77
+     "us": 16.01
     }
    },
    "impl": "unfused"
@@ -186,7 +186,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 4,
-     "us": 16.59,
+     "us": 16.58,
      "use_dot": true,
      "waves_per_eu": 0,
      "xcd_remap": false
@@ -205,7 +205,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 4,
-     "us": 17.58,
+     "us": 17.53,
      "use_dot": true,
      "waves_per_eu": 0,
      "xcd_remap": false
@@ -224,7 +224,7 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 8,
-     "us": 47.17,
+     "us": 47.26,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -243,7 +243,7 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 1,
-     "us": 54.82,
+     "us": 54.15,
      "use_dot": true,
      "waves_per_eu": 0,
      "xcd_remap": true
@@ -262,7 +262,7 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 8,
-     "us": 47.59,
+     "us": 46.95,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -281,7 +281,7 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 8,
-     "us": 48.59,
+     "us": 47.91,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -300,7 +300,7 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 8,
-     "us": 52.09,
+     "us": 51.06,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -314,7 +314,7 @@
   "k1024-n248320-rows1": {
    "candidates": {
     "aiter": {
-     "us": 105.11
+     "us": 104.4
     },
     "hipblaslt": {
      "us": 137.87
@@ -339,7 +339,7 @@
   "k1024-n248320-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 142.08
+     "us": 141.97
     },
     "hipblaslt_tuned": {
      "solution": 205562,
@@ -362,7 +362,7 @@
   "k1024-n248320-rows2": {
    "candidates": {
     "aiter": {
-     "us": 110.41
+     "us": 109.71
     },
     "hipblaslt": {
      "us": 139.18
@@ -388,7 +388,7 @@
   "k1024-n248320-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 148.13
+     "us": 147.69
     },
     "hipblaslt_tuned": {
      "solution": 205578,
@@ -403,7 +403,7 @@
      "us": 118.32
     },
     "hipblaslt": {
-     "us": 139.75
+     "us": 139.57
     },
     "hipblaslt_tuned": {
      "solution": 205562,
@@ -426,7 +426,7 @@
   "k1024-n248320-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 156.16
+     "us": 155.93
     },
     "hipblaslt_tuned": {
      "solution": 198308,
@@ -438,7 +438,7 @@
   "k1024-n248320-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 165.07
+     "us": 163.81
     },
     "hipblaslt_tuned": {
      "solution": 205493,
@@ -450,7 +450,7 @@
   "k1024-n248320-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 141.74
+     "us": 141.31
     },
     "hipblaslt_tuned": {
      "solution": 205562,
@@ -473,7 +473,7 @@
   "k1024-n5120-rows1": {
    "candidates": {
     "aiter": {
-     "us": 4.37
+     "us": 4.41
     },
     "hipblaslt": {
      "us": 6.26
@@ -516,12 +516,12 @@
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n5120-rows2": {
    "candidates": {
     "aiter": {
-     "us": 4.73
+     "us": 4.78
     },
     "hipblaslt": {
      "us": 6.28
@@ -553,7 +553,7 @@
      "us": 6.37
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n5120-rows4": {
    "candidates": {
@@ -561,7 +561,7 @@
      "us": 5.69
     },
     "hipblaslt": {
-     "us": 6.29
+     "us": 6.26
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -579,7 +579,7 @@
      "xcd_remap": true
     }
    },
-   "impl": "aiter"
+   "impl": "hipblaslt"
   },
   "k1024-n5120-rows48": {
    "candidates": {
@@ -591,24 +591,24 @@
      "us": 6.46
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n5120-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.56
+     "us": 7.57
     },
     "hipblaslt_tuned": {
      "solution": 205515,
      "us": 7.05
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n5120-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 6.3
+     "us": 6.29
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -626,12 +626,12 @@
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n7168-rows1": {
    "candidates": {
     "aiter": {
-     "us": 4.98
+     "us": 5.05
     },
     "hipblaslt": {
      "us": 6.74
@@ -656,7 +656,7 @@
   "k1024-n7168-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 6.8
+     "us": 6.78
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -679,7 +679,7 @@
   "k1024-n7168-rows2": {
    "candidates": {
     "aiter": {
-     "us": 5.38
+     "us": 5.35
     },
     "hipblaslt": {
      "us": 6.83
@@ -719,7 +719,7 @@
      "us": 6.37
     },
     "hipblaslt": {
-     "us": 6.85
+     "us": 6.8
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -737,7 +737,7 @@
      "xcd_remap": true
     }
    },
-   "impl": "aiter"
+   "impl": "hipblaslt"
   },
   "k1024-n7168-rows48": {
    "candidates": {
@@ -749,12 +749,12 @@
      "us": 7.52
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n7168-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 8.15
+     "us": 8.04
     },
     "hipblaslt_tuned": {
      "solution": 198259,
@@ -766,7 +766,7 @@
   "k1024-n7168-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 6.82
+     "us": 6.77
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -789,7 +789,7 @@
   "k1024-n8224-rows1": {
    "candidates": {
     "aiter": {
-     "us": 5.53
+     "us": 5.5
     },
     "hipblaslt": {
      "us": 7.72
@@ -814,7 +814,7 @@
   "k1024-n8224-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.66
+     "us": 7.65
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -832,12 +832,12 @@
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n8224-rows2": {
    "candidates": {
     "aiter": {
-     "us": 5.93
+     "us": 5.86
     },
     "hipblaslt": {
      "us": 7.75
@@ -862,14 +862,14 @@
   "k1024-n8224-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 8.39
+     "us": 8.34
     },
     "hipblaslt_tuned": {
      "solution": 197954,
      "us": 7.6
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n8224-rows4": {
    "candidates": {
@@ -877,7 +877,7 @@
      "us": 6.85
     },
     "hipblaslt": {
-     "us": 7.83
+     "us": 7.82
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -895,24 +895,24 @@
      "xcd_remap": true
     }
    },
-   "impl": "aiter"
+   "impl": "hipblaslt"
   },
   "k1024-n8224-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 8.33
+     "us": 8.19
     },
     "hipblaslt_tuned": {
      "solution": 205639,
      "us": 7.94
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k1024-n8224-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 8.66
+     "us": 8.88
     },
     "hipblaslt_tuned": {
      "solution": 197935,
@@ -924,7 +924,7 @@
   "k1024-n8224-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.91
+     "us": 7.83
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -942,12 +942,12 @@
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k12288-n4096-rows1": {
    "candidates": {
     "aiter": {
-     "us": 22.47
+     "us": 22.36
     },
     "hipblaslt": {
      "us": 29.21
@@ -976,7 +976,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205481,
-     "us": 26.56
+     "us": 26.58
     },
     "triton": {
      "block_k": 256,
@@ -995,7 +995,7 @@
   "k12288-n4096-rows2": {
    "candidates": {
     "aiter": {
-     "us": 24.35
+     "us": 23.18
     },
     "hipblaslt": {
      "us": 29.44
@@ -1021,7 +1021,7 @@
   "k12288-n4096-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 35.1
+     "us": 34.16
     },
     "hipblaslt_tuned": {
      "solution": 205481,
@@ -1048,7 +1048,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 28.17,
+     "us": 28.06,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -1059,7 +1059,7 @@
   "k12288-n4096-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 32.29
+     "us": 32.17
     },
     "hipblaslt_tuned": {
      "solution": 198314,
@@ -1071,7 +1071,7 @@
   "k12288-n4096-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 35.08
+     "us": 35.06
     },
     "hipblaslt_tuned": {
      "solution": 197914,
@@ -1087,7 +1087,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205481,
-     "us": 26.57
+     "us": 26.44
     },
     "triton": {
      "block_k": 256,
@@ -1106,7 +1106,7 @@
   "k2048-n1024-rows1": {
    "candidates": {
     "aiter": {
-     "us": 3.82
+     "us": 3.76
     },
     "hipblaslt": {
      "us": 5.49
@@ -1126,12 +1126,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "aiter"
   },
   "k2048-n1024-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 5.61
+     "us": 5.55
     },
     "hipblaslt_tuned": {
      "solution": 198199,
@@ -1154,7 +1154,7 @@
   "k2048-n1024-rows2": {
    "candidates": {
     "aiter": {
-     "us": 4.12
+     "us": 4.11
     },
     "hipblaslt": {
      "us": 5.41
@@ -1174,12 +1174,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "aiter"
   },
   "k2048-n1024-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 5.83
+     "us": 5.84
     },
     "hipblaslt_tuned": {
      "solution": 198203,
@@ -1194,7 +1194,7 @@
      "us": 6.91
     },
     "hipblaslt": {
-     "us": 5.52
+     "us": 5.54
     },
     "hipblaslt_tuned": {
      "solution": 198199,
@@ -1211,12 +1211,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "hipblaslt"
   },
   "k2048-n1024-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 6.03
+     "us": 6.02
     },
     "hipblaslt_tuned": {
      "solution": 198204,
@@ -1228,7 +1228,7 @@
   "k2048-n1024-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 6.1
+     "us": 6.08
     },
     "hipblaslt_tuned": {
      "solution": 198203,
@@ -1240,7 +1240,7 @@
   "k2048-n1024-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 5.56
+     "us": 5.54
     },
     "hipblaslt_tuned": {
      "solution": 198199,
@@ -1263,7 +1263,7 @@
   "k2048-n12288-rows1": {
    "candidates": {
     "aiter": {
-     "us": 12.57
+     "us": 12.52
     },
     "hipblaslt": {
      "us": 17.57
@@ -1311,7 +1311,7 @@
   "k2048-n12288-rows2": {
    "candidates": {
     "aiter": {
-     "us": 13.15
+     "us": 13.09
     },
     "hipblaslt": {
      "us": 17.78
@@ -1336,7 +1336,7 @@
   "k2048-n12288-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 19.58
+     "us": 19.45
     },
     "hipblaslt_tuned": {
      "solution": 205530,
@@ -1363,7 +1363,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 15.43,
+     "us": 15.35,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -1374,7 +1374,7 @@
   "k2048-n12288-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 19.45
+     "us": 19.35
     },
     "hipblaslt_tuned": {
      "solution": 205531,
@@ -1386,7 +1386,7 @@
   "k2048-n12288-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 21.4
+     "us": 21.17
     },
     "hipblaslt_tuned": {
      "solution": 205508,
@@ -1410,18 +1410,18 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 1,
-     "us": 16.21,
+     "us": 16.31,
      "use_dot": true,
      "waves_per_eu": 0,
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "triton"
   },
   "k2048-n2048-rows1": {
    "candidates": {
     "aiter": {
-     "us": 4.42
+     "us": 4.4
     },
     "hipblaslt": {
      "us": 6.42
@@ -1441,7 +1441,7 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "aiter"
   },
   "k2048-n2048-rows16": {
    "candidates": {
@@ -1469,7 +1469,7 @@
   "k2048-n2048-rows2": {
    "candidates": {
     "aiter": {
-     "us": 4.7
+     "us": 4.68
     },
     "hipblaslt": {
      "us": 6.46
@@ -1509,7 +1509,7 @@
      "us": 7.42
     },
     "hipblaslt": {
-     "us": 6.47
+     "us": 6.48
     },
     "hipblaslt_tuned": {
      "solution": 198198,
@@ -1526,7 +1526,7 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "hipblaslt"
   },
   "k2048-n2048-rows48": {
    "candidates": {
@@ -1555,7 +1555,7 @@
   "k2048-n2048-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 6.51
+     "us": 6.53
     },
     "hipblaslt_tuned": {
      "solution": 198198,
@@ -1578,7 +1578,7 @@
   "k2048-n248320-rows1": {
    "candidates": {
     "aiter": {
-     "us": 211.19
+     "us": 209.78
     },
     "hipblaslt": {
      "us": 300.84
@@ -1627,7 +1627,7 @@
   "k2048-n248320-rows2": {
    "candidates": {
     "aiter": {
-     "us": 216.72
+     "us": 214.78
     },
     "hipblaslt": {
      "us": 305.9
@@ -1653,7 +1653,7 @@
   "k2048-n248320-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 322.94
+     "us": 318.85
     },
     "hipblaslt_tuned": {
      "solution": 205531,
@@ -1665,7 +1665,7 @@
   "k2048-n248320-rows4": {
    "candidates": {
     "aiter": {
-     "us": 236.36
+     "us": 234.22
     },
     "hipblaslt": {
      "us": 307.35
@@ -1691,7 +1691,7 @@
   "k2048-n248320-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 337.67
+     "us": 336.35
     },
     "hipblaslt_tuned": {
      "solution": 205531,
@@ -1727,18 +1727,18 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 1,
-     "us": 254.43,
+     "us": 252.35,
      "use_dot": true,
      "waves_per_eu": 0,
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "triton"
   },
   "k2048-n5120-rows1": {
    "candidates": {
     "aiter": {
-     "us": 6.77
+     "us": 6.72
     },
     "hipblaslt": {
      "us": 10.42
@@ -1763,7 +1763,7 @@
   "k2048-n5120-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 10.53
+     "us": 10.5
     },
     "hipblaslt_tuned": {
      "solution": 198228,
@@ -1781,12 +1781,12 @@
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k2048-n5120-rows2": {
    "candidates": {
     "aiter": {
-     "us": 7.12
+     "us": 7.1
     },
     "hipblaslt": {
      "us": 10.5
@@ -1811,7 +1811,7 @@
   "k2048-n5120-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 10.22
+     "us": 10.21
     },
     "hipblaslt_tuned": {
      "solution": 198237,
@@ -1823,7 +1823,7 @@
   "k2048-n5120-rows4": {
    "candidates": {
     "aiter": {
-     "us": 9.05
+     "us": 8.89
     },
     "hipblaslt": {
      "us": 10.48
@@ -1849,14 +1849,14 @@
   "k2048-n5120-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 10.97
+     "us": 10.88
     },
     "hipblaslt_tuned": {
      "solution": 205507,
      "us": 10.4
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k2048-n5120-rows64": {
    "candidates": {
@@ -1868,7 +1868,7 @@
      "us": 11.13
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k2048-n5120-rows8": {
    "candidates": {
@@ -1885,18 +1885,18 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 9.99,
+     "us": 9.91,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "triton"
   },
   "k2048-n8224-rows1": {
    "candidates": {
     "aiter": {
-     "us": 9.35
+     "us": 9.32
     },
     "hipblaslt": {
      "us": 13.44
@@ -1921,7 +1921,7 @@
   "k2048-n8224-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 13.45
+     "us": 13.39
     },
     "hipblaslt_tuned": {
      "solution": 198006,
@@ -1944,7 +1944,7 @@
   "k2048-n8224-rows2": {
    "candidates": {
     "aiter": {
-     "us": 9.62
+     "us": 9.89
     },
     "hipblaslt": {
      "us": 13.4
@@ -1969,7 +1969,7 @@
   "k2048-n8224-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 14.38
+     "us": 14.41
     },
     "hipblaslt_tuned": {
      "solution": 197954,
@@ -1981,7 +1981,7 @@
   "k2048-n8224-rows4": {
    "candidates": {
     "aiter": {
-     "us": 12.52
+     "us": 12.45
     },
     "hipblaslt": {
      "us": 13.39
@@ -2002,12 +2002,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "aiter"
   },
   "k2048-n8224-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 15.08
+     "us": 15.01
     },
     "hipblaslt_tuned": {
      "solution": 205639,
@@ -2019,7 +2019,7 @@
   "k2048-n8224-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 15.45
+     "us": 15.63
     },
     "hipblaslt_tuned": {
      "solution": 198259,
@@ -2043,7 +2043,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 12.67,
+     "us": 12.61,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2054,7 +2054,7 @@
   "k3584-n1024-rows1": {
    "candidates": {
     "aiter": {
-     "us": 5.42
+     "us": 5.32
     },
     "hipblaslt": {
      "us": 7.36
@@ -2074,12 +2074,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "aiter"
   },
   "k3584-n1024-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.59
+     "us": 7.58
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -2097,12 +2097,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k3584-n1024-rows2": {
    "candidates": {
     "aiter": {
-     "us": 5.83
+     "us": 5.8
     },
     "hipblaslt": {
      "us": 7.37
@@ -2122,19 +2122,19 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "aiter"
   },
   "k3584-n1024-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 8.33
+     "us": 8.34
     },
     "hipblaslt_tuned": {
      "solution": 198206,
      "us": 8.0
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k3584-n1024-rows4": {
    "candidates": {
@@ -2142,7 +2142,7 @@
      "us": 10.25
     },
     "hipblaslt": {
-     "us": 7.5
+     "us": 7.45
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -2159,12 +2159,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "hipblaslt"
   },
   "k3584-n1024-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.68
+     "us": 7.64
     },
     "hipblaslt_tuned": {
      "solution": 198204,
@@ -2176,7 +2176,7 @@
   "k3584-n1024-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.75
+     "us": 7.71
     },
     "hipblaslt_tuned": {
      "solution": 198202,
@@ -2188,7 +2188,7 @@
   "k3584-n1024-rows8": {
    "candidates": {
     "hipblaslt": {
-     "us": 7.55
+     "us": 7.53
     },
     "hipblaslt_tuned": {
      "solution": 205638,
@@ -2206,12 +2206,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k4096-n10240-rows1": {
    "candidates": {
     "aiter": {
-     "us": 19.3
+     "us": 19.1
     },
     "hipblaslt": {
      "us": 23.87
@@ -2240,7 +2240,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205516,
-     "us": 23.44
+     "us": 23.42
     },
     "triton": {
      "block_k": 256,
@@ -2259,7 +2259,7 @@
   "k4096-n10240-rows2": {
    "candidates": {
     "aiter": {
-     "us": 20.05
+     "us": 19.92
     },
     "hipblaslt": {
      "us": 23.97
@@ -2285,7 +2285,7 @@
   "k4096-n10240-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 26.35
+     "us": 26.21
     },
     "hipblaslt_tuned": {
      "solution": 198483,
@@ -2303,7 +2303,7 @@
      "us": 24.13
     },
     "hipblaslt_tuned": {
-     "solution": 198176,
+     "solution": 198175,
      "us": 24.16
     },
     "triton": {
@@ -2318,12 +2318,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "triton"
+   "impl": "hipblaslt_tuned"
   },
   "k4096-n10240-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 29.47
+     "us": 29.34
     },
     "hipblaslt_tuned": {
      "solution": 205508,
@@ -2335,14 +2335,14 @@
   "k4096-n10240-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 30.56
+     "us": 30.43
     },
     "hipblaslt_tuned": {
      "solution": 205508,
      "us": 29.26
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k4096-n10240-rows8": {
    "candidates": {
@@ -2351,7 +2351,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205516,
-     "us": 22.96
+     "us": 22.94
     },
     "triton": {
      "block_k": 256,
@@ -2370,7 +2370,7 @@
   "k4096-n12352-rows1": {
    "candidates": {
     "aiter": {
-     "us": 22.25
+     "us": 22.23
     },
     "hipblaslt": {
      "us": 27.75
@@ -2399,7 +2399,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205516,
-     "us": 25.23
+     "us": 25.58
     },
     "triton": {
      "block_k": 256,
@@ -2418,7 +2418,7 @@
   "k4096-n12352-rows2": {
    "candidates": {
     "aiter": {
-     "us": 23.22
+     "us": 23.15
     },
     "hipblaslt": {
      "us": 27.97
@@ -2444,14 +2444,14 @@
   "k4096-n12352-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 30.52
+     "us": 30.36
     },
     "hipblaslt_tuned": {
      "solution": 205508,
      "us": 28.83
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k4096-n12352-rows4": {
    "candidates": {
@@ -2471,7 +2471,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 26.86,
+     "us": 27.34,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2482,7 +2482,7 @@
   "k4096-n12352-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 33.63
+     "us": 33.27
     },
     "hipblaslt_tuned": {
      "solution": 205508,
@@ -2494,7 +2494,7 @@
   "k4096-n12352-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 34.86
+     "us": 34.5
     },
     "hipblaslt_tuned": {
      "solution": 205508,
@@ -2510,7 +2510,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205516,
-     "us": 24.97
+     "us": 24.84
     },
     "triton": {
      "block_k": 256,
@@ -2529,7 +2529,7 @@
   "k4096-n24576-rows1": {
    "candidates": {
     "aiter": {
-     "us": 46.69
+     "us": 46.53
     },
     "hipblaslt": {
      "us": 54.23
@@ -2566,7 +2566,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 53.21,
+     "us": 52.99,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2577,7 +2577,7 @@
   "k4096-n24576-rows2": {
    "candidates": {
     "aiter": {
-     "us": 48.47
+     "us": 47.95
     },
     "hipblaslt": {
      "us": 54.26
@@ -2603,7 +2603,7 @@
   "k4096-n24576-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 59.71
+     "us": 58.21
     },
     "hipblaslt_tuned": {
      "solution": 205483,
@@ -2630,7 +2630,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 48.45,
+     "us": 48.52,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2657,7 +2657,7 @@
     },
     "hipblaslt_tuned": {
      "solution": 205483,
-     "us": 54.68
+     "us": 54.28
     }
    },
    "impl": "hipblaslt_tuned"
@@ -2677,7 +2677,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 49.37,
+     "us": 49.77,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2688,7 +2688,7 @@
   "k4096-n248320-rows1": {
    "candidates": {
     "aiter": {
-     "us": 422.55
+     "us": 422.48
     },
     "hipblaslt": {
      "us": 481.3
@@ -2736,7 +2736,7 @@
   "k4096-n248320-rows2": {
    "candidates": {
     "aiter": {
-     "us": 425.82
+     "us": 425.85
     },
     "hipblaslt": {
      "us": 487.2
@@ -2762,7 +2762,7 @@
   "k4096-n248320-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 534.45
+     "us": 533.66
     },
     "hipblaslt_tuned": {
      "solution": 205508,
@@ -2774,7 +2774,7 @@
   "k4096-n248320-rows4": {
    "candidates": {
     "aiter": {
-     "us": 454.16
+     "us": 451.52
     },
     "hipblaslt": {
      "us": 496.86
@@ -2836,18 +2836,18 @@
      "num_stages": 2,
      "num_warps": 2,
      "split_k": 1,
-     "us": 476.18,
+     "us": 475.81,
      "use_dot": true,
      "waves_per_eu": 0,
      "xcd_remap": true
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "triton"
   },
   "k4096-n4096-rows1": {
    "candidates": {
     "aiter": {
-     "us": 9.05
+     "us": 9.03
     },
     "hipblaslt": {
      "us": 13.09
@@ -2884,7 +2884,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 12.69,
+     "us": 12.64,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2895,7 +2895,7 @@
   "k4096-n4096-rows2": {
    "candidates": {
     "aiter": {
-     "us": 9.39
+     "us": 9.34
     },
     "hipblaslt": {
      "us": 13.21
@@ -2921,7 +2921,7 @@
   "k4096-n4096-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 13.91
+     "us": 13.92
     },
     "hipblaslt_tuned": {
      "solution": 198234,
@@ -2948,7 +2948,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 11.49,
+     "us": 11.5,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -2959,7 +2959,7 @@
   "k4096-n4096-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 14.87
+     "us": 14.94
     },
     "hipblaslt_tuned": {
      "solution": 198214,
@@ -2971,7 +2971,7 @@
   "k4096-n4096-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 15.85
+     "us": 15.17
     },
     "hipblaslt_tuned": {
      "solution": 198244,
@@ -2995,7 +2995,7 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 11.79,
+     "us": 11.75,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
@@ -3006,7 +3006,7 @@
   "k6144-n2048-rows1": {
    "candidates": {
     "aiter": {
-     "us": 8.52
+     "us": 8.35
     },
     "hipblaslt": {
      "us": 10.91
@@ -3032,7 +3032,7 @@
   "k6144-n2048-rows16": {
    "candidates": {
     "hipblaslt": {
-     "us": 11.05
+     "us": 11.01
     },
     "hipblaslt_tuned": {
      "solution": 198228,
@@ -3050,12 +3050,12 @@
      "xcd_remap": false
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k6144-n2048-rows2": {
    "candidates": {
     "aiter": {
-     "us": 9.16
+     "us": 9.05
     },
     "hipblaslt": {
      "us": 10.87
@@ -3081,14 +3081,14 @@
   "k6144-n2048-rows32": {
    "candidates": {
     "hipblaslt": {
-     "us": 11.71
+     "us": 11.89
     },
     "hipblaslt_tuned": {
      "solution": 198240,
      "us": 11.42
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k6144-n2048-rows4": {
    "candidates": {
@@ -3108,30 +3108,30 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 10.6,
+     "us": 10.58,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "triton"
   },
   "k6144-n2048-rows48": {
    "candidates": {
     "hipblaslt": {
-     "us": 13.33
+     "us": 13.4
     },
     "hipblaslt_tuned": {
      "solution": 205639,
      "us": 12.26
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "hipblaslt"
   },
   "k6144-n2048-rows64": {
    "candidates": {
     "hipblaslt": {
-     "us": 13.81
+     "us": 13.9
     },
     "hipblaslt_tuned": {
      "solution": 198212,
@@ -3155,13 +3155,13 @@
      "num_stages": 1,
      "num_warps": 2,
      "split_k": 8,
-     "us": 10.68,
+     "us": 10.72,
      "use_dot": true,
      "waves_per_eu": 2,
      "xcd_remap": false
     }
    },
-   "impl": "hipblaslt_tuned"
+   "impl": "triton"
   }
  }
 }
