@@ -539,9 +539,9 @@ def test_qwen3_tts_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from test_qwen3_tts_model import _make_model
 
     talker = _tiny_qwen3_tts_talker()
-    outputs = {"new_token": [torch.tensor(NOT_EOS)]}
+    outputs = {"layer0_codes": [torch.tensor(NOT_EOS)]}
     talker.request_state("r").add_all(generated_frames=0)
-    talker.postprocess("r", None, outputs)
+    talker.postprocess("r", SimpleNamespace(graph_walk="talker_decode"), outputs)
 
     def check_stop(request_id, request_info, outputs):
         talker.postprocess(request_id, request_info, outputs)
