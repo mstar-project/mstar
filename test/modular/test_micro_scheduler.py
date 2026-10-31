@@ -23,6 +23,7 @@ import pytest
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    FULL_ADMIT_QUEUED,
     AdmitOutcome,
     AdmitRuntimeError,
     FullAdmitOutcome,
@@ -265,6 +266,28 @@ class _Engine:
         if rid in self.not_ready:
             return FULL_ADMIT_NOT_READY
         return FULL_ADMIT_OK
+
+
+class _QueuingEngine(_Engine):
+    """Queues the rids in ``queued`` until `admit` lets them in, as the runner does."""
+
+    def __init__(self, queued):
+        super().__init__()
+        self.queued, self.admitted = set(queued), []
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        if rid in self.queued:
+            self.checked.append(rid)
+            return FULL_ADMIT_QUEUED
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+    def admit(self, rid):
+        self.queued.discard(rid)
+        self.admitted.append((NODE, rid))
+
+    def admit_waiting(self, published_of):
+        admitted, self.admitted = self.admitted, []
+        return admitted
 
 
 def _scheduler(engine: _Engine) -> MicroScheduler:
@@ -1181,6 +1204,28 @@ def test_a_tp_follow_batch_goes_before_the_backlog():
     assert ("B", WALK) in sched.backlog
 
 
+def test_a_follower_does_not_hold_a_head_back_for_rows_rank_0_has_not_sent():
+    """A follower of two lockstep nodes has the other node's rows graph-ready
+    (its own step of the first node routed them) long before rank 0 sends
+    their head. They are no work this rank can take, so they must not make it
+    pass over the head rank 0 is waiting on in the collective."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: _Engine(max_bs=8)),
+        parallel_leader_nodes=set(),
+    )
+    manager = _Manager(["t0", "t1"])
+    manager.queues["wg0"]._ready["b0"] = {"B"}
+    manager.per_request_info["b0"] = object()
+    for rid in ("t0", "t1"):
+        sched.register_tp_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=[rid]))
+
+    assert list(_next_batch(sched, manager).request_to_worker_graph) == ["t0"]
+    second = _next_batch(sched, manager)
+    assert second is not None and list(second.request_to_worker_graph) == ["t1"]
+
+
 def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
     """A backlogged row's node is off its ready queue but not yet running. A
     streamed input arriving for it then re-readied it, the next scan popped it
@@ -1586,3 +1631,26 @@ def test_a_mixing_yield_away_skips_the_whole_combined_walk():
 def test_a_bad_mixing_setting_is_refused(mixes, error):
     with pytest.raises(ValueError, match=error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
+
+
+
+def test_a_queued_request_is_not_asked_again_until_the_engine_admits_it():
+    engine = _QueuingEngine(queued={"b"})
+    sched = _scheduler(engine)
+    for _ in range(3):
+        assert not sched._check_ready(NODE, "b", None)
+    assert engine.checked == ["b"], "every pass asked the engine about a request it had queued"
+
+    engine.admit("b")
+    sched._unpark(_Manager(["b"]))
+
+    assert sched._check_ready(NODE, "b", None), "an admitted request stayed parked"
+
+
+def test_removal_forgets_a_parked_request():
+    sched = _scheduler(_QueuingEngine(queued={"b"}))
+    assert not sched._check_ready(NODE, "b", None)
+
+    sched.clear_rid("b", "b")
+
+    assert not any(sched.parked.values()), "a recycled handle would start parked"

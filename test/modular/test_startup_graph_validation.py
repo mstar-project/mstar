@@ -3,7 +3,8 @@ are rejected when it starts, not served wrongly later.
 
 ``validate_deployment`` refuses: a walk in no partition or in two, a
 partition naming an undefined walk, a node placed by no node_group or by two
-for one walk, a node_group naming an undefined walk, and the stream-driven
+for one walk, a node_group naming an undefined walk, a rank no walk runs on,
+and the stream-driven
 shapes the runtime and conductor can't account for: a self-triggered consumer
 (every input streamed) sharing its worker graph with another top-level entity,
 and a consumer walk across worker graphs, unless its consumers are gated and
@@ -42,17 +43,18 @@ from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwa
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.containers import ParallelList
-from mstar.validation import DeploymentError, validate_deployment
+from mstar.validation import validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class _ToyModel(Model):
-    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=()):
+    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
         self._topology = topology
         self._tp_enabled_nodes = set(tp_enabled_nodes)
+        self._sp_enabled_nodes = set(sp_enabled_nodes)
 
     def get_graph_walk_graphs(self):
         return self._walks()
@@ -64,7 +66,8 @@ class _ToyModel(Model):
         return self._topology() if self._topology else super().get_partition_topology()
 
     def get_default_sharding_config(self):
-        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={})
+        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
+                              sp_enabled_nodes=self._sp_enabled_nodes)
 
     def get_node_resources(self):
         return []
@@ -163,6 +166,30 @@ def test_node_in_no_node_group_is_rejected(tmp_path):
     cfg = _config(tmp_path, [{"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill"]}])
     with pytest.raises(ValueError, match=r"node 'llm' of graph walk 'decode' is placed by no node_groups entry"):
         _validate(_ToyModel(_prefill_decode), cfg)
+
+
+def test_a_rank_no_walk_runs_on_is_rejected(tmp_path):
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0]},
+        {"node_names": ["left_over"], "ranks": [1, 2]},
+    ])
+    with pytest.raises(ValueError, match=r"names ranks \[1, 2\], but no node of any graph walk runs on them"):
+        _validate(_ToyModel(_prefill_decode), cfg)
+    # a group whose walks don't hold its node
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill", "decode"]},
+        {"node_names": ["other"], "ranks": [1], "graph_walks": ["decode"]},
+    ])
+    with pytest.raises(ValueError, match=r"node_groups names ranks \[1\]"):
+        _validate(_ToyModel(_prefill_decode), cfg)
+
+
+def test_a_left_over_group_on_a_rank_a_walk_uses_is_accepted(tmp_path, monkeypatch):
+    cfg = _config(tmp_path, [
+        {"node_names": ["llm"], "ranks": [0]},
+        {"node_names": ["left_over"], "ranks": [0]},
+    ])
+    assert _start_conductor(_ToyModel(_prefill_decode), cfg, tmp_path, monkeypatch)._sorted_ranks == [0]
 
 
 def test_node_group_naming_an_undefined_walk_is_rejected(tmp_path):
@@ -370,9 +397,12 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     # on one worker the flag is shared, but self-triggered passes still overlap
     (_vocoder_then_post, _ONE, _ONE, False),
     (_gated_vocoder_then_post, _ONE, _ONE, True),
+    # one TP instance on the same ranks shares the flag too
+    (_gated_vocoder_then_post, _TP2, _TP2, True),
     # each node_group picks its own replica, so a request can split across them
     (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, False),
-], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_dp_replicas"])
+], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
+     "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):
     cfg = _config(tmp_path, [
         {"node_names": ["producer"], "ranks": [0]},
@@ -389,24 +419,6 @@ def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted,
         r"2 worker graphs \[\['vocoder'\], \['post'\]\] on ranks"
     )):
         _start_conductor(model, cfg, tmp_path, monkeypatch)
-
-
-def test_colocated_tp_consumer_walk_passes_the_stream_check_but_not_one_lockstep_node(tmp_path):
-    """One TP instance on the same ranks shares the final-stream flag, but two
-    TP node_groups on one worker are two lockstep nodes there, which every
-    worker refused at startup and the conductor now refuses first."""
-    cfg = _config(tmp_path, [
-        {"node_names": ["producer"], "ranks": [0]},
-        {"node_names": ["vocoder"], **_TP2},
-        {"node_names": ["post"], **_TP2},
-    ])
-    with pytest.raises(DeploymentError) as refusal:
-        _validate(_stream_model(_gated_vocoder_then_post, tp_enabled_nodes=["vocoder", "post"]), cfg)
-    assert refusal.value.problems == [
-        f"Multiple parallel nodes ['post', 'vocoder'] found in worker worker_{rank}; current "
-        "implementation requires at most one lockstep-parallel node per worker."
-        for rank in (1, 2)
-    ]
 
 
 def test_consumer_loop_spanning_worker_graphs_is_rejected(tmp_path):
@@ -703,6 +715,12 @@ def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
 
 
+def _cosyvoice3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.cosyvoice3.config import CosyVoice3Config
+    from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
+    return _bare(CosyVoice3Model, config=CosyVoice3Config())
+
+
 def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
     if name in ("cosmos3_edge", "cosmos3_edge_droid"):
         from test_cosmos3_edge_model import _fake_edge_dir
@@ -806,6 +824,19 @@ def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
 
 
+def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
+    # __init__ reads only config.json and the tokenizer; the config defaults are the published geometry
+    import transformers
+
+    from mstar.model.voxcpm2 import voxcpm2_model
+    from mstar.model.voxcpm2.config import VoxCPM2Config
+    monkeypatch.setattr(voxcpm2_model, "_resolve_metadata", lambda repo_id, cache_dir: str(tmp_path))
+    monkeypatch.setattr(VoxCPM2Config, "from_pretrained", classmethod(lambda cls, path: cls()))
+    monkeypatch.setattr(transformers.LlamaTokenizerFast, "from_pretrained",
+                        classmethod(lambda cls, path: types.SimpleNamespace(get_vocab=dict)))
+    return _constructed(name, model_kwargs)
+
+
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
     return _bare(WhisperModel, config=WhisperModelConfig())
@@ -851,6 +882,7 @@ _FACTORIES = {
     "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
+    "CosyVoice3Model": _cosyvoice3,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
@@ -862,6 +894,7 @@ _FACTORIES = {
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
     "Qwen3ASRModel": _qwen3_asr,
+    "VoxCPM2Model": _voxcpm2,
     "WhisperModel": _whisper,
     # constructed directly: NemotronDuplexModel, OmniVoiceModel, Pi05Model,
     # VJepa2Model, VJepa2ACModel, Wan22Model, WaypointModel
@@ -893,3 +926,5 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
+    # the workers the API server places from the config are the ones the walks run on
+    assert conductor._sorted_ranks == sorted({rank for wg in conductor.worker_graphs.values() for rank in wg.ranks})

@@ -42,6 +42,7 @@ class WorkerMessageType(Enum):
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
     WEIGHT_CONTROL = "weight_control"
+    CLIENT_STREAM_ROUTE = "client_stream_route"
 
 
 @dataclass
@@ -71,8 +72,10 @@ class RemoveRequest(MessageBody):
 
 @dataclass
 class DrainRequest(MessageBody):
-    # Phase-1 teardown: stop reading this request and confirm no reads remain.
-    # Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.
+    # Phase-1 teardown: stop scheduling this request, and ACK READS_DONE once no
+    # read of it is in flight, starting none after (the data worker also stops
+    # reading its results and sending its client stream items). Hard cleanup
+    # (RemoveRequest) follows once every reader has ACKed.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 
@@ -81,7 +84,8 @@ class DrainRequest(MessageBody):
 class InputSignals(MessageBody):
     request_id: str
     inputs: list[GraphEdge]
-    request_info: CurrentForwardPassInfo
+    # None for a signal with no non-streaming input, which reads none
+    request_info: CurrentForwardPassInfo | None
     partition_name: str = "default"
     # Producer partition names. Declared, not a bare ``set``: a bare one is
     # untyped on the wire, so an empty set a Rust sender writes came back a
@@ -103,6 +107,21 @@ class TensorReceived(MessageBody):
 class UnpersistTensors(MessageBody):
     request_id: str
     uuid_to_ref_count: dict[int, int]
+
+
+@dataclass
+class ClientStreamRoute(MessageBody):
+    """The conductor telling the API server's data worker, the producer of a
+    request's client streams, where each one goes: once at dispatch, and
+    again with no ranks for a stream whose consuming partition has ended,
+    which then takes no more items."""
+    request_id: str
+    # client stream edge -> the consuming node's ranks for this request
+    workers: dict[str, list[str]]
+    # client stream edge -> that node, from the walks as the deployment shaped
+    # them; the data worker's copy of the model is the unshaped one
+    nodes: dict[str, str]
+
 
 @dataclass
 class StopLoops(MessageBody):
@@ -255,17 +274,6 @@ class ConductorMessageType(Enum):
     UPDATE_WEIGHTS_FROM_DISK = "update_weights_from_disk"
     GET_GENERATION_STATE = "get_generation_state"
     WEIGHT_CONTROL_ACK = "weight_control_ack"
-    CLIENT_STREAM_INPUT = "client_stream_input"
-
-
-@dataclass
-class ClientStreamInput(MessageBody):
-    """The next chunk of a running request's client streams (see
-    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
-    the streams that end after it. An ended stream takes no more chunks."""
-    request_id: str
-    signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    ended: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -279,10 +287,9 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
-    # For a model with client streams, the opening's own client input: its
-    # first chunk and the streams it ends, forwarded once the request is
-    # admitted. A stream it leaves open makes it a live call.
-    client_input: ClientStreamInput | None = None
+    # A client stream the opening leaves open: a live call, which is refused
+    # rather than queued at max_concurrent_requests.
+    input_open: bool = False
 
 
 @dataclass

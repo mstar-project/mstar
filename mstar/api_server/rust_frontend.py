@@ -9,10 +9,12 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          prompt_parts, streaming} | {t:"abort", rid, sub}
+                          prompt_parts, streaming, accepts_chunks}
+                       | {t:"abort", rid, sub}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
+                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -23,6 +25,14 @@ exports as ``mstar_http_refusals_total``. The reply is what ``GET /metrics``
 serves on the Python frontend: the text rendered from ``APIServer.metrics``
 with its ``content_type`` in ``metadata``, or empty ``metadata`` when metrics
 are off (a 404; the counts are then ignored).
+
+``chunks`` carries many submissions' chunks as parallel lists, in order:
+the API server's message thread hands the bridge every chunk it drained in
+one pass (``APIServer.relay_chunks_to``), so a decode step costs one message
+rather than one per request. Only a submit that sets ``accepts_chunks`` gets
+them, so a frontend binary older than this bridge still gets ``chunk``s. A
+submission's error chunk, and anything its handler finds unrelayed at the
+end, always goes out as ``chunk``.
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -62,6 +72,7 @@ from mstar.communication.rust_communicator import (
 )
 from mstar.model.multimodal import PromptPart
 from mstar.utils.client_errors import client_error_text
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +157,8 @@ class RustFrontendBridge:
         self.running = True
         # sub -> its submission's key, until its relay ends.
         self._keys: dict[int, str] = {}
+        # set by _serve; the API server's message thread schedules relay() on it
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     # -- outbound ----------------------------------------------------------
 
@@ -154,6 +167,15 @@ class RustFrontendBridge:
 
     def _err(self, rid: str, sub: int | None, detail: str) -> None:
         self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
+
+    def relay(self, tags: list[int], chunks: list) -> None:
+        """``ChunkSink.relay``: one ``chunks`` message for a message pass."""
+        self._send({
+            "t": "chunks", "subs": tags,
+            "modalities": [c.modality for c in chunks],
+            "payloads": [bytes(c.data) for c in chunks],
+            "metadatas": [c.metadata for c in chunks],
+        })
 
     # -- request lifecycle ---------------------------------------------------
 
@@ -206,7 +228,9 @@ class RustFrontendBridge:
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.
-        self._keys[sub] = self.server.submission_key(rid)
+        key = self._keys[sub] = self.server.submission_key(rid)
+        if msg.get("accepts_chunks"):
+            self.server.relay_chunks_to(key, self, sub)
         chunks = self.server.iter_result_chunks(rid)
         asyncio.get_running_loop().create_task(self._relay(rid, sub, chunks))
 
@@ -273,7 +297,11 @@ class RustFrontendBridge:
 
     async def _serve(self) -> None:
         logger.info("Rust-frontend bridge serving")
-        loop = asyncio.get_running_loop()
+        loop = self.loop = asyncio.get_running_loop()
+        # asyncio would start its default pool from this thread, and so on
+        # the result CPU when the bridge is pinned; handlers' to_thread work
+        # (audio planning, request decoding) belongs on the process mask
+        loop.set_default_executor(ThreadPool(thread_name_prefix="mstar-bridge"))
         # Blocking receive on an executor thread: the wait happens inside the
         # transport (GIL released), so an arriving submit is picked up
         # immediately instead of on the next tick of a sleep/poll loop — and
@@ -300,6 +328,12 @@ class RustFrontendBridge:
 
     def run(self) -> None:
         """Blocking serve loop (the ``uvicorn.run`` replacement)."""
+        # with the message thread: tokens pass from it to this loop. The Rust
+        # process is already running, so it keeps the process mask. Test doubles
+        # stand in for the server without the pin.
+        pin = getattr(self.server, "pin_result_thread", None)
+        if pin is not None:
+            pin()
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:

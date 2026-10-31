@@ -5,7 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -107,6 +107,11 @@ class PagedKVConfig(KVConfig):
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
+
+    @property
+    def request_pages(self) -> int:
+        """Pages requests can hold: all but the sink page the KV manager takes at build."""
+        return self.max_num_pages - 1
 
     @property
     def latent_dim(self) -> int:
@@ -301,12 +306,28 @@ class KVReqConfig(ResourceReqConfig):
             for loop, slots in layout.growth:
                 n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
                 room[loop] = min(n, room.get(loop, n))
+        pool, page_size = spec.config.request_pages, spec.config.page_size
+        if self.pages(spec.nodes, caps, page_size) > pool:
+            # each loop's room in pages, searched with the other loops at their caps
+            for loop, cap in caps.items():
+                low, high = 0, cap
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if self.pages(spec.nodes, {**caps, loop: mid}, page_size) <= pool:
+                        low = mid
+                    else:
+                        high = mid - 1
+                room[loop] = min(low, room.get(loop, low))
         return room
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
         than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
-        the one model that declares one, computes its positions in each forward."""
+        the one model that declares one, computes its positions in each forward.
+
+        Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
+        has for requests. The pool admits on the prompt alone, so such a request would be admitted
+        and then could not finish even alone in an empty pool."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
@@ -316,6 +337,12 @@ class KVReqConfig(ResourceReqConfig):
                     f"this request needs {positions} positions of {label!r}, "
                     f"past the model's context of {spec.config.max_seq_len}"
                 )
+        pages = self.pages(spec.nodes, self.loop_caps or {}, spec.config.page_size)
+        if pages > spec.config.request_pages:
+            raise ValueError(
+                f"this request needs {pages} pages of {spec.resource_key!r} for labels "
+                f"{sorted(self.opened_labels(spec.nodes))}, and the pool has {spec.config.request_pages}"
+            )
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -326,11 +353,21 @@ class KVReqConfig(ResourceReqConfig):
             return self.needed_labels
         return ["main"]
 
-    def opened_labels(self) -> set[str]:
+    def opened_labels(self, nodes: Collection[str] | None = None) -> set[str]:
+        """The labels the request opens on ``nodes``, or on every node when ``nodes`` is None."""
         labels = set(self.needed_labels or ["main"])
-        for named in (*self.needed_labels_per_node.values(), *self.needed_labels_per_node_walk.values()):
-            labels.update(named)
+        for node, named in self.needed_labels_per_node.items():
+            if nodes is None or node in nodes:
+                labels.update(named)
+        for (node, _), named in self.needed_labels_per_node_walk.items():
+            if nodes is None or node in nodes:
+                labels.update(named)
         return labels
+
+    def pages(self, nodes: Collection[str] | None, caps: Mapping[str, int], page_size: int) -> int:
+        """The most pages the request holds in a pool shared by ``nodes``, at ``caps``."""
+        layouts = self.kv_layout or {}
+        return sum(layouts[label].pages(caps, page_size) for label in self.opened_labels(nodes) if label in layouts)
 
     def get_publish_labels(
         self,
@@ -380,6 +417,9 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
+    # more pages per request than the leader's, as long as the leader offloads nothing.
+    leader: str | None = None
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -493,6 +533,9 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
+    # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
+    commits: int = field(default=0, init=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)

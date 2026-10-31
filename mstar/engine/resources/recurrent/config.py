@@ -245,6 +245,10 @@ class RecurrentStateConfig:
     # label, so this bounds concurrent requests times labels.
     max_slots: int = 256
 
+    # The labels a request's steps address or fork into. Admission reserves a
+    # slot for each, and a step that opens any other label fails its request.
+    labels: tuple[str, ...] = ("main",)
+
     # Whether padding rows address a real sink slot or a -1 sentinel. Kernels
     # disagree on -1: FlashInfer's fp32 GDN decode skips it, its bf16 path
     # writes slot 0, and SM90 prefill masks it itself (`GDNPrefillWrapper.run`).
@@ -261,6 +265,8 @@ class RecurrentStateConfig:
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
+        if not self.labels:
+            raise ValueError("a recurrent state pool must declare a label")
         if not self.disable_sink_slot and self.max_slots < 2:
             raise ValueError(
                 f"max_slots={self.max_slots} leaves nothing to hand out: the "

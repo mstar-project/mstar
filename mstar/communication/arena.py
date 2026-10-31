@@ -60,6 +60,8 @@ from mstar.communication.tensors import (
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.host_copy import HostCopier
+from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +234,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         communicator: BaseCommunicator,
         shm_dir: str | None = None,
         enable_prof: bool = False,
+        copy_workers: int = 1,
     ):
         super().__init__(
             my_entity_id=my_entity_id, hostname=hostname, device=device,
@@ -239,6 +242,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             enable_prof=enable_prof,
         )
         from mstar_rust import SegmentedShmArena, ShmArena
+
+        # A CPU consumer's reads (the API server's outputs) copy on these.
+        self._host_copier = HostCopier(copy_workers)
 
         self._ShmArena = ShmArena
         segment_mb = int(os.getenv("MSTAR_SHM_ARENA_SEGMENT_MB", "256"))
@@ -846,6 +852,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
+            if not any(e.tensor_info for e in graph_edges):
+                # signal-only edges: no stream context to pay for, but the
+                # (time-gated) sweep of dead peers' segments still runs here
+                self._evict_dead_peers()
+                return []
             return self._start_read_tensors(request_id, graph_edges,
                                             graph_walk)
         finally:
@@ -935,7 +946,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # staticmethod target closing over ONLY the queue: a bound
                 # method would pin the whole manager (and its arena — so
                 # segments never unlink) for the daemon thread's lifetime.
-                threading.Thread(
+                Thread(
                     target=self._watch_wakes, args=(self._wake_q,),
                     daemon=True,
                     name=f"arena-h2d-wake-{self.my_entity_id}").start()
@@ -973,10 +984,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         view = self._peer_view(info.shm_segment)
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
         if self.device == "cpu":
-            # A CPU consumer owns a copy past reclaim. numpy copies with one
-            # memcpy; clone() would split it over torch's intra-op pool.
-            flat = torch.from_numpy(np.frombuffer(
-                view, dtype=np.uint8, count=info.nbytes, offset=start).copy())
+            # A CPU consumer owns a copy past reclaim. clone() would split it
+            # over torch's intra-op pool, sized for small ops; the copier keeps
+            # an image one memcpy and slices a video over threads of its own.
+            flat = self._host_copier.copy(
+                np.frombuffer(view, dtype=np.uint8, count=info.nbytes, offset=start))
             return flat.view(info.dtype).reshape(info.dims)
         flat = torch.frombuffer(
             view[start:start + info.nbytes], dtype=torch.uint8)

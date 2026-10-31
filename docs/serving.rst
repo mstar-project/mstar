@@ -336,15 +336,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
-     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+     - *(optional)* Async scheduling for the parallel nodes: ``true``
+       (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold`` and ``pre_plan``
-       (``true``/``false`` or an integer). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
+       (``true``/``false`` or an integer; ``step_thread_core`` takes
+       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -385,15 +386,23 @@ ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
 ranks. Loading fails otherwise.
 
-A cached prompt no longer reserves its pages, so the pool no longer limits how many
-requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out.
+On a single rank, a request waits at the head of its pool's queue until its prompt fits
+beside the prompts already admitted, and no request behind it starts first. A cache hit on
+a page only the prefix index holds counts as a page the request takes. A request that
+can't fit in its pool at its full output length gets a 400 if it asked for that length,
+and otherwise has the model's default length cut until it fits. The pool
+reserves only prompts, so it still has to hold the decode of every request allowed to run
+at once, and a decode step that finds no page outside the admitted prompts holds its
+requests until they time out.
 ``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
 safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
 frees only the device pages no other running request reads, though, so a request that
 shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap.
+It doesn't replace the cap. With a host pool and the prefix cache on, a cached page is
+copied to the host once no request holds it, and a later request whose prefix the device
+evicted copies it back from there. So the host pool should hold more pages than the device's
+prefix cache.
 
 **Single GPU.** Everything on rank 0:
 
@@ -460,6 +469,15 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
+groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
+then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
+in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
+rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
+per node, riding on one node's next step, so two nodes on one pool could admit out of step on
+a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
+different workers.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank

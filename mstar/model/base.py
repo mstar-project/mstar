@@ -30,6 +30,7 @@ from mstar.graph.base import (
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -439,8 +440,8 @@ class Model(ABC):
     # Request keys that set an output length. A request that sets one is refused when it
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
-    # Request keys the conductor reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache")
+    # Request keys the conductor or data worker reads for every model, never logged as ignored.
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids")
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -807,7 +808,20 @@ class Model(ABC):
         video = video.float().div_(255.0)
         return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
-    @abstractmethod
+    def text_output(self) -> TextOutput | None:
+        """How this model's text output, token ids, becomes bytes, or None for a
+        model that encodes text in its own ``postprocess``. ``postprocess`` and
+        ``postprocess_inline`` derive their text paths from it."""
+        return None
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
+
+    def _chunk_detokenizer(self) -> TextChunkDetokenizer:
+        """A ``TextChunkDetokenizer`` over ``self.tokenizer``, for ``text_output``."""
+        if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+            self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+        return self._text_detokenizer
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -816,7 +830,8 @@ class Model(ABC):
     ) -> bytes:
         """
         Given an output of a certain modality, encode and return as bytes.
-        This will likely need to overridden with model-specific behavior.
+        Text follows ``text_output`` when the model declares it; any other
+        modality will likely need model-specific behavior.
         ``request_kwargs`` is the request's model_kwargs, so encoders can honor
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
@@ -826,10 +841,36 @@ class Model(ABC):
         override must not keep state across calls.
 
         Modality to expected encoding type:
-        - text: utf-8
+        - text: utf-8; a chunk may end inside a character, since the API
+          server joins a request's text chunks before decoding them
         - image: png
         """
+        text = self.text_output() if modality == TEXT else None
+        if text is not None:
+            ids = drop_stop_tokens(output, text.stop_token_ids, request_kwargs)
+            return text.detokenizer.to_bytes(ids)
         return output.cpu().numpy().tobytes()
+
+    def postprocess_inline(
+        self,
+        values: list[int],
+        modality: str,
+        request_kwargs: list[dict | None],
+    ) -> list[bytes]:
+        """``postprocess`` for one step's inline values (one per request) in
+        one call: a declared ``text_output`` maps token ids straight to bytes,
+        and anything else gets ``postprocess`` of a one-element tensor."""
+        text = self.text_output() if modality == TEXT else None
+        if text is None:
+            return [
+                self.postprocess(torch.tensor([v], dtype=torch.int64), modality, request_kwargs=kw)
+                for v, kw in zip(values, request_kwargs, strict=True)
+            ]
+        stop, token_bytes = text.stop_token_ids, text.detokenizer.token_bytes
+        return [
+            b"" if v in stop and not (kw or {}).get("ignore_eos") else token_bytes(v)
+            for v, kw in zip(values, request_kwargs, strict=True)
+        ]
 
     @abstractmethod
     def get_submodule(
@@ -860,9 +901,12 @@ class Model(ABC):
         meta module to this dtype *before* ``to_empty(device)`` so storage
         is allocated directly in the target dtype — casting after
         ``to_empty`` first materialises every param in the meta default
-        (float32), doubling the load-time VRAM peak. ``None`` means leave
-        the default (float32); the engine manager passes ``None`` for
-        nodes whose engine does not autocast.
+        (float32), doubling the load-time VRAM peak. It is always the
+        model-wide dtype (``get_autocast_dtype``, or YAML ``autocast_dtype``):
+        the submodule does not exist yet, so a node with ``disable_autocast``
+        gets it too. The engine manager's cast afterwards keeps such a node in
+        whatever dtype it was built in, and moves a node with its own
+        ``get_autocast_dtype`` to that dtype.
         """
         pass
 
@@ -887,6 +931,9 @@ class Model(ABC):
         return None
 
     def get_autocast_dtype(self):
+        """The model-wide dtype nodes are cast to and autocast in. ``None``
+        runs every node without autocast, in the dtype it was built in; YAML
+        ``autocast_dtype`` may then only be ``null``."""
         return torch.bfloat16
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
@@ -985,7 +1032,8 @@ class Model(ABC):
         the next graph walk, inputs, and whether the request is done.
 
         ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions. For single-partition models,
+        producer_done) for consumer partitions, one per stream from another
+        partition; a client stream has no entry. For single-partition models,
         this will be ``None`` or an empty list.
         """
         pass

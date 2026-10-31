@@ -72,7 +72,7 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # docs/installation.rst, same as flash-attn.
 omnivoice = []
 command_a_plus = [
-    "flashinfer-python>=0.6.18",
+    "flashinfer-python==0.7.2",
     "huggingface-hub>=1.5",
     "mooncake-transfer-engine>=0.3.13.post1",
     "ninja",
@@ -140,7 +140,7 @@ dynamo = [
 
 bagel = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -177,7 +177,7 @@ cosmos3 = [
     # build; on a mismatch the engine runs the dense pass on FlashInfer's
     # ragged prefill instead. See docs/models.rst.
     "fa3-fwd",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -192,7 +192,7 @@ qwen3_omni = [
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
     # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -218,7 +218,7 @@ qwen3_omni = [
 # into one downgrades huggingface-hub under them. See docs/installation.rst.
 qwen3_tts = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -227,7 +227,7 @@ qwen3_tts = [
 ]
 
 fish_s2_pro = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -252,7 +252,7 @@ kokoro = [
 # resemble-perth 1.0.1 (the latest) imports pkg_resources, which setuptools 82
 # removed; without it the package hides its watermarker.
 chatterbox = [
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "librosa",
     "mooncake-transfer-engine>=0.3.13.post1",
@@ -270,9 +270,34 @@ chatterbox_multilingual = [
     "spacy-pkuseg",
 ]
 
+# Fun-CosyVoice3: reference clips decode through Chatterbox's loader (soundfile,
+# torchcodec as the fallback); the speech tokenizer and speaker encoder load from
+# the checkpoint's ONNX files without onnxruntime.
+cosyvoice3 = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "soundfile",
+    "torchcodec",
+    "transformers",
+]
+
+# VoxCPM2: soundfile reads reference clips and soxr resamples them to 16 kHz
+# the way the reference's librosa.load does.
+voxcpm2 = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "soundfile",
+    "soxr",
+    "transformers",
+]
+
 orpheus = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -280,7 +305,7 @@ orpheus = [
 ]
 
 pi05 = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -348,7 +373,7 @@ flux2_klein = [
     # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
     # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
     "diffusers>=0.39",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "Pillow>=12.3.0",
     "safetensors",
@@ -357,7 +382,7 @@ flux2_klein = [
 ]
 
 vjepa2_ac = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -367,7 +392,7 @@ vjepa2_ac = [
 # ASR models: Whisper-large-v3, Higgs Audio
 asr = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -404,7 +429,7 @@ all = [
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -442,6 +467,7 @@ all = [
     "spacy>=3.8",
     "num2words",
     "audioseal>=0.2,<0.3",  # see the audioseal extra
+    "soxr",  # see the voxcpm2 extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.
@@ -468,7 +494,7 @@ target-version = "py312"
 [tool.ruff.lint]
 fixable = ["ALL"]
 unfixable = []
-select = ["F", "E", "W", "I", "B", "PL", "N"] 
+select = ["F", "E", "W", "I", "B", "PL", "N", "TID251"]
 ignore = [
     "B006",    # Do not use mutable data structures for argument defaults
     "B008",    # Do not perform function call in argument defaults
@@ -490,7 +516,21 @@ ignore = [
     "PLR0917", # Too many positional arguments
 ]
 
+# A new thread starts with its creator's CPU mask, so a thread or pool started
+# from a pinned step thread (step_thread_core) would share its CPU; the helpers
+# start theirs on the process mask.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"threading.Thread".msg = "use mstar.utils.threads.Thread, which starts on the process mask"
+"concurrent.futures.ThreadPoolExecutor".msg = "use mstar.utils.threads.ThreadPool, which starts on the process mask"
+"concurrent.futures.thread.ThreadPoolExecutor".msg = "use mstar.utils.threads.ThreadPool, which starts on the process mask"
+
 [tool.ruff.lint.per-file-ignores]
+# banned-api covers the serving code under mstar/: tests, benchmarks and
+# scripts never run on a pinned thread
+"!mstar/**" = ["TID251"]
+"mstar/**/tests/**" = ["TID251"]
+# the helpers themselves
+"mstar/utils/threads.py" = ["TID251"]
 # Intentional star-import re-export of the graph base API.
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().
