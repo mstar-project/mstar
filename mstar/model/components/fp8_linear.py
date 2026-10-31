@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 LINEAR_DTYPES = ("bf16", "fp8")
 BF16, FP8 = LINEAR_DTYPES
+# a denoise step that runs only some of the fp8 linears in fp8 (``fp8_partial_keep_bf16``)
+FP8_PARTIAL = "fp8_partial"
+STEP_DTYPES = (BF16, FP8, FP8_PARTIAL)
 # hipBLASLt's fp8 kernels need both GEMM dimensions of the weight in multiples of 16
 _ALIGN = 16
 
@@ -83,13 +86,15 @@ class Fp8Linear(nn.Module):
 class StepDtypes:
     """The dtype a transformer's fp8 linears run in on each denoise step (``linear_dtype_steps``).
 
-    ``steps[k]`` is step ``k``'s dtype and steps past the list take its last entry. The denoise
-    loop sets ``active`` before each forward. A compiled forward guards on it, so each dtype
-    compiles, and captures, on its own."""
+    ``steps[k]`` is step ``k``'s dtype and steps past the list take its last entry. On an
+    ``fp8_partial`` step the linears matching ``partial_keep`` stay bf16. The denoise loop sets
+    ``active`` before each forward. A compiled forward guards on it, so each dtype compiles, and
+    captures, on its own."""
 
-    def __init__(self, steps: Sequence[str]):
+    def __init__(self, steps: Sequence[str], partial_keep: Sequence[str] = ()):
         self.steps = tuple(steps)
         self.dtypes = tuple(dict.fromkeys(self.steps))
+        self.partial_keep = tuple(partial_keep)
         self.active = self.steps[0]
 
     def at(self, step: int) -> str:
@@ -101,14 +106,18 @@ class SteppedFp8Linear(nn.Module):
 
     Under compile the choice folds away: each dtype's graph holds one GEMM."""
 
-    def __init__(self, linear: nn.Linear | FusedColumnLinear, fp8_dtype: torch.dtype, policy: StepDtypes):
+    def __init__(
+        self, linear: nn.Linear | FusedColumnLinear, fp8_dtype: torch.dtype, policy: StepDtypes, name: str,
+    ):
         super().__init__()
         self.bf16 = linear
         self.fp8 = Fp8Linear.from_linear(linear, fp8_dtype)
         self.policy = policy
+        kept = any(matches(name, pattern) for pattern in policy.partial_keep)
+        self.bf16_on = (BF16, FP8_PARTIAL) if kept else (BF16,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fp8(x) if self.policy.active == FP8 else self.bf16(x)
+        return self.bf16(x) if self.policy.active in self.bf16_on else self.fp8(x)
 
 
 _RANGE = re.compile(r"(\d+)-(\d+)")
@@ -155,7 +164,10 @@ def quantize_linears(
                         tuple(child.weight.shape), _ALIGN)
             continue
         parent, _, attr = name.rpartition(".")
-        fp8 = Fp8Linear.from_linear(child, fp8_dtype) if policy is None else SteppedFp8Linear(child, fp8_dtype, policy)
+        fp8 = (
+            Fp8Linear.from_linear(child, fp8_dtype) if policy is None
+            else SteppedFp8Linear(child, fp8_dtype, policy, name)
+        )
         setattr(module.get_submodule(parent), attr, fp8)
         replaced.append(name)
     return replaced
@@ -177,18 +189,26 @@ def check_linear_dtype(linear_dtype: str) -> str:
     return linear_dtype
 
 
-def check_linear_dtype_steps(steps: Sequence[str] | None, linear_dtype: str) -> StepDtypes | None:
-    """A model config's ``linear_dtype_steps``, checked when the model is constructed."""
+def check_linear_dtype_steps(
+    steps: Sequence[str] | None, linear_dtype: str, partial_keep: Sequence[str] | None = None,
+) -> StepDtypes | None:
+    """A model config's ``linear_dtype_steps`` and ``fp8_partial_keep_bf16``, checked when the
+    model is constructed."""
+    partial_keep = [str(p) for p in (partial_keep or [])]
     if not steps:
+        if partial_keep:
+            raise ValueError("fp8_partial_keep_bf16 needs linear_dtype_steps")
         return None
     if linear_dtype != FP8:
         raise ValueError(f"linear_dtype_steps needs linear_dtype: {FP8}, not {linear_dtype!r}")
-    unknown = sorted({s for s in steps if s not in LINEAR_DTYPES}, key=str)
+    unknown = sorted({s for s in steps if s not in STEP_DTYPES}, key=str)
     if unknown:
-        raise ValueError(f"linear_dtype_steps {unknown} are not in {LINEAR_DTYPES}")
+        raise ValueError(f"linear_dtype_steps {unknown} are not in {STEP_DTYPES}")
     if len(set(steps)) == 1:
         raise ValueError(f"linear_dtype_steps {list(steps)} name one dtype: set linear_dtype to it instead")
-    return StepDtypes(steps)
+    if (FP8_PARTIAL in steps) != bool(partial_keep):
+        raise ValueError(f"an {FP8_PARTIAL} step and fp8_partial_keep_bf16 come together")
+    return StepDtypes(steps, partial_keep)
 
 
 def apply_linear_dtype(
@@ -203,9 +223,10 @@ def apply_linear_dtype(
     if check_linear_dtype(linear_dtype) == "bf16":
         return []
     eligible = [n for n, _ in module.named_modules() if any(matches(n, p) for p in patterns)]
-    unused = [k for k in keep if not any(matches(n, k) for n in eligible)]
+    partial = policy.partial_keep if policy is not None else ()
+    unused = [k for k in (*keep, *partial) if not any(matches(n, k) for n in eligible)]
     if unused:
-        raise ValueError(f"{what}: fp8_keep_bf16 entries {unused} name none of its fp8-eligible linears")
+        raise ValueError(f"{what}: fp8 keep-list entries {unused} name none of its fp8-eligible linears")
     reason = fp8_unavailable_reason()
     if reason is not None:
         logger.warning("%s: linear_dtype fp8 requested, but %s; its linears stay bf16", what, reason)
