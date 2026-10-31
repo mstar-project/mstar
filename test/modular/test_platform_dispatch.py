@@ -212,7 +212,7 @@ class _SmallGemmsOnAten(RocmPlatform):
     def __init__(self):
         self.queries: list[int | None] = []
 
-    def inductor_overrides(self, num_tokens=None, rows=None):
+    def inductor_overrides(self, num_tokens=None, rows=None, decode_rows=False):
         self.queries.append(num_tokens)
         if num_tokens is not None and num_tokens <= 32:
             return {"max_autotune_gemm_backends": "ATEN"}
@@ -231,6 +231,14 @@ def _read_gemm_backends(*args, **kwargs):
 def test_no_overrides_returns_the_callable_itself(on_platform, platform, num_tokens):
     on_platform(platform)
     assert with_inductor_overrides(_read_gemm_backends, num_tokens) is _read_gemm_backends
+
+
+def test_a_verify_bucket_compiles_as_decode_by_its_rows(on_platform):
+    on_platform(RocmPlatform())
+    # 64 rows of three tokens: past the packed limit, inside the decode one
+    assert RocmPlatform().inductor_overrides(192, 64) == {}
+    assert RocmPlatform().inductor_overrides(192, 64, True)["max_autotune_gemm_backends"] == "ATEN"
+    assert RocmPlatform().inductor_overrides(600, 200, True) == {}
 
 
 @pytest.mark.parametrize(
@@ -285,7 +293,7 @@ def test_overrides_are_undone_when_the_call_raises(on_platform):
 
 
 class _EverythingOnAten(_SmallGemmsOnAten):
-    def inductor_overrides(self, num_tokens=None, rows=None):
+    def inductor_overrides(self, num_tokens=None, rows=None, decode_rows=False):
         self.queries.append(num_tokens)
         return {"max_autotune_gemm_backends": "ATEN"}
 

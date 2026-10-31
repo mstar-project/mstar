@@ -125,6 +125,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
         compile_dynamic: bool = False,
+        decode_rows: bool = False,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -139,6 +140,9 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             compile_dynamic=compile_dynamic,
         )
         self.single_request_inputs = single_request_inputs
+        # A few tokens a row that are decode all the same (a speculative verify
+        # row): the platform compiles the bucket by its rows, as decode.
+        self.decode_rows = decode_rows
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
         # submodule's own ``declare_step`` (e.g. replicated across cond/uncond
         # labels for a combined guidance step), so it must stay a per-label
