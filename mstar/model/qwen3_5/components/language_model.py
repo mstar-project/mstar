@@ -416,6 +416,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        # what a draft pass reads in place of the lm_head, if not None
+        self.draft_head: nn.Module | None = None
 
     def forward(
         self, input_ids: torch.Tensor, *, label: str,
