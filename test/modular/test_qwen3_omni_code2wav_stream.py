@@ -442,6 +442,7 @@ RAMPS = [
     pytest.param((4,), 25, 25, id="4-then-25"),
     pytest.param((8, 10, 13, 16, 20), 25, 25, id="early-audio-8-10-13-16-20"),
     pytest.param((4, 8, 16), 25, 25, id="ramp4-4-8-16-25"),
+    pytest.param((4, 5, 6, 8, 10, 13, 16, 20), 25, 25, id="ramp4g-4-5-6-8-10-13-16-20"),
     # a ramp chunk wider than the steady chunk widens the padded window
     pytest.param((30, 10), 25, 25, id="30-10-25"),
     pytest.param((4, 10), 25, 50, id="4-10-25-context-50"),
@@ -493,7 +494,9 @@ def test_a_batch_mixes_windows_from_different_ramp_stages():
 
 
 @pytest.mark.parametrize(
-    "schedule", [(12, 13), (8, 10, 13, 16, 20), (4, 8, 16)], ids=["default", "early-audio", "ramp4"],
+    "schedule",
+    [(12, 13), (8, 10, 13, 16, 20), (4, 8, 16), (4, 5, 6, 8, 10, 13, 16, 20)],
+    ids=["default", "early-audio", "ramp4", "ramp4g"],
 )
 @pytest.mark.parametrize("num_frames", [3, 4, 12, 25, 26, 50, 120])
 def test_real_decoder_streams_the_ramp_like_the_full_decode(tiny_code2wav, num_frames, schedule):
@@ -648,6 +651,39 @@ def test_the_ramp4_config_starts_audio_after_4_frames_inside_the_default_capture
 def test_the_ramp4_schedule_streams_the_full_decode_around_each_boundary(boundary, offset):
     decoder = _LookaheadDecoder()
     submodule = Code2WavSubmodule(decoder, _config((4, 8, 16)))
+    codes = _codes(boundary + offset)
+
+    steps = _stream(submodule, codes, _scheduled_policy)
+    full = _to_pcm(decoder(codes.t()[None], torch.arange(boundary + offset)[None]))[0, 0]
+
+    assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
+
+
+RAMP4G_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "qwen3omni_colocated_ramp4g.yaml"
+
+
+def test_the_gentle_ramp4_config_needs_no_more_of_the_talker_than_the_early_audio_one():
+    """First audio after 4 frames, while each chunk still arrives in time at
+    about 17 frames/s per request: the first chunk plays 555 samples short."""
+    from mstar.model.qwen3_omni.qwen3_omni_model import apply_code2wav_serving_overrides
+
+    kwargs = dict(yaml.safe_load(RAMP4G_CONFIG.read_text())["model_kwargs"])
+    cfg = Code2WavConfig()
+    apply_code2wav_serving_overrides(cfg, kwargs)
+
+    sizes = (*cfg.codec_chunk_schedule, cfg.codec_chunk_frames)
+    assert sizes[0] == 4 and not kwargs
+    assert cfg.codec_max_window == Code2WavConfig().codec_max_window == 50
+    plays_s = [(sizes[0] * UPSAMPLE - cfg.codec_lookahead_samples) / 24000]
+    plays_s += [n * UPSAMPLE / 24000 for n in sizes[1:-1]]
+    assert max(n / s for n, s in zip(sizes[1:], plays_s, strict=True)) < 17
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("boundary", [4, 9, 15, 23, 33, 46, 62, 82, 107])
+def test_the_gentle_ramp4_schedule_streams_the_full_decode_around_each_boundary(boundary, offset):
+    decoder = _LookaheadDecoder()
+    submodule = Code2WavSubmodule(decoder, _config((4, 5, 6, 8, 10, 13, 16, 20)))
     codes = _codes(boundary + offset)
 
     steps = _stream(submodule, codes, _scheduled_policy)
