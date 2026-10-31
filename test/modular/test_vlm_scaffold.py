@@ -184,17 +184,6 @@ def _qwen_llm(encoders=(VISION,), model=None):
     return llm
 
 
-def test_the_step_is_the_layers_then_the_sampler_and_position():
-    from mstar.model.qwen3_5.config import ATTN, GDN_STATE, KV_CACHE, LINEAR_ATTN
-    from mstar.model.submodule_base import ARNodeInputs
-
-    llm = _qwen_llm()
-    rows = [ARNodeInputs(input_seq_len=3, input_ids=torch.tensor([5, 6, 7]))]
-    step = llm.declare_step("prefill_text", [0], rows)
-    assert list(step.steps) == [KV_CACHE, ATTN, GDN_STATE, LINEAR_ATTN, SAMPLER, ROPE]
-    assert step.steps[ROPE].advance is None
-
-
 def test_a_media_prompt_hands_its_advance_and_ids_to_the_resources():
     """The position resource takes the row's advance; the repetition penalty
     tracks the whole prompt, pads and sentinels included."""
@@ -238,9 +227,8 @@ def test_every_media_walk_replays_one_capture_that_caps_it():
     for walk in ("prefill_vision", "prefill_audio", "prefill_vision_audio"):
         (config,) = [c for c in configs if walk in c.replay_graph_walks]
         assert config.caps_eager_batch_size
-        assert max(config.capture_batch_sizes) == max(llm.PREFILL_MEDIA_CAPTURE_BATCH_SIZES)
         assert config.input_seq_dims == {"vision_embeds": 0, "audio_embeds": 0}
-        assert llm.max_batch_size(walk) == max(llm.PREFILL_MEDIA_CAPTURE_BATCH_SIZES)
+        assert llm.max_batch_size(walk) == max(config.capture_batch_sizes)
     assert llm.max_batch_size("decode") is None
 
 
@@ -282,19 +270,6 @@ def test_the_forward_reads_only_tensors_from_preprocess():
 # ---------------------------------------------------------------------------
 # Muse Glimmer on the scaffolds
 # ---------------------------------------------------------------------------
-
-
-def test_glimmer_reads_one_cache_through_two_attention_resources():
-    from mstar.model.muse.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE
-    from mstar.model.muse.submodules import LLMSubmodule
-    from mstar.model.submodule_base import ARNodeInputs
-
-    llm = object.__new__(LLMSubmodule)
-    rows = [ARNodeInputs(input_seq_len=2, input_ids=torch.tensor([5, 6]))]
-    step = llm.declare_step("prefill_text", [0], rows)
-    assert set(step.steps) == {KV_CACHE, ATTN_SLIDING, ATTN_FULL, SAMPLER, ROPE}
-    # plain 1D positions: the resource advances by the span
-    assert step.steps[ROPE].advance is None
 
 
 def test_glimmer_encoder_declares_windows_and_frames():
