@@ -577,7 +577,7 @@ Qwen3-TTS notes
   captured decode at 91 dB median PSNR against the reference decoder; other
   GPUs run the reference stack, bit for bit. ``model_kwargs: {codec_dtype:
   bfloat16}`` in the deployment YAML selects a bf16 codec (the Talker is bf16
-  either way). Channels-last on a B300 it is another 7-17% faster but audibly
+  either way). Channels-last on a B300, bf16 is another 7-17% faster but
   further off: 57 dB median and 36 dB worst PSNR against fp32 over 200
   sentences. Off that stack it is slower, not faster, because cuDNN's
   heuristics run several of its convs on a kernel without tensor cores.
