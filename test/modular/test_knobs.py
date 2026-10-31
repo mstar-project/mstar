@@ -38,6 +38,14 @@ def test_a_malformed_block_fails_the_startup_check(bad):
         knobs.check(bad)
 
 
+def test_the_in_graph_sampler_scatter_is_on_by_default(monkeypatch):
+    assert knobs.sampler_ingraph_scatter() is True and knobs.sampler_slots() == 4096
+    knobs.configure({"sampler_ingraph_scatter": False})
+    assert knobs.sampler_ingraph_scatter() is False
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    assert knobs.sampler_ingraph_scatter() is True
+
+
 def test_step_thread_core_from_the_config_and_the_environment(monkeypatch):
     assert knobs.step_thread_core() == "off"
     # yaml reads a bare off as False

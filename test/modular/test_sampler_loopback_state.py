@@ -119,6 +119,9 @@ def test_resource_stores_by_step_and_commit_persists_what_the_step_declares(monk
     res = _resource(monkeypatch)
     for rid in ("a", "b"):
         res.ingest_request(rid)
+        if res.ask(rid, "decoder", "decode") is not None:
+            # with the in-graph scatter the row is taken at admission
+            assert res.reserve(rid, "decoder", "decode", None) is None
     # an eager step reads and writes by request
     assert res.loopback_state("rules", ["a", "b"]).tolist() == [DEFAULT, DEFAULT]
     res.store_loopback_state("rules", ["a", "b"], torch.tensor([[1] * 3, [2] * 3]))
