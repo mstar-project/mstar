@@ -143,14 +143,17 @@ def test_split_k_replays_to_the_same_bits():
 
 @pytest.fixture
 def triton_config(tmp_path, monkeypatch):
-    """A ``decode_gemv`` (and gate/up) config sending every bucket to Triton."""
+    """A ``decode_gemm`` table sending every bucket's linears to Triton and folding its gated activations."""
     facts = current_platform.device_facts()
-    knobs = {"impl": "triton", "block_n": 8, "block_k": 512, "split_k": 2, "num_warps": 4}
-    for name in ("decode_gemv", "decode_gemv_silu_mul"):
-        path = configs.config_path(name, facts.arch, facts.product, root=tmp_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        classes = {c: knobs for c in ("rows1", "rows2", "rows4", "rows8", "rows16")}
-        path.write_text(json.dumps({"kernel": name, "classes": classes}))
+    knobs = {"block_n": 8, "block_k": 512, "split_k": 2, "num_warps": 4}
+    path = configs.config_path("decode_gemm", facts.arch, facts.product, root=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    triton = {"impl": "triton", "candidates": {"triton": knobs}}
+    classes = dict.fromkeys(("rows1", "rows2", "rows4", "rows8", "rows16"), triton)
+    gated = {
+        f"gated1-k1024-n5632-rows{rows}": {"impl": "fused", "candidates": {"fused": knobs}} for rows in (1, 4, 16)
+    }
+    path.write_text(json.dumps({"kernel": "decode_gemm", "classes": classes, "shapes": gated}))
     monkeypatch.setattr(configs, "CONFIG_ROOT", tmp_path)
     configs._read.cache_clear()
     yield

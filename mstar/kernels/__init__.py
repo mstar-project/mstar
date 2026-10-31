@@ -3,6 +3,6 @@
 C++/CUDA/HIP sources (``hip.build``). See docs/kernels.rst."""
 
 from mstar.kernels.numerics import Tolerance
-from mstar.kernels.registry import KernelOp, ShapePolicy, get, load_all, ops
+from mstar.kernels.registry import Choice, KernelChoice, KernelOp, ShapePolicy, get, load_all, ops
 
-__all__ = ["KernelOp", "ShapePolicy", "Tolerance", "get", "load_all", "ops"]
+__all__ = ["Choice", "KernelChoice", "KernelOp", "ShapePolicy", "Tolerance", "get", "load_all", "ops"]
