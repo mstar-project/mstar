@@ -10,10 +10,12 @@ from torch import nn
 
 from mstar.model.components.diffusion.compile_utils import (
     EXACT_OP_TYPES,
+    STEP_POLICY_RECOMPILE_LIMIT,
     compile_transformer_forward,
     exact_op_types,
     exclude_from_compile,
 )
+from mstar.model.components.fp8_linear import StepDtypes
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.config import Flux2TransformerConfig
 from mstar.model.z_image.components.transformer import ScaledRMSNorm
@@ -144,3 +146,26 @@ def test_rocm_compiles_the_exact_ops_unless_a_config_or_env_asks(no_knob_overrid
     dit = Flux2DiT(TINY)
     compile_transformer_forward(dit, exact_ops=True)
     assert _disabled(dit) == len(_excluded(Flux2DiT(TINY))), "and an exported variable wins too"
+
+
+@pytest.mark.parametrize(
+    ("step_dtypes", "limit"),
+    [(None, None), (StepDtypes(("bf16", "fp8")), STEP_POLICY_RECOMPILE_LIMIT)],
+)
+def test_only_a_step_policy_raises_the_transformers_recompile_limit(monkeypatch, step_dtypes, limit):
+    from mstar.model.components.diffusion import compile_utils
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+    from mstar.model.flux2_klein.submodules import KleinDenoiseSubmodule
+
+    seen = {}
+
+    def fake_compile(fn, **kwargs):
+        seen.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(compile_utils.torch, "compile", fake_compile)
+    config = Flux2KleinConfig()
+    KleinDenoiseSubmodule(
+        Flux2DiT(TINY), config, loop_name="denoise_loop", attn_resource_key=None, step_dtypes=step_dtypes,
+    )
+    assert seen["recompile_limit"] == limit
