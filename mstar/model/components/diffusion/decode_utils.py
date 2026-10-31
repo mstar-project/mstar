@@ -8,7 +8,7 @@ own to the decoder submodule.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
@@ -56,3 +56,44 @@ def decode_in_chunks(decode, latents: torch.Tensor, chunk_sizes: Sequence[int]) 
         outputs.append(decode(latents[start:start + size]))
         start, remaining = start + size, remaining - size
     return torch.cat(outputs)
+
+
+class WarmedDecode:
+    """``vae.decode`` of a batch of latents, optionally through ``compile_vae_decode``.
+
+    Compiled, a batch is split into ``decode_batch_sizes`` (``decode_in_chunks``),
+    and the construction decodes zeros at each of them for every ``(C, H, W)`` of
+    ``warm_shapes`` on ``device``, so the compiles and their autotuning happen
+    before the first request. Only a warmed shape runs compiled: any other decodes
+    eager, since a fresh max-autotune compile inside a request cost 40-100 s
+    (measured on 1024x768 / 512^2 edits). Eager, any batch decodes in one call.
+    """
+
+    def __init__(
+        self, vae: nn.Module, compile_decode: bool, decode_batch_sizes: Sequence[int],
+        warm_shapes: Iterable[tuple[int, int, int]], device,
+    ):
+        self.vae = vae
+        self._compiled = bool(compile_decode)
+        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
+        self._batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
+        self._warmed: set[tuple[int, int, int]] = set()  # (batch, H, W) decoded compiled at load
+        # Before the warm-up, not after: the loader leaves requires_grad=True and
+        # Engine.load_model only clears it later. Dynamo guards on requires_grad, so
+        # a graph warmed with it set fails its guard on the first served decode and
+        # recompiles under max-autotune inside the request.
+        vae.requires_grad_(False)
+        for shape in warm_shapes if self._compiled else ():
+            for bs in self._batch_sizes:
+                latent = torch.zeros(bs, *shape, device=device, dtype=vae.dtype)
+                with torch.no_grad():
+                    self._decode_one(latent)
+                self._warmed.add((bs, int(shape[-2]), int(shape[-1])))
+
+    def __call__(self, latents: torch.Tensor) -> torch.Tensor:
+        return decode_in_chunks(self._decode_chunk, latents, self._batch_sizes)
+
+    def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
+        if self._compiled and (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])) not in self._warmed:
+            return self.vae.decode(latent)
+        return self._decode_one(latent)

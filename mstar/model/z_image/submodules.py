@@ -26,8 +26,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
-    compile_vae_decode,
-    decode_in_chunks,
+    WarmedDecode,
 )
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
@@ -276,39 +275,12 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
-        # see KleinVaeDecoderSubmodule: static per-size compiles, warmed at load, larger batches split
-        self._compiled = bool(compile_decode)
-        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
-        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
-        self._warmed: set[tuple[int, int, int]] = set()  # shapes the compiled decode was warmed with
-        # see KleinVaeDecoderSubmodule: clear requires_grad before warming, or dynamo
-        # guards on it and the first served decode recompiles inside the request
-        vae.requires_grad_(False)
-        self.warmup(warmup_grids)
-
-    def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
-        key = (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1]))
-        if self._compiled and key not in self._warmed:
-            return self.vae.decode(latent)  # unwarmed shape: eager beats a 40-100 s in-request autotune
-        return self._decode_one(latent)
-
-    def _decode_fn(self, latents: torch.Tensor) -> torch.Tensor:
-        return decode_in_chunks(self._decode_chunk, latents, self._decode_batch_sizes)
-
-    def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
-        """Decode zeros at every decode batch size per latent grid at load (compiled decode only)."""
-        if not self._compiled:
-            return
-        patch = self.config.transformer.patch_size
-        for h, w in grids:
-            for bs in self._decode_batch_sizes:
-                latent = torch.zeros(
-                    bs, self.config.transformer.in_channels, h * patch, w * patch, device=self.get_device(),
-                    dtype=self.vae.dtype,
-                )
-                with torch.no_grad():
-                    self._decode_one(latent)
-                self._warmed.add((int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])))
+        # see KleinVaeDecoderSubmodule
+        patch = config.transformer.patch_size
+        self._vae_decode = WarmedDecode(
+            vae, compile_decode, decode_batch_sizes,
+            [(config.transformer.in_channels, h * patch, w * patch) for h, w in warmup_grids], self.get_device(),
+        )
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         latents = inputs[LATENTS][0]
@@ -325,7 +297,7 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
 
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
-        return pixels_to_uint8(self._decode_fn(self.vae.unscale_latents(latents)))
+        return pixels_to_uint8(self._vae_decode(self.vae.unscale_latents(latents)))
 
     def forward(self, graph_walk, engine_inputs, latents: torch.Tensor, **kwargs):
         return {IMAGE_OUTPUT: [self._decode(latents)]}

@@ -26,8 +26,7 @@ from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
-    compile_vae_decode,
-    decode_in_chunks,
+    WarmedDecode,
 )
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
@@ -304,45 +303,11 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
         # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
         # the compiled decode is not launch-bound (measured), so the node declares no captures.
-        self._compiled = bool(compile_decode)
-        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
-        # compiled: only these batch sizes are ever decoded (larger batches are split into them)
-        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
-        # latent shapes (batch, H, W) the compiled decode was warmed with; any other shape decodes eager:
-        # a fresh max-autotune compile inside a request cost 40-100 s (measured on 1024x768 / 512^2 edits)
-        self._warmed: set[tuple[int, int, int]] = set()
-        # Before the warm-up, not after: the loader leaves requires_grad=True and
-        # Engine.load_model only clears it later. Dynamo guards on requires_grad, so
-        # a graph warmed with it set fails its guard on the first served decode and
-        # recompiles under max-autotune *inside* the request -- the warm-up is thrown
-        # away exactly when it matters.
-        vae.requires_grad_(False)
-        self.warmup(warmup_grids)
-
-    def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
-        key = (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1]))
-        if self._compiled and key not in self._warmed:
-            return self.vae.decode(latent)
-        return self._decode_one(latent)
-
-    def _decode(self, latents: torch.Tensor) -> torch.Tensor:
-        return decode_in_chunks(self._decode_chunk, latents, self._decode_batch_sizes)
-
-    def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
-        """Decode zeros at every decode batch size for every token grid at load, so the compiles
-        and their autotuning happen before the first request (only when the decode is compiled)."""
-        if not self._compiled:
-            return
-        for h, w in grids:
-            patch = self.config.vae.patch_size
-            for bs in self._decode_batch_sizes:
-                latent = torch.zeros(
-                    bs, self.config.vae.latent_channels, h * patch[0], w * patch[1],
-                    device=self.get_device(), dtype=self.vae.dtype,
-                )
-                with torch.no_grad():
-                    self._decode_one(latent)
-                self._warmed.add((int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])))
+        ph, pw = config.vae.patch_size
+        self._vae_decode = WarmedDecode(
+            vae, compile_decode, decode_batch_sizes,
+            [(config.vae.latent_channels, h * ph, w * pw) for h, w in warmup_grids], self.get_device(),
+        )
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
@@ -363,5 +328,5 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
     def run_batch(self, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
         latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
         patched = self.vae.denormalize_latents(unpack_latents(latents, *grid))
-        image = self._decode(unpatchify_latents(patched))
+        image = self._vae_decode(unpatchify_latents(patched))
         return {IMAGE_OUTPUT: pixels_to_uint8(image)}

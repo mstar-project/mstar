@@ -520,7 +520,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         # shapes cover 1088x1920 (dynamo would unroll the tile loop of ``vae.decode`` into one
         # enormous graph).
         if compile_decode:
-            # before the warm-up: dynamo guards on requires_grad (see KleinVaeDecoderSubmodule)
+            # before the warm-up: dynamo guards on requires_grad (see decode_utils.WarmedDecode)
             vae.requires_grad_(False)
             vae.decoder = _WarmedDecoder(vae.decoder)
             self.warmup(warmup_shapes)
