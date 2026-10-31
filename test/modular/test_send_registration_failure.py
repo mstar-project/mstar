@@ -44,6 +44,12 @@ class _Communicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 class _Engine:
     """Registers like a transfer engine, but refuses the given pointers the
@@ -206,6 +212,7 @@ def _postprocess_worker(refuse, follower=False):
     engine = SimpleNamespace(
         check_stop_for_batch=check_stop,
         extend_prefix_chains=lambda *a, **k: None,
+        after_output_copy=lambda batch: None,
         materialize_publish=lambda *a: None,
         # like the engine's, reads each stopped rid's info
         finalize_stopped_requests=lambda nb, rids: [nb.per_request_info[r] for r in rids],

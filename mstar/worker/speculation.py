@@ -36,6 +36,7 @@ from mstar.worker.spec_rows import DeferredRowInputs, loop_counter_snapshots
 from mstar.worker.stream_buffers import StreamBufferManager
 
 if TYPE_CHECKING:
+    from mstar.worker.engine_manager import EngineManager
     from mstar.worker.worker import PendingBatch
 
 
@@ -82,6 +83,8 @@ class SpeculationContext:
     request_state: RequestStateManager
     scheduler: MicroScheduler
     streams: StreamBufferManager
+    # orders a mixed step's rows for its split kernels
+    engine_manager: EngineManager | None = None
 
 
 @dataclass(slots=True)
@@ -269,8 +272,9 @@ class SpeculationBuilder:
         tp_seq: int = -1,
         request_walks: dict[int, str] | None = None,
     ) -> Speculation:
-        """Package prepared rids (batch order) into the ``Speculation`` the main
-        loop runs. Leader and follower differ only in how they pick the rids.
+        """Package prepared rids (batch order, which ``make_executing_batch``
+        reorders for a split walk) into the ``Speculation`` the main loop runs.
+        Leader and follower differ only in how they pick the rids.
 
         ``fresh_final_edges`` is ``final_edges`` (see ``make_executing_batch``)
         for the rids that did not come from batch N: their final chunks were
@@ -319,6 +323,7 @@ class SpeculationBuilder:
             } | fresh_final_edges,
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
+            engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
         )
         return Speculation(
             scheduled_batch=spec_batch,

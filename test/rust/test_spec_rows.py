@@ -11,6 +11,7 @@ runs on.
 """
 import copy
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -167,6 +168,10 @@ def _worker(
     w.enable_prof = False
     w.enable_nvtx = False
     w.streams = StreamBufferManager(w.request_state, tm, [])
+    # no resource splits a walk here, so a mixed step keeps its rows' order
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        order_split_rows=lambda node, walk, rids, walks: rids,
+    ))
     w._pending_removes = {}
     w._pending_drains = {}
     w._draining_rids = set()
