@@ -390,7 +390,8 @@ class MicroScheduler:
         if picked is None or not self.lockstep_first_nodes or picked[0] in self.lockstep_first_nodes:
             return picked
         first = next((key for key in ready if key[0] in self.lockstep_first_nodes), None)
-        return picked if self._local_turn(first is not None) or first is None else first
+        local_turn = self._local_turn(first is not None)
+        return picked if first is None or local_turn else first
 
     def _local_turn(self, contested: bool) -> bool:
         """Whether this worker's other ready work takes this step from a lockstep-first

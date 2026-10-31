@@ -722,11 +722,6 @@ class Wan22Shape:
     i2v: bool
     video_tokens: int  # per guidance branch, after the patch
 
-    @property
-    def rows(self) -> int:
-        """Transformer rows a request contributes: one per guidance branch."""
-        return 2 if self.cfg else 1
-
 
 def wan22_shape(config: Wan22Config, step_metadata: dict, i2v: bool) -> Wan22Shape:
     grid = _latent_grid(config, step_metadata)
@@ -888,10 +883,9 @@ class Wan22DenoiseSubmodule(_Fp32IslandMixin, DenoiseLoopSubmodule):
         mask[:, :, 0] = 0
         p_t, p_h, p_w = self.config.patch_size
         tokens = mask[0, 0][::p_t, ::p_h, ::p_w]
-        # A forward of one branch per row pays most for per-token modulation (77.7 -> 71.8 ms
-        # at 480x832x33, 143 -> 139 ms at two rows), so under the placement a row's tokens
-        # take one timestep (T2V) or one per frame (I2V). The values match the reference's
-        # per-token grid; the outputs differ in rounding.
+        # A forward of one branch per row pays most for per-token modulation, so under the
+        # placement a row's tokens take one timestep (T2V) or one per frame (I2V). The values
+        # match the reference's per-token grid; the outputs differ in rounding.
         return mask, (tokens[:, 0, 0] if self.guidance_parallel is not None else tokens.flatten())
 
     def denoise(
