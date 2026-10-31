@@ -136,3 +136,35 @@ def test_a_clients_value_for_a_model_internal_key_never_reaches_the_model_or_con
     )
     assert kwargs["voice"] == "tara", "the strip dropped the request's own kwargs"
     assert kwargs["from_process_prompt"] == 1, "the model's own metadata never arrived"
+
+
+@pytest.mark.parametrize("kwargs, field", [
+    ({"pad_duration": "soon"}, "pad_duration"),
+    # the pad is allocated on the API server, after generation
+    ({"pad_duration": 1e5}, "pad_duration"),
+    ({"fade_duration": float("nan")}, "fade_duration"),
+    # bool("false") is True
+    ({"postprocess_output": "false"}, "postprocess_output"),
+    # a non-finite unmask knob
+    ({"position_temperature": float("inf")}, "position_temperature"),
+    ({"layer_penalty_factor": "steep"}, "layer_penalty_factor"),
+])
+def test_omnivoice_refuses_a_bad_request_value_before_it_generates(kwargs, field):
+    """``postprocess`` shapes the waveform after the whole unmask loop, which
+    reads its knobs at every step; a bad value in either would fail a request
+    whose generation already ran (or, read at the conductor, hang its client)."""
+    from mstar.model.omnivoice.config import OmniVoiceConfig
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
+    model = object.__new__(OmniVoiceModel)
+    model.config = OmniVoiceConfig()
+    with pytest.raises(ValueError, match=field):
+        model.process_prompt("hello", ["text"], ["audio"], **kwargs)
+
+
+def test_omnivoice_output_shaping_takes_json_booleans():
+    """``postprocess_output: 0`` (or 1), as a JSON client sends a boolean."""
+    from mstar.model.omnivoice.omnivoice_model import output_shaping
+
+    assert output_shaping({"postprocess_output": 0})["enabled"] is False
+    assert output_shaping({"postprocess_output": 1})["enabled"] is True

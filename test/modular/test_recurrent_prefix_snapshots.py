@@ -176,9 +176,14 @@ def test_snapshots_stay_off_and_unallocated_where_the_cache_cant_open(closed):
     assert _pool().enable_prefix_cache(b"a root")
 
 
-def test_a_negative_prefix_slots_override_is_refused():
-    with pytest.raises(ValueError, match="prefix_slots=-1"):
-        _specs(0)["state"].apply_yaml_overrides(prefix_slots=-1)
+@pytest.mark.parametrize("override, refusal", [
+    ({"prefix_slots": -1}, "prefix_slots=-1"),
+    # the sink takes one slot, so no request would ever be admitted
+    ({"max_slots": 1}, "max_slots=1"),
+])
+def test_a_slot_override_that_cannot_work_is_refused(override, refusal):
+    with pytest.raises(ValueError, match=refusal):
+        _specs(0)["state"].apply_yaml_overrides(**override)
 
 
 @pytest.mark.parametrize("admitted", [False, True])

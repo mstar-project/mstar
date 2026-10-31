@@ -267,10 +267,14 @@ class RecurrentStateConfig:
             raise ValueError("a recurrent state pool must declare a block")
         if not self.labels:
             raise ValueError("a recurrent state pool must declare a label")
-        if not self.disable_sink_slot and self.max_slots < 2:
+        self.check_slots()
+
+    def check_slots(self) -> None:
+        """A pool must hold at least one request's state, or every admit waits forever."""
+        if self.usable_slots < 1:
             raise ValueError(
-                f"max_slots={self.max_slots} leaves nothing to hand out: the "
-                "sink takes one. Raise it or set disable_sink_slot."
+                f"max_slots={self.max_slots} leaves nothing to hand out"
+                + ("." if self.disable_sink_slot else ": the sink takes one. Raise it or set disable_sink_slot.")
             )
 
     @property
@@ -311,6 +315,7 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+            self.config.check_slots()
         if prefix_slots is not None:
             if prefix_slots < 0:
                 raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")

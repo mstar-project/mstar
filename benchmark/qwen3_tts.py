@@ -104,9 +104,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         size / (SAMPLE_RATE * SAMPLE_WIDTH) for size in byte_counts
     ]
     # The 12 Hz decoder emits 1,920 samples (80 ms) per valid codec frame.
-    # ``ignore_eos`` fixes Talker compute, but Codec intentionally filters any
-    # EOS values sampled inside that fixed sequence, so actual PCM length can
-    # be a few frames shorter. Use nominal duration for comparable compute RTF
+    # ``ignore_eos`` fixes Talker compute, but the Talker withholds any EOS
+    # frame sampled inside that fixed sequence from the codec stream, so actual
+    # PCM length can be a few frames shorter. Use nominal duration for comparable compute RTF
     # and report the observed output range separately.
     nominal_audio_duration = args.frames * 1_920 / SAMPLE_RATE
     trial_throughputs = [
