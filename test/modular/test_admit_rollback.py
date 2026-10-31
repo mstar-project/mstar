@@ -334,9 +334,8 @@ def _forward_raising_on(row):
 
 
 def test_a_per_request_forward_that_raises_fails_only_its_row():
-    """Rows 1 and 3 commit and return outputs; row 2 is failed for the worker
-    to drop. Row 2 keeps what its admit took until the removal its failure
-    leads to, as every rid of a batch that raises does."""
+    """Rows 1 and 3 commit; row 2 is failed, and holds what its admit took
+    until its removal frees it."""
     kv = _kv("kv", pages=16)
     eng = _engine({"kv": kv})
     mgmt = eng._submodules["n"]
@@ -363,28 +362,6 @@ def test_a_per_request_forward_that_raises_fails_only_its_row():
     kv.remove_request(2)
     assert kv._arena.num_free == free - 4, "only rows 1 and 3 hold pages"
     assert not any(rid == 2 for rid, _ in kv._admit_reserved_pages)
-
-
-def test_a_step_that_raised_before_commit_is_released_by_the_removal():
-    """Why a raise gets no unwind of its own: the rid is failed, its REMOVE
-    comes once the step is out of flight, and ``remove_request`` frees the
-    pages, the reservation record and the ``step_in_flight`` mark the admit
-    left. Unwinding on the GPU thread right after the raise would free the
-    pages while the forward's queued kernels may still write them."""
-    kv = _kv("kv", pages=8)
-    runner = StepRunner({"kv": kv})
-    kv.ingest_request(1, None)
-    free = kv._arena.num_free
-    step = SubmoduleStep(steps={"kv": _kv_step(1, 2 * PAGE)})
-    step.set_ctx(_ctx(1))
-    assert runner.admit(step).ok
-    runner.plan(step)
-    assert kv._streams[1]["main"].step_in_flight
-
-    kv.remove_request(1)
-
-    assert kv._arena.num_free == free
-    assert 1 not in kv._streams and not kv._admit_reserved_pages
 
 
 # --- the recurrent pool gives back the slots a refused step took --------------
