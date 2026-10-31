@@ -282,6 +282,11 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
 - One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- All four run the FastConformer encoder ``nemotron_duplex`` streams
+  (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
+  Nemotron ASR read its dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's
+  ``perception.encoder`` (``FastConformerConfig.from_nemo``), which refuses an encoder
+  whose parts NeMo configures as partly causal.
 - Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
   ``model_kwargs``:
 
@@ -672,7 +677,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   streamed: each chunk runs the layers over its new frames only, against the
   call's cached last 70 frames, so a step costs the same however long the call
   is; it emits the frames no later audio can change, the last ones at the end
-  of input)
+  of input. It is the shared FastConformer, Canary's encoder, as a stream node
+  (``FastConformerStreamSubmodule``), with the featurizer of the VoiceChat
+  reference, which predates NeMo 2.5: reflected clip edges and
+  ``samples // 160 + 1`` mel frames. The checkpoint's RNN-T transcription head
+  is not loaded)
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
   → ``eartts_talker`` (one text token → 31 RVQ codes, decoded by the RVQ codec
@@ -781,14 +790,23 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   shorter appends need several steps per frame and fall behind once a step
   takes longer than an append.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
-  weights: an upload is one encoder pass, bit for bit the offline encoder's in
-  fp32 and under bf16 autocast, save the last frame when the end of input
-  reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
-  the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
-  autocast. So live and one-shot text should agree token for token in fp32
-  (inferred from those frames, not measured on served text); under the served
-  bf16 a different chunking can flip a knife-edge frame such as the agent's
-  turn start.
+  weights on the duplex encoder the shared FastConformer replaced, and not
+  since: an upload was one encoder pass, bit for bit that encoder's offline
+  pass in fp32 and under bf16 autocast, save the last frame when the end of
+  input reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends
+  put the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
+  autocast. The shared encoder's stream attention adds the relative-position
+  term before scaling and its offline attention after, so an upload is no
+  longer expected to match the offline pass bit for bit. From those figures,
+  live and one-shot text should agree token for token in fp32 (inferred, not
+  measured on served text); under the served bf16 a different chunking can flip
+  a knife-edge frame such as the agent's turn start. Under bf16 autocast the
+  stream node keeps the blocks' residual in fp32, as the replaced encoder did
+  from its second layer on; the offline FastConformer encoders keep theirs in
+  bf16. Against an fp32 run on 13 clips (one H200, real checkpoint,
+  2026-10-29), live frames have a mean per-frame relative error of 1.35%,
+  level with the replaced encoder's 1.39%, where a bf16 residual gave 1.63%;
+  uploads and offline passes are as close as the replaced encoder's too.
 - The encoder keeps each call's state in a slot per session of three
   resources: its attention keys and values in a bounded KV (``encoder_kv``),
   which keeps a call's last 70 frames per layer and runs the attention, each new
