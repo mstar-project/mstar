@@ -318,6 +318,10 @@ class _RaggedManagerBase:
         self._preplanned = ctx.is_preplan
 
     def clear_preplan(self):
+        # The dropped plan's H2Ds went on the plan stream, and the step that runs
+        # instead waits on no event from it, so it must stage its layout itself.
+        for wrapper in self._preplan_states.values():
+            wrapper.forget_plan()
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
@@ -373,7 +377,6 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
             wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
-            # TODO: cache the latest plan state
             wrapper.plan(cu_seqlens=self._cu_seqlens(segments), causal=step.causal)
             plan_states[label] = wrapper
 

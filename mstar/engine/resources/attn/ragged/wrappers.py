@@ -25,7 +25,8 @@ def padded_head_dim(head_dim: int) -> int:
 
 class _RaggedPrefillBase(ABC):
     """What the self- and cross-attention wrappers share: the graph-mode static
-    buffers and their padding. A backend subclass plans and runs its kernel.
+    buffers and their padding, and skipping a plan the wrapper already holds. A
+    backend subclass plans and runs its kernel.
     """
 
     def __init__(
@@ -54,6 +55,8 @@ class _RaggedPrefillBase(ABC):
             max_total_kv_tokens if max_total_kv_tokens is not None else max_total_tokens
         )
         self._num_segments = 0
+        # the layout this wrapper's schedule describes; see ``_plan``
+        self._planned_layout: tuple | None = None
 
         if accelerator_graph:
             assert max_num_segments is not None, "max_num_segments required for accelerator graph mode"
@@ -117,13 +120,40 @@ class _RaggedPrefillBase(ABC):
         return cu, total_tokens
 
     def _plan(self, cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> None:
+        # A wrapper keeps the schedule of its last plan until it is planned again
+        # and ``run`` only reads it, so a layout it already holds is not replanned:
+        # FlashInfer's plan is a device kernel plus a stream sync, and a denoising
+        # request keeps its layout from step to step. Each (label, slot) has its
+        # own wrapper, so this compares against what this slot's schedule says,
+        # never against what the previous step ran.
+        layout = self._layout_key(cu_seqlens, kv_cu_seqlens, causal)
+        if layout is not None and layout == self._planned_layout:
+            return
         cu, total_tokens = self._prepare_cu_seqlens(cu_seqlens, self.max_total_tokens)
         if kv_cu_seqlens is cu_seqlens:
             kv_cu = cu
         else:
             kv_cu, _ = self._prepare_cu_seqlens(kv_cu_seqlens, self.max_total_kv_tokens, "key ")
         self._num_segments = int(cu_seqlens.numel()) - 1
+        # a plan that raises may already have overwritten the schedule
+        self._planned_layout = None
         self._plan_kernel(cu, kv_cu, total_tokens, causal)
+        self._planned_layout = layout
+
+    @staticmethod
+    def _layout_key(cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> tuple | None:
+        """What identifies a planned layout, or None for one that can't be read
+        back without a device sync, which then simply always plans."""
+        if cu_seqlens.device.type != "cpu" or kv_cu_seqlens.device.type != "cpu":
+            return None
+        q = cu_seqlens.tolist()
+        return q, q if kv_cu_seqlens is cu_seqlens else kv_cu_seqlens.tolist(), causal
+
+    def forget_plan(self) -> None:
+        """Replan on the next ``plan``, whatever its layout. For a plan whose
+        staging the wrapper's next user can't order against (a dropped pre-plan,
+        whose H2Ds went on the plan stream with nothing left to wait on them)."""
+        self._planned_layout = None
 
     @abstractmethod
     def _plan_kernel(
@@ -168,8 +198,9 @@ class RaggedPrefillWrapper(_RaggedPrefillBase):
     def plan(self, cu_seqlens: torch.Tensor, causal: bool = False) -> None:
         """Plan one packed layout. ``cu_seqlens``: ``[num_segments + 1]``, [0] == 0.
 
-        CPU tensor preferred; a GPU one costs a sync. Safe to call before every
-        replay — values are copied through the static buffers, not rebound.
+        CPU tensor preferred; a GPU one costs a sync and is never recognized as
+        the layout already planned. Safe to call before every replay — values
+        are copied through the static buffers, not rebound.
         """
         self._plan(cu_seqlens, cu_seqlens, causal)
 
