@@ -60,6 +60,7 @@
    submodule_base
    utils
    vjepa2
+   voxcpm2
    wan22
    waypoint
    whisper

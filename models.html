@@ -388,6 +388,11 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.voxcpm2.html">mstar.model.voxcpm2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.voxcpm2.components.html">mstar.model.voxcpm2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.voxcpm2.config.html">mstar.model.voxcpm2.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
 </ul>
@@ -692,6 +697,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosyvoice3-notes">CosyVoice3 notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fish-audio-s2-pro-notes">Fish Audio S2-Pro notes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#voxcpm2-notes">VoxCPM2 notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nemotron-voicechat-nemotron-duplex-notes">Nemotron VoiceChat (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>) notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#chatterbox-notes">Chatterbox notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
@@ -790,142 +796,148 @@ Clones from a preset or an uploaded clip. 24 kHz.</p></td>
 decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
 batched across requests.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">voxcpm2</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">openbmb/VoxCPM2</span></code></p></td>
+<td><p>Tokenizer-free TTS: MiniCPM-4 base and residual LMs emit continuous latent
+patches through a local flow-matching DiT, decoded by AudioVAE V2 in
+streamed chunks. Zero-shot, voice design, and cloning from a clip. 48 kHz.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/NVIDIA-NemotronLabs-VoiceChat-11B</span></code></p></td>
 <td><p>Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
 encoder + Nemotron-H hybrid Mamba-2/attention backbone + EarTTS talker +
 RVQ codec; user speech in, agent text and 22.05 kHz speech out.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">glm52</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">glm52</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5.2-FP8</span></code></p></td>
 <td><p>GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">canopylabs/orpheus-3b-0.1-ft</span></code></p></td>
 <td><p>TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pi05</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pi05</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lerobot/pi05_base</span></code></p></td>
 <td><p>Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_5_{0.8,2,4,9,27}b</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_5_{0.8,2,4,9,27}b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.5-4B</span></code></p></td>
 <td><p>Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
 attention interleaved with full attention, plus a ViT tower.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-27B</span></code></p></td>
 <td><p>Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">omnivoice</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">omnivoice</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">k2-fsa/OmniVoice</span></code></p></td>
 <td><p>Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
 backbone + audio codec. Clones a voice from a reference clip.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Omni-30B-A3B-Instruct</span></code></p></td>
 <td><p>Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice</span></code></p></td>
 <td><p>Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice</span></code></p></td>
 <td><p>1.7B CustomVoice: built-in speakers plus style/emotion <code class="docutils literal notranslate"><span class="pre">instruct</span></code> control.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_voicedesign</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_voicedesign</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign</span></code></p></td>
 <td><p>1.7B VoiceDesign: the voice is described by the request’s <code class="docutils literal notranslate"><span class="pre">instruct</span></code> text.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_base</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_base</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-Base</span></code></p></td>
 <td><p>1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fish_s2_pro</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fish_s2_pro</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">fishaudio/s2-pro</span></code></p></td>
 <td><p>Fish Audio S2-Pro: dual-AR TTS (Qwen3-4B Slow AR + 4-layer Fast AR over 10 codebooks),
 44.1 kHz causal DAC codec, voice cloning from one reference clip, inline <code class="docutils literal notranslate"><span class="pre">[tag]</span></code>
 prosody control. Weights under the Fish Audio Research License (non-commercial use
 only); check it before deploying.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/vjepa2-vitl-fpc64-256</span></code></p></td>
 <td><p>V-JEPA 2 video encoder + masked predictor.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">vjepa2-ac-vitg</span></code></p></td>
 <td><p>V-JEPA 2-AC encoder + action-conditioned predictor. Video frames take the official
 repo’s central square crop, not the HF processor’s resize and crop.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large_v3_turbo</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large_v3_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3-turbo</span></code></p></td>
 <td><p>Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
 decoder with write-once cross-attention; language detection, forced
 language/task, <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> context, <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>.
 The 4-decoder-layer distillation of large-v3, same class as below.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 <td><p>Whisper large-v3 (32 decoder layers) on the same scaffold.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-ASR-1.7B</span></code></p></td>
 <td><p>Qwen3-ASR: AuT audio encoder (8 s attention windows, ragged attention)
 + dense Qwen3 decoder; up to 20 min of audio per request, 30 languages
 (detected or forced), <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>. A repetition loop
 in the transcript is collapsed as the reference SDK does.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-ASR-0.6B</span></code></p></td>
 <td><p>The 0.6B Qwen3-ASR checkpoint on the same class, sized in its config for the
 short steps of <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> sessions.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_{300m,1b,3b,7b}</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_{300m,1b,3b,7b}</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/omniASR-CTC-300M</span></code> (v1); v2 from Meta’s CDN (default)</p></td>
 <td><p>Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
 in 1,600+ languages with no language code. Not autoregressive; batched across
 requests. Apache-2.0.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">canary</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">canary</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/canary-1b-v2</span></code></p></td>
 <td><p>FastConformer encoder + Transformer decoder: speech recognition in 25 European
 languages and translation to or from English (<code class="docutils literal notranslate"><span class="pre">language</span></code>, English if unset, and
 <code class="docutils literal notranslate"><span class="pre">target_language</span></code> or <code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>). Clips up to 40 s; longer uploads are
 windowed. No timestamps.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/canary-qwen-2.5b</span></code></p></td>
 <td><p>English speech recognition by an LLM: Canary’s FastConformer encoder projected into
 Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
 OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code> is ignored. No timestamps.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">parakeet</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">parakeet</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/parakeet-tdt-0.6b-v3</span></code></p></td>
 <td><p>FastConformer + token-and-duration transducer, 25 European languages, language detected
 from the speech. Clips up to 10 min; longer uploads are windowed. No timestamps.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/nemotron-3.5-asr-streaming-0.6b</span></code></p></td>
 <td><p>Cache-aware streaming FastConformer + RNN-T with a language prompt (<code class="docutils literal notranslate"><span class="pre">language</span></code>: a locale
 such as <code class="docutils literal notranslate"><span class="pre">en-US</span></code>, a bare code, or <code class="docutils literal notranslate"><span class="pre">auto</span></code>); served over whole clips, with the streaming
 model’s chunked attention at its widest lookahead (<code class="docutils literal notranslate"><span class="pre">lookahead</span></code> in the YAML’s
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>). Clips up to 10 min; longer uploads are windowed. No timestamps.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Overworld/Waypoint-1.5-1B</span></code></p></td>
 <td><p>Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
 frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lingbot_world_1_3b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lingbot_world_1_3b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">robbyant/lingbot-world-v2-1.3b-causal-fast</span></code></p></td>
 <td><p>LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
 chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
@@ -944,23 +956,23 @@ server process to the next.
 The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
 before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (<code class="docutils literal notranslate"><span class="pre">Robbyant/lingbot-world</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-4B</span></code></p></td>
 <td><p>FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
 image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-9B</span></code></p></td>
 <td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
 the FLUX Non-Commercial License; check it before deploying.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2.5-Diffusers</span></code></p></td>
 <td><p>LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
 joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
 stereo audio. Gated; LTX-2.x Community License.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
@@ -1432,6 +1444,37 @@ it unless it is the most likely token. <code class="docutils literal notranslate
 <li><p>Streamed audio matches the whole-utterance decode to within one int16 step:
 each codec window carries the decoder’s whole receptive field as context, and
 the codec runs in fp32 with TF32 off.</p></li>
+</ul>
+</section>
+<section id="voxcpm2-notes">
+<h2>VoxCPM2 notes<a class="headerlink" href="#voxcpm2-notes" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Install with <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[voxcpm2]'</span></code> and serve with
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">voxcpm2</span> <span class="pre">--gpus</span> <span class="pre">0</span></code>. <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> takes the text alone
+(zero-shot), a voice description in <code class="docutils literal notranslate"><span class="pre">instructions</span></code> (voice design), a
+<code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> clip (cloning) or <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> with its transcript in
+<code class="docutils literal notranslate"><span class="pre">ref_text</span></code> (continuation). Output is 48 kHz.</p></li>
+<li><p>The Talker’s decode step (both LMs, the local DiT solve, the stop head) is
+<code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’d and captured as CUDA graphs at start-up, so a first
+start-up with a cold Inductor cache takes 10 to 30 minutes (591 s on a
+B200, 1,723 s on an H100), and about two minutes once the cache is warm.
+<code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{compile_talker:</span> <span class="pre">false}</span></code>
+in the deployment YAML captures the eager step instead: on a B200 the server
+is up in about 15 seconds, with about a third less throughput at
+concurrency 1 and a sixth less at concurrency 8.</p></li>
+<li><p>A request may hold the whole 8,192-position context, and nothing preempts a
+request once a KV cache is full, so each LM’s cache defaults to 2,049 pages
+(32 such requests and the sink page, about 9.7 GB for both) and the YAML sets
+<code class="docutils literal notranslate"><span class="pre">max_concurrent_requests:</span> <span class="pre">32</span></code>; the conductor queues the rest. Start-up
+refuses a cap the caches cannot hold, so raise <code class="docutils literal notranslate"><span class="pre">resources.base_kv</span></code> and
+<code class="docutils literal notranslate"><span class="pre">resources.res_kv</span></code> <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> with it. Text over
+<code class="docutils literal notranslate"><span class="pre">max_text_tokens</span></code> (1,365 by default) gets a 400: English speech runs at up
+to about 2.9 patches per token, so longer text may not fit in the
+4,096-patch (655 s) audio budget.</p></li>
+<li><p>One request with long text can end early: on some seeds the stop head fires
+mid-text, as it does in the official <code class="docutils literal notranslate"><span class="pre">voxcpm</span></code> package (a 983-character
+Russian text stopped about three quarters of the way in on 5 of 10 seeds
+there). Split long text into several requests.</p></li>
 </ul>
 </section>
 <section id="nemotron-voicechat-nemotron-duplex-notes">
@@ -2337,6 +2380,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosyvoice3-notes">CosyVoice3 notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#fish-audio-s2-pro-notes">Fish Audio S2-Pro notes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#voxcpm2-notes">VoxCPM2 notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nemotron-voicechat-nemotron-duplex-notes">Nemotron VoiceChat (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>) notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#chatterbox-notes">Chatterbox notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
