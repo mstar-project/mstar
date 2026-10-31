@@ -11,6 +11,7 @@ rank.
 import json
 import os
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -520,3 +521,42 @@ def test_cosmos3_denoise_graphs_are_not_captured_under_the_placement():
     sub._prefill_capture_configs = lambda device: []
     assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
     assert captured == []
+
+
+def _assigner(ranks, **group):
+    from types import SimpleNamespace
+
+    from mstar.conductor.conductor import Conductor
+
+    conductor = SimpleNamespace(
+        worker_graphs={0: WorkerGraph(section=None, graph_walks={WALK}, ranks=ranks, _group_id=7, **group)},
+        _replica_turns=defaultdict(int),
+    )
+    conductor._next_replica = lambda wg, replicas: Conductor._next_replica(conductor, wg, replicas)
+    return lambda: Conductor._assign_worker_graphs_to_workers(conductor)[0]
+
+
+def test_round_robin_replicas_take_requests_in_turn():
+    assign = _assigner([0, 1], round_robin=True)
+    assert [assign() for _ in range(4)] == [["worker_0"], ["worker_1"], ["worker_0"], ["worker_1"]]
+
+
+def test_replicas_stay_random_unless_a_group_asks(monkeypatch):
+    import numpy as np
+
+    monkeypatch.setattr(np.random, "randint", lambda n: n - 1)
+    assign = _assigner([0, 1])
+    assert [assign() for _ in range(3)] == [["worker_1"]] * 3
+
+
+def test_round_robin_covers_lockstep_instances_too():
+    assign = _assigner([0, 1, 2, 3], cfg_size=2, round_robin=True)
+    assert [assign() for _ in range(3)] == [
+        ["worker_0", "worker_1"], ["worker_2", "worker_3"], ["worker_0", "worker_1"],
+    ]
+
+
+def test_replica_policy_must_be_known(tmp_path):
+    model, config, path = _wan22(tmp_path, cfg_size=2, replica_policy="busiest")
+    with pytest.raises(DeploymentError, match="replica_policy must be one of"):
+        validate_deployment(model, config, path)

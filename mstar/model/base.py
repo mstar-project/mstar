@@ -179,6 +179,11 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
 
 _wg_id_counter = itertools.count(1 << 20)
 
+# ``replica_policy`` of a node group: how a request picks among its replicas.
+REPLICA_RANDOM = "random"
+REPLICA_ROUND_ROBIN = "round_robin"
+REPLICA_POLICIES = (REPLICA_RANDOM, REPLICA_ROUND_ROBIN)
+
 
 @dataclass
 class WorkerGraph:
@@ -190,6 +195,8 @@ class WorkerGraph:
     tp_size: int = 1
     sp_size: int = 1
     cfg_size: int = 1
+    # Replicas of this graph's node group take requests in turn rather than at random.
+    round_robin: bool = False
 
     # ``ranks`` form a 3D [cfg_size, sp_size, tp_size] mesh per instance
     # (instances tile for data parallelism). ``_tp_ranks`` are the mesh rows
@@ -300,6 +307,7 @@ def _divide_into_worker_graphs(
                 tp_size=ng.get("tp_size", 1),
                 sp_size=ng.get("sp_size", 1),
                 cfg_size=ng.get("cfg_size", 1),
+                round_robin=ng.get("replica_policy") == REPLICA_ROUND_ROBIN,
             )
         ]
 
