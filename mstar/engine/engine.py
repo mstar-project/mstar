@@ -1205,7 +1205,12 @@ class Engine:
                 # a first chunk starts past what `input_sequence_len` matched;
                 # the probe answers the same again, now checked against the prepared inputs
                 prefix = None
-                if self._prefix_cuttable(full, batch.node_name, walk):
+                policy = self._chunking.policy(batch.node_name, walk)
+                declines = (
+                    policy.reuses_cached_prefix is not None
+                    and not policy.reuses_cached_prefix(batch.per_request_info_wrapped[rid])
+                )
+                if not declines and self._prefix_cuttable(full, batch.node_name, walk):
                     prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, full)
                 matched = prefix.tokens if prefix is not None else 0
                 if matched != start:
@@ -1214,8 +1219,11 @@ class Engine:
                             f"{batch.node_name}/{walk}: the row's chunks start past a "
                             f"{start}-token cached prefix, but its prepared inputs match {matched}"
                         )
-                    # chunked from 0 (its policy declines the prefix): write it all
-                    prefix = None
+                    # Measured with no hit, and another request's pages landed
+                    # while it waited. Its chunks are cut from 0, so decline the
+                    # hit, keeping the chain so the row still keys its own pages.
+                    prefix = prefix._replace(tokens=0, position=prefix.position - prefix.tokens)
+                # a declined or uncuttable walk writes over the lease (prefix None)
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
             self._chunking.prepared[key] = full
         part = submodule.split_inputs(

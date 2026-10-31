@@ -741,6 +741,12 @@ class RecurrentStatePool(Resource):
             if prefix is None:
                 self._drop_lease(rid)
                 return
+            if prefix.tokens == 0 and lease.slot is not None:
+                # a declined hit runs from token 0: give the snapshot back, and
+                # keep the hit, which admit still snapshots the boundary of
+                self._unref(lease.slot)
+                self._leases[rid] = lease._replace(slot=None, tokens=0)
+                return
             if prefix.tokens != lease.tokens:
                 raise RuntimeError(
                     f"recurrent state: {rid} holds a snapshot of {lease.tokens} tokens, "

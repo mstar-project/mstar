@@ -386,6 +386,18 @@ def test_a_row_chunked_from_the_start_writes_over_a_lease_it_declined():
     assert engine._runner.applied == [(0, 10, None)]
 
 
+def test_a_hit_that_lands_after_the_row_was_measured_is_declined_not_dropped():
+    """Measured with nothing cached, then another request's pages landed while
+    the row waited. Its chunks are cut from 0, so it runs from 0, but with a
+    zero-token prefix rather than none: no prefix would end the row's chain,
+    and it would never key its own pages."""
+    engine = _keyed_engine(_KeyedPrompt(10), matched=4)
+
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+
+    assert engine._runner.applied == [(0, 10, 0)]
+
+
 def test_a_first_chunk_past_a_prefix_its_inputs_cannot_skip_fails():
     import pytest
 
