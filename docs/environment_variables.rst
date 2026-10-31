@@ -499,6 +499,59 @@ Worker scheduling
        identically on every rank of a lockstep instance: a follower builds a
        voided speculative step as rank 0 pre-planned it, so the workers compare
        it at startup and refuse to start on a mismatch.
+   * - ``MSTAR_STEP_THREAD_CORE``
+     - config's ``knobs: step_thread_core``, else ``off``
+     - Pin each worker's main, GPU and plan threads to one core's two
+       hardware threads, and the API server's message thread and Rust
+       frontend bridge to one CPU of another core. A step hands work between
+       the three worker threads several times and every step's tokens pass
+       from the message thread to the bridge; a thread woken on an idle core
+       waits for that core to leave its idle state. The gain needs deep idle
+       states. On a 2x B300 host (Xeon 6767P, ``intel_idle``, C6 at 170 µs)
+       a handoff to another core took 130-175 µs and 4-5 µs to a running
+       one; on an H100 cloud VM without deep C-states it took 22 µs and
+       11 µs, and pinning only cost throughput there. Turn it on (``auto``)
+       where ``/sys/devices/system/cpu/cpu*/cpuidle/state*/latency`` shows a
+       C6-class state of 100 µs or more and the server is host-bound (small
+       models, high concurrency); leave it off on a VM without deep idle
+       states. Measured off → ``auto`` (all three threads on one CPU in
+       parentheses). B300 host, server ``taskset`` to 16 cores and their
+       siblings: Qwen3.5-0.8B c=1 408 → 546 tok/s, c=16 5969 → 8049;
+       Qwen3-TTS 1.7B c=1 TTFA p50 24.9 → 24.3 ms. H100 VM, 40-CPU
+       ``taskset`` (from the #919 review):
+       0.8B c=1 525 → 434 (486) tok/s, c=64 14455 → 14040 (12800); Qwen3-TTS
+       c=1 TTFA mean 21.0 → 21.0 (25.6) ms. ``auto``
+       places by the GPU's rank among the host's GPUs on its NUMA node (sysfs
+       ``/sys/bus/pci/devices``: the PCI functions of the GPU's vendor and
+       class in address order, ``numa_node`` and ``local_cpulist``), so
+       servers on different GPUs take different CPUs without knowing about
+       each other: a worker the core at that rank from the bottom of the
+       node's cores in the process mask, the API server the core at its
+       first worker's GPU's rank from the top; further workers of one
+       deployment on one GPU step by the node's GPU count. A GPU whose node
+       has no CPU in the mask picks, by its rank among the host's GPUs in
+       the same case, from the cores the node-local GPUs leave. The cores a GPU picks
+       from must hold two per GPU that picks from them (its workers count up
+       from the bottom, its API server down from the top); with fewer, or a
+       mask too small to leave a CPU unpinned, nothing is pinned and a
+       warning says why. Servers on one GPU (two MIG instances share its
+       address) would take the same CPUs, so the first ``auto`` server holds
+       ``/tmp/mstar-gpu-<PCI address>.lock`` for its life and a second one
+       pins nothing, with a warning; the lock goes with the process however
+       it exits. The lock only reaches servers that share ``/tmp``, so
+       servers in separate containers on one GPU still take the same CPUs.
+       A split config's second worker can also take a core that a server on
+       a GPU without allowed CPUs takes under the same mask. A
+       number names the first worker's core (its hardware threads in the
+       mask); the next workers take the next cores up and the API server the
+       last core of the mask. A number outside the mask, or too near its top
+       for every worker, stops the server at startup. Threads and pools a
+       pinned thread starts keep the process mask (``mstar.utils.threads``),
+       and the API server's intra-op and encode pools are sized from the
+       CPUs the pins leave (``CpuPlan`` in ``mstar.utils.cpus``). Each worker
+       and the API server log their CPUs and why. Read by
+       ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
+       is missing (macOS, Windows).
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads

@@ -31,6 +31,8 @@ from uuid import uuid4
 
 import numpy as np
 
+from mstar.utils.threads import Thread
+
 # MIME (top-level type or full type) -> file extension used when persisting.
 _MIME_TO_EXT: dict[str, str] = {
     "image/png": ".png",
@@ -365,7 +367,7 @@ def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir:
         time.sleep(UPLOAD_CLEANUP_DELAY_S)
         remove_uploads(file_paths, upload_dir)
 
-    threading.Thread(target=_cleanup, daemon=True).start()
+    Thread(target=_cleanup, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
