@@ -255,7 +255,7 @@ def test_a_step_takes_its_words_of_the_stream_without_overlap(monkeypatch):
 
     def spy_chain(ids, p, d, q, seed, offset):
         for r in range(rows):
-            words[r].append((int(offset[r]), k + 1))
+            words[r].append((int(offset[r]), sampled.chain_words(k)))
         return chain(ids, p, d, q, seed, offset)
 
     def spy_draw(probs, seed, offset):
@@ -284,7 +284,70 @@ def test_a_step_takes_its_words_of_the_stream_without_overlap(monkeypatch):
 def test_the_stream_starts_clear_of_the_sampler_resource():
     # the sampler counts from 0 under the same seed; a request would need 2**31 steps to get there
     assert RNG_START == 1 << 31
-    assert sampled.words_per_step(2) == 5
+    assert sampled.words_per_step(2) == 6
+
+
+def test_a_rejection_uses_every_word_the_chain_is_given(monkeypatch):
+    """A rejection at any draft uses the same words, and the last is the
+    replacement's: whatever the next draw starts from must lie past it."""
+    k = 3
+    q = torch.zeros(1, k + 1, VOCAB)
+    q[:, :, 1] = 1.0
+    p = torch.zeros(1, k, VOCAB)
+    p[:, :, 2] = 1.0
+    word = sampled._word
+    read = []
+
+    def spy(seed, row, offset):
+        read.append(int(offset))
+        return word(seed, row, offset)
+
+    monkeypatch.setattr(sampled, "_word", spy)
+    for wrong_at in range(k):
+        read.clear()
+        d = torch.tensor([[1 if i < wrong_at else 2 for i in range(k)]])
+        p[:] = 0
+        p[0, torch.arange(k), d[0]] = 1.0
+        sampled._chain_reference(p, d, q, torch.tensor([1]), torch.tensor([100]))
+        assert max(read) == 100 + sampled.chain_words(k) - 1, (wrong_at, read)
+
+
+def _chain_step(spec, target, draft, k):
+    """One verify step on bigram tables: each token's logits depend on the one before."""
+    ids, _ = spec.verify_inputs()
+    out = spec.accept(target[ids], sample=True)
+    last = out.target.gather(1, (out.accepted - 1).long()[:, None])[:, 0]
+    for j in range(k):
+        last = spec.draw_draft(j, draft[last])
+    return out
+
+
+def test_a_token_after_a_rejection_follows_the_target():
+    """Two steps of a chain whose tokens depend on the one before, on the kernels'
+    word stream: every pair of emitted tokens has the target's joint distribution,
+    which fails if a draft shares a word with the replacement before it."""
+    k, rows, vocab = 2, 4000, VOCAB
+    gen = torch.Generator().manual_seed(21)
+    target = torch.randn(vocab, vocab, generator=gen) * 2
+    draft = target + torch.randn(vocab, vocab, generator=gen)
+    q = _filter(target, 0.8)
+    spec = _spec(rows, k=k, temperature=0.8)
+    # as a seed leaves them: the first drafts a point mass, repeated
+    spec._tokens[:, 1:] = torch.tensor([[3], [7], [7]])
+    spec._draft_ids[1:] = 7
+    spec._draft_probs[1:] = 0.0
+    spec._draft_probs[1:, :, 0] = 1.0
+    spec._seed[1:] = torch.arange(rows)
+    pairs = torch.zeros(vocab, vocab)
+    first = _chain_step(spec, target, draft, k)
+    spec._seq_len[1:] = 10
+    second = _chain_step(spec, target, draft, k)
+    tokens = [torch.cat((a[a >= 0], b[b >= 0])) for a, b in zip(first.tokens, second.tokens, strict=True)]
+    for t in tokens:
+        pairs[t[0], t[1]] += 1
+    want = q[3][:, None] * q
+    # a sample of the target itself reads about 0.03 at this size, a shared word about 0.11
+    assert 0.5 * (pairs / rows - want).abs().sum() < 0.06, 0.5 * (pairs / rows - want).abs().sum()
 
 
 def test_a_request_repeats_its_tokens_from_the_same_seed_and_layout():
