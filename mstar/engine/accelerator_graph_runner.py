@@ -1344,6 +1344,7 @@ class AcceleratorGraphRunner:
             )
         return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens, spec.bs,
+            getattr(spec.config, "decode_rows", False),
         ), self._submodule)
 
     def _dummy_engine_inputs(
