@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import functools
 import math
+from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
+from mstar.model.components.dft import stft_as_real
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -177,13 +180,19 @@ def librosa_mel_filters(sampling_rate: int, n_fft: int, num_mel_bins: int) -> np
 
 class NemoLogMel:
     """FastConformer front end (Canary, Parakeet, Nemotron ASR): ``(samples,)``
-    at 16 kHz -> ``(samples // hop, n_mels)``.
+    at 16 kHz -> ``(num_frames(samples), n_mels)``.
 
     Preemphasis, a power spectrum from a 25 ms symmetric Hann window zero-padded
     to ``n_fft``, Slaney mel, natural log with a 2^-24 floor, then (offline
     checkpoints) per-bin standardization over the clip. Matches HF's
     ``ParakeetFeatureExtractor`` for one clip; the STFT's last frame is
     padding there and is dropped here.
+
+    ``reflect_edges``: the STFT reflects the clip's edges instead of
+    zero-padding them, and the last frame is kept, ``samples // hop + 1``
+    frames. That is the featurizer of checkpoints whose reference predates NeMo
+    2.5 (Nemotron VoiceChat's); NeMo changed both in one commit, so they go
+    together.
 
     A plain object rather than a module, so an engine casting its node to
     bf16 leaves the filters and window in fp32.
@@ -198,15 +207,18 @@ class NemoLogMel:
         hop_length: int = 160,
         preemphasis: float = 0.97,
         normalize: bool = True,
+        reflect_edges: bool = False,
         device: torch.device | str = "cpu",
         mel_filters: torch.Tensor | None = None,
         window: torch.Tensor | None = None,
     ):
         """``mel_filters`` / ``window`` override the computed ones, for a
         checkpoint that ships its own (rounded) copies."""
+        self.sampling_rate = sampling_rate
         self.n_fft, self.win_length, self.hop_length = n_fft, win_length, hop_length
         self.preemphasis = preemphasis
         self.normalize = normalize
+        self.reflect_edges = reflect_edges
         if mel_filters is None:
             mel_filters = torch.from_numpy(librosa_mel_filters(sampling_rate, n_fft, num_mel_bins))
         if window is None:
@@ -214,8 +226,51 @@ class NemoLogMel:
         self.mel_filters = mel_filters.reshape(num_mel_bins, n_fft // 2 + 1).to(device=device, dtype=torch.float32)
         self.window = window.to(device=device, dtype=torch.float32)
 
+    @staticmethod
+    def frames(num_samples: int, hop_length: int, reflect_edges: bool) -> int:
+        """``num_frames`` from the settings alone, for a caller with no featurizer."""
+        return num_samples // hop_length + reflect_edges
+
     def num_frames(self, num_samples: int) -> int:
-        return num_samples // self.hop_length
+        return self.frames(num_samples, self.hop_length, self.reflect_edges)
+
+    @property
+    def min_samples(self) -> int:
+        """The shortest clip it featurizes: two frames, and (``reflect_edges``)
+        more than ``n_fft/2`` samples, which the reflection reads past each edge."""
+        two_frames = (2 - self.reflect_edges) * self.hop_length
+        return max(two_frames, self.n_fft // 2 + 1) if self.reflect_edges else two_frames
+
+    def check_length(self, num_samples: int) -> None:
+        if num_samples < self.min_samples:
+            raise ValueError(f"audio of {num_samples} samples is shorter than the {self.min_samples} it needs")
+
+    def complete_frames(self, num_samples: int, final: bool) -> int:
+        """Frames of a stream ``num_samples`` long that no later audio changes:
+        frame m spans ``[m * hop - n_fft/2, m * hop + n_fft/2)``, and the first
+        reflects ``n_fft/2`` samples past the stream's first, so it needs more
+        than that. At the stream's end, every frame of the clip. ``reflect_edges``
+        streams only."""
+        assert self.reflect_edges
+        if num_samples <= self.n_fft // 2:
+            return 0
+        if final:
+            return self.num_frames(num_samples)
+        return (num_samples - self.n_fft // 2) // self.hop_length + 1
+
+    def stream_span(self, x: torch.Tensor, start: int, lo: int, hi: int, final: bool) -> torch.Tensor:
+        """The samples ``windows`` reads for a stream's frames ``lo .. hi - 1``,
+        from ``x``, its preemphasized samples from sample ``start`` on (from its
+        first, while its first frames are cut): reflected at the stream's edges
+        as ``batch`` reflects a clip's. Only ``reflect_edges`` streams."""
+        assert self.reflect_edges
+        pad, hop = self.n_fft // 2, self.hop_length
+        if lo * hop < pad:  # frame lo reads past the stream's first sample
+            assert start == 0, "the reflection needs the stream's first samples"
+            x, start = torch.cat([x[1: pad + 1].flip(0), x]), start - pad
+        if final:
+            x = torch.cat([x, x[-pad - 1: -1].flip(0)])
+        return x[lo * hop - pad - start: (hi - 1) * hop + pad - start]
 
     def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
         return self.batch([waveform])[0]
@@ -223,13 +278,13 @@ class NemoLogMel:
     def batch(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
         """``__call__`` for several clips in one pass and one host-to-device
         copy: each clip gets what it gets alone. A clip is preemphasized, then
-        zero past its end, which is what the STFT pads a lone clip with; and
-        standardized over its own frames."""
+        zero past its end, which is what the STFT pads a lone clip with (or,
+        ``reflect_edges``, reflected at its own edges); and standardized over its
+        own frames."""
         lengths = [w.numel() for w in waveforms]
+        self.check_length(min(lengths))
         frames = [self.num_frames(n) for n in lengths]
-        if min(frames) < 2:
-            n = lengths[frames.index(min(frames))]
-            raise ValueError(f"audio of {n} samples is shorter than two {self.hop_length}-sample frames")
+        pad = self.n_fft // 2
         device = self.window.device
         source = waveforms[0].device
         # host clips are padded straight into pinned memory: one copy to the device
@@ -242,15 +297,21 @@ class NemoLogMel:
         if self.preemphasis:
             x = torch.cat([x[:, :1], x[:, 1:] - self.preemphasis * x[:, :-1]], dim=1)
             x = x * (torch.arange(x.shape[1], device=device) < n_samples[:, None])
-        stft = torch.stft(
-            x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
-            window=self.window, return_complex=True, pad_mode="constant",
-        )
-        # sqrt then square, as the reference does: it rounds differently
-        power = torch.view_as_real(stft).pow(2).sum(-1).sqrt().pow(2)
-        # full fp32, as the reference: the process default is TF32
-        with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
-            mel =torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
+        if self.reflect_edges:
+            # each clip reflected at its own end, as alone, not at the batch's zeros
+            padded = x.new_zeros(x.shape[0], x.shape[1] + 2 * pad)
+            for row, n in enumerate(lengths):
+                padded[row, :n + 2 * pad] = F.pad(x[row:row + 1, :n], (pad, pad), mode="reflect")[0]
+            stft = torch.stft(
+                padded, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
+                window=self.window, center=False, return_complex=True,
+            )
+        else:
+            stft = torch.stft(
+                x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
+                window=self.window, return_complex=True, pad_mode="constant",
+            )
+        mel = self._log_mel(torch.view_as_real(stft))[:, :, :max(frames)]
         if self.normalize:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
@@ -262,6 +323,56 @@ class NemoLogMel:
             std = (((mel - mean) * valid).pow(2).sum(dim=2, keepdim=True) / (n - 1)).sqrt()
             mel = (mel - mean) / (std + 1e-5)
         return [mel[row, :, :f].T for row, f in enumerate(frames)]
+
+    def windows(self, x: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+        """``(B, samples)`` preemphasized samples -> ``(B, T, n_mels)`` log-mel
+        frames, one per ``n_fft`` window at each hop, with no padding (a
+        stream's front end cuts the windows itself). ``basis``
+        (``stft_basis(self.window, n_fft)``) takes the STFT as a matmul, for a
+        captured graph, which must not hold a cuFFT plan (see ``dft``)."""
+        if basis is not None:
+            spec = stft_as_real(x, basis, self.n_fft, self.hop_length)
+        else:
+            spec = torch.view_as_real(torch.stft(
+                x, self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
+                window=self.window, center=False, return_complex=True,
+            ))
+        return self._log_mel(spec).transpose(1, 2).to(torch.float32)
+
+    def _log_mel(self, spec: torch.Tensor) -> torch.Tensor:
+        """``(B, F, T, 2)`` STFT -> ``(B, n_mels, T)`` log mel power."""
+        # sqrt then square, as the reference does: it rounds differently
+        power = spec.pow(2).sum(-1).sqrt().pow(2)
+        # full fp32 rather than the process's TF32 default, as the reference, when
+        # autocast is off (offline); under the engine's autocast it runs in its dtype
+        with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
+            return torch.log(self.mel_filters @ power + 2.0 ** -24)
+
+
+# NeMo ``preprocessor`` settings ``NemoLogMel`` runs for every checkpoint
+NEMO_MEL_SETTINGS = dict(
+    window="hann", log=True, frame_splicing=1, mag_power=2.0, exact_pad=False,
+    log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+)
+# NeMo's ``AudioToMelSpectrogramPreprocessor`` defaults for the checked settings
+# its configs usually leave out
+NEMO_PREPROCESSOR_DEFAULTS = dict(
+    mag_power=2.0, exact_pad=False, log_zero_guard_type="add", log_zero_guard_value=2 ** -24,
+    preemph=0.97, pad_to=16,
+)
+
+
+def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any) -> None:
+    """Refuse a NeMo ``preprocessor`` config whose settings differ from
+    ``NEMO_MEL_SETTINGS`` and the model's own, the only ones compared. A key it
+    leaves out reads as NeMo's default where ``NEMO_PREPROCESSOR_DEFAULTS``
+    has one, and is refused otherwise."""
+    expected = {**NEMO_MEL_SETTINGS, **model_settings}
+    got = {k: preprocessor.get(k, NEMO_PREPROCESSOR_DEFAULTS.get(k)) for k in expected}
+    unsupported = {k if k in preprocessor else f"{k} (not in config)": v
+                   for k, v in got.items() if v != expected[k]}
+    if unsupported:
+        raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
 
 
 @functools.cache

@@ -349,7 +349,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        model whose preprocessing runs long on the data-worker thread lost from it
        (Kokoro's G2P: about -3.6% at c=32), so it is per deployment. Both numbers
        were measured before `#849 <https://github.com/mstar-project/mstar/pull/849>`_
-       changed the message-thread and data-worker path; the knob awaits a
+       and `#939 <https://github.com/mstar-project/mstar/pull/939>`_ changed the
+       message-thread and data-worker path; the knob awaits a
        re-measure on the current path and is deleted if neutral. Workers take
        theirs from ``MSTAR_PY_SWITCH_INTERVAL_SEC``.
    * - ``tp_async_sched``
@@ -360,8 +361,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold`` and ``pre_plan``
-       (``true``/``false`` or an integer). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
+       (``true``/``false`` or an integer; ``step_thread_core`` takes
+       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -485,6 +487,15 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
+groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
+then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
+in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
+rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
+per node, riding on one node's next step, so two nodes on one pool could admit out of step on
+a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
+different workers.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
