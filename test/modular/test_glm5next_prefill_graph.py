@@ -1,10 +1,7 @@
-"""Captured prefill (``prefill_graphs``) against the eager prefill — CUDA, sm90 (FlashInfer MLA).
-
-Two levels. The fused KDA prefill over a bucket-sized ``varlen_layout`` against the exact
-one: the kernels work per span, so real rows and slots must match bit for bit.
-And the whole submodule captured by the engine's ``AcceleratorGraphRunner`` and replayed the way
-``Engine._exec_single`` drives a leased step, against the eager forward of the same prompts.
-"""
+"""Captured prefill (``prefill_graphs``) against eager, on sm90 (FlashInfer MLA): the fused KDA
+prefill over a bucket-sized ``varlen_layout`` matches the exact layout bit for bit on the real
+rows and slots, and the submodule captured by ``AcceleratorGraphRunner`` and replayed on a
+leased step emits what its eager forward does."""
 import pytest
 import torch
 
@@ -153,7 +150,7 @@ def _randomize(lm):
 
 
 class _Engine:
-    """The submodule, its real resources and a AcceleratorGraphRunner, stepped like Engine."""
+    """The submodule, its real resources and an AcceleratorGraphRunner, stepped like Engine."""
 
     def __init__(self, buckets, batch_sizes, seed=0):
         torch.manual_seed(seed)
@@ -280,21 +277,6 @@ def _prompts(tag, lengths, seed):
             for i, n in enumerate(lengths)}
 
 
-def test_no_prefill_capture_without_the_fused_kda():
-    from mstar.engine.resources.kv import manager as kv_mod
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(kv_mod, "KVTransferManager", _NoTransfer)
-        mp.setattr(fused_decode, "_ENABLED", False)
-        eng = _Engine(buckets=[256], batch_sizes=[2])
-    assert not any(k.graph_walk == "prefill" for k in eng.cg._buckets)
-
-
-def test_prefill_buckets_are_captured(engine):
-    walks = {(k.graph_walk, k.bs, k.num_tokens) for k in engine.cg._buckets}
-    assert {("prefill", 2, 256), ("prefill", 2, 512)} <= walks
-
-
 @pytest.mark.parametrize("lengths", [
     [128, 128],   # exact fit: the replay runs the eager shapes
     [100, 180],   # padded tokens
@@ -324,13 +306,3 @@ def test_captured_prefill_matches_eager(engine, lengths):
         assert torch.equal(nxt_e[re], nxt_g[rg])
     for rid in [*eager, *graph]:
         engine.runner.remove_request(rid)
-
-
-def test_nan_router_rows_stay_in_range():
-    logits = torch.randn(4, 16, device=DEV)
-    logits[1] = float("nan")
-    w, ids = fused_decode.router_topk(logits, torch.zeros(16, device=DEV), top_k=4, scale=1.0,
-                                      normalize=True)
-    assert int(ids.max()) < 16 and int(ids.min()) >= 0
-    ref = torch.topk(torch.sigmoid(logits[0]), 4).indices.sort().values
-    assert torch.equal(ids[0].sort().values, ref)

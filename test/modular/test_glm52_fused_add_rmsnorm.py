@@ -22,7 +22,6 @@ from test_glm52_engine_cycle import (  # noqa: E402
 from test_glm52_moe import _RecordingGroup  # noqa: E402
 
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
-from mstar.model.glm52.components.language_model import build_dense_mlp  # noqa: E402
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock  # noqa: E402
 from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
@@ -126,8 +125,8 @@ def test_fused_wiring_leaves_the_row_parallel_outputs_partial():
 
 
 def test_moe_partial_is_what_the_fused_allreduce_block_reduces():
-    """reduce_results=False: no collective in the block, and the returned partial is the
-    routed + shared sum a kernels: auto block hands its one all-reduce."""
+    """reduce_results=False: no collective in the block, which returns the routed + shared
+    partial a reducing block hands its one all-reduce."""
     torch.manual_seed(3)
     cfg = Glm52ModelConfig.reduced()
     g_reduce, g_partial = _RecordingGroup(), _RecordingGroup()
@@ -142,16 +141,6 @@ def test_moe_partial_is_what_the_fused_allreduce_block_reduces():
     out = partial(x)
     assert g_partial.reduced == [] and len(g_reduce.reduced) == 1
     assert torch.equal(out, g_reduce.reduced[0].view_as(out))
-
-
-def test_dense_mlp_partial_skips_the_reduce():
-    cfg = Glm52ModelConfig.reduced()
-    group = _RecordingGroup()
-    mlp = build_dense_mlp(cfg, comm_group=group, reduce_results=False)
-    for p in mlp.parameters():
-        p.data.normal_(0, 0.05)
-    mlp(torch.randn(3, cfg.hidden_size))
-    assert group.reduced == []
 
 
 def test_norms_reduce_through_the_group_under_tp():

@@ -28,7 +28,7 @@ def test_a_failed_hub_fetch_raises(monkeypatch, tmp_path):
     # a local checkpoint never reaches the Hub
     m.model_path_hf = str(tmp_path)
     assert m._resolve_checkpoint() == str(tmp_path)
-    # a repo id that cannot be fetched used to come back as if it were a local path
+    # a repo id that cannot be fetched raises rather than reading as a local path
     m.model_path_hf = "zai-org/some-repo"
     with pytest.raises(OSError, match="offline"):
         m._resolve_checkpoint()

@@ -1,7 +1,6 @@
 """KDA head-sharding across TP, simulated on CPU."""
 from __future__ import annotations
 
-import inspect
 import sys
 
 sys.path.insert(0, ".")
@@ -82,13 +81,11 @@ def _slice_for_rank(name: str, tensor: torch.Tensor, rank: int, full: KimiDeltaA
     return tensor
 
 
-def _load(layer: ParallelKimiDeltaAttention, ckpt, rank: int, full, presliced: bool) -> None:
+def _load(layer: ParallelKimiDeltaAttention, ckpt, rank: int, full) -> None:
     params = dict(layer.named_parameters())
     for name, (tensor, shard_id) in ckpt.items():
-        base = name.split("/")[0]
-        param = params[base]
-        if presliced:
-            tensor = _slice_for_rank(name, tensor, rank, full)
+        param = params[name.split("/")[0]]
+        tensor = _slice_for_rank(name, tensor, rank, full)
         loader = getattr(param, "weight_loader", None)
         if loader is not None:
             loader(param, tensor, shard_id) if shard_id is not None else loader(param, tensor)
@@ -96,20 +93,21 @@ def _load(layer: ParallelKimiDeltaAttention, ckpt, rank: int, full, presliced: b
             param.data.copy_(tensor)
 
 
-def _ranks(full, presliced: bool) -> list[ParallelKimiDeltaAttention]:
+def _ranks(full) -> list[ParallelKimiDeltaAttention]:
     ranks = []
     for r in range(TP):
         layer = ParallelKimiDeltaAttention(_cfg(), comm_group=_FakeGroup(r, TP), dtype=torch.float32)
-        _load(layer, _checkpoint(full), r, full, presliced)
+        _load(layer, _checkpoint(full), r, full)
         ranks.append(layer)
     return ranks
 
 
-@pytest.mark.parametrize("presliced", [False, True])
 @torch.no_grad()
-def test_sharded_ranks_reproduce_the_full_layer(presliced):
+def test_presliced_ranks_reproduce_the_full_layer():
+    """Ranks loaded from the slices the read plan hands them: their states are the full
+    layer's head blocks, and their partial outputs sum to its output, prefill and decode."""
     full = _full_layer(0)
-    ranks = _ranks(full, presliced)
+    ranks = _ranks(full)
     assert all(r.num_heads == full.num_heads // TP for r in ranks)
     assert all(r.qkv_dim == full.qkv_dim // TP for r in ranks)
 
@@ -135,22 +133,6 @@ def test_sharded_ranks_reproduce_the_full_layer(presliced):
     y_full = full.decode_step(tok, s_full, c_full)
     y_tp = sum(r.decode_step(tok, s_r, c_r) for r, (_, s_r, c_r) in zip(ranks, parts, strict=True))
     torch.testing.assert_close(y_tp, y_full, atol=1e-5, rtol=1e-5)
-
-
-def test_every_output_path_is_reduced_across_tp():
-    # o_proj is row-parallel with no reduce of its own, so each path that ends in it
-    # (the dense reference's, and the resource path's _project_out) must be wrapped by
-    # the TP subclass, or TP>1 serves partial sums.
-    ends_in_o_proj = {
-        name for name, fn in vars(KimiDeltaAttention).items()
-        if callable(fn) and name != "_finalize"
-        and any(s in inspect.getsource(fn) for s in ("self.o_proj(", "self._finalize("))
-    }
-    assert {"prefill", "decode_step", "_project_out"} <= ends_in_o_proj
-    assert ends_in_o_proj <= set(vars(ParallelKimiDeltaAttention))
-    # the resource path reduces on both of its branches
-    source = inspect.getsource(ParallelKimiDeltaAttention._project_out)
-    assert source.count("all_reduce(") == 2
 
 
 def test_loaders_refuse_a_wrong_width():

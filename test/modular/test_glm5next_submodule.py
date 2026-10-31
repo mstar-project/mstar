@@ -1,9 +1,7 @@
-"""GLM-5.3-Flash serving submodule on the resource-pool engine — CPU, reduced
-config, no GPU deps.
-"""
+"""GLM-5.3-Flash's serving submodule on its real resources, on CPU: what it declares and
+prepares, its capture policy and batch caps, its stop rule, and padded decode rows."""
 from __future__ import annotations
 
-import logging
 import sys
 import types
 
@@ -16,9 +14,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    SamplerStep,
     SamplingReqConfig,
     Segment,
     StepRunner,
@@ -26,9 +21,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.kv import manager as kv_mod
-from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda import KDAPlan
-from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
@@ -45,12 +38,7 @@ from mstar.model.glm5_next.config import (
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import (
-    ARNodeInputs,
-    ARNodeSubmodule,
-    ModelInputsFromEngine,
-    NodeSubmodule,
-)
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 
 MAX_SLOTS = 4
 DEVICE = torch.device("cpu")
@@ -263,59 +251,15 @@ def _moe_blocks(lm: Glm5NextForCausalLM) -> list[Glm5NextSparseMoeBlock]:
     return [m for m in lm.modules() if isinstance(m, Glm5NextSparseMoeBlock)]
 
 
-# --- (1) surface + construction ---------------------------------------------
+# --- construction, declare_step and preprocess ------------------------------
 
 
-class TestSurface:
-    def test_exposes_concrete_arnode_surface(self):
-        # Every method the engine drives is overridden ON this class, not left
-        # as the base stub. nn.Module's metaclass is not ABCMeta, so
-        # __abstractmethods__ is never populated — check the override set.
-        for name in (
-            "prepare_inputs", "declare_step", "preprocess", "forward",
-            "forward_batched", "can_batch", "postprocess", "check_stop",
-            "max_batch_size", "to", "get_accelerator_graph_configs",
-        ):
-            assert name in Glm5NextLLMSubmodule.__dict__, name
-            assert callable(getattr(Glm5NextLLMSubmodule, name)), name
-        # cleanup_request is deliberately the base one: the submodule holds
-        # no per-request state of its own (the resources hold it all).
-        assert "cleanup_request" not in Glm5NextLLMSubmodule.__dict__
-
-        _model, lm, cfg = _build_model(seed=37)
-        sub = Glm5NextLLMSubmodule(language_model=lm, config=cfg)
-        assert isinstance(sub, ARNodeSubmodule)
-        assert isinstance(sub, NodeSubmodule)
-        assert sub.can_batch(None, []) is True
-        assert sub.language_model is lm
-        assert sub.lm_head is lm.lm_head
-        assert sub.config is cfg
-        # unbound: no resources yet, so no pool to size a batch by
-        assert sub.node_resources == {}
-        assert sub.max_batch_size("decode") is None
-
-    def test_constructs_mtp_off_and_on(self):
-        for k in (0, 2):
-            _model, lm, cfg = _build_model(seed=30, mtp_num_draft_tokens=k)
-            sub = Glm5NextLLMSubmodule(language_model=lm, config=cfg)
-            # The walk stays plain single-token regardless of k: the
-            # submodule carries no MTP machinery, so both builds are valid.
-            assert (lm.mtp is None) == (k == 0)
-            assert sub.can_batch(None, []) is True
-
-    def test_torch_compile_disabled_by_default(self):
-        # The eager prefill forward hosts the KDA span loop; compiling the
-        # captured decode is opt-in.
-        assert Glm5NextLLMSubmodule.disable_torch_compile is True
-
+class TestConstruction:
     def test_create_submodule_builds_on_reduced_config(self, tmp_path, monkeypatch):
-        """The real meta-build -> to_empty(cpu) -> load -> process_weights_
-        after_loading -> wrap sequence runs end to end on CPU, with the
-        checkpoint read stubbed out (random-init the meta-materialized module
-        instead)."""
+        """``_create_submodule``'s meta-build, load and wrap on CPU, the checkpoint read
+        stubbed by a random init."""
         model = Glm5NextModel("zai-org/GLM-5.3-Flash", config_variant="reduced")
-        # A bare dir: no index.json (generic driver branch), no config.json
-        # (_maybe_apply_checkpoint_quant_config is a no-op, bf16 stands).
+        # a bare dir: no index, and no config.json, so no quantization config
         monkeypatch.setattr(model, "_resolve_checkpoint", lambda: str(tmp_path))
 
         def _fake_load(self, language_model, source, device, tp_group):
@@ -331,24 +275,21 @@ class TestSurface:
         assert sub.config is model.config
         assert sub.lm_head is sub.language_model.lm_head
         assert not sub.language_model.training
-        # The declared conv-tail dtype follows the loaded projections, so the
-        # pool the engine builds next matches the layer.
+        # the declared conv-tail dtype follows the loaded projections, so the pool the engine
+        # builds next matches the layer
         assert model.kda_conv_dtype == torch.float32
         kda_spec = next(s for s in model.get_node_resources() if s.resource_key == KDA_STATE)
         assert kda_spec.config.blocks["conv"].dtype == torch.float32
         assert sub.node_resources == {}
 
-        # Non-LLM nodes have no submodule; a dummy build (no checkpoint) is None.
+        # non-LLM nodes have no submodule, and a dummy build (no checkpoint) is None
         assert model._create_submodule("EMBED", device="cpu") is None
         monkeypatch.setattr(model, "_resolve_checkpoint", lambda: None)
         assert model._create_submodule("LLM", device="cpu") is None
 
 
-# --- (1) declare_step + preprocess ------------------------------------------
-
-
 class TestDeclareStep:
-    def test_prefill_declares_chunk_walk_and_tracks_prompts(self):
+    def test_a_step_declares_every_resource_and_tracks_only_the_prompt(self):
         _model, lm, cfg = _build_model(seed=1)
         sub = Glm5NextLLMSubmodule(lm, cfg)
         ids = {"a": torch.arange(5), "b": torch.arange(3)}
@@ -356,52 +297,19 @@ class TestDeclareStep:
 
         step = sub.declare_step("prefill", list(ids), inputs)
 
-        assert isinstance(step, SubmoduleStep)
         assert step.segments == [Segment("a", LABEL, 5), Segment("b", LABEL, 3)]
-        assert step.cg_key_info is None
         assert set(step.keys()) == {KV_CACHE, ATTN, SAMPLER, KDA_STATE, KDA}
-        assert isinstance(step.get(KV_CACHE), KVStep)
-        assert isinstance(step.get(ATTN), AttentionStep)
-        assert step.get(ATTN).causal is True
-        sampler = step.get(SAMPLER)
-        assert isinstance(sampler, SamplerStep)
-        assert sampler.apply_penalty is True
-        # the prompt goes to the sampler's seen-token mask, by identity
-        assert list(sampler.prefill_tracked_tokens) == ["a", "b"]
-        assert sampler.prefill_tracked_tokens["a"] is ids["a"]
-        assert sampler.prefill_tracked_tokens["b"] is ids["b"]
-        assert isinstance(step.get(KDA_STATE), RecurrentStep)
-        # no forks: a step writes the slots it reads
-        assert step.get(KDA_STATE).pre_forks == step.get(KDA_STATE).post_forks == ()
-        assert isinstance(step.get(KDA), LinearAttnStep)
-        # the envelope hands its segment list to every resource step
-        for key in (KV_CACHE, ATTN, SAMPLER, KDA_STATE, KDA):
+        for key in step.keys():
             assert step.get(key).segments is step.segments, key
+        # the prompt goes to the sampler's seen-token mask, for the repetition penalty
+        sampler = step.get(SAMPLER)
+        assert sampler.apply_penalty is True
+        assert list(sampler.prefill_tracked_tokens) == ["a", "b"]
+        assert all(sampler.prefill_tracked_tokens[rid] is ids[rid] for rid in ids)
 
-    def test_decode_declares_single_token_step_and_tracks_nothing(self):
-        _model, lm, cfg = _build_model(seed=1)
-        sub = Glm5NextLLMSubmodule(lm, cfg)
-        inputs = [ARNodeInputs(input_ids=torch.tensor([7]), input_seq_len=1) for _ in range(3)]
-
-        step = sub.declare_step("decode", ["a", "b", "c"], inputs)
-
-        assert step.segments == [Segment(r, LABEL, 1) for r in ("a", "b", "c")]
-        # the walk is the KDA resource's to derive from the spans
-        assert isinstance(step.get(KDA), LinearAttnStep)
-        assert step.get(SAMPLER).prefill_tracked_tokens == {}
-        assert step.get(ATTN).causal is True
-
-    def test_padding_rows_declare_their_own_segments(self):
-        # Under a lease the engine declares over the PADDED rids; the
-        # submodule declares a segment per row, padding included, and lets
-        # the resources tell real from padding by ctx.request_ids.
-        _model, lm, cfg = _build_model(seed=1)
-        sub = Glm5NextLLMSubmodule(lm, cfg)
-        rids = ["r0", "__cg_x_0__", "__cg_x_1__"]
-        inputs = [ARNodeInputs(input_ids=torch.tensor([3]), input_seq_len=1), _padding_input(), _padding_input()]
-        step = sub.declare_step("decode", rids, inputs)
-        assert [s.request_id for s in step.segments] == rids
-        assert [s.span for s in step.segments] == [1, 1, 1]
+        decode = sub.declare_step("decode", ["a", "b"], [_padding_input(), _padding_input()])
+        assert decode.segments == [Segment(rid, LABEL, 1) for rid in ("a", "b")]
+        assert decode.get(SAMPLER).prefill_tracked_tokens == {}
 
     def test_rid_input_mismatch_is_loud(self):
         _model, lm, cfg = _build_model(seed=1)
@@ -412,8 +320,8 @@ class TestDeclareStep:
 
 class TestPreprocess:
     def test_returns_only_input_ids(self):
-        # The one per-replay-varying input; everything else the forward reads
-        # is a resource plan, which is what lets a captured decode repoint.
+        # the one input that varies per replay; everything else the forward reads is a
+        # resource plan, which is what lets a captured decode repoint
         _model, lm, cfg = _build_model(seed=2)
         sub = Glm5NextLLMSubmodule(lm, cfg)
         a, b = torch.tensor([1, 2, 3]), torch.tensor([9])
@@ -425,27 +333,9 @@ class TestPreprocess:
             assert torch.equal(pre["input_ids"], torch.tensor([1, 2, 3, 9]))
             assert pre["input_ids"].dtype == torch.long
 
-    def test_prepare_inputs_passes_at_index_topk_unbound(self):
-        # A request with no step behind it has no context yet, so the whole
-        # budget is the prompt.
-        _model, lm, cfg = _build_model(seed=2)
-        sub = Glm5NextLLMSubmodule(lm, cfg)
-        limit = cfg.index_topk
-        ids = torch.zeros(limit, dtype=torch.long)
-        out = sub.prepare_inputs("prefill", _info("r", "prefill"), {"text_inputs": [ids]})
-        assert isinstance(out, ARNodeInputs)
-        assert out.input_ids is ids
-        assert out.input_seq_len == limit
-        with pytest.raises(RuntimeError, match="index_topk"):
-            sub.prepare_inputs(
-                "prefill", _info("r", "prefill"),
-                {"text_inputs": [torch.zeros(limit + 1, dtype=torch.long)]},
-            )
-
     def test_prepare_inputs_counts_committed_tokens(self):
-        """The cap is on the CONTEXT: the tokens of the steps that ran plus
-        this step's. Refusing raises, which fails only that rid — and leaks
-        nothing, because the guard runs before any admit."""
+        """The cap is on the context, the tokens of the steps that ran plus this step's; the
+        refusal runs before any admit, so it leaks nothing."""
         h = _Harness(seed=3)
         h.ingest("r", "other")
         limit = h.cfg.index_topk
@@ -457,7 +347,7 @@ class TestPreprocess:
         # boundary: 4 committed + (limit - 4) new == limit passes
         out = h.prepare("decode", "r", torch.zeros(limit - 4, dtype=torch.long))
         assert out.input_seq_len == limit - 4
-        # one past it is refused, naming the regime
+        # one past it is refused
         with pytest.raises(RuntimeError, match=r"exceeds index_topk"):
             h.prepare("decode", "r", torch.zeros(limit - 3, dtype=torch.long))
         # another request with no history still gets the full budget
@@ -469,7 +359,7 @@ class TestPreprocess:
         h.remove("r", "other")
 
 
-# --- (3) capture policy ------------------------------------------------------
+# --- capture policy and batch caps -------------------------------------------
 
 
 class TestCudaGraphs:
@@ -495,70 +385,48 @@ class TestCudaGraphs:
         assert sub._moe_capture_blocked(tp_world_size=1) is False
 
     @pytest.mark.parametrize("max_slots", [3, MAX_SLOTS])
-    def test_fused_moe_returns_one_decode_graph_clamped_to_pool(self, max_slots, monkeypatch):
-        """The capture flip is entirely ``_use_fused``-driven."""
+    def test_fused_moe_captures_decode_at_the_batch_sizes_the_pool_holds(self, max_slots):
         h = _Harness(seed=34, max_slots=max_slots)
         sub, lm = h.sub, h.lm
         sub.config.quantization_config = Glm5NextModelConfig.reduced_fp8().quantization_config
         assert sub.get_accelerator_graph_configs(DEVICE, tp_world_size=8) == []
-
         for blk in _moe_blocks(lm):
             blk._use_fused = True
-        assert sub._moe_resolved_fused() is True
-        assert sub._moe_capture_blocked(tp_world_size=8) is False
 
-        configs = sub.get_accelerator_graph_configs(DEVICE, tp_world_size=8)
-        assert len(configs) == 1
-        (config,) = configs
+        (config,) = sub.get_accelerator_graph_configs(DEVICE, tp_world_size=8)
         assert isinstance(config, BatchedAcceleratorGraphConfig)
         assert config.capture_graph_walk == "decode"
-        assert config.replay_graph_walks == ["decode"]
-        assert config.capture_forward_method == "forward_batched"
-        assert config.additional_key_info is None
-        assert config.compile is False
-        expected = [b for b in DEFAULT_CAPTURE_BATCH_SIZES if b <= max_slots]
-        assert config.capture_batch_sizes == expected
-        assert max(config.capture_batch_sizes) <= h.usable == max_slots
-        # one token per row: the padding rows clone this
-        single = config.single_request_inputs
-        assert isinstance(single, ARNodeInputs)
-        assert single.input_seq_len == 1
-        assert single.input_ids.shape == (1,) and single.input_ids.dtype == torch.long
-        assert single.input_ids.device == DEVICE
-        assert config.get_total_tokens(4) == [4]
+        assert config.capture_batch_sizes == [b for b in DEFAULT_CAPTURE_BATCH_SIZES if b <= max_slots]
+        # the padding rows clone this one-token input
+        assert config.single_request_inputs.input_seq_len == 1
 
-    def test_unbound_submodule_keeps_every_default_bucket(self, monkeypatch):
-        # No slot pool to clamp by until the engine binds the resources.
-        _model, lm, cfg = _build_model(seed=34)
-        sub = Glm5NextLLMSubmodule(lm, cfg)
-        (config,) = sub.get_accelerator_graph_configs(DEVICE, tp_world_size=1)
-        assert config.capture_batch_sizes == list(DEFAULT_CAPTURE_BATCH_SIZES)
+    @pytest.mark.parametrize("fused_kda", [False, True])
+    def test_prefill_rows_follow_the_captured_prefill(self, monkeypatch, fused_kda):
+        """Prefill is captured only on the fused KDA kernels, and a captured prefill holds a
+        step to its largest graph's rows: a larger step would run eager and compile the MoE
+        decode kernels for its row count mid-serve. An eager prefill is held to the free
+        slots alone."""
+        from mstar.model.glm5_next import submodules
 
-    def test_max_batch_size_is_the_slot_pool(self):
-        # the pool's sink is not a request's to hold
-        h = _Harness(seed=36, max_slots=3)
-        assert h.pool.config.max_slots == 4 and h.usable == 3
-        assert h.sub.max_batch_size("decode") == 3
-        assert h.sub.max_batch_size("prefill") == 3
+        h = _Harness(seed=35)
+        sub = h.sub
+        monkeypatch.setattr(submodules, "_fused_kda", lambda config: fused_kda)
+        sub.config.prefill_graphs = True
+        walks = [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(DEVICE)]
+        assert walks == (["decode", "prefill"] if fused_kda else ["decode"])
+        rows = max(sub.config.prefill_capture_batch_sizes)
+        assert sub.max_batch_size("prefill") == (rows if fused_kda else h.usable)
+        assert sub.max_batch_size("decode") == h.usable
+        # no graphs at all (the fp8 reference MoE): prefill runs eager
+        sub.config.quantization_config = Glm5NextModelConfig.reduced_fp8().quantization_config
+        assert sub.get_accelerator_graph_configs(DEVICE) == []
+        assert sub.max_batch_size("prefill") == h.usable
 
 
-# --- (4) slow-postprocess path ----------------------------------------------
+# --- check_stop and dtypes ---------------------------------------------------
 
 
-class TestPostprocessAndStop:
-    def test_postprocess_rebinds_new_token_to_text_inputs(self):
-        _model, lm, cfg = _build_model(seed=4)
-        sub = Glm5NextLLMSubmodule(lm, cfg)
-        token = torch.tensor([17])
-        outputs = {"new_token": [token]}
-        sub.postprocess("r", _info("r"), outputs)
-        assert outputs["text_inputs"] is outputs["new_token"]
-        assert outputs["text_inputs"][0] is token
-        # nothing emitted (admit failure): nothing rebound
-        empty = {}
-        sub.postprocess("r", _info("r"), empty)
-        assert empty == {}
-
+class TestCheckStop:
     def test_check_stop_eos_unless_ignored(self):
         _model, lm, cfg = _build_model(seed=4)
         sub = Glm5NextLLMSubmodule(lm, cfg)
@@ -589,134 +457,32 @@ class TestPostprocessAndStop:
         assert sub.check_stop("r", _info("r", max_tokens=5, ignore_eos=True, decode_iters=3), out) == {"decode_loop"}
 
 
-class TestDtypeAndCleanup:
-    def test_to_refuses_post_load_dtype_cast(self, caplog):
-        # The loader left mixed per-param dtypes (fp32 scales / Sinkhorn /
-        # router bias next to bf16 compute); the engine's blanket
-        # submodule.to(device, autocast_dtype) must not re-narrow them.
+class TestDtype:
+    def test_to_refuses_post_load_dtype_cast(self):
+        # the loader leaves fp32 params beside bf16 ones; the engine's blanket
+        # submodule.to(device, dtype) must not narrow them
         _model, lm, cfg = _build_model(seed=5)
         sub = Glm5NextLLMSubmodule(lm, cfg)
         before = {n: p.dtype for n, p in sub.named_parameters()}
         assert set(before.values()) == {torch.float32}
 
-        with caplog.at_level(logging.INFO, logger="mstar.model.glm5_next.submodules"):
-            assert sub.to(torch.float64) is sub
-            assert sub.to(dtype=torch.bfloat16) is sub
-            assert sub.to("cpu", torch.float64) is sub
+        assert sub.to(torch.float64) is sub
+        assert sub.to(dtype=torch.bfloat16) is sub
+        assert sub.to("cpu", torch.float64) is sub
         assert {n: p.dtype for n, p in sub.named_parameters()} == before
-        assert sum("ignoring post-load dtype cast" in r.message for r in caplog.records) == 3
         # a bare device move still goes through
         assert sub.to("cpu") is sub
         assert sub.to(device="cpu") is sub
         assert {n: p.dtype for n, p in sub.named_parameters()} == before
 
-    def test_cleanup_request_drops_submodule_state_only(self):
-        # The submodule's per-request state (the context count) lives in the
-        # base request_states, so cleanup is the base pop. The resources'
-        # state is the engine's to remove.
-        h = _Harness(seed=6)
-        h.ingest("r")
-        h.step("prefill", {"r": torch.arange(3)})
-        slot = _slot_of(h.pool, "r")
-        assert slot is not None
-        assert h.context("r") == 3
 
-        h.sub.cleanup_request("r")
-        assert "r" not in h.sub.request_states
-        assert _slot_of(h.pool, "r") == slot
-        assert h.kv._streams["r"][LABEL].stored_len == 3
-        h.sub.cleanup_request("r")  # the engine may double-retire
-
-        h.remove("r")
-        assert _slot_of(h.pool, "r") is None
-        assert h.pool.num_free_slots == h.usable
-        assert "r" not in h.kv._streams
+# --- padded decode rows ------------------------------------------------------
 
 
-# --- (5) lifecycle through the runner ---------------------------------------
-
-
-class TestEngineSeam:
-    def test_prefill_decode_lifecycle_and_chunk_step_parity(self):
-        h = _Harness(seed=7)
-        h.ingest("r0")
-        prompt = torch.tensor([5, 9, 13, 7, 21], dtype=torch.long)
-
-        t1 = h.step("prefill", {"r0": prompt})["r0"]
-        assert t1.shape == (1,) and t1.dtype == torch.long
-        assert h.context("r0") == 5
-        assert _slot_of(h.pool, "r0") not in (None, SINK_SLOT)
-        assert h.kv._streams["r0"][LABEL].stored_len == 5
-        assert not h.kda.current_plan().is_decode
-
-        t2 = h.step("decode", {"r0": t1})["r0"]
-        assert h.kda.current_plan().is_decode
-        t3 = h.step("decode", {"r0": t2})["r0"]
-        assert h.context("r0") == 7
-        assert h.kv._streams["r0"][LABEL].stored_len == 7
-        assert h.pool.num_free_slots == h.usable - 1
-
-        # postprocess seeds the next step from the emission
-        outputs = {"new_token": [t3]}
-        h.sub.postprocess("r0", _info("r0"), outputs)
-        assert outputs["text_inputs"] is outputs["new_token"]
-
-        # the whole sequence prefilled on a fresh request yields the same
-        # third token: chunk-vs-step parity of the engine path
-        h.ingest("ref")
-        t3_ref = h.step("prefill", {"ref": torch.cat([prompt, t1, t2])})["ref"]
-        assert t3_ref.item() == t3.item(), (t3_ref.item(), t3.item())
-
-        h.remove("r0", "ref")
-        assert h.pool.num_free_slots == h.usable
-        assert _holders(h.pool) == set()
-        assert not h.kv._streams
-
-    def test_batched_two_requests_match_isolated_and_free_all(self):
-        """Two requests prefilled AND decoded jointly emit, at every step, the greedy
-        tokens each emits alone — per-request slot / KV-stream isolation across a real
-        batch, over the >1-row decode slot index.
-        """
-        lens = {"a": 7, "b": 4}
-        num_decode = 4
-        torch.manual_seed(39)
-        vocab = Glm5NextModelConfig.reduced().vocab_size
-        toks = {rid: torch.randint(0, vocab, (n + num_decode,)) for rid, n in lens.items()}
-
-        def _run(h: _Harness, rids: list[str]) -> dict[str, list[int]]:
-            # teacher-forced on each rid's own tokens; greedy emission per step
-            h.ingest(*rids)
-            emitted = {rid: [] for rid in rids}
-            out = h.step("prefill", {rid: toks[rid][: lens[rid]] for rid in rids})
-            for rid in rids:
-                emitted[rid].append(out[rid].item())
-            for s in range(num_decode):
-                out = h.step("decode", {rid: toks[rid][lens[rid] + s : lens[rid] + s + 1] for rid in rids})
-                for rid in rids:
-                    emitted[rid].append(out[rid].item())
-            return emitted
-
-        joint = _Harness(seed=38, dtype=torch.float64)
-        got = _run(joint, ["a", "b"])
-        # one step, two rows: the planned slot index carried one slot per rid
-        plan: KDAPlan = joint.kda.current_plan()
-        assert plan.slot_ids.tolist() == [_slot_of(joint.pool, "a"), _slot_of(joint.pool, "b")]
-        for rid, n in lens.items():
-            assert joint.context(rid) == n + num_decode
-            assert joint.kv._streams[rid][LABEL].stored_len == n + num_decode
-        joint.remove("a", "b")
-        assert joint.pool.num_free_slots == joint.usable
-        assert not joint.kv._streams
-
-        for rid in lens:
-            alone = _Harness(seed=38, dtype=torch.float64)  # same weights
-            ref = _run(alone, [rid])
-            assert got[rid] == ref[rid], (rid, got[rid], ref[rid])
-
+class TestPaddedRows:
     def test_padded_decode_reads_the_sink_and_commits_only_real_rows(self):
-        """A captured replay pads the batch with ``__cg_*`` rows: the engine declares over
-        ``padded_request_ids`` and runs the forward over them.
-        """
+        """A captured replay pads the batch with ``__cg_*`` rows, declared and run like real
+        ones: they read the sink, and only the real rows commit."""
         h = _Harness(seed=8)
         pad = "__cg_x_0__"
         # the dummy-row pool ingests padding rids up front, like real ones

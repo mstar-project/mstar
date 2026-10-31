@@ -1278,9 +1278,9 @@ class MicroScheduler:
     def _engine_cap(self, node_name: str, graph_walk: str) -> int | None:
         """The engine's cap for this (node, walk), if it has one. A combined
         walk's cap is the model's to declare, via its captures or max_batch_size.
-        Fixed once the graphs are captured, so asked once, unless the submodule
-        says it follows free state (``NodeSubmodule.batch_cap_varies``): that one
-        is asked every pass, since a stale cap overfills the step."""
+        Fixed once the graphs are captured, so asked once, unless
+        ``NodeSubmodule.batch_cap_varies`` says it moves: a stale cap overfills
+        the step."""
         key = (node_name, graph_walk)
         if key in self._max_bs:
             return self._max_bs[key]

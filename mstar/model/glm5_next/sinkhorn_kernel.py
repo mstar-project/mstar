@@ -27,11 +27,8 @@ if _HAS_TRITON:
         offs = pid * H * H + rows[:, None] * H + cols[None, :]
         m = tl.load(m_ptr + offs).to(tl.float32)  # [H, H]
 
-        # Keep every intermediate fp32. ``eps`` is a python float (fp64 in
-        # triton), so ``+ eps`` promotes the divide to fp64; ``.to(tl.float32)``
-        # after each step both matches the reference's fp32 arithmetic and keeps
-        # the loop-carried value fp32 — triton rejects a loop variable whose
-        # dtype changes between iterations.
+        # ``+ eps`` (a Python float, fp64 in Triton) promotes the divide to fp64; casting back
+        # matches the fp32 reference and keeps the loop-carried dtype fixed, as Triton requires.
         csum = tl.sum(m, axis=0)               # [H], per-column sum over rows
         m = (m / (csum[None, :] + eps)).to(tl.float32)
         for _ in range(num_iters - 1):
@@ -45,10 +42,8 @@ if _HAS_TRITON:
     def sinkhorn_normalize_fused(
         matrix: torch.Tensor, num_iters: int, eps: float,
     ) -> torch.Tensor:
-        """CUDA fused Sinkhorn: one kernel launch for the whole iteration loop.
-        ``matrix`` is ``[..., H, H]`` fp32 on CUDA; returns a new tensor (functional,
-        like the reference).
-        """
+        """The whole Sinkhorn loop in one launch over ``[..., H, H]`` fp32 on CUDA, into a new
+        tensor like the reference."""
         H = matrix.shape[-1]
         out = matrix.reshape(-1, H, H).contiguous().clone()
         n = out.shape[0]

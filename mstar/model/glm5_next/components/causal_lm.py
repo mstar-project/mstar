@@ -35,8 +35,7 @@ class Glm5NextLanguageModel(nn.Module):
             ]
         )
         self.norm = build_rmsnorm(config)
-        # Unweighted stream mean: the checkpoint ships no head weights, so
-        # the collapse is parameter-free.
+        # an unweighted stream mean: the checkpoint ships no head weights
         self.hc_head = Glm5NextHyperHead()
 
     def forward(
@@ -48,8 +47,7 @@ class Glm5NextLanguageModel(nn.Module):
         """``input_ids (T,)`` flat batch -> ``(T, hidden)`` final hidden, or only its
         ``rows``."""
         hidden_states = self.embed_tokens(input_ids)
-        # (1, T, hc_mult, hidden): embedding replicated into all streams.
-        # B=1 over the flat token batch is exact — mHC is per-token.
+        # (1, T, hc_mult, hidden): one batch row over the flat tokens is exact, as mHC is per token
         hidden_streams = expand_streams(hidden_states.unsqueeze(0), self.hc_mult)
         pending = None
         last = len(self.layers) - 1
@@ -75,8 +73,6 @@ class Glm5NextForCausalLM(nn.Module):
         self.config = config
         self.model = Glm5NextLanguageModel(config, comm_group=comm_group)
         self.lm_head = build_lm_head(config, comm_group=comm_group)
-        # Per-request KDA state is the engine's recurrent pool, run by its KDA
-        # resource (get_node_resources declares both).
         self.mtp = None
         if config.mtp_num_draft_tokens > 0:
             from mstar.model.glm5_next.components.mtp import Glm5NextMTPModule
@@ -89,8 +85,7 @@ class Glm5NextForCausalLM(nn.Module):
 
     def kda_conv_dtype(self) -> torch.dtype:
         """The KDA projection dtype: the pool's conv state must match it, because
-        the conv reads the tail alongside the projected activations. Read off
-        the first KDA layer's q_proj."""
+        the conv reads the tail alongside the projected activations."""
         for layer in self.model.layers:
             if layer.is_linear_attention:
                 return layer.self_attn.q_proj.weight.dtype

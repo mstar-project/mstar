@@ -13,8 +13,7 @@ from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm5_next.config import ATTN, DSA, KV_CACHE, LABEL, Glm5NextModelConfig
 
-# k_norm eps is hardcoded in the reference indexer (LayerNorm(head_dim,
-# eps=1e-6), weight AND bias) — NOT rms_norm_eps.
+# the reference indexer's k_norm is LayerNorm(head_dim, eps=1e-6) with a bias, not rms_norm_eps
 _INDEXER_K_NORM_EPS = 1e-6
 
 
@@ -33,9 +32,7 @@ class Glm5NextIndexer(nn.Module):
         self.wk = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=_INDEXER_K_NORM_EPS)
-        # Pool compression: an additive per-slot prior over the kpool members
-        # plus the member gate applied via F.linear (no bias). Both decide
-        # which slots get selected, so they are carried exactly.
+        # k-pool compression: an additive prior per pool member and the member gate (F.linear, no bias)
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.kpool, self.head_dim))
         self.index_kpool_compress_gate = nn.Parameter(
@@ -72,8 +69,7 @@ class Glm5NextMLAAttention(MLAAttention):
     ) -> None:
         if not config.mla_absorb:
             raise ValueError(
-                "Glm5NextMLAAttention serves the absorbed path only "
-                "(mla_absorb=False was the pre-resource-pool naive fallback)"
+                "Glm5NextMLAAttention serves the absorbed path only (mla_absorb=True)"
             )
         super().__init__(config, comm_group, layer_idx, kv_key=KV_CACHE, attn_key=ATTN,
                          pos_key=None, kv_label=LABEL, cache_layer=kv_plane)
@@ -82,8 +78,7 @@ class Glm5NextMLAAttention(MLAAttention):
             # With MTP a verify step's rejected rows stay in the cache as holes with a very
             # negative rope slot: a query rope part of ones adds 0 to a real key (its slot is 0).
             self.kpe_query_fill = 1.0
-        # Every full-attention layer (the MTP layer included) ships its own
-        # full indexer; config.indexer_types is the source of truth.
+        # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages),
         # and the DSA resource whose context the submodule opens per forward

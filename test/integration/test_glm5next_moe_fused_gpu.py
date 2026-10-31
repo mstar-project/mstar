@@ -1,4 +1,5 @@
-"""GPU golden for GLM-5.3's opt-in SwiGLU clamp on the fused fp8 MoE path."""
+"""GLM-5.3's SwiGLU clamp on the fused fp8 MoE path, on CUDA: the block against its clamped
+reference dispatch, and the activation kernel with the clamp on and off."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -41,9 +42,8 @@ def fake_quantize_fp8_block(
 
 
 def _reduced_fp8_128_config(swiglu_limit: float) -> Glm5NextModelConfig:
-    """``reduced_fp8`` defaults to (16, 16) scale blocks; the fused kernel
-    needs the real checkpoint's (128, 128), so pick 128-divisible MoE dims by
-    hand on the reduced base."""
+    """``reduced_fp8`` has (16, 16) scale blocks; the fused kernel needs the checkpoint's
+    (128, 128), so 128-divisible MoE dims on the reduced base."""
     cfg = Glm5NextModelConfig.reduced()
     cfg.hidden_size = 256
     cfg.moe_intermediate_size = 128
@@ -55,9 +55,8 @@ def _reduced_fp8_128_config(swiglu_limit: float) -> Glm5NextModelConfig:
 
 
 def _build_fp8_block(seed: int, swiglu_limit: float):
-    """Reduced fp8-resident glm5_next MoE block with random e4m3 experts on
-    DEVICE. ``components.moe`` reaches triton transitively at dispatch, so it
-    is imported here rather than at module level."""
+    """A reduced fp8-resident MoE block with random e4m3 experts. ``components.moe`` reaches
+    triton at dispatch, hence the local import."""
     from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
 
     torch.manual_seed(seed)
@@ -85,23 +84,16 @@ def _build_fp8_block(seed: int, swiglu_limit: float):
         exp.gate_up_proj_scale_inv.data[e, srow:] = us
         exp.down_proj_fp8.data[e] = d8.view(torch.uint8)
         exp.down_proj_scale_inv.data[e] = ds
-    # Device-only move keeps the uint8 bytes and fp32 scales untouched.
+    # a device move keeps the uint8 bytes and fp32 scales
     return block.to(DEVICE)
-
-
-# --- (a) fused-clamped dispatch tracks the clamped reference ----------------
 
 
 @pytest.mark.parametrize("num_tokens", [8, 3])  # M > E and M <= E config branches
 def test_dispatch_fused_matches_clamped_reference(num_tokens):
-    # swiglu_limit small vs the ~||input||*0.3 pre-activations so a meaningful
-    # fraction actually clips -- otherwise the clamp is inert and (a) would pass
-    # trivially for the wrong reason.
+    # a limit small against the pre-activations, so that a good fraction clips
     block = _build_fp8_block(seed=0, swiglu_limit=0.5)
     x = (torch.randn(num_tokens, block.hidden_size, device=DEVICE) * 0.6).to(torch.bfloat16)
 
-    # fp32 topk_weights straight from the gate: BOTH dispatch paths keep the
-    # router weight fp32, with no downcast on the way in.
     topk_weights, topk_ids = block.gate(x)
     assert topk_weights.dtype == torch.float32
 
@@ -110,100 +102,28 @@ def test_dispatch_fused_matches_clamped_reference(num_tokens):
 
     assert got.shape == (num_tokens, block.hidden_size)
     assert got.dtype == torch.bfloat16
-    # Cosine similarity: scale- and clamp-boundary-robust, so it isolates
-    # STRUCTURAL correctness (routing / weights / reduce) from fp8 magnitude
-    # noise -- a wrong-routing or swapped-weight bug collapses it toward 0.
-    # Element-wise error stays dominated by fp8 rounding at this hidden size,
-    # so it is no gate here; on-checkpoint greedy parity (fused serve ==
-    # reference serve) is what catches magnitude drift.
+    # fp8 rounding dominates the elementwise error at this size; a routing or weight-layout
+    # bug drives the cosine toward 0
     cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.float().flatten(), dim=0)
-    assert cos > 0.99, f"fused vs reference cosine = {cos:.4f} -- structural break?"
+    assert cos > 0.99, f"fused vs reference cosine = {cos:.4f}"
 
 
-# --- (b) clamp OFF is a strict no-op (other fused-MoE users' guard) ----------
-
-
-def test_clamp_off_is_noop_even_past_limit():
-    # swiglu_limit=None must apply NO clamp, even when |pre-activations| dwarf
-    # any limit. If the constexpr gate were inverted (or the disabled branch
-    # ever clamped), the output would be bounded and this would fail.
+@pytest.mark.parametrize("limit", [None, 10.0])
+def test_act_and_mul_clamps_only_with_a_limit(limit):
+    """With no limit the kernel is plain SwiGLU, as the other fused-MoE users need; with one,
+    the clamped SwiGLU. At these magnitudes the two are far apart."""
     from mstar.utils.fused_moe.kernels import act_and_mul_triton
 
     torch.manual_seed(3)
     m, inter = 16, 256
     gateup = (torch.randn(m, 2 * inter, device=DEVICE) * 40.0).to(torch.bfloat16)
     out = torch.empty(m, inter, device=DEVICE, dtype=torch.bfloat16)
-    act_and_mul_triton(gateup, out, activation="silu")  # swiglu_limit defaults to None
+    act_and_mul_triton(gateup, out, activation="silu", swiglu_limit=limit)
 
-    gate, up = gateup.chunk(2, dim=-1)
-    unclamped = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
-    limit = 10.0
-    clamped = (
-        F.silu(gate.float().clamp(max=limit)) * up.float().clamp(-limit, limit)
-    ).to(torch.bfloat16)
-
-    # Matches the UNclamped SwiGLU (bf16-rounding tolerance -- the kernel rounds
-    # silu to bf16 before the multiply) ...
-    torch.testing.assert_close(out, unclamped, rtol=2e-2, atol=2e-2)
-    # ... and is NOWHERE NEAR the clamped result at these magnitudes, proving no
-    # clamp was applied on the disabled path.
-    assert not torch.allclose(out, clamped, rtol=2e-2, atol=2e-2)
-
-
-# --- (b') clamp ON actually bounds the activation and diverges ---------------
-
-
-def test_clamp_on_bounds_activation_and_diverges():
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
-
-    torch.manual_seed(4)
-    m, inter, limit = 16, 256, 10.0
-    gateup = (torch.randn(m, 2 * inter, device=DEVICE) * 40.0).to(torch.bfloat16)
-    gate, up = gateup.chunk(2, dim=-1)
-
-    out_clamped = torch.empty(m, inter, device=DEVICE, dtype=torch.bfloat16)
-    act_and_mul_triton(gateup, out_clamped, activation="silu", swiglu_limit=limit)
-
-    ref_clamped = (
-        F.silu(gate.float().clamp(max=limit)) * up.float().clamp(-limit, limit)
-    ).to(torch.bfloat16)
-    torch.testing.assert_close(out_clamped, ref_clamped, rtol=2e-2, atol=2e-2)
-
-    ref_unclamped = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
-    assert not torch.allclose(out_clamped, ref_unclamped, rtol=2e-2, atol=2e-2)
-
-
-# --- (c) resolved fused path re-enables cuda-graph capture ------------------
-
-
-def test_get_cuda_graph_configs_nonempty_when_fused_resolved():
-    # The capture flip is driven entirely by ``_use_fused``. This half is
-    # CPU-testable but rides the GPU gate with the rest of the file.
-    from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
-    from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-
-    cfg = Glm5NextModelConfig.reduced_fp8()
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = cfg
-
-    lm = torch.nn.Module()
-    lm.blk = Glm5NextSparseMoeBlock(cfg)
-    # object.__new__ skipped nn.Module.__init__, so bypass its __setattr__;
-    # node_resources normally comes from NodeSubmodule.__init__ -- unbound
-    # here, so the decode buckets are the full DEFAULT_CAPTURE_BATCH_SIZES.
-    object.__setattr__(sub, "language_model", lm)
-    object.__setattr__(sub, "node_resources", {})
-    object.__setattr__(sub, "mtp_k", 0)
-
-    lm.blk._use_fused = False
-    assert sub._moe_capture_blocked(tp_world_size=8) is True
-    assert sub.get_accelerator_graph_configs(torch.device(DEVICE), tp_world_size=8) == []
-
-    lm.blk._use_fused = True
-    assert sub._moe_resolved_fused() is True
-    assert sub._moe_capture_blocked(tp_world_size=8) is False
-    configs = sub.get_accelerator_graph_configs(torch.device(DEVICE), tp_world_size=8)
-    # Only decode is captured: KDA prefill is a host span loop.
-    assert len(configs) == 1
-    assert configs[0].capture_graph_walk == "decode"
-    assert configs[0].capture_batch_sizes
+    gate, up = gateup.float().chunk(2, dim=-1)
+    unclamped = (F.silu(gate) * up).to(torch.bfloat16)
+    clamped = (F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)).to(torch.bfloat16)
+    want, other = (unclamped, clamped) if limit is None else (clamped, unclamped)
+    # the kernel rounds silu to bf16 before the multiply
+    torch.testing.assert_close(out, want, rtol=2e-2, atol=2e-2)
+    assert not torch.allclose(out, other, rtol=2e-2, atol=2e-2)

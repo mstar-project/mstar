@@ -44,8 +44,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.kda_pos = config.kda_layer_indices.index(layer_idx)
             self.kv_plane = None
         else:
-            # Compact plane map: 3 -> 0, 7 -> 1, ..., 43 -> 10. The attention
-            # module addresses its own plane so KDA layers never touch KV.
+            # this layer's plane of the MLA cache: 3 -> 0, 7 -> 1, ..., 43 -> 10
             self.kv_plane = config.full_attn_layer_indices.index(layer_idx)
             self.self_attn = Glm5NextMLAAttention(
                 config, comm_group=comm_group, layer_idx=layer_idx,
@@ -107,7 +106,7 @@ class Glm5NextDecoderLayer(nn.Module):
         return hidden_streams, (self.mlp(hidden), post, comb)
 
 class Glm5NextPlainDecoderLayer(nn.Module):
-    """Plain-residual NoPE MLA + MoE layer — the MTP layer-45 structure."""
+    """The MTP layer (45): plain-residual MLA + MoE, no mHC."""
 
     def __init__(
         self,

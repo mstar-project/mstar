@@ -57,10 +57,9 @@ from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
-# Captured prefill shapes when the config names none (prefill_graphs on). Buckets start
-# above the MoE decode path's 64 tokens: the fused runner routes padding rows safely.
-# 128-token steps to 1024, then 64 up to one request's max, so a long prompt replays at most
-# 63 padding tokens; then 256 to 4096, so a step of several prompts pads at most 255.
+# Captured prefill shapes when the config names none. They start above the MoE decode path's
+# 64 tokens, since the fused runner routes padding rows safely; 64 apart from 1024 to one
+# request's 2048, then 256 apart to 4096 for steps of several prompts.
 PREFILL_TOKEN_BUCKETS = (*range(128, 1024, 128), *range(1024, 2049, 64), *range(2304, 4097, 256))
 PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
@@ -101,9 +100,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
 
-    # The eager prefill forward hosts the KDA resource (@torch.compiler.disable
-    # inside a compiled outer frame) and the fp8 reference MoE loop; the
-    # post-capture torch.compile of the eager forwards is untested for it.
+    # torch.compile of the eager forwards is untested: they host the KDA resource
+    # (compiler-disabled) and the reference MoE loop
     disable_torch_compile: bool = True
     # Weights load in bf16; the KDA conv and delta rule, the router and mHC run
     # in fp32 on purpose, which the engine's bf16 autocast would undo.
@@ -157,11 +155,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     # -- CUDA-graph configs ----------------------------------------------
 
     def _moe_resolved_fused(self) -> bool:
-        """True iff the loaded MoE blocks resolved to the clamped fused fp8
-        kernel (``moe_quant_kernel`` "triton"/"auto" on CUDA); False on the
-        "reference" default, whose per-hit-expert loop hosts ``.nonzero()``
-        and cannot be captured.
-        """
+        """Whether the loaded MoE blocks resolved to the fused fp8 kernel. The reference
+        loop hosts ``.nonzero()`` and cannot be captured."""
         from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
 
         lm = getattr(self, "language_model", None)
@@ -187,15 +182,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         return None if pool is None else pool.config.usable_slots
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # A step can hold at most one slot per row of real state; the
-        # scheduler splits anything larger rather than admit-failing it.
+        # one KDA slot per row: the scheduler splits a larger step rather than fail its admit
         pool = self.node_resources.get(KDA_STATE) if self.node_resources else None
         if pool is None:
             return None
-        # A prefill takes only the slots free now, and waits while none are, so a
-        # TP follower refusing one has diverged from rank 0 (its worker stops).
-        # With prefill graphs, no more rows than one takes: an eager prefill's
-        # last layer compiles the MoE decode kernels for its row count mid-serve.
+        # A prefill takes only the slots free now, so a TP follower that refuses one has
+        # diverged from rank 0. With prefill graphs, also no more rows than one captures: an
+        # eager prefill's last layer would compile the MoE decode kernels for its row count.
         if graph_walk == "prefill":
             rows = self._captured_prefill_rows()
             free = pool.num_free_slots
@@ -210,8 +203,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """The most rows a captured prefill takes, or None while prefill runs eager."""
         if not self.config.prefill_graphs or not _fused_kda(self.config):
             return None
-        # declared no prefill graph (reference MoE, the MLA fallback): an eager prefill
-        # held to 4 rows took 16 steps for a burst of 64 prompts
+        # no prefill graph (reference MoE, the MLA fallback): an eager prefill is not held
+        # to the captured rows
         if getattr(self, "_prefill_captured", True) is False:
             return None
         return max(self.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
@@ -249,8 +242,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             b for b in DEFAULT_CAPTURE_BATCH_SIZES
             if max_slots is None or b <= max_slots
         ]
-        # Graphs capture the eager forward: a Triton crash in Inductor's compile
-        # subprocess would fail every capture and fall back to eager silently.
+        # compile=False: a Triton crash in Inductor's compile subprocess would fail every
+        # capture, and serve eager silently
         configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -804,9 +797,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if inputs is not None:
             state = self.request_state(request_id)
             state.add("context", state.get("context", 0) + inputs.input_seq_len)
-        # Seed the next decode step from the emitted token: the walk's
-        # text_inputs loop-back edge (get_graph_walk_graphs) carries it. An MTP
-        # verify step already set it: the token after the accepted drafts.
+        # the decode loop's text_inputs edge carries the emitted token; an MTP verify step set
+        # it already, to the token after the accepted drafts
         if "new_token" not in outputs:
             return
         outputs.setdefault("text_inputs", outputs["new_token"])
@@ -820,8 +812,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        # The ONLY place .item() on a token value is allowed (slow-postprocess
-        # path, off the step-critical GPU thread — base-class contract).
+        # check_stop gets host tensors, so .item() here does not sync
         state = self.request_states.get(request_id)
         if state is not None and state.get("ended_at_prefill"):
             return {"decode_loop"}
