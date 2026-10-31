@@ -38,7 +38,6 @@ from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.unfiltered import with_unfiltered_sampling
 from mstar.engine.resources.spec_decode.config import SpecDecodeStep, SpecPhase
-from mstar.engine.resources.spec_decode.draft_head import FP8_SKINNY_MAX_ROWS
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
@@ -741,17 +740,9 @@ class LLMSubmodule(ARNodeSubmodule):
         for j in range(self.num_draft_tokens):
             attend = functools.partial(self._attend_draft, spec, j)
             out = self.model.mtp.draft(hidden, lm.embed_tokens(ids), attend, keep=keep if j == 0 else None)
-            ids = spec.record_draft(j, self._draft_logits(out))
+            ids = spec.record_draft(j, (self.model.draft_head or head)(out))
             hidden = out
         return accepted
-
-    def _draft_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """What a draft pass takes its argmax of: the fp8 head where a
-        deployment keeps one and this step's rows suit it."""
-        draft_head = self.model.draft_head
-        if draft_head is not None and hidden.shape[0] <= FP8_SKINNY_MAX_ROWS:
-            return draft_head(hidden)
-        return self.model.lm_head(hidden)
 
     def _attend_draft(self, spec, j: int, qkv, q_weight, k_weight, *layout) -> tuple[torch.Tensor, torch.Tensor]:
         """Draft pass ``j``'s attention, from the MTP layer's packed projection."""
