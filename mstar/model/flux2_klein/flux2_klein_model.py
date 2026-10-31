@@ -44,9 +44,14 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
-from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
-from mstar.model.components.diffusion.image_io import encode_image
+from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.lora import LoraSpec
+from mstar.model.components.diffusion.qwen3.submodule import (
+    TEXT_EMBEDS,
+    TEXT_INPUTS,
+    TEXT_LEN,
+    Qwen3TextEncoderSubmodule,
+)
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -58,12 +63,8 @@ from mstar.model.flux2_klein.submodules import (
     IMAGE_OUTPUT,
     LATENTS,
     REF_LATENTS,
-    TEXT_EMBEDS,
-    TEXT_INPUTS,
-    TEXT_MASK,
     KleinDenoiseSubmodule,
     KleinShape,
-    KleinTextEncoderSubmodule,
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
@@ -191,7 +192,7 @@ class Flux2KleinModel(Model):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
             name="text_encoder", enable_async_scheduling=self.async_scheduling,
-            input_names=[TEXT_INPUTS, TEXT_MASK],
+            input_names=[TEXT_INPUTS],
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=TEXT_EMBEDS, persist=True)],
         )
         encode_image = GraphNode(
@@ -242,13 +243,14 @@ class Flux2KleinModel(Model):
             [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=False,
         )
 
-    def tokenize(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(input_ids, attention_mask)``, each ``[max_sequence_length]`` int64, right padded."""
+    def tokenize(self, prompt: str) -> torch.Tensor:
+        """Unpadded token ids ``[L]`` (``L <= max_sequence_length``), truncated like the
+        pipeline; the text encoder node pads them to ``max_sequence_length`` as it does."""
         enc = self._ensure_tokenizer()(
-            self.render_prompt(prompt), return_tensors="pt", padding="max_length", truncation=True,
+            self.render_prompt(prompt), return_tensors="pt", truncation=True,
             max_length=self.config.text_encoder.max_sequence_length,
         )
-        return enc["input_ids"][0].to(torch.long), enc["attention_mask"][0].to(torch.long)
+        return enc["input_ids"][0].to(torch.long)
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
@@ -327,14 +329,14 @@ class Flux2KleinModel(Model):
         ref_dims = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
         self._resolve_size(kwargs, ref_dims)
         self._resolve_steps(kwargs)
+        image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
         # Ungated on is_distilled: a non-distilled checkpoint is the case that most
         # needed telling, and it was the one case that stayed silent. Only distilled
         # checkpoints load at all now (Flux2KleinConfig.from_snapshot), so this fires
         # whenever a caller's guidance_scale is about to be dropped.
         if float(kwargs.get("guidance_scale", 1.0)) != 1.0:
             logger.warning("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
-        ids, mask = self.tokenize(prompt)
-        return {TEXT_INPUTS: [ids], TEXT_MASK: [mask]}
+        return {TEXT_INPUTS: [self.tokenize(prompt)]}
 
     # --------------------------------------------------------- state machine
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
@@ -344,6 +346,7 @@ class Flux2KleinModel(Model):
             "height": kw["height"], "width": kw["width"],
             "num_inference_steps": kw["num_inference_steps"],
             "ref_grids": kw["ref_grids"],
+            TEXT_LEN: kw[TEXT_LEN],
         }
 
     def get_initial_forward_pass_args(
@@ -365,6 +368,7 @@ class Flux2KleinModel(Model):
             "width": width,
             "num_inference_steps": self._resolve_steps(model_kwargs),
             "ref_grids": [list(self.config.latent_grid(h, w)) for h, w in ref_dims],
+            TEXT_LEN: int(input_signals[TEXT_INPUTS][0].dims[0]),
         }
         logger.info(
             "FLUX.2 klein request: %dx%d steps=%d refs=%s seed=%s", width, height, kwargs["num_inference_steps"],
@@ -374,14 +378,11 @@ class Flux2KleinModel(Model):
             input_modalities=input_modalities, output_modalities=output_modalities,
             graph_walk=schedule[0], is_prefill=True, kwargs=kwargs,
         )
-        inputs = []
-        for name in (TEXT_INPUTS, TEXT_MASK):
-            edge = GraphEdge(next_node="text_encoder", name=name)
-            edge.tensor_info = input_signals[name]
-            inputs.append(edge)
+        edge = GraphEdge(next_node="text_encoder", name=TEXT_INPUTS)
+        edge.tensor_info = input_signals[TEXT_INPUTS]
         return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
+            full_metadata=metadata, inputs=[edge],
+            unpersist_tensors=list(edge.tensor_info),
             step_metadata=self._step_metadata(metadata),
         )
 
@@ -470,7 +471,10 @@ class Flux2KleinModel(Model):
 
         if node_name == "text_encoder":
             encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device)
-            return KleinTextEncoderSubmodule(encoder, self.config, max_batch_size=self.max_batch_size)
+            return Qwen3TextEncoderSubmodule(
+                encoder, self.config.text_encoder, max_batch_size=self.max_batch_size,
+                capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
+            )
         if node_name == "vae_encoder":
             return KleinVaeEncoderSubmodule(self._vae_module(device), self.config)
         if node_name == "vae_decoder":
@@ -478,9 +482,6 @@ class Flux2KleinModel(Model):
                 self._vae_module(device), self.config, max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
                 warmup_grids=[self.config.latent_grid(h, w) for h, w in self.warmup_sizes()],
-                # the VAE compiles four static sizes (each ~30-60 s of autotuning at a cold start) and
-                # splits other batches into them; the dit captures every batch size up to the maximum
-                decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],
             )
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)

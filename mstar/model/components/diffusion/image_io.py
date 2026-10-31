@@ -149,13 +149,27 @@ OUTPUT_FORMATS = ("png", "jpeg", "webp")
 
 def image_output_format(request_kwargs: dict | None) -> str:
     """The request's ``output_format`` (default ``png``; ``jpg`` means ``jpeg``), or ValueError
-    for one :func:`encode_image` cannot write. A model calls it at intake too, so a bad value
-    fails the request before generation rather than after."""
-    fmt = str((request_kwargs or {}).get("output_format") or "png").lower()
+    for one :func:`encode_image` cannot write, or a value it cannot apply for that format's
+    knob (``png_compress_level`` 0-9 for PNG, ``output_compression`` 0-100 otherwise). A model
+    calls it at intake too, so a bad value fails the request before generation rather than after."""
+    kwargs = request_kwargs or {}
+    fmt = str(kwargs.get("output_format") or "png").lower()
     if fmt == "jpg":
         fmt = "jpeg"
     if fmt not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    key, top = ("png_compress_level", 9) if fmt == "png" else ("output_compression", 100)
+    value = kwargs.get(key)
+    if value is None:
+        return fmt
+    try:
+        # a whole number as encode_image's int() reads it (90, 90.0, "90"), not True or 50.9
+        ok = not isinstance(value, bool) and (isinstance(value, str) or int(value) == value)
+        ok = ok and 0 <= int(value) <= top
+    except (TypeError, ValueError, OverflowError):
+        ok = False
+    if not ok:
+        raise ValueError(f"{key} must be a whole number from 0 to {top}, got {value!r}")
     return fmt
 
 
@@ -170,7 +184,8 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     kwargs = request_kwargs or {}
     fmt = image_output_format(kwargs)
     if fmt == "png":
-        return uint8_to_png(image, compress_level=int(kwargs.get("png_compress_level", 1)))
+        level = kwargs.get("png_compress_level")
+        return uint8_to_png(image, compress_level=1 if level is None else int(level))
     from PIL import Image
 
     if image.ndim == 4:
@@ -179,7 +194,7 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     quality = int(quality) if quality is not None else (95 if fmt == "jpeg" else 80)
     buffer = io.BytesIO()
     Image.fromarray(image.permute(1, 2, 0).contiguous().cpu().numpy(), mode="RGB").save(
-        buffer, format=fmt.upper(), quality=max(0, min(100, quality)),
+        buffer, format=fmt.upper(), quality=quality,
     )
     return buffer.getvalue()
 

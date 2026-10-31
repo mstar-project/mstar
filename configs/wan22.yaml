@@ -5,19 +5,20 @@ model: "wan22"
 max_seq_len: 512
 
 # The untiled VAE decode runs the shared Wan VAE decoder, compiled (1.74x faster
-# decode at 1280x704 x 121 frames on an H200). The compile is per output
-# resolution, not frame count, about 20 s on an H200, so it runs only for the
-# listed sizes (default: 1280x704); any other size decodes with stock vae.decode.
+# decode at 1280x704 x 121 frames on an H200; 1.59x at 832x480 x 81). The compile
+# is per output resolution, not frame count, about 20 s on an H200, so it runs
+# only for the listed sizes, the 720p and 480p tiers here; any other size
+# decodes with stock vae.decode.
 #
 # The DiT is compiled per input shape, so only the listed "WxHxF" shapes
 # (default: 1280x704x81) use it, each compiling once with CFG and once without;
 # any other shape runs the DiT eager. Requests above max_video_pixels
 # (height x width x num_frames, default 268435456) get a 400.
 #
-# Uncomment the lines you need (one model_kwargs block) to list more decode
-# sizes or DiT shapes, restore stock vae.decode everywhere, or raise the ceiling:
-# model_kwargs:
-#   vae_decode_fast_sizes: ["1280x704", "832x480"]
+# Uncomment the lines you need to list DiT shapes, restore stock vae.decode
+# everywhere, or raise the ceiling:
+model_kwargs:
+  vae_decode_fast_sizes: ["1280x704", "832x480"]
 #   vae_decode_fast: false
 #   compile_dit_sizes: ["1280x704x81", "1280x704x121", "832x480x81"]
 #   max_video_pixels: 536870912

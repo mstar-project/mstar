@@ -2301,15 +2301,28 @@ GPU 2:
    node_groups:
      - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
      - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
-     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen]}
+     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
+
+A guided request's denoising runs as a sequence of walks. Its guided steps form one window,
+known when the request arrives, which runs as ``image_gen_guided2`` (text guidance) or
+``image_gen_guided3`` (text and image guidance), every branch in one combined forward on
+``LLM``. The steps before the window run as ``image_gen_head``, and the steps after it run
+as ``image_gen``, which also decodes; a window that reaches the last step is followed by the
+decode alone (``image_decode``). Each walk's loop is capped per request at its share of the
+steps (``get_loop_caps``), the conductor moves the request from one walk to the next, and
+the latents cross between walks as persisted edges. Each walk's branch count is fixed when
+the request arrives, so no node reads a loop counter to decide it. A request without
+guidance runs ``image_gen`` alone. A config that places ``LLM`` per walk, as above, lists
+all four of its denoise walks.
 
 BAGEL also supports a CFG-parallel mode. When the config names the extra
 ``LLM_cfg_text`` and ``LLM_cfg_img`` nodes, as in ``configs/bagel_cfg_parallel.yaml``, the
-model uses an ``image_gen_cfg`` walk instead. The loop body of that walk is a ``Parallel``
-of the three classifier-free-guidance branches, each on its own GPU, feeding a
-``combine_cfg`` node. The model code detects this mode only from the node names present in
-the config, so the extra parallelism is enabled in YAML and requires no code change. One
-model can therefore run in many physical layouts.
+window runs as ``image_gen_cfg2`` or ``image_gen_cfg3`` instead. The loop body of that walk
+is a ``Parallel`` of the guidance branches, each on its own GPU, feeding a ``combine_cfg``
+node, and a request without guidance never reaches the branch GPUs. The model code detects
+this mode only from the node names present in the config, so the extra parallelism is
+enabled in YAML and requires no code change. One model can therefore run in many physical
+layouts.
 
 Worked example: Whisper
 -----------------------

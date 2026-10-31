@@ -155,6 +155,17 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         ]
 
 
+def geometric_batch_sizes(max_batch_size: int) -> list[int]:
+    """Powers of two below ``max_batch_size``, then ``max_batch_size`` itself.
+
+    Startup grows with ``log B`` rather than ``B``; a batch between two sizes
+    pads up to the next (or splits into these sizes), and a full batch fits one.
+    """
+    if max_batch_size < 1:
+        raise ValueError(f"max_batch_size must be at least 1, got {max_batch_size}")
+    return [1 << i for i in range((max_batch_size - 1).bit_length())] + [max_batch_size]
+
+
 def distribute_tokens(total_tokens: int, bs: int) -> list[int]:
     """Split ``total_tokens`` across ``bs`` requests, remainder on the first.
     """

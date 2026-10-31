@@ -470,7 +470,7 @@ prefill, decode, and image generation on three GPUs:
    node_groups:
      - {node_names: [LLM], ranks: [0], graph_walks: [prefill_text, prefill_vit, prefill_vae]}
      - {node_names: [LLM], ranks: [1], graph_walks: [decode]}
-     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen]}
+     - {node_names: [LLM], ranks: [2], graph_walks: [image_gen, image_gen_head, image_gen_guided2, image_gen_guided3]}
 
 Because placement is config-only, the *same* model code runs single-GPU or fully
 disaggregated. ``configs/`` ships several layouts per model (``*_single_gpu``,

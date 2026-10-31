@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -170,6 +171,7 @@ class Wan22DiTAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         query = self.q_norm(self.q_proj(hidden_states))
@@ -184,13 +186,9 @@ class Wan22DiTAttention(nn.Module):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
-        # [B, S, H, D] -> [B, H, S, D] SDPA -> back (the reference's
-        # dispatch_attention_fn native path; bidirectional, no mask).
-        out = F.scaled_dot_product_attention(
-            query.permute(0, 2, 1, 3),
-            key.permute(0, 2, 1, 3),
-            value.permute(0, 2, 1, 3),
-        ).permute(0, 2, 1, 3)
+        # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
+        # native path) without a ragged callable, one segment per row with one.
+        out = joint_attention(query, key, value, ragged=attn_fn)
         return self.o_proj(out.flatten(2, 3))
 
 
@@ -251,6 +249,7 @@ class Wan22DiTBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        self_attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -260,7 +259,7 @@ class Wan22DiTBlock(nn.Module):
         c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)
 
         norm_hidden = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb)
+        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attn_fn=self_attn_fn)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
@@ -328,11 +327,14 @@ class Wan22DiT(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        self_attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, post-patch seq]`` per-token grid (``expand_timesteps`` — the
         only timestep form mstar's dit submodule produces), text embeds
-        ``[B, 512, text_dim]`` bf16. Returns ``[B, C_out, F, H, W]`` bf16."""
+        ``[B, 512, text_dim]`` bf16. Returns ``[B, C_out, F, H, W]`` bf16.
+        ``self_attn_fn`` runs the self-attention on the engine's ragged
+        resource; without it, and always for the cross-attention, SDPA."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -350,7 +352,7 @@ class Wan22DiT(nn.Module):
         )
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attn_fn)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes), then project and unpatchify.

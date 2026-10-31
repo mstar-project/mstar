@@ -89,7 +89,13 @@ def _pointer(tensor: torch.Tensor):
 
 def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     from mstar.conductor.request_info import DEFAULT_PARTITION
-    from mstar.model.bagel.submodules import IMAGE_SENTINELS, VAEEncoderSubmodule, vit_patches, vit_preprocess
+    from mstar.model.bagel.submodules import (
+        DENOISE_WALKS,
+        IMAGE_SENTINELS,
+        VAEEncoderSubmodule,
+        vit_patches,
+        vit_preprocess,
+    )
 
     cfg = model.config
     images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
@@ -97,14 +103,18 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     tensors = {"text_inputs": out.new_input_tensors.get("text_inputs", []),
                "image_inputs": out.new_input_tensors.get("image_inputs", images)}
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
-    fwd = model.get_initial_forward_pass_args(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
+    # what the data worker folds into model_kwargs from process_prompt
+    stamped = {key: value for key, value in out.metadata.items() if key != "kv_layout"}
+    fwd = model.get_initial_forward_pass_args(
+        DEFAULT_PARTITION, input_modalities, output_modalities, signals, {**kwargs, **stamped},
+    )
     metadata = fwd.full_metadata
     by_uuid = {id(t): t for by_name in tensors.values() for t in by_name}
     later = []
     while not model.get_partition_forward_pass_args(DEFAULT_PARTITION, metadata, {}).request_done:
         if not metadata.is_prefill:
             later.append(metadata.graph_walk)
-            if metadata.graph_walk in ("image_gen", "image_gen_cfg"):
+            if metadata.graph_walk in DENOISE_WALKS:
                 break
     config = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
@@ -190,7 +200,7 @@ def _bagel_checks(monkeypatch):
         manager_mod, "KVTransferManager", lambda *a, **kw: SimpleNamespace(remove_request=lambda rid: None),
     )
     model = _bagel()
-    model.config.num_timesteps = 3
+    model.config.num_timesteps, model.config.timestep_shift = 3, 3.0
     return model
 
 

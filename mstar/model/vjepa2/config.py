@@ -14,6 +14,10 @@ from typing import Any
 KV_CACHE = "kv"
 ATTN = "attn"
 
+# Frames of context an AC rollout request's video is trimmed to, matching
+# upstream's DROID training config (configs/train/vitg16/droid-256px-8f.yaml).
+AC_ROLLOUT_NUM_FRAMES = 8
+
 
 @dataclass
 class VJepa2ACPredictorConfig:

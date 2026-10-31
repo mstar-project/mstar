@@ -1,0 +1,32 @@
+model: "wan22"
+
+# See wan22.yaml. CFG-parallel on two GPUs, latency-oriented: the dit runs on
+# both, each rank computing one classifier-free-guidance branch at batch 1, and
+# the two noise predictions are all-gathered every step, so a guided denoise
+# step costs one branch's forward. The text encoder and both VAE passes run on
+# rank 0.
+# For throughput under concurrency, wan22_dp2.yaml (one full replica per GPU)
+# avoids rank 1 idling through rank 0's VAE decode.
+max_seq_len: 512
+
+model_kwargs:
+  vae_decode_fast_sizes: ["1280x704", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks: [0, 1]
+    # a two-rank lockstep instance; Wan2.2's dit uses it for the CFG branches,
+    # not to split the sequence
+    sp_size: 2

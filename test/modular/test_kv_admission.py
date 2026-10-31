@@ -486,7 +486,7 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
     kv.ingest_request("a", KVReqConfig(
         kv_layout={label: _layout(16 * n)["main"] for label, n in (("main", 2), ("cfg_img", 1), ("cfg_text", 3))},
         needed_labels_per_node_walk={
-            (NODE, WALK): ["main", "cfg_img"], ("LLM_cfg_text", "image_gen_cfg"): ["cfg_text"],
+            (NODE, WALK): ["main", "cfg_img"], ("LLM_cfg_text", "image_gen_cfg2"): ["cfg_text"],
         },
     ))
 
