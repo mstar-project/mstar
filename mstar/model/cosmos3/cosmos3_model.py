@@ -430,7 +430,7 @@ class Cosmos3Model(Model):
         # in-module, Megatron-style. The VAE decoder runs un-sharded on one rank.
         return ShardingConfig(
             groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={},
-            sp_enabled_nodes={DIT_NODE},
+            sp_enabled_nodes={DIT_NODE}, cfg_enabled_nodes={DIT_NODE},
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -1791,7 +1791,7 @@ class Cosmos3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None, guidance_parallel=None,
     ) -> torch.nn.Module | None:
         # autocast_dtype is accepted for interface parity (the engine manager
         # passes it to every model). Cosmos3 already casts the meta module to
@@ -1801,18 +1801,19 @@ class Cosmos3Model(Model):
         # config sets sp_size > 1); it is orthogonal to the tp_group.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group, sp_group, guidance_parallel)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Cosmos3 submodule for %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None, sp_group=None):
+    def _create_submodule(self, node_name: str, device: str, tp_group=None, sp_group=None, guidance_parallel=None):
         if node_name == DIT_NODE:
             return Cosmos3DiTSubmodule(
                 transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
+                guidance_parallel=guidance_parallel,
                 # Chained windows re-encode the frames they continue from: the
                 # decode on the streaming decoder's VAE, the encode on the
                 # encoder node's fp32 one, both shared with those nodes when

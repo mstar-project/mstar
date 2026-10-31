@@ -347,3 +347,176 @@ def test_cfg_size_places_two_branches(tmp_path):
     model, config, path = _wan22(tmp_path, cfg_size=3)
     with pytest.raises(DeploymentError, match="must be 1 or 2"):
         validate_deployment(model, config, path)
+
+
+def _cosmos3(rank, transformer=None):
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    placed = None if rank is None else GuidanceParallel(CommGroup(rank, rank, [0, 1]))
+    return Cosmos3DiTSubmodule(
+        transformer, Cosmos3Config(compile_denoise=False), scheduler=None, guidance_parallel=placed,
+    )
+
+
+def _gen_inputs(cfg=True, cfg_active=True, spans=(32,)):
+    from mstar.model.cosmos3.submodules import GenStepInfo
+    from mstar.model.submodule_base import ARNodeInputs
+
+    return [
+        ARNodeInputs(
+            input_seq_len=span, tensor_inputs={},
+            resource_step_info=GenStepInfo(cfg=cfg, cfg_active=cfg_active, capture_key=None),
+        )
+        for span in spans
+    ]
+
+
+@pytest.mark.parametrize("spans", [(32,), (32, 32)])
+def test_cosmos3_ranks_declare_the_same_pages_and_plan_each_branch_apart(spans):
+    from mstar.model.cosmos3.constants import VIDEO_GEN_WALK
+    from mstar.model.cosmos3.submodules import COND_LABEL, KV_CACHE, UNCOND_LABEL
+
+    rids = [f"r{i}" for i in range(len(spans))]
+    first, second = (
+        _cosmos3(rank).declare_step(VIDEO_GEN_WALK, rids, _gen_inputs(spans=spans)) for rank in (0, 1)
+    )
+    assert first.steps[KV_CACHE].segments == second.steps[KV_CACHE].segments
+    assert first.steps[KV_CACHE].combined_labels == second.steps[KV_CACHE].combined_labels == {}
+    assert {segment.label for segment in first.steps[KV_CACHE].segments} == {COND_LABEL, UNCOND_LABEL}
+
+
+def test_cosmos3_one_gpu_keeps_its_combined_plan():
+    from mstar.model.cosmos3.constants import VIDEO_GEN_WALK
+    from mstar.model.cosmos3.submodules import CFG_BATCHED_LABEL, COND_LABEL, KV_CACHE, UNCOND_LABEL
+
+    step = _cosmos3(None).declare_step(VIDEO_GEN_WALK, ["r0"], _gen_inputs())
+    assert step.steps[KV_CACHE].combined_labels == {(COND_LABEL, UNCOND_LABEL): CFG_BATCHED_LABEL}
+
+
+def test_cosmos3_walks_that_run_both_branches_keep_their_combined_plan():
+    from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
+    from mstar.model.cosmos3.submodules import CFG_BATCHED_LABEL, COND_LABEL, KV_CACHE, UNCOND_LABEL
+
+    step = _cosmos3(1).declare_step(VIDEO_SOUND_GEN_WALK, ["r0"], _gen_inputs())
+    assert step.steps[KV_CACHE].combined_labels == {(COND_LABEL, UNCOND_LABEL): CFG_BATCHED_LABEL}
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_step_outside_the_guidance_interval_runs_the_conditional_branch_on_both_ranks(rank):
+    from mstar.model.cosmos3.constants import VIDEO_GEN_WALK
+    from mstar.model.cosmos3.submodules import COND_LABEL, KV_CACHE
+
+    step = _cosmos3(rank).declare_step(VIDEO_GEN_WALK, ["r0"], _gen_inputs(cfg_active=False))
+    assert {segment.label for segment in step.steps[KV_CACHE].segments} == {COND_LABEL}
+
+
+class _BranchTransformer:
+    """Returns a velocity that names the rotary table it was given, recording the label."""
+
+    def __init__(self):
+        self.labels = []
+
+    def denoise_step(self, latents, timesteps, rotary, shapes, frames, indexes, label, attn):
+        self.labels.append(label)
+        return latents + rotary
+
+    def denoise_step_batched(self, requests, label, attn, cond_branch=None):
+        self.labels.append(label)
+        key = "rotary_cond" if cond_branch else "rotary_uncond"
+        return [req["latents"] + req[key] for req in requests]
+
+
+class _Exchange(GuidanceParallel):
+    """The all-gather's result on this rank: its own row, and the row the other rank
+    computes from the same latents."""
+
+    def __init__(self, rank, theirs):
+        super().__init__(CommGroup(rank, rank, [0, 1]))
+        self.theirs = theirs
+
+    def exchange(self, velocity):
+        theirs = self.theirs(velocity)
+        return (velocity, theirs) if self.runs_cond else (theirs, velocity)
+
+
+def _cosmos3_state(gs=5.0):
+    from types import SimpleNamespace
+
+    scheduler = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0]))
+    return {
+        "scheduler": scheduler, "gs": gs, "guidance_interval": None,
+        "cond": {
+            "num_noisy_vision_tokens": 4, "rotary": 1.0, "vision_token_shapes": None,
+            "vision_noisy_frame_indexes": None, "mse_gen_indexes": None,
+        },
+        "uncond": {"rotary": 3.0, "vision_token_shapes": None, "vision_noisy_frame_indexes": None,
+                   "mse_gen_indexes": None},
+    }
+
+
+@pytest.mark.parametrize("rank,label,other", [(0, "main", 3.0), (1, "uncond", 1.0)])
+def test_cosmos3_each_rank_runs_its_own_branch_and_both_combine_the_pair(monkeypatch, rank, label, other):
+    transformer = _BranchTransformer()
+    sub = _cosmos3(None, transformer)
+    sub.guidance_parallel = _Exchange(rank, lambda velocity: velocity * 0 + other)
+    seen = {}
+
+    def scheduler_step(st, velocity, t, latents):
+        seen["velocity"] = velocity
+        return latents
+
+    monkeypatch.setattr(sub, "_scheduler_step", scheduler_step)
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    sub._forward_image_gen(None, _cosmos3_state(), latents, torch.zeros(1, dtype=torch.long))
+    assert transformer.labels == [label]
+    # uncond (3) + 5 * (cond (1) - uncond (3))
+    assert torch.equal(seen["velocity"], torch.full_like(latents, -7.0))
+
+
+@pytest.mark.parametrize("rank,label", [(0, "main"), (1, "uncond")])
+def test_cosmos3_batched_step_exchanges_every_row_in_request_order(monkeypatch, rank, label):
+    from types import SimpleNamespace
+
+    from mstar.model.cosmos3.constants import VIDEO_GEN_WALK
+
+    transformer = _BranchTransformer()
+    sub = _cosmos3(None, transformer)
+    exchanged = []
+
+    def other_row(velocity):
+        exchanged.append(velocity.clone())
+        return velocity + (2.0 if rank == 0 else -2.0)  # the branches' rotary tables are 2 apart
+
+    sub.guidance_parallel = _Exchange(rank, other_row)
+    monkeypatch.setattr(sub, "_scheduler_step", lambda st, velocity, t, latents: velocity)
+    rids = ["a", "b"]
+    states = {rid: _cosmos3_state() for rid in rids}
+    latents = {rid: torch.full((1, 2, 1, 1, 1), float(i)) for i, rid in enumerate(rids)}
+    out = sub.forward_batched(
+        VIDEO_GEN_WALK,
+        SimpleNamespace(request_ids=rids, per_request_states=states, step=None, resources={"attn": None}),
+        latents=latents, time_index={rid: torch.zeros(1, dtype=torch.long) for rid in rids},
+    )
+    assert transformer.labels == [label]
+    assert len(exchanged) == 2
+    # request i's rows are i + 1 (cond) and i + 3 (uncond): both ranks combine them to i + 3 + 5 * -2
+    for i, rid in enumerate(rids):
+        assert torch.equal(out[rid]["latents"][0], torch.full_like(latents[rid], i - 7.0))
+
+
+def test_cosmos3_denoise_graphs_are_not_captured_under_the_placement():
+    from types import SimpleNamespace
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    captured = []
+    sub = Cosmos3DiTSubmodule(
+        SimpleNamespace(), Cosmos3Config(compile_denoise=False), scheduler=None,
+        guidance_parallel=GuidanceParallel(CommGroup(0, 0, [0, 1])),
+    )
+    sub._gen_capture_config = lambda *args, **kwargs: captured.append(args)
+    sub._prefill_capture_configs = lambda device: []
+    assert sub.get_accelerator_graph_configs(torch.device("cpu")) == []
+    assert captured == []
