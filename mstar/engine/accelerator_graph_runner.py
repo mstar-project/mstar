@@ -1268,6 +1268,7 @@ class AcceleratorGraphRunner:
             return with_inductor_overrides(self._compiled_forwards[spec.config_idx])
         return with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens, spec.bs,
+            getattr(spec.config, "decode_rows", False),
         )
 
     def _dummy_engine_inputs(
