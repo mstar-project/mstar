@@ -370,7 +370,8 @@ def test_a_replay_equals_the_eager_step_at_the_same_registers():
                                       (3.0, 0, 0.9), (1.0, 100, 1.0), (1.0, 0, 1.0)])
 def test_the_filter_matches_its_reference(settings):
     """The kernels and the torch path keep the same tokens and renormalise alike,
-    whether the filter's kept set fits the candidates or not (the last three)."""
+    whether the filter's kept set fits the candidates or not (the last three). The
+    vocabulary is small enough to read the references in float32."""
     temperature, top_k, top_p = settings
     rows, vocab = 8, 512
     logits = (torch.randn(rows, vocab, generator=torch.Generator().manual_seed(2)) * 3).to(DEV)
@@ -383,23 +384,50 @@ def test_the_filter_matches_its_reference(settings):
     assert torch.allclose(got, want, atol=1e-5, rtol=1e-3)
 
 
-def test_topk_replays_on_new_inputs():
-    """The selection under the filters, captured on one input and replayed on others."""
-    rows, vocab = 3, 2048
-    gen = torch.Generator().manual_seed(8)
-    x = torch.zeros(rows, vocab, device=DEV)
-    y = torch.topk(x, sampled.CANDIDATES, dim=-1)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        y = torch.topk(x, sampled.CANDIDATES, dim=-1)
-    for _ in range(5):
-        x.copy_(torch.rand(rows, vocab, generator=gen).to(DEV))
-        torch.cuda.synchronize()
-        graph.replay()
-        torch.cuda.synchronize()
-        want = torch.sort(x.cpu(), dim=-1, descending=True)
-        assert torch.equal(y.values.cpu(), want.values[:, :sampled.CANDIDATES])
-        assert torch.equal(x.cpu().gather(1, y.indices.cpu()), y.values.cpu())
+def _renormed(logits, temperature, top_k, top_p):
+    """FlashInfer's vocabulary-wide filter, the distribution the plain sampler draws from."""
+    fi = sampled.sampling
+    probs = fi.fused_temperature_softmax(logits, temperature, include_greedy=True)
+    return fi._top_p_renorm_probs(fi._top_k_renorm_probs(probs, top_k), top_p)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("settings", [(0.7, 40, 0.9), (0.7, 0, 0.9), (1.0, 5, 1.0), (1.0, 0, 0.95), (2.0, 0, 0.9),
+                                      (1.0, 100, 0.9), (1.0, 0, 1.0)])
+def test_the_filter_is_flashinfers_at_a_real_vocabulary(settings, dtype):
+    """Noise under a few dozen tokens across tiles, and the flat rows that run past
+    the candidates: the same tokens kept, in the same proportions."""
+    temperature, top_k, top_p = settings
+    rows, vocab = 6, 248320
+    g = torch.Generator().manual_seed(11)
+    logits = torch.randn(rows, vocab, generator=g) * 1.5
+    logits.scatter_add_(1, torch.randint(0, vocab, (rows, 64), generator=g), 6 + torch.rand(rows, 64, generator=g) * 14)
+    logits = logits.to(DEV, dtype=dtype)
+    args = (torch.full((rows,), float(temperature), device=DEV),
+            torch.full((rows,), top_k or vocab, device=DEV, dtype=torch.int32),
+            torch.full((rows,), float(top_p), device=DEV))
+    got, want = sampled.filtered_probs(logits, *args), _renormed(logits, *args)
+    assert torch.equal(got > 0, want > 0), ((got > 0).sum(-1), (want > 0).sum(-1))
+    assert torch.allclose(got, want, atol=1e-6, rtol=1e-3)
+
+
+def test_more_kept_tokens_in_a_tile_than_it_hands_up():
+    """A row whose kept tokens crowd one tile says it isn't complete, and the
+    target is exact all the same; a row they don't crowd is left to its candidates."""
+    rows, vocab = 2, 8192
+    logits = torch.full((rows, vocab), -30.0)
+    logits[0, :40] = 5.0 + torch.arange(40) * 0.01      # one tile
+    logits[1, torch.arange(40) * 200] = 5.0 + torch.arange(40) * 0.01      # many
+    logits = logits.to(DEV)
+    args = (torch.ones(rows, device=DEV), torch.full((rows,), vocab, device=DEV, dtype=torch.int32),
+            torch.full((rows,), 0.9, device=DEV))
+    cand = sampled.filtered_candidates(logits, *args)
+    assert cand.complete.tolist() == [0, 1]
+    got, want = sampled.filtered_probs(logits, *args), _renormed(logits, *args)
+    assert torch.equal(got > 0, want > 0)
+    assert torch.allclose(got, want, atol=1e-6, rtol=1e-3)
+    # past the candidates a draft is still a distribution to draw from
+    assert torch.allclose(cand.probs.sum(dim=-1), torch.ones(rows, device=DEV))
 
 
 def test_the_filter_matches_the_plain_sampler():
