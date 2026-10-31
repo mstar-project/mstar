@@ -1,0 +1,13 @@
+model: "qwen3_0.6b"
+# Qwen/Qwen3-0.6B, bf16, on the generic text LM (mstar/model/text_lm).
+max_seq_len: 32768
+model_kwargs:
+  max_seq_len: 32768
+resources:
+  kv_cache:
+    # 112 KiB a token (28 layers x 8 KV heads x 128 dims x K and V x bf16):
+    # 1024 pages of 128 tokens = 131k tokens, 14 GiB.
+    max_num_pages: 1024
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]

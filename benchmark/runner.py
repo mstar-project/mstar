@@ -676,12 +676,12 @@ def parse_args() -> BenchmarkConfig:
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
     # `--model-id` is what the request names, so a size other than the family's
-    # default (e.g. Qwen3.5-9B) reaches the server. Only the Qwen3.5 code takes
+    # default (e.g. Qwen3.5-9B) reaches the server. Only the Qwen3 and Qwen3.5 code takes
     # other checkpoints today; the rest pin one checkpoint and their constructors take no
     # such argument, so passing it would be a TypeError rather than a no-op.
     extra = (
         {"model_id": args.model_id}
-        if args.model_id and model_type in (ModelType.QWEN3_5, ModelType.QWEN3_8) else {}
+        if args.model_id and model_type in (ModelType.QWEN3, ModelType.QWEN3_5, ModelType.QWEN3_8) else {}
     )
     if model_type == ModelType.BAGEL:
         model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.bagel_image_preprocess)
