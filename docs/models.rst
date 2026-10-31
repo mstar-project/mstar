@@ -59,8 +59,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
-       LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_longctx.yaml``
-       serves a 1M-token window; ``python -m benchmark.glm.longctx_probe`` measures decode
+       LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_mtp.yaml``
+       drafts with MTP k=3 (greedy only). ``configs/glm5_next_tp8_longctx.yaml`` serves a
+       1M-token window; ``python -m benchmark.glm.longctx_probe`` measures decode
        speed and passkey retrieval by prompt length against a running server.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
@@ -76,7 +77,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``zai-org/GLM-5.2-FP8``
      - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
        ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or ``reference``, the numerics
-       anchor, served eager.
+       anchor, served eager. ``configs/glm52_tp8_mtp.yaml`` drafts with MTP k=3 (greedy only).
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.

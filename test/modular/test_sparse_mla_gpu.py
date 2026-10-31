@@ -70,10 +70,8 @@ def test_graph_plan_replays_each_steps_lengths(kpe):
 
 
 def test_an_eager_plan_queued_behind_other_work_keeps_its_own_plan():
-    """FlashInfer's plan() copies its pinned host buffer with an async memcpy torch does not
-    track. A windowed prefill drops a window's plan while that copy may still be queued and
-    plans the next window, which can reuse the freed pinned buffer: the queued attention must
-    still run with its own plan."""
+    """plan() copies its pinned host buffer with an async memcpy torch does not track: an
+    attention still queued keeps its own plan when the next window's plan reuses the buffer."""
     latent, lens, slots, q_nope, q_pe = _case(4, 64, seed=5)
     _, o_lens, o_slots, o_q, o_pe = _case(2, 64, seed=6)
     scale = 192 ** -0.5

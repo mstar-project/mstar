@@ -1,6 +1,6 @@
-"""GLM-5.2 ``dense_fp8`` in the model, on CPU: it follows the checkpoint, the module layout,
-TP shards along whole scale blocks, the load, and a reduced model whose forward is bitwise
-the bf16 model's (host tensors dequantize to bf16 exactly as the loader does)."""
+"""GLM-5.2's fp8 linears in the model, on CPU: TP shards along whole scale blocks, the load,
+and a reduced model whose forward is bitwise the bf16 model's (host tensors dequantize exactly
+as the loader does)."""
 import contextlib
 import importlib.util
 import sys
@@ -43,7 +43,6 @@ from mstar.engine.resources import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.components.distributed import ColumnParallelLinear  # noqa: E402
 from mstar.model.components.fp8_linear import COLUMN, ROW, Fp8Linear, Fp8ParallelGatedMLP  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
@@ -69,48 +68,10 @@ def _cfg(block=(16, 16), kernels="reference"):
 
 @contextlib.contextmanager
 def _bf16_linears():
-    """The layout an fp8 checkpoint had before its linears stayed fp8: every non-expert
-    linear dequantized to bf16 at load."""
+    """Every non-expert linear dequantized to bf16 at load, as without dense_fp8."""
     with mock.patch.object(Glm52ModelConfig, "dense_fp8", new_callable=mock.PropertyMock,
                            return_value=False):
         yield
-
-
-def test_dense_fp8_follows_the_checkpoint():
-    from mstar.model.glm52.glm52_model import Glm52Model
-
-    assert Glm52ModelConfig().dense_fp8 is False
-    assert Glm52ModelConfig.reduced().dense_fp8 is False
-    assert Glm52ModelConfig.reduced_fp8().dense_fp8 is True
-    assert Glm52Model("unused", config_variant="reduced_fp8").config.dense_fp8 is True
-    with pytest.raises(ValueError, match="dense_fp8"):
-        Glm52Model("unused", config_variant="reduced_fp8", dense_fp8=False)
-
-
-def test_fp8_linears_need_the_fp8_checkpoint():
-    from mstar.model.components.fp8_linear import dense_fp8_block
-
-    with pytest.raises(ValueError, match="quantization_config"):
-        dense_fp8_block(types.SimpleNamespace(dense_fp8=True, quantization_config=None))
-
-
-def test_flag_builds_fp8_linears_except_kv_b():
-    model = Glm52ForCausalLM(_cfg())
-    attn = model.model.layers[0].self_attn
-    for name in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"):
-        lin = getattr(attn, name)
-        assert isinstance(lin, Fp8Linear), name
-        assert lin.weight.dtype == torch.uint8 and lin.weight_scale_inv.dtype == torch.float32
-    assert isinstance(attn.kv_b_proj, ColumnParallelLinear)  # folded into bf16 w_kc / w_vc
-    assert tuple(attn.kv_a_proj_with_mqa.weight_scale_inv.shape) == (3, 8)  # 40 rows: ragged
-    assert isinstance(model.model.layers[0].mlp, Fp8ParallelGatedMLP)  # dense layer
-    assert isinstance(model.model.layers[1].mlp.shared_expert, Fp8ParallelGatedMLP)
-    assert model.model.layers[1].mlp.shared_expert.down_proj.reduce_results
-
-    with _bf16_linears():
-        off = Glm52ForCausalLM(_cfg())
-    assert isinstance(off.model.layers[0].self_attn.q_a_proj, torch.nn.Linear)
-    assert not any(isinstance(m, Fp8Linear) for m in off.modules())
 
 
 def test_bf16_autocast_leaves_the_fp8_layout_to_restore():
@@ -251,9 +212,8 @@ def _forward_cpu(model, cfg, ids):
 
 
 def test_cpu_forward_is_bitwise_the_bf16_model(cpu_flashinfer):
-    """On host tensors the fp8 linears dequantize to bf16 exactly as the loader does for
-    the flag-off model, so every shard, the fused q_a/kv_a scales and the SwiGLU halves
-    line up only if the logits agree bit for bit."""
+    """Host tensors dequantize as the loader does, so the logits are the bf16 model's bit for
+    bit only if every shard, the fused q_a/kv_a scales and the SwiGLU halves line up."""
     from test_glm52_moe import BLOCK, _fabricate_checkpoint
 
     torch.manual_seed(4)

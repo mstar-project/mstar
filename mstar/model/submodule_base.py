@@ -577,6 +577,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
+    def dynamo_recompile_limit(self) -> int | None:
+        """Entries dynamo may keep per code object of this submodule's compiled forwards, when
+        its captures need more than the engine's ``MSTAR_RECOMPILE_LIMIT``. The engine applies
+        it around this submodule's compiled calls only. None keeps the engine's."""
+        return None
+
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
     # numerically sensitive fp32 vocoder. The engine then neither casts its
     # params to the autocast dtype nor wraps its forward (or capture) in
@@ -904,8 +910,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def batch_cap_varies(self, graph_walk: str) -> bool:
         """Whether ``max_batch_size(graph_walk)`` follows state that changes while
-        serving (free slots, say). The scheduler asks such a cap every pass and
-        caches every other one, so a cap that moves must say so here."""
+        serving (free slots, say). The scheduler caches every other cap."""
         del graph_walk
         return False
 

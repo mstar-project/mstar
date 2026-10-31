@@ -267,8 +267,8 @@ def build_cpu_resources(
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
             class _ReplannedMLA(FlashInferMLAManager):
-                # EagerPiecewiseRunner plans before every region call, so a leased
-                # fallback plan is never replayed stale
+                # the CPU tests plan before every call, so a leased fallback plan is
+                # never replayed stale
                 @property
                 def uses_kernel(self) -> bool:
                     return True

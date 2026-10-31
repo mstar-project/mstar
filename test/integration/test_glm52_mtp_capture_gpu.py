@@ -89,9 +89,8 @@ def _mtp_cfg(k: int) -> dict:
 @pytest.mark.parametrize("k", [1, 3])
 @pytest.mark.parametrize("oracle", [False, True], ids=["mtp", "seed_oracle"])
 def test_captured_mtp_matches_eager_and_plain_decode(tmp_path, monkeypatch, eager_capture, k, oracle):
-    """Two requests decoded as one batch, captured at bs 1/2/4 (the batch runs the bs-2
-    bucket; the single prefills bs 1): captured == eager MTP == plain decode, token for token.
-    With the seed oracle every step's d1 is right, so replays verify accepted rows too."""
+    """Captured == eager MTP == plain decode for a batch of two; with the seed oracle's right
+    d1, replays verify accepted rows too."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
     model, submodule = _load(tmp_path, monkeypatch, fp8=False, cfg_overrides={**_mtp_cfg(0), **eager_capture})

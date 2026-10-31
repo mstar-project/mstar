@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # kernels: auto fuses all-reduces up to this size into the next add + RMSNorm; larger ones
 # reduce, add and norm apart
 AR_FUSION_MAX_BYTES = 1 << 20
-# the switches kernels and the checkpoint's quantization replaced
+# model_kwargs that kernels and the checkpoint's quantization replaced, refused rather than ignored
 _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
@@ -117,7 +117,6 @@ class Glm52Model(Model):
         if "mtp_num_draft_tokens" in kwargs:
             k = int(kwargs["mtp_num_draft_tokens"])
             if k < 0:
-                # a negative k read as off in some places and on in others
                 raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
             self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
@@ -132,10 +131,8 @@ class Glm52Model(Model):
         if self._config_variant in ("reduced", "reduced_fp8"):
             from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
-            # reduced() sizes 2 trunk layers, landing the MTP position
-            # (layer_idx = num_hidden_layers) on a SHARED indexer slot. Grow
-            # the trunk so it lands FULL, as the real 78 = 2 + 19·freq
-            # geometry does; real variants keep the MTP constructor's guard.
+            # reduced() has 2 trunk layers, which puts the MTP layer on a SHARED indexer
+            # slot; grow the trunk so it lands FULL, as layer 78 does in the real geometry
             if not is_full_indexer_layer(self.config, self.config.num_hidden_layers):
                 self.config.num_hidden_layers = (
                     self.config.index_skip_topk_offset - 1 + self.config.index_topk_freq
@@ -411,7 +408,7 @@ class Glm52Model(Model):
         if prompt is None:
             return {}
         if self.config.mtp_num_draft_tokens > 0:
-            # what prepare_inputs refuses, as a 500 once every rank had the request
+            # refused here as a 400; prepare_inputs would refuse it as a 500
             sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
@@ -480,10 +477,8 @@ class Glm52Model(Model):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP is greedy-only, so greedy is the declared default on MTP
-            # configs: a bare request serves instead of inheriting the config
-            # temperature and being refused by prepare_inputs. An explicit
-            # temperature > 0 still refuses.
+            # greedy by default under MTP, so a request that names no temperature serves
+            # rather than being refused; an explicit temperature > 0 still is
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 

@@ -1,13 +1,10 @@
-"""Kimi delta attention, sharded across tensor-parallel ranks.
+"""Kimi delta attention sharded by head across tensor-parallel ranks.
 
-Sharding is by head: q/k/v, the gates' up-projections, ``dt_bias``, ``A_log`` and ``b_proj`` by
-row, ``o_proj`` by column, and the depthwise conv per q/k/v block. Head dims, and so the gated
-norm's weight, do not shard. The recurrent pool shards to match (``DeltaNetGeometry`` over one
-rank's heads). The forward is inherited; ``o_proj``'s partials are summed once per layer.
-
-The loaders take a checkpoint tensor either whole or already sliced to this rank (a read plan
-that reads only its rank's head block). The conv's are always given a shard id, ``q`` / ``k`` /
-``v``: the checkpoints store three convs, which the layer runs as one.
+q/k/v, the gates' up-projections, ``dt_bias``, ``A_log`` and ``b_proj`` shard by row, ``o_proj``
+by column and the conv per q/k/v block; the head-dim weights (``f_a_proj``, ``g_a_proj``, the
+norm) are replicated. ``o_proj``'s partials are summed once per layer. A loader takes a
+checkpoint tensor whole or already sliced to this rank; the conv's take a shard id, ``q`` /
+``k`` / ``v``, since checkpoints store three.
 """
 from __future__ import annotations
 
@@ -61,9 +58,8 @@ def _slice_cols_loader(
 
 
 class ParallelKimiDeltaAttention(KimiDeltaAttention):
-    """``KimiDeltaAttention`` over one rank's heads, with the checkpoint loaders.
-
-    Takes the checkpoint's (total) head count and divides it here."""
+    """``KimiDeltaAttention`` over one rank's heads, with the checkpoint loaders. Takes the
+    checkpoint's total head count."""
 
     _CONV_SHARD_ROW = {"q": 0, "k": 1, "v": 2}
 
@@ -84,8 +80,7 @@ class ParallelKimiDeltaAttention(KimiDeltaAttention):
         self.tp_size = comm_group.world_size
         self.tp_rank = comm_group.rank
         self.total_num_heads = config.num_heads
-        # The base sees this rank's heads only; all its widths (qkv_dim, conv
-        # channels, gate widths) follow from that.
+        # the base sees this rank's heads only, and its widths follow
         local = replace(config, num_heads=divide(config.num_heads, self.tp_size))
         super().__init__(local, dtype=dtype, kda_key=kda_key, state_key=state_key)
         self.total_qkv_dim = self.total_num_heads * self.head_dim

@@ -1,5 +1,5 @@
-"""MLA without decoupled dims (GLM-5.3): both latent RMSNorms and the zero-kpe cache row in one
-kernel, for ``components/mla.py``."""
+"""MLA without decoupled dims (``mla_use_nope``): both latent RMSNorms and the zero-kpe cache row
+in one kernel, for ``components/mla.py``."""
 from __future__ import annotations
 
 import torch
@@ -28,8 +28,7 @@ if _HAS_TRITON:
         """
         t = tl.program_id(0)
         row = fused_ptr + t * fused_stride
-        # Triton needs a name bound in both branches to have one type, so each
-        # branch keeps its own (q_* is [BLOCK_Q], kv_* is [L]).
+        # a name bound in both branches must have one type in Triton, so each keeps its own
         if tl.program_id(1) == 0:
             q_offs = tl.arange(0, BLOCK_Q)
             q_mask = q_offs < Q
@@ -82,9 +81,8 @@ else:
 def mla_latent_norm_available(
     fused: torch.Tensor, q_norm_weight: torch.Tensor, kv_norm_weight: torch.Tensor,
 ) -> bool:
-    """Fused path is usable: triton present, bf16 CUDA activations and norm weights (the
-    serving dtype; the torch path casts anything else to it first), a unit-stride row, and a
-    power-of-two latent width."""
+    """Whether the kernel serves: triton, bf16 CUDA activations and norm weights, unit-stride
+    rows and a power-of-two latent width."""
     L = kv_norm_weight.shape[0]
     return (
         _HAS_TRITON and fused.is_cuda and fused.dim() == 2 and fused.stride(1) == 1

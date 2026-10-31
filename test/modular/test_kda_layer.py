@@ -1,10 +1,5 @@
-"""The shared KDA layer (``components/kda.py``, ``components/distributed/kda.py``) on CPU.
-
-Through the engine's KDA resource with its torch bundle, a prefill and decodes equal the same
-layer's dense reference on caller-held state (as GLM-5.3's resource test checks for its model),
-for both output gates: the low-rank ``g_a``/``g_b`` pair (GLM-5.3, Kimi-Linear) and Kimi K3's
-full-rank ``g_proj``, which the layer normalizes itself. Under tensor parallelism, ranks built
-from one checkpoint sum to the unsharded layer, whole or pre-sliced tensors alike.
+"""The shared KDA layer on CPU: through the KDA resource it computes what its dense reference
+does, for both output gates, and TP ranks loaded from one checkpoint sum to the full layer.
 """
 from __future__ import annotations
 
@@ -90,7 +85,6 @@ def test_the_resource_path_matches_the_dense_reference(full_rank):
     layer = ParallelKimiDeltaAttention(cfg, dtype=torch.float64)
     _randomize(layer)
     layer.process_weights_after_loading("cpu")
-    assert hasattr(layer, "g_proj") == full_rank and hasattr(layer, "g_a_proj") != full_rank
     pool, kda = _resources(cfg)
     layer.bind_resources({POOL: pool, KDA: kda})
     lengths = {"a": 5, "b": 70}

@@ -1,9 +1,6 @@
-"""Kimi delta attention in plain torch: the reference math, and ``TorchKDAKernels``, a
-``KDAManager`` kernel bundle that runs it against the recurrent pool's slots.
-
-The bundle is the manager's default wherever ``kda_triton``'s fused kernels do not run (no
-CUDA, or a head dim they are not validated for), and the oracle the fused kernels are tested
-against. Its prefill walks the spans on the host, so it cannot be captured.
+"""Kimi delta attention in plain torch, and ``TorchKDAKernels``, the ``KDAManager`` bundle
+that runs it on the pool's slots: the default where the fused kernels don't run, and their
+test oracle. Its prefill loops over the spans on the host, so it cannot be captured.
 """
 from __future__ import annotations
 
@@ -12,7 +9,7 @@ import torch.nn.functional as F
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """FLA-form l2 normalization: ``x / sqrt(sum(x^2) + eps)``, fp32 inputs."""
+    """``x / sqrt(sum(x^2) + eps)``, eps inside the root as in FLA; fp32 inputs."""
     inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x / inv_norm
 
@@ -61,7 +58,7 @@ def chunk_kda(
         for x in (query, key, value, beta, g)
     ]
 
-    # FLA computes these in fp32 — after the casts, before the scale.
+    # in fp32 and before the scale, as FLA does
     query = l2norm(query)
     key = l2norm(key)
 
@@ -69,8 +66,7 @@ def chunk_kda(
     v_head_dim = value.shape[-1]
     scale = 1 / (query.shape[-1] ** 0.5)
     if initial_state is not None:
-        # Clamp the chunk to a continue's own length: a short resume/verify
-        # tail is never padded out. L >= chunk_size continues are unchanged.
+        # a continue shorter than a chunk runs as one chunk of its own length
         chunk_size = min(chunk_size, sequence_length)
     pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
     total_sequence_length = sequence_length + pad_size
@@ -90,15 +86,14 @@ def chunk_kda(
     ]
     beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
 
-    # Per-head AND per-key-channel decay — the KDA/GDN divergence.
+    # decay per head and per key channel, where KDA differs from GDN
     g = g.cumsum(dim=-2)
     upper_incl_diag = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=0,
     )
-    # decay[i, j] = exp(g_i - g_j), (B, H, N, C, C, D), materialized for ALL
-    # chunks at once as the reference does. It is the largest transient in
-    # prefill, and recomputing it per chunk is how to shrink it.
+    # exp(g_i - g_j), (B, H, N, C, C, D), for every chunk at once as the
+    # reference does: prefill's largest transient
     decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
     attn = (
         -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask)
@@ -133,9 +128,9 @@ def chunk_kda(
         k_i = key[:, :, i]
         g_i = g[:, :, i]
 
-        # Inter chunk: decay-weighted read of the carry-in state.
+        # inter chunk: the decayed read of the carried-in state
         attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
-        # Intra chunk: diagonal INCLUDED — token i reads its own write.
+        # intra chunk, diagonal included: token i reads its own write
         attn_intra = (
             (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i])
             .sum(dim=-1)
@@ -145,7 +140,7 @@ def chunk_kda(
         v_new = u[:, :, i] - v_prime
 
         core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-        # exp(g_C) broadcasts over the v-dim: decay along the KEY dim of S.
+        # exp(g_C) decays S along its key dim
         last_recurrent_state = (
             last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
             + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
@@ -184,7 +179,7 @@ def recurrent_kda_step(
     q_t = query[:, 0]  # (B, H, D)
     k_t = key[:, 0]
     v_t = value[:, 0]
-    decay_t = g[:, 0].unsqueeze(-1).exp()  # (B, H, D, 1) — key-dim decay
+    decay_t = g[:, 0].unsqueeze(-1).exp()  # (B, H, D, 1): decay along the key dim
     beta_t = beta[:, 0].unsqueeze(-1)  # (B, H, 1)
 
     state.mul_(decay_t)
@@ -218,13 +213,9 @@ def gated_rms_norm(
 
 
 class TorchKDAKernels:
-    """The KDA resource's reference bundle: this module's torch math against the pool's
-    slots. Every slot is read and written on device at the plan's slot ids, so no step waits
-    on the host; prefill walks the spans on the host, so it cannot be captured. The pool's
-    state is V-first, ``[H, V, K]``; this math runs on K-first copies of it.
-
-    Takes what the fused bundle takes (the low-rank gates with ``params.f_b`` / ``g_b``) or
-    the full-rank forget gate, and returns what it would.
+    """The reference bundle. Slots are read and written on device at the plan's slot ids,
+    so no step waits on the host. The pool's state is V-first, ``[H, V, K]``; the math runs
+    on K-first copies. Takes the fused bundle's arguments, or a full-rank forget gate.
     """
 
     def layout(self, spans, num_tokens, fixed):
@@ -269,8 +260,8 @@ class TorchKDAKernels:
             start += n
             if n == 0:
                 continue
-            # the row's slot as a device index, not a host int: reading the id back would
-            # wait for the step's queued work. Its state K-first; a fresh slot is zeros.
+            # the slot as a device index: reading it back would wait on the step's queued
+            # work. A fresh slot is zeros.
             slot = slots[i:i + 1]
             conv = conv_state.index_select(0, slot)
             rec = rec_state.index_select(0, slot).transpose(-1, -2).contiguous()
@@ -302,8 +293,8 @@ class TorchKDAKernels:
 
     @staticmethod
     def _verify(qkv, f, beta, plan, conv_state, rec_state, spec, p):
-        """All rows at once, a row advancing through its prefix only while the token was
-        accepted (a mask where the kernel branches): no host reads, so a graph captures it."""
+        """All rows at once: a mask, where the kernel branches, advances a row through its
+        accepted prefix only, so nothing is read back and a graph captures it."""
         h, d = p.num_heads, p.head_dim
         n, block = plan.num_rows, plan.block
         weight = p.conv_weight.unsqueeze(1)  # the depthwise conv's [3P, 1, W]

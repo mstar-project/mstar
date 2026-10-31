@@ -77,9 +77,8 @@ class Glm52ModelConfig:
     index_skip_topk_offset: int = 3
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True
-    # Speculative decoding: 0 = off, k > 0 = draft k tokens per step with the
-    # layer-78 MTP module. Gates both the Glm52MTPModule construction and the
-    # layer-78 weight load.
+    # MTP speculative decoding: draft k tokens per step with the layer-78 module; 0 (off)
+    # neither builds nor loads it.
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
@@ -144,15 +143,11 @@ class Glm52ModelConfig:
     # dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts
     # alone outsize a device at TP8 on the real 753B checkpoint.
     moe_fp8_resident: bool = True
-    # "auto": the tuned kernels, each choosing per GPU from its module's table: the fused fp8
-    # MoE (the W8A8 runner, and up to 64 tokens fused_moe's decode chain, w8a16 with fp32
-    # routing weights, and its router kernel), the MLA latent prep as two kernels, every TP
-    # all-reduce fused into the next residual add + RMSNorm (and the MoE block's two partials
-    # reduced once), and prefill running the last layer's FFN on the rows it samples only.
-    # "reference": the numerics anchor, served eager: the per-expert dequant loop, the fp8
-    # linears dequantized per call as the loader would, the latent prep op by op, unfused
-    # all-reduces and norms, every prefill row through the last layer. The MoE prefill
-    # kernels, the runner's bits, run under both.
+    # "auto": the tuned kernels, each picking per GPU from its module's table: the fused fp8
+    # MoE with its decode chain and router kernel, the MLA latent prep in two kernels, each
+    # TP all-reduce fused into the next add + RMSNorm, and the last layer's FFN at prefill on
+    # the sampled rows only. "reference": the numerics anchor, all of those op by op, served
+    # eager. The MoE prefill kernels keep the runner's bits and run under both.
     kernels: str = "auto"
     # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
     # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that
@@ -179,10 +174,9 @@ class Glm52ModelConfig:
 
     @property
     def dense_fp8(self) -> bool:
-        """The non-expert linears the checkpoint stores in fp8 (q_a/kv_a, q_b, o_proj, the
-        shared expert, the dense-layer MLPs) stay fp8 with their block scales, half the bytes
-        of bf16 copies: exactly when the checkpoint is block fp8. kv_b_proj still dequantizes
-        (the absorbed MLA folds it into w_kc / w_vc)."""
+        """Whether the non-expert linears the checkpoint stores in fp8 stay fp8 with their block
+        scales: exactly when it is block fp8. kv_b_proj still dequantizes, since the absorbed
+        MLA folds it into w_kc / w_vc."""
         return self.quantization_config is not None
 
     @property

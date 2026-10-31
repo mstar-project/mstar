@@ -1,4 +1,5 @@
-"""Validate the glm5_next weight loader against a REAL GLM-5.3-Flash checkpoint."""
+"""Check the glm5_next weight loader against a real GLM-5.3-Flash checkpoint's headers (no
+tensor data): names, mapping, dtypes and shapes."""
 
 from __future__ import annotations
 
@@ -66,8 +67,8 @@ def main() -> int:
     print(f"[1] names: {len(real_names)} real, {len(index_names)} index, "
           f"{'MATCH' if not (only_index or only_files) else 'DRIFT'}")
 
-    # (2) full mapping on the real names (0 unmapped). MTP tensors are loaded
-    # only when drafting is enabled; at M1 (MTP off) they are a counted skip.
+    # (2) full mapping on the real names (0 unmapped); the MTP tensors are a counted skip
+    # unless drafting is on
     load_mtp = cfg.mtp_num_draft_tokens > 0
     res = resolve_index_names(real_names, cfg, load_mtp=load_mtp)
     unmapped = res.get("unmapped", ())
@@ -78,8 +79,7 @@ def main() -> int:
     print(f"[2] mapping: {loaded} loaded/absorbed, {skipped} skipped, "
           f"{len(unmapped)} unmapped")
 
-    # (3) dtype partition. Classify each real name by its dtype-family rule and
-    # assert the header dtype matches. fp8 weights must carry a scale sibling.
+    # (3) dtypes; an fp8 weight must carry a scale sibling
     def dtype_label(ds: str) -> str:
         u = ds.upper()
         if u.startswith("F8") or "E4M3" in u:
@@ -115,10 +115,9 @@ def main() -> int:
     print(f"[3] dtypes: {n_fp8} fp8(+scales), {n_bf16} bf16, {n_f32} fp32; "
           f"{len(scale_bases)} scale siblings")
 
-    # (3b) fp32-preservation coverage — the load path narrows every float param
-    # to bf16 then re-widens only FP32_PARAM_SUFFIXES. Every fp32 tensor that
-    # becomes a param (the 'loaded' stream; absorbed fp8 scales don't) must map
-    # to a target ending in one of those suffixes, else it loads bf16-downcast.
+    # (3b) the load narrows every float param to bf16 and re-widens only
+    # FP32_PARAM_SUFFIXES, so each fp32 tensor that becomes a param (absorbed fp8
+    # scales don't) must map to a target with one of those suffixes
     loaded_map: dict[str, str] = {}
     for entry in res.get("loaded", ()):
         raw, _, target = entry.partition(" -> ")
@@ -158,7 +157,7 @@ def main() -> int:
         else:
             print(f"    ok {name} {got}")
 
-    # find first KDA layer and first MLA layer from the schedule.
+    # the first KDA and the first MLA layer of the schedule
     kda_layer = next(i for i, t in enumerate(cfg.layer_types) if t == "linear_attention")
     mla_layer = next(i for i, t in enumerate(cfg.layer_types) if t != "linear_attention")
     pre = "model.language_model.layers"
@@ -167,7 +166,7 @@ def main() -> int:
     expect("lm_head.weight", [V, H])
     for c in ("q_conv1d", "k_conv1d", "v_conv1d"):
         expect(f"{pre}.{kda_layer}.self_attn.{c}.weight", [kda_qkv, 1, K])
-    # dt_bias / A_log fp32 restore set — shape sanity (per KDA spec: [qkv], [heads]).
+    # dt_bias and A_log, restored to fp32: [qkv] and [heads]
     for leaf, want in (("dt_bias", [kda_qkv]), ("A_log", [cfg.linear_num_heads])):
         got = sh(f"{pre}.{kda_layer}.self_attn.{leaf}")
         if got is None:

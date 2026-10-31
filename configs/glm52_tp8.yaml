@@ -4,13 +4,9 @@ model: "glm52"
 # checkpoint through the HF cache (HF_HOME) or pass
 # model_kwargs.checkpoint_path.
 #
-# The fp8 linears stay fp8, and the model serves its tuned kernels (kernels: auto):
-# the fused fp8 MoE, which is what lets decode capture, its decode and router
-# kernels, the MLA latent prep in two kernels, each all-reduce up to 1 MiB fused
-# with the next add + RMSNorm, and the last layer's FFN on the sampled rows at
-# prefill. model_kwargs.kernels: reference serves the numerics anchor instead,
-# eager. tp_async_sched builds decode step N+1 while step N runs
-# (MSTAR_TP_ASYNC_SCHED overrides).
+# model_kwargs.kernels: auto (the default) serves the tuned kernels, among them
+# the fused fp8 MoE that lets decode capture; kernels: reference serves the
+# numerics anchor, eager.
 #
 # Without dsa_long_context the context is capped at index_topk (2048), where
 # dense MLA equals the sparse reference exactly; the submodule refuses more.
@@ -18,8 +14,7 @@ model: "glm52"
 max_seq_len: 2048
 # A 750 GB load outruns PyTorch's default process-group timeout.
 dist_timeout_s: 7200
-# NVLS multicast all-reduce, one-shot up to 32 KiB; stays on NCCL, with a
-# warning, where NVLink multicast is unavailable.
+# NVLS multicast; NCCL, with a warning, where that is unavailable
 tp_allreduce: "symm_multimem"
 # a 2048-token prefill moves 24 MiB, which the 512 KiB default sends to NCCL
 tp_allreduce_max_kb: 32768
@@ -28,9 +23,9 @@ tp_async_sched: true
 # fit the pool below, so a decode step never finds it empty.
 max_concurrent_requests: 64
 model_kwargs:
-  # prefill graphs every 64 tokens to 2048 for one request (a 1024-token chat
-  # prompt is ~1100 tokens), coarser for batches to 4096; longer prefills run
-  # the compiled forward, where the GPU is the bound
+  # one request's prefill captures every 64 tokens to 2048 (a 1024-token chat
+  # prompt is ~1100), a batch's coarser to 4096; longer prefills are GPU-bound
+  # and run compiled
   prefill_token_buckets: [
     64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
     832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,

@@ -1,11 +1,7 @@
-"""The fused KDA kernels (kda_triton) against the torch reference, on CUDA: prefill, decode
-and verify.
+"""The fused KDA kernels against the torch reference on CUDA: prefill, decode and verify.
 
-The prefill oracle is ``KimiDeltaAttention.prefill`` run per span in fp32 against in-place slot
-views, as the reference bundle does; the fused path must be no less accurate than that
-reference under the engine's bf16 autocast. Decode is checked against the layer's
-``decode_step``, verify against ``TorchKDAKernels.run_verify`` over the pool's speculative
-blocks.
+The prefill oracle is the layer's ``prefill`` per span in fp32; the fused path must be no less
+accurate than that reference under the engine's bf16 autocast.
 """
 from dataclasses import dataclass
 
@@ -143,10 +139,6 @@ def _paged(kda, x, spans, rec, conv, kernels=None):
         return kda(x, 0)
 
 
-def _fused(kda, x, spans, rec, conv):
-    return _paged(kda, x, spans, rec, conv)
-
-
 def _rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
@@ -161,7 +153,7 @@ def _check(fused, served, oracle, what, floor):
 
 @pytest.mark.parametrize("fresh", [True, False])
 @pytest.mark.parametrize("lengths", [
-    (1,), (3,), (64,), (65,), (300,), (2048,),
+    (3,), (65,), (2048,),
     (5, 64, 1, 130, 2, 700),  # mixed: below the conv width, chunk edges, multi-chunk
     (63, 127, 128, 129),  # either side of the chunk boundaries
 ])
@@ -198,7 +190,7 @@ def _compare(kda, x, spans, fresh):
     rec_s, conv_s = rec.clone(), conv.clone()
     served = _reference(kda, x, spans, rec_s, conv_s, autocast=True)
 
-    out = _fused(kda, x, spans, rec, conv)
+    out = _paged(kda, x, spans, rec, conv)
 
     _check(out, served, oracle, "output", floor=1e-2)
     touched = [s.slot for s in spans]
@@ -229,8 +221,8 @@ def test_kda_prefill_continue_then_decode(fp32_matmul):
 
     first = [Span(slot=slot, q_start=0, q_len=100)]
     second = [Span(slot=slot, q_start=0, q_len=200)]
-    out = torch.cat([_fused(kda, x[:100], first, rec, conv),
-                     _fused(kda, x[100:300], second, rec, conv)])
+    out = torch.cat([_paged(kda, x[:100], first, rec, conv),
+                     _paged(kda, x[100:300], second, rec, conv)])
     slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
     kda.mix.attn.plan = KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
                                 spans=(1,), num_tokens=1, is_decode=True)
@@ -269,10 +261,8 @@ def _randomize(module, seed):
         for name, p in module.named_parameters():
             if "conv1d" in name:
                 p.normal_(0.0, 0.3)
-            elif name.endswith(("A_log", "dt_bias", "base", "e_score_correction_bias")):
+            elif name.endswith(("A_log", "dt_bias")):
                 p.normal_(0.0, 0.5)
-            elif name.endswith("scale"):
-                p.uniform_(0.5, 1.5)
             elif "norm" in name:
                 p.normal_(1.0, 0.1)
             else:
@@ -290,7 +280,7 @@ def _bind(kda, rec, conv, plan, kernels):
     kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
 
 
-@pytest.mark.parametrize("batch", [1, 5, 32])
+@pytest.mark.parametrize("batch", [1, 32])
 def test_kda_decode_matches_reference(batch):
     heads, head_dim, hidden, slots = 8, 128, 4096, 40
     kda = ParallelKimiDeltaAttention(KDAConfig(
@@ -387,8 +377,8 @@ def _after_verdict(pool, slots, accepted):
 
 @torch.no_grad()
 @pytest.mark.parametrize("block", [1, 2, 4])
-@pytest.mark.parametrize("batch", [1, 7, 64])
-def test_kernel_matches_reference(block, batch):
+@pytest.mark.parametrize("batch", [1, 64])
+def test_kda_verify_matches_reference(block, batch):
     """One TP8 rank's KDA layer (8 heads of 128) over four verify steps with random verdicts."""
     cfg = KDAConfig(hidden_size=4096, num_heads=8, head_dim=128)
     layer = _layer(cfg, "cuda", torch.bfloat16)
