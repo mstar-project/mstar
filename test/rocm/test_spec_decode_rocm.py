@@ -36,6 +36,7 @@ from mstar.engine.resources.recurrent import (
     RecurrentStep,
 )
 from mstar.engine.resources.spec_decode.config import SpecPhase
+from mstar.engine.resources.spec_decode.draft_head import Fp8DraftHead
 from mstar.engine.resources.spec_decode.resource import SpecDecodePlan, SpecDecodeResource
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.platforms import current_platform
@@ -324,6 +325,21 @@ def test_a_verify_step_issues_no_host_sync(k):
         step_with_attention()
         manager.run_conv(conv_x, conv_layer=pool.block("conv", 0), weight=conv_w)
         run(manager, pool, x, w)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4])
+def test_the_fp8_draft_head_issues_no_host_sync(rows):
+    head = Fp8DraftHead(torch.randn(2048, 1024, device=DEV).to(torch.bfloat16))
+    x = torch.randn(rows, 1024, device=DEV).to(torch.bfloat16)
+    # compile the kernels before the tripwire: a first launch syncs
+    head(x)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        head(x)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
