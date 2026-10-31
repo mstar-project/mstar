@@ -627,6 +627,30 @@ def test_a_follower_keeps_its_turn_taking_unless_the_placement_asks():
     assert _follow_head(scheduler, waiting=False)
 
 
+def test_a_follower_holds_local_work_for_a_moment_while_a_head_is_on_its_way(monkeypatch):
+    from mstar.worker import micro_scheduler
+
+    clock = [100.0]
+    monkeypatch.setattr(micro_scheduler.time, "monotonic", lambda: clock[0])
+    scheduler = _scheduler(lockstep_first_nodes={"dit"})
+    ready = {("vae_decoder", WALK): [1]}
+    scheduler._followed_rows_ready = True
+    assert scheduler._await_lockstep_head(ready)
+    clock[0] += scheduler.LOCKSTEP_HEAD_WAIT_SECONDS / 2
+    assert scheduler._await_lockstep_head(ready)
+    # the leader is busy with something else: local work goes ahead
+    clock[0] += scheduler.LOCKSTEP_HEAD_WAIT_SECONDS
+    assert not scheduler._await_lockstep_head(ready)
+    # nothing to hold, or no rows of the node here
+    assert not scheduler._await_lockstep_head({})
+    scheduler._followed_rows_ready = False
+    assert not scheduler._await_lockstep_head(ready)
+
+
+def test_a_rank_with_no_lockstep_first_node_never_waits():
+    assert not _scheduler()._await_lockstep_head({("vae_decoder", WALK): [1]})
+
+
 def test_no_node_goes_first_unless_the_placement_asks():
     scheduler = _scheduler()
     dit, vae = ("dit", WALK), ("vae_decoder", WALK)

@@ -217,6 +217,9 @@ class MicroScheduler:
     # Steps a lockstep-first node may run ahead of other ready work on this worker
     # before that work gets its turn. About the gap between two requests of a batch.
     LOCKSTEP_FIRST_STEPS = 8
+    # Seconds a follower holds local work back for a head on its way: the leader's
+    # post-step plus a ZMQ hop.
+    LOCKSTEP_HEAD_WAIT_SECONDS = 0.01
 
     def __init__(
         self, engine_manager: EngineManager,
@@ -234,6 +237,10 @@ class MicroScheduler:
         # other rank would sit idle in the step's collective.
         self.lockstep_first_nodes = frozenset(lockstep_first_nodes)
         self.lockstep_first_steps = 0
+        # A follower: rows of such a node are ready here, and when it gave up waiting
+        # for the leader's next head for them; see `_await_lockstep_head`.
+        self._followed_rows_ready = False
+        self._head_deadline: float | None = None
         # (node, real walk) -> combined walk; scheduling keys use the combined one
         self.combined_walk_of = combined_walk_of or {}
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -864,6 +871,8 @@ class MicroScheduler:
                 return scheduled
         if ready is None:
             ready = self._scan_ready(request_state, scan_target, scan_exclude)
+        if self._await_lockstep_head(ready):
+            return None
         # A walk with no room (a cap of 0) takes nothing, so it stays the least
         # recent; picked anyway, it would starve the walk that frees the room.
         rr_key = self._lockstep_first(self._select_node_rr({
@@ -901,8 +910,10 @@ class MicroScheduler:
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
         exclude = self.failed_rids.union(self.pending_removes, self.held_until)
+        self._followed_rows_ready = False
         for spec in self._ready_specs(exclude, target, exclude_target):
             if spec.node_name not in self.parallel_leader_nodes:
+                self._followed_rows_ready |= spec.node_name in self.lockstep_first_nodes
                 continue  # only rank 0 can initiate scheduling!
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
@@ -921,6 +932,22 @@ class MicroScheduler:
                     entries = ready.setdefault(self._key(spec.node_name, spec.graph_walk), [])
                 entries.append(ReadyNodeEntry(rid, wg_id, spec.graph_walk))
         return ready
+
+    def _await_lockstep_head(self, ready: dict[tuple[str, str], list[ReadyNodeEntry]]) -> bool:
+        """A follower with no head queued, local work ready and rows of a lockstep-first
+        node ready here: the leader's next step for those rows is on its way, and local
+        work started now would hold the instance for all of it. Wait a moment, a bounded
+        one, since the leader may be busy with work of its own."""
+        if not self._followed_rows_ready or not ready:
+            self._head_deadline = None
+            return False
+        now = time.monotonic()
+        if self._head_deadline is None:
+            self._head_deadline = now + self.LOCKSTEP_HEAD_WAIT_SECONDS
+        if now < self._head_deadline:
+            return True
+        self._head_deadline = None
+        return False
 
     def _key(self, node_name: str, graph_walk: str) -> tuple[str, str]:
         """The scheduling key: the walk's combined walk if it has one."""
