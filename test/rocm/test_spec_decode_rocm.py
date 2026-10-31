@@ -387,6 +387,70 @@ def test_the_filter_matches_its_reference(settings):
     assert torch.allclose(got, want, atol=1e-5, rtol=1e-3)
 
 
+def test_tokens_after_a_rejection_follow_the_target():
+    """Steps of a chain whose tokens depend on the one before, through the kernels
+    and their word streams: the pairs of emitted tokens have the target's joint
+    distribution, across the step boundary. A draft that shares a Philox word with
+    the replacement before it fails this."""
+    k, rows, vocab = 2, 30000, VOCAB
+    gen = torch.Generator().manual_seed(21)
+    target = (torch.randn(vocab, vocab, generator=gen) * 2).to(DEV)
+    draft = target + (torch.randn(vocab, vocab, generator=gen).to(DEV))
+    temperature = 0.8
+    args = (torch.full((vocab,), temperature, device=DEV), torch.full((vocab,), vocab, device=DEV, dtype=torch.int32),
+            torch.ones(vocab, device=DEV))
+    q = sampled.filtered_probs(target, *args)
+    spec = SpecDecodeResource(device=DEV, num_draft_tokens=k, max_requests=rows, page_size=PAGE, kv_key="kv",
+                              attn_key="attn", sampling=True)
+    for r in range(rows):
+        spec.ingest_request(r)
+    image = spec._new_image(rows)
+    image.rows[:rows].copy_(torch.tensor([spec._row_of[r] for r in range(rows)], device=DEV))
+    image.real[:rows].fill_(1)
+    table = (1 + torch.arange(rows * 8, device=DEV, dtype=torch.int32)).view(rows, 8)
+    state = torch.zeros(rows * (k + 1), dtype=torch.long, device=DEV)
+    spec._current = SpecDecodePlan(phase=SpecPhase.VERIFY, num_rows=rows, image=image, block_table=table,
+                                   kv_lens=torch.zeros(rows, dtype=torch.int32, device=DEV), write_pages=state,
+                                   write_offsets=state.clone())
+    regs = slice(1, rows + 1)
+    spec._temperature[regs] = temperature
+    spec._top_p[regs] = 1.0
+    spec._seed[regs] = torch.arange(rows, device=DEV)
+    spec._rng_offset[regs] = RNG_START
+    spec._budget[regs] = 1 << 20
+    spec._seq_len[regs] = 10
+    spec._num_acc[regs] = 1
+    spec._tokens[regs] = torch.tensor([3, 7, 7], device=DEV)
+    spec._draft_ids[regs] = 7
+    spec._draft_probs[regs] = 0.0
+    spec._draft_probs[1:rows + 1, :, 0] = 1.0
+    outs = []
+    for _ in range(2):
+        spec._seq_len[regs] = 10
+        ids, _ = spec.verify_inputs()
+        out = spec.accept(target[ids], sample=True)
+        last = out.target.gather(1, (out.accepted - 1).long()[:, None])[:, 0]
+        for j in range(k):
+            spec.begin_draft_pass(j)
+            last = spec.draw_draft(j, draft[last])
+            spec.record_draft(j, last)
+        outs.append(out.tokens.clone())
+    torch.cuda.synchronize()
+    tokens = torch.cat(outs, dim=1).cpu()
+    # each row's first two emitted tokens, past the -1s
+    keep = (tokens >= 0).long().argsort(dim=1, descending=True, stable=True)
+    first_two = tokens.gather(1, keep)[:, :2]
+    keys = first_two[:, 0] * vocab + first_two[:, 1]
+    pairs = torch.bincount(keys, minlength=vocab * vocab).float().view(vocab, vocab)
+    want = (q[3][:, None] * q).cpu()
+    # against what a sample of the target itself reads at this size
+    drawn = torch.multinomial(want.reshape(-1), rows, replacement=True, generator=gen)
+    iid = torch.bincount(drawn, minlength=vocab * vocab).float().view(vocab, vocab)
+    noise = 0.5 * (iid / rows - want).abs().sum()
+    tv = 0.5 * (pairs / rows - want).abs().sum()
+    assert tv < 2 * noise, (tv, noise)
+
+
 def _renormed(logits, temperature, top_k, top_p):
     """FlashInfer's vocabulary-wide filter, the distribution the plain sampler draws from."""
     fi = sampled.sampling
