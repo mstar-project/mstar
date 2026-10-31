@@ -207,7 +207,7 @@ def _attention(rows: int, width: int, table: torch.Tensor) -> AiterPagedAttentio
     """The real manager's kernel call over a plan with this block table."""
     manager = AiterPagedAttentionManager.__new__(AiterPagedAttentionManager)
     manager._device, manager._dtype, manager._scale = DEV, torch.bfloat16, 256 ** -0.5
-    manager._row_starts = None
+    manager._row_starts, manager._retired_row_starts = None, []
     manager._reserve_row_starts(rows)
     manager._current_plans = {"main": _Staged(
         manager._row_starts[: rows + 1], torch.ones(rows, dtype=torch.int32, device=DEV), table, 1, 32768, rows,

@@ -30,6 +30,7 @@ import sys
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 sys.path.insert(0, ".")
 
@@ -532,7 +533,7 @@ def test_attend_rows_reads_one_query_a_row_off_a_verify_plan(monkeypatch):
 
     manager = aiter.AiterPagedAttentionManager.__new__(aiter.AiterPagedAttentionManager)
     manager._device = CPU
-    manager._row_starts = None
+    manager._row_starts, manager._retired_row_starts = None, []
     manager._reserve_row_starts(3)
     cu, lens = torch.tensor([0, 3, 6, 9], dtype=torch.int32), torch.zeros(3, dtype=torch.int32)
     table = torch.zeros(3, 8, dtype=torch.int32)
@@ -561,6 +562,10 @@ def test_an_fp8_head_keeps_a_clear_argmax(monkeypatch):
     weight = torch.randn(256, 64, generator=gen, dtype=torch.bfloat16) * 0.02
     head = module.Fp8DraftHead(weight)
     assert head.weight.dtype == torch.float8_e4m3fnuz
+    # the engine moves the whole submodule to its dtype
+    bits = head.weight.clone()
+    head = nn.Sequential(head).to(dtype=torch.bfloat16)[0]
+    assert head.weight.dtype == torch.float8_e4m3fnuz and torch.equal(head.weight, bits)
     # rows along a row of the head: its own dot product stands well clear of the rest
     x = weight[[3, 200]].float() + 0.001 * torch.randn(2, 64, generator=gen)
     logits = head(x.to(torch.bfloat16))
