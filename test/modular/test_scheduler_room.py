@@ -134,9 +134,8 @@ def test_a_full_caller_batch_still_takes_nothing():
 
 
 def test_a_cap_that_moves_is_read_on_every_pass():
-    """A cap the submodule says varies (one that follows free slots) is read every
-    pass. A pass that kept an earlier pass's cap would hand prefill rows it has no
-    slot for: refused on one rank, a divergence error on a TP follower."""
+    """A cap the engine says varies, as one following the free slots does, is read on every
+    pass: a stale one would hand prefill rows no slot holds, a divergence on a TP follower."""
     max_bs = {"prefill": 2}
     sched, _, state = _setup({f"p{i}": "prefill" for i in range(4)}, max_bs=max_bs, varies={"prefill"})
 
@@ -150,8 +149,7 @@ def test_a_cap_that_moves_is_read_on_every_pass():
 
 
 def test_a_static_cap_is_asked_once():
-    """Every other cap is fixed once the graphs are captured: the scheduler asks the
-    engine once and keeps the answer, whatever the passes after it."""
+    """Any other cap is fixed once the graphs are captured, so the scheduler asks once."""
     max_bs = {"decode": 2}
     sched, _, state = _setup({f"d{i}": "decode" for i in range(4)}, max_bs=max_bs)
 

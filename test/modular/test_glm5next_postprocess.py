@@ -1,5 +1,5 @@
-"""GLM-5.3-Flash emits each token's raw bytes, so a character split across
-tokens survives per-token postprocess (per-token decode gave U+FFFD)."""
+"""postprocess emits each token's raw bytes, so a character split across tokens
+survives per-token streaming."""
 
 import torch
 

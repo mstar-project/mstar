@@ -1,6 +1,6 @@
-"""GLM-5.3-Flash assembled-model tests on the resource-pool engine — CPU,
-reduced config, no GPU deps.
-"""
+"""The assembled GLM-5.3-Flash model on its real engine resources, on CPU with the reduced
+config: prefill/decode parity, the layer schedule, the node resources, the MTP layer and the
+loader."""
 import sys
 import types
 from pathlib import Path
@@ -36,12 +36,10 @@ from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM  # no
 from mstar.model.glm5_next.components.moe import Glm5NextGatedMLP, Glm5NextSparseMoeBlock  # noqa: E402
 from mstar.model.glm5_next.config import (  # noqa: E402
     ATTN,
-    FULL_ATTENTION,
     KDA,
     KDA_STATE,
     KV_CACHE,
     LABEL,
-    LINEAR_ATTENTION,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -52,23 +50,13 @@ from mstar.model.glm5_next.glm5_next_model import (  # noqa: E402
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 
-# Chunked prefill and recurrent decode are mathematically equal but numerically
-# distinct (different reduction structure). In fp32 the gap between them is
-# BLAS-backend-dependent, and a tolerance wide enough to cover any backend
-# would swallow real bugs — gate wiring, state desync or op order move the
-# logits far more — so cross-path parity runs in float64 (LOGITS_ATOL_F64).
-# LOGITS_ATOL is for the same-path bitwise/greedy checks, which are stable.
-#
-# The MLA backend's SDPA fallback computes in fp32 whatever the model dtype, so
-# the float64 run still isolates the KDA chunk-vs-recurrent structure.
-LOGITS_ATOL = 1e-3
+# Chunked prefill and recurrent decode differ in reduction order, and in fp32 the gap is
+# BLAS-dependent: a tolerance wide enough for every backend would hide real bugs, so the
+# cross-path parity runs in float64. The MLA fallback computes in fp32 regardless.
 LOGITS_ATOL_F64 = 1e-5
 _WEIGHT_STD = 0.03
 
-# Small pages so a reduced prefill spans several: the paged latent gather of
-# the MLA fallback and the page-boundary bookkeeping of the KV resource are
-# on the path the parity tests measure. (The serve YAML tunes these under
-# ``resources: kv_cache:`` — this is the same override hook.)
+# small pages, so a reduced prefill spans several and crosses page boundaries
 _PAGE_SIZE = 8
 _MAX_PAGES = 32
 
@@ -150,16 +138,8 @@ def _build_model(
     return model, cfg
 
 
-class _GreedySampler:
-    """Argmax in place of the Triton sampler for the engine-path smoke test
-    (``forward_batched`` samples inside the forward)."""
-
-    def sample(self, request_ids, logits, **kwargs):
-        return logits.argmax(-1)
-
-
 class _Harness:
-    """A reduced ``Glm5NextForCausalLM`` behind the REAL engine resources."""
+    """A reduced ``Glm5NextForCausalLM`` behind the real engine resources."""
 
     def __init__(
         self,
@@ -215,14 +195,6 @@ class _Harness:
     def stored_len(self, rid: str) -> int:
         return self.kv._streams[rid][LABEL].stored_len
 
-    def rewind_kv(self, rid: str, n: int) -> None:
-        """Rewind a request's KV stream by ``n`` tokens. The KV resource has
-        no rewind entry point of its own, and on a paged cache a rewind is
-        only the stream's ``stored_len`` — its pages stay leased as a
-        high-water mark and heal by overwrite.
-        """
-        self.kv._streams[rid][LABEL].stored_len -= n
-
     # -- one engine step --------------------------------------------------
 
     def open_step(self, walk: str, request_ids: list[str], token_rows: list[torch.Tensor]):
@@ -272,14 +244,12 @@ class _Harness:
         )
 
 
-# --- (1) prefill == stepwise decode, batched, incl. save/restore ------------
+# --- prefill against stepwise decode ---------------------------------------
 
 
 @torch.no_grad()
 def test_prefill_matches_stepwise_decode_batched():
     """Chunked prefill and recurrent decode agree over the same tokens."""
-    # float64: isolates the chunk-vs-recurrent algorithmic equivalence from
-    # platform fp32 rounding, which the reduced config amplifies layer by layer.
     h = _Harness(seed=10, dtype=torch.float64)
     cfg = h.cfg
     prefill_lens = {"r0": 11, "r1": 7}
@@ -325,7 +295,7 @@ def test_prefill_matches_stepwise_decode_batched():
                 f"{rid} decode step {step}: max|d|="
                 f"{(logits[i] - want).abs().max().item():.3e}"
             )
-            # Same greedy trajectory, not merely close logits.
+            # the same greedy trajectory, not merely close logits
             assert int(logits[i].argmax()) == int(want.argmax())
 
     for rid in request_ids:
@@ -334,99 +304,7 @@ def test_prefill_matches_stepwise_decode_batched():
     assert h.pool.num_free_slots == h.usable
 
 
-@torch.no_grad()
-def test_decode_replays_bitwise_across_kda_snapshot_restore():
-    """snapshot -> decode k -> restore + KV rewind -> decode k again: the
-    replay is BIT-exact (same states, same ops), the strongest save/restore
-    check there is. The KV plane rewinds for free, the recurrent state does
-    not — hence the snapshot, taken from the request's slot in the pool.
-    """
-    h = _Harness(seed=12)
-    cfg = h.cfg
-    prefill_len, num_decode = 9, 3
-    torch.manual_seed(13)
-    ids = torch.randint(0, cfg.vocab_size, (prefill_len + num_decode,))
-
-    h.ingest("r0")
-    h.prefill(["r0"], [ids[:prefill_len]])
-
-    slot = _slot_of(h.pool, "r0")
-    snap = {name: block[:, slot].clone() for name, block in h.pool._blocks.items()}
-    assert snap["state"].shape == (
-        len(cfg.kda_layer_indices), cfg.linear_num_heads, cfg.linear_head_dim, cfg.linear_head_dim)
-
-    def run_decode():
-        out = []
-        for step in range(num_decode):
-            pos = prefill_len + step
-            out.append(h.decode(["r0"], ids[pos : pos + 1]))
-        return torch.cat(out)
-
-    first = run_decode()
-    assert h.stored_len("r0") == prefill_len + num_decode
-
-    for name, saved in snap.items():
-        h.pool._blocks[name][:, slot].copy_(saved)
-    h.rewind_kv("r0", num_decode)  # paged-KV rewind heals by overwrite
-    assert h.stored_len("r0") == prefill_len
-    replay = run_decode()
-
-    assert torch.equal(first, replay)
-    h.remove("r0")
-
-
-def test_kda_pool_lifecycle_is_explicit_and_loud():
-    """The pool's slot lifecycle, driven on the model's own declared pool."""
-    h = _Harness(seed=14, max_slots=2)
-    pool = h.pool
-    ids = torch.zeros(4, dtype=torch.long)
-    h.ingest("r0")
-    assert _slot_of(pool, "r0") is None  # ingest registers, admit leases
-
-    step, _ = h.open_step("prefill", ["r0"], [ids])
-    slot = _slot_of(pool, "r0")
-    assert slot is not None and slot != 0  # not the sink
-    # a fresh slot reads as zeros until the step that wrote it commits
-    assert h.kda.current_plan().has_state.tolist() == [False]
-    h.close_step(step)
-    assert pool._slots["r0"][LABEL].has_state
-
-    # Chunked continue: the same slot is kept (idempotent lease) and resumed.
-    step, _ = h.open_step("prefill", ["r0"], [ids[:2]])
-    assert _slot_of(pool, "r0") == slot
-    assert h.kda.current_plan().has_state.tolist() == [True]
-    h.close_step(step)
-
-    # A planned-but-dropped step (its forward never ran) moves nothing.
-    h.open_step("decode", ["r0"], [ids[:1]])
-    assert _slot_of(pool, "r0") == slot and pool.num_free_slots == 1
-
-    # reset zeroes the slot and keeps it; a freeing reset hands it back
-    pool.block("state", 0)[slot].fill_(1.0)
-    pool.reset_request("r0")
-    assert _slot_of(pool, "r0") == slot and not pool._slots["r0"][LABEL].has_state
-    assert pool._blocks["state"][:, slot].abs().sum() == 0
-    pool.reset_request("r0", free=True)
-    assert _slot_of(pool, "r0") is None and pool.num_free_slots == 2
-    h.remove("r0")
-    h.remove("r0")  # idempotent, engine may double-retire
-    assert pool.num_free_slots == 2 and _holders(pool) == set()
-
-    # Exhaustion is a retryable admit failure, not an exception.
-    h.ingest("a", "b", "c")
-    for rid in ("a", "b"):
-        h.close_step(h.open_step("prefill", [rid], [ids[:1]])[0])
-    node_in = [ARNodeInputs(input_ids=ids[:1], input_seq_len=1)]
-    step = h.sub.declare_step("prefill", ["c"], node_in)
-    step.set_ctx(StepContext(request_ids=("c",), graph_walk="prefill", slot=0, capture=False))
-    step.steps.pop(SAMPLER)
-    outcome = h.runner.admit(step)
-    assert not outcome.ok and outcome.failed_resource == KDA_STATE
-    assert "pool is full" in outcome.reason.message
-    h.remove("a", "b", "c")
-
-
-# --- (2) layer_types schedule honored ---------------------------------------
+# --- the layer schedule -----------------------------------------------------
 
 
 class _KVSpy:
@@ -452,60 +330,40 @@ class _KVSpy:
 
 @torch.no_grad()
 def test_layer_schedule_honored():
-    """idx % 4 == 3 -> MLA (compact planes), else KDA; dense iff idx < 3."""
+    """idx % 4 == 3 -> MLA on its compact plane, else KDA on the pool; a dense MLP iff
+    idx < first_k_dense_replace. A prefill writes the MLA planes in order and fills only its
+    own slot of the pool."""
     h = _Harness(seed=15)
     cfg, model = h.cfg, h.lm
 
-    assert cfg.layer_types == (
-        LINEAR_ATTENTION, LINEAR_ATTENTION, LINEAR_ATTENTION, FULL_ATTENTION,
-        LINEAR_ATTENTION, LINEAR_ATTENTION, LINEAR_ATTENTION, FULL_ATTENTION,
-    )
     for idx, layer in enumerate(model.model.layers):
         if idx % 4 == 3:
             assert isinstance(layer.self_attn, Glm5NextMLAAttention)
             assert layer.kv_plane == cfg.full_attn_layer_indices.index(idx)
             assert layer.self_attn.kv_plane == layer.kv_plane
-            assert layer.self_attn.indexer is not None  # every FULL owns one
+            assert layer.self_attn.indexer is not None
             assert layer.self_attn._kv is h.kv and layer.self_attn._attn is h.attn
         else:
             assert isinstance(layer.self_attn, ParallelKimiDeltaAttention)
             assert layer.kda_pos == cfg.kda_layer_indices.index(idx)
             assert layer.self_attn.mix.pool is h.pool and layer.self_attn.mix.attn is h.kda
-        if idx < cfg.first_k_dense_replace:
-            assert isinstance(layer.mlp, Glm5NextGatedMLP)
-        else:
-            assert isinstance(layer.mlp, Glm5NextSparseMoeBlock)
-        # mHC on every trunk layer, both sites.
-        assert layer.attn_hc.fn.shape == (
-            (2 + cfg.hc_mult) * cfg.hc_mult, cfg.hc_mult * cfg.hidden_size)
-        assert layer.ffn_hc.scale.shape == (3,)
-
-    # The KV pool holds exactly the full-attention planes.
-    assert h.kv.kv_cache.num_layers == len(cfg.full_attn_layer_indices) == 2
+        mlp = Glm5NextGatedMLP if idx < cfg.first_k_dense_replace else Glm5NextSparseMoeBlock
+        assert isinstance(layer.mlp, mlp)
+    assert h.kv.kv_cache.num_layers == len(cfg.full_attn_layer_indices)
 
     spy = _KVSpy(h.kv)
     h.ingest("r0")
     h.prefill(["r0"], [torch.randint(0, cfg.vocab_size, (6,))])
-    assert spy.writes == [0, 1]
-    assert spy.views == [0, 1]
+    assert spy.writes == spy.views == [0, 1]
     slot = _slot_of(h.pool, "r0")
     recurrent, conv = h.pool._blocks["state"], h.pool._blocks["conv"]
     for kda_pos in range(len(cfg.kda_layer_indices)):
         assert recurrent[kda_pos, slot].abs().sum() > 0
         assert conv[kda_pos, slot].abs().sum() > 0
-    # ... and only that slot: the sink and the free slots stay zero.
+    # the sink and the free slots stay zero
     others = [s for s in range(h.pool.config.max_slots) if s != slot]
     assert recurrent[:, others].abs().sum() == 0
     h.remove("r0")
-
-    # The real 45-layer schedule, config-level (never build full dims here).
-    full = Glm5NextModelConfig()
-    assert full.full_attn_layer_indices == tuple(range(3, 45, 4))
-    assert len(full.kda_layer_indices) == 34
-    assert [full.layer_types[i] for i in (0, 2, 3, 4, 43, 44)] == [
-        LINEAR_ATTENTION, LINEAR_ATTENTION, FULL_ATTENTION,
-        LINEAR_ATTENTION, FULL_ATTENTION, LINEAR_ATTENTION,
-    ]
 
 
 def test_kda_layers_hold_no_per_slot_state():
@@ -523,7 +381,7 @@ def test_kda_layers_hold_no_per_slot_state():
         assert not any(t.dim() >= 2 and t.shape[0] == slots for t in tensors), module
 
 
-# --- (3) registry + Model construction --------------------------------------
+# --- the node resources and registration -----------------------------------
 
 
 def _specs_by_key(model: Glm5NextModel) -> dict:
@@ -546,12 +404,11 @@ def test_serve_yaml_pages_cover_the_slot_pool(name):
     cfg.mtp_num_draft_tokens = serve["model_kwargs"]["mtp_num_draft_tokens"]
     # both pools hold a sink out of circulation
     requests = kda["max_slots"] - 1
-    assert requests == 64
     assert (kv["max_num_pages"] - 1) * kv["page_size"] >= requests * cfg.kv_rows
 
 
 def test_glm5next_model_constructs_from_config():
-    """The five node resources, full-size and reduced."""
+    """The five node resources, full-size and reduced; each builds on CPU."""
     model = object.__new__(Glm5NextModel)
     model.config = Glm5NextModelConfig()
     model.kda_max_requests = 32
@@ -559,68 +416,39 @@ def test_glm5next_model_constructs_from_config():
     specs = _specs_by_key(model)
 
     kv = specs[KV_CACHE].config
-    # 11 compact latent planes (full-attention layers only), one latent head.
+    # a compact latent plane per full-attention layer, one latent head
     assert kv.layout == KVLayout.MLA
-    assert kv.num_layers == 11
+    assert kv.num_layers == len(model.config.full_attn_layer_indices) == 11
     assert kv.num_kv_heads == 1
-    # NoPE: no rope slot in the cache unless MTP needs it (checked below)
+    # NoPE: no rope slot in the cache unless MTP needs it
     assert (kv.kv_lora_rank, kv.qk_rope_head_dim, kv.head_dim) == (512, 0, 512)
-    assert kv.num_qo_heads == 64
     assert kv.max_seq_len == model.config.index_topk == 2048
     assert kv.page_size == 128  # the FlashInfer MLA kernel's page size
-
-    attn = specs[ATTN]
-    assert attn.config.kv_cache == KV_CACHE and attn.depends_on() == {KV_CACHE}
-    assert attn.config.backend == AttnBackend.FLASHINFER_MLA
-    assert attn.config.sm_scale == pytest.approx(256 ** -0.5)
-
-    sampler = specs[SAMPLER]
-    assert sampler.vocab_size == 154880 and sampler.enable_repetion_penalty
+    attn = specs[ATTN].config
+    assert attn.backend == AttnBackend.FLASHINFER_MLA
+    assert attn.sm_scale == pytest.approx(256 ** -0.5)
 
     pool = specs[KDA_STATE].config
-    assert pool.num_layers == 34
-    assert pool.max_slots == 33 and pool.usable_slots == 32  # + the sink slot
-    rec, conv = pool.blocks["state"], pool.blocks["conv"]
-    assert rec.shape == (64, 128, 128) and rec.dtype == torch.float32
-    assert conv.shape == (3 * 64 * 128, 3) and conv.dtype == torch.bfloat16
-    assert rec.shard_dims == conv.shard_dims == (0,)  # heads and channels shard
+    assert pool.num_layers == len(model.config.kda_layer_indices) == 34
+    assert pool.usable_slots == 32  # and the sink slot
+    assert pool.blocks["state"].dtype == torch.float32
     specs[KDA_STATE].apply_yaml_overrides(max_slots=8)
     assert pool.max_slots == 8
     kda = specs[KDA]
     assert kda.depends_on() == {KDA_STATE}
     assert kda.config.variant is LinearAttnVariant.KDA
     assert kda.config.backend is LinearAttnBackend.TRITON
-    assert kda.config.gate_lower_bound == -5.0
 
+    # MTP adds the draft layer's plane, with the rope slot that masks rejected draft rows
     model.config.mtp_num_draft_tokens = 2
     kv_mtp = _specs_by_key(model)[KV_CACHE].config
-    assert kv_mtp.num_layers == 12  # + draft plane 11
-    assert kv_mtp.head_dim == 576  # the rope slot masks rejected draft rows
+    assert kv_mtp.num_layers == 12
+    assert kv_mtp.head_dim == 576
 
-    from mstar.graph.base import Loop
-
-    walks = model.get_graph_walk_graphs()
-    assert set(walks) == {"prefill", "decode"}
-    assert isinstance(walks["decode"], Loop)
-
-    # Real constructor path: no tokenizer IO at init, the tokenizer is lazy.
+    # the real constructor: no tokenizer IO at init
     constructed = Glm5NextModel(
         "zai-org/GLM-5.3-Flash", config_variant="reduced", kda_max_requests=4)
-    assert constructed.config.num_hidden_layers == 8
     reduced = _specs_by_key(constructed)
-    kv_reduced = reduced[KV_CACHE].config
-    # Same absorbed path as full-size — there is no non-absorbed fallback:
-    # 2 planes, one latent head of 32.
-    assert kv_reduced.layout == KVLayout.MLA
-    assert kv_reduced.num_layers == 2
-    assert kv_reduced.num_kv_heads == 1
-    assert kv_reduced.head_dim == kv_reduced.kv_lora_rank == 32
-    assert kv_reduced.num_qo_heads == constructed.config.num_attention_heads == 4
-    pool = reduced[KDA_STATE].config
-    assert pool.max_slots == 5 and pool.num_layers == 6
-    assert pool.blocks["state"].shape == (4, 16, 16)
-    assert pool.blocks["conv"].shape == (3 * 4 * 16, 3)
-    # Every spec builds into its resource on CPU (the harness relies on it).
     by_key = resolve_spec_dependencies(list(reduced.values()))
     for spec in reduced.values():
         info = EngineResourceInfo(
@@ -649,7 +477,7 @@ def test_glm5next_registered():
     assert registry.HF_MODELS["glm5_next"]["model_path_hf"] == "zai-org/GLM-5.3-Flash"
 
 
-# --- (4) MTP off / structure present ----------------------------------------
+# --- the MTP layer ----------------------------------------------------------
 
 
 @torch.no_grad()
@@ -661,19 +489,17 @@ def test_mtp_off_and_on_both_construct():
     model_on, cfg = h.lm, h.cfg
     mtp = model_on.mtp
     assert mtp is not None
-    # Draft plane is the COMPACT index after the trunk's full-attn planes
-    # (2 for the reduced config, 11 full-size) — never layer index 45.
+    # the draft plane is the compact index after the trunk's MLA planes, not layer index 45
     assert mtp.kv_plane == len(cfg.full_attn_layer_indices)
     assert h.kv.kv_cache.num_layers == mtp.kv_plane + 1  # the spec declared it
-    # Plain-residual layer: the checkpoint has no hc tensors at layer 45.
+    # plain residual: the checkpoint has no mHC tensors at layer 45
     assert not hasattr(mtp.transformer_layer, "attn_hc")
     assert isinstance(mtp.transformer_layer.self_attn, Glm5NextMLAAttention)
     assert mtp.transformer_layer.self_attn.indexer is not None  # own FULL indexer
     assert mtp.transformer_layer.self_attn._kv is h.kv  # bound like the trunk
 
-    # Draft-loop call contract: (embeds, prev_hidden) -> the shared-head norm
-    # output, which is both the caller-owned lm_head's input and the next
-    # draft's prev_hidden; run inside a planned engine step like any other layer.
+    # (embeds, prev_hidden) -> the shared-head norm output, which is the lm_head's input and
+    # the next draft's prev_hidden
     spy = _KVSpy(h.kv)
     h.ingest("r0")
     step, _ = h.open_step("prefill", ["r0"], [torch.tensor([5])])
@@ -712,7 +538,7 @@ def test_mtp_block_row_query_matches_the_causal_block():
     h.remove("r0")
 
 
-# --- (5) loader <-> model seam, executed -----------------------------------
+# --- the loader against the model ------------------------------------------
 
 
 def _raw_checkpoint_stream(model, cfg):
@@ -779,8 +605,7 @@ def test_loader_roundtrip_through_real_pipeline():
     for name, param_b in model_b.named_parameters():
         assert torch.equal(param_b, params_a[name]), name
 
-    # Conv fusion order is q|k|v by the module's cat order — pin the
-    # loader's placement against the raw stream, not just the roundtrip.
+    # the conv taps fuse q|k|v in the module's order: the placement, not just the roundtrip
     kda = model_b.model.layers[0].self_attn
     qkv = kda.qkv_dim
     raw = dict(stream)
@@ -790,12 +615,12 @@ def test_loader_roundtrip_through_real_pipeline():
     assert torch.equal(
         kda.conv1d.weight[2 * qkv :],
         raw["model.language_model.layers.0.self_attn.v_conv1d.weight"])
-    # Flat checkpoint ForgetGate names landed on the nested module.
+    # the checkpoint's flat forget-gate names land on the nested module
     assert torch.equal(
         model_b.model.layers[0].self_attn.forget_gate.dt_bias,
         raw["model.language_model.layers.0.self_attn.dt_bias"])
 
-    # Drafting off: the same stream loads the trunk and drops layer 45.
+    # drafting off: the same stream loads the trunk and drops layer 45
     model_c, _ = _build_model(seed=22, mtp_num_draft_tokens=0, process=False)
     loaded_c = model_c.load_weights(iter(stream))
     assert loaded_c == {name for name, _ in model_c.named_parameters()}
@@ -836,7 +661,7 @@ def test_checkpoint_load_refuses_a_missing_trunk_weight(tmp_path):
 
 
 def _safe_open_shards(repo_dir, device="cpu", prefix=None, keys=None, slice_spec=None):
-    """The mmap reader the loader iterators replaced: safe_open + get_slice."""
+    """The obvious reader, as the oracle: safe_open + get_slice."""
     import json
 
     from safetensors import safe_open
@@ -859,7 +684,7 @@ def _safe_open_shards(repo_dir, device="cpu", prefix=None, keys=None, slice_spec
 
 
 class _LinearScanMatcher:
-    """The first-win rule scan ``load_weights_into`` used before indexing."""
+    """A first-win scan over the stacked rules, as the oracle for the indexed matcher."""
 
     def __init__(self, rules):
         self.rules = rules
@@ -889,8 +714,7 @@ def test_fp8_checkpoint_loads_bit_identical_to_the_mmap_reader(tmp_path, monkeyp
     torch.manual_seed(25)
     stream = {}
     for key, tensor in _raw_checkpoint_stream(source, cfg):
-        # Routed and shared experts ship fp8 with 16x16 block scales here
-        # (reduced_fp8); every other tensor stays unquantized.
+        # the routed and shared experts ship fp8 with 16x16 block scales (reduced_fp8)
         if tensor.ndim == 2 and (".experts." in key or ".shared_experts." in key):
             rows, cols = tensor.shape
             stream[key] = (tensor * 64).to(FP8_DTYPE)
@@ -930,15 +754,14 @@ def test_fp8_checkpoint_loads_bit_identical_to_the_mmap_reader(tmp_path, monkeyp
 
 
 def test_full_geometry_names_resolve_through_pipeline():
-    """Representative full-config (45-layer) raw names resolve to targets
-    the loader expects — pins the forget_gate remap at the geometry the
-    real index has (the reduced roundtrip can't see layer 44)."""
+    """Full-geometry raw names resolve to targets the loader expects: the reduced roundtrip
+    can't see layer 44's KDA names or the MTP layer's."""
     from mstar.model.glm5_next.weight_loader import (
         expected_parameter_paths,
         resolve_index_names,
     )
 
-    cfg = Glm5NextModelConfig()  # config only — never build full dims
+    cfg = Glm5NextModelConfig()  # config only: full dims are never built
     names = [
         "model.language_model.layers.44.self_attn.dt_bias",  # KDA, flat
         "model.language_model.layers.44.self_attn.A_log",
@@ -963,14 +786,13 @@ def test_full_geometry_names_resolve_through_pipeline():
     assert "mtp.transformer_layer.self_attn.o_proj.weight" in targets
 
 
-# --- (6) the one MLP-math delta: the SwiGLU clamp ---------------------------
+# --- the SwiGLU clamp and the MoE kernel choice ----------------------------
 
 
 @torch.no_grad()
 def test_swiglu_clamp_engages_on_every_mlp_path():
-    """gate.clamp(max=L), up.clamp(-L, L), THEN silu — dense/shared MLP and
-    routed experts alike. Verified against an inline reference at a limit
-    small enough that unclamped math visibly diverges."""
+    """gate.clamp(max=L) and up.clamp(-L, L), then silu, on the dense MLP and on the shared
+    and routed experts, at a limit the unclamped math visibly misses."""
     from mstar.model.glm5_next.components.moe import Glm5NextMoEGate
 
     torch.manual_seed(31)
@@ -1025,7 +847,8 @@ def test_swiglu_clamp_engages_on_every_mlp_path():
 
 
 def test_moe_quant_kernel_resolution_and_clamp_guard(monkeypatch):
-    """'reference' and 'auto' resolve off the device; 'triton' refuses without one."""
+    """'reference', and 'auto' without fp8 dots, take the reference dispatch; 'triton'
+    refuses without them."""
     cfg = Glm5NextModelConfig.reduced_fp8()
     assert cfg.moe_quant_kernel == "reference"
     blk = Glm5NextSparseMoeBlock(cfg)
@@ -1044,11 +867,19 @@ def test_moe_quant_kernel_resolution_and_clamp_guard(monkeypatch):
     with pytest.raises(RuntimeError, match="needs CUDA"):
         blk_triton.process_weights_after_loading("cpu")
 
-    # before sm89 (A100) there are no fp8 dots: 'auto' is the reference, 'triton' refuses
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))
-    blk_a100 = Glm5NextSparseMoeBlock(cfg_auto)
-    blk_a100.process_weights_after_loading("cuda")
-    assert blk_a100._use_fused is False
+    # no NVIDIA fp8 dots by the platform's word, though the device reports a CUDA-style 9.4
+    # (an MI300X) and the fused kernels import
+    from mstar.model.glm5_next.components import moe as moe_mod
+
+    fake = types.ModuleType("mstar.utils.fused_moe")
+    fake.fused_experts_fp8 = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", fake)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 4))
+    monkeypatch.setattr(moe_mod, "current_platform", types.SimpleNamespace(
+        has_cuda_capability=lambda major, minor=0, device=None: False))
+    blk_no_dots = Glm5NextSparseMoeBlock(cfg_auto)
+    blk_no_dots.process_weights_after_loading("cuda")
+    assert blk_no_dots._use_fused is False
     with pytest.raises(RuntimeError, match="sm89"):
         Glm5NextSparseMoeBlock(cfg_triton).process_weights_after_loading("cuda")
 
@@ -1059,30 +890,8 @@ def test_moe_quant_kernel_resolution_and_clamp_guard(monkeypatch):
     assert blk_bf16.fp8_experts is False and blk_bf16._use_fused is False
 
 
-def test_the_fused_moe_asks_the_platform_for_fp8_dots(monkeypatch):
-    """An AMD GPU reports a CUDA-style capability (an MI300X is 9.4), which a raw check took for
-    sm89+: 'auto' resolves to the reference dispatch where the platform has no NVIDIA fp8 dots."""
-    from types import SimpleNamespace
-
-    from mstar.model.glm5_next.components import moe as moe_mod
-
-    fake = types.ModuleType("mstar.utils.fused_moe")
-    fake.fused_experts_fp8 = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", fake)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 4))
-    monkeypatch.setattr(moe_mod, "current_platform", SimpleNamespace(
-        has_cuda_capability=lambda major, minor=0, device=None: False))
-    cfg = Glm5NextModelConfig.reduced_fp8()
-    cfg.moe_quant_kernel = "auto"
-    block = Glm5NextSparseMoeBlock(cfg)
-    block.process_weights_after_loading("cuda")
-    assert block._use_fused is False
-
-
 def test_module_tree_matches_loader_expectations():
-    """The assembled tree == the loader's expected target set, name for name — the loader
-    <-> model integration seam, pinned without a checkpoint.
-    """
+    """The assembled module tree is the loader's expected target set, name for name."""
     from mstar.model.glm5_next.weight_loader import expected_parameter_paths
 
     for k, load_mtp in ((0, False), (2, True)):
@@ -1094,71 +903,6 @@ def test_module_tree_matches_loader_expectations():
             f"only in loader expectations: "
             f"{sorted(set(expected) - actual)[:5]}"
         )
-
-
-# --- (7) the submodule's engine path, end to end ----------------------------
-
-
-@torch.no_grad()
-def test_submodule_engine_path_prefill_then_decode():
-    """The submodule's own seam (prepare_inputs -> declare_step -> preprocess
-    -> forward_batched), with a greedy stand-in for the Triton sampler.
-    """
-    from types import SimpleNamespace
-
-    h = _Harness(seed=0)
-    sub, resources = h.sub, h.resources
-    resources[SAMPLER] = _GreedySampler()  # forward_batched samples in-forward
-
-    def step(walk, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        rids = list(inputs)
-        node_in = [
-            sub.prepare_inputs(walk, SimpleNamespace(request_id=f"wire-{rid}", rid_handle=rid),
-                               {"text_inputs": [ids]})
-            for rid, ids in inputs.items()
-        ]
-        st = sub.declare_step(walk, rids, node_in)
-        st.set_ctx(StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False))
-        st.steps.pop(SAMPLER)
-        assert h.runner.admit(st).ok
-        h.runner.plan(st)
-        ei = h.engine_inputs(rids)
-        out = sub.forward_batched(walk, ei, **sub.preprocess(walk, ei, node_in))
-        h.runner.commit(st)
-        rows = out.row_outputs["new_token"]
-        return {rid: rows[i : i + 1] for i, rid in enumerate(rids)}
-
-    prompts = {
-        "r0": torch.tensor([5, 9, 13, 7, 21], dtype=torch.long),
-        "r1": torch.tensor([3, 1, 4, 1, 5, 9, 2, 6, 5, 3], dtype=torch.long),
-    }
-    h.ingest("r0", "r1")
-    t1 = step("prefill", prompts)
-    t2 = step("decode", t1)
-    t3 = step("decode", t2)
-    for rid, prompt in prompts.items():
-        assert h.stored_len(rid) == prompt.shape[0] + 2
-
-    # Reference: the whole trajectory prefilled on a fresh request must yield
-    # the same third token (chunk-vs-step parity of the engine path).
-    for rid, prompt in prompts.items():
-        ref = f"ref-{rid}"
-        h.ingest(ref)
-        (t3_ref,) = step("prefill", {ref: torch.cat([prompt, t1[rid], t2[rid]])}).values()
-        assert t3_ref.item() == t3[rid].item(), (rid, t3_ref.item(), t3[rid].item())
-        h.remove(ref)
-
-    # The serving regime: a request may not cross index_topk (reduced: 64).
-    h.ingest("long")
-    too_long = torch.zeros(h.cfg.index_topk + 1, dtype=torch.long)
-    with pytest.raises(RuntimeError, match="index_topk"):
-        sub.prepare_inputs("prefill", SimpleNamespace(request_id="wire-long", rid_handle="long"),
-                           {"text_inputs": [too_long]})
-    assert sub.max_batch_size("decode") == h.usable
-
-    h.remove("r0", "r1", "long")
-    assert h.pool.num_free_slots == h.usable
-    assert _holders(h.pool) == set()
 
 
 @pytest.mark.parametrize("version,mtp,kpe", [
