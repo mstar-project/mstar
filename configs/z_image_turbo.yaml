@@ -20,14 +20,16 @@ model_kwargs:
   # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
   accelerator_graph: true
-  capture_sizes: [[1024, 1024]]
+  # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles per
+  # batch size inside its first requests and decodes on the eager VAE.
+  capture_sizes: [[1024, 1024], [768, 1344]]
   # Captions pad to multiples of 32 up to max_seq_len, so cap_len has 16 possible
   # values -- and it is an INPUT, not a shape: the DiT substitutes a learned
   # cap_pad_token at every padded position and attends over it, so a prompt cannot
   # be padded up into a wider bucket without changing the image. A cap_len with no
   # captured graph falls back to the eager batched path.
   #
-  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes),
+  # The capture budget per size is len(capture_caption_lengths) x len(capture_batch_sizes),
   # so all 16 lengths would be 128 graphs. Spend the budget on caption lengths
   # instead of batch sizes: a captured bucket already serves SHORTER batches by
   # padding them with dummy rows (CudaGraphRunner.DummyRowPool), so 1/2/4/8 covers
