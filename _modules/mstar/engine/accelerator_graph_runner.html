@@ -1456,15 +1456,25 @@ window.runMermaid = runMermaid;</script>
     <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Could not capture </span><span class="si">%s</span><span class="s2"> to size it"</span><span class="p">,</span> <span class="n">what</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="n">graph</span> <span class="o">=</span> <span class="n">outputs</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">taken</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">graph</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">sum</span><span class="p">(</span>
-        <span class="n">segment</span><span class="p">[</span><span class="s2">"total_size"</span><span class="p">]</span> <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_snapshot</span><span class="p">(</span><span class="n">pool</span><span class="o">.</span><span class="n">handle</span><span class="p">)</span>
-    <span class="p">)</span>
+    <span class="n">taken</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">graph</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">_pool_bytes</span><span class="p">(</span><span class="n">pool</span><span class="o">.</span><span class="n">handle</span><span class="p">)</span>
     <span class="k">del</span> <span class="n">graph</span><span class="p">,</span> <span class="n">outputs</span>
     <span class="c1"># A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS</span>
     <span class="c1"># workspace in the pool. No real graph uses it yet.</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_cuda_clearCublasWorkspaces</span><span class="p">()</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
     <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">taken</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">GraphMemory</span><span class="p">(</span><span class="n">taken</span><span class="p">,</span> <span class="nb">round</span><span class="p">(</span><span class="n">nodes</span> <span class="o">*</span> <span class="p">(</span><span class="n">executable</span><span class="o">.</span><span class="n">per_node</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">)))</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_pool_bytes</span><span class="p">(</span><span class="n">pool_id</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The bytes the caching allocator holds for graph pool ``pool_id``, read off the whole</span>
+<span class="sd">    snapshot: ``memory_snapshot(pool_id)`` drops a reference to each item of the id (torch</span>
+<span class="sd">    2.9-2.13), which past 256 pools frees the id while the pool's handle still holds it.</span>
+<span class="sd">    """</span>
+    <span class="n">pool_id</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">pool_id</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span>
+        <span class="n">segment</span><span class="p">[</span><span class="s2">"total_size"</span><span class="p">]</span> <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_snapshot</span><span class="p">()</span>
+        <span class="k">if</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"segment_pool_id"</span><span class="p">,</span> <span class="p">()))</span> <span class="o">==</span> <span class="n">pool_id</span>
+    <span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_graph_nodes</span><span class="p">(</span><span class="n">graph</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
