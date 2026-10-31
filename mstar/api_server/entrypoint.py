@@ -846,8 +846,9 @@ class APIServer:
         ``file_streams`` names, per modality in ``file_paths``' order, the
         client stream each file is for (None: the model decides);
         ``model_kwargs`` are this append's own. ``on_late`` answers the
-        append as late if the model routes any of it to a stream the client
-        already ended, which only the preprocess worker can tell.
+        append as late if the model routes any of it to a stream that has
+        ended (by the client, or with its consuming partition), which only
+        the preprocess worker can tell.
 
         Takes the submission's key (:meth:`submission_key`), not its
         request_id: once a call has finished, its id may already name a newer

@@ -67,6 +67,7 @@ def test_preprocess_failure_emits_error_chunk():
         take_failed_reads=lambda: [],
     )
     wt.model = _RejectingModel()
+    wt._client_edges = frozenset()
     wt.device = "cpu"
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}

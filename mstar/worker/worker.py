@@ -629,11 +629,11 @@ class Worker:
         self._removes_awaiting_step: dict[int, list[str]] = {}
 
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
-        # behind an in-flight GPU step; _draining_rids have stopped reading and
-        # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
-        # _reads_done_sent tracks which have already ACKed. These three are keyed
+        # behind an in-flight GPU step; _draining_rids take no new work and
+        # persist until REMOVE_REQUEST; _reads_done_sent tracks which have
+        # already ACKed, after which no read starts. These three are keyed
         # by the wire string: a DRAIN can precede the NEW_REQUEST that mints the
-        # handle, and a draining rid has to refuse that late NEW_REQUEST.
+        # handle.
         self._pending_drains: set[str] = set()
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
@@ -841,8 +841,7 @@ class Worker:
             engine.skip_publish(request_id, keys)
 
     def _add_new_request(self, body: NewRequest) -> None:
-        if body.request_id in self._draining_rids:
-            # Being torn down (out-of-order NEW after DRAIN); don't start reads.
+        if not self._takes_input(body.request_id):
             return
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted; a request with several partitions
@@ -856,6 +855,10 @@ class Worker:
             loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
+        if body.request_id in self._draining_rids:
+            # Drained before admission: take no new work, as ``_begin_drain``
+            # does for an admitted rid, while committed TP steps still run.
+            self.scheduler.fail_rids({request_id})
 
         now = _time.monotonic()
         for node_name in self.engine_manager.evictable_nodes():
@@ -911,7 +914,7 @@ class Worker:
     def _mark_removed(self, wire_rid: str) -> None:
         """Remember a request that will not be admitted here again, and drop
         what was parked for it. Clears the wire-keyed drain state too: a
-        request drained before its NEW_REQUEST (which was then refused) is
+        request drained before its NEW_REQUEST, refused after READS_DONE, is
         never admitted, so no later teardown would."""
         self._draining_rids.discard(wire_rid)
         self._pending_drains.discard(wire_rid)
@@ -1034,8 +1037,8 @@ class Worker:
         self._graph_runtime.remove_request(request_id)
 
     def _drain_request(self, body: DrainRequest) -> None:
-        """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
-        then ACK READS_DONE once its in-flight reads finish. The hard cleanup
+        """Phase-1 teardown (abort/fail): stop scheduling this rid, then ACK
+        READS_DONE once its in-flight reads finish. The hard cleanup
         (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
         only after every reader has ACKed."""
         if self.is_tp_follower and body.source not in (
@@ -1054,8 +1057,9 @@ class Worker:
 
     def _begin_drain(self, request_id: str) -> None:
         """Takes the wire string: a drain can arrive for a request this worker
-        never admitted, and it still has to go into ``_draining_rids`` so a late
-        NEW_REQUEST is refused."""
+        never admitted, and it still has to go into ``_draining_rids``, so a
+        late NEW_REQUEST is refused after READS_DONE, or admitted with its
+        handle failed while a committed TP-follow batch holds READS_DONE back."""
         handle = self._rid(request_id)
         # Fan the drain to TP followers so each rank drains and ACKs its own
         # READS_DONE (the conductor waits on every rank).
@@ -1087,7 +1091,8 @@ class Worker:
 
     def _complete_drain_if_ready(self, request_id: str) -> None:
         """ACK READS_DONE once no async read for the rid is still in flight.
-        The rid stays in _draining_rids (reads gated) until REMOVE_REQUEST."""
+        The rid stays in _draining_rids until REMOVE_REQUEST, and no read starts
+        for it after the ACK (``_takes_input``)."""
         if request_id not in self._draining_rids:
             return
         if request_id in self._reads_done_sent:
@@ -1141,10 +1146,15 @@ class Worker:
             list(body.successful_tensors.values()),
         )
 
+    def _takes_input(self, wire_rid: str) -> bool:
+        """Whether this rank still takes NEW_REQUEST and INPUT_SIGNALS for
+        ``wire_rid``: until it sends READS_DONE, draining or not, since a step
+        rank 0 committed may wait on one that arrives behind the forwarded
+        drain. After READS_DONE the producer may free what it sent."""
+        return wire_rid not in self._reads_done_sent
+
     def _process_new_inputs(self, body: InputSignals) -> None:
-        # Draining for teardown: don't start new reads for this rid. The
-        # producer's segment may be unlinked once every reader ACKs READS_DONE.
-        if body.request_id in self._draining_rids:
+        if not self._takes_input(body.request_id):
             return
         if logger.isEnabledFor(logging.DEBUG):  # the edge list is formatted per message
             logger.debug(
@@ -1166,9 +1176,10 @@ class Worker:
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
         # Handle producer_done signal: end the producer's streams it counts.
-        # The conductor (its only sender) counts every edge it ends, with 0
-        # items too, so a producer partition's end names each of its edges into
-        # this consumer, and a client's names only the streams the client ended.
+        # Its sender counts every edge it ends, with 0 items too: the conductor
+        # for a producer partition, naming each of its edges into this
+        # consumer, and the data worker for the client, naming only the
+        # streams the client ended.
         if body.producer_done and req_info:
             counts = body.producer_done_items
             for edge_name, sbuf in req_info.stream_buffers.items():
@@ -1219,22 +1230,23 @@ class Worker:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
         # Start RDMA reads for non-streaming edges with tensor_info
-        futures = self.tensor_manager.start_read_tensors(
-            request_id, non_streaming,
-            graph_walk=body.request_info.graph_walk
-        )
-        self.wakeup_event.register_futures(futures)
+        if non_streaming:
+            futures = self.tensor_manager.start_read_tensors(
+                request_id, non_streaming,
+                graph_walk=body.request_info.graph_walk
+            )
+            self.wakeup_event.register_futures(futures)
         # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
         if streaming_with_tensors:
             futures = self.tensor_manager.start_read_tensors(
                 request_id, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
+            # a client stream's chunks come with no forward-pass info, and drive no walk
+            walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
-                walk = body.request_info.stream_consumer_walks.get(
-                    self._walk_driven_edges.get(edge.name)
-                )
+                walk = walks.get(self._walk_driven_edges.get(edge.name))
                 for info in edge.tensor_info:
                     stream_buf.pre_read_register(info.uuid, walk)
         if self.enable_nvtx:
