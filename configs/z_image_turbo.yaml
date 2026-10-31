@@ -10,12 +10,14 @@ model_kwargs:
   attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
-  # transformer still lands at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below 40 dB)
+  # transformer still landed at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below
+  # 40 dB), measured before the compiled forward fused its q/k norms and rotary into one kernel
   compile_eager_rounding: true
   # compile_exact_ops keeps op classes on the eager kernels inside the compiled forward. On Z-Image the cost is the
   # 180 norm graph breaks per step: [norms] (or true) is >= 55.9 dB from the eager path on all 100 protocol prompts but
   # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
-  # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
+  # [activations] buys nothing (median 34.9 dB); the plain-compile and [activations] figures predate the fused q/k
+  # norm + rotary kernel. Default: the fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
@@ -37,8 +39,9 @@ model_kwargs:
   capture_caption_lengths: [32, 64, 96, 128]
   capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
-  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
-  # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
+  # compiled VAE decode (max-autotune), not bit-exact with the eager decode: before the folded upsample and split
+  # GroupNorm it was 3x faster at 1024^2 and ~56 dB from eager, and the autotuner may pick other conv kernels in another
+  # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)

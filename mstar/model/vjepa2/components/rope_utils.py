@@ -70,10 +70,8 @@ def apply_rope_BNHD(x: torch.Tensor, emb_sin: torch.Tensor, emb_cos: torch.Tenso
 
 
 class RopeTables(NamedTuple):
-    """One cached step's ``(sin, cos)`` per axis (``rope_tables_BNHD``): built once
-    from the step's positions and shared by every block, q and k."""
+    """One cached step's ``(sin, cos)`` (``ACRoPEAttention.rope_tables``): built
+    once from the step's positions and shared by every block, q and k."""
 
-    d: tuple[torch.Tensor, torch.Tensor]
-    h: tuple[torch.Tensor, torch.Tensor]
-    w: tuple[torch.Tensor, torch.Tensor]
+    spatial: tuple[torch.Tensor, torch.Tensor]  # d/h/w side by side over the head dim
     time: tuple[torch.Tensor, torch.Tensor] | None  # action tokens, over the d dims

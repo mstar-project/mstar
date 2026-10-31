@@ -224,9 +224,10 @@ class _Metadata:
     average_fps: float = 30.0
 
 
-def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
+def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None, key_frames=None):
     class FakeDecoder:
-        def __init__(self, *_args, **kwargs):
+        def __init__(self, source=None, *_args, **kwargs):
+            self.source = source
             self.metadata = metadata or _Metadata()
             if opened is not None:
                 opened.append(kwargs)
@@ -244,9 +245,20 @@ def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
             return torch.zeros(3, 64, 64, dtype=torch.uint8)
 
         def get_frames_at(self, indices):
+            if isinstance(self.source, str):
+                pathlib.Path(self.source).read_bytes()  # a decoder on a path reads the file to decode
             pulled.extend(indices)
-            return torch.zeros(len(indices), 3, self.metadata.height, self.metadata.width, dtype=torch.uint8)
+            # every pixel of a frame holds its index (mod 256), to tell the frames apart
+            frames = (torch.tensor(indices, dtype=torch.int64) % 256).to(torch.uint8)
+            return frames.view(-1, 1, 1, 1).expand(-1, 3, self.metadata.height, self.metadata.width)
 
+    if key_frames is not None:  # what _get_key_frame_indices returns, or the exception it raises
+        def _get_key_frame_indices(self):
+            if isinstance(key_frames, Exception):
+                raise key_frames
+            return key_frames
+
+        FakeDecoder._get_key_frame_indices = _get_key_frame_indices
     decoders = types.ModuleType("torchcodec.decoders")
     decoders.VideoDecoder = FakeDecoder
     monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
@@ -273,6 +285,63 @@ def test_vjepa2_refuses_sampled_frames_over_the_budget_before_decoding(monkeypat
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
         model.load_video("clip.mp4", "cpu")
     assert pulled == []
+
+
+def test_vjepa2_refuses_a_video_without_load_video_metadata():
+    """A video tensor it can't decode is an error, not a request without a video."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    model = VJepa2Model("unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="load_video"):
+        model.process_prompt(None, ["video"], ["video"], tensors={"video_inputs": [torch.zeros(8, 3, 64, 64)]})
+
+
+@pytest.mark.parametrize("kwargs, decoded", [
+    ({"rollout_horizon": 0}, 64),
+    ({"rollout_horizon": 4}, 8),
+    # the encoder-only walk encodes the whole clip, whatever horizon the request names
+    ({"rollout_horizon": 4, "skip_predictor": True}, 64),
+])
+def test_vjepa2_ac_decodes_only_the_frames_its_walk_encodes(monkeypatch, tmp_path, kwargs, decoded):
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    pulled = []
+    _fake_torchcodec(monkeypatch, pulled, _Metadata(num_frames=1000, height=64, width=64))
+    model = VJepa2Model("unused", skip_weight_loading=True, predictor_kind="ac")
+    upload = tmp_path / "clip.mp4"
+    upload.write_bytes(b"not decoded by the fake")
+    loaded = model.load_video(str(upload), "cpu")
+    assert pulled == []
+    upload.unlink()  # the API server deletes an upload on a timer that doesn't wait for the decode
+    out = model.process_prompt(
+        None, ["video"], ["video"],
+        tensors={"video_inputs": [loaded.data]}, input_metadata={"video_inputs": [loaded.metadata]},
+        actions=[[0.0] * 7] * 4, states=[[0.0] * 7] * 4, **kwargs,
+    ).new_input_tensors
+    assert pulled == loaded.metadata["sampled_indices"][:decoded]
+    assert out["video_frames"][0].shape[0] == decoded
+    assert out["video_inputs"] == []
+
+
+@pytest.mark.parametrize("key_frames, decoders", [
+    (torch.tensor([0, 10, 20, 30, 40]), 3),  # one per group of GOPs; the index's decoder decodes the first
+    ([0, 10, 20, 30, 40], 3),  # the list torchcodec's annotation promises
+    (RuntimeError("private API changed"), 1),  # an unusable index: one decoder, not an error
+])
+def test_gop_split_decode_returns_the_frames_in_the_order_asked(monkeypatch, key_frames, decoders):
+    """Sampled frames grouped by keyframe interval decode on separate decoders, each frame
+    once, and come back in the order asked for, duplicates included; without a usable
+    keyframe index they decode on one decoder."""
+    from mstar.model.components import video_decode
+
+    pulled, opened = [], []
+    _fake_torchcodec(monkeypatch, pulled, opened=opened, key_frames=key_frames)
+    monkeypatch.setattr(video_decode, "_max_decoders", lambda: 3)
+    indices = [41, 3, 22, 3, 15, 0, 35, 22, 8]
+    frames = video_decode.decode_frames_at(torch.zeros(16, dtype=torch.uint8), indices)
+    assert frames[:, 0, 0, 0].tolist() == indices
+    assert sorted(pulled) == sorted(set(indices) if decoders > 1 else indices)
+    assert len(opened) == decoders
 
 
 def _mp4(path, frames, side=64):

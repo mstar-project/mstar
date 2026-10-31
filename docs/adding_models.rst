@@ -1979,8 +1979,9 @@ the CPUs.
 A model whose media load and ``process_prompt`` are thread-safe can also prepare several
 requests at once on a thread pool by setting ``PREPROCESS_WORKERS`` on the class above 1
 (the default 1 prepares them one at a time on the data-worker thread). The class value is
-the default pool size, which a deployment may change with ``preprocess_workers`` (see
-:doc:`serving`); a class left at 1 gets no pool. Requests are still handed on in arrival order.
+the default pool size (V-JEPA2 sets 8, V-JEPA2-AC 4), which a deployment may raise or lower
+with ``preprocess_workers`` (see :doc:`serving`); a class left at 1 gets no pool. Requests
+are still handed on in arrival order.
 
 .. _tensor-parallelism:
 
