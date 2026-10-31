@@ -208,10 +208,14 @@ def test_a_row_that_overstayed_its_loop_stop_is_not_stopped_again():
 
 def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
     """A chunkable walk the prefix cache served whole never runs, but its chunk
-    Loop is still stopped. Finalizing that stop read the row's forward-pass
-    info, which a row that did not run no longer has: ``KeyError``, and every
-    request in the step failed with it."""
+    Loop still has to end, which its route stride does. Finalizing a stop for
+    it once read the row's forward-pass info, which a row that did not run no
+    longer has: ``KeyError``, and every request in the step failed with it."""
+    from mstar.model.submodule_base import CHUNK_LOOP_END
+
     batch, runtime, w = _postprocess(_Sub(skip={2}), cached={2}, chunk_loop=True)
-    assert sorted(runtime.stopped) == [1, 2], "the served row's loop still ends"
+    served = ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={2: 0})
+    assert w.chunk_loops.loop_strides(served, [2]) == [CHUNK_LOOP_END], "the served row's loop still ends"
+    assert runtime.stopped == [1], "by its stride, not a stop"
     assert not w.reported
     assert 2 not in batch.resource_publish_info
