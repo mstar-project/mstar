@@ -2,11 +2,11 @@
 
 As in ``gdn.py``, the pool's addressing arrives through ``ctx.plan_results`` and a
 layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resolves.
-The math is a kernel bundle's: ``kda_triton.TritonKDAKernels`` on CUDA at a head
-dim it is validated for, ``kda_torch.TorchKDAKernels`` elsewhere. A bundle
-implements ``layout`` (the token layout its prefill reads, or None), ``run_paged``
-and, for a speculative step, ``run_verify``. The plan stages the layout into
-buffers that stay put under capture.
+The math is a kernel bundle's, which the resource picks from the spec and the pool:
+``kda_triton.TritonKDAKernels`` where they run it, ``kda_torch.TorchKDAKernels``
+elsewhere. A bundle implements ``layout`` (the token layout its prefill reads, or
+None), ``run_paged`` and, for a speculative step, ``run_verify``. The plan stages the
+layout into buffers that stay put under capture.
 """
 
 from __future__ import annotations
@@ -97,12 +97,14 @@ class KDAPlan:
         return self._cache[key]
 
 
-def _default_kernels(device: torch.device, head_dim: int):
-    # the Triton kernels inline NVIDIA PTX
-    if (device.type != "cuda" or current_platform.is_rocm() or not kda_triton._HAS_TRITON
-            or not kda_triton.supported(head_dim)):
-        return kda_torch.TorchKDAKernels()
-    return kda_triton.TritonKDAKernels()
+def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, config: LinearAttnConfig):
+    fused = (
+        # the Triton kernels inline NVIDIA PTX
+        device.type == "cuda" and not current_platform.is_rocm() and kda_triton._HAS_TRITON
+        and kda_triton.supported(geometry.head_k_dim) and geometry.conv_kernel_size == 4
+        and not config.full_rank_output_gate
+    )
+    return kda_triton.TritonKDAKernels() if fused else kda_torch.TorchKDAKernels()
 
 
 class KDAManager(LinearAttnManager):
@@ -113,7 +115,6 @@ class KDAManager(LinearAttnManager):
         num_layers: int,
         state_dtype: torch.dtype,
         device: torch.device,
-        kernels=None,
         speculative_tokens: int = 0,
     ):
         if (geometry.num_k_heads != geometry.num_v_heads
@@ -132,7 +133,7 @@ class KDAManager(LinearAttnManager):
         self.num_layers = num_layers
         self._device = device
         self._pool_key = config.recurrent_state
-        self.kernels = kernels if kernels is not None else _default_kernels(device, geometry.head_k_dim)
+        self.kernels = _default_kernels(device, geometry, config)
         # k of the pool's speculative blocks: a verify block spans up to k + 1 tokens
         self.speculative_tokens = speculative_tokens
 
@@ -145,9 +146,10 @@ class KDAManager(LinearAttnManager):
         self._preplanned = False
         self._cached_plan_output: dict[str, KDAPlan] | None = None
 
-    def set_kernels(self, kernels) -> None:
-        """Run every layer on ``kernels`` instead of the default bundle."""
-        self.kernels = kernels
+    @property
+    def prefill_capturable(self) -> bool:
+        """Whether a captured prefill replays with each step's spans on these kernels."""
+        return self.kernels.prefill_capturable
 
     def depends_on(self) -> set[str]:
         # the pool plans first; its addressing arrives via `ctx.plan_results`
