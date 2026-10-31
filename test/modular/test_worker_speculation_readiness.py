@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import SpeculationTarget, Worker
 
 
@@ -37,7 +38,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
     worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: 0, get_fwd_info=lambda rid, p: None)
     target = SpeculationTarget(SimpleNamespace(node_name="decoder", graph_walk="walk"), [1, 2, 3])
 
-    batch = SimpleNamespace(node_name="audio_encoder", incomplete_node_rids=set())
+    batch = ScheduledBatch(node_name="audio_encoder", graph_walk="walk")
     worker._try_speculate_next(SimpleNamespace(batch=batch), target)
 
     assert worker._spec_preparer.prepped == [1, 3], "a request the decoder would not run was carried onto it anyway"

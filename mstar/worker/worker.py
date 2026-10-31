@@ -97,7 +97,6 @@ from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_acr
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
-    MidPrefillRow,
     ScheduledBatch,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -2723,15 +2722,14 @@ class Worker:
         # to run it, since the target's admit would otherwise skip the readiness
         # check. The teardown filter comes first, since the readiness check would
         # queue a torn-down rid or reload its pages.
-        # A row mid-prefill loops back on nothing of N's; it joins the merge
-        # below as `mid_prefill`.
-        held = batch_N.incomplete_node_rids
-        speculating_same_node = spec_node_name == batch_N.node_name
-        candidates = (
-            [r for r in walk_rids if not self._is_tearing_down(r) and r not in held]
-            if self._teardowns_pending() or held else walk_rids
+        # N's rows mid-prefill take their next chunk in this step, not the one
+        # after; their nodes stay off the ready queue until N's chunk lands.
+        candidates, mid_prefill = batch_N.get_continuing_rows(
+            spec_node_name, walk_rids,
+            self._is_tearing_down if self._teardowns_pending() else None,
+            self.chunk_loops.speculated,
         )
-        if not speculating_same_node:
+        if spec_node_name != batch_N.node_name:
             partition = self.request_state.get_partition_for_node(spec_node_name)
             candidates = [
                 r for r in candidates
@@ -2746,17 +2744,6 @@ class Worker:
         laps.lap("continuing_inputs")
         continuing = prep.ready_rids
 
-        # N's rows whose node needs another chunk take it in this step, not the
-        # one after: their nodes stay off the ready queue until N's chunk lands
-        mid_prefill = [
-            MidPrefillRow(
-                r, batch_N.request_to_worker_graph[r], batch_N.walk_of(r),
-                batch_N.chunk_ranges[r].end, batch_N.chunk_ranges[r].total,
-            )
-            for r in held
-            if r in batch_N.request_to_worker_graph and not self._is_tearing_down(r)
-            and (spec_node_name, batch_N.walk_of(r)) in self.chunk_loops.speculated
-        ] if held and speculating_same_node else ()
         if not continuing and not mid_prefill:
             return None
         # fresh rows of another walk (a mixing chain): rid -> walk
@@ -2775,7 +2762,7 @@ class Worker:
             # estimated from their spans in this step, if a token budget needs them
             pre_existing_seq_lens=lambda: self._continuing_seq_lens(
                 pending, spec_node_name, graph_walk, continuing,
-                speculating_same_node,
+                spec_node_name == batch_N.node_name,
             ),
             mid_prefill=mid_prefill,
         )

@@ -52,6 +52,16 @@ class MidPrefillRow(NamedTuple):
     total: int
 
 
+class ContinuingRows(NamedTuple):
+    """The rows of an in-flight step that run again in the step speculated
+    after it, split by where their next step's inputs come from."""
+    # from the step's loop-back outputs, as decode's do
+    loop_back: list[int]
+    # from the inputs held since their first chunk; the chunk Loop's tick
+    # carries nothing, and the scheduler cuts their next chunk
+    mid_prefill: list[MidPrefillRow]
+
+
 @dataclass
 class ScheduledBatch:
     """
@@ -100,6 +110,37 @@ class ScheduledBatch:
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
+
+    def get_continuing_rows(
+        self, node_name: str, walk_rids: list[int],
+        tearing_down: Callable[[int], bool] | None,
+        speculated: Collection[tuple[str, str]],
+    ) -> ContinuingRows:
+        """This step's rows that continue into a speculated step on
+        ``node_name``: ``walk_rids`` (the target walk's rows) that loop back,
+        and the rows mid-prefill whose (node, walk) speculates its next chunk
+        (``speculate_mid_prefill``). ``tearing_down``: rows to leave out, or
+        None when none can be."""
+        held = self.incomplete_node_rids
+        if not held and tearing_down is None:
+            return ContinuingRows(walk_rids, [])
+        loop_back = [
+            r for r in walk_rids
+            if r not in held and (tearing_down is None or not tearing_down(r))
+        ]
+        if not held or node_name != self.node_name:
+            return ContinuingRows(loop_back, [])
+        mid_prefill = [
+            MidPrefillRow(
+                r, self.request_to_worker_graph[r], self.walk_of(r),
+                self.chunk_ranges[r].end, self.chunk_ranges[r].total,
+            )
+            for r in held
+            if r in self.request_to_worker_graph
+            and (tearing_down is None or not tearing_down(r))
+            and (node_name, self.walk_of(r)) in speculated
+        ]
+        return ContinuingRows(loop_back, mid_prefill)
 
     def rids_by_walk(self) -> dict[str, list[int]]:
         """The batch's rids grouped by real walk, in batch order. Shared:

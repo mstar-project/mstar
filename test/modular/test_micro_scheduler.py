@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from mstar.engine.chunking import ChunkingManagement
+from mstar.engine.chunking import ChunkingManagement, ChunkRange
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -2128,6 +2128,36 @@ def test_a_mixing_merge_runs_the_next_chunk_of_a_row_whose_chunk_is_in_flight():
     assert merged.chunk_ranges == {"p0": (4, 8, 10, 4)}
     assert merged.incomplete_node_rids == {"p0"}
     assert not manager.pops[1:], "nothing popped: the row's node is in flight"
+
+
+def _in_flight_step_with_a_row_mid_prefill() -> ScheduledBatch:
+    batch = _batch(["d0", "p0", "p1"])
+    batch.request_walks = {"p0": "prefill", "p1": "prefill"}
+    batch.chunk_ranges = {"p0": ChunkRange(0, 4, 10, 4), "p1": ChunkRange(0, 6, 6, 6)}
+    batch.incomplete_node_rids = {"p0"}
+    return batch
+
+
+def test_continuing_rows_split_loop_back_from_mid_prefill():
+    """A row mid-prefill runs again from its held inputs, from where N's chunk
+    ends; the others continue from the loop-back, and a finished prompt (p1)
+    is left to the target walk's own rows."""
+    batch = _in_flight_step_with_a_row_mid_prefill()
+
+    rows = batch.get_continuing_rows(NODE, ["d0", "p1"], None, {(NODE, "prefill")})
+
+    assert rows.loop_back == ["d0", "p1"]
+    assert rows.mid_prefill == [MidPrefillRow("p0", "wg0", "prefill", 4, 10)]
+
+
+def test_continuing_rows_leave_out_a_row_tearing_down_and_a_walk_not_speculated():
+    batch = _in_flight_step_with_a_row_mid_prefill()
+
+    torn = batch.get_continuing_rows(NODE, ["d0"], {"p0"}.__contains__, {(NODE, "prefill")})
+    off = batch.get_continuing_rows(NODE, ["d0"], None, set())
+    other_node = batch.get_continuing_rows("other", ["d0"], None, {("other", "prefill")})
+
+    assert torn == (["d0"], []) and off == (["d0"], []) and other_node == (["d0"], [])
 
 
 def test_a_merge_that_keeps_to_its_walk_leaves_a_row_mid_prefill_to_its_chunk_landing():
