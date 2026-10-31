@@ -45,9 +45,8 @@ def test_strided_rows_and_empty_batch():
 
 
 @pytest.mark.parametrize("norm_topk_prob", [True, False])
-def test_topk_router_on_cuda_takes_the_kernel_and_keeps_the_contract(norm_topk_prob):
-    """TopKRouter on CUDA routes through the kernel: fp32 weights, int64 ids, no state, the
-    softmax-then-top-k of its own logits."""
+def test_topk_router_on_cuda_keeps_its_contract(norm_topk_prob):
+    """fp32 weights, int64 ids, no state: the softmax-then-top-k of its own logits."""
     from mstar.model.components.moe import TopKRouter
 
     torch.manual_seed(1)

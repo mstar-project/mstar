@@ -1,8 +1,8 @@
 """Softmax top-k routing in one kernel.
 
-``TopKRouter``'s softmax, top-k, renormalization and dtype casts were five launches per MoE
-layer (``softmax``, ``topk``, ``sum``, ``div``, and the int32 cast ahead of the alignment),
-each a few microseconds at decode width. One program per token does them all here.
+One program per token does ``TopKRouter``'s softmax, top-k and renormalization, and writes
+the int64 ids the alignment reads as they are: one launch where torch takes five, each a few
+microseconds at decode width.
 """
 from __future__ import annotations
 

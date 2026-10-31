@@ -148,35 +148,16 @@ def test_fp8_compiles_whole_with_symbolic_tokens(num_tokens):
                                rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("num_tokens", [3, 40, 600])
-def test_int64_ids_align_as_int32_ids_do(num_tokens):
-    """The router's int64 ids reach the alignment without a cast kernel."""
-    from mstar.utils.fused_moe.align import moe_align_block_size
-
-    torch.manual_seed(6)
-    ids = torch.stack([torch.randperm(128, device=DEVICE)[:8] for _ in range(num_tokens)])
-    got = moe_align_block_size(ids, 16, 128)
-    want = moe_align_block_size(ids.to(torch.int32), 16, 128)
-    assert torch.equal(got[1], want[1]) and torch.equal(got[2], want[2])
-    # slot order within an expert is atomics-ordered: compare (expert, slot) pairs as sets
-    n = int(want[2])
-
-    def pairs(sorted_ids, expert_ids):
-        expert = expert_ids[torch.arange(n, device=DEVICE) // 16].to(torch.int64)
-        return sorted((expert * 10**6 + sorted_ids[:n].to(torch.int64)).tolist())
-
-    assert pairs(got[0], got[1]) == pairs(want[0], want[1])
-
-
 @pytest.mark.parametrize("num_tokens,num_experts", [(1, 128), (8, 128), (32, 128), (511, 128), (32, 256),
                                                     (520, 128)])
-def test_align_one_and_two_kernel_paths_agree_with_the_torch_reference(num_tokens, num_experts):
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])  # int64: a router's ids, uncast
+def test_align_one_and_two_kernel_paths_agree_with_the_torch_reference(num_tokens, num_experts, dtype):
     """Below 4096 slots the alignment runs as one kernel, above as two; both match the torch
     fallback (as sets within each expert's span: the scatter is atomics-ordered)."""
     from mstar.utils.fused_moe import align
 
     torch.manual_seed(num_tokens)
-    ids = torch.stack([torch.randperm(num_experts, device=DEVICE)[:8] for _ in range(num_tokens)])
+    ids = torch.stack([torch.randperm(num_experts, device=DEVICE)[:8] for _ in range(num_tokens)]).to(dtype)
     ids[0, 0] = num_experts  # a skipped slot (the EP sentinel)
     got = align.moe_align_block_size(ids, 16, num_experts)
     n_pad = ids.numel() + num_experts * 15
