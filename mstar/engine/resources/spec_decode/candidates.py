@@ -15,7 +15,8 @@ above it is under the cut.
 What is kept can run past the selection: more tokens than it holds, or more of them
 in one tile than the tile handed up. A row then says so in ``complete`` and holds
 the kept tokens it saw, renormalised, and `FILTER_PAST_CANDIDATES` gives the exact
-row for the callers that need it, at no cost to the other rows.
+row for the callers that need it, at no cost to the other rows. The vocabulary is
+sorted by frequency, so tiles do crowd, but with what top-k keeps at its tail.
 """
 
 from __future__ import annotations
@@ -97,17 +98,21 @@ def _select_kernel(
     order_k = tl.sum(tl.where(pos == k - 1, order, 0), axis=0)
     in_k = off | wide | (order >= order_k)
     held = tl.where(in_k, p, 0.0)
-    # with top-k off, top-p is a share of the whole row, not of what is held here
-    mass = tl.where(off, 1.0, tl.sum(held, axis=0))
-    cut = tl.where(top_p >= 1.0, float("inf"), top_p * mass)
-    prefix = in_k & ((tl.cumsum(held, axis=0) - held) < cut)
-    floor = tl.min(tl.where(prefix, order, 1 << 61), axis=0)
+    before = tl.cumsum(held, axis=0) - held
+    # Top-p is a share of the whole row, or with top-k on of what that keeps. With
+    # top-k's cut out of sight that mass is only known to lie between what is seen
+    # above `bound` and the whole row. Frequent tokens crowd a tile, so this is usual
+    # at a top-k of 40, and the cut still lands on the same token from both ends.
+    sure = off | (~wide & (order_k > bound))
+    low = tl.where(off, 1.0, tl.sum(tl.where(sure | (order > bound), held, 0.0), axis=0))
+    high = tl.where(sure, low, 1.0)
+    inf = float("inf")
+    floor = tl.min(tl.where(in_k & (before < tl.where(top_p >= 1.0, inf, top_p * high)), order, 1 << 61), axis=0)
+    floor_low = tl.min(tl.where(in_k & (before < tl.where(top_p >= 1.0, inf, top_p * low)), order, 1 << 61), axis=0)
     kept = tl.where(in_k & (order >= floor), p, 0.0)
     out = kept / tl.maximum(tl.sum(kept, axis=0), 1e-30)
     lowest = tl.min(tl.where(kept > 0, order, 1 << 61), axis=0)
-    fits = (tl.sum((kept > 0).to(tl.int32), axis=0) < C) & (lowest > bound)
-    # top-k's own cut has to have been in sight too, or `mass` is not its mass
-    fits = fits & (off | (~wide & (order_k > bound)))
+    fits = (tl.sum((kept > 0).to(tl.int32), axis=0) < C) & (lowest > bound) & (floor == floor_low)
 
     greedy = temp == 0
     out = tl.where(greedy, tl.where(pos == 0, 1.0, 0.0), out)

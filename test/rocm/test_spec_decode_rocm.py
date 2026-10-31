@@ -437,6 +437,38 @@ def test_more_kept_tokens_in_a_tile_than_it_hands_up():
     assert torch.allclose(cand.probs.sum(dim=-1), torch.ones(rows, device=DEV))
 
 
+@pytest.mark.parametrize(("top_k", "complete"), [(40, 1), (100, 1), (12, 1), (0, 1)])
+def test_a_top_k_cut_out_of_sight_leaves_the_kept_tokens_in_sight(top_k, complete):
+    """Frequent tokens crowd a tile past what it hands up, so a top-k of 40 can't see
+    its own last token. What top-p keeps of a steep row doesn't depend on that."""
+    rows, vocab = 2, 8192
+    logits = torch.full((rows, vocab), -30.0)
+    logits[:, :100] = 10.0 - torch.arange(100) * 0.25
+    logits = logits.to(DEV)
+    args = (torch.full((rows,), 0.7, device=DEV), torch.full((rows,), top_k or vocab, device=DEV, dtype=torch.int32),
+            torch.full((rows,), 0.9, device=DEV))
+    assert sampled.filtered_candidates(logits, *args).complete.tolist() == [complete] * rows
+    got, want = sampled.filtered_probs(logits, *args), _renormed(logits, *args)
+    assert torch.equal(got > 0, want > 0)
+    assert torch.allclose(got, want, atol=1e-6, rtol=1e-3)
+
+
+def test_a_cut_that_depends_on_top_ks_mass_takes_the_exact_row():
+    """Top-p's cut moves with a mass out of sight: not complete, and exact. A row where
+    the two ends of that mass put the cut on different tokens."""
+    rows, vocab = 2, 8192
+    logits = torch.full((rows, vocab), -30.0)
+    # flat, so 90% of a top-k's 40 is 36 tokens and 90% of the row's 100 is 90
+    logits[:, :100] = 5.0 - torch.arange(100) * 1e-3
+    logits = logits.to(DEV)
+    args = (torch.ones(rows, device=DEV), torch.full((rows,), 40, device=DEV, dtype=torch.int32),
+            torch.full((rows,), 0.9, device=DEV))
+    assert sampled.filtered_candidates(logits, *args).complete.tolist() == [0, 0]
+    got, want = sampled.filtered_probs(logits, *args), _renormed(logits, *args)
+    assert torch.equal(got > 0, want > 0), ((got > 0).sum(-1), (want > 0).sum(-1))
+    assert torch.allclose(got, want, atol=1e-6, rtol=1e-3)
+
+
 def test_the_filter_matches_the_plain_sampler():
     """Draws of the plain step's kernel fall on exactly what the filter keeps, in
     its proportions."""
