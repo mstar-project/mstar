@@ -82,11 +82,15 @@ def test_mismatch_is_refused_on_every_rank(axis):
     assert all(exc is not None and "disagrees" in str(exc) for exc in errors)
 
 
-def _worker_with_tp_sizes(tp_sizes):
+def _worker_with_tp_sizes(tp_sizes, cfg_sizes=None):
+    cfg_sizes = cfg_sizes or {}
     worker = Worker.__new__(Worker)
     worker.parallel_nodes = set(tp_sizes)
     groups = {node: types.SimpleNamespace(world_size=size) for node, size in tp_sizes.items()}
-    worker.parallel_groups = types.SimpleNamespace(get_tp_config_for_node=groups.__getitem__)
+    worker.parallel_groups = types.SimpleNamespace(
+        get_tp_config_for_node=groups.__getitem__,
+        get_cfg_config_for_node=lambda node: types.SimpleNamespace(world_size=cfg_sizes.get(node, 1)),
+    )
     return worker
 
 
@@ -100,6 +104,12 @@ def test_the_platform_default_covers_tp_nodes_on_amd_gpus_only(monkeypatch, plat
     monkeypatch.setattr(worker_module, "current_platform", platform)
     worker = _worker_with_tp_sizes({"tp2": 2, "tp2_sp2": 2, "sp2": 1})
     assert worker._tp_async_default_nodes() == want
+
+
+def test_a_guidance_parallel_node_stays_serial_by_default(monkeypatch):
+    monkeypatch.setattr(worker_module, "current_platform", RocmPlatform())
+    worker = _worker_with_tp_sizes({"cfg2": 1, "tp2_cfg2": 2, "tp2": 2}, {"cfg2": 2, "tp2_cfg2": 2})
+    assert worker._tp_async_default_nodes() == frozenset({"tp2"})
 
 
 @pytest.mark.parametrize("env, config, want", [
