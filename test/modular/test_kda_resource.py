@@ -62,9 +62,9 @@ class _Recorder:
 
 
 def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, speculative_tokens=0,
-          sink=True):
+          sink=True, dim=DIM, full_rank_output_gate=False):
     geometry = DeltaNetGeometry(
-        num_k_heads=heads, num_v_heads=v_heads, head_k_dim=DIM, head_v_dim=DIM,
+        num_k_heads=heads, num_v_heads=v_heads, head_k_dim=dim, head_v_dim=dim,
         conv_kernel_size=4,
     )
     pool = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
@@ -73,7 +73,7 @@ def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, speculat
     ))
     kda = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
         recurrent_state=POOL, variant=LinearAttnVariant.KDA, backend=backend,
-        gate_lower_bound=-5.0,
+        gate_lower_bound=-5.0, full_rank_output_gate=full_rank_output_gate,
     ))
     return pool, kda
 
@@ -134,25 +134,34 @@ def test_refuses_a_pool_it_cannot_run(kwargs, match):
 
 
 def test_default_kernels(monkeypatch):
-    """The torch reference off CUDA, on ROCm (the fused kernels inline PTX), and at a head
-    dim the fused kernels aren't validated for. A spec that leaves the config's default backend builds."""
+    """The resource picks the fused kernels where they run what the spec declares, and the
+    torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline PTX), at
+    a head dim they aren't validated for and for a full-rank output gate. A spec that leaves
+    the config's default backend builds."""
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
+    assert not kda.prefill_capturable
     from mstar.engine.resources.linear_attn import kda as kda_mod
 
+    def built_on_cuda(**kwargs) -> KDAManager:
+        pool_spec, kda_spec = specs(**kwargs)
+        return build_resource(kda_spec, EngineResourceInfo(
+            device=torch.device("cuda"), dependencies={POOL: pool_spec},
+        ))
+
     monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
-    monkeypatch.setattr(kda_mod.kda_triton, "TritonKDAKernels", lambda: "bundle")
-    cuda = torch.device("cuda")
-    assert kda_mod._default_kernels(cuda, 128) == "bundle"
-    assert isinstance(kda_mod._default_kernels(cuda, 16), TorchKDAKernels)
+    kda = built_on_cuda(dim=128)
+    assert isinstance(kda.kernels, TritonKDAKernels) and kda.prefill_capturable
+    assert isinstance(built_on_cuda(dim=16).kernels, TorchKDAKernels)
+    assert isinstance(built_on_cuda(dim=128, full_rank_output_gate=True).kernels, TorchKDAKernels)
     monkeypatch.setattr(kda_mod.current_platform, "is_rocm", lambda: True)
-    assert isinstance(kda_mod._default_kernels(cuda, 128), TorchKDAKernels)
+    assert isinstance(built_on_cuda(dim=128).kernels, TorchKDAKernels)
 
 
 def test_eager_plans():
     """A prefill stages the layout its bundle asks for, at the pool's slots; a decode needs none."""
     pool, kda = build()
-    kda.set_kernels(rec := _Recorder())
+    rec = kda.kernels = _Recorder()
     p = plan(pool, kda, ["a", "b"], [5, 3], eager(["a", "b"]))
     assert not p.is_decode and p.num_tokens == 8 and p.num_rows == 2
     assert rec.layouts == [((5, 3), 8, False)]
@@ -168,7 +177,7 @@ def test_a_captured_prefill_keeps_one_layout_buffer():
     """Replays of one bucket and slot fill one buffer, sized by the bucket; a padding row
     is on the sink."""
     pool, kda = build()
-    kda.set_kernels(rec := _Recorder())
+    rec = kda.kernels = _Recorder()
     first = plan(pool, kda, ["a", "pad"], [5, 0], leased(["a"], ["a", "pad"], bs=2, tokens=64))
     assert first.slot_ids.tolist()[1] == SINK_SLOT
     second = plan(pool, kda, ["b", "c"], [1, 1], leased(["b", "c"], ["b", "c"], bs=2, tokens=64))
@@ -186,7 +195,7 @@ def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
     """Under a lease the walk picks the kernels, not the spans: a replay runs what its
     bucket captured."""
     pool, kda = build()
-    kda.set_kernels(_Recorder())
+    kda.kernels = _Recorder()
     capture = plan(pool, kda, ["a", "b"], [1, 1], leased(["a", "b"], ["a", "b"], bs=2, tokens=2))
     replay = plan(pool, kda, ["c", "pad"], [2, 0], leased(["c"], ["c", "pad"], bs=2, tokens=2))
     assert not capture.is_decode and not replay.is_decode
@@ -198,7 +207,7 @@ def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
 
 def test_preplan_promotes_the_staged_plan():
     pool, kda = build()
-    kda.set_kernels(_Recorder())
+    kda.kernels = _Recorder()
     ctx = eager(["a"], walk="decode")
     ctx.is_preplan = True
     staged = plan(pool, kda, ["a"], [1], ctx)
@@ -217,7 +226,7 @@ def test_the_callable_hands_the_bundle_each_layers_blocks():
     """The layer names no block: the callable resolves its conv and state, by the cursor or
     an explicit index, and a pool without speculative blocks has none to hand over."""
     pool, kda = build()
-    kda.set_kernels(rec := _Recorder())
+    rec = kda.kernels = _Recorder()
     p = plan(pool, kda, ["a"], [4], eager(["a"]))
     mix = KDACallable(pool, kda)
     assert mix.current_plan() is p
@@ -236,7 +245,7 @@ def test_the_callable_hands_the_bundle_each_layers_blocks():
 def test_a_speculative_step_runs_verify_blocks():
     pool, kda = build(speculative_tokens=2)
     assert kda.speculative_tokens == 2
-    kda.set_kernels(rec := _Recorder())
+    rec = kda.kernels = _Recorder()
     mix = KDACallable(pool, kda)
     # each request's prefill commits before its first verify step
     ctx = eager(["a", "b"])
@@ -273,7 +282,7 @@ def test_set_prefix_len_leaves_the_slots_outside_the_step():
     """A captured verify bucket's padding row writes the sink; another request's slot,
     not in the step, keeps its count and side."""
     pool, kda = build(speculative_tokens=2)
-    kda.set_kernels(_Recorder())
+    kda.kernels = _Recorder()
     mix = KDACallable(pool, kda)
     ctx = eager(["a", "c"])
     plan(pool, kda, ["a", "c"], [2, 2], ctx)
