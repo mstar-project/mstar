@@ -1,15 +1,12 @@
 """Kimi delta attention planned against the recurrent state pool.
 
-Same shape as ``gdn.py``: the pool's addressing arrives through
-``ctx.plan_results`` and its per-layer blocks as plain tensors to ``run``, which a
-layer calls through ``convenience.KDACallable`` rather than naming the blocks.
+As in ``gdn.py``, the pool's addressing arrives through ``ctx.plan_results`` and a
+layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resolves.
 The math is a kernel bundle's: ``kda_triton.TritonKDAKernels`` on CUDA at a head
-dim it is validated for, ``kda_torch.TorchKDAKernels`` elsewhere, or one installed
-with ``set_kernels``. A bundle implements ``layout(spans, num_tokens, fixed)``,
-the token layout its prefill reads on device (or None), ``run_paged(qkv, g,
-beta, plan, conv, state, params, gate=None)``, and for a speculative step
-``run_verify`` with the layer's ``SpecBlocks`` after the state. The plan stages
-the layout, into buffers that stay put under CUDA-graph capture.
+dim it is validated for, ``kda_torch.TorchKDAKernels`` elsewhere. A bundle
+implements ``layout`` (the token layout its prefill reads, or None), ``run_paged``
+and, for a speculative step, ``run_verify``. The plan stages the layout into
+buffers that stay put under capture.
 """
 
 from __future__ import annotations
@@ -44,11 +41,9 @@ class KDAParams:
     num_heads: int
     head_dim: int
     scale: float
-    # The forget gate's up-projection [P, D]: set when the gate reaches the
-    # kernels as its low-rank factor [T, D] rather than as [T, H, D].
+    # the forget gate's up-projection [P, D], when g is its low-rank factor [T, D]
     f_b: torch.Tensor | None = None
-    # The output gate's up-projection [P, D] and the gated RMSNorm: set when
-    # the kernels take the output gate too and return the normed [T, P].
+    # the output gate's up-projection [P, D] and the norm, when the kernels apply them
     g_b: torch.Tensor | None = None
     norm_weight: torch.Tensor | None = None
     norm_eps: float = 1e-5
@@ -102,8 +97,6 @@ class KDAPlan:
 
 
 def _default_kernels(device: torch.device, head_dim: int):
-    """The fused Triton bundle on CUDA at a head dim it is validated for; the
-    torch reference elsewhere."""
     if device.type != "cuda" or not kda_triton._HAS_TRITON or not kda_triton.supported(head_dim):
         return kda_torch.TorchKDAKernels()
     return kda_triton.TritonKDAKernels()
@@ -150,13 +143,11 @@ class KDAManager(LinearAttnManager):
         self._cached_plan_output: dict[str, KDAPlan] | None = None
 
     def set_kernels(self, kernels) -> None:
-        """Install the bundle every layer runs in place of the default; see the
-        module docstring."""
+        """Run every layer on ``kernels`` instead of the default bundle."""
         self.kernels = kernels
 
     def depends_on(self) -> set[str]:
-        # so the pool plans first and its addressing reaches us through
-        # `ctx.plan_results`; see `StepRunner.topo_sort`
+        # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
 
     # Step lifecycle
@@ -207,9 +198,8 @@ class KDAManager(LinearAttnManager):
         lease = ctx.slot_lease
         num_tokens = lease.bucket.num_tokens if lease is not None else sum(spans)
         if lease is not None:
-            # A replay runs the kernels its bucket was captured with, so the walk decides,
-            # not this step's spans: a prefill bucket of as many tokens as rows captures
-            # one-token spans (decode kernels, before) and replays uneven ones.
+            # a replay runs the kernels its bucket captured, so the walk decides, not the
+            # spans: a prefill bucket of as many tokens as rows replays uneven spans
             is_decode = not speculative and ctx.graph_walk == "decode"
         else:
             is_decode = (not speculative and rows > 0 and num_tokens == rows
@@ -237,7 +227,12 @@ class KDAManager(LinearAttnManager):
     def _stage_layout(self, host: list[int], label: str, ctx: StepContext) -> torch.Tensor:
         """A fresh device copy eager; under a lease, the static buffer of that
         (bucket, slot, label), which every replay of the bucket fills at the
-        same size."""
+        same size.
+
+        No ``force_double_buffer``: the stager's ring never rewrites a host
+        buffer whose copy is in flight; pre-plan gets a second slot from
+        ``supports_preplan``, and without it the copy queues behind the
+        previous replay on the stream that runs the step."""
         lease = ctx.slot_lease
         if lease is None:
             return self._layout_stager.to_device(host, self._device)
@@ -283,14 +278,13 @@ class KDAManager(LinearAttnManager):
     ) -> torch.Tensor:
         """One layer's KDA over this step's packed tokens.
 
-        ``qkv`` is ``[T, 3P]`` before the conv, ``beta`` ``[T, H]`` before its
-        sigmoid, and ``g`` the forget gate before its activation: ``[T, H, D]``,
-        or its low-rank factor ``[T, D]`` with ``params.f_b``. ``conv_layer``
-        and ``state_layer`` are this layer's ``pool.block`` views, updated in
-        place, and ``spec`` its speculative blocks, which a verify step needs;
-        ``KDACallable`` resolves all three. Returns ``[T, H, D]``, or the
-        gated-normed ``[T, P]`` when ``gate``, the output gate's low-rank
-        factor, comes with ``params.g_b``.
+        ``qkv [T, 3P]`` is pre-conv, ``beta [T, H]`` pre-sigmoid, and ``g`` the
+        forget gate pre-activation, ``[T, H, D]`` or its low-rank factor
+        ``[T, D]`` with ``params.f_b``. ``conv_layer`` / ``state_layer`` are the
+        layer's pool blocks, updated in place, and ``spec`` its speculative
+        blocks for a verify step. Returns ``[T, H, D]``, or the gated-normed
+        ``[T, P]`` when ``gate`` (the output gate's low-rank factor) comes with
+        ``params.g_b``.
         """
         plan = self.current_plan(label)
         if plan.is_verify:

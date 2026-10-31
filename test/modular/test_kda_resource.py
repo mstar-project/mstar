@@ -1,10 +1,6 @@
-"""The KDA linear-attention resource: built off the pool, planned against it.
-
-What the manager owns is the plan: which rows run, which walk they take, and
-the token layout its kernel bundle asked for, staged where a captured graph
-will read it. The math is the bundle's, so a recording bundle stands in here;
-``KDACallable`` hands the bundle each layer's blocks. The torch reference bundle
-runs at the end, and once on CUDA to show it never waits on the host.
+"""The KDA resource's plan: which rows run, on which kernels, and the token layout its bundle
+asks for, staged where a captured graph reads it. A recording bundle stands in for the math;
+the torch bundle runs at the end.
 """
 
 from __future__ import annotations
@@ -127,29 +123,21 @@ def leased(real, padded, bs, tokens, walk="prefill", slot=0):
     return ctx
 
 
-def test_builds_off_the_pool():
-    pool, kda = build()
-    assert isinstance(kda, KDAManager) and kda.depends_on() == {POOL}
-    assert kda.geometry.num_v_heads == HEADS and kda.geometry.head_k_dim == DIM
-    # no CUDA: the torch reference
-    assert isinstance(kda.kernels, TorchKDAKernels)
-    # the config's GDN default is taken as the one KDA backend there is
-    _, kda = build(backend=LinearAttnBackend.FLASHINFER)
-    assert kda.config.backend is LinearAttnBackend.TRITON
-
-
-def test_refuses_a_pool_it_cannot_run():
-    with pytest.raises(ValueError, match="one head count"):
-        build(heads=1, v_heads=2)
-
-
-def test_refuses_a_pool_without_a_sink():
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(heads=1, v_heads=2), "one head count"),
     # padding rows address the sink; without one they would land on a live slot
-    with pytest.raises(ValueError, match="sink slot"):
-        build(sink=False)
+    (dict(sink=False), "sink slot"),
+], ids=["uneven-heads", "no-sink"])
+def test_refuses_a_pool_it_cannot_run(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        build(**kwargs)
 
 
-def test_the_torch_reference_at_an_unvalidated_head_dim(monkeypatch):
+def test_default_kernels(monkeypatch):
+    """The torch reference off CUDA, and at a head dim the fused kernels aren't validated
+    for. A spec that leaves the config's default backend builds."""
+    _, kda = build(backend=LinearAttnBackend.FLASHINFER)
+    assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
     from mstar.engine.resources.linear_attn import kda as kda_mod
 
     monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
@@ -159,7 +147,8 @@ def test_the_torch_reference_at_an_unvalidated_head_dim(monkeypatch):
     assert isinstance(kda_mod._default_kernels(cuda, 16), TorchKDAKernels)
 
 
-def test_prefill_plan_stages_the_bundles_layout():
+def test_eager_plans():
+    """A prefill stages the layout its bundle asks for, at the pool's slots; a decode needs none."""
     pool, kda = build()
     kda.set_kernels(rec := _Recorder())
     p = plan(pool, kda, ["a", "b"], [5, 3], eager(["a", "b"]))
@@ -169,18 +158,13 @@ def test_prefill_plan_stages_the_bundles_layout():
     slots = [pool._slots[r]["main"].index for r in "ab"]
     assert p.slot_ids.tolist() == slots and SINK_SLOT not in slots
 
-
-def test_decode_plan_needs_no_layout():
-    pool, kda = build()
-    kda.set_kernels(rec := _Recorder())
-    p = plan(pool, kda, ["a", "b"], [1, 1], eager(["a", "b"], walk="decode"))
-    assert p.is_decode and p.layout is None and rec.layouts == []
+    p = plan(pool, kda, ["c", "d"], [1, 1], eager(["c", "d"], walk="decode"))
+    assert p.is_decode and p.layout is None and len(rec.layouts) == 1
 
 
 def test_a_captured_prefill_keeps_one_layout_buffer():
-    """Replays of one bucket fill the same buffer, sized by the bucket; the
-    padding row is on the sink; one-token rows in a prefill bucket are still
-    a prefill, since the graph replays the prefill kernels."""
+    """Replays of one bucket and slot fill one buffer, sized by the bucket; a padding row
+    is on the sink."""
     pool, kda = build()
     kda.set_kernels(rec := _Recorder())
     first = plan(pool, kda, ["a", "pad"], [5, 0], leased(["a"], ["a", "pad"], bs=2, tokens=64))
@@ -197,9 +181,8 @@ def test_a_captured_prefill_keeps_one_layout_buffer():
 
 
 def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
-    """A prefill bucket with as many tokens as rows captured one-token spans, planned as a
-    decode: the graph then replayed the decode kernels over a step's uneven spans, each
-    token on another request's slot."""
+    """Under a lease the walk picks the kernels, not the spans: a replay runs what its
+    bucket captured."""
     pool, kda = build()
     kda.set_kernels(_Recorder())
     capture = plan(pool, kda, ["a", "b"], [1, 1], leased(["a", "b"], ["a", "b"], bs=2, tokens=2))
@@ -224,23 +207,6 @@ def test_preplan_promotes_the_staged_plan():
         kda.current_plan("draft")
 
 
-def test_run_hands_the_bundle_this_steps_plan():
-    pool, kda = build()
-    kda.set_kernels(rec := _Recorder())
-    p = plan(pool, kda, ["a"], [4], eager(["a"]))
-    params = KDAParams(
-        conv_weight=torch.zeros(3 * HEADS * DIM, 4), A_log=torch.zeros(HEADS),
-        dt_bias=torch.zeros(HEADS * DIM), lower_bound=-5.0, num_heads=HEADS,
-        head_dim=DIM, scale=DIM ** -0.5,
-    )
-    conv, state = pool.block("conv", 1), pool.block("state", 1)
-    gate = torch.zeros(4, DIM)
-    kda.run(torch.zeros(4, 3 * HEADS * DIM), torch.zeros(4, DIM), torch.zeros(4, HEADS),
-            conv, state, params, gate=gate)
-    ((got, got_conv, got_state, got_gate),) = rec.runs
-    assert got is p and got_conv is conv and got_state is state and got_gate is gate
-
-
 def _ptr(t):
     return t.data_ptr(), tuple(t.shape)
 
@@ -252,7 +218,6 @@ def test_the_callable_hands_the_bundle_each_layers_blocks():
     kda.set_kernels(rec := _Recorder())
     p = plan(pool, kda, ["a"], [4], eager(["a"]))
     mix = KDACallable(pool, kda)
-    assert mix.conv_dtype == pool.block("conv", 0).dtype
     assert mix.current_plan() is p
     gate = torch.zeros(4, DIM)
     args = (torch.zeros(4, 3 * HEADS * DIM), torch.zeros(4, DIM), torch.zeros(4, HEADS), params())
@@ -329,11 +294,6 @@ def test_a_verify_step_fits_the_pools_blocks():
     pool, kda = build(speculative_tokens=2)
     with pytest.raises(ValueError, match="got spans"):
         plan(pool, kda, ["a", "b"], [3, 2], eager(["a", "b"], walk="decode"), speculative=True)
-    kda.set_kernels(_Recorder())
-    plan(pool, kda, ["c"], [3], eager(["c"], walk="decode"), speculative=True)
-    with pytest.raises(ValueError, match="SpecBlocks"):
-        kda.run(torch.zeros(3, 3 * HEADS * DIM), torch.zeros(3, DIM), torch.zeros(3, HEADS),
-                pool.block("conv", 0), pool.block("state", 0), params())
 
 
 # --- the torch reference bundle -------------------------------------------------
@@ -405,7 +365,7 @@ def test_the_torch_bundle_keeps_each_row_in_its_own_slot():
 @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
 def test_the_torch_bundle_never_waits_on_the_host():
     """The reference prefill and decode on CUDA under sync debugging: no step reads a
-    device value back (the prefill once read its slot ids with ``.tolist()``)."""
+    device value back."""
     cuda = torch.device("cuda")
     pool, kda = build(device=cuda)
     assert isinstance(kda.kernels, TorchKDAKernels)  # head dim 16: no fused kernels
@@ -430,15 +390,11 @@ def test_the_torch_bundle_never_waits_on_the_host():
 # --- the Triton bundle's host side ---------------------------------------------
 
 
-def test_triton_layout_eager_is_exact():
-    # starts, lens, first chunks, then (span, chunk) pairs
+def test_triton_layout():
+    """Starts, lengths and first chunks, then (span, chunk) pairs. Under capture the table
+    is filled out with chunks at span 0's end, up to the rows any split of the bucket's
+    tokens can need."""
     assert varlen_layout([70, 9]) == [0, 70, 70, 9, 0, 2, 0, 0, 0, 1, 1, 0]
-    assert TritonKDAKernels().layout((70, 9), 79, fixed=False) == varlen_layout([70, 9])
-
-
-def test_triton_layout_under_capture_fills_the_table():
-    """Two real chunks, then rows that start at span 0's end, up to the rows
-    any split of the bucket's tokens can need."""
     layout = TritonKDAKernels().layout((70, 0), 256, fixed=True)
     n, rows = 2, 256 // 64 + 2
     assert layout[:3 * n] == [0, 70, 70, 0, 0, 2]

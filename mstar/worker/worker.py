@@ -561,9 +561,8 @@ class Worker:
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         self._tp_leader_gap_warned = False
-        # The runtime takes an explicit set, so resolve the two special cases
-        # here: tp_async_nodes=None means "every node", and the feature being
-        # off means "none". An empty set on the runtime side is just "none".
+        # without these the runtime sees no parallel node, and its speculation
+        # filter never holds one to the leader
         self._graph_runtime.set_node_metadata(
             parallel_nodes=self.parallel_nodes,
             parallel_leader_nodes=self.parallel_leader_nodes,

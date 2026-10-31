@@ -1611,14 +1611,12 @@ class Engine:
     def _check_follower_refusal(
         self, batch: ExecutingBatch, outcome: FullAdmitOutcome,
     ) -> None:
-        """Stop this worker when a TP follower refuses a step rank 0 cannot have refused.
-
-        Rank 0 schedules within ``get_max_batch_size``. Where that cap follows free
-        state (GLM-5.3's prefill takes only the free KDA slots), a batch past this
-        rank's own cap, refused for capacity, means the ranks' state has diverged:
-        rank 0 admitted a step this rank cannot join. Re-queueing it or failing its
-        requests would leave rank 0 in the step's collectives until the watchdog, so
-        the worker exits, as the micro-scheduler does on a diverged page trail.
+        """Exit when a TP follower refuses, for capacity, a batch past its own
+        ``get_max_batch_size``. Rank 0 scheduled it within its cap, so the caps
+        differ, and where a cap follows free state, so does the ranks' state.
+        Re-queueing or failing the requests would leave rank 0 in the step's
+        collectives until the watchdog; the micro-scheduler exits the same way
+        on a diverged page trail.
         """
         node = batch.node_name
         if node not in self._tp_follower_nodes or not isinstance(outcome.reason, AllocationFailed):

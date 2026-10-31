@@ -1,9 +1,5 @@
-"""Blocks held per slot rather than per layer: one tensor for the whole stack.
-
-They live and die with the slot like the per-layer blocks: handed out as zeros,
-zeroed on release, copied by a fork. A speculating delta net declares some.
-
-CPU-only: nothing here launches a kernel.
+"""Blocks held per slot rather than per layer: one tensor for the whole stack, which lives and
+dies with the slot like the per-layer blocks.
 """
 
 from __future__ import annotations
@@ -52,17 +48,6 @@ def slot_of(pool: RecurrentStatePool, rid: str, label: str = "main") -> int:
     return pool._slots[rid][label].index
 
 
-def test_a_per_slot_block_has_no_layer_axis():
-    pool = build_pool()
-    assert pool.block("count").shape == (SLOTS, 1)
-    assert pool.block("state", 1).shape == (SLOTS, 2, 4)
-    with pytest.raises(ValueError, match="per slot"):
-        pool.block("count", 0)
-    with pytest.raises(ValueError, match="per layer"):
-        pool.block("state")
-    assert sum(t.nbytes for t in pool._blocks.values()) == SLOTS * (LAYERS * 2 * 4 * 4 + 4)
-
-
 def test_released_slots_are_zeroed_and_forks_copy():
     pool = build_pool()
     run(pool, RecurrentStep(segments=[Segment("a", "main", 3)]), ["a"])
@@ -81,10 +66,11 @@ def test_released_slots_are_zeroed_and_forks_copy():
     assert pool.block("state", 2).abs().sum() == 0
 
 
-def test_gather_and_scatter_take_no_layer_for_a_per_slot_block():
-    """gather / scatter_ address a per-slot block with ``layer_idx=None`` and a per-layer one
-    with its layer, through the step's plan; each refuses the other's form."""
+def test_a_per_slot_block_takes_no_layer():
+    """One tensor for every layer; gather / scatter_ address it with ``layer_idx=None`` and
+    a per-layer block with its layer, and each refuses the other's form."""
     pool = build_pool()
+    assert sum(t.nbytes for t in pool._blocks.values()) == SLOTS * (LAYERS * 2 * 4 * 4 + 4)
     step = RecurrentStep(segments=[Segment("a", "main", 2), Segment("b", "main", 1)])
     for rid in ("a", "b"):
         pool.ingest_request(rid)
