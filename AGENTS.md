@@ -157,7 +157,7 @@ Review any new early return, `continue`, or exception path in worker and engine 
 
 Lockstep is also about **when** something is run, not only whether. The main thread runs ahead of the GPU thread within a single step (invariant 7), so "one step in flight" does not mean "that step has admitted": admit is on the GPU thread while the main thread is already applying teardowns and scanning readiness, both of which move the state admit reads. A rank can then admit a step in a window that exists only between two of its own state changes, and a rank replaying those changes in order admits the same step from a different state. Every mutation of replicated state has to land before the step is broadcast or after that step has admitted, never between.
 
-**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, LRU orders on wall clock, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
+**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, the victim comes from stamps each rank's scheduler keeps for itself, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
 
 Some lessons learned from debugging KV cache symmetry across TP ranks:
 - **Ordered, not summarized.** A set of offloads plus a set of reloads cannot say whether a request ended up resident; the order of actions must be sent, and replayed verbatim.

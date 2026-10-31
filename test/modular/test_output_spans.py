@@ -153,7 +153,6 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
     worker.enable_nvtx = False
     worker.enable_prof = False
     worker.device = torch.device("cpu")
-    worker._last_active = {}
     worker._graph_runtime = SimpleNamespace(
         cleanup_consumed_inputs=lambda node, rids, wgs: ([], []),
         clear_pending_loop_stops=lambda: None,

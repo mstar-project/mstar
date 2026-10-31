@@ -607,7 +607,7 @@ class GraphRuntime(ABC):
         gets that handle next, which reads as one request inheriting another's
         state. Known handle-keyed maps: MicroScheduler.{failed_rids,
         admit_errors, held_until, backlog, pending_tp_follow_count} (purged by
-        clear_rid), Worker.{_last_active, _pending_removes}, the runtime's
+        clear_rid), Worker._pending_removes, the runtime's
         pending loop stops, and the tensor manager's per-request maps.
         """
         pass
