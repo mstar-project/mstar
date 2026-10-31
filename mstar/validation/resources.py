@@ -14,8 +14,10 @@ from mstar.engine.resources.spec import (
     spec_dependency_problems,
     unknown_overrides_message,
 )
+from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 from mstar.model.base import Model, keyed_labels
+from mstar.model.submodule_base import chunk_loop_name
 from mstar.streaming.topology import StreamingGraphEdge
 
 
@@ -222,15 +224,9 @@ def _unservable_walks(specs: Sequence[NodeResourceSpec], model: Model) -> Iterat
                 for name in ran:
                     fed = sorted(
                         {
-                            edge.next_node for edge in nodes[name].outputs
-                            # a loop-back is not a downstream reader: it feeds
-                            # the next iteration of the node that produced it,
-                            # and a walk served whole runs no iteration at all
-                            if edge.next_node != name
-                            and (
-                                not isinstance(edge, StreamingGraphEdge)
-                                or edge.target_partition == partition_of[walk]
-                            )
+                            edge.next_node for edge in _node_outputs(graphs[walk], name, walk)
+                            if not isinstance(edge, StreamingGraphEdge)
+                            or edge.target_partition == partition_of[walk]
                         }
                         - SPECIAL_DESTINATIONS
                     )
@@ -256,7 +252,17 @@ def streamed_partitions(specs: Sequence[NodeResourceSpec], model: Model) -> froz
         for key, by_label in keyed_labels(model).items()
         for kv_label in by_label.values() if len(kv_label.keys.walks) > 1
         for walk in kv_label.keys.walks
-        for name, node in graphs[walk].get_nodes().items() if name in nodes_of[key]
-        for edge in node.outputs
+        for name in graphs[walk].get_nodes() if name in nodes_of[key]
+        for edge in _node_outputs(graphs[walk], name, walk)
         if isinstance(edge, StreamingGraphEdge) and edge.target_partition != partition_of[walk]
     )
+
+
+def _node_outputs(graph: GraphSection, name: str, walk: str) -> list[GraphEdge]:
+    """The edges ``name``'s outputs leave the node on in ``walk``. A chunked
+    node's real edges are on its chunk Loop; its body routes only to
+    ``EMPTY_DESTINATION`` and back to itself."""
+    loop = graph.get_loops().get(chunk_loop_name(name, walk))
+    if loop is not None:
+        return loop.outputs + loop.accumulated_outputs
+    return graph.get_nodes()[name].outputs
