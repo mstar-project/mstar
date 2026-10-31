@@ -26,6 +26,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -53,8 +54,9 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.spec_decode.config import SpecDecodeStep, SpecPhase  # noqa: E402
-from mstar.engine.resources.spec_decode.resource import SpecDecodeResource  # noqa: E402
+from mstar.engine.resources.spec_decode.resource import SpecDecodePlan, SpecDecodeResource  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.model.qwen3_5.qwen3_5_model import KV_CACHE, Qwen3_5DenseModel  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "kv_prefix_decode_helpers", pathlib.Path(__file__).with_name("test_kv_prefix_decode.py"),
@@ -546,6 +548,58 @@ def test_attend_rows_reads_one_query_a_row_off_a_verify_plan(monkeypatch):
     assert plan.cu_seqlens_q.tolist() == [0, 1, 2, 3]
     assert plan.seqused_k is kv_lens and plan.max_seqlen_q == 1 and plan.num_tokens == 3
     assert plan.block_table is table and plan.max_seqlen_k == 1024
+
+
+def _verify_plan(max_requests: int, rows: int, k: int = 2) -> SpecDecodeResource:
+    """A resource with a verify plan over ``rows`` padding rows."""
+    t = k + 1
+    spec = SpecDecodeResource(device=CPU, num_draft_tokens=k, max_requests=max_requests, page_size=16,
+                              kv_key="kv", attn_key="attn", stop_token_ids=(2,))
+    spec._current = SpecDecodePlan(
+        phase=SpecPhase.VERIFY, num_rows=rows, image=spec._new_image(rows),
+        block_table=torch.zeros(rows, 4, dtype=torch.int32), kv_lens=torch.zeros(rows, dtype=torch.int32),
+        write_pages=torch.zeros(rows * t, dtype=torch.long), write_offsets=torch.zeros(rows * t, dtype=torch.long),
+    )
+    return spec
+
+
+def test_a_bucket_wider_than_the_registers_argmaxes_every_row():
+    rows, t, vocab = 8, 3, 16
+    spec = _verify_plan(max_requests=4, rows=rows)
+    spec.verify_inputs()
+    logits = torch.zeros(rows * t, vocab)
+    logits[:, 3] = 1
+    accepted = spec.accept(logits)
+    assert accepted.target.shape == (rows, t) and accepted.target.eq(3).all()
+    assert spec.record_draft(0, torch.zeros(rows, vocab).index_fill(1, torch.tensor([5]), 1.0)).eq(5).all()
+
+
+def test_a_head_with_no_output_gate_drafts():
+    rows, t, heads, kv_heads, dim = 2, 3, 2, 1, 8
+    spec = _verify_plan(max_requests=4, rows=rows)
+    spec.verify_inputs()
+    spec.accept(torch.zeros(rows * t, 16))
+    layer = torch.zeros(32, 2, 16, kv_heads, dim)
+    spec._kv = SimpleNamespace(layer_view=lambda idx: layer)
+    spec._attn = SimpleNamespace(attend_rows=lambda q, layer, kv_lens: q)
+    qkv = torch.randn(rows * t, (heads + 2 * kv_heads) * dim)
+    weight = torch.zeros(dim)
+    out, _ = spec.attend_draft(0, qkv, weight, weight, torch.ones(64, 2), torch.zeros(64, 2),
+                               heads, kv_heads, dim, 1e-6, False, 0)
+    assert out.shape[0] == rows
+
+
+def test_speculation_refuses_a_context_past_the_rotary_table():
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=1024)
+    model.num_draft_tokens = 2
+    fits, past = ({"resources": {KV_CACHE: {"max_seq_len": n}}} for n in (1024, 1025))
+    model.validate_config_yaml(fits, "x.yaml")
+    with pytest.raises(ValueError, match="max_seq_len=1025"):
+        model.validate_config_yaml(past, "x.yaml")
+    # plain decode builds its rotations from the position
+    model.num_draft_tokens = 0
+    model.validate_config_yaml(past, "x.yaml")
 
 
 def test_an_fp8_head_keeps_a_clear_argmax(monkeypatch):
