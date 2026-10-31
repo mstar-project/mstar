@@ -112,7 +112,8 @@ def main(argv=None) -> int:
         for c in conc:
             rdir = out / f"c{c}"
             rdir.mkdir(exist_ok=True)
-            cmd = sweep.runner_command(arm, row, wl, c, args.port, rdir, wl.warmup_waves_first)
+            cmd = sweep.runner_command(arm, row, wl, c, args.port, rdir, wl.warmup_waves_first,
+                                       request_kwargs=arm.request_kwargs or None)
             if numa is not None:
                 cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
             t0 = time.time()
