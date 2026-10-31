@@ -1219,6 +1219,14 @@ disaggregated. <code class="docutils literal notranslate"><span class="pre">conf
 weight loaders then shard parameters automatically, with no model-code changes. See
 <a class="reference internal" href="adding_models.html#tensor-parallelism"><span class="std std-ref">Tensor parallelism</span></a> in the model guide for the model-side
 details.</p>
+<p>Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
+groups, each listed in the model’s <code class="docutils literal notranslate"><span class="pre">tp_enabled_nodes</span></code> (or <code class="docutils literal notranslate"><span class="pre">sp_enabled_nodes</span></code>). The ranks
+then run every node’s steps in one order. The conductor refuses lockstep nodes on one worker
+in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
+rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
+per node, riding on one node’s next step, so two nodes on one pool could admit out of step on
+a follower. Until rank 0 journals a shared pool’s moves in one stream, place such nodes on
+different workers.</p>
 <p><strong>Expert parallelism.</strong> By default a TP group shards every MoE expert along its
 intermediate dimension. An <code class="docutils literal notranslate"><span class="pre">ep_config</span></code> block on the node group instead gives each rank
 whole experts. Attention and dense MLPs stay TP-sharded:</p>

@@ -541,6 +541,15 @@ these common members:
   config carries ``splits`` must return them here. ``AttentionSpec`` and
   ``LinearAttnSpec`` return their config's ``splits``.
 
+Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
+share a resource whose state rank 0 decides for the other ranks outside the step that uses it:
+a resource implementing ``supports_eviction``, ``lease_cached_prefix`` or ``page_trail``, which
+the paged KV cache does with or without host offload. The other ranks replay each decision
+with the next step of the node it was recorded under, so two nodes on one such resource could
+admit out of step. The conductor refuses that placement (``Resource.journals_resident_moves``
+says which resources it covers); give each node a spec of its own, or place the nodes on
+different workers.
+
 The spec types are:
 
 .. list-table::

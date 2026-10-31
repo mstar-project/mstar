@@ -346,11 +346,12 @@ class Worker:
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
 
-    # The lockstep node this worker leads, and per request the inputs of it
-    # that its followers read from elsewhere, not yet consumed by a step (see
-    # ``_setup_tp_read_check``). Empty on a bare instance.
+    # The lockstep nodes this worker leads, and per request and node the
+    # inputs of it that its followers read from elsewhere, not yet consumed by
+    # a step of that node (see ``_setup_tp_read_check``). Empty on a bare
+    # instance.
     _lockstep_led: frozenset[str] = frozenset()
-    _lockstep_unread: Mapping[int, set[str]] = MappingProxyType({})
+    _lockstep_unread: Mapping[int, dict[str, set[str]]] = MappingProxyType({})
 
     # The CPUs the main, GPU and plan threads share (None: not pinned) and
     # the process mask everything else keeps; see ``mstar.utils.cpus``.
@@ -548,8 +549,9 @@ class Worker:
         # A node is lockstep-scheduled when its instance spans more than one rank,
         # i.e. tp_size * sp_size > 1. Pure sequence-parallel nodes (tp_size 1,
         # sp_size > 1) count too: their attention all-to-all requires the whole
-        # instance to step together. v1 allows at most one per worker, which
-        # validate_deployment checks in the conductor.
+        # instance to step together. Every one on a worker is in the same
+        # instance (validate_deployment checks it in the conductor), so the
+        # worker leads all of them or follows all of them, in one step stream.
         self.parallel_nodes = set([
             node for node in node_names
             if self.parallel_groups.get_instance_world_size_for_node(node) > 1
@@ -1408,12 +1410,14 @@ class Worker:
         any rank (``_drop_rows_whose_read_failed``)."""
         self._lockstep_led = frozenset(self.parallel_nodes & self.parallel_leader_nodes)
         self._lockstep_unread = {}
+        # (producer, walk) -> {signal: the led nodes it is routed to}; structural
+        self._lockstep_consumers: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
 
     def _note_lockstep_reads(self, ready: dict[int, list[GraphEdge]]) -> None:
-        """Rank 0: the inputs of its lockstep node that landed here by a read,
-        which each follower reads too. This rank's own output of the node coming
-        back (a persisted token as the decode walk's input) is every rank's own
-        copy, with no read."""
+        """Rank 0: the inputs of a lockstep node it leads that landed here by a
+        read, which each follower reads too. This rank's own output of a led node
+        coming back (a persisted token as the decode walk's input) is every
+        rank's own copy, with no read."""
         led, me = self._lockstep_led, self.tensor_manager.my_entity_id
         for rid, edges in ready.items():
             for edge in edges:
@@ -1424,15 +1428,40 @@ class Worker:
                     for i in edge.tensor_info
                 ):
                     continue
-                self._lockstep_unread.setdefault(rid, set()).add(edge.name)
+                self._lockstep_unread.setdefault(rid, {}).setdefault(edge.next_node, set()).add(edge.name)
 
-    def _note_local_lockstep_inputs(self, stored: StoredOutputs, signals: list[str]) -> None:
+    def _note_local_lockstep_inputs(
+        self, stored: StoredOutputs, signals: list[str], producer: str,
+        rids: list[int], walks: list[str], rid_walk_idx: list[int] | None,
+    ) -> None:
         """Rank 0: outputs of a node outside the instance (an encoder beside
-        rank 0), which its lockstep node takes without a read and each follower
-        reads."""
-        unread = self._lockstep_unread
+        rank 0), which the lockstep nodes they are routed to take without a
+        read and each follower reads. Noted under each of those nodes, since a
+        step of one spends only its own. ``rids[i]`` ran
+        ``walks[rid_walk_idx[i]]``, or ``walks[0]`` when ``rid_walk_idx`` is None."""
+        unread, consumers = self._lockstep_unread, self._lockstep_consumers
+        per_walk = []
+        for walk in walks:
+            routes = consumers.get((producer, walk))
+            if routes is None:
+                routes = consumers[(producer, walk)] = self._led_consumers(producer, walk)
+            per_walk.append(routes)
+        routes_of = None if rid_walk_idx is None else {
+            rid: per_walk[w] for rid, w in zip(rids, rid_walk_idx, strict=True)
+        }
         for rid, sig in zip(stored.flat_rids, stored.signal_idxs, strict=True):
-            unread.setdefault(rid, set()).add(signals[sig])
+            routes = per_walk[0] if routes_of is None else routes_of[rid]
+            signal = signals[sig]
+            for node in routes.get(signal, ()):
+                unread.setdefault(rid, {}).setdefault(node, set()).add(signal)
+
+    def _led_consumers(self, producer: str, walk: str) -> dict[str, tuple[str, ...]]:
+        """Which led nodes each of ``producer``'s signals goes to in ``walk``."""
+        routes: dict[str, list[str]] = {}
+        for node in sorted(self._lockstep_led):
+            for signal, _ in self._graph_runtime.get_consumed_edges(producer, node, walk):
+                routes.setdefault(signal, []).append(node)
+        return {signal: tuple(nodes) for signal, nodes in routes.items()}
 
     def _step_reads(self, node_batch: ExecutingBatch) -> bool:
         """Rank 0: whether a row of this step takes an input a follower reads,
@@ -1440,7 +1469,7 @@ class Worker:
         unread, streamed = self._lockstep_unread, self._streaming_edge_names
         if not unread and not streamed:
             return False
-        tensors = node_batch.per_request_input_tensors
+        node, tensors = node_batch.node_name, node_batch.per_request_input_tensors
         for rid in node_batch.request_ids:
             names = tensors.get(rid)
             if not names:
@@ -1448,23 +1477,27 @@ class Worker:
             # a stream chunk lands with no step to mark, so a chunk is always a read
             if streamed and not streamed.isdisjoint(names):
                 return True
-            pending = unread.get(rid)
+            by_node = unread.get(rid)
+            pending = by_node.get(node) if by_node else None
             if pending and not pending.isdisjoint(names):
                 return True
         return False
 
     def _consume_lockstep_reads(self, node_batch: ExecutingBatch) -> None:
-        """Rank 0, once a step of its lockstep node ran: the marked inputs its
-        rows took are spent. Not at the broadcast: a step that does not run (a
+        """Rank 0, once a step of a node it leads ran: the marked inputs its
+        rows took for that node are spent. Not at the broadcast: a step that does not run (a
         voided speculation, a refused admit) leaves its rows to a later one."""
-        unread = self._lockstep_unread
+        unread, node = self._lockstep_unread, node_batch.node_name
         tensors = node_batch.per_request_input_tensors
         for rid in node_batch.request_ids:
-            pending = unread.get(rid)
+            by_node = unread.get(rid)
+            pending = by_node.get(node) if by_node else None
             if pending:
                 pending.difference_update(tensors.get(rid, ()))
                 if not pending:
-                    del unread[rid]
+                    del by_node[node]
+                    if not by_node:
+                        del unread[rid]
 
     def _drop_rows_whose_read_failed(self, node_batch: ExecutingBatch) -> None:
         """Before preparing a step rank 0 sent with ``read_check``: take out the
@@ -3671,7 +3704,9 @@ class Worker:
         else:
             stored = store(rids)
         if self._lockstep_led and batch_N.node_name not in self.parallel_nodes:
-            self._note_local_lockstep_inputs(stored, signals)
+            self._note_local_lockstep_inputs(
+                stored, signals, batch_N.node_name, rids, walks, rid_walk_idx,
+            )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs

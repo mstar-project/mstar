@@ -1244,6 +1244,20 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="Resource.journals_resident_moves">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.journals_resident_moves">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">journals_resident_moves</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether rank 0 decides this resource's state for the other ranks of a lockstep</span>
+<span class="sd">        instance outside the step that uses it (eviction, prefix leases, page trails). They</span>
+<span class="sd">        replay each decision with the next step of the node it was journaled under, so</span>
+<span class="sd">        validation refuses lockstep nodes on one worker sharing such a resource. Asked of</span>
+<span class="sd">        the class a spec's ``resource_class`` names, so the hooks live there, not only on</span>
+<span class="sd">        a subclass its ``build`` returns."""</span>
+        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">hook</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">Resource</span><span class="p">,</span> <span class="n">hook</span><span class="p">)</span>
+                   <span class="k">for</span> <span class="n">hook</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"supports_eviction"</span><span class="p">,</span> <span class="s2">"lease_cached_prefix"</span><span class="p">,</span> <span class="s2">"page_trail"</span><span class="p">))</span></div>
+
+
 <div class="viewcode-block" id="Resource.fingerprint">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.fingerprint">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>

@@ -1241,6 +1241,14 @@ none. The engine reads only this hook to order a split walk’s rows, so a spec 
 config carries <code class="docutils literal notranslate"><span class="pre">splits</span></code> must return them here. <code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> and
 <code class="docutils literal notranslate"><span class="pre">LinearAttnSpec</span></code> return their config’s <code class="docutils literal notranslate"><span class="pre">splits</span></code>.</p></li>
 </ul>
+<p>Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
+share a resource whose state rank 0 decides for the other ranks outside the step that uses it:
+a resource implementing <code class="docutils literal notranslate"><span class="pre">supports_eviction</span></code>, <code class="docutils literal notranslate"><span class="pre">lease_cached_prefix</span></code> or <code class="docutils literal notranslate"><span class="pre">page_trail</span></code>, which
+the paged KV cache does with or without host offload. The other ranks replay each decision
+with the next step of the node it was recorded under, so two nodes on one such resource could
+admit out of step. The conductor refuses that placement (<code class="docutils literal notranslate"><span class="pre">Resource.journals_resident_moves</span></code>
+says which resources it covers); give each node a spec of its own, or place the nodes on
+different workers.</p>
 <p>The spec types are:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <colgroup>
