@@ -461,6 +461,92 @@ def test_host_gives_back_exactly_what_it_overcounted(k):
     assert stream.stored_len == true_len + (k - 1) + (k + 1 - int(accepted[0]))
 
 
+def test_draft_passes_attend_one_query_a_row():
+    """Pass 0 writes every verify position and attends slot n alone; a later
+    pass runs one token a row, at the position after it. Both reach the
+    attention with each row's keys up to and including its query."""
+    k, rows, heads, kv_heads, dim = 2, 2, 2, 1, 8
+    t = k + 1
+    spec = SpecDecodeResource(device=CPU, num_draft_tokens=k, max_requests=rows, page_size=PAGE,
+                              kv_key="kv", attn_key="attn", stop_token_ids=(EOS,))
+    for r in range(rows):
+        spec.ingest_request(r)
+    image = spec._new_image(rows)
+    image.rows.copy_(torch.tensor([spec._row_of[r] for r in range(rows)], dtype=torch.int32))
+    image.real.fill_(1)
+    width = 16
+    table = (1 + torch.arange(rows * width, dtype=torch.int32)).view(rows, width)
+    from mstar.engine.resources.spec_decode.resource import SpecDecodePlan
+
+    spec._current = SpecDecodePlan(
+        phase=SpecPhase.VERIFY, num_rows=rows, image=image, block_table=table,
+        kv_lens=torch.zeros(rows, dtype=torch.int32), write_pages=torch.zeros(rows * t, dtype=torch.long),
+        write_offsets=torch.zeros(rows * t, dtype=torch.long),
+    )
+    regs = slice(1, rows + 1)
+    spec._seq_len[regs] = torch.tensor([10, 21], dtype=torch.int32)
+    spec._budget[regs] = 1 << 20
+    # row 0 accepts everything, row 1 refuses its first draft
+    spec._tokens[:, regs] = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    ids, _ = spec.verify_inputs()
+    spec.accept_tokens(torch.tensor([3, 5, 9, 8, 8, 8]))
+
+    calls = []
+
+    class Attn:
+        def attend_rows(self, q, layer, kv_lens):
+            calls.append((q.clone(), kv_lens.tolist()))
+            return q
+
+    pages, slots_per_page = 32, PAGE
+    layer = torch.zeros(pages, 2, slots_per_page, kv_heads, dim)
+    spec._kv = type("KV", (), {"layer_view": lambda self, idx: layer})()
+    spec._attn = Attn()
+    cos, sin = torch.ones(64, 2), torch.zeros(64, 2)
+    width_qkv = (2 * heads + 2 * kv_heads) * dim
+    gen = torch.Generator().manual_seed(0)
+    q_w, k_w = torch.zeros(dim), torch.zeros(dim)
+    args = (q_w, k_w, cos, sin, heads, kv_heads, dim, 1e-6, True, 0)
+
+    full = torch.randn(rows * t, width_qkv, generator=gen)
+    out0, gate0 = spec.attend_draft(0, full, *args)
+    assert out0.shape == (rows, heads, dim) and gate0.shape == (rows, heads, dim)
+    # row 0's last accepted slot is 2, row 1's is 0
+    assert spec.draft_slots().tolist() == [2, 3]
+    assert calls[0][1] == [13, 22]
+    pos_pages = [int(table[0, p // PAGE]) for p in (10, 11, 12)]
+    written = layer[pos_pages, 0, [10 % PAGE, 11 % PAGE, 12 % PAGE]]
+    assert written.abs().sum(dim=(1, 2)).min() > 0, "pass 0 writes every verify position of a row"
+
+    one = torch.randn(rows, width_qkv, generator=gen)
+    out1, _ = spec.attend_draft(1, one, *args)
+    assert out1.shape == (rows, heads, dim)
+    assert calls[1][1] == [14, 23]
+    where = spec.draft_address(1)
+    assert where.positions.tolist() == [13, 22]
+    assert where.slots.tolist() == [int(table[r, p // PAGE]) * PAGE + p % PAGE for r, p in enumerate((13, 22))]
+
+
+def test_attend_rows_reads_one_query_a_row_off_a_verify_plan(monkeypatch):
+    from mstar.engine.resources.attn import aiter
+
+    manager = aiter.AiterPagedAttentionManager.__new__(aiter.AiterPagedAttentionManager)
+    manager._device = CPU
+    manager._row_starts = None
+    manager._reserve_row_starts(3)
+    cu, lens = torch.tensor([0, 3, 6, 9], dtype=torch.int32), torch.zeros(3, dtype=torch.int32)
+    table = torch.zeros(3, 8, dtype=torch.int32)
+    manager._current_plans = {"main": aiter._Staged(cu, lens, table, 3, 1024, 9)}
+    seen = {}
+    monkeypatch.setattr(manager, "_unified", lambda q, plan, layer: seen.update(plan=plan) or q)
+    kv_lens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    manager.attend_rows(torch.zeros(3, 2, 4), None, kv_lens)
+    plan = seen["plan"]
+    assert plan.cu_seqlens_q.tolist() == [0, 1, 2, 3]
+    assert plan.seqused_k is kv_lens and plan.max_seqlen_q == 1 and plan.num_tokens == 3
+    assert plan.block_table is table and plan.max_seqlen_k == 1024
+
+
 def test_requests_hold_slot_groups_and_return_them():
     k = 3
     h = Harness(k)
