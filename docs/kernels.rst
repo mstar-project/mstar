@@ -20,7 +20,8 @@ Where things live
    ``JitExtension``: C++/CUDA/HIP sources built into a torch extension on
    first use, per architecture.
 ``mstar/kernels/configs/<arch>/[<product>/]<kernel>.json``
-   Tuned launch parameters per device, keyed by the op's shape classes.
+   Tuned launch parameters per device, keyed by the op's shape classes, and
+   kernel-choice tables (``KernelChoice``): which kernel serves a shape.
 ``mstar/platforms/``
    What the hardware is (``current_platform``, ``Platform.device_facts()``)
    and ``PlatformDispatch``. Nothing else branches on the vendor.
@@ -125,7 +126,7 @@ helps: ``ResultsStore.promote`` writes one family's winning knobs per class,
 and ``ResultsStore.promote_best`` picks an implementation per shape across
 families (a kernel of this repo only where it beats the shipped one by a
 margin), optionally keeping each class's default so that shapes nobody
-searched run what they ran before.
+searched run what they ran before, and optionally into a kernel-choice table.
 
 An entry may name the implementation as well as its knobs, for an op that
 chooses per shape. On AMD GPUs:
@@ -134,15 +135,26 @@ chooses per shape. On AMD GPUs:
   (``mstar/kernels/triton/norm.py``) for entries with ``"impl": "triton"`` and
   FlashInfer's ROCm fork otherwise, including on every product without a
   config.
-- Decode buckets of up to 16 rows send each linear where the
-  ``decode_gemv`` entry for its ``(rows, n, k)`` says: ``"aiter"`` (AITER's
-  skinny GEMM), ``"triton"`` (``mstar::decode_gemv``,
-  ``mstar/kernels/triton/gemv.py``) or ``"hipblaslt"`` (left to inductor),
-  and a gated MLP's gate/up projection and ``silu(gate) * up``
-  become one ``mstar::decode_gemv_silu_mul`` where that op's entry names a
-  kernel. Without a config, 1-2 row linears go to AITER and the rest to
-  hipBLASLt. The graph passes are in ``mstar/platforms/rocm_gemm.py``; their
-  cache key covers the configs, so a changed config recompiles.
+- Decode GEMMs (``mstar/platforms/rocm_gemm.py``) read one table,
+  ``decode_gemm`` (``KernelChoice``): each ``(rows, n, k)`` entry says what
+  serves that linear, ``"aiter"`` (AITER's skinny GEMM), ``"triton"``
+  (``mstar::decode_gemv``, ``mstar/kernels/triton/gemv.py``, up to 16 rows),
+  ``"hipblaslt_tuned"`` (``mstar::decode_linear`` at the hipBLASLt solution
+  the entry holds, in decode buckets of up to 128 rows) or ``"hipblaslt"``
+  (left to inductor). The same shape with ``gated`` in its key says whether a
+  gated MLP's gate/up projection and ``silu(gate) * up`` run as one
+  ``mstar::decode_gemv_silu_mul`` (``"fused"``) or as the linear and a
+  pointwise kernel (``"unfused"``). Without a table, 1-2 row linears go to
+  AITER and the rest to hipBLASLt. The graph passes' cache key covers the
+  table, so a changed table recompiles, and the solutions apply only on the
+  stack the table was tuned on.
+
+A kernel-choice table is written by ``python -m benchmark.kernels.promote
+decode_gemm --store <dir>`` from a store holding a search of ``decode_gemv``
+and ``decode_gemv_silu_mul``. An entry keeps every implementation's time and
+parameters beside the one chosen, so moving a shape is a one-word edit, and
+``python -m mstar.kernels --probe`` counts the shapes each implementation
+serves.
 
 Measuring with the harness
 --------------------------
