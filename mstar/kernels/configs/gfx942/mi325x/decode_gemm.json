@@ -28,6 +28,99 @@
   "store": "/work/amd/results/innovation/f4-gemm-arbitration/store1f"
  },
  "shapes": {
+  "gated1-k1024-n7168-rows1": {
+   "candidates": {
+    "fused": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 6.81,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    },
+    "unfused": {
+     "us": 6.96
+    }
+   },
+   "impl": "fused"
+  },
+  "gated1-k1024-n7168-rows16": {
+   "candidates": {
+    "fused": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 9.61,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    },
+    "unfused": {
+     "us": 8.91
+    }
+   },
+   "impl": "unfused"
+  },
+  "gated1-k1024-n7168-rows2": {
+   "candidates": {
+    "fused": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 7.78,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    },
+    "unfused": {
+     "us": 7.26
+    }
+   },
+   "impl": "unfused"
+  },
+  "gated1-k1024-n7168-rows4": {
+   "candidates": {
+    "fused": {
+     "block_k": 256,
+     "block_n": 16,
+     "num_stages": 1,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 8.06,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    },
+    "unfused": {
+     "us": 8.36
+    }
+   },
+   "impl": "fused"
+  },
+  "gated1-k1024-n7168-rows8": {
+   "candidates": {
+    "fused": {
+     "block_k": 256,
+     "block_n": 16,
+     "num_stages": 1,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 8.85,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    },
+    "unfused": {
+     "us": 8.94
+    }
+   },
+   "impl": "fused"
+  },
   "gated1-k2048-n12288-rows1": {
    "candidates": {
     "fused": {
@@ -216,6 +309,639 @@
    },
    "impl": "fused"
   },
+  "k1024-n248320-rows1": {
+   "candidates": {
+    "aiter": {
+     "us": 105.11
+    },
+    "hipblaslt": {
+     "us": 137.87
+    },
+    "hipblaslt_tuned": {
+     "solution": 205562,
+     "us": 110.29
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 111.41,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n248320-rows16": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 142.08
+    },
+    "hipblaslt_tuned": {
+     "solution": 205562,
+     "us": 119.22
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 123.09,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n248320-rows2": {
+   "candidates": {
+    "aiter": {
+     "us": 110.41
+    },
+    "hipblaslt": {
+     "us": 139.18
+    },
+    "hipblaslt_tuned": {
+     "solution": 205562,
+     "us": 111.84
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 118.04,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n248320-rows32": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 148.13
+    },
+    "hipblaslt_tuned": {
+     "solution": 205578,
+     "us": 135.21
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n248320-rows4": {
+   "candidates": {
+    "aiter": {
+     "us": 118.32
+    },
+    "hipblaslt": {
+     "us": 139.75
+    },
+    "hipblaslt_tuned": {
+     "solution": 205562,
+     "us": 115.67
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 120.28,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n248320-rows48": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 156.16
+    },
+    "hipblaslt_tuned": {
+     "solution": 198308,
+     "us": 145.88
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n248320-rows64": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 165.07
+    },
+    "hipblaslt_tuned": {
+     "solution": 205493,
+     "us": 156.32
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n248320-rows8": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 141.74
+    },
+    "hipblaslt_tuned": {
+     "solution": 205562,
+     "us": 117.17
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 121.76,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n5120-rows1": {
+   "candidates": {
+    "aiter": {
+     "us": 4.37
+    },
+    "hipblaslt": {
+     "us": 6.26
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 5.99
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 4.78,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n5120-rows16": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.3
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.12
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 6.42,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n5120-rows2": {
+   "candidates": {
+    "aiter": {
+     "us": 4.73
+    },
+    "hipblaslt": {
+     "us": 6.28
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.08
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 5.53,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n5120-rows32": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.56
+    },
+    "hipblaslt_tuned": {
+     "solution": 205507,
+     "us": 6.37
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n5120-rows4": {
+   "candidates": {
+    "aiter": {
+     "us": 5.69
+    },
+    "hipblaslt": {
+     "us": 6.29
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.05
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 6.16,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n5120-rows48": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.18
+    },
+    "hipblaslt_tuned": {
+     "solution": 205507,
+     "us": 6.46
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n5120-rows64": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.56
+    },
+    "hipblaslt_tuned": {
+     "solution": 205515,
+     "us": 7.05
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n5120-rows8": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.3
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.11
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 6.33,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n7168-rows1": {
+   "candidates": {
+    "aiter": {
+     "us": 4.98
+    },
+    "hipblaslt": {
+     "us": 6.74
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.6
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 5.73,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n7168-rows16": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.8
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.7
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 7.19,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k1024-n7168-rows2": {
+   "candidates": {
+    "aiter": {
+     "us": 5.38
+    },
+    "hipblaslt": {
+     "us": 6.83
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.66
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 6.31,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n7168-rows32": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.06
+    },
+    "hipblaslt_tuned": {
+     "solution": 198237,
+     "us": 7.03
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k1024-n7168-rows4": {
+   "candidates": {
+    "aiter": {
+     "us": 6.37
+    },
+    "hipblaslt": {
+     "us": 6.85
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.67
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 6.69,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n7168-rows48": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.71
+    },
+    "hipblaslt_tuned": {
+     "solution": 205639,
+     "us": 7.52
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n7168-rows64": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 8.15
+    },
+    "hipblaslt_tuned": {
+     "solution": 198259,
+     "us": 8.15
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k1024-n7168-rows8": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.82
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.68
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 6.95,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k1024-n8224-rows1": {
+   "candidates": {
+    "aiter": {
+     "us": 5.53
+    },
+    "hipblaslt": {
+     "us": 7.72
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 7.14
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 6.24,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n8224-rows16": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.66
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 7.2
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 8.11,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n8224-rows2": {
+   "candidates": {
+    "aiter": {
+     "us": 5.93
+    },
+    "hipblaslt": {
+     "us": 7.75
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 7.17
+    },
+    "triton": {
+     "block_k": 1024,
+     "block_n": 4,
+     "num_warps": 2,
+     "split_k": 4,
+     "us": 7.55,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n8224-rows32": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 8.39
+    },
+    "hipblaslt_tuned": {
+     "solution": 197954,
+     "us": 7.6
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n8224-rows4": {
+   "candidates": {
+    "aiter": {
+     "us": 6.85
+    },
+    "hipblaslt": {
+     "us": 7.83
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 7.18
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 7.89,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "aiter"
+  },
+  "k1024-n8224-rows48": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 8.33
+    },
+    "hipblaslt_tuned": {
+     "solution": 205639,
+     "us": 7.94
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k1024-n8224-rows64": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 8.66
+    },
+    "hipblaslt_tuned": {
+     "solution": 197935,
+     "us": 8.77
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k1024-n8224-rows8": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.91
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 7.2
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 1,
+     "us": 7.97,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
   "k12288-n4096-rows1": {
    "candidates": {
     "aiter": {
@@ -374,6 +1100,163 @@
     }
    },
    "impl": "hipblaslt_tuned"
+  },
+  "k2048-n1024-rows1": {
+   "candidates": {
+    "aiter": {
+     "us": 3.82
+    },
+    "hipblaslt": {
+     "us": 5.49
+    },
+    "hipblaslt_tuned": {
+     "solution": 198199,
+     "us": 5.54
+    },
+    "triton": {
+     "block_k": 2048,
+     "block_n": 2,
+     "num_warps": 4,
+     "split_k": 2,
+     "us": 3.29,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "triton"
+  },
+  "k2048-n1024-rows16": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 5.61
+    },
+    "hipblaslt_tuned": {
+     "solution": 198199,
+     "us": 5.55
+    },
+    "triton": {
+     "block_k": 512,
+     "block_n": 16,
+     "num_stages": 2,
+     "num_warps": 2,
+     "split_k": 2,
+     "us": 6.34,
+     "use_dot": true,
+     "waves_per_eu": 0,
+     "xcd_remap": true
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k2048-n1024-rows2": {
+   "candidates": {
+    "aiter": {
+     "us": 4.12
+    },
+    "hipblaslt": {
+     "us": 5.41
+    },
+    "hipblaslt_tuned": {
+     "solution": 198199,
+     "us": 5.41
+    },
+    "triton": {
+     "block_k": 2048,
+     "block_n": 2,
+     "num_warps": 4,
+     "split_k": 2,
+     "us": 3.64,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "triton"
+  },
+  "k2048-n1024-rows32": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 5.83
+    },
+    "hipblaslt_tuned": {
+     "solution": 198203,
+     "us": 5.88
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k2048-n1024-rows4": {
+   "candidates": {
+    "aiter": {
+     "us": 6.91
+    },
+    "hipblaslt": {
+     "us": 5.52
+    },
+    "hipblaslt_tuned": {
+     "solution": 198199,
+     "us": 5.55
+    },
+    "triton": {
+     "block_k": 2048,
+     "block_n": 2,
+     "num_warps": 4,
+     "split_k": 2,
+     "us": 4.48,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "triton"
+  },
+  "k2048-n1024-rows48": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.03
+    },
+    "hipblaslt_tuned": {
+     "solution": 198204,
+     "us": 5.96
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k2048-n1024-rows64": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 6.1
+    },
+    "hipblaslt_tuned": {
+     "solution": 198203,
+     "us": 6.11
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k2048-n1024-rows8": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 5.56
+    },
+    "hipblaslt_tuned": {
+     "solution": 198199,
+     "us": 5.59
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 1,
+     "num_warps": 2,
+     "split_k": 8,
+     "us": 5.59,
+     "use_dot": true,
+     "waves_per_eu": 2,
+     "xcd_remap": false
+    }
+   },
+   "impl": "hipblaslt"
   },
   "k2048-n12288-rows1": {
    "candidates": {
@@ -1166,6 +2049,163 @@
     }
    },
    "impl": "triton"
+  },
+  "k3584-n1024-rows1": {
+   "candidates": {
+    "aiter": {
+     "us": 5.42
+    },
+    "hipblaslt": {
+     "us": 7.36
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.74
+    },
+    "triton": {
+     "block_k": 4096,
+     "block_n": 2,
+     "num_warps": 4,
+     "split_k": 2,
+     "us": 4.36,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "triton"
+  },
+  "k3584-n1024-rows16": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.59
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.9
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 1,
+     "num_warps": 2,
+     "split_k": 8,
+     "us": 7.99,
+     "use_dot": true,
+     "waves_per_eu": 2,
+     "xcd_remap": false
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k3584-n1024-rows2": {
+   "candidates": {
+    "aiter": {
+     "us": 5.83
+    },
+    "hipblaslt": {
+     "us": 7.37
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.75
+    },
+    "triton": {
+     "block_k": 4096,
+     "block_n": 2,
+     "num_warps": 4,
+     "split_k": 2,
+     "us": 4.99,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "triton"
+  },
+  "k3584-n1024-rows32": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 8.33
+    },
+    "hipblaslt_tuned": {
+     "solution": 198206,
+     "us": 8.0
+    }
+   },
+   "impl": "hipblaslt_tuned"
+  },
+  "k3584-n1024-rows4": {
+   "candidates": {
+    "aiter": {
+     "us": 10.25
+    },
+    "hipblaslt": {
+     "us": 7.5
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.76
+    },
+    "triton": {
+     "block_k": 4096,
+     "block_n": 2,
+     "num_warps": 4,
+     "split_k": 2,
+     "us": 6.04,
+     "use_dot": false,
+     "waves_per_eu": 0,
+     "xcd_remap": false
+    }
+   },
+   "impl": "triton"
+  },
+  "k3584-n1024-rows48": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.68
+    },
+    "hipblaslt_tuned": {
+     "solution": 198204,
+     "us": 7.67
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k3584-n1024-rows64": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.75
+    },
+    "hipblaslt_tuned": {
+     "solution": 198202,
+     "us": 7.75
+    }
+   },
+   "impl": "hipblaslt"
+  },
+  "k3584-n1024-rows8": {
+   "candidates": {
+    "hipblaslt": {
+     "us": 7.55
+    },
+    "hipblaslt_tuned": {
+     "solution": 205638,
+     "us": 6.81
+    },
+    "triton": {
+     "block_k": 256,
+     "block_n": 32,
+     "num_stages": 1,
+     "num_warps": 2,
+     "split_k": 8,
+     "us": 7.17,
+     "use_dot": true,
+     "waves_per_eu": 2,
+     "xcd_remap": false
+    }
+   },
+   "impl": "hipblaslt_tuned"
   },
   "k4096-n10240-rows1": {
    "candidates": {
