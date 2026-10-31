@@ -160,15 +160,35 @@ class KVRows(RowFills):
             rows.write(lens, d.join_slots, stored)
             rows.write(pages, d.join_slots, out)
 
-    def write_pages(self, rows: StepRows, label: str, slot: int, first: int, new_pages) -> None:
-        """Pages a held row's stream gained this step, from page ``first`` on."""
-        n = len(new_pages)
-        if first + n > self.max_pages:
-            raise ValueError(f"a row of {label} grows past its {self.max_pages} pages")
-        rows.write_at(
-            self.labels[label][1], np.full(n, slot), (np.arange(first, first + n),),
-            np.asarray(new_pages, np.int32),
-        )
+    def write_crossings(self, rows: StepRows, streams: dict, held) -> None:
+        """For each held row (``held(rid)``) whose token starts a page, that
+        page, from its stream.
+
+        Derived from the committed length rather than from what this step's
+        admit reserved: a discarded pre-plan of the step reserved the page
+        and left it with the stream, so the admit of the step that runs
+        reserves nothing, yet the row has never been given the page."""
+        order = rows.order
+        page_size = self.page_size
+        for label, (lens_buf, pages) in self.labels.items():
+            lens = rows.mirror(lens_buf)[:len(order)]
+            crossing = np.flatnonzero(lens % page_size == 0)
+            if not len(crossing):
+                continue
+            slots, at, values = [], [], []
+            for i in crossing.tolist():
+                rid = order[i]
+                if not held(rid):
+                    continue
+                first = int(lens[i]) // page_size
+                if first >= self.max_pages:
+                    raise ValueError(f"a row of {label} grows past its {self.max_pages} pages")
+                slots.append(rows.slot_of(rid))
+                at.append(first)
+                # admit gave the stream this page; an IndexError here is a step admitted without it
+                values.append(streams[rid][label].page_indices[first])
+            if slots:
+                rows.write_at(pages, np.asarray(slots), (np.asarray(at),), np.asarray(values, np.int32))
 
     def lens_host(self, rows: StepRows, label: str) -> np.ndarray:
         """This step's lengths, before its token, by slot."""

@@ -2578,15 +2578,13 @@ class KVManager(AttentionResource):
             )
         rows = ctx.rows
         d = rows.diff
+        joined = ()
         if d.join_rids:
             kv_rows.write_joins(rows, self._streams)
-        if self._admit_reserved_pages:
             joined = set(d.join_rids)
-            for (rid, label), new in self._admit_reserved_pages.items():
-                if rid in joined or label not in kv_rows.labels or ctx.is_padding_row(rid):
-                    continue
-                held = self._streams[rid][label].page_indices.n
-                kv_rows.write_pages(rows, label, rows.slot_of(rid), held - len(new), new)
+        kv_rows.write_crossings(
+            rows, self._streams, lambda rid: rid not in joined and not ctx.is_padding_row(rid),
+        )
         return by_label
 
     def _arm_rows(self, kv_rows: KVRows, res: "KVPlanOutputs", ctx: StepContext) -> None:
@@ -2651,8 +2649,13 @@ class KVManager(AttentionResource):
         if rid is None or rid in self._readonly_rows:
             self._drop_readonly_plans()
         if self._rows_plans:
-            for key in [k for k, p in self._rows_plans.items() if rid is None or rid in p.rids]:
-                del self._rows_plans[key]
+            # runs on the main, plan and GPU threads while a commit hook on the
+            # GPU thread inserts: iterate a snapshot (list() of a dict is
+            # atomic under the GIL) and tolerate a key another thread removed
+            plans = self._rows_plans
+            for key, p in list(plans.items()):
+                if rid is None or rid in p.rids:
+                    plans.pop(key, None)
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
