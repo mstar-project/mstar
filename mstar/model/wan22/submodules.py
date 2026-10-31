@@ -38,6 +38,7 @@ from mstar.model.wan22.components.unipc import (
     unipc_predictor_step,
 )
 from mstar.model.wan22.config import Wan22Config
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -155,18 +156,14 @@ def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     setattr(owner, attr, value)
 
 
-def _loop_step(fwd_info: CurrentForwardPassInfo, time_index: torch.Tensor) -> int:
+def _loop_step(fwd_info: CurrentForwardPassInfo) -> int:
     """The denoise iteration this step runs, from the engine's loop counter.
 
-    ``time_index`` holds the same value, but it is the previous step's device
-    output: reading it on the host waits for that step to finish, which stalls
-    the speculative preparation of this one. Callers that drive the submodule
-    without a loop counter (tests, harnesses) fall back to the edge.
+    A value carried on a loop-back edge would be the previous step's device
+    output, and reading it on the host waits for that step to finish, which
+    stalls the speculative preparation of this one.
     """
-    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
-    if DENOISE_LOOP_NAME in counts:
-        return int(counts[DENOISE_LOOP_NAME])
-    return int(time_index.reshape(-1)[0].item())
+    return int(fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME])
 
 
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
@@ -335,16 +332,15 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     Loop-carried edges, all float32 over the latent grid:
 
         latents              current sample x_t
-        time_index           [1] int64, the 0-based step index k
         unipc_model_outputs  ring buffer of the last two converted outputs;
                              see ``UniPCState``
         unipc_last_sample    the sample the previous predictor was given
 
     Nothing else is carried. The sigmas, the order ramp and the timestep pair all
-    follow from ``time_index`` and the per-request tables, so they are recomputed
-    rather than shipped across an edge.
+    follow from the engine's loop counter and the per-request tables, so they are
+    recomputed rather than shipped across an edge.
 
-    At iteration 0 the conductor sends the four edges empty and this submodule
+    At iteration 0 the conductor sends the three edges empty and this submodule
     seeds them (noise from the request's seed, on a CPU generator as diffusers
     does). I2V also consumes the persisted ``image_latent``: frame 0 of the input
     is replaced by it and its per-token timestep zeroed, and the conditioning is
@@ -418,16 +414,12 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
             latents = torch.randn(shape, generator=generator, dtype=torch.float32).to(device)
             tensor_inputs["latents"] = latents
-            # 1-D, not 0-dim: the worker's output fanout reads dims[0] of every
-            # routed edge.
-            tensor_inputs["time_index"] = torch.zeros(1, dtype=torch.int64, device=device)
             tensor_inputs["unipc_model_outputs"] = torch.zeros(
                 (SOLVER_ORDER, *shape), dtype=torch.float32, device=device
             )
             tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
         else:
-            time_index = inputs["time_index"][0]
-            k = _loop_step(fwd_info, time_index)
+            k = _loop_step(fwd_info)
             num_steps = int(fwd_info.step_metadata["num_inference_steps"])
             if k >= num_steps:
                 # Async scheduling dispatched an iteration past this request's
@@ -441,7 +433,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 )
                 return None
             tensor_inputs["latents"] = inputs["latents"][0]
-            tensor_inputs["time_index"] = time_index
             tensor_inputs["unipc_model_outputs"] = inputs["unipc_model_outputs"][0]
             tensor_inputs["unipc_last_sample"] = inputs["unipc_last_sample"][0]
         return NodeInputs(tensor_inputs=tensor_inputs)
@@ -451,7 +442,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         latents: torch.Tensor,
-        time_index: torch.Tensor,
         unipc_model_outputs: torch.Tensor,
         unipc_last_sample: torch.Tensor,
         text_embeds_pos: torch.Tensor,
@@ -459,15 +449,17 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         image_latent: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        step_metadata = engine_inputs.single_request_info.step_metadata
+        fwd_info = engine_inputs.single_request_info
+        step_metadata = fwd_info.step_metadata
         num_steps = int(step_metadata["num_inference_steps"])
         guidance_scale = float(step_metadata["guidance_scale"])
-        k = int(time_index.item())
+        k = _loop_step(fwd_info)
         device = latents.device
 
         with _inference_ctx():
             sigmas, timesteps = make_unipc_tables(num_steps, self.config.flow_shift)
-            t = timesteps[k].to(device)
+            sigmas_device = to_device_nonblocking(sigmas, device)
+            t = to_device_nonblocking(timesteps, device)[k]
 
             # All-ones for T2V; frame 0 zeroed for I2V.
             mask = torch.ones(1, 1, *latents.shape[2:], dtype=torch.float32, device=device)
@@ -478,9 +470,9 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 model_input = latents
             model_input = model_input.to(self.transformer.dtype)
 
-            # expand_timesteps: per-token timestep over the post-patch grid
-            # ([:, ::2, ::2] == patch_size (1, 2, 2)); I2V frame-0 tokens get 0.
-            temp_ts = (mask[0, 0][:, ::2, ::2] * t).flatten()
+            # expand_timesteps: every token of a latent frame takes its frame's
+            # timestep (patch_size (1, 2, 2) keeps the frame axis); I2V frame 0 gets 0.
+            temp_ts = mask[0, 0, :, 0, 0] * t
             noise_pred = self._noise_prediction(
                 model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale
             )
@@ -493,7 +485,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                     UniPCState(model_outputs=unipc_model_outputs, last_sample=unipc_last_sample),
                     this_model_output=m_k,
                     this_sample=sample,
-                    sigmas=sigmas,
+                    sigmas=sigmas_device,
                     step_index=k,
                     order=unipc_effective_order(k - 1, num_steps),
                 )
@@ -501,7 +493,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             new_latents = unipc_predictor_step(
                 UniPCState(model_outputs=new_ring, last_sample=sample),
                 sample=sample,
-                sigmas=sigmas,
+                sigmas=sigmas_device,
                 step_index=k,
                 order=unipc_effective_order(k, num_steps),
             )
@@ -513,7 +505,6 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
 
         return {
             "latents": [new_latents],
-            "time_index": [time_index + 1],
             "unipc_model_outputs": [new_ring],
             "unipc_last_sample": [sample],
         }
@@ -593,11 +584,13 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
 class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE latent -> pixel decoder (tiled).
 
-    Consumes the loop's final ``latents`` and emits ``video_output``
-    ``[1, 3, num_frames, H, W]`` as uint8. Quantizing here, at the worker boundary,
+    Consumes the loop's final ``latents`` and emits ``video_output`` as uint8
+    ``[num_frames, H, W, 3]`` frames. Quantizing here, at the worker boundary,
     keeps the edge to the data worker at one byte per pixel instead of a 4x larger
     float tensor; the output is 8-bit mp4 either way, and ``Wan22Model.postprocess``
-    does the muxing.
+    does the muxing. The frames are laid out as PyAV's rgb24 frames here, on the
+    GPU, so the encoder reads them without copying each one out of a strided
+    view on the host.
 
     The node owns its own VAE instance because the decode dtype depends on the cuDNN
     version (see ``_decode_dtype``) while the I2V encode stays bf16 — one shared
@@ -788,6 +781,6 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 )
             else:
                 video = vae.decode(latents, return_dict=False)[0]
-            # Quantize to 8-bit at the worker boundary (see class docstring).
-            video = (video / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
-        return {"video_output": [video]}
+            # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
+            frames = (video[0] / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
+        return {"video_output": [frames]}

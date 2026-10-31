@@ -115,6 +115,10 @@ class StepRunner:
         ]
         self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
+        self._after_output_copy_keys = frozenset(
+            key for key in self._order
+            if type(self._resources[key]).after_output_copy is not Resource.after_output_copy
+        )
         # publisher key -> every node of the deployment that declares it
         # (``declared_by``): a replica on another worker, under another node
         # name, reads what this one publishes. This runner's own nodes when
@@ -255,6 +259,11 @@ class StepRunner:
                         rid, node_name,
                         walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
                     )
+
+    def after_output_copy(self, step: SubmoduleStep) -> None:
+        for key in self._keys_for(step):
+            if key in self._after_output_copy_keys:
+                self._resources[key].after_output_copy(step.get(key))
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Tell the node's resources that the cache served this walk whole."""

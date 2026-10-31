@@ -12,7 +12,7 @@ Every caller holds the manager's lock, so none of this takes one of its own.
 
 import copy
 import heapq
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -119,6 +119,13 @@ class PrefixIndex:
     def holds(self, page: int) -> bool:
         return self._key[page] is not None
 
+    def key_of(self, page: int) -> bytes | None:
+        return self._key[page]
+
+    def parent_key(self, page: int) -> bytes | None:
+        parent = self._parent[page]
+        return None if parent is None else self._key[parent]
+
     def evictable(self) -> set[int]:
         """Return the live set of pages `evict` could free.
         Callers read it and don't keep it.
@@ -216,8 +223,9 @@ class PrefixIndex:
         """How many pages the index holds a reference to (``len(pages())``)."""
         return len(self._by_key)
 
-    def evict(self, n: int) -> list[bytes]:
-        """Drop the oldest leaves the index alone holds, until ``n`` are free.
+    def evict(self, n: int, spare: Callable[[bytes], bool] | None = None) -> list[bytes]:
+        """Drop the oldest leaves the index alone holds, until ``n`` are free. When ``spare`` accepts a leaf's
+        key, that leaf is dropped only once no other leaf is left.
 
         A leaf a request or a lease also holds is passed over and put back:
         dropping it would free nothing and lose an entry that is still good.
@@ -225,17 +233,24 @@ class PrefixIndex:
         """
         dropped = []
         passed_over = []
+        spared: list[tuple[int, int]] = []
         while len(dropped) < n:
             entry = self._pop_leaf()
+            last = entry is None and bool(spared)
+            if last:
+                entry = heapq.heappop(spared)
             if entry is None:
                 break
             stamp, page = entry
             if self._arena.num_owners[page] > 1:
                 passed_over.append(entry)
                 continue
+            if not last and spare is not None and spare(self._key[page]):
+                heapq.heappush(spared, entry)
+                continue
             dropped.append(self._key[page])
             self._remove(page)
-        for entry in passed_over:
+        for entry in passed_over + spared:
             heapq.heappush(self._leaves, entry)
         return dropped
 
