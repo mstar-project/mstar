@@ -441,6 +441,7 @@ RAMPS = [
     pytest.param((1, 2, 4, 8, 16), 25, 25, id="doubling-ramp"),
     pytest.param((4,), 25, 25, id="4-then-25"),
     pytest.param((8, 10, 13, 16, 20), 25, 25, id="early-audio-8-10-13-16-20"),
+    pytest.param((4, 8, 16), 25, 25, id="ramp4-4-8-16-25"),
     # a ramp chunk wider than the steady chunk widens the padded window
     pytest.param((30, 10), 25, 25, id="30-10-25"),
     pytest.param((4, 10), 25, 50, id="4-10-25-context-50"),
@@ -491,7 +492,9 @@ def test_a_batch_mixes_windows_from_different_ramp_stages():
         assert torch.equal(torch.cat([audio for _, audio, _ in steps[rid]]), full), rid
 
 
-@pytest.mark.parametrize("schedule", [(12, 13), (8, 10, 13, 16, 20)], ids=["default", "early-audio"])
+@pytest.mark.parametrize(
+    "schedule", [(12, 13), (8, 10, 13, 16, 20), (4, 8, 16)], ids=["default", "early-audio", "ramp4"],
+)
 @pytest.mark.parametrize("num_frames", [3, 4, 12, 25, 26, 50, 120])
 def test_real_decoder_streams_the_ramp_like_the_full_decode(tiny_code2wav, num_frames, schedule):
     """A ramp's windows carry every frame decoded so far as context (none for
