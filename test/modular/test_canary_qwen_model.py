@@ -45,8 +45,9 @@ def test_nemo_names_map_onto_hf_names():
     assert nemo_to_hf_name("layers.0.feed_forward1.linear1.weight") == "layers.0.feed_forward1.linear1.weight"
 
 
-def test_nemo_named_encoder_loads_completely():
-    """Every parameter of the encoder is reachable from NeMo's names."""
+def _nemo_perception(encoder: FastConformerEncoder) -> dict[str, torch.Tensor]:
+    """``encoder``'s weights, a projection and filters under the names NeMo's
+    perception module saves them with, BatchNorm statistics included."""
     hf_to_nemo = [(hf, nemo) for nemo, hf in [
         ("pre_encode.conv.", "subsampling.layers."), ("pre_encode.out.", "subsampling.linear."),
         (".self_attn.linear_q.", ".self_attn.q_proj."), (".self_attn.linear_k.", ".self_attn.k_proj."),
@@ -54,30 +55,73 @@ def test_nemo_named_encoder_loads_completely():
         (".self_attn.linear_pos.", ".self_attn.relative_k_proj."), (".self_attn.pos_bias_u", ".self_attn.bias_u"),
         (".self_attn.pos_bias_v", ".self_attn.bias_v"), (".conv.batch_norm.", ".conv.norm."),
     ]]
-    cfg = FastConformerConfig(hidden_size=16, num_layers=1, num_heads=2, intermediate_size=32, num_mel_bins=16,
-                              subsampling_channels=4)
-    enc = FastConformerEncoder(cfg)
     nemo = {}
-    for name, p in enc.named_parameters():
+    for name, p in encoder.named_parameters():
+        p = torch.randn_like(p) * 0.2
         if name.endswith("qkv_proj.weight") or name.endswith("qkv_proj.bias"):
             for i, s in enumerate("qkv"):
-                nemo[name.replace("qkv_proj", f"linear_{s}")] = p.detach().chunk(3)[i]
+                nemo[name.replace("qkv_proj", f"linear_{s}")] = p.chunk(3)[i]
             continue
         if ".conv.pointwise_conv" in name and name.endswith("weight"):
-            nemo[name] = p.detach()[..., None]
-            continue
-        if ".conv.depthwise_conv" in name:
-            nemo[name] = p.detach()
-            continue
-        for hf, n in hf_to_nemo:
-            name = name.replace(hf, n)
-        nemo[name] = p.detach()
-    for i in range(cfg.num_layers):
-        for stat, value in (("weight", 1.0), ("bias", 0.0), ("running_mean", 0.0), ("running_var", 1.0)):
-            nemo[f"layers.{i}.conv.batch_norm.{stat}"] = torch.full((16,), value)
-    fresh = FastConformerEncoder(cfg)
-    loaded = fresh.load_hf_weights((nemo_to_hf_name(k), v) for k, v in nemo.items())
-    assert loaded == {n for n, _ in fresh.named_parameters()}
+            p = p[..., None]
+        elif ".conv.depthwise_conv" not in name:
+            for hf, n in hf_to_nemo:
+                name = name.replace(hf, n)
+        nemo[name] = p
+    c = encoder.config.hidden_size
+    for i in range(encoder.config.num_layers):
+        for stat, (lo, hi) in (("weight", (0.8, 1.2)), ("bias", (-0.2, 0.2)), ("running_mean", (-0.5, 0.5)),
+                               ("running_var", (0.5, 2.0))):
+            nemo[f"layers.{i}.conv.batch_norm.{stat}"] = torch.empty(c).uniform_(lo, hi)
+    mels = encoder.config.num_mel_bins
+    return {
+        **{f"encoder.{k}": v for k, v in nemo.items()},
+        "proj.weight": torch.randn(24, c), "proj.bias": torch.randn(24),
+        "preprocessor.featurizer.fb": torch.rand(1, mels, 257),
+        "preprocessor.featurizer.window": torch.hann_window(400, periodic=False),
+    }
+
+
+def test_perception_loads_the_encoder_canary_loads():
+    """Canary-Qwen's NeMo-named perception (``from_nemo``, ``load_nemo_perception``)
+    is, bit for bit, the encoder an HF-named checkpoint of the same weights
+    loads (``from_hf``, ``load_hf_weights``, Canary's path): the same config,
+    every parameter reached, the BatchNorm folded alike; and it carries the
+    checkpoint's projection and filters."""
+    from mstar.model.components.audio_features import NemoLogMel
+    from mstar.model.components.fastconformer import load_nemo_perception
+
+    nemo_config = {
+        "d_model": 32, "n_layers": 2, "n_heads": 4, "ff_expansion_factor": 2, "conv_kernel_size": 9,
+        "feat_in": 16, "subsampling_factor": 8, "subsampling_conv_channels": 8,
+        "self_attention_model": "rel_pos", "subsampling": "dw_striding", "att_context_size": [-1, -1],
+    }
+    hf_config = dict(
+        model_type="parakeet_encoder", hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=64, conv_kernel_size=9, num_mel_bins=16, subsampling_factor=8,
+        subsampling_conv_channels=8, subsampling_conv_kernel_size=3, subsampling_conv_stride=2,
+        attention_bias=True, convolution_bias=True, scale_input=True,   # NeMo's xscaling default
+    )
+    config = FastConformerConfig.from_nemo(nemo_config)
+    assert config == FastConformerConfig.from_hf(hf_config)
+    torch.manual_seed(0)
+    weights = _nemo_perception(FastConformerEncoder(config))
+    encoder, proj, log_mel = load_nemo_perception(config, 24, weights.items(), device="cpu")
+    hf = FastConformerEncoder(config).eval()
+    hf.load_hf_weights((nemo_to_hf_name(k.removeprefix("encoder.")), v) for k, v in weights.items()
+                       if k.startswith("encoder."))
+    wave = torch.randn(5000) * 0.1
+    feats = log_mel(wave)[None]
+    with torch.no_grad():
+        assert torch.equal(encoder(feats)[0], hf(feats)[0])
+    assert torch.equal(proj.weight, weights["proj.weight"]) and torch.equal(proj.bias, weights["proj.bias"])
+    own = NemoLogMel(num_mel_bins=16, mel_filters=weights["preprocessor.featurizer.fb"],
+                     window=weights["preprocessor.featurizer.window"])
+    assert torch.equal(feats[0], own(wave))
+    # a weight the loader doesn't place (a modality adapter's, say) is refused, not skipped
+    with pytest.raises(ValueError, match="modality_adapter"):
+        load_nemo_perception(config, 24, [*weights.items(), ("modality_adapter.weight", torch.ones(1))],
+                             device="cpu")
 
 
 def test_config(tmp_path):
@@ -111,7 +155,12 @@ def test_config(tmp_path):
     (tmp_path / "nemo" / "config.json").write_text(json.dumps(nemo))
     assert CanaryQwenModelConfig.from_pretrained(tmp_path / "nemo", tmp_path / "qwen").encoder.scale_input
     for section, key, value in (("encoder", "att_context_size", [70, 13]), ("preprocessor", "window_size", 0.02),
-                                ("preprocessor", "normalize", "all_features"), ("preprocessor", "features", 80)):
+                                ("preprocessor", "normalize", "all_features"), ("preprocessor", "features", 80),
+                                # NemoLogMel's fixed settings, which NeMo's config leaves out as defaults
+                                ("preprocessor", "mag_power", 1.0), ("preprocessor", "preemph", 0.5),
+                                # one part of the encoder causal, the rest not: not one this encoder runs
+                                ("encoder", "conv_norm_type", "layer_norm"),
+                                ("encoder", "causal_downsampling", True)):
         bad = json.loads(json.dumps(nemo))
         bad["perception"][section][key] = value
         (tmp_path / "nemo" / "config.json").write_text(json.dumps(bad))

@@ -319,7 +319,9 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::graph::runtime::GraphRuntime>()?;
     m.add_class::<crate::graph::runtime::PopRidsOut>()?;
     m.add_class::<crate::graph::runtime::SpecPrepOut>()?;
+    m.add_class::<crate::graph::runtime::SpecRowsOut>()?;
     m.add_class::<crate::graph::runtime::RouteOut>()?;
+    m.add_class::<crate::graph::runtime::FusedRouteOut>()?;
     m.add_class::<crate::graph::runtime::SendPlan>()?;
     m.add_class::<crate::tensors::TensorBookkeeping>()?;
     m.add_class::<crate::tensors::TensorInfoOut>()?;

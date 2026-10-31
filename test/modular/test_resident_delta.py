@@ -36,6 +36,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
@@ -934,7 +935,6 @@ class _ForwardingLeader:
         self._pending_removes: dict[int, None] = {}
         self._last_active: dict = {}
         self.streaming_buffers: dict = {}
-        self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[str]] = {}
@@ -957,6 +957,7 @@ class _ForwardingLeader:
             remove_request=lambda rid: None, evictable_nodes=lambda: (),
         )
         self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+        self.streams = StreamBufferManager(self.request_state, self.tensor_manager, [])
         self.profile_info = SimpleNamespace(pop_request=lambda rid: None)
         self.scheduler = SimpleNamespace(
             clear_rid=lambda rid, wire_rid: None,

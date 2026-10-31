@@ -72,8 +72,23 @@ class Platform:
         """
         return {}
 
+    def pci_address(self, device_index: int) -> str | None:
+        """The device's PCI address (``0000:40:00.0``), its name under
+        ``/sys/bus/pci/devices``; None where the platform doesn't say."""
+        return None
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
+
+
+def _torch_pci_address(device_index: int) -> str | None:
+    """The PCI address torch reports for a ``torch.cuda`` device. ROCm builds
+    report it the same way, so this needs no NVML; it creates no context."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        return f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+    except (AssertionError, AttributeError, RuntimeError):
+        return None
 
 
 class CudaPlatform(Platform):
@@ -91,6 +106,9 @@ class CudaPlatform(Platform):
         if device is not None and torch.device(device).type != "cuda":
             return None
         return torch.cuda.get_device_capability(device)
+
+    def pci_address(self, device_index: int) -> str | None:
+        return _torch_pci_address(device_index)
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
@@ -114,6 +132,9 @@ class RocmPlatform(Platform):
     def process_env_defaults(self) -> dict[str, str]:
         # none until one is measured to help on AMD GPUs
         return {}
+
+    def pci_address(self, device_index: int) -> str | None:
+        return _torch_pci_address(device_index)
 
 
 class XpuPlatform(Platform):

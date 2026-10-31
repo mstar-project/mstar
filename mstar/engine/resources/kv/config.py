@@ -650,6 +650,9 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
+    # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
+    commits: int = field(default=0, init=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)

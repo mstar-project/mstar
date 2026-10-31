@@ -45,6 +45,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w._draining_rids = set()
+    w._reads_done_sent = set()
     w._unprocessed_messages = {"wire": ["parked"]}
     w._last_active = {}
     processed, failed, registered = [], [], []
@@ -52,6 +53,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: [],
         add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
     )
