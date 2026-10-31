@@ -1878,6 +1878,12 @@ module docstring. What a model declares and calls:
   between passes reads the host.
 - **Capture.** ``decode_rows=True`` on the decode ``BatchedAcceleratorGraphConfig``,
   so a platform compiles the verify bucket as decode, by its rows.
+- **The draft's head.** A draft pass needs one argmax, and the target checks it, so
+  ``Fp8DraftHead`` (``mstar/engine/resources/spec_decode/draft_head.py``) can hold an fp8
+  copy of the vocabulary head for the draft alone: half the bytes of the pass's largest
+  kernel, for a little acceptance and no correctness. Verification always reads the
+  checkpoint's head. A vocabulary subset is not offered: it saves as much on Latin-script
+  text and loses a third to a half of the accepted drafts on other scripts.
 - **The prompt's last step.** It declares ``SpecDecodeStep(phase=SEED)`` (budgets
   and ``ignore_eos`` rows) and ``KVStep.commit_adjust`` of ``seed_lookahead`` tokens,
   runs the draft head over the prompt, and calls ``seed(first_token, first_draft)``.
