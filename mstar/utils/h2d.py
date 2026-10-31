@@ -25,6 +25,9 @@ class H2DMirror:
     already holds. Only sound for a destination nothing but that stager writes,
     and that lives as long as its mirror -- hence an object the owner keeps
     with it, not a cache keyed by address (the allocator reuses addresses).
+    A skip is recorded when the copy is issued, possibly on another stream;
+    the engine orders each step after every earlier pre-plan's copies
+    (``Engine._order_after_pre_plans``), which makes it sound across streams.
     """
 
     __slots__ = ("_key", "_values")

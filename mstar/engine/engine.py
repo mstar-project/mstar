@@ -290,10 +290,6 @@ class ExecutingBatch:
 
     # Populated on preplan
     preplan_event: Any | None = None
-    # A discarded pre-plan's event: its copies may still be in flight into
-    # buffers a re-plan skips as already holding those bytes, so the forward
-    # waits on it as on a kept pre-plan's
-    discarded_preplan_event: Any | None = None
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
@@ -586,6 +582,9 @@ class Engine:
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
         self._loopback_steps: dict[int, tuple[str, str]] = {}
+        # node -> the event after its plan stream's latest pre-plan; see
+        # ``_order_after_pre_plans``
+        self._pre_plan_done: dict[str, Any] = {}
         self._runner = StepRunner(
             self._resources,
             # every node, including one that owns nothing (Code2Wav) — an
@@ -1361,7 +1360,6 @@ class Engine:
             raise
         finally:
             batch.preplan_event = None
-            batch.discarded_preplan_event = None
             batch.release_waiters()
             if nvtx:
                 range_pop()
@@ -1720,6 +1718,7 @@ class Engine:
                 )
             t0 = phase_start()
             try:
+                self._order_after_pre_plans()
                 # promoted and inline plans per resource, apart
                 self._runner.plan(
                     step, "res.plan" if batch.preplan_event is not None else "res.plan_fresh",
@@ -1817,7 +1816,7 @@ class Engine:
         if lease is not None:
             return cg_runner.run_forward(
                 lease, preprocessed,
-                plan_done_event=batch.preplan_event or batch.discarded_preplan_event,
+                plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
         if release_event is not None:
@@ -2591,16 +2590,38 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with stream if stream is not None else nullcontext():
-                self._runner.pre_plan(step)
+            event = torch.Event(device=self._device)
+            try:
+                with stream if stream is not None else nullcontext():
+                    self._order_after_pre_plans()
+                    self._runner.pre_plan(step)
+            finally:
+                # recorded even when the plan raised: its copies are in flight
+                event.record(stream)
+                self._pre_plan_done[batch.node_name] = event
             laps.skip()
-            batch.preplan_event = torch.Event(device=self._device)
-            batch.preplan_event.record(stream)
+            batch.preplan_event = event
             batch.preplanned_rids = tuple(batch.request_ids)
             laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
         return True
+
+    def _order_after_pre_plans(self) -> None:
+        """Order the current stream after every copy a pre-plan has issued.
+
+        Resources skip a copy into a slot's buffer that already holds the
+        bytes (``H2DMirror``, ``_SlotBuffer.zero_prefix``), recorded when the
+        copy is issued. A pre-plan's copy runs on its node's plan stream, and
+        the pre-plan may be dropped before its batch runs, so nothing else
+        orders a later step that skips its own copy, or overwrites the buffer,
+        after it. Every plan stream is waited on, not just this node's: nodes
+        can share a resource and its slot buffers."""
+        events = tuple(self._pre_plan_done.values())
+        if events:
+            stream = torch.accelerator.current_stream(self._device)
+            for event in events:
+                stream.wait_event(event)
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
         """Whether the staged plan no longer describes this batch."""
@@ -2622,8 +2643,6 @@ class Engine:
                 # a discarded pre-plan falls back to inline plan; mark it so the
                 # cost is visible next to the nvtx ranges
                 mark(f"engine.preplan_discarded.{batch.node_name}")
-            if batch.preplan_event is not None:
-                batch.discarded_preplan_event = batch.preplan_event
             batch.preplan_event = None
             batch.preplanned_rids = None
             # The step was declared over the rows the pre-plan saw: template
