@@ -22,6 +22,8 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.linear_attn.kda import KDAPlan
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
+from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
@@ -402,15 +404,13 @@ class TestCudaGraphs:
 
     @pytest.mark.parametrize("fused_kda", [False, True])
     def test_prefill_rows_follow_the_captured_prefill(self, monkeypatch, fused_kda):
-        """Prefill is captured only on the fused KDA kernels, and a captured prefill holds a
-        step to its largest graph's rows: a larger step would run eager and compile the MoE
-        decode kernels for its row count mid-serve. An eager prefill is held to the free
-        slots alone."""
-        from mstar.model.glm5_next import submodules
-
+        """Prefill is captured only on the kernels the KDA resource picked if they capture it
+        (the fused ones), and a captured prefill holds a step to its largest graph's rows: a
+        larger step would run eager and compile the MoE decode kernels for its row count
+        mid-serve. An eager prefill is held to the free slots alone."""
         h = _Harness(seed=35)
         sub = h.sub
-        monkeypatch.setattr(submodules, "_fused_kda", lambda config: fused_kda)
+        monkeypatch.setattr(h.kda, "kernels", TritonKDAKernels() if fused_kda else TorchKDAKernels())
         sub.config.prefill_graphs = True
         walks = [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(DEVICE)]
         assert walks == (["decode", "prefill"] if fused_kda else ["decode"])

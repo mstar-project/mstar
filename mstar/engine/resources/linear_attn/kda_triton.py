@@ -764,6 +764,8 @@ class TritonKDAKernels:
     plan's tensors, so a captured step replays with new slots and spans.
     """
 
+    prefill_capturable = True
+
     def __init__(self, config: PrefillConfig | None = None):
         self.config = config or CONFIG
 
