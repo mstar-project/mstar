@@ -209,7 +209,7 @@ def _tp_async_sched_setting(
         return _parse_tp_async_sched(",".join(config))
     if isinstance(config, bool):
         return config, None
-    return _parse_tp_async_sched(str(config or "0"))
+    return _parse_tp_async_sched(str(config if config is not None else "1"))
 
 
 def _wait_ms(raw: str) -> float:
