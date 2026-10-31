@@ -83,11 +83,13 @@ def kv_configs(config, model_path=None):
     return cfg, without, int(serving.get("max_seq_len", cfg.max_seq_len)), shards
 
 
-def manager(cfg, device="cuda"):
+def manager(cfg, shards=1, device="cuda"):
+    # Built at one rank, so above one it is told not to lead: like a pool there, it then
+    # doesn't decide admission (`KVManager._decides`).
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None,
         transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
-        device=torch.device(device), dtype=torch.bfloat16,
+        device=torch.device(device), dtype=torch.bfloat16, leads=shards == 1,
     )
 
 
@@ -101,24 +103,25 @@ def step(m, rid, span):
     return True
 
 
-def admitted(m, rid, prompt, decode, allots):
-    """Whether admission lets ``rid`` in, with ``allots`` asking for its prompt's pages as a
-    pool at one rank does."""
+def admitted(m, rid, prompt, decode):
+    """Whether admission lets ``rid`` in: a pool that decides allots it its prompt's pages,
+    and one that doesn't asks nothing."""
     layout = StreamLayout(spans=(PrefixSpan(prompt, prompt, "walk"),), growth=(("decode", 1),))
     m.ingest_request(rid, KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": decode}))
-    if not allots:
+    asked = m.ask(rid, "node", "walk")
+    if asked is None:
         return True
     # a request that can never fit fails its ask
-    return m.ask(rid, "node", "walk").ok and m.reserve(rid, "node", "walk", None) is None
+    return asked.ok and m.reserve(rid, "node", "walk", None) is None
 
 
 def fill(cfg, length, shards=1, decode=DECODE, device="cuda"):
-    m = manager(cfg, device)
+    m = manager(cfg, shards, device)
     n = 0
     while True:
         rid = f"r{n}"
         if not (
-            admitted(m, rid, length - decode, decode, allots=shards == 1)
+            admitted(m, rid, length - decode, decode)
             and step(m, rid, length - decode) and all(step(m, rid, 1) for _ in range(decode))
         ):
             m.remove_request(rid)
@@ -136,7 +139,8 @@ def main():
     ap.add_argument("--config", required=True, help="serving config, e.g. configs/muse_glimmer.yaml")
     ap.add_argument("--out", help="JSON results, rewritten after each cell (required unless --one)")
     ap.add_argument("--lengths", default="8192,32768,131072",
-                    help="request lengths; those past the config's max_seq_len are skipped")
+                    help=f"request lengths; those past the config's max_seq_len, or not past {DECODE} "
+                         "decode tokens, are skipped")
     ap.add_argument("--model-path", help="read the checkpoint's configs from this repo or directory")
     ap.add_argument("--one", help="length,arm: run one cell in this process and print its JSON")
     a = ap.parse_args()
@@ -149,7 +153,7 @@ def main():
     if not a.out:
         ap.error("--out is required")
     _, _, max_seq_len, _ = kv_configs(a.config, a.model_path)
-    lengths = [n for n in map(int, a.lengths.split(",")) if n <= max_seq_len]
+    lengths = [n for n in map(int, a.lengths.split(",")) if DECODE < n <= max_seq_len]
     # a process per cell: a built KV manager's pool isn't returned to the GPU when it's dropped
     results = {}
     for length in lengths:
