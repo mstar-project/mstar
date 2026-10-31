@@ -15,8 +15,8 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.canary_qwen.config import ATTN, DECODE_LOOP, DECODE_WALK, KV_CACHE, ROPE, SAMPLER
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
-from mstar.model.components.sampled_token_decoder import splice_media
 from mstar.model.components.token_step import TokenStepNode
+from mstar.model.multimodal import splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,

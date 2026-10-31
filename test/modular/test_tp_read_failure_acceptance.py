@@ -230,8 +230,7 @@ class _Rope:
 def _submodule_class():
     from mstar.engine.resources.kv.config import KVStep
     from mstar.engine.resources.step import Segment, SubmoduleStep
-    from mstar.model.components.sampled_token_decoder import splice_media
-    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal import splice_media, vision_encoder
     from mstar.model.qwen3_5.config import ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 

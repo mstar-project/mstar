@@ -22,7 +22,8 @@ contract that makes this capture-safe:
   cumulative pad count;
 - real tokens precede a replay's padding tail, so the tail's stale ids
   cannot shift a real row's index; and a captured media buffer has at least
-  the bucket's tokens rows, so a tail index stays in bounds.
+  the bucket's tokens rows, so a tail index stays in bounds and
+  `splice_media`'s clamp to the last row never binds.
 
 A step that splits a media row (chunked prefill) must slice its media by
 the host pad counts of each piece.
@@ -63,7 +64,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, ROPE, SAMPLER
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -73,14 +74,6 @@ from mstar.model.submodule_base import (
     device_loopback_enabled,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
-
-
-def splice_media(embeds: torch.Tensor, pad: torch.Tensor, media: torch.Tensor) -> torch.Tensor:
-    """``embeds`` with the nth token that ``pad`` marks replaced by ``media[n]``
-    (the last row past the end). Static shapes and no host sync, so it runs
-    inside a captured forward; see the module docstring for the row contract."""
-    index = (torch.cumsum(pad, 0) - 1).clamp_(0, media.shape[0] - 1)
-    return torch.where(pad[:, None], media[index].to(embeds.dtype), embeds)
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):

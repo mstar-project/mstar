@@ -392,7 +392,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     """The schedule and the LLM's media row, against transformers: the
     spliced row's token order and its 3D positions, plus where decode
     resumes."""
-    from mstar.model.components.sampled_token_decoder import splice_media
+    from mstar.model.multimodal import splice_media
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 

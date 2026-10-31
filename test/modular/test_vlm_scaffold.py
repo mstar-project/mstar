@@ -71,7 +71,7 @@ def test_a_pad_without_a_count_or_a_count_without_a_pad_is_refused(ids):
 @pytest.mark.parametrize("compiled", [False, True])
 def test_the_splice_fills_each_pad_with_the_next_media_row(compiled):
     """Also traced whole, as inside a compiled forward: no host sync or graph break."""
-    from mstar.model.components.sampled_token_decoder import splice_media
+    from mstar.model.multimodal import splice_media
 
     splice = torch.compile(splice_media, fullgraph=True, backend="aot_eager") if compiled else splice_media
     ids = torch.tensor([1, IMAGE_PAD, IMAGE_PAD, 2, VIDEO_PAD, 3])
@@ -84,7 +84,7 @@ def test_a_replay_tail_cannot_shift_a_real_row():
     """Real tokens precede the tail, so stale pads there index past the real
     media without moving a real row's index; the buffer holds a row per
     token, so their index stays in bounds."""
-    from mstar.model.components.sampled_token_decoder import splice_media
+    from mstar.model.multimodal import splice_media
 
     real = [5, IMAGE_PAD, 6]
     ids = torch.tensor(real + [IMAGE_PAD, IMAGE_PAD, IMAGE_PAD])  # a previous replay's tail
