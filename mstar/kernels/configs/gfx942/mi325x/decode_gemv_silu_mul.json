@@ -23,7 +23,8 @@
   "harness": "benchmark.kernels.search, one MI325X VF GPU, one run per cell",
   "jobs": [
    "45",
-   "83"
+   "83",
+   "390"
   ],
   "margin": 0.02,
   "note": "fused gate/up + silu*mul vs the unfused pair (AITER or hipBLASLt, then inductor's silu*mul); jobs 45 and 83; measured shapes only",
@@ -85,6 +86,17 @@
    "waves_per_eu": 2,
    "xcd_remap": false
   },
+  "k4096-n24576-rows12": {
+   "block_k": 256,
+   "block_n": 32,
+   "impl": "triton",
+   "num_stages": 2,
+   "num_warps": 2,
+   "split_k": 1,
+   "use_dot": true,
+   "waves_per_eu": 0,
+   "xcd_remap": true
+  },
   "k4096-n24576-rows16": {
    "block_k": 256,
    "block_n": 32,
@@ -107,7 +119,29 @@
    "waves_per_eu": 2,
    "xcd_remap": false
   },
+  "k4096-n24576-rows3": {
+   "block_k": 256,
+   "block_n": 32,
+   "impl": "triton",
+   "num_stages": 2,
+   "num_warps": 2,
+   "split_k": 8,
+   "use_dot": true,
+   "waves_per_eu": 2,
+   "xcd_remap": false
+  },
   "k4096-n24576-rows4": {
+   "block_k": 256,
+   "block_n": 32,
+   "impl": "triton",
+   "num_stages": 2,
+   "num_warps": 2,
+   "split_k": 8,
+   "use_dot": true,
+   "waves_per_eu": 2,
+   "xcd_remap": false
+  },
+  "k4096-n24576-rows6": {
    "block_k": 256,
    "block_n": 32,
    "impl": "triton",
