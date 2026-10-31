@@ -44,6 +44,10 @@ class LinearAttnConfig:
     # formula in the KDA kernel. None keeps the softplus one.
     gate_lower_bound: float | None = None
 
+    # KDA only: the layers' output gate is one full-rank projection (Kimi K3), as
+    # their `KDAConfig` says. The fused kernels apply only the low-rank one.
+    full_rank_output_gate: bool = False
+
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
     # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
     # it (the HF reference passes it) and skipping it diverges silently.
