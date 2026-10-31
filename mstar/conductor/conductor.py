@@ -14,7 +14,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-import yaml
 
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -41,6 +40,7 @@ from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import WorkerColocation, apply_process_env_defaults, current_platform
+from mstar.platforms.serving_config import load_serving_config
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.streaming.topology import CLIENT
@@ -485,8 +485,7 @@ class Conductor:
         self._next_liveness_check = 0.0
         self.waiting_queue: list[NewRequestConductor] = []
 
-        with open(model_config_file, "r") as f:
-            self.model_config = yaml.safe_load(f)
+        self.model_config = load_serving_config(model_config_file)
         # fail here, once, rather than in every worker
         knobs.check(self.model_config.get("knobs"))
         # Every check that needs only the model, this YAML and the environment,

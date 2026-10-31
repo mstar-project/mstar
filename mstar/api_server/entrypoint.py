@@ -155,12 +155,11 @@ def _conductor_process_target(
     # Pi05's action_horizon for the DROID benchmark variant) without code
     # changes per model. Backward compatible: missing section → empty dict,
     # so existing configs see identical behavior.
-    import yaml as _yaml
-
     from mstar.conductor.conductor import Conductor
     from mstar.model.registry import get_model_class
-    with open(config_path, "r") as _f:
-        _yaml_cfg = _yaml.safe_load(_f) or {}
+    from mstar.platforms.serving_config import load_serving_config
+
+    _yaml_cfg = load_serving_config(config_path) or {}
     yaml_model_kwargs = _yaml_cfg.get("model_kwargs", {}) or {}
     if yaml_model_kwargs:
         logging.getLogger(__name__).info(
@@ -2598,7 +2597,7 @@ def _set_preprocess_threads(model, config: dict) -> None:
 def main(argv: list[str] | None = None):
     import argparse
 
-    import yaml
+    from mstar.platforms.serving_config import load_serving_config
 
     parser = argparse.ArgumentParser(
         description="mstar — launch API server and conductor from a config file"
@@ -2690,8 +2689,7 @@ def main(argv: list[str] | None = None):
     keep_api_key_from_children(api_key)
     logger.info("IPC sockets under %s, uploads under %s", args.socket_path_prefix, args.upload_dir)
 
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    config = load_serving_config(args.config)
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
