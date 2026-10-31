@@ -218,9 +218,10 @@ class Wan22TimeTextEmbedding(nn.Module):
     def forward(
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``timestep`` ``[B, seq]`` (per-token, ``expand_timesteps``);
-        returns ``temb [B, seq, dim]``, ``timestep_proj [B, seq, 6, dim]``,
-        projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
+        """``timestep`` ``[B, groups]``, one entry per token (``expand_timesteps``)
+        or per group of tokens sharing one; returns ``temb [B, groups, dim]``,
+        ``timestep_proj [B, groups, 6, dim]``, projected text ``[B, 512, dim]``
+        — all in the text embeds' dtype."""
         batch, seq_len = timestep.shape
         sincos = _sinusoidal_timestep_embedding(timestep.flatten(), self.freq_dim)
         temb = self.time_embedder(sincos.unflatten(0, (batch, seq_len)))
@@ -258,24 +259,32 @@ class Wan22DiTBlock(nn.Module):
         ragged_self: RaggedAttentionFn | None = None,
         ragged_cross: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
+        # [1, 1, 6, dim] + [B, groups, 6, dim] -> six [B, groups, 1, dim] fp32 tensors,
+        # over the tokens viewed as [B, groups, tokens per group, dim]
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             (self.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(6, dim=2)
         )
-        shift_msa, scale_msa, gate_msa = shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2)
-        c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)
+        groups = timestep_proj.shape[1]
 
-        norm_hidden = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, ragged=ragged_self)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        def grouped(tokens: torch.Tensor) -> torch.Tensor:
+            return tokens.unflatten(1, (groups, -1))
+
+        norm_hidden = (grouped(self.norm1(hidden_states.float())) * (1 + scale_msa) + shift_msa)
+        attn_output = self.self_attn(
+            norm_hidden.flatten(1, 2).type_as(hidden_states), rotary_emb=rotary_emb, ragged=ragged_self,
+        )
+        hidden_states = (grouped(hidden_states.float()) + grouped(attn_output) * gate_msa).flatten(1, 2)
+        hidden_states = hidden_states.type_as(attn_output)
 
         norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
         attn_output = self.cross_attn(norm_hidden, encoder_hidden_states=encoder_hidden_states, ragged=ragged_cross)
         hidden_states = hidden_states + attn_output
 
-        norm_hidden = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
-        ff_output = self.ffn(norm_hidden)
-        return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        norm_hidden = grouped(self.norm3(hidden_states.float())) * (1 + c_scale_msa) + c_shift_msa
+        ff_output = self.ffn(norm_hidden.flatten(1, 2).type_as(hidden_states))
+        return (grouped(hidden_states.float()) + grouped(ff_output.float()) * c_gate_msa).flatten(1, 2).type_as(
+            hidden_states
+        )
 
 
 class Wan22DiT(nn.Module):
@@ -346,17 +355,19 @@ class Wan22DiT(nn.Module):
         ragged_cross: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
-        ``[B, post-patch seq]`` per-token grid (``expand_timesteps`` — the
-        only timestep form mstar's dit submodule produces), text embeds
-        ``[B, 512, text_dim]`` bf16. ``ragged_self`` / ``ragged_cross`` are the
-        engine's attention callables over the batch's packed rows (one segment
-        per row), or None for SDPA. Returns ``[B, C_out, F, H, W]`` bf16."""
+        ``[B, groups]``: the reference's per-token grid (``expand_timesteps``),
+        or one entry per frame or per row where every token of the group has the
+        same one, which modulates by broadcast instead of a tensor per token per
+        layer. Text embeds ``[B, 512, text_dim]`` bf16. ``ragged_self`` /
+        ``ragged_cross`` are the engine's attention callables over the batch's
+        packed rows (one segment per row), or None for SDPA. Returns
+        ``[B, C_out, F, H, W]`` bf16."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
         if timestep.ndim != 2:
             raise ValueError(
-                f"Wan22DiT requires a per-token [batch, seq] timestep grid; got ndim={timestep.ndim}."
+                f"Wan22DiT requires a [batch, groups] timestep grid; got ndim={timestep.ndim}."
             )
 
         rotary_emb = self.rope(grid, hidden_states.device)
@@ -375,8 +386,8 @@ class Wan22DiT(nn.Module):
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2), scale.squeeze(2)
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        tokens = self.norm_out(hidden_states.float()).unflatten(1, (temb.shape[1], -1))
+        hidden_states = (tokens * (1 + scale) + shift).flatten(1, 2).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
