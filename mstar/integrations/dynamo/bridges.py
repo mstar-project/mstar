@@ -206,8 +206,7 @@ class RequestBridge:
             body["modalities"] = ["text"]
         req = ChatCompletionRequest.model_validate(body)
         try:
-            # the bridge streams text and parses no call out of a reply, so a model whose
-            # adapter serves tool calls (GLM's) would hand the client the raw call markup
+            # the bridge parses no tool call out of a reply, even where the adapter serves them
             _refuse_tool_calls(req)
             if self.adapter.stop_strings(req):
                 # matched on the decoded answer by the native chat route; the bridge streams

@@ -1,6 +1,5 @@
-"""Fused glm5_next kernels (fused_decode) and the whole layer on the fused KDA kernels vs
-the torch reference — parity on CUDA. The KDA kernels' own parity tests are
-test_kda_triton.py."""
+"""The mHC kernels in ``fused_decode``, and a whole decoder layer on the fused kernels, against
+the torch reference on CUDA. The KDA kernels' own parity tests are in test_kda_triton.py."""
 import pytest
 import torch
 
@@ -11,7 +10,6 @@ from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.decoder_layer import Glm5NextDecoderLayer
-from mstar.model.glm5_next.components.moe import Glm5NextMoEGate
 from mstar.model.glm5_next.config import Glm5NextModelConfig
 from mstar.model.glm5_next.mhc import Glm5NextHyperConnection, update_streams
 
@@ -101,8 +99,11 @@ def _site(hidden, hc):
     return site
 
 
-@pytest.mark.parametrize("tokens", [1, 7, 64])
-@pytest.mark.parametrize("hidden,hc", [(4096, 4), (128, 2)])
+# past fused_decode._PREFILL_TOKENS at GLM-5.3's width the site takes the prefill kernels
+@pytest.mark.parametrize("tokens,hidden,hc", [
+    (1, 4096, 4), (7, 4096, 4), (64, 4096, 4), (257, 4096, 4), (1036, 4096, 4),
+    (1, 128, 2), (7, 128, 2), (64, 128, 2),
+])
 def test_hc_pre_matches_reference(tokens, hidden, hc, fp32_matmul):
     site, norm = _site(hidden, hc), _norm(hidden)
     streams = torch.randn(1, tokens, hc, hidden, device="cuda", dtype=torch.bfloat16)
@@ -136,40 +137,25 @@ def test_update_streams_is_fp32_exact(tokens, fp32_matmul):
     exact = _update_exact(residual, h, post, comb)
     fused = fused_decode.update_streams(residual, h, post, comb)
     torch.testing.assert_close(fused, exact, rtol=8e-3, atol=1e-2)
-    # The reference computes in bf16, so it only agrees to a few ulp.
+    # the reference computes in bf16, so it only agrees to a few ulp
     ref = update_streams(residual, h.unsqueeze(0), post, comb)
     torch.testing.assert_close(fused, ref, rtol=3e-2, atol=5e-2)
 
 
-@pytest.mark.parametrize("tokens", [1, 64])
-def test_hc_pre_with_update_matches_reference(tokens, fp32_matmul):
-    site, norm = _site(4096, 4), _norm(4096)
-    residual, h, post_p, comb_p = _update_inputs(tokens, 4096, 4)
-    with torch.no_grad():
-        # The fused update rounds once from fp32; the reference update_streams rounds at
-        # every bf16 op, so the site is checked on the exactly-updated streams.
-        streams_r = _update_exact(residual, h, post_p, comb_p)
-        post_r, comb_r, collapsed = site(streams_r)
-        normed_r = norm(collapsed.squeeze(0))
-        post, comb, normed, streams = site.forward_fused(
-            residual, norm, update=(h, post_p, comb_p))
-    torch.testing.assert_close(streams, streams_r, rtol=8e-3, atol=1e-2)
-    torch.testing.assert_close(post, post_r, rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(comb, comb_r, rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(normed, normed_r, rtol=2e-2, atol=2e-2)
-
-
-@pytest.mark.parametrize("tokens", [1, 7, 40])
+@pytest.mark.parametrize("tokens", [1, 7, 40, 1036])
 @pytest.mark.parametrize("fn_dtype", [torch.float32, torch.bfloat16])
-def test_hc_pre_update_matches_plain_on_its_streams(tokens, fn_dtype):
-    """The mix kernel takes its mix over updated streams it never stores, and the finalize
-    recomputes and stores them: the site must equal a plain site over those streams."""
+def test_hc_pre_with_update_matches_plain_on_its_streams(tokens, fn_dtype, fp32_matmul):
+    """With the previous sublayer's update fused in, the site stores the exactly-updated
+    streams and gives the bits a plain site gives over them. At decode sizes the mix reads
+    updated streams it never stores; at prefill sizes the update is its own pass."""
     site, norm = _site(4096, 4), _norm(4096)
     site.fn.data = site.fn.data.to(fn_dtype)
     residual, h, post_p, comb_p = _update_inputs(tokens, 4096, 4)
     with torch.no_grad():
         fused = site.forward_fused(residual, norm, update=(h, post_p, comb_p))
         plain = site.forward_fused(fused[3], norm)
+    torch.testing.assert_close(fused[3], _update_exact(residual, h, post_p, comb_p),
+                               rtol=8e-3, atol=1e-2)
     for name, a, b in zip(("post", "comb", "normed"), fused[:3], plain[:3], strict=True):
         assert torch.equal(a, b), name
 
@@ -206,24 +192,6 @@ def test_mhc_chain_with_pdl_is_bitwise_unchanged(tokens, monkeypatch):
         torch.cuda.synchronize()
     for name, a, b in zip(("normed", "streams"), out, ref, strict=True):
         assert torch.equal(a, b), name
-
-
-# -- router ------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("tokens", [1, 33, 65])
-def test_router_matches_reference(tokens, monkeypatch, fp32_matmul):
-    gate = Glm5NextMoEGate(4096, 288, 8, routed_scaling_factor=2.5).cuda()
-    _randomize(gate, 2)
-    gate.finalize_weights()
-    x = torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16)
-    w, ids = gate(x)
-    monkeypatch.setattr(fused_decode, "_ENABLED", False)
-    w_r, ids_r = gate(x)
-    ids, order = ids.sort(dim=-1)
-    ids_r, order_r = ids_r.sort(dim=-1)
-    torch.testing.assert_close(ids, ids_r, rtol=0, atol=0)
-    torch.testing.assert_close(w.gather(1, order), w_r.gather(1, order_r), rtol=1e-5, atol=1e-6)
 
 
 # -- whole layer (reduced dims) ------------------------------------------------

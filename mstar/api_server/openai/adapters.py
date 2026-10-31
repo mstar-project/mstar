@@ -1527,7 +1527,7 @@ class TextChatAdapter(OpenAIAdapter):
     applies its own chat template; sampling fields reach it as model_kwargs."""
 
     supports_chat = True
-    # a subclass whose output parser splits tool calls out of the reply serves them
+    # set by a subclass whose output parser splits tool calls out of the reply
     serves_tool_calls = False
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:

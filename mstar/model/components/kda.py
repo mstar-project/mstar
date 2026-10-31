@@ -1,13 +1,9 @@
-"""Kimi delta attention (KDA): the linear-attention layer of Kimi-Linear, Kimi K3 and GLM-5.3.
+"""Kimi delta attention (KDA): the layer's weights.
 
-Holds the weights; the recurrent state and the kernels belong to the engine's KDA resource
-(``engine/resources/linear_attn/kda.py``), reached through ``KDACallable``. ``forward`` runs a
-step through the resource; ``prefill`` / ``decode_step`` run the same math on state the caller
-holds (``kda_torch``, the resource's reference), the parity oracle.
-
-Head counts are whatever ``KDAConfig`` says; ``ParallelKimiDeltaAttention``
-(``components/distributed/kda.py``) builds one rank's share, so this module has no distributed
-import.
+The state and kernels belong to the engine's KDA resource, reached through ``KDACallable``:
+``forward`` runs a step there, while ``prefill`` / ``decode_step`` run the reference math
+(``kda_torch``) on state the caller holds, as a parity oracle. ``ParallelKimiDeltaAttention``
+(``components/distributed/kda.py``) builds one rank's share.
 """
 from __future__ import annotations
 
@@ -48,19 +44,17 @@ class KDAConfig:
 
     @property
     def qkv_dim(self) -> int:
-        """Per-projection width: heads x head_dim."""
         return self.num_heads * self.head_dim
 
     @property
     def conv_channels(self) -> int:
-        """The fused depthwise conv's channels over cat(q, k, v)."""
         return 3 * self.qkv_dim
 
 
 def apply_mask_to_padding_states(
     hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
 ) -> torch.Tensor:
-    """Zero padded positions BEFORE any projection (2D boolean ``(B, L)`` mask)."""
+    """Zero padded positions before any projection; the mask is a boolean ``(B, L)``."""
     if attention_mask is not None:
         dtype = hidden_states.dtype
         hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
@@ -83,9 +77,8 @@ class KDAForgetGate(nn.Module):
 
         self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
         self.f_b_proj = nn.Linear(self.head_dim, config.qkv_dim, bias=False, dtype=dtype)
-        # fp32 params (HF _keep_in_fp32_modules_strict); stored fp32 in the
-        # checkpoint. Zero init keeps the fresh module runnable (loader
-        # overwrites): decay_rate = 1, g = lower_bound * sigmoid(f(x)).
+        # fp32, as the checkpoint stores them; zero init leaves a fresh module
+        # runnable until the loader overwrites them
         self.dt_bias = nn.Parameter(torch.zeros(config.qkv_dim, dtype=torch.float32))
         self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
@@ -109,10 +102,8 @@ class KDAGatedRMSNorm(nn.Module):
 
 
 class KimiDeltaAttention(nn.Module):
-    """One KDA layer: projections + fused causal conv + delta rule + gated out.
-
-    ``kda_key`` / ``state_key``: the resource labels this layer binds (the KDA resource and the
-    recurrent pool holding its state), as ``GatedDeltaNet``'s."""
+    """One KDA layer. ``kda_key`` / ``state_key`` name the KDA resource and the recurrent pool
+    holding its state."""
 
     def __init__(
         self,
@@ -130,16 +121,14 @@ class KimiDeltaAttention(nn.Module):
         self.conv_dim = 3 * self.qkv_dim
         self.conv_kernel_size = config.conv_kernel_size
         self.full_rank_output_gate = config.full_rank_output_gate
-        # Kernel-internal chunking, not a config field; 64 is the reference
-        # default, which the parity tests are written against.
+        # the reference's chunk, which the parity tests are written against
         self.chunk_size = 64
 
         self.q_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)
-        # Fused depthwise conv over cat(q, k, v); fp32 weight, no bias (the loader fuses the
-        # checkpoint's three [qkv_dim, 1, K] taps and upcasts). padding is unused (both paths
-        # call F.conv1d directly)
+        # one fp32 depthwise conv over cat(q, k, v), which the loader fills from the
+        # checkpoint's three; `padding` is unused, both paths call F.conv1d
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -160,7 +149,7 @@ class KimiDeltaAttention(nn.Module):
         self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False, dtype=dtype)
         # q | k | v | b | f_a | gate input, built by process_weights_after_loading.
         self._in_proj_weight: torch.Tensor | None = None
-        # The KDA resource and its pool, bound once at load (NodeSubmodule.bind_node_resources).
+        # bound once at load, by `bind_resources`
         self._kda_key, self._state_key = kda_key, state_key
         self.mix: KDACallable | None = None
         self._params: KDAParams | None = None
@@ -179,7 +168,7 @@ class KimiDeltaAttention(nn.Module):
     def process_weights_after_loading(self, device) -> None:
         """Concatenate the six input projections for the fused kernels, zero-padded to a
         multiple of 16 rows: Triton only vectorizes loads from the projected activations when
-        their row stride is a multiple of 16 elements (3336 -> 3344 at one TP8 rank)."""
+        their row stride is a multiple of 16 elements."""
         del device
         weights = [
             self.q_proj.weight, self.k_proj.weight, self.v_proj.weight, self.b_proj.weight,
@@ -231,7 +220,7 @@ class KimiDeltaAttention(nn.Module):
         hidden_states: torch.Tensor,
         hidden_shape: tuple[int, ...],
     ) -> torch.Tensor:
-        """Output gate (from the PRE-conv input) + gated RMSNorm + o_proj."""
+        """The output gate, from the pre-conv input, then the gated RMSNorm and ``o_proj``."""
         batch_size, seq_len = hidden_states.shape[:2]
         gate = self._output_gate(hidden_states).view(hidden_shape)
         output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, self.qkv_dim)
@@ -267,7 +256,7 @@ class KimiDeltaAttention(nn.Module):
 
         query, key, value = self._split_heads(conv_out, hidden_shape)
 
-        # Gates from the PRE-conv hidden states — never the conv output.
+        # the gates read the hidden states, not the conv output
         g = self.forget_gate(hidden_states)
         beta = torch.sigmoid(self.b_proj(hidden_states))
 
@@ -289,7 +278,7 @@ class KimiDeltaAttention(nn.Module):
         recurrent_state: torch.Tensor,
         conv_state: torch.Tensor,
     ) -> torch.Tensor:
-        """One decode token ``(B, 1, hidden)``; states mutated IN PLACE."""
+        """One decode token ``(B, 1, hidden)``; the states are updated in place."""
         batch_size, seq_len = hidden_states.shape[:2]
         if seq_len != 1:
             raise ValueError(

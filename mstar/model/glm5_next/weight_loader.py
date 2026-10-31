@@ -35,10 +35,8 @@ _EXPERT_BASE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)$")
 # Flat layer-level mHC params -> per-site submodules.
 _HC_RE = re.compile(r"\.hc_(attn|ffn)_(fn|base|scale)$")
 
-# KDA ForgetGate params live FLAT under self_attn. in the checkpoint but
-# the module (mirroring the HF class structure) nests them under
-# forget_gate. — the four suffixes exist only on KDA layers, so the
-# rewrite is unambiguous (kda spec: "map names accordingly").
+# The checkpoint keeps the KDA forget-gate params flat under self_attn; the module nests
+# them under forget_gate. Only KDA layers have these suffixes.
 _KDA_FORGET_RE = re.compile(
     r"\.self_attn\.(f_a_proj\.weight|f_b_proj\.weight|dt_bias|A_log)$"
 )
@@ -53,10 +51,7 @@ _KDA_ROW_QKV_FLAT_RE = re.compile(r"\.self_attn\.dt_bias$")
 _KDA_ROW_HEADS_RE = re.compile(r"\.self_attn\.(A_log|b_proj\.weight)$")
 _KDA_COL_RE = re.compile(r"\.self_attn\.o_proj\.weight$")
 
-# Mirrors glm52.components.mtp.remap_mtp_key / MTP_GLUE_PREFIXES (same four
-# DeepSeek-V3 names). Defined locally because that module drags in the
-# engine stack (cache_manager -> zmq) and this loader must stay importable
-# on any machine — the same reason the KDA/mHC math files must.
+# checkpoint sub-keys under ``layers.45.`` that keep their names on the MTP module
 MTP_GLUE_PREFIXES = ("enorm", "hnorm", "eh_proj", "shared_head")
 
 
@@ -85,12 +80,9 @@ def glm5_next_name_remapper(name: str) -> str | None:
 
 
 def _make_glm5_next_name_remapper(num_hidden_layers: int, load_mtp: bool):
-    """Trunk remapping, plus layer-45 routing onto the ``mtp.`` submodule:
-    strip the layer prefix, place glue keys direct and the rest under
-    ``transformer_layer.``, then the trunk naming conventions — the
-    expert/shared-expert rewrites are prefix-agnostic, so the fused
-    stacked-param rules apply to the MTP MoE unchanged.
-    """
+    """The trunk remapper, plus layer 45 onto ``mtp.``: glue keys directly, the rest
+    under ``transformer_layer.``. The expert rewrites are prefix-agnostic, so the
+    stacked-param rules cover the MTP MoE too."""
     if not load_mtp:
         return glm5_next_name_remapper
 
@@ -110,9 +102,8 @@ def skip_vision_and_mtp_keys(
     num_hidden_layers: int,
     load_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Drop vision-tower keys — and, unless ``load_mtp``, MTP-layer keys —
-    before any dequant buffering, counting every drop.
-    """
+    """Drop vision-tower keys, and MTP-layer keys unless ``load_mtp``, before any
+    dequant buffering."""
     skipped_vision = 0
     skipped_mtp = 0
     for name, tensor in weights:
@@ -194,14 +185,13 @@ def build_glm5_next_stacked_params(
 # Parameter-name suffixes the checkpoint stores in fp32 and that must stay
 # fp32 after ``model.to(autocast_dtype)`` narrows every float param to bf16.
 FP32_PARAM_SUFFIXES = (
-    "e_score_correction_bias",  # DeepSeek-V3 router selection bias (glm52 set)
-    "_scale_inv",               # fp8 block scales (glm52 set)
+    "e_score_correction_bias",  # DeepSeek-V3 router selection bias
+    "_scale_inv",               # fp8 block scales
     ".dt_bias",                 # KDA, HF _keep_in_fp32_modules_strict
     ".A_log",                   # KDA per-head decay, same
     "conv1d.weight",            # KDA short conv, same
-    "_hc.base",                 # mHC per-site bias (attn_hc/ffn_hc): the
-    "_hc.scale",                # checkpoint ships these fp32 and the Sinkhorn
-                                # reads them at fp32 — matches ``fn``'s fp32 cache
+    "_hc.base",                 # mHC, read at fp32 like ``fn``'s fp32 copy
+    "_hc.scale",
 )
 
 
@@ -418,9 +408,7 @@ def _kda_attention_targets(prefix: str) -> dict[str, int]:
 
 
 def _mla_attention_targets(prefix: str) -> dict[str, int]:
-    # The indexer targets are unconditional: Glm5NextMLAAttention always
-    # builds its indexer, so the expected tree always feeds it (an
-    # indexer-less load would be 84 silently-uninitialized parameters).
+    # unconditional: Glm5NextMLAAttention always builds its indexer
     p = f"{prefix}self_attn."
     names = [
         "q_a_proj.weight", "q_a_layernorm.weight", "q_b_proj.weight",
@@ -629,8 +617,8 @@ if __name__ == "__main__":
 
 
 def _refuse_fp8(weights: Iterable[tuple[str, torch.Tensor]]):
-    """Without a quant config an fp8 checkpoint loaded clean and served garbage: its e4m3
-    tensors were copied unscaled and its block scales dropped as unmatched."""
+    """Refuse fp8 tensors and block scales without a quant config: they would load clean
+    and serve garbage, the e4m3 tensors copied unscaled and the scales dropped."""
     for name, tensor in weights:
         if name.endswith("_scale_inv") or tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             raise ValueError(

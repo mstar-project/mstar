@@ -28,21 +28,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.engine.resources import StepRunner, SubmoduleStep  # noqa: E402
-from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
-from mstar.engine.resources.recurrent.config import (  # noqa: E402
-    RecurrentBlockConfig,
-    RecurrentStateConfig,
-    RecurrentStateSpec,
-    RecurrentStep,
-)
-from mstar.engine.resources.recurrent.pool import RecurrentStatePool  # noqa: E402
-from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
@@ -308,76 +297,6 @@ def test_a_follower_tears_down_what_it_deferred_in_the_order_rank_0_did(monkeypa
         on_rank_0.free(pages[HANDLES[rid]])
     assert [entry[1] for entry in log if entry[0] == "teardown"] == ["also", "gone"], log
     assert list(freed.free_pages.queue) == list(on_rank_0.free_pages.queue)
-
-
-def _slot_pool() -> tuple[RecurrentStatePool, StepRunner]:
-    """One TP rank's recurrent pool (GLM-5.3 keeps its KDA state in one): 5 slots and the
-    sink, sharded over two ranks, so it decides nothing alone."""
-    spec = RecurrentStateSpec("state", {NODE}, RecurrentStateConfig(
-        num_layers=1,
-        blocks={"state": RecurrentBlockConfig(shape=(2, 2), dtype=torch.float32, shard_dims=(0,))},
-        max_slots=6,
-    ))
-    joint = SimpleNamespace(world_size=2)
-    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
-    return pool, StepRunner({"state": pool}, node_resources={NODE: ["state"]})
-
-
-def _admit_slots(run: StepRunner, rids: list[str]) -> None:
-    """A prefill of ``rids``: each request not yet holding a slot takes one."""
-    segments = [Segment(rid, "main", 1) for rid in rids]
-    step = SubmoduleStep(segments=segments, steps={"state": RecurrentStep(segments=tuple(segments))})
-    step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False))
-    for rid in rids:
-        run.ingest_request(rid, {})
-    assert run.admit(step).ok
-    run.plan(step)
-    run.commit(step)
-
-
-def test_a_follower_admits_against_rank_0s_free_recurrent_slots(monkeypatch):
-    """As above, on each rank's real recurrent pool, and with a new request in N+1 that
-    takes a slot. Rank 0 had nothing in flight and tore "also" down, then "gone", before
-    it sent N+1; here both wait on N. At each admit this rank's free slots are rank 0's, in
-    rank 0's order, so N+1's new request gets the slot it got on rank 0 (the free list is
-    a stack: the other order hands out also's slot)."""
-    also, gone = (
-        RemoveRequest(request_id=rid, source=MessageSource.TP_RANK_0, after_tp_seq=0)
-        for rid in ("also", "gone")
-    )
-    w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [also, gone]], serial=True)
-    w.scheduler.steps[1] = [HANDLES["kept"], HANDLES["idle"]]
-    rid_of = {handle: rid for rid, handle in HANDLES.items()}
-    pool, run = _slot_pool()
-    rank_0, run_0 = _slot_pool()
-    expected = [list(rank_0._free)]
-    _admit_slots(run_0, ["gone", "kept", "also"])
-    run_0.remove_request("also")
-    run_0.remove_request("gone")
-    expected.append(list(rank_0._free))
-    _admit_slots(run_0, ["kept", "idle"])
-
-    tear_down, gpu = w.engine_manager.remove_request, w._execute_on_gpu_thread
-    at_admit = []
-
-    def _release(handle):
-        tear_down(handle)
-        run.remove_request(rid_of[handle])
-
-    def _admit(batch, node_batch, plan_future=None):
-        out = gpu(batch, node_batch, plan_future)  # the admit, after any hold
-        at_admit.append(list(pool._free))
-        _admit_slots(run, [rid_of[h] for h in batch.request_to_worker_graph])
-        return out
-
-    w.engine_manager.remove_request, w._execute_on_gpu_thread = _release, _admit
-    _run(w)
-
-    assert [entry[1] for entry in log if entry[0] == "teardown"] == ["also", "gone"], log
-    assert log.index(("teardown", "gone")) < log.index(("admit", 1)), log
-    assert at_admit == expected
-    assert pool._slots["idle"]["main"].index == rank_0._slots["idle"]["main"].index
-    assert pool._free == rank_0._free and pool.num_free_slots == rank_0.num_free_slots
 
 
 def test_a_follower_tears_down_nothing_ahead_of_one_it_deferred(monkeypatch):

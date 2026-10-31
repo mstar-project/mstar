@@ -82,26 +82,18 @@ def test_host_plan_matches_packed_path(spans):
     assert torch.equal(state.token_to_cache, packed.token_to_cache)
 
 
-def test_small_multi_token_steps_skip_the_packed_path(monkeypatch):
+@pytest.mark.parametrize("spans, max_tokens, packed", [
+    ((4, 4, 4), None, False),  # a verify step's k + 1 rows per request
+    ((2, 2, 2), 4, True),  # more tokens than the host path takes
+    ((12, 1, 1), None, True),  # a prefill-sized row, however few tokens in all
+])
+def test_only_small_steps_plan_on_the_host(monkeypatch, spans, max_tokens, packed):
+    """The host path takes small rows only, so other models' small prefills keep the packed one."""
     mgr = _make_manager()
     calls = []
     real = mgr._compute_plan_state
     monkeypatch.setattr(mgr, "_compute_plan_state", lambda *a, **k: calls.append(1) or real(*a, **k))
-
-    _step(mgr, (4, 4, 4))  # an MTP verify step: k + 1 rows per request
-    assert not calls
-    monkeypatch.setattr(manager_mod, "HOST_PLAN_MAX_TOKENS", 4)
-    _step(mgr, (2, 2, 2))
-    assert calls
-
-
-def test_a_prefill_sized_row_takes_the_packed_path(monkeypatch):
-    """Only MTP-sized rows plan on the host: a step with a 12-token row takes the packed
-    path however few tokens it holds, so every model's small prefills keep main's path."""
-    mgr = _make_manager()
-    calls = []
-    real = mgr._compute_plan_state
-    monkeypatch.setattr(mgr, "_compute_plan_state", lambda *a, **k: calls.append(1) or real(*a, **k))
-
-    _step(mgr, (12, 1, 1))
-    assert calls
+    if max_tokens is not None:
+        monkeypatch.setattr(manager_mod, "HOST_PLAN_MAX_TOKENS", max_tokens)
+    _step(mgr, spans)
+    assert bool(calls) is packed

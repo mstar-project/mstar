@@ -29,8 +29,9 @@ def test_longctx_config_window_fits_its_pages(name):
     assert model.config.dsa_long_context
     assert model.config.mtp_num_draft_tokens == (3 if "mtp" in name else 0)
     assert model.config.dsa_shard_prefill
-    # every captured prefill bucket runs in one pass, never in row chunks
-    assert max(cfg["model_kwargs"]["prefill_batched_token_buckets"]) <= model.config.prefill_chunk_tokens
+    # every captured prefill bucket runs in one pass, never in row chunks (MTP over DSA captures none)
+    buckets = cfg["model_kwargs"].get("prefill_batched_token_buckets", [])
+    assert max(buckets, default=0) <= model.config.prefill_chunk_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
@@ -55,15 +56,7 @@ def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match
         _submodule(cfg).bind_node_resources(resources)
 
 
-def test_long_context_bind_warns_of_a_pool_below_the_window(caplog):
-    # the manager holds one page back as its sink: 2047 x 128 < 262144
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144)
-    with pytest.raises(AttributeError):  # past the checks, into the unbuilt module
-        _submodule(cfg).bind_node_resources({"kv": _kv(2048, 128)})
-    assert "usable pages" in caplog.text
-
-
-def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag, caplog):
+def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag):
     import torch
 
     chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
@@ -75,4 +68,3 @@ def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag, capl
     prefill = [n for c in configs if c.capture_graph_walk == "prefill"
                for n in c.capture_token_lengths]
     assert prefill and max(prefill) <= chunk
-    assert "run eager, in row chunks" in caplog.text

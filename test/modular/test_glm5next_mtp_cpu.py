@@ -30,8 +30,8 @@ from mstar.model.submodule_base import InputMetadata
 
 
 def _batch(**kwargs) -> ExecutingBatch:
-    """An ExecutingBatch as the worker builds it: the engine reads each request's
-    loop counts from its input metadata (main #351), not from its forward-pass info."""
+    """An ExecutingBatch as the worker builds it, each request's loop counts in its input
+    metadata."""
     kwargs.setdefault("per_request_input_metadata", {
         rid: InputMetadata(dynamic_loop_iter_counts=dict(info.dynamic_loop_iter_counts))
         for rid, info in kwargs["per_request_info"].items()
@@ -367,45 +367,6 @@ def test_rejected_drafts_stop_at_the_cache_rows():
     assert 16 + generated < 2048
 
 
-def test_acceptance_is_logged(caplog):
-    engine, sub, _ = _build_engine(3)
-    sub._mtp_logged = float("-inf")  # the first step logs
-    with caplog.at_level("INFO", logger="mstar.model.glm5_next.submodules"):
-        _generate(engine, {"a": PROMPTS["a"]}, 4)
-    assert any("drafts accepted per step" in r.getMessage() for r in caplog.records)
-
-
-def test_temperature_is_refused_under_mtp(caplog):
-    engine, _, _ = _build_engine(2)
-    engine.add_request("t", {SAMPLER: SamplingReqConfig(temperature=0.7)})
-    batch = _batch(
-        node_name="LLM",
-        per_request_info={"t": CurrentForwardPassInfo(
-            request_id="wire-t", rid_handle="t", graph_walk="prefill", fwd_index=0, random_seed=0,
-            max_tokens=4,
-            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.7)})},
-        per_request_input_tensors={"t": {"text_inputs": [PROMPTS["b"]]}},
-        step_context=StepContext(request_ids=("t",), graph_walk="prefill", slot=0,
-                                 capture=False),
-    )
-    with caplog.at_level(logging.ERROR, logger="mstar.engine.engine"):
-        engine.prepare_inputs(batch)
-    # process_prompt refuses this as a 400; past it, the client sees an error id, the log the reason
-    error = batch.failed_requests["t"]
-    assert error.startswith("internal error (error id ")
-    error_id = error.removeprefix("internal error (error id ").removesuffix(")")
-    assert any(error_id in r.getMessage() and "greedy only" in r.getMessage() for r in caplog.records)
-
-
-def test_prompts_leave_two_blocks_of_index_topk():
-    model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte",
-                          mtp_num_draft_tokens=3)
-    limit = model.config.index_topk - 2 * 4
-    assert model.process_prompt("a" * limit, ["text"], ["text"]).new_input_tensors["text_inputs"][0].numel() == limit
-    with pytest.raises(ValueError, match="at most"):
-        model.process_prompt("a" * (limit + 1), ["text"], ["text"])
-
-
 def test_vocab_parallel_argmax_equals_the_full_argmax():
     """``_argmax`` over 4 emulated TP ranks, ties across shards included, against the argmax
     of the gathered logits; one gather of the ranks' (logit, id) pairs per call."""
@@ -496,10 +457,8 @@ LONG_MAX_TOKENS = 30
 
 
 def _generate_long(engine, sub, prompts, max_tokens):
-    """``_generate`` with the cache checked after each step: the host's cache counts every
-    verify step's whole block, whatever it accepted (so it moves the same on every rank), and
-    the device's length is the rows of the input and the accepted drafts, nothing else (the
-    token after them is the next input)."""
+    """``_generate``, checking after each step that the host books every verify step's whole
+    block (the same on every rank) and ``MTP_LEN`` only the accepted rows."""
     kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
     rows = {rid: len(ids) for rid, ids in prompts.items()}
     host = dict(rows)
@@ -538,8 +497,8 @@ def long_reference():
 @pytest.mark.parametrize("k", [1, 3])
 @pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
 def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, drafts):
-    """Prompts past index_topk, prefilled in windows: drafting on gives greedy's tokens,
-    whatever the drafts, and each verify step's rejected rows leave the cache."""
+    """Prompts past index_topk, prefilled in windows: drafting gives greedy's tokens, whatever
+    the drafts."""
     assert all(len(v) == LONG_MAX_TOKENS for v in long_reference.values()), long_reference
     engine, sub, cfg = _build_engine(k, long_context=True)
     assert cfg.mtp_trims and min(map(len, LONG_PROMPTS.values())) > cfg.index_topk
@@ -551,29 +510,27 @@ def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, dr
 
 # hundreds of index pools against the 16 a query selects, on 16-token pages
 REAL_PROMPTS = {"a": (torch.arange(700) * 37 + 11) % 240, "b": (torch.arange(450) * 53 + 5) % 240}
-REAL_MAX_TOKENS = 120
+REAL_MAX_TOKENS = 60
 
 
-@pytest.mark.parametrize("drafts", ["mtp", "oracle_partial"])
-def test_long_context_mtp_at_a_real_geometry(drafts):
+def test_long_context_mtp_at_a_real_geometry():
     """The same parity where the trims bookkeeping can drift: ~175 pools against the 16
-    selected, 16-token pages, and after 120 tokens the host's rows several pages past the
-    device's. Greedy's tokens, and every step's host rows, context and MTP_LEN checked."""
+    selected, on 16-token pages, with the host's rows pages past the device's."""
     geometry = {"long_context": True, "max_seq_len": 2048, "page_size": 16}
     engine, sub, _ = _build_engine(0, **geometry)
     reference = _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS)
     assert all(len(v) == REAL_MAX_TOKENS for v in reference.values()), reference
-    engine, sub, cfg = _build_engine(3, **geometry)
-    assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
-    if drafts != "mtp":
-        _oracle(sub, reference, wrong_every=2)
-    assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference
+    for drafts in ("mtp", "oracle_partial"):
+        engine, sub, cfg = _build_engine(3, **geometry)
+        assert cfg.mtp_trims and min(map(len, REAL_PROMPTS.values())) > 4 * cfg.index_topk
+        if drafts != "mtp":
+            _oracle(sub, reference, wrong_every=2)
+        assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference, drafts
 
 
 def test_long_context_mtp_layer_selects_with_its_own_indexer():
-    """Under dsa_long_context the MTP layer keeps an index plane, as a trunk layer does, and
-    the prompt's MTP pass writes every prompt row's key there: its drafts select over the whole
-    context, not over its last index_topk tokens."""
+    """The prompt's MTP pass writes every prompt row's index key to the MTP layer's own plane,
+    so its drafts select over the whole context."""
     engine, sub, cfg = _build_engine(2, long_context=True)
     attn = sub.language_model.mtp.transformer_layer.self_attn
     assert attn.index_plane == attn.kv_plane

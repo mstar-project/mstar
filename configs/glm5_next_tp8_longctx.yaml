@@ -1,9 +1,10 @@
 model: "glm5_next"
-# GLM-5.3-Flash on 8 GPUs of 80 GB with contexts to its native 1M tokens: every MLA layer runs
-# the k-pool DSA indexer and sparse MLA (dsa_long_context). Otherwise glm5_next_tp8.yaml.
+# GLM-5.3-Flash on 8 GPUs of 80 GB with contexts to its native 1M tokens, every MLA layer
+# through the k-pool DSA and sparse MLA (dsa_long_context). Otherwise as glm5_next_tp8.yaml.
 max_seq_len: 1048576
-# One request per KDA slot below, as glm5_next_tp8.yaml. The KV pool admits by prompt: when
-# the live contexts outgrow it, decode holds requests until they time out (no eviction).
+# One request per KDA slot below. The KV pool admits by prompt and cannot evict (aux planes
+# need cpu_offload_pages: 0): when live contexts outgrow it, decode holds requests until
+# pages free up or they time out.
 max_concurrent_requests: 64
 # NVLS multicast for the small decode all-reduces; stays on NCCL, with a
 # warning, where NVLink multicast is unavailable.
@@ -18,21 +19,20 @@ model_kwargs:
   dsa_shard_prefill: true
   # Tokens a request may hold, prompt and output together.
   max_seq_len: 1048576
-  # Prompts up to the largest captured bucket (4096 tokens) prefill captured, several to a
-  # step; a longer prompt takes a step of its own and runs eager, 8192 tokens at a time.
+  # A prefill step up to the largest captured bucket (4096 tokens) replays a graph; a longer
+  # one runs eager, prefill_window_tokens (8192) at a time.
   prefill_graphs: true
 resources:
   kv_cache:
-    # 11 latent planes + 11 index planes, one 512-wide bf16 row per token each: 22.5 KB per
-    # token per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of
-    # others, ~26 GB/rank next to ~38 GB of weights.
+    # 11 latent planes (512 wide) and 11 index planes (3 x 128), bf16: ~19.7 KB per token
+    # per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of others,
+    # ~22.6 GB/rank beside ~38 GB of weights.
     max_num_pages: 8960
     page_size: 128
   kda_state:
     max_slots: 65
-# A prompt past the captured buckets prefills eager, in windows, and its kernels compile on first
-# use. Three lengths (6k, 12.5k and 20k tokens: one to three windows) take those compiles before the
-# server binds, not the first long request.
+# An eager prefill compiles its kernels on first use: these prompts (one, two and three
+# windows) take those compiles before the server binds, not the first long request.
 warmup_requests:
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}

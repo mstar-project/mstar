@@ -1117,11 +1117,8 @@ class RecurrentStatePool(Resource):
         self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
     def post_warmup_validate(self):
-        """Every rank of the group must hold the same free slots after warmup.
-
-        Each rank admits from its own pool, so identical free lists are what
-        make their verdicts agree; see ``KVManager.post_warmup_validate``.
-        """
+        """Every rank of the group must hold the same free slots after warmup:
+        each rank admits from its own pool. See ``KVManager.post_warmup_validate``."""
         if self._comm_group is None or self._comm_group.world_size == 1:
             return
         local = torch.tensor(

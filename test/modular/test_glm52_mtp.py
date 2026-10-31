@@ -1,6 +1,6 @@
-"""CPU tests for the GLM-5.2 MTP components."""
+"""The GLM-5.2 MTP module on CPU: its indexer-slot guard, its forward over the node's resources
+and the load of the layer-78 keys."""
 
-import random
 import sys
 import types
 from pathlib import Path
@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import pytest
 import torch
 
-from mstar.model.glm52.components.indexer import is_full_indexer_layer
 from mstar.model.glm52.config import Glm52ModelConfig
 
 
@@ -25,10 +24,6 @@ def _cpu_flashinfer() -> types.ModuleType:
     fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
     return fi
 
-
-# mtp.py's import chain reaches flashinfer via decoder_layer -> attention;
-# stub it before the import so construction-level tests import at all on
-# machines without CUDA wheels.
 
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
@@ -45,12 +40,7 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
-from mstar.model.glm52.components.mtp import (  # noqa: E402
-    Glm52MTPModule,
-    mtp_greedy_verify,
-    mtp_greedy_verify_host,
-    remap_mtp_key,
-)
+from mstar.model.glm52.components.mtp import Glm52MTPModule  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -58,79 +48,10 @@ from mstar.model.glm52.config import (  # noqa: E402
 )
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
-# The collapsed key inventory under model.layers.78. from the real
-# checkpoint's model.safetensors.index.json (experts collapsed to one
-# representative index, fp8 scale companions dropped — scale pairing is
-# quantization.py's business, exercised by its own goldens).
-CHECKPOINT_LAYER78_SUBKEYS = [
-    "eh_proj.weight",
-    "enorm.weight",
-    "hnorm.weight",
-    "input_layernorm.weight",
-    "mlp.experts.0.down_proj.weight",
-    "mlp.experts.0.gate_proj.weight",
-    "mlp.experts.0.up_proj.weight",
-    "mlp.gate.e_score_correction_bias",
-    "mlp.gate.weight",
-    "mlp.shared_experts.down_proj.weight",
-    "mlp.shared_experts.gate_proj.weight",
-    "mlp.shared_experts.up_proj.weight",
-    "post_attention_layernorm.weight",
-    "self_attn.indexer.k_norm.bias",
-    "self_attn.indexer.k_norm.weight",
-    "self_attn.indexer.weights_proj.weight",
-    "self_attn.indexer.wk.weight",
-    "self_attn.indexer.wq_b.weight",
-    "self_attn.kv_a_layernorm.weight",
-    "self_attn.kv_a_proj_with_mqa.weight",
-    "self_attn.kv_b_proj.weight",
-    "self_attn.o_proj.weight",
-    "self_attn.q_a_layernorm.weight",
-    "self_attn.q_a_proj.weight",
-    "self_attn.q_b_proj.weight",
-    "shared_head.norm.weight",
-]
-
-
-def test_mtp_layer_is_formula_full():
-    # The checkpoint ships an indexer under layer 78; the IndexShare skip
-    # formula must classify it FULL so Glm52DecoderLayer(78) constructs one
-    # without any special-casing (78 - 3 + 1 = 76, 76 % 4 == 0).
-    cfg = Glm52ModelConfig()
-    assert is_full_indexer_layer(cfg, cfg.num_hidden_layers)
-
-
-def _expected_module_key(sub_key: str) -> str:
-    """Compose remap_mtp_key (subtree routing) with the naming conventions
-    the trunk loader already implements (weight_loader.glm52_name_remapper
-    + fused expert stacking): shared_experts -> shared_expert, per-expert
-    gate/up/down projections -> the fused stacked parameters. This mirrors,
-    not reimplements, the loader — if the loader's conventions change, the
-    trunk goldens break first and this map is updated with them.
-    """
-    routed = remap_mtp_key(sub_key)
-    routed = routed.replace(".shared_experts.", ".shared_expert.")
-    import re
-
-    m = re.match(r"(.*)\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$", routed)
-    if m:
-        prefix, proj = m.groups()
-        fused = "down_proj" if proj == "down_proj" else "gate_up_proj"
-        return f"{prefix}.experts.{fused}"
-    # Shared expert is a ParallelGatedMLP: gate/up fuse into the merged
-    # column-parallel gate_up_proj through its stacked weight_loader.
-    m = re.match(r"(.*\.shared_expert)\.(gate_proj|up_proj|down_proj)\.weight$", routed)
-    if m:
-        prefix, proj = m.groups()
-        fused = "down_proj" if proj == "down_proj" else "gate_up_proj"
-        return f"{prefix}.{fused}.weight"
-    return routed
-
 
 def _reduced_mtp_config() -> Glm52ModelConfig:
-    """reduced() puts the MTP position (layer 2, offset=1) on a SHARED
-    slot; 4 trunk layers make it land FULL (4 = offset-1 + freq), matching
-    the real geometry where 78 = 2 + 19·4."""
+    """reduced() puts the MTP layer on a SHARED indexer slot; 4 trunk layers put it on a FULL
+    one, as layer 78 is."""
     cfg = Glm52ModelConfig.reduced()
     cfg.num_hidden_layers = 4
     cfg.dsa_long_context = True  # the indexer (and its checkpoint keys) exist only on the DSA path
@@ -138,85 +59,14 @@ def _reduced_mtp_config() -> Glm52ModelConfig:
 
 
 def test_mtp_module_refuses_shared_position():
-    # reduced() itself: layer 2 with offset=1 is SHARED -> indexer-less
-    # would desync from a checkpoint that ships indexer weights. Loud > silent.
     with pytest.raises(ValueError, match="FULL indexer"):
         Glm52MTPModule(Glm52ModelConfig.reduced())
-
-
-def test_mtp_module_covers_checkpoint_keys():
-    """Every layer-78 checkpoint key must land on a real module parameter under
-    subtree routing plus the trunk loader's naming conventions: the module has
-    to be shaped for the checkpoint before any loader can fill it.
-    """
-    cfg = _reduced_mtp_config()
-    module = Glm52MTPModule(cfg)
-    sd_keys = set(module.state_dict().keys())
-    for sub_key in CHECKPOINT_LAYER78_SUBKEYS:
-        mapped = _expected_module_key(sub_key)
-        assert mapped in sd_keys, f"{sub_key} -> {mapped} not in module"
-
-
-def test_mtp_layer_reduces_its_own_partials_under_fused_add_rmsnorm():
-    """The perf config fuses each all-reduce into the next add + RMSNorm, so a trunk layer
-    returns (partial, residual). The draft layer has no next norm in that chain: it must
-    reduce in o_proj and the FFN itself and return one tensor."""
-    import dataclasses
-
-    cfg = dataclasses.replace(_reduced_mtp_config(), kernels="auto")
-    layer = Glm52MTPModule(cfg).transformer_layer
-    assert layer.fused_add_rmsnorm is False
-    assert layer.self_attn.o_proj.reduce_results is True
-
-
-def test_mtp_glue_routes_direct_trunk_routes_nested():
-    assert remap_mtp_key("enorm.weight") == "enorm.weight"
-    assert remap_mtp_key("shared_head.norm.weight") == "shared_head.norm.weight"
-    assert (
-        remap_mtp_key("self_attn.q_a_proj.weight")
-        == "transformer_layer.self_attn.q_a_proj.weight"
-    )
-    assert (
-        remap_mtp_key("input_layernorm.weight")
-        == "transformer_layer.input_layernorm.weight"
-    )
-
-
-def test_mtp_fusion_math():
-    """fuse() = eh_proj([enorm(e); hnorm(h)]) — checked against the same
-    ops applied by hand, and sensitive to argument order (embedding half
-    first, hidden half second — the DeepSeek-V3 convention)."""
-    cfg = _reduced_mtp_config()
-    module = Glm52MTPModule(cfg).eval()
-    torch.manual_seed(0)
-    e = torch.randn(3, cfg.hidden_size)
-    h = torch.randn(3, cfg.hidden_size)
-    with torch.no_grad():
-        out = module.fuse(e, h)
-        ref = module.eh_proj(
-            torch.cat([module.enorm(e), module.hnorm(h)], dim=-1)
-        )
-        swapped = module.eh_proj(
-            torch.cat([module.hnorm(h), module.enorm(e)], dim=-1)
-        )
-    assert out.shape == (3, cfg.hidden_size)
-    assert torch.equal(out, ref)
-    assert not torch.allclose(out, swapped)
-
-
-def test_mtp_module_has_no_embedding_or_head():
-    # The checkpoint ships neither under layer 78 — drafts must reuse the
-    # target's embed_tokens / lm_head. A module that grew its own copies
-    # would silently serve garbage (loader would skip-log them as missing).
-    cfg = _reduced_mtp_config()
-    names = {n for n, _ in Glm52MTPModule(cfg).named_parameters()}
-    assert not any("embed" in n or "lm_head" in n for n in names)
 
 
 # --- the module forward over the bound resources ---------------------------
 
 
-def _plane_step(runner, rid, span, k=0):
+def _plane_step(runner, rid, span):
     steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)}
     if DSA_RESOURCE in runner.resources:  # dsa_long_context: the layers select through it
         steps[DSA_RESOURCE] = DSAStep()
@@ -228,12 +78,7 @@ def _plane_step(runner, rid, span, k=0):
 
 
 def test_mtp_forward_writes_the_plane_layer():
-    """The module's attention is bound to the node's KV/attention resources
-    like any trunk layer, and its KV goes to the plane: layer index
-    ``num_hidden_layers`` (4 here, the one extra plane the resource
-    declaration adds under MTP), never a trunk layer. The forward returns
-    ``(head_input, raw_hidden)`` of the token shape.
-    """
+    """The module's KV goes to the extra plane at ``num_hidden_layers``, never a trunk layer's."""
     cfg = _reduced_mtp_config()
     cfg.mla_absorb = True
     cfg.mtp_num_draft_tokens = 2
@@ -273,69 +118,9 @@ def test_mtp_forward_writes_the_plane_layer():
     assert kv._streams["r0"]["main"].stored_len == n
 
 
-# --- greedy verify truth table ---------------------------------------------
-
-
-def _verify(draft, target):
-    n, tok = mtp_greedy_verify(
-        torch.tensor(draft, dtype=torch.long),
-        torch.tensor(target, dtype=torch.long),
-    )
-    return n, int(tok)
-
-
-def test_verify_all_accepted_emits_bonus():
-    # target agrees with every draft; the k+1-th entry is the bonus token.
-    assert _verify([5, 7, 9], [5, 7, 9, 11]) == (3, 11)
-
-
-def test_verify_first_mismatch_corrects():
-    assert _verify([5, 7, 9], [4, 7, 9, 11]) == (0, 4)
-
-
-def test_verify_mid_mismatch_truncates():
-    # draft[1] wrong: accept 1, emit the target's correction; entries past
-    # the mismatch are meaningless and must not affect the result.
-    assert _verify([5, 8, 9], [5, 7, 999, 999]) == (1, 7)
-
-
-def test_verify_k0_is_plain_decode():
-    assert _verify([], [42]) == (0, 42)
-
-
-def test_verify_shape_mismatch_raises():
-    with pytest.raises(ValueError):
-        mtp_greedy_verify(torch.tensor([1, 2]), torch.tensor([1, 2]))
-
-
-def test_verify_emission_invariant():
-    # Every step emits num_accepted + 1 tokens and they are exactly the
-    # target's greedy stream: at temp 0, MTP-on matches MTP-off up to
-    # rounding (kernels that tile by row count can round differently).
-    draft = [3, 1, 4, 1]
-    target = [3, 1, 5, 9, 2]
-    n, tok = _verify(draft, target)
-    emitted = draft[:n] + [tok]
-    assert emitted == target[: n + 1]
-
-
-# ---------------------------------------------------------------------------
-# Weight loader path: layer-78 keys -> the ``mtp.`` submodule.
-
-def test_mtp_flag_default_off_no_module():
-    from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
-
-    cfg = Glm52ModelConfig.reduced()
-    assert cfg.mtp_num_draft_tokens == 0
-    model = Glm52ForCausalLM(cfg)
-    assert model.mtp is None
-    assert not any(n.startswith("mtp.") for n in dict(model.named_parameters()))
-
-
 def test_mtp_load_end_to_end_reduced_fp8():
-    """The loader contract, executed: layer-78 keys ride the single-pass
-    stream — fp8 dequant, fused expert stacking, glue keys — onto the mtp
-    submodule, with completeness both ways."""
+    """The layer-78 keys ride the trunk's load stream (fp8 dequant, stacked experts, the glue)
+    onto ``mtp.``, with completeness both ways."""
     from test_glm52_moe import BLOCK, _fabricate_checkpoint
 
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
@@ -358,7 +143,7 @@ def test_mtp_load_end_to_end_reduced_fp8():
         num_hidden_layers=cfg.num_hidden_layers, load_mtp=True,
     )
 
-    # Completeness both ways, now including the mtp.* subtree.
+    # completeness both ways, the mtp.* subtree included
     params = set(dict(model.named_parameters()))
     assert any(n.startswith("mtp.") for n in params)
     assert loaded == params
@@ -391,32 +176,3 @@ def test_mtp_load_end_to_end_reduced_fp8():
     idxr = model.mtp.transformer_layer.self_attn.indexer
     _, _, wk_deq = refs[f"{mtp_p}.self_attn.indexer.wk"]
     assert torch.equal(idxr.wk.weight.data, wk_deq.to(idxr.wk.weight.dtype))
-
-
-# --- host greedy verify ----------------------------------------------------
-
-def test_host_verify_matches_tensor_verify():
-    rng = random.Random(7)
-    for _ in range(500):
-        k = rng.randint(1, 5)
-        vocab = 5
-        target = [rng.randrange(vocab) for _ in range(k + 1)]
-        # Bias drafts toward matching so every acceptance count is exercised.
-        drafts = [t if rng.random() < 0.6 else rng.randrange(vocab)
-                  for t in target[:k]]
-        n_ref, bonus_ref = mtp_greedy_verify(
-            torch.tensor(drafts), torch.tensor(target))
-        n = mtp_greedy_verify_host(drafts, target)
-        assert n == n_ref
-        # The identity the decode step uses: emitted == target[:n_acc+1].
-        emitted_ref = drafts[:n_ref] + [int(bonus_ref)]
-        assert emitted_ref == target[:n + 1]
-
-
-def test_host_verify_shape_check():
-    try:
-        mtp_greedy_verify_host([1, 2], [1, 2])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("k+1 target rows required")

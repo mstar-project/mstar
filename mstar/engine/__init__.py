@@ -57,6 +57,27 @@ def apply_dynamo_config() -> None:
     torch._dynamo.config.specialize_int = False
 
 
+def with_recompile_limit(fn, submodule):
+    """Wrap ``fn``, one of ``submodule``'s torch.compile'd callables, so dynamo compiles it under
+    the submodule's ``dynamo_recompile_limit()`` where that is above this thread's limit. The
+    limit is that submodule's alone: other nodes, and calls outside it, keep the engine's. A
+    submodule that doesn't override the hook gets ``fn`` back as is."""
+    from mstar.model.submodule_base import NodeSubmodule
+
+    hook = getattr(type(submodule), "dynamo_recompile_limit", None)
+    if hook is None or hook is NodeSubmodule.dynamo_recompile_limit:
+        return fn
+
+    def forward(*args, **kwargs):
+        need = submodule.dynamo_recompile_limit()
+        if need is None or need <= torch._dynamo.config.recompile_limit:
+            return fn(*args, **kwargs)
+        with torch._dynamo.config.patch(recompile_limit=need):
+            return fn(*args, **kwargs)
+
+    return forward
+
+
 def apply_torch_config() -> None:
     apply_dynamo_config()
     # Process-wide, so set once here and never from a thread initializer: a

@@ -206,12 +206,8 @@ def build_glm52_read_plan(
 
 
 def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
-    """Trunk remapping, plus layer-78 routing onto the ``mtp.``
-    submodule: strip the layer prefix, apply ``remap_mtp_key`` (glue keys
-    direct, the rest under ``transformer_layer.``), then the trunk naming
-    conventions — the expert/shared-expert regexes are prefix-agnostic, so
-    the fused stacked-param rules apply to the MTP MoE unchanged.
-    """
+    """The trunk's remapper, plus the layer-78 keys onto ``mtp.`` through ``remap_mtp_key``;
+    the expert regexes are prefix-agnostic, so the stacked-param rules cover the MTP MoE."""
     if not load_mtp:
         return glm52_name_remapper
 
@@ -221,7 +217,7 @@ def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
         m = _LAYER_RE.match(name)
         if m and int(m.group(1)) >= num_hidden_layers:
             if int(m.group(1)) > num_hidden_layers:
-                # one draft module: a second next-token layer silently overwrote the first
+                # one draft module: a second next-token layer would overwrite the first
                 raise ValueError(f"{name}: MTP serves one next-token layer, "
                                  f"{num_hidden_layers}; the checkpoint has more")
             return glm52_name_remapper("mtp." + remap_mtp_key(name[m.end():]))

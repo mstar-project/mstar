@@ -223,8 +223,8 @@ class _Serve:
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
     """The real serve loop (prefill -> decode -> check_stop) on the sparse
-    path; returns (generated tokens, stopped-via-check_stop, the tokens the
-    latent cache and the index-key store hold before retirement)."""
+    path; returns (generated tokens, stopped-via-check_stop, _stored_rows before
+    retirement)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)

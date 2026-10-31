@@ -1,11 +1,9 @@
 """Linears that keep an fp8 block-scale checkpoint's weights (a config's ``dense_fp8``).
 
-Each holds this rank's shard of an e4m3 weight (uint8 container, like the routed experts,
-so ``module.to(bf16)`` leaves it alone) and its fp32 ``weight_scale_inv`` blocks. Column
-parallel shards the output rows, row parallel the input columns; the scales shard with
-them, so every per-rank size must be a whole number of blocks. ``reference`` runs them as
-the weight dequantized per call (a config's ``kernels: reference``), else the dense_fp8
-kernels.
+Each holds this rank's shard of an e4m3 weight, in a uint8 container so ``module.to(bf16)``
+leaves it alone, and its fp32 ``weight_scale_inv`` blocks. The scales shard with the weight,
+so every per-rank size must be a whole number of blocks. ``reference`` dequantizes the
+weight per call (``kernels: reference``); otherwise ``mstar.utils.dense_fp8`` runs them.
 """
 from __future__ import annotations
 
@@ -33,8 +31,7 @@ def dense_fp8_block(config) -> tuple[int, int] | None:
 
 
 def fp8_reference(config) -> bool:
-    """Whether a config's fp8 linears take ``reference``: its ``kernels: reference``, the
-    numerics anchor."""
+    """Whether a config's fp8 linears run ``reference`` (``kernels: reference``)."""
     return getattr(config, "kernels", "auto") == "reference"
 
 
@@ -43,8 +40,8 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 def reference(x, weight, scale, block_size, glu=False):
-    """The flag-off numerics: the weight dequantized to bf16 as the loader does, then the
-    plain linear in x.dtype."""
+    """The numerics anchor: the weight dequantized as the loader would, then a plain linear
+    in x.dtype."""
     w = dequantize_fp8_block_weight(weight, scale, block_size=block_size).to(x.dtype)
     y = torch.nn.functional.linear(x, w)
     if glu:

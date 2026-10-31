@@ -54,12 +54,10 @@ def select_topk_causal(
 ) -> torch.Tensor:
     """Per-row top-``topk`` key positions of causally masked ``scores``.
 
-    ``scores`` is ``(T, num_keys)`` with every key past a row's position
-    already ``-inf``; the result is ``(T, topk)`` int32, -1 padded where a
-    row sees fewer than ``topk`` keys. One stable sort for the whole batch:
-    no per-token topk launch, no host sync. Ties break toward the earlier
-    key position, so a row's selection does not depend on how the batch
-    is packed or on which device ran it (torch.topk's tie order is neither).
+    ``scores`` is ``(T, num_keys)`` with every key past a row's position already ``-inf``; the
+    result is ``(T, topk)`` int32, -1 padded where a row sees fewer than ``topk`` keys. Ties
+    break toward the earlier key (a stable sort), so a row's pick depends neither on the batch's
+    packing nor on the device, as torch.topk's would.
     """
     num_tokens, num_keys = scores.shape
     k_eff = min(topk, num_keys)
@@ -83,9 +81,8 @@ def index_topk(
     ``q`` ``(T, H, D)`` and ``weights`` ``(T, H)`` are the indexer's queries and head weights
     (any scales folded in), ``keys`` ``(S, D)`` a request's keys by position and ``positions``
     ``(T,)`` the rows' own: a row sees keys ``0 .. position``, itself included."""
-    # score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]), in fp32: per-head ReLU BEFORE the
-    # weighted sum; the raw weights get no softmax/sigmoid. The engine's bf16 autocast would run
-    # both einsums in bf16.
+    # score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]): relu per head, raw weights (no
+    # softmax), fp32 even under the engine's bf16 autocast
     with torch.autocast(q.device.type, enabled=False):
         dots = torch.einsum("thd,sd->ths", q.float(), keys.float()).relu()
         scores = torch.einsum("th,ths->ts", weights.float(), dots)
@@ -267,8 +264,8 @@ def build_cpu_resources(
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
             class _ReplannedMLA(FlashInferMLAManager):
-                # EagerPiecewiseRunner plans before every region call, so a leased
-                # fallback plan is never replayed stale
+                # the CPU tests plan before every call, so a leased fallback plan is
+                # never replayed stale
                 @property
                 def uses_kernel(self) -> bool:
                     return True

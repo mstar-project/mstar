@@ -477,9 +477,8 @@ class TextOutput(NamedTuple):
     derive their text paths from it."""
 
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | ByteIdDetokenizer
-    # ids that end a reply, dropped unless the request sets ``ignore_eos``. The API
-    # reports a reply whose last token is not one as cut at its budget
-    # (``finish_reason: "length"``), and every reply of a model that names none as stopped.
+    # ids that end a reply, dropped unless the request sets ``ignore_eos``; a reply
+    # that ends on none is reported as cut at its budget (``finish_reason: "length"``)
     stop_token_ids: Container[int] = frozenset()
 
 
