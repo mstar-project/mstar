@@ -1634,11 +1634,13 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    partial step and this list come together, and an entry that names no fp8 linear is an
    error at load. It spends the budget a step at a time: klein-4B with
    ``[bf16, fp8_partial, fp8, fp8]`` and 34 of its 60 linears kept on the partial step loses
-   0.22 dB on the typical image (worst 1.65 dB) at 68% of the time saving of fp8 on every
-   step, where fp8 on steps 1 to 3 loses 0.48 dB with a worst image of 5.61 dB. klein-9B with
-   ``[bf16, bf16, fp8_partial, fp8]`` and 51 of 80 linears kept loses 0.21 dB (worst 1.71 dB)
-   at 40% of that saving. Every klein-9B schedule measured above 65% of it lost more than
-   0.7 dB on the typical image.
+   0.22 dB on the typical image (worst 1.65 dB), where fp8 on steps 1 to 3 loses 0.48 dB with
+   a worst image of 5.61 dB. It keeps about three quarters of the fp8 speedup at 16 requests
+   and half of it at one (one MI325X, shared node). klein-9B with
+   ``[bf16, bf16, fp8_partial, fp8]`` and 51 of 80 linears kept loses 0.21 dB (worst 1.65 dB)
+   and keeps about two thirds of the speedup of its ``fp8_keep_bf16`` list at 16 requests,
+   about 37% of the speedup with every linear in fp8. Every klein-9B schedule measured above
+   60% of the time saving of fp8 on every step lost at least 0.7 dB on the typical image.
 
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
