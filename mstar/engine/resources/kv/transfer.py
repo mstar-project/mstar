@@ -762,10 +762,8 @@ class KVTransferManager:
             transfer_engine_info.transfer_engine, LocalTransferEngine
         ):
             if not needs_remote_transfer:
-                # No other worker reads it, so it isn't shared: a cache shared over CUDA
-                # IPC and then freed waits in torch's IPC limbo for a reader to release
-                # it, still allocated, and the limbo's destructor makes CUDA calls at exit,
-                # after c10's statics are destroyed.
+                # not shared: a freed IPC-shared cache stays allocated in torch's IPC
+                # limbo, whose destructor makes CUDA calls after c10's statics are gone
                 self._kv_transfer_engine = LocalOnlyKVTransferEngine()
             elif kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
