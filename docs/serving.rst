@@ -350,6 +350,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ingraph_decode_rope: true}``, or ``knobs: {pre_plan: false}``
        (``whisper_large_v3_turbo.yaml``). On AMD GPUs ``ingraph_decode_rope`` and
        ``sampler_ingraph_scatter`` default to ``true``.
+   * - ``platform_overrides``
+     - *(optional)* Top-level keys this deployment replaces on one platform, keyed
+       by platform: ``cuda``, ``rocm``, ``xpu`` or ``cpu``. An unknown platform
+       fails at startup. See :ref:`platform-overrides`.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
@@ -441,6 +445,29 @@ submits to hardware queues of its own, which the GPU schedules without a daemon,
 (``Platform.colocated_workers``). Whether a split gains there is per deployment: Qwen3-TTS's
 did on an MI300X (see :doc:`models`), Whisper's did not on a one-GPU slice.
 The ``*_split.yaml`` configs for Whisper and Qwen3-ASR set it.
+
+.. _platform-overrides:
+
+**A layout per platform.** A config whose best layout differs per platform lists the
+difference under ``platform_overrides``. Each entry's keys replace the file's top-level keys on that
+platform, the platform being the one torch was built for, and every other platform
+serves the file as written. ``configs/qwen3omni_2gpu.yaml`` puts Code2Wav on a worker of
+its own on AMD GPUs:
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Thinker], ranks: [1]}
+     - {node_names: [Talker, Code2Wav], ranks: [0]}
+   platform_overrides:
+     rocm:
+       node_groups:
+         - {node_names: [Thinker], ranks: [1]}
+         - {node_names: [Talker], ranks: [0]}
+         - {node_names: [Code2Wav], ranks: [2]}
+       rank_devices: {2: 0}
+
+The server logs which keys an entry replaced.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
