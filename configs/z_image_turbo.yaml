@@ -19,6 +19,8 @@ model_kwargs:
   # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
   # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
+  # the device's tuned GEMM solutions where it has a table (mstar/platforms/rocm_dit_gemm.py); elsewhere nothing changes
+  tuned_linears: true
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles per
   # batch size inside its first requests and decodes on the eager VAE.
