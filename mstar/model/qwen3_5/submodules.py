@@ -734,14 +734,17 @@ class LLMSubmodule(ARNodeSubmodule):
         ids, positions = spec.verify_inputs()
         hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=self._cos_sin_1d(positions))
         step = engine_inputs.step
-        accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
+        sample = bool(step is not None and step.cg_key_info)
+        accepted = spec.accept(head(hidden), sample=sample)
         ids = accepted.target.reshape(-1)
         keep = spec.draft_slots()
-        draft_head = head if self.model.draft_head is None else self.model.draft_head
+        # a sampled draft keeps its distribution, and the fp8 head's rows are each on a scale of their own
+        draft_head = head if sample or self.model.draft_head is None else self.model.draft_head
         for j in range(self.num_draft_tokens):
             attend = functools.partial(self._attend_draft, spec, j)
             out = self.model.mtp.draft(hidden, lm.embed_tokens(ids), attend, keep=keep if j == 0 else None)
-            ids = spec.record_draft(j, draft_head(out))
+            logits = draft_head(out)
+            ids = spec.draw_draft(j, logits) if sample else spec.record_draft(j, logits)
             hidden = out
         return accepted
 

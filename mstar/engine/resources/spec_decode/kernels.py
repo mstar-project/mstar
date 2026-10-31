@@ -136,19 +136,22 @@ def _accept_kernel(
     rows_ptr, ids_ptr, targets_ptr, positions_ptr, block_table_ptr, stop_ids_ptr,
     seq_len_ptr, num_acc_ptr, tokens_ptr, emitted_ptr, budget_ptr, stop_on_ptr,
     out_tokens_ptr, accepted_ptr, done_ptr, keep_ptr,
-    draft_slots_ptr, draft_positions_ptr, draft_lens_ptr,
+    draft_slots_ptr, draft_positions_ptr, draft_lens_ptr, kept_ptr,
     table_stride, page_size, num_stops, num_rows, T, K,
-    BLOCK: tl.constexpr, STOPS: tl.constexpr, PASSES: tl.constexpr,
+    BLOCK: tl.constexpr, STOPS: tl.constexpr, PASSES: tl.constexpr, KEPT: tl.constexpr,
 ):
     r = tl.program_id(0)
     row = tl.load(rows_ptr + r)
     slot = tl.arange(0, BLOCK)
     mask = slot < T
     target = tl.load(targets_ptr + r * T + slot, mask=mask, other=-1)
-    drafted = tl.load(ids_ptr + r * T + slot + 1, mask=slot + 1 < T, other=-2)
-    # the first slot whose next draft the target refused ends the step: never
-    # one past the last, which has no draft after it
-    last = tl.argmin((drafted == target).to(tl.int32), axis=0)
+    if KEPT:
+        last = tl.load(kept_ptr + r)
+    else:
+        drafted = tl.load(ids_ptr + r * T + slot + 1, mask=slot + 1 < T, other=-2)
+        # the first slot whose next draft the target refused ends the step: never
+        # one past the last, which has no draft after it
+        last = tl.argmin((drafted == target).to(tl.int32), axis=0)
     accepted = last + 1
     base = tl.load(positions_ptr + r * T).to(tl.int32)
 
@@ -187,7 +190,7 @@ def _accept_kernel(
 def _accept(
     rows, ids, targets, positions, block_table, page_size, stop_ids,
     seq_len, num_acc, tokens, emitted, budget, stop_on,
-    out_tokens, accepted, done, keep, draft_slots, draft_positions, draft_lens,
+    out_tokens, accepted, done, keep, draft_slots, draft_positions, draft_lens, kept=None,
 ) -> None:
     b, k = rows.shape[0], draft_slots.shape[0]
     t = out_tokens.shape[1]
@@ -195,23 +198,24 @@ def _accept(
         rows, ids, targets, positions, block_table, stop_ids,
         seq_len, num_acc, tokens, emitted, budget, stop_on,
         out_tokens, accepted, done, keep, draft_slots, draft_positions, draft_lens,
+        rows if kept is None else kept,
         block_table.stride(0), page_size, stop_ids.shape[0], b, t, k,
         BLOCK=triton.next_power_of_2(t), STOPS=triton.next_power_of_2(stop_ids.shape[0]),
-        PASSES=triton.next_power_of_2(k), num_warps=1,
+        PASSES=triton.next_power_of_2(k), KEPT=kept is not None, num_warps=1,
     )
 
 
 def _accept_reference(
     rows, ids, targets, positions, block_table, page_size, stop_ids,
     seq_len, num_acc, tokens, emitted, budget, stop_on,
-    out_tokens, accepted, done, keep, draft_slots, draft_positions, draft_lens,
+    out_tokens, accepted, done, keep, draft_slots, draft_positions, draft_lens, kept=None,
 ) -> None:
     b, t, k = rows.shape[0], out_tokens.shape[1], draft_slots.shape[0]
     rows_l = rows.long()
     y = targets.view(b, t).long()
     x = ids.view(b, t)
     base = positions.view(b, t)[:, 0].int()
-    count = (x[:, 1:] == y[:, :-1]).int().cumprod(dim=1).sum(dim=1) + 1
+    count = ((x[:, 1:] == y[:, :-1]).int().cumprod(dim=1).sum(dim=1) if kept is None else kept) + 1
     last = (count - 1)[:, None].long()
     accepted.copy_(count.int())
     seq_len.index_copy_(0, rows_l, base + count.int())
@@ -245,8 +249,8 @@ def _accept_fake(*args) -> None:
     return None
 
 
-def _accept_shape(rows, *rest):
-    return {"rows": rows.shape[0], "tokens": rest[-7].shape[1]}
+def _accept_shape(rows, ids, targets, positions, block_table, page_size, stop_ids, seq_len, num_acc, tokens, *rest):
+    return {"rows": rows.shape[0], "tokens": tokens.shape[0]}
 
 
 def _accept_args(shape, dtype, device, generator=None):
@@ -284,7 +288,7 @@ SPEC_ACCEPT = KernelOp(
     "(Tensor rows, Tensor ids, Tensor targets, Tensor positions, Tensor block_table, int page_size, Tensor stop_ids, "
     "Tensor(a!) seq_len, Tensor(b!) num_acc, Tensor(c!) tokens, Tensor(d!) emitted, Tensor budget, Tensor stop_on, "
     "Tensor(e!) out_tokens, Tensor(f!) accepted, Tensor(g!) done, Tensor(h!) keep, Tensor(i!) draft_slots, "
-    "Tensor(j!) draft_positions, Tensor(k!) draft_lens) -> ()",
+    "Tensor(j!) draft_positions, Tensor(k!) draft_lens, Tensor? kept=None) -> ()",
     fake=_accept_fake,
     reference=_accept_reference,
     impls={"rocm": lambda: _accept},
