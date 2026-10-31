@@ -1864,8 +1864,7 @@ on the device. That needs an attention backend whose plan reads per-row KV lengt
 a block table on the device: AITER's unified attention on AMD GPUs. No
 ``repetition_penalty``.
 
-Verification is greedy, or with ``SpecDecodeConfig(sampling=True, vocab_size=...)``
-speculative sampling (``spec_decode/sampled.py``). The forward takes each draft pass's
+Verification is greedy, or with ``SpecDecodeConfig(sampling=True)`` speculative sampling (``spec_decode/sampled.py``). The forward takes each draft pass's
 token from ``draw_draft(j, logits)``, which draws it from the request's top-k/top-p
 distribution at its temperature and keeps that distribution per request, and ``accept``
 judges it by the target's next step: a draft ``d`` stays with probability
@@ -1873,9 +1872,9 @@ judges it by the target's next step: a draft ``d`` stays with probability
 then follow the plain sampler's distribution exactly, at an acceptance of
 ``sum min(p, q)``. Each request reads its own Philox stream from device registers, so
 a replay equals the eager step, but the stream differs from a plain step's: the same
-seed does not give the plain path's tokens. A sampling node keeps ``k`` vocabulary-sized
-rows per request (``max_requests``), 1.3 GB at ``k = 2`` and the default 256 requests on
-Qwen3.5.
+seed does not give the plain path's tokens. Filters run on each row's top 64 tokens
+(``sampled.CANDIDATES``); a row whose kept set may run past them takes FlashInfer's
+vocabulary-wide renorms instead, so the target stays exact.
 
 Tuning resources per deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

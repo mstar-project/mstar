@@ -312,7 +312,6 @@ class Qwen3_5DenseModel(Model):
                 resource_key=SPEC_DECODE, nodes={"LLM"},
                 config=SpecDecodeConfig(
                     num_draft_tokens=self.num_draft_tokens, sampling=self.spec_sampling,
-                    vocab_size=self.config.vocab_size,
                 ),
                 kv_cache=KV_CACHE, attn=ATTN,
                 stop_token_ids=tuple(self.config.stop_token_ids),
