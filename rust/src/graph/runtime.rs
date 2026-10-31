@@ -3263,7 +3263,7 @@ impl GraphRuntime {
     #[pyo3(signature = (
         partition, graph_walk, node_name, output_signals, rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        row_rids,
+        row_rids, loop_strides = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn route_and_send_inline(
@@ -3280,6 +3280,7 @@ impl GraphRuntime {
         inline_stride: usize,
         inline_dtype: &str,
         row_rids: Vec<u32>,
+        loop_strides: Option<Vec<u32>>,
     ) -> PyResult<FusedRouteOut> {
         let itemsize = match inline_dtype {
             "int64" | "int32" => if inline_dtype == "int64" { 8 } else { 4 },
@@ -3333,8 +3334,7 @@ impl GraphRuntime {
                 inline_values: values,
                 walks: None,
                 rid_walk_idx: None,
-                // a device-loopback step: one token per row, no chunk loop
-                loop_strides: None,
+                loop_strides,
             })?;
             let completion_id = route.completion_id;
             let needs_python = !route.register_uuids.is_empty()

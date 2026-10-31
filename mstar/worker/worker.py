@@ -2253,6 +2253,7 @@ class Worker:
         refused admit, a raise, an executor that never ran it) sets it on
         completion, so the admit fence and the submitter's wait always lift.
         """
+        batch.chunk_loop_walks = self.chunk_loops.walks_by_node.get(batch.node_name, frozenset())
         event = node_batch.launch_started_event = threading.Event()
         future = gpu_executor.submit(
             self._execute_on_gpu_thread, batch, node_batch, plan_future,
@@ -2654,7 +2655,7 @@ class Worker:
             counts = [len(walk_rids) for walk_rids in groups.values()]
         ready_for_spec = self._graph_runtime.speculate_node(
             batch.node_name, list(groups), rows, counts,
-            self.chunk_loops.loop_strides(batch, rows),
+            batch.loop_strides(rows),
         )
         if not ready_for_spec:
             return None
@@ -2739,7 +2740,7 @@ class Worker:
             ]
         prep = self._spec_preparer.prepare(
             batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
-            self.chunk_loops.loop_strides(batch_N, candidates),
+            batch_N.loop_strides(candidates),
         )
         laps.lap("continuing_inputs")
         continuing = prep.ready_rids
@@ -3608,8 +3609,6 @@ class Worker:
         if (
             host_rows is None or batch.request_walks or self.enable_prof
             or batch_N.node_batch.stream_partition_done_rids
-            # the fused route takes no loop strides
-            or batch.graph_walk in self.chunk_loops.walks_by_node.get(batch_N.node_name, ())
             or not getattr(rt, "supports_route_and_send_inline", False)
             or not self._all_on_device(
                 engine, batch_N.node_name, batch_N.graph_walk, signals,
@@ -3629,6 +3628,7 @@ class Worker:
             node_name=batch_N.node_name, output_signals=signals, rids=rids,
             inline_signal=signal, inline_column=column,
             row_rids=list(host_rows.request_ids),
+            loop_strides=batch.loop_strides(rids),
         )
         if inline.status is InlineRouteStatus.NOT_ROUTED:
             return False
@@ -3775,7 +3775,7 @@ class Worker:
                 inline_values=inline_values,
                 walks=walks if rid_walk_idx is not None else None,
                 rid_walk_idx=rid_walk_idx,
-                loop_strides=self.chunk_loops.loop_strides(batch_N.batch, rids),
+                loop_strides=batch_N.batch.loop_strides(rids),
             ),
         )
         if self._phase_period:

@@ -107,9 +107,34 @@ class ScheduledBatch:
     # runs; and the rows whose node needs at least one more chunk.
     chunk_ranges: dict[int, ChunkRange] = field(default_factory=dict)
     incomplete_node_rids: set[int] = field(default_factory=set)
+    # This node's walks that run as a chunk Loop on this worker, stamped when
+    # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
+    # not the scheduler, and every step that runs passes through there.
+    chunk_loop_walks: frozenset[str] = frozenset()
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
+
+    def loop_strides(self, rids: Iterable[int]) -> list[int] | None:
+        """``RouteInput.loop_strides`` for ``rids``, in that order: a row of a
+        chunk-Loop walk moves its Loop by its chunk (``chunk_loop_stride``),
+        and any other row its loop by one. None for a step with no row in a
+        chunk Loop, which is every decode step.
+
+        Keyed on the walk having a Loop rather than on the row having a chunk
+        range: a row with no range ran whole, which also ends the Loop -- a
+        walk with no token budget is never measured or cut.
+        """
+        walks = self.chunk_loop_walks
+        # one lookup for a single-walk step outside a chunk Loop (decode)
+        if not walks or (not self.request_walks and self.graph_walk not in walks):
+            return None
+        ranges = self.chunk_ranges
+        walk_of = self.walk_of
+        return [
+            chunk_loop_stride(ranges.get(rid)) if walk_of(rid) in walks else 1
+            for rid in rids
+        ]
 
     def get_continuing_rows(
         self, node_name: str, walk_rids: list[int],

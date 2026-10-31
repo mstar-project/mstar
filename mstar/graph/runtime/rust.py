@@ -675,13 +675,14 @@ class RustGraphRuntime(GraphRuntime):
         self, partition: str, graph_walk: str, node_name: str,
         output_signals: list[str], rids: list[int],
         inline_signal: str, inline_column: torch.Tensor,
-        row_rids: list[int],
+        row_rids: list[int], loop_strides: list[int] | None = None,
     ) -> InlineRoute:
         """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
         step, one crossing with the GIL released (see the Rust side).
 
         ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
-        caller keeps alive; Rust reads it in place.
+        caller keeps alive; Rust reads it in place. ``loop_strides`` is as
+        for ``complete_and_route_batch``.
         """
         out = self._rust.route_and_send_inline(
             partition=partition, graph_walk=graph_walk, node_name=node_name,
@@ -689,6 +690,7 @@ class RustGraphRuntime(GraphRuntime):
             inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
             inline_stride=inline_column.stride(0),
             inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
+            loop_strides=loop_strides,
         )
         status = InlineRouteStatus(out.status)
         route = None
