@@ -350,12 +350,14 @@ class LLMSubmodule(ARNodeSubmodule):
         return frozenset()
 
     @staticmethod
-    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
-        """A decode step replayed on a leased slot, or being captured for one.
-        The caller's walk decides (a capture's own context carries the
-        piecewise walk), the lease says the slot's static buffers are in
-        play."""
-        if graph_walk != "decode":
+    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A step of a text walk replayed on a leased slot, or being captured
+        for one, with ``ingraph_decode_rope`` on: its rotary tables come from
+        the planned positions inside the graph. The caller's walk decides (a
+        capture's own context carries the piecewise walk), the lease says the
+        slot's static buffers are in play. Only ``prefill_vision`` rows bring
+        their own 3D positions."""
+        if graph_walk not in ("decode", "prefill_text", LLM_MIXED) or not ingraph_decode_rope():
             return False
         step = getattr(engine_inputs, "step", None)
         ctx = getattr(step, "ctx", None) if step is not None else None
@@ -414,7 +416,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
-        captured = self._captured_decode(engine_inputs, graph_walk)
+        in_graph = self._rope_in_graph(engine_inputs, graph_walk)
         first = inputs[0]
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
@@ -436,11 +438,16 @@ class LLMSubmodule(ARNodeSubmodule):
             out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
-            if captured and ingraph_decode_rope():
+            if in_graph:
                 # the captured forward builds the rotary tables itself
                 return out
         elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
+            if in_graph:
+                assert all(inp.custom_pos_ids is None for inp in inputs), (
+                    "a text walk's rows take the planned 1D positions"
+                )
+                return out
         else:
             out["input_embeds"] = torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0,
@@ -538,10 +545,9 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        captured = self._captured_decode(engine_inputs, graph_walk)
         if input_ids is None and input_embeds is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
+        if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
             # positions, inside the graph; the static cos/sin stay unread
             num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]

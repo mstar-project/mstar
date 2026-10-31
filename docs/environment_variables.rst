@@ -645,9 +645,11 @@ Worker scheduling
        master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
-     - A captured decode step builds its rotary tables inside the graph from
-       the position resource's planned positions instead of staging them.
-       Experiment knob, measured and gated on its own.
+     - A captured step of a text walk (Qwen3.5 decode, text prefill and
+       mixed) builds its rotary tables inside the graph from the position
+       resource's planned positions instead of building them before the
+       replay (``LLMSubmodule._rope_in_graph``). Experiment knob, measured
+       and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``0``
      - The captured sampler gathers its RNG offsets from the slot masters
