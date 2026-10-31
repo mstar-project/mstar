@@ -92,21 +92,16 @@ class ZImageTextEncoderSubmodule(NodeSubmodule):
     learned pad token). ``text_inputs`` arrives unpadded; rows are right-padded to the
     encoder's ``max_sequence_length`` (512), as the reference pipeline pads them: the real
     tokens' values do not depend on the padding mathematically, but the attention kernel's
-    accumulation order does, so the padded length is part of bit-exactness. With
-    ``pad_to_max_length=False`` rows are padded only to the batch's longest caption bucket, which
-    gives up that last bit for a forward over tens of rows instead of 512. Requests of any length
-    batch together."""
+    accumulation order does, so the padded length is part of bit-exactness. Requests of any
+    length batch together."""
 
     disable_torch_compile = True
 
-    def __init__(
-        self, encoder: nn.Module, config: ZImageConfig, max_batch_size: int = 16, pad_to_max_length: bool = True,
-    ):
+    def __init__(self, encoder: nn.Module, config: ZImageConfig, max_batch_size: int = 16):
         super().__init__()
         self.encoder = encoder
         self.config = config
         self._max_batch_size = max_batch_size
-        self._pad_to_max_length = pad_to_max_length
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         ids = inputs[TEXT_INPUTS][0]
@@ -121,8 +116,6 @@ class ZImageTextEncoderSubmodule(NodeSubmodule):
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         lengths = [int(inp.tensor_inputs[TEXT_INPUTS].shape[0]) for inp in inputs]
         width = self.config.text_encoder.max_sequence_length
-        if not self._pad_to_max_length:
-            width = min(width, padded_length(max(lengths)))
         pad_id = self.config.text_encoder.pad_token_id
         ids = torch.full((len(inputs), width), pad_id, dtype=torch.long)
         mask = torch.zeros((len(inputs), width), dtype=torch.long)
