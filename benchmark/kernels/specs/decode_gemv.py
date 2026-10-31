@@ -141,6 +141,30 @@ def _decode_linear():
     return lambda x, w: torch.ops.mstar.decode_linear(x, w, None)
 
 
+def _served_knobs(impl: str, shape) -> dict:
+    """``registry``'s record of what serves a shape, for `promote`."""
+    from mstar.platforms.rocm_gemm import DECODE_GEMM
+
+    params = {k: v for k, v in DECODE_GEMM.params(shape, impl).items() if k != "us"}
+    return {**params, "serves": impl}
+
+
+def _linear_served(fn, args) -> dict:
+    from mstar.platforms.rocm_gemm import gemv_impl
+
+    x, w = args[:2]
+    shape = {"rows": x.shape[0], "n": w.shape[0], "k": x.shape[1]}
+    return _served_knobs(gemv_impl(**shape), shape)
+
+
+def _gated_served(fn, args) -> dict:
+    from mstar.platforms.rocm_gemm import fuses_silu_mul
+
+    x, w = args[:2]
+    shape = {"rows": x.shape[0], "n": w.shape[0], "k": x.shape[1]}
+    return _served_knobs("fused" if fuses_silu_mul(**shape) else "unfused", {**shape, "gated": 1})
+
+
 def _registry():
     """The linear as this tree's graph passes route it."""
     from mstar.platforms.rocm_gemm import gemv_impl
@@ -200,7 +224,7 @@ def candidates(facts: DeviceFacts, budget: int | None = None, seeds=None) -> lis
     found = [Candidate("torch", {}, lambda: F.linear)]
     if is_amd(facts):
         found.extend((
-            Candidate("registry", {}, _registry),
+            Candidate("registry", {}, _registry, shape_knobs=_linear_served),
             Candidate("aiter_skinny", {}, _aiter_linear),
             Candidate("decode_linear", {}, _decode_linear),
             Candidate("hipblaslt_tuned", {}, hipblaslt_best, shape_knobs=chosen_solution),
@@ -212,7 +236,7 @@ def silu_mul_candidates(facts: DeviceFacts, budget: int | None = None, seeds=Non
     found = [Candidate("torch", {}, lambda: _unfused(F.linear))]
     if is_amd(facts):
         found.extend((
-            Candidate("registry", {}, _registry_silu_mul),
+            Candidate("registry", {}, _registry_silu_mul, shape_knobs=_gated_served),
             Candidate("aiter_skinny", {}, lambda: _unfused(_aiter_linear())),
             Candidate("decode_linear", {}, lambda: _unfused(_decode_linear())),
             Candidate("hipblaslt_tuned", {}, lambda: _unfused(hipblaslt_best()), shape_knobs=chosen_solution),
@@ -263,13 +287,30 @@ GATED_IMPLS = {
 _CLASS_DEFAULTS = {"rows1": {"impl": "aiter"}, "rows2": {"impl": "aiter"}}
 
 
+def _served(record):
+    """What the searched tree serves a record's shape with, from its ``registry``
+    candidate, and the gain a move off it must clear: one graph node, since a
+    move can break a fold with its neighbours that a kernel timed alone cannot
+    show (a one-row GEMM on AITER takes its input in any layout, so inductor
+    finishes the norm before it in one kernel). Leaving the fused gate/up breaks
+    no fold, and the pair's time already holds the kernel it adds."""
+    cand = record["candidates"].get("registry", {})
+    knobs = dict(cand.get("knobs", {}))
+    if "serves" not in knobs or not cand.get("oracle", {}).get("ok") or not isinstance(cand.get("us"), (int, float)):
+        return None
+    impl = knobs.pop("serves")
+    return impl, knobs, cand["us"], 0.0 if impl == "fused" else record.get("node_us") or 0.0
+
+
 def promote(store, facts, margin: float, root=None, provenance=None) -> Path:
     """The ``decode_gemm`` table from the stored ``decode_gemv`` and
     ``decode_gemv_silu_mul`` records: every measured shape's fastest kernel, a
-    kernel of this repo or a tuned solution leaving the default by ``margin``.
-    A gate/up projection stays fused unless the best pair beats it by ``margin``:
-    a tie goes to the fold, which launches one kernel less."""
-    common = dict(table="decode_gemm", margin=margin, root=root, provenance=provenance, shape_class=_shape_class)
+    kernel of this repo or a tuned solution leaving the default by ``margin``,
+    and a shape the searched tree already serves leaving that for a real gain
+    (`ResultsStore.promote_best`). A gate/up projection nobody served stays fused
+    unless the best pair beats it by ``margin``: the fold launches one kernel less."""
+    common = dict(table="decode_gemm", margin=margin, root=root, provenance=provenance, shape_class=_shape_class,
+                  incumbent=_served)
     store.promote_best(facts, "decode_gemv", LINEAR_IMPLS.get, tuned=("triton", "hipblaslt_tuned"),
                        class_default=lambda klass: _CLASS_DEFAULTS.get(klass, {"impl": "hipblaslt"}), **common)
     return store.promote_best(facts, "decode_gemv_silu_mul", GATED_IMPLS.get, tuned=("fused",),
