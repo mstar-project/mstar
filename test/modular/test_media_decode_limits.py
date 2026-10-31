@@ -189,12 +189,13 @@ def test_unreadable_image_is_a_client_error_without_the_path(tmp_path):
     assert "secret-name" not in str(info.value)
 
 
-def test_waypoint_and_flux2_loaders_check_the_header(tmp_path, no_decode):
+def test_model_image_loaders_check_the_header(tmp_path, no_decode):
     from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+    from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
     from mstar.model.waypoint.waypoint_model import WaypointModel
 
     path = _png(tmp_path / "bomb.png", 30_000, 30_000, rows=0)
-    for cls in (WaypointModel, Flux2KleinModel):
+    for cls in (WaypointModel, Flux2KleinModel, LingBotWorldModel):
         with pytest.raises(ValueError, match="limit"):
             cls.load_image(None, path, "cpu")
 
