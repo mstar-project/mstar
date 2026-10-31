@@ -222,8 +222,7 @@ class RecurrentStatePool(Resource):
         # Snapshots:
         # `_kv` is the KV cache whose page keys name them, None while they are off.
         # `_snap_meta` maps a filed slot to its key, least recently filed or restored first.
-        # `_replies` holds the filed decode snapshots in the same order, which eviction takes
-        # before any other: they serve only a prompt that repeats the reply token for token.
+        # `_replies` holds the filed decode snapshots, in the same order; eviction takes them first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
         self._kv: KVManager | None = None
         first = config.max_slots
@@ -851,12 +850,10 @@ class RecurrentStatePool(Resource):
         """A free snapshot slot, else the least recently used one nothing
         holds, a decode snapshot before a prompt's.
 
-        A prompt's snapshot serves a resend and every later turn of its chat,
-        while a decode snapshot serves only a prompt that repeats the reply as
-        decoded, which a chat template that re-renders the reply never sends.
-        Taking decode snapshots first keeps about one prompt per slot; one LRU
-        over both holds half as many, since every request files one of each.
-        Caller holds the lock."""
+        A prompt's snapshot serves every resend and later turn of its chat; a
+        decode snapshot only a prompt that repeats the reply token for token.
+        Every request files one of each, so one LRU over both would hold half
+        as many prompts as slots. Caller holds the lock."""
         if self._snap_free:
             return self._snap_free.pop()
         refs = self._snap_refs

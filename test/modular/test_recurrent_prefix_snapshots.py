@@ -589,17 +589,14 @@ def _answered(pool: RecurrentStatePool, rid: str, prompt: list[int], reply: list
 
 
 def test_a_full_pool_keeps_a_prompt_per_slot_though_every_reply_files_a_snapshot():
-    """Each answered request files its prompt's snapshot and its reply's. A resend restores only
-    the prompt's, so with one LRU over both a pool of n slots held n / 2 prompts, and resends
-    past that restored nothing while the KV cache still held their pages."""
+    """Three answered requests file six snapshots into four slots; every prompt still resends
+    from its snapshot."""
     pool = _pool(prefix_slots=4)
     prompts = [[100 * i + j for j in range(12)] for i in range(3)]
     for i, prompt in enumerate(prompts):
         _answered(pool, f"p{i}", prompt, [100 * i + 50 + j for j in range(4)])
     for i, prompt in enumerate(prompts):
-        assert _probe(pool, f"again{i}", prompt, hit=8).tokens == 8, (
-            f"prompt {i}'s snapshot went to keep a reply's, so its resend recomputes the prompt"
-        )
+        assert _probe(pool, f"again{i}", prompt, hit=8).tokens == 8, f"prompt {i}'s snapshot was evicted for a reply's"
 
 
 def test_a_reply_snapshot_that_served_a_prompt_is_kept_like_a_prompts():
