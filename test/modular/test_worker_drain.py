@@ -209,6 +209,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     )
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
+        after_output_copy=lambda batch: None,
         extend_prefix_chains=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     )
