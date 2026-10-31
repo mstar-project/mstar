@@ -1085,6 +1085,7 @@ class PreprocessWorkerThread:
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
+        intake: bool = False,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -1102,12 +1103,16 @@ class PreprocessWorkerThread:
 
         ``traceback`` False logs one line, for an error already logged where
         it happened.
+
+        ``intake`` marks a failure while taking client input in (a request or
+        an append), where a ValueError or TypeError refuses it (a 400). Past
+        intake one is a server bug like any other error (a 500).
         """
+        status = 400 if intake and isinstance(exc, (ValueError, TypeError)) else 500
         text, _ = client_error_text(
             exc, f"{stage} failed for request {request_id}", log=logger,
-            traceback=traceback,
+            traceback=traceback, refusal=status < 500,
         )
-        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
@@ -1596,7 +1601,7 @@ class PreprocessWorkerThread:
             try:
                 self._process_stream_input(pre_input)
             except Exception as exc:  # noqa: BLE001 — must reach the client
-                self._fail_request(pre_input.request_id, exc, "stream input")
+                self._fail_request(pre_input.request_id, exc, "stream input", intake=True)
             return
         profile = None
         try:
@@ -1611,7 +1616,7 @@ class PreprocessWorkerThread:
             # reaches the conductor, so nothing downstream would ever complete
             # it; surface the failure as an error chunk instead of leaving the
             # client to hit the server timeout.
-            self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
+            self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False, intake=True)
             # Never reached the conductor, so there are no remote readers to
             # race: hard-drop the (possibly persisted) input signals directly.
             self._cleanup_request_state(pre_input.request_id, force=True)

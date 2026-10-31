@@ -3,12 +3,14 @@
 A compressed image or video can be tiny on the wire and enormous once decoded
 (a flat PNG compresses about 1000:1, a still video far more), so the loaders
 check what a file will decode to, not how big it is. A refusal is a
-``ValueError``, which the data worker answers with a 400.
+``ValueError``, which the data worker answers with a 400, as is a file its
+decoder can't read (:func:`decoding_upload`).
 
 The pixel and audio caps hold for a whole request: while the data worker loads
 a request's files inside :class:`RequestMediaBudget`, every check also counts
 against what the request's earlier files used.
 """
+import errno
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -152,6 +154,52 @@ def check_file_counts(counts: dict[str, int], model_limits: dict[str, int]) -> N
             raise ValueError(
                 f"the request attaches {count} {modality} files; this model takes at most {limit}"
             )
+
+
+def ffmpeg_unavailable() -> str | None:
+    """Why torchcodec can't decode in this process, or None if it can."""
+    try:
+        import torchcodec
+        import torchcodec.decoders  # noqa: F401
+    except (ImportError, RuntimeError, OSError) as exc:
+        # torchcodec 0.9 and earlier raise here when FFmpeg is missing
+        return f"it failed to load: {exc}"
+    # 0.16 imports without FFmpeg and fails only at decode (0.8 has no
+    # ffmpeg_major_version, and has already raised above)
+    if getattr(torchcodec, "ffmpeg_major_version", 0) is None:
+        return "it found no FFmpeg shared libraries"
+    return None
+
+
+class UndecodableMediaError(ValueError):
+    """A request file its decoder refused: the client's error, a 400."""
+
+
+def _out_of_memory(exc: BaseException) -> bool:
+    # torch's CPU allocator raises a plain RuntimeError; it and FFmpeg put
+    # ENOMEM's text in the message
+    return isinstance(exc, torch.OutOfMemoryError) or os.strerror(errno.ENOMEM) in str(exc)
+
+
+@contextmanager
+def decoding_upload(filepath: str, what: str, *, ffmpeg: bool = False):
+    """Around a loader's decode call: the decoder refusing ``filepath`` is the
+    client's error, raised as :class:`UndecodableMediaError`.
+
+    Decoders raise RuntimeError (torchvision, torchcodec, libsndfile) or
+    OSError (Pillow) for a file they can't read, but also for the server's own
+    faults, which are re-raised: a failed allocation, an upload our cleanup
+    removed and, with ``ffmpeg``, a torchcodec that has no FFmpeg.
+    """
+    try:
+        yield
+    except (RuntimeError, OSError) as exc:
+        if _out_of_memory(exc) or not os.path.exists(filepath) or (ffmpeg and ffmpeg_unavailable()):
+            raise
+        # the decoder's message can name the server path
+        raise UndecodableMediaError(
+            f"could not decode {what}: the file is corrupt or truncated, or not a format this server reads"
+        ) from exc
 
 
 # libsndfile reports 2**63 - 1 frames for a FLAC whose STREAMINFO has no sample
@@ -360,7 +408,8 @@ def _on_white(image: torch.Tensor) -> torch.Tensor:
 
 
 def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
-    """A request image as uint8 ``[C, H, W]``, refused first if it is too large.
+    """A request image as uint8 ``[C, H, W]``, refused first if it is too large
+    and then if it does not decode.
 
     ``rgb`` forces three channels, with any transparency composited on white
     as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha
@@ -379,7 +428,7 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
         import numpy as np
         from PIL import Image
 
-        with Image.open(filepath) as image:
+        with decoding_upload(filepath, "the image"), Image.open(filepath) as image:
             array = np.array(image.convert("RGBA"))
         return _on_white(torch.from_numpy(array).permute(2, 0, 1))
     if not rgb:
@@ -388,7 +437,8 @@ def read_image(filepath: str, *, rgb: bool = False) -> torch.Tensor:
         # only a file with transparency is read with alpha: a CMYK JPEG's
         # four channels are not RGBA
         mode = torchvision.io.ImageReadMode.RGB_ALPHA if transparent else torchvision.io.ImageReadMode.RGB
-    image = torchvision.io.decode_image(filepath, mode=mode)
+    with decoding_upload(filepath, "the image"):
+        image = torchvision.io.decode_image(filepath, mode=mode)
     if image.dtype == torch.uint16:
         # a 16-bit PNG: its high byte, as Pillow reads a 16-bit RGB PNG
         image = (image.to(torch.int32) >> 8).to(torch.uint8)

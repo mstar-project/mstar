@@ -209,11 +209,12 @@ class OmniVoiceModel(Model):
         loader, libsndfile first: torchcodec needs an FFmpeg built with audio
         decoders, which some deployment images lack (#639).
         """
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
         from mstar.model.base import TensorAndMetadata
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.model.components.audio_features import load_speech_file
 
         rate = self.config.sample_rate
-        audio = load_audio_file(filepath, rate)
+        audio = load_speech_file(filepath, rate, MAX_AUDIO_SECONDS)
         return TensorAndMetadata(
             data=audio, metadata=dict(sample_rate=rate, num_channels=1)
         )

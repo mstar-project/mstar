@@ -29,6 +29,7 @@ def scrub_paths(text: str) -> str:
 def client_error_text(
     exc: BaseException, what: str, *,
     log: logging.Logger = logger, type_name: bool = True, traceback: bool = True,
+    refusal: bool | None = None,
 ) -> tuple[str, str]:
     """Return ``(text, error_id)``: what a client may see for ``exc``.
 
@@ -38,13 +39,17 @@ def client_error_text(
     ``internal error (error id <id>)``. Either way the full error and its
     traceback (left out when ``traceback`` is False, for an error already
     logged where it happened) go to ``log`` as ``<what> [error id <id>]``.
+    ``refusal`` overrides that type check, for a caller that knows whether
+    the request was refused.
     """
     error_id = secrets.token_hex(6)
     log.error(
         "%s [error id %s]: %s: %s", what, error_id, type(exc).__name__, exc,
         exc_info=exc if traceback else None,
     )
-    if isinstance(exc, (ValueError, TypeError)):
+    if refusal is None:
+        refusal = isinstance(exc, (ValueError, TypeError))
+    if refusal:
         text = scrub_paths(str(exc))
         if type_name:
             text = f"{type(exc).__name__}: {text}"

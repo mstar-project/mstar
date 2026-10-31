@@ -28,7 +28,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.model.media_limits import VideoBudget, read_image
+from mstar.model.media_limits import VideoBudget, decoding_upload, read_image
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
 
@@ -751,10 +751,7 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
-        try:
-            img = read_image(filepath, rgb=True)
-        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
-            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        img = read_image(filepath, rgb=True)
         img = img.to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
@@ -763,20 +760,22 @@ class Model(ABC):
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
         # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
+        audio = load_speech_file(filepath, 16000, MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device)
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, device=device)
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)

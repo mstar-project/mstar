@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.model.media_limits import VideoBudget, decoding_upload, ffmpeg_unavailable
 from mstar.model.multimodal import TEXT, PromptPart
 
 VIDEO = "video"
@@ -43,21 +44,6 @@ class ProcessedVideo(NamedTuple):
     timestamps: list[float]
 
 
-def ffmpeg_unavailable() -> str | None:
-    """Why torchcodec can't decode video in this process, or None if it can."""
-    try:
-        import torchcodec
-        import torchcodec.decoders  # noqa: F401
-    except (ImportError, RuntimeError, OSError) as exc:
-        # torchcodec 0.9 and earlier raise here when FFmpeg is missing
-        return f"it failed to load: {exc}"
-    # 0.16 imports without FFmpeg and fails only at decode (0.8 has no
-    # ffmpeg_major_version, and has already raised above)
-    if getattr(torchcodec, "ffmpeg_major_version", 0) is None:
-        return "it found no FFmpeg shared libraries"
-    return None
-
-
 def sample_video(path: str, video_processor) -> SampledVideo:
     """Decode the frames the checkpoint's video processor would sample.
 
@@ -75,15 +61,14 @@ def sample_video(path: str, video_processor) -> SampledVideo:
     try:
         from transformers.video_utils import load_video
     except ImportError as exc:
-        raise ValueError(f"Qwen3.5 video input needs transformers: {exc}") from exc
+        raise RuntimeError(f"Qwen3.5 video input needs transformers: {exc}") from exc
     if reason := ffmpeg_unavailable():
-        raise ValueError(
+        raise RuntimeError(
             "Qwen3.5 video input needs torchcodec with FFmpeg, the decoder "
             f"transformers uses; {reason}"
         )
 
     from mstar.model.base import video_metadata_dict
-    from mstar.model.media_limits import VideoBudget
 
     budget = VideoBudget()
 
@@ -98,11 +83,8 @@ def sample_video(path: str, video_processor) -> SampledVideo:
         budget.add(metadata.height, metadata.width, len(indices))
         return indices
 
-    try:
+    with decoding_upload(path, "the video"):
         frames, metadata = load_video(path, backend="torchcodec", sample_indices_fn=sampler)
-    except RuntimeError as exc:
-        # torchcodec's error for a corrupt or unsupported file: the client's input, a 400
-        raise ValueError(f"Qwen3.5 could not decode video {path!r}: {exc}") from exc
     return SampledVideo(frames, video_metadata_dict(metadata))
 
 

@@ -64,7 +64,7 @@ from mstar.model.base import (
     TensorAndMetadata,
     video_metadata_dict,
 )
-from mstar.model.media_limits import VideoBudget
+from mstar.model.media_limits import VideoBudget, decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -605,7 +605,8 @@ class VJepa2Model(Model):
 
         target_frames = self.config.frames_per_clip
         logger.info("load_video: opening %s", filepath)
-        decoder = VideoDecoder(filepath)
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath)
         logger.info("load_video: decoder opened; reading metadata")
 
         metadata_obj = getattr(decoder, "metadata", None)
@@ -648,15 +649,16 @@ class VJepa2Model(Model):
             height, width = decoder[indices[0]].shape[-2:]
         VideoBudget().add(height, width, len(indices))
         get_at = getattr(decoder, "get_frames_at", None)
-        if get_at is not None:
-            logger.info("load_video: calling get_frames_at(%d indices)", len(indices))
-            frame_batch = get_at(indices=indices)
-            frames = getattr(frame_batch, "data", frame_batch)
-        else:
-            # Older torchcodec: no batched sampled-decode API, per-index
-            # lookup still avoids materializing the whole video.
-            logger.info("load_video: per-index lookup (no get_frames_at)")
-            frames = torch.stack([decoder[i] for i in indices])
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            if get_at is not None:
+                logger.info("load_video: calling get_frames_at(%d indices)", len(indices))
+                frame_batch = get_at(indices=indices)
+                frames = getattr(frame_batch, "data", frame_batch)
+            else:
+                # Older torchcodec: no batched sampled-decode API, per-index
+                # lookup still avoids materializing the whole video.
+                logger.info("load_video: per-index lookup (no get_frames_at)")
+                frames = torch.stack([decoder[i] for i in indices])
         logger.info("load_video: decoded frames shape=%s", tuple(frames.shape))
 
         video = frames.float() / 255.0

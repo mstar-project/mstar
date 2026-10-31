@@ -45,7 +45,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
-from mstar.model.components.diffusion.image_io import encode_image
+from mstar.model.components.diffusion.image_io import encode_image, image_output_options
 from mstar.model.components.diffusion.lora import LoraSpec
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
@@ -67,7 +67,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -258,7 +258,8 @@ class Flux2KleinModel(Model):
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
         with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
-            raw.load()
+            with decoding_upload(filepath, "the reference image"):
+                raw.load()
             image = raw
             width, height = image.size
             if width < 64 or height < 64:
@@ -319,6 +320,7 @@ class Flux2KleinModel(Model):
             raise ValueError(f"FLUX.2 klein only generates images; got output modality {output_modalities!r}")
         if prompt is None or not prompt.strip():
             raise ValueError("FLUX.2 klein requires a non-empty text prompt")
+        image_output_options(kwargs)  # postprocess would fail it as a 500
         images = (tensors or {}).get(IMAGE_INPUTS) or []
         if "image" in input_modalities and not images:
             raise ValueError("request declared an image input but no image arrived; editing needs the reference image")

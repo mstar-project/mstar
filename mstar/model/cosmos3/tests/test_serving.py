@@ -118,6 +118,13 @@ def test_gen_params_and_step_metadata() -> None:
     assert sm["num_inference_steps"] == 7
 
 
+@pytest.mark.parametrize("fps", [0, -24, float("nan"), float("inf")])
+def test_gen_params_reject_a_bad_fps(fps) -> None:
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="fps must be positive"):
+        model._resolve_gen_params({"fps": fps}, ["text"], ["video"])
+
+
 def test_dynamic_loop_check_stop_and_wasted_step() -> None:
     """The denoise loop stops at each request's own step count, and a step
     dispatched one past that count is a no-op — so the loop's single speculative

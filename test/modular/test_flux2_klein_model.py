@@ -150,6 +150,17 @@ def test_process_prompt_rejects_bad_geometry(kwargs, message):
         _make_model().process_prompt("a cat", ["text"], ["image"], **kwargs)
 
 
+@pytest.mark.parametrize("kwargs,message", [
+    ({"output_format": "gif"}, "output_format"),
+    ({"output_format": "jpeg", "output_compression": "high"}, "output_compression"),
+    ({"png_compress_level": 10}, "png_compress_level"),
+])
+def test_process_prompt_rejects_bad_output_knobs(kwargs, message):
+    """encode_image reads them after the GPU work, where a raise is a 500."""
+    with pytest.raises(ValueError, match=message):
+        _make_model().process_prompt("a cat", ["text"], ["image"], **kwargs)
+
+
 def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
     model = _make_model()
     with pytest.raises(ValueError, match="text prompt"):

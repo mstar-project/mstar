@@ -173,7 +173,7 @@ def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
     )
     with pytest.raises(ValueError) as info:
         wt._process_input(request)
-    wt._fail_request("r1", info.value, "preprocessing", abort=False)
+    wt._fail_request("r1", info.value, "preprocessing", abort=False, intake=True)
     chunk = wt.out_queue.get_nowait()
     assert chunk.modality == "error"
     assert chunk.metadata["status"] == 400
@@ -555,7 +555,7 @@ def test_images_in_one_request_share_the_image_limit(tmp_path, decoded):
     with pytest.raises(ValueError, match="images decode to more than .* together") as info:
         wt._process_input(_image_request(paths))
     assert decoded == paths[:1]
-    wt._fail_request("r1", info.value, "preprocessing", abort=False)
+    wt._fail_request("r1", info.value, "preprocessing", abort=False, intake=True)
     assert wt.out_queue.get_nowait().metadata["status"] == 400
 
 
