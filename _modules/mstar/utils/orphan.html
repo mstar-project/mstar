@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -798,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -975,8 +977,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">multiprocessing</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">mp</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">signal</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.threads</span><span class="w"> </span><span class="kn">import</span> <span class="n">Thread</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1024,7 +1027,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">who</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">parent_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">stop_signal</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">signal</span><span class="o">.</span><span class="n">SIGTERM</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Start :func:`exit_when_orphaned` on a daemon thread."""</span>
-    <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span>
+    <span class="n">Thread</span><span class="p">(</span>
         <span class="n">target</span><span class="o">=</span><span class="n">exit_when_orphaned</span><span class="p">,</span>
         <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">who</span><span class="p">,</span> <span class="n">parent_name</span><span class="p">,</span> <span class="n">stop_signal</span><span class="p">),</span>
         <span class="n">daemon</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>

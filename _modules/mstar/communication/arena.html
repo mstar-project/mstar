@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -798,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -1032,6 +1034,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.containers</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParallelList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.host_copy</span><span class="w"> </span><span class="kn">import</span> <span class="n">HostCopier</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.threads</span><span class="w"> </span><span class="kn">import</span> <span class="n">Thread</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1930,7 +1933,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># staticmethod target closing over ONLY the queue: a bound</span>
                 <span class="c1"># method would pin the whole manager (and its arena — so</span>
                 <span class="c1"># segments never unlink) for the daemon thread's lifetime.</span>
-                <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span>
+                <span class="n">Thread</span><span class="p">(</span>
                     <span class="n">target</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_watch_wakes</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="p">,),</span>
                     <span class="n">daemon</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                     <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s2">"arena-h2d-wake-</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>

@@ -244,6 +244,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -445,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -698,7 +700,7 @@
 <span id="mstar-utils-host-copy"></span><h1>mstar.utils.host_copy<a class="headerlink" href="#module-mstar.utils.host_copy" title="Link to this heading">#</a></h1>
 <p>Large host copies split over threads of their own.</p>
 <p>The API server sizes torch’s intra-op pool for its small per-request ops
-(<code class="docutils literal notranslate"><span class="pre">entrypoint.default_preprocess_threads</span></code>), and one numpy memcpy runs on one
+(<code class="docutils literal notranslate"><span class="pre">cpus.CpuPlan.preprocess_threads</span></code>), and one numpy memcpy runs on one
 core. Most of a large copy into a fresh allocation is the destination’s
 first-touch page faults, which a copy split into slices takes in parallel too.
 numpy releases the GIL while it copies, so slices on a pool of their own run in

@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -798,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -990,6 +992,7 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"kv_pinned_indptrs"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_PINNED_INDPTRS"</span><span class="p">,</span>
     <span class="s2">"gc_gen0_threshold"</span><span class="p">:</span> <span class="s2">"MSTAR_GC_GEN0_THRESHOLD"</span><span class="p">,</span>
     <span class="s2">"pre_plan"</span><span class="p">:</span> <span class="s2">"MSTAR_PRE_PLAN_SPEC"</span><span class="p">,</span>
+    <span class="s2">"step_thread_core"</span><span class="p">:</span> <span class="s2">"MSTAR_STEP_THREAD_CORE"</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="c1"># this process's ``knobs:`` block, as strings in the env vars' format</span>
@@ -1014,7 +1017,9 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
     <span class="n">out</span> <span class="o">=</span> <span class="p">{}</span>
     <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">settings</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="o">==</span> <span class="s2">"step_thread_core"</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">_step_thread_core_value</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
             <span class="n">out</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"1"</span> <span class="k">if</span> <span class="n">value</span> <span class="k">else</span> <span class="s2">"0"</span>
         <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
             <span class="n">out</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
@@ -1024,6 +1029,19 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
     <span class="k">return</span> <span class="n">out</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_step_thread_core_value</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="nb">object</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="c1"># yaml reads a bare ``off`` as False</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">"auto"</span> <span class="k">if</span> <span class="n">value</span> <span class="k">else</span> <span class="s2">"off"</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="n">value</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">and</span> <span class="n">value</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"off"</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">value</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">"`knobs: step_thread_core` must be auto, off or a CPU number, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span>
+    <span class="p">)</span>
 
 
 <div class="viewcode-block" id="configure">
@@ -1163,6 +1181,25 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    4 layers), where the step is too short to hide the planning in and the</span>
 <span class="sd">    extra thread is just GIL contention."""</span>
     <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"pre_plan"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+
+
+
+<div class="viewcode-block" id="step_thread_core">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.step_thread_core">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">step_thread_core</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``off``):</span>
+<span class="sd">    pin each worker's main, GPU and plan threads, and the API server's result</span>
+<span class="sd">    threads, to CPUs of their own. ``auto`` places them by the GPU's rank on</span>
+<span class="sd">    its NUMA node, a number is the first worker's CPU (see</span>
+<span class="sd">    ``mstar.utils.cpus``)."""</span>
+    <span class="n">value</span> <span class="o">=</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"step_thread_core"</span><span class="p">,</span> <span class="s2">"off"</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"off"</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">value</span>
+    <span class="k">if</span> <span class="n">value</span><span class="o">.</span><span class="n">isdigit</span><span class="p">():</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">"MSTAR_STEP_THREAD_CORE must be auto, off or a CPU number, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span>
+    <span class="p">)</span></div>
 
 </pre></div>
 

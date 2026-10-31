@@ -244,6 +244,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -445,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -1291,7 +1293,61 @@ thread, which Whisper turbo’s serve config sets: its 4-layer steps
 are too short to hide the planning in. Read by
 <code class="docutils literal notranslate"><span class="pre">knobs.pre_plan_enabled</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">step_thread_core</span></code>, else <code class="docutils literal notranslate"><span class="pre">off</span></code></p></td>
+<td><p>Pin each worker’s main, GPU and plan threads to one core’s two
+hardware threads, and the API server’s message thread and Rust
+frontend bridge to one CPU of another core. A step hands work between
+the three worker threads several times and every step’s tokens pass
+from the message thread to the bridge; a thread woken on an idle core
+waits for that core to leave its idle state. The gain needs deep idle
+states. On a 2x B300 host (Xeon 6767P, <code class="docutils literal notranslate"><span class="pre">intel_idle</span></code>, C6 at 170 µs)
+a handoff to another core took 130-175 µs and 4-5 µs to a running
+one; on an H100 cloud VM without deep C-states it took 22 µs and
+11 µs, and pinning only cost throughput there. Turn it on (<code class="docutils literal notranslate"><span class="pre">auto</span></code>)
+where <code class="docutils literal notranslate"><span class="pre">/sys/devices/system/cpu/cpu*/cpuidle/state*/latency</span></code> shows a
+C6-class state of 100 µs or more and the server is host-bound (small
+models, high concurrency); leave it off on a VM without deep idle
+states. Measured off → <code class="docutils literal notranslate"><span class="pre">auto</span></code> (all three threads on one CPU in
+parentheses). B300 host, server <code class="docutils literal notranslate"><span class="pre">taskset</span></code> to 16 cores and their
+siblings: Qwen3.5-0.8B c=1 408 → 546 tok/s, c=16 5969 → 8049;
+Qwen3-TTS 1.7B c=1 TTFA p50 24.9 → 24.3 ms. H100 VM, 40-CPU
+<code class="docutils literal notranslate"><span class="pre">taskset</span></code> (from the #919 review):
+0.8B c=1 525 → 434 (486) tok/s, c=64 14455 → 14040 (12800); Qwen3-TTS
+c=1 TTFA mean 21.0 → 21.0 (25.6) ms. <code class="docutils literal notranslate"><span class="pre">auto</span></code>
+places by the GPU’s rank among the host’s GPUs on its NUMA node (sysfs
+<code class="docutils literal notranslate"><span class="pre">/sys/bus/pci/devices</span></code>: the PCI functions of the GPU’s vendor and
+class in address order, <code class="docutils literal notranslate"><span class="pre">numa_node</span></code> and <code class="docutils literal notranslate"><span class="pre">local_cpulist</span></code>), so
+servers on different GPUs take different CPUs without knowing about
+each other: a worker the core at that rank from the bottom of the
+node’s cores in the process mask, the API server the core at its
+first worker’s GPU’s rank from the top; further workers of one
+deployment on one GPU step by the node’s GPU count. A GPU whose node
+has no CPU in the mask picks, by its rank among the host’s GPUs in
+the same case, from the cores the node-local GPUs leave. The cores a GPU picks
+from must hold two per GPU that picks from them (its workers count up
+from the bottom, its API server down from the top); with fewer, or a
+mask too small to leave a CPU unpinned, nothing is pinned and a
+warning says why. Servers on one GPU (two MIG instances share its
+address) would take the same CPUs, so the first <code class="docutils literal notranslate"><span class="pre">auto</span></code> server holds
+<code class="docutils literal notranslate"><span class="pre">/tmp/mstar-gpu-&lt;PCI</span> <span class="pre">address&gt;.lock</span></code> for its life and a second one
+pins nothing, with a warning; the lock goes with the process however
+it exits. The lock only reaches servers that share <code class="docutils literal notranslate"><span class="pre">/tmp</span></code>, so
+servers in separate containers on one GPU still take the same CPUs.
+A split config’s second worker can also take a core that a server on
+a GPU without allowed CPUs takes under the same mask. A
+number names the first worker’s core (its hardware threads in the
+mask); the next workers take the next cores up and the API server the
+last core of the mask. A number outside the mask, or too near its top
+for every worker, stops the server at startup. Threads and pools a
+pinned thread starts keep the process mask (<code class="docutils literal notranslate"><span class="pre">mstar.utils.threads</span></code>),
+and the API server’s intra-op and encode pools are sized from the
+CPUs the pins leave (<code class="docutils literal notranslate"><span class="pre">CpuPlan</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar.utils.cpus</span></code>). Each worker
+and the API server log their CPUs and why. Read by
+<code class="docutils literal notranslate"><span class="pre">knobs.step_thread_core</span></code>; no effect where <code class="docutils literal notranslate"><span class="pre">os.sched_setaffinity</span></code>
+is missing (macOS, Windows).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1,2,4,8,16,32,48,64,96,128</span></code></p></td>
 <td><p>The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
 it; a model with its own ladder reads it the same way). A decode step
@@ -1301,7 +1357,7 @@ both the rows per step and the graph memory; narrow it (for example
 former ladder. <code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN35_DECODE_BUCKETS</span></code> overrides it for
 Qwen3.5 alone.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAZY_PUBLISH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAZY_PUBLISH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Publish resource state (KV pages, positions) only for the requests
 whose frame or completion carries it: <code class="docutils literal notranslate"><span class="pre">finalize_batch</span></code> keeps a
@@ -1310,13 +1366,13 @@ cheap per-request snapshot and the worker finishes it on demand.
 the old behaviour; it was a quarter of the GPU thread’s host time at
 batch 32 in a decode loop that never reads it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONSECUTIVE_SPEC_STEPS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONSECUTIVE_SPEC_STEPS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1024</span></code></p></td>
 <td><p>Cap on back-to-back speculative steps before the leader yields to
 other ready work. <code class="docutils literal notranslate"><span class="pre">0</span></code> turns speculation off. A value that is not an
 integer is ignored with a warning when the worker starts.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAUNCH_WAIT_MS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAUNCH_WAIT_MS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">5</span></code></p></td>
 <td><p>Milliseconds the speculative submitter holds off the GIL waiting for
 the GPU thread to reach the launch before it carries on. A value that
@@ -1325,7 +1381,7 @@ is not a number, is <code class="docutils literal notranslate"><span class="pre"
 worker starts and <code class="docutils literal notranslate"><span class="pre">5</span></code> is used; a negative value is raised to <code class="docutils literal notranslate"><span class="pre">0</span></code>
 with a warning.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">32,64,128,256,512,1024,2048,4096,8192</span></code></p></td>
 <td><p>Total tokens of a packed Qwen3.5 text-prefill step that get a captured
 graph (one per bucket and batch size). A prompt past the top bucket
@@ -1333,7 +1389,7 @@ prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
 spends 78 ms of wall time on 36 ms of kernels. The default now reaches
 8192; narrow it to save graph memory and capture time, or extend it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_chain_lazy_steps</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>How many decode steps of sampled ids the KV manager holds back before
 it extends the requests’ prefix chains (the per-page keys the prefix
@@ -1346,7 +1402,7 @@ page unindexed. The default <code class="docutils literal notranslate"><span cla
 measured as noise at c64/c128 on 0.8B (the extension is a small part
 of the stop check’s tail).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_pinned_indptrs</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The KV plan writes FlashInfer’s index arrays (qo_indptr, kv_indptr,
 kv_indices, last_page_len) into a ring of page-locked host buffers and
@@ -1357,7 +1413,7 @@ one and FlashInfer makes the indices copy blocking. No measurable gain
 at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
 event per plan, which a buffer set waits on before it is rewritten.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">gc_gen0_threshold</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The generation-0 garbage-collection threshold a worker sets after
 warmup (<code class="docutils literal notranslate"><span class="pre">0</span></code> keeps CPython’s 700). A decode step at 128 rows keeps
@@ -1368,7 +1424,7 @@ allocating. <code class="docutils literal notranslate"><span class="pre">50000</
 shorter decode step), at the cost of holding at most that many young
 objects between collections. Read by <code class="docutils literal notranslate"><span class="pre">knobs.gc_gen0_threshold</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_plan_cache</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The KV manager plans a captured decode step off the previous step’s
 plan when the batch is the same rows in the same order and nothing
@@ -1381,7 +1437,7 @@ views); the reworked path keeps the views lazy and is off by default
 until measured. <code class="docutils literal notranslate"><span class="pre">0</span></code> plans every step from the streams. <code class="docutils literal notranslate"><span class="pre">2</span></code> runs
 both and logs a difference, for checking a run.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">device_loopback</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Whether a decode node may keep its loop-back token on the device:
 the sampler writes each request’s last token to a slot-addressed
@@ -1395,13 +1451,13 @@ buffers; the sampler keeps the masters for those nodes alone, so a
 node that takes its tokens on the host does not pay the eager-step
 master write. <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps every node on the per-request tensor path.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">ingraph_decode_rope</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>A captured decode step builds its rotary tables inside the graph from
 the position resource’s planned positions instead of staging them.
 Experiment knob, measured and gated on its own.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The captured sampler gathers its RNG offsets from the slot masters
 and scatters the advanced offsets and the sampled tokens back inside
@@ -1413,24 +1469,24 @@ the masters are allocated once for <code class="docutils literal notranslate"><s
 cap with this on). Only with the device
 loop-back on. An experiment knob; measure before turning it on.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_SEND_TIMING</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_SEND_TIMING</span></code></p></td>
 <td><p>unset</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> makes the Rust runtime print, every 500 calls, how long the
 worker’s per-step send spends in its own work against the whole call
 (which includes taking the GIL back when the send had to release it).
 A diagnostic for the host-overhead work; off by default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Yield the speculation chain only when another (node, walk) is
 actually ready right now; <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the consecutive-step cap alone.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>: every N iterations log per-phase p50/p95/mean of the
 worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: after every <code class="docutils literal notranslate"><span class="pre">admit</span></code>, <code class="docutils literal notranslate"><span class="pre">commit</span></code>, <code class="docutils literal notranslate"><span class="pre">reset_request</span></code>, <code class="docutils literal notranslate"><span class="pre">remove_request</span></code>
 and change to an admitted request’s pages, check the KV page bookkeeping against

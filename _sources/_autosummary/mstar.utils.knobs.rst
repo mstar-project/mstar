@@ -24,6 +24,7 @@ mstar.utils.knobs
       pre_plan_enabled
       sampler_ingraph_scatter
       sampler_slots
+      step_thread_core
    
    
 

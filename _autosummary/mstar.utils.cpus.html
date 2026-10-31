@@ -244,6 +244,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -445,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -678,7 +680,44 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan"><code class="docutils literal notranslate"><span class="pre">CpuPlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.copy_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.copy_workers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.encode_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.encode_workers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.left"><code class="docutils literal notranslate"><span class="pre">CpuPlan.left</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.mask"><code class="docutils literal notranslate"><span class="pre">CpuPlan.mask</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.pinned"><code class="docutils literal notranslate"><span class="pre">CpuPlan.pinned</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.png_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.png_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.preprocess_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.preprocess_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.result"><code class="docutils literal notranslate"><span class="pre">CpuPlan.result</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.usable"><code class="docutils literal notranslate"><span class="pre">CpuPlan.usable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.why"><code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.workers</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlanError"><code class="docutils literal notranslate"><span class="pre">CpuPlanError</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu"><code class="docutils literal notranslate"><span class="pre">HostGpu</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu.address"><code class="docutils literal notranslate"><span class="pre">HostGpu.address</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu.local"><code class="docutils literal notranslate"><span class="pre">HostGpu.local</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu.node"><code class="docutils literal notranslate"><span class="pre">HostGpu.node</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.StepCpus"><code class="docutils literal notranslate"><span class="pre">StepCpus</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.StepCpus.cpus"><code class="docutils literal notranslate"><span class="pre">StepCpus.cpus</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.StepCpus.why"><code class="docutils literal notranslate"><span class="pre">StepCpus.why</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.cgroup_cpu_quota"><code class="docutils literal notranslate"><span class="pre">cgroup_cpu_quota()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.claim_gpus"><code class="docutils literal notranslate"><span class="pre">claim_gpus()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.deployment_plan"><code class="docutils literal notranslate"><span class="pre">deployment_plan()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.device_addresses"><code class="docutils literal notranslate"><span class="pre">device_addresses()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.devices_plan"><code class="docutils literal notranslate"><span class="pre">devices_plan()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.format_cpu_list"><code class="docutils literal notranslate"><span class="pre">format_cpu_list()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.host_gpus"><code class="docutils literal notranslate"><span class="pre">host_gpus()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.install"><code class="docutils literal notranslate"><span class="pre">install()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.parse_cpu_list"><code class="docutils literal notranslate"><span class="pre">parse_cpu_list()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.plan"><code class="docutils literal notranslate"><span class="pre">plan()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.process_mask"><code class="docutils literal notranslate"><span class="pre">process_mask()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.smt_siblings"><code class="docutils literal notranslate"><span class="pre">smt_siblings()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.usable_cpus"><code class="docutils literal notranslate"><span class="pre">usable_cpus()</span></code></a></li>
 </ul>
             </nav>
@@ -693,23 +732,257 @@
                   
   <section id="module-mstar.utils.cpus">
 <span id="mstar-utils-cpus"></span><h1>mstar.utils.cpus<a class="headerlink" href="#module-mstar.utils.cpus" title="Link to this heading">#</a></h1>
-<p>How many CPUs this process can keep busy at once.</p>
+<p>The CPUs this process may use, and the plan every process of a deployment reads.</p>
 <p><code class="docutils literal notranslate"><span class="pre">os.cpu_count()</span></code> reports the host’s CPUs. In a container the cgroup CPU quota
 can be far smaller, and a thread pool sized to the host then runs more threads
 than the quota lets run, so a fork-join op waits on whichever thread the
 scheduler parked.</p>
+<p><code class="docutils literal notranslate"><span class="pre">CpuPlan</span></code> holds the process mask, how many of its CPUs the quota lets run,
+the CPUs the <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> knob pins (each worker’s step threads and the
+API server’s result threads, see <code class="docutils literal notranslate"><span class="pre">mstar.utils.threads</span></code>), and the pool sizes,
+taken from the CPUs left after those. The API server and every worker build it
+with <code class="docutils literal notranslate"><span class="pre">deployment_plan</span></code> from the same inputs (the knob, the mask, the
+deployment’s devices), so they agree on it without talking.</p>
+<p>Placement under <code class="docutils literal notranslate"><span class="pre">auto</span></code> is by the device’s rank among the host’s GPUs on its
+NUMA node, as sysfs lists them (every GPU of the host, not only the ones this
+process was given), so servers on different GPUs pick different CPUs without
+knowing about each other. A worker takes the core at its device’s rank from the
+bottom of the node’s allowed CPUs, the API server the core at its first
+device’s rank from the top, so the cores a GPU picks from must hold two per GPU
+or <code class="docutils literal notranslate"><span class="pre">auto</span></code> pins nothing. Servers on one GPU can’t be told apart that way, so
+the first holds a lock on it (<code class="docutils literal notranslate"><span class="pre">claim_gpus</span></code>) and the next pins nothing.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.cgroup_cpu_quota" title="mstar.utils.cpus.cgroup_cpu_quota"><code class="xref py py-obj docutils literal notranslate"><span class="pre">cgroup_cpu_quota</span></code></a>([root, proc_cgroup])</p></td>
 <td><p>The tightest cgroup v2 <code class="docutils literal notranslate"><span class="pre">cpu.max</span></code> quota over this process's cgroup and its ancestors, in CPUs; None when no level sets one (or cgroup v2 is absent).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.usable_cpus" title="mstar.utils.cpus.usable_cpus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">usable_cpus</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.claim_gpus" title="mstar.utils.cpus.claim_gpus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">claim_gpus</span></code></a>(addresses)</p></td>
+<td><p>Hold a lock on each GPU for the life of this process; if one can't be had, hold none of them and say why.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.deployment_plan" title="mstar.utils.cpus.deployment_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">deployment_plan</span></code></a>(setting, addresses, *[, ...])</p></td>
+<td><p>The plan for a deployment whose workers' devices sit at PCI <code class="docutils literal notranslate"><span class="pre">addresses</span></code>, in the conductor's worker order (None for a device sysfs doesn't place, such as a CPU worker; only <code class="docutils literal notranslate"><span class="pre">auto</span></code> reads them).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.device_addresses" title="mstar.utils.cpus.device_addresses"><code class="xref py py-obj docutils literal notranslate"><span class="pre">device_addresses</span></code></a>(devices)</p></td>
+<td><p>The PCI address of each worker's device (<code class="docutils literal notranslate"><span class="pre">cuda:1</span></code>); None for a CPU worker, or where the platform doesn't report one.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.devices_plan" title="mstar.utils.cpus.devices_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">devices_plan</span></code></a>(setting, devices)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deployment_plan</span></code> for the workers' device strings, in the conductor's worker order: the same call in the API server and in every worker.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.format_cpu_list" title="mstar.utils.cpus.format_cpu_list"><code class="xref py py-obj docutils literal notranslate"><span class="pre">format_cpu_list</span></code></a>(cpus)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cpus</span></code> as ranges, the inverse of <code class="docutils literal notranslate"><span class="pre">parse_cpu_list</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.host_gpus" title="mstar.utils.cpus.host_gpus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_gpus</span></code></a>(like[, root])</p></td>
+<td><p>The host's GPUs in PCI address order: the functions with the vendor and class of the device at <code class="docutils literal notranslate"><span class="pre">like</span></code> (<code class="docutils literal notranslate"><span class="pre">0000:40:00.0</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.install" title="mstar.utils.cpus.install"><code class="xref py py-obj docutils literal notranslate"><span class="pre">install</span></code></a>(new)</p></td>
+<td><p>Make <code class="docutils literal notranslate"><span class="pre">new</span></code> this process's plan (None: back to nothing pinned).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.parse_cpu_list" title="mstar.utils.cpus.parse_cpu_list"><code class="xref py py-obj docutils literal notranslate"><span class="pre">parse_cpu_list</span></code></a>(text)</p></td>
+<td><p>The CPUs in a list such as <code class="docutils literal notranslate"><span class="pre">0-3,8,10-11</span></code> (as sysfs and <code class="docutils literal notranslate"><span class="pre">taskset</span></code> write them); empty for an empty string.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.plan" title="mstar.utils.cpus.plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan</span></code></a>()</p></td>
+<td><p>This process's plan: the one <code class="docutils literal notranslate"><span class="pre">install</span></code> set, else nothing pinned.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.process_mask" title="mstar.utils.cpus.process_mask"><code class="xref py py-obj docutils literal notranslate"><span class="pre">process_mask</span></code></a>()</p></td>
+<td><p>The CPUs this process may run on; every CPU where affinity is unknown.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.smt_siblings" title="mstar.utils.cpus.smt_siblings"><code class="xref py py-obj docutils literal notranslate"><span class="pre">smt_siblings</span></code></a>(cpu)</p></td>
+<td><p>The hardware threads of <code class="docutils literal notranslate"><span class="pre">cpu</span></code>'s core, <code class="docutils literal notranslate"><span class="pre">cpu</span></code> included.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.usable_cpus" title="mstar.utils.cpus.usable_cpus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">usable_cpus</span></code></a>()</p></td>
 <td><p>CPUs this process may run on (its affinity, else <code class="docutils literal notranslate"><span class="pre">os.cpu_count()</span></code>), capped by the cgroup quota rounded down.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p class="rubric">Classes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.CpuPlan" title="mstar.utils.cpus.CpuPlan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CpuPlan</span></code></a>(mask, usable[, workers, result, why])</p></td>
+<td><p>See the module docstring.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.cpus.HostGpu" title="mstar.utils.cpus.HostGpu"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostGpu</span></code></a>(address, node, local)</p></td>
+<td><p>One of the host's GPUs as sysfs lists it: its PCI address, NUMA node and the node's CPUs (None where sysfs doesn't say).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.StepCpus" title="mstar.utils.cpus.StepCpus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepCpus</span></code></a>(cpus, why)</p></td>
+<td><p>The CPUs one worker's main, GPU and plan threads share (one core's hardware threads in the mask), and how they were chosen, for the log.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p class="rubric">Exceptions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.cpus.CpuPlanError" title="mstar.utils.cpus.CpuPlanError"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CpuPlanError</span></code></a></p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> value the process mask can't honour.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">CpuPlan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mask</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">usable</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">workers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">result</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">why</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'step_thread_core</span> <span class="pre">off'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#CpuPlan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.CpuPlan" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>See the module docstring. <code class="docutils literal notranslate"><span class="pre">workers</span></code> has one entry per worker of the
+deployment, in the conductor’s worker order (empty, or all None, when
+nothing is pinned).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>mask</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>usable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>workers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="#mstar.utils.cpus.StepCpus" title="mstar.utils.cpus.StepCpus"><em>StepCpus</em></a><em> | </em><em>None</em><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>result</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>why</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.copy_workers">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">copy_workers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.copy_workers" title="Link to this definition">#</a></dt>
+<dd><p>Threads a large output read copies over (<code class="docutils literal notranslate"><span class="pre">host_copy.HostCopier</span></code>):
+one encode’s share of the CPUs left. Reads run one at a time on the
+data worker’s thread, each ahead of its own encode.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.encode_workers">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">encode_workers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.encode_workers" title="Link to this definition">#</a></dt>
+<dd><p>Outputs the data worker encodes at once. A PNG deflates on
+<code class="docutils literal notranslate"><span class="pre">png_threads</span></code> of its own, so the pool times that stays within the
+CPUs left.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.left">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">left</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.left" title="Link to this definition">#</a></dt>
+<dd><p>what the pools
+are sized from.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>The CPUs the quota lets run, less the pinned ones</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.mask">
+<span class="sig-name descname"><span class="pre">mask</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.mask" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.pinned">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">pinned</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.pinned" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.png_threads">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">png_threads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.png_threads" title="Link to this definition">#</a></dt>
+<dd><p>Threads one PNG deflates on (<code class="docutils literal notranslate"><span class="pre">image_io.uint8_to_png</span></code>).</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.preprocess_threads">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">preprocess_threads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.preprocess_threads" title="Link to this definition">#</a></dt>
+<dd><p>The API server’s intra-op threads when neither the config nor the
+model sets them. A quarter of the CPUs left, at most 4: the process
+shares them with the engine workers, and its per-request ops are a few
+MB.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.result">
+<span class="sig-name descname"><span class="pre">result</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.result" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.usable">
+<span class="sig-name descname"><span class="pre">usable</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.usable" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.why">
+<span class="sig-name descname"><span class="pre">why</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'step_thread_core</span> <span class="pre">off'</span></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.why" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.workers">
+<span class="sig-name descname"><span class="pre">workers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.utils.cpus.StepCpus" title="mstar.utils.cpus.StepCpus"><span class="pre">StepCpus</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.workers" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py exception">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlanError">
+<span class="property"><span class="k"><span class="pre">exception</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">CpuPlanError</span></span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#CpuPlanError"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.CpuPlanError" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#ValueError" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ValueError</span></code></a></p>
+<p>A <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> value the process mask can’t honour.</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.cpus.HostGpu">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">HostGpu</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">address</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">local</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#HostGpu"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.HostGpu" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>One of the host’s GPUs as sysfs lists it: its PCI address, NUMA node
+and the node’s CPUs (None where sysfs doesn’t say).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>address</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>local</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.HostGpu.address">
+<span class="sig-name descname"><span class="pre">address</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.cpus.HostGpu.address" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.HostGpu.local">
+<span class="sig-name descname"><span class="pre">local</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.utils.cpus.HostGpu.local" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.HostGpu.node">
+<span class="sig-name descname"><span class="pre">node</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.utils.cpus.HostGpu.node" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.cpus.StepCpus">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">StepCpus</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpus</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">why</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#StepCpus"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.StepCpus" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>The CPUs one worker’s main, GPU and plan threads share (one core’s
+hardware threads in the mask), and how they were chosen, for the log.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>cpus</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>why</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.StepCpus.cpus">
+<span class="sig-name descname"><span class="pre">cpus</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.cpus.StepCpus.cpus" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.cpus.StepCpus.why">
+<span class="sig-name descname"><span class="pre">why</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.cpus.StepCpus.why" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.cpus.cgroup_cpu_quota">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">cgroup_cpu_quota</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">root</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">_CGROUP_ROOT</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">proc_cgroup</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'/proc/self/cgroup'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#cgroup_cpu_quota"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.cgroup_cpu_quota" title="Link to this definition">#</a></dt>
@@ -724,6 +997,188 @@ ancestors, in CPUs; None when no level sets one (or cgroup v2 is absent).</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)">float</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.claim_gpus">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">claim_gpus</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">addresses</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#claim_gpus"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.claim_gpus" title="Link to this definition">#</a></dt>
+<dd><p>Hold a lock on each GPU for the life of this process; if one can’t be
+had, hold none of them and say why.</p>
+<p><code class="docutils literal notranslate"><span class="pre">auto</span></code> depends only on the PCI address and the mask, so two servers on
+one GPU (two MIG instances report one address) would take the same CPUs.
+The kernel drops an <code class="docutils literal notranslate"><span class="pre">flock</span></code> however the process exits, so a dead server
+leaves nothing to clean up. The file is never unlinked: another process may
+already hold an fd on this inode, and removing it would let a third lock a
+different one. The lock only reaches servers that share <code class="docutils literal notranslate"><span class="pre">_GPU_LOCK_DIR</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>addresses</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.deployment_plan">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">deployment_plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">setting</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">addresses</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">mask</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">usable</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pci_root</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">_PCI_DEVICES</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">siblings</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">smt_siblings</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#deployment_plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.deployment_plan" title="Link to this definition">#</a></dt>
+<dd><p>The plan for a deployment whose workers’ devices sit at PCI
+<code class="docutils literal notranslate"><span class="pre">addresses</span></code>, in the conductor’s worker order (None for a device sysfs
+doesn’t place, such as a CPU worker; only <code class="docutils literal notranslate"><span class="pre">auto</span></code> reads them).</p>
+<p><code class="docutils literal notranslate"><span class="pre">off</span></code> pins nothing. A CPU number is the first worker’s CPU; the next
+workers take the next cores above it, and the API server the last core of
+the mask; a number outside the mask, or too near its top for every worker,
+raises <code class="docutils literal notranslate"><span class="pre">CpuPlanError</span></code>. <code class="docutils literal notranslate"><span class="pre">auto</span></code> places by device rank (module docstring),
+and pins nothing, saying why in <code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code>, when the mask is too small.
+Either way at least one CPU of the mask stays unpinned.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>setting</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>addresses</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>mask</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>usable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>pci_root</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p></li>
+<li><p><strong>siblings</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.utils.cpus.CpuPlan" title="mstar.utils.cpus.CpuPlan"><em>CpuPlan</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.device_addresses">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">device_addresses</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">devices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#device_addresses"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.device_addresses" title="Link to this definition">#</a></dt>
+<dd><p>The PCI address of each worker’s device (<code class="docutils literal notranslate"><span class="pre">cuda:1</span></code>); None for a CPU
+worker, or where the platform doesn’t report one.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>devices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.devices_plan">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">devices_plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">setting</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">devices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#devices_plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.devices_plan" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">deployment_plan</span></code> for the workers’ device strings, in the conductor’s
+worker order: the same call in the API server and in every worker.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>setting</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>devices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.utils.cpus.CpuPlan" title="mstar.utils.cpus.CpuPlan"><em>CpuPlan</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.format_cpu_list">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">format_cpu_list</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpus</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#format_cpu_list"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.format_cpu_list" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">cpus</span></code> as ranges, the inverse of <code class="docutils literal notranslate"><span class="pre">parse_cpu_list</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>cpus</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.host_gpus">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">host_gpus</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">like</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">root</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">_PCI_DEVICES</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#host_gpus"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.host_gpus" title="Link to this definition">#</a></dt>
+<dd><p>The host’s GPUs in PCI address order: the functions with the vendor
+and class of the device at <code class="docutils literal notranslate"><span class="pre">like</span></code> (<code class="docutils literal notranslate"><span class="pre">0000:40:00.0</span></code>). Every process on
+the host sees the same list, whatever GPUs it was given; empty without
+sysfs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>like</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>root</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="#mstar.utils.cpus.HostGpu" title="mstar.utils.cpus.HostGpu"><em>HostGpu</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.install">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">install</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">new</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#install"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.install" title="Link to this definition">#</a></dt>
+<dd><p>Make <code class="docutils literal notranslate"><span class="pre">new</span></code> this process’s plan (None: back to nothing pinned).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>new</strong> (<a class="reference internal" href="#mstar.utils.cpus.CpuPlan" title="mstar.utils.cpus.CpuPlan"><em>CpuPlan</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.parse_cpu_list">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">parse_cpu_list</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">text</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#parse_cpu_list"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.parse_cpu_list" title="Link to this definition">#</a></dt>
+<dd><p>The CPUs in a list such as <code class="docutils literal notranslate"><span class="pre">0-3,8,10-11</span></code> (as sysfs and <code class="docutils literal notranslate"><span class="pre">taskset</span></code>
+write them); empty for an empty string.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>text</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.plan">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.plan" title="Link to this definition">#</a></dt>
+<dd><p>This process’s plan: the one <code class="docutils literal notranslate"><span class="pre">install</span></code> set, else nothing pinned.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#mstar.utils.cpus.CpuPlan" title="mstar.utils.cpus.CpuPlan"><em>CpuPlan</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.process_mask">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">process_mask</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#process_mask"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.process_mask" title="Link to this definition">#</a></dt>
+<dd><p>The CPUs this process may run on; every CPU where affinity is unknown.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.cpus.smt_siblings">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.cpus.</span></span><span class="sig-name descname"><span class="pre">smt_siblings</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpu</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#smt_siblings"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.smt_siblings" title="Link to this definition">#</a></dt>
+<dd><p>The hardware threads of <code class="docutils literal notranslate"><span class="pre">cpu</span></code>’s core, <code class="docutils literal notranslate"><span class="pre">cpu</span></code> included.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>cpu</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -789,7 +1244,44 @@ by the cgroup quota rounded down. At least 1.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan"><code class="docutils literal notranslate"><span class="pre">CpuPlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.copy_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.copy_workers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.encode_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.encode_workers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.left"><code class="docutils literal notranslate"><span class="pre">CpuPlan.left</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.mask"><code class="docutils literal notranslate"><span class="pre">CpuPlan.mask</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.pinned"><code class="docutils literal notranslate"><span class="pre">CpuPlan.pinned</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.png_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.png_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.preprocess_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.preprocess_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.result"><code class="docutils literal notranslate"><span class="pre">CpuPlan.result</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.usable"><code class="docutils literal notranslate"><span class="pre">CpuPlan.usable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.why"><code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.workers</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlanError"><code class="docutils literal notranslate"><span class="pre">CpuPlanError</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu"><code class="docutils literal notranslate"><span class="pre">HostGpu</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu.address"><code class="docutils literal notranslate"><span class="pre">HostGpu.address</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu.local"><code class="docutils literal notranslate"><span class="pre">HostGpu.local</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.HostGpu.node"><code class="docutils literal notranslate"><span class="pre">HostGpu.node</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.StepCpus"><code class="docutils literal notranslate"><span class="pre">StepCpus</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.StepCpus.cpus"><code class="docutils literal notranslate"><span class="pre">StepCpus.cpus</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.StepCpus.why"><code class="docutils literal notranslate"><span class="pre">StepCpus.why</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.cgroup_cpu_quota"><code class="docutils literal notranslate"><span class="pre">cgroup_cpu_quota()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.claim_gpus"><code class="docutils literal notranslate"><span class="pre">claim_gpus()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.deployment_plan"><code class="docutils literal notranslate"><span class="pre">deployment_plan()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.device_addresses"><code class="docutils literal notranslate"><span class="pre">device_addresses()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.devices_plan"><code class="docutils literal notranslate"><span class="pre">devices_plan()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.format_cpu_list"><code class="docutils literal notranslate"><span class="pre">format_cpu_list()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.host_gpus"><code class="docutils literal notranslate"><span class="pre">host_gpus()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.install"><code class="docutils literal notranslate"><span class="pre">install()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.parse_cpu_list"><code class="docutils literal notranslate"><span class="pre">parse_cpu_list()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.plan"><code class="docutils literal notranslate"><span class="pre">plan()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.process_mask"><code class="docutils literal notranslate"><span class="pre">process_mask()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.smt_siblings"><code class="docutils literal notranslate"><span class="pre">smt_siblings()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.usable_cpus"><code class="docutils literal notranslate"><span class="pre">usable_cpus()</span></code></a></li>
 </ul>
   </nav></div>

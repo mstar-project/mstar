@@ -53,5 +53,6 @@
    quant_fp8
    socket_prefix
    streams
+   threads
    utf8_stream
 

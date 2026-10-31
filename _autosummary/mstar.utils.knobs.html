@@ -244,6 +244,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -445,6 +446,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -689,6 +691,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.pre_plan_enabled"><code class="docutils literal notranslate"><span class="pre">pre_plan_enabled()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_ingraph_scatter"><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_slots"><code class="docutils literal notranslate"><span class="pre">sampler_slots()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.step_thread_core"><code class="docutils literal notranslate"><span class="pre">step_thread_core()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -742,6 +745,9 @@ non-empty <code class="docutils literal notranslate"><span class="pre">MSTAR_*</
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_slots" title="mstar.utils.knobs.sampler_slots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_slots</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows allocated up front when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.step_thread_core" title="mstar.utils.knobs.step_thread_core"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step_thread_core</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code> (default <code class="docutils literal notranslate"><span class="pre">off</span></code>): pin each worker's main, GPU and plan threads, and the API server's result threads, to CPUs of their own.</p></td>
 </tr>
 </tbody>
 </table>
@@ -926,6 +932,21 @@ allocated up front when the in-graph scatter is on (see
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.knobs.step_thread_core">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">step_thread_core</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#step_thread_core"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.step_thread_core" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code> (default <code class="docutils literal notranslate"><span class="pre">off</span></code>):
+pin each worker’s main, GPU and plan threads, and the API server’s result
+threads, to CPUs of their own. <code class="docutils literal notranslate"><span class="pre">auto</span></code> places them by the GPU’s rank on
+its NUMA node, a number is the first worker’s CPU (see
+<code class="docutils literal notranslate"><span class="pre">mstar.utils.cpus</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -986,6 +1007,7 @@ allocated up front when the in-graph scatter is on (see
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.pre_plan_enabled"><code class="docutils literal notranslate"><span class="pre">pre_plan_enabled()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_ingraph_scatter"><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.sampler_slots"><code class="docutils literal notranslate"><span class="pre">sampler_slots()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.step_thread_core"><code class="docutils literal notranslate"><span class="pre">step_thread_core()</span></code></a></li>
 </ul>
   </nav></div>
 

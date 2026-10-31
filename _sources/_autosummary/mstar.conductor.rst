@@ -30,4 +30,5 @@
    conductor
    mps
    request_info
+   workers
 

@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -798,6 +799,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.threads.html">mstar.utils.threads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
@@ -972,7 +974,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""Large host copies split over threads of their own.</span>
 
 <span class="sd">The API server sizes torch's intra-op pool for its small per-request ops</span>
-<span class="sd">(``entrypoint.default_preprocess_threads``), and one numpy memcpy runs on one</span>
+<span class="sd">(``cpus.CpuPlan.preprocess_threads``), and one numpy memcpy runs on one</span>
 <span class="sd">core. Most of a large copy into a fresh allocation is the destination's</span>
 <span class="sd">first-touch page faults, which a copy split into slices takes in parallel too.</span>
 <span class="sd">numpy releases the GIL while it copies, so slices on a pool of their own run in</span>
@@ -980,10 +982,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">ThreadPoolExecutor</span>
-
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.threads</span><span class="w"> </span><span class="kn">import</span> <span class="n">ThreadPool</span>
 
 <span class="c1"># The smallest slice worth a pool thread: below a few MB the handoff costs</span>
 <span class="c1"># about what the slice saves, so a 3 MB image stays one memcpy and a copy gets</span>
@@ -1005,7 +1007,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">workers</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">workers</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">min_slice_bytes</span> <span class="o">=</span> <span class="n">MIN_SLICE_BYTES</span> <span class="k">if</span> <span class="n">min_slice_bytes</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">min_slice_bytes</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span> <span class="o">=</span> <span class="p">(</span>
-            <span class="n">ThreadPoolExecutor</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">workers</span><span class="p">,</span> <span class="n">thread_name_prefix</span><span class="o">=</span><span class="s2">"mstar-copy"</span><span class="p">)</span>
+            <span class="n">ThreadPool</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">workers</span><span class="p">,</span> <span class="n">thread_name_prefix</span><span class="o">=</span><span class="s2">"mstar-copy"</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">workers</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="p">)</span>
 
