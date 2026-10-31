@@ -63,8 +63,9 @@ def _aiter_impl():
 
 
 def _reference(x, weight):
-    xq = quantize_rows(x, weight.dtype)[0]
-    return (xq.to(torch.float32) @ weight.to(torch.float32).T).to(x.dtype)
+    compute = torch.float64 if x.dtype == torch.float64 else torch.float32
+    xq = quantize_rows(x, current_platform.fp8_dtype() or torch.float8_e4m3fn)[0]
+    return (xq.to(compute) @ weight.to(compute).T).to(x.dtype)
 
 
 def _fake(x, weight):

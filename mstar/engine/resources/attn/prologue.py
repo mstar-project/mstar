@@ -8,13 +8,11 @@ token. A decode step otherwise runs a norm-and-rope kernel per tensor and a
 cache scatter for each attention layer.
 
 ``mstar::qkv_norm_rope_cache`` runs AITER's ``fused_qkv_split_qk_norm_rope_cache``
-on AMD GPUs. Elsewhere it has no implementation, and layers keep their own path
-(``available()``).
+on AMD GPUs, the only place a caller reaches it: speculative decoding needs
+AITER's attention.
 """
 
 from __future__ import annotations
-
-import functools
 
 import torch
 
@@ -121,9 +119,3 @@ QKV_NORM_ROPE_CACHE = KernelOp(
     # fp32 norm and rotation, one rounding (or two: the kernel rounds the normalised q before rotating)
     tolerance=Tolerance.accumulated(rtol=1.6e-2, atol_scale=1e-2),
 )
-
-
-@functools.cache
-def available() -> bool:
-    """Whether this platform runs the fused prologue (its implementation loads)."""
-    return QKV_NORM_ROPE_CACHE.unavailable_reason() is None
