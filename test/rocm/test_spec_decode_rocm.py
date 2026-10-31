@@ -4,9 +4,9 @@
   of k + 1 tokens starts from the slot its last step accepted up to and leaves
   the state after every token in its own slot, against the fp32 reference run
   token by token, including a step that starts after a rejected tail.
-* The step's device work (the speculative resource's in-graph operations and
-  the GDN verify kernels) issues no host sync: run under
-  ``torch.cuda.set_sync_debug_mode("error")``.
+* The step's device work (the speculative resource's in-graph operations, the
+  GDN verify kernels and a whole draft pass's attention) issues no host sync:
+  run under ``torch.cuda.set_sync_debug_mode("error")``.
 * A captured step follows the device registers: replayed after the registers
   move, its positions, KV slots and lengths move with them, with no re-plan.
 """
@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources.attn.aiter import AiterPagedAttentionManager, _Staged
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.manager import KVPlanState
 from mstar.engine.resources.linear_attn import (
@@ -201,6 +202,18 @@ def test_the_verify_kernel_replays_in_a_graph():
     assert torch.isfinite(out[t:].float()).all()
 
 
+def _attention(rows: int, width: int, table: torch.Tensor) -> AiterPagedAttentionManager:
+    """The real manager's kernel call over a plan with this block table."""
+    manager = AiterPagedAttentionManager.__new__(AiterPagedAttentionManager)
+    manager._device, manager._dtype, manager._scale = DEV, torch.bfloat16, 256 ** -0.5
+    manager._row_starts = None
+    manager._reserve_row_starts(rows)
+    manager._current_plans = {"main": _Staged(
+        manager._row_starts[: rows + 1], torch.ones(rows, dtype=torch.int32, device=DEV), table, 1, 32768, rows,
+    )}
+    return manager
+
+
 def _spec(k: int, rows: int, width: int):
     """The speculative resource with a verify plan over fake attention and KV
     buffers: a block table of distinct pages per row."""
@@ -261,10 +274,33 @@ def test_a_verify_step_issues_no_host_sync(k):
     x = inputs(rows * t, seed=3)
     conv_x = torch.randn(rows * t, GEO.conv_dim, device=DEV).to(torch.bfloat16)
     conv_w = torch.randn(GEO.conv_dim, GEO.conv_kernel_size, device=DEV).to(torch.bfloat16)
+    head_dim, heads, kv_heads = 256, 16, 4
+    layer = torch.zeros(64, 2, PAGE, kv_heads, head_dim, dtype=torch.bfloat16, device=DEV)
+    spec._kv = SimpleNamespace(layer_view=lambda idx: layer)
+    spec._attn = _attention(rows, width=8, table=spec._current.block_table)
+    packed = (rows * t, (2 * heads + 2 * kv_heads) * head_dim)
+    qkv = [torch.randn(*packed, device=DEV).to(torch.bfloat16),
+           torch.randn(rows, packed[1], device=DEV).to(torch.bfloat16)]
+    weight = torch.zeros(head_dim, dtype=torch.bfloat16, device=DEV)
+    freqs = torch.arange(1024, device=DEV).float()[:, None] * torch.linspace(0, 1, 32, device=DEV)[None, :]
+    cos, sin = freqs.cos().to(torch.bfloat16), freqs.sin().to(torch.bfloat16)
+    layout = (heads, kv_heads, head_dim, 1e-6, True, 0)
+
+    def step_with_attention():
+        out = _verify_step(spec, noise, vocab, k)
+        for j in range(k):
+            spec.attend_draft(j, qkv[min(j, 1)], weight, weight, cos, sin, *layout)
+        return out
+
+    # compile the kernels before the tripwire: a first launch syncs
+    step_with_attention()
+    torch.cuda.synchronize()
+    spec._seq_len[1:rows + 1] = torch.tensor([30 + 17 * r for r in range(rows)], dtype=torch.int32, device=DEV)
+    spec._num_acc[1:rows + 1] = 1
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        _verify_step(spec, noise, vocab, k)
+        step_with_attention()
         manager.run_conv(conv_x, conv_layer=pool.block("conv", 0), weight=conv_w)
         run(manager, pool, x, w)
     finally:
