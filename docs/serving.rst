@@ -336,8 +336,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        rendezvouses. Default 512.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default; on AMD GPUs the nodes with ``tp_size`` > 1 default to on) or a
-       list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which overrides it).
+       (default; on AMD GPUs the nodes with ``tp_size`` > 1 and no ``cfg_size`` default
+       to on) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
@@ -489,9 +489,13 @@ before the solver, so both ranks run the same solver step and the latents stay r
 
 The two ranks are one lockstep instance, so a node that holds one of them (a VAE decode
 here) holds the other too. With decoders on both ranks and requests taking them in turn, two
-concurrent clips decode side by side instead of one after the other. ``cfg_size`` multiplies
-``tp_size`` and ``sp_size`` into the instance. A node must be declared guidance-parallel by
-the model; ``configs/wan22_cfg2.yaml`` and ``configs/cosmos3_nano_cfg2.yaml`` ship it.
+concurrent clips decode side by side instead of one after the other; a step of the node runs
+ahead of a decode on its rank, a few steps at most, so a clip one step behind finishes first
+and the two decodes line up. ``cfg_size`` multiplies ``tp_size`` and ``sp_size`` into the
+instance. A node must be declared guidance-parallel by the model;
+``configs/wan22_cfg2.yaml`` and ``configs/cosmos3_nano_cfg2.yaml`` ship it. These nodes run
+the serial lockstep protocol: at concurrency 2 on MI325X async scheduling served Wan2.2 at 9
+clips/min against 28 serial, so the default leaves it off for them.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
