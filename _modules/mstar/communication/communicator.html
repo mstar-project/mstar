@@ -1039,6 +1039,23 @@ window.runMermaid = runMermaid;</script>
         <span class="k">pass</span></div>
 
 
+<div class="viewcode-block" id="BaseCommunicator.register_event_for_poll">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.register_event_for_poll">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_event_for_poll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">:</span> <span class="n">EventWakeup</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Have ``poll_for_messages`` (and ``wait_for_work``) also end when</span>
+<span class="sd">        ``event`` is signalled."""</span></div>
+
+
+<div class="viewcode-block" id="BaseCommunicator.poll_for_messages">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.poll_for_messages">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">poll_for_messages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">20</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Block until a message is readable, the registered event fires, or</span>
+<span class="sd">        ``timeout_ms`` elapses, whichever comes first. True when a message is</span>
+<span class="sd">        waiting for ``get_all_new_messages``; a fired event is drained."""</span></div>
+
+
     <span class="c1"># -- endpoint scheme (shared by every ZMQ-based communicator) ------------</span>
     <span class="c1"># Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.</span>
 

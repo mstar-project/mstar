@@ -798,7 +798,9 @@ a message is available (buffered here, delivered by
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.rust_communicator.RustZMQCommunicator.register_event_for_poll">
 <span class="sig-name descname"><span class="pre">register_event_for_poll</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">event</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/rust_communicator.html#RustZMQCommunicator.register_event_for_poll"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.rust_communicator.RustZMQCommunicator.register_event_for_poll" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dd><p>Have <code class="docutils literal notranslate"><span class="pre">poll_for_messages</span></code> (and <code class="docutils literal notranslate"><span class="pre">wait_for_work</span></code>) also end when
+<code class="docutils literal notranslate"><span class="pre">event</span></code> is signalled.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>event</strong> (<a class="reference internal" href="mstar.communication.event.html#mstar.communication.event.EventWakeup" title="mstar.communication.event.EventWakeup"><em>EventWakeup</em></a>)</p>
 </dd>

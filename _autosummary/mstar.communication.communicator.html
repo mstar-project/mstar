@@ -682,6 +682,8 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.get_all_new_messages"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.get_all_new_messages()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.poll_for_messages"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.poll_for_messages()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.register_event_for_poll"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.register_event_for_poll()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.send"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.try_send_bytes"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.try_send_bytes()</span></code></a></li>
 </ul>
@@ -777,6 +779,37 @@
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.communicator.BaseCommunicator.poll_for_messages">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">poll_for_messages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">20</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#BaseCommunicator.poll_for_messages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.BaseCommunicator.poll_for_messages" title="Link to this definition">#</a></dt>
+<dd><p>Block until a message is readable, the registered event fires, or
+<code class="docutils literal notranslate"><span class="pre">timeout_ms</span></code> elapses, whichever comes first. True when a message is
+waiting for <code class="docutils literal notranslate"><span class="pre">get_all_new_messages</span></code>; a fired event is drained.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout_ms</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.communicator.BaseCommunicator.register_event_for_poll">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">register_event_for_poll</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">event</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#BaseCommunicator.register_event_for_poll"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.BaseCommunicator.register_event_for_poll" title="Link to this definition">#</a></dt>
+<dd><p>Have <code class="docutils literal notranslate"><span class="pre">poll_for_messages</span></code> (and <code class="docutils literal notranslate"><span class="pre">wait_for_work</span></code>) also end when
+<code class="docutils literal notranslate"><span class="pre">event</span></code> is signalled.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>event</strong> (<a class="reference internal" href="mstar.communication.event.html#mstar.communication.event.EventWakeup" title="mstar.communication.event.EventWakeup"><em>EventWakeup</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -953,7 +986,9 @@ method so call sites work against either transport.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.register_event_for_poll">
 <span class="sig-name descname"><span class="pre">register_event_for_poll</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">event</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.register_event_for_poll"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.register_event_for_poll" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dd><p>Have <code class="docutils literal notranslate"><span class="pre">poll_for_messages</span></code> (and <code class="docutils literal notranslate"><span class="pre">wait_for_work</span></code>) also end when
+<code class="docutils literal notranslate"><span class="pre">event</span></code> is signalled.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>event</strong> (<a class="reference internal" href="mstar.communication.event.html#mstar.communication.event.EventWakeup" title="mstar.communication.event.EventWakeup"><em>EventWakeup</em></a>)</p>
 </dd>
@@ -1089,6 +1124,8 @@ raises under <code class="docutils literal notranslate"><span class="pre">1</spa
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.get_all_new_messages"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.get_all_new_messages()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.poll_for_messages"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.poll_for_messages()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.register_event_for_poll"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.register_event_for_poll()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.send"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.BaseCommunicator.try_send_bytes"><code class="docutils literal notranslate"><span class="pre">BaseCommunicator.try_send_bytes()</span></code></a></li>
 </ul>
