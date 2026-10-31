@@ -48,7 +48,7 @@ from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
-from mstar.model.components.fp8_linear import apply_linear_dtype, check_linear_dtype
+from mstar.model.components.fp8_linear import apply_linear_dtype, check_linear_dtype, check_linear_dtype_steps
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -104,6 +104,7 @@ class Flux2KleinModel(Model):
         lora: list | None = None,
         linear_dtype: str = "bf16",
         fp8_keep_bf16: list[str] | None = None,
+        linear_dtype_steps: list[str] | None = None,
         **kwargs,
     ):
         # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
@@ -148,6 +149,8 @@ class Flux2KleinModel(Model):
         self.linear_dtype = check_linear_dtype(linear_dtype)
         # fp8 linears kept in bf16 anyway (module-name patterns, block ranges like single_blocks.0-3.*)
         self.fp8_keep_bf16 = [str(p) for p in (fp8_keep_bf16 or [])]
+        # those linears' dtype per denoise step, past the list its last entry (docs/models.rst)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -221,8 +224,10 @@ class Flux2KleinModel(Model):
                 input_names=dit_inputs,
                 # latents is the only loop-carried edge; the step index is the loop counter
                 outputs=[GraphEdge(next_node="dit", name=LATENTS)],
-                # speculative by default (see the async_scheduling knob); `false` = lockstep
-                enable_async_scheduling=self.async_scheduling,
+                # speculative by default (see the async_scheduling knob); `false` = lockstep. A chain's rows
+                # would cross a dtype boundary at different steps, and a step takes one dtype, so a per-step
+                # policy is lockstep here
+                enable_async_scheduling=self.async_scheduling and self.step_dtypes is None,
             ),
             max_iters=self.config.max_denoise_steps,
             outputs=[GraphEdge(next_node="vae_decoder", name=LATENTS)],
@@ -494,8 +499,9 @@ class Flux2KleinModel(Model):
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 
                 apply_transformer_loras(transformer, self.loras)
-            apply_linear_dtype(
+            quantized = apply_linear_dtype(
                 transformer, self.linear_dtype, transformer.FP8_LINEARS, "FLUX.2 transformer", keep=self.fp8_keep_bf16,
+                policy=self.step_dtypes,
             )
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
@@ -504,6 +510,8 @@ class Flux2KleinModel(Model):
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
+                # without an fp8 GEMM every step is bf16
+                step_dtypes=self.step_dtypes if quantized else None,
             )
         logger.warning("FLUX.2 klein has no submodule for node %r; running it dummy", node_name)
         return None
