@@ -578,7 +578,11 @@ class ChatterboxModel(Model):
             try:
                 return decode_torchcodec_capped(filepath, S3GEN_SR).float()
             except RuntimeError as decode_exc:
-                raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
+                # the decoder's message names the server's upload path; the client gets none of it
+                logger.info("torchcodec could not decode %s: %s", filepath, decode_exc)
+                raise ValueError(
+                    "Could not decode the reference audio: not a format soundfile or torchcodec can read"
+                ) from None
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip
             raise ValueError("Reference audio is empty")

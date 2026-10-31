@@ -2,7 +2,9 @@
 
 A full-duplex speech-to-speech model with three nodes:
 
-    conformer_encoder — 16 kHz speech → per-frame LLM embeds (+ RNN-T transcript)
+    conformer_encoder — 16 kHz speech → per-frame LLM embeds (the shared streaming
+                        FastConformer); resources encoder_kv / encoder_state /
+                        encoder_front
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
                         resources nano_kv / nano_attn (4 attention layers),
                         mamba_state / mamba (27 Mamba-2 layers), nano_sampler
@@ -17,8 +19,7 @@ Full-duplex: the model consumes user speech continuously and emits agent text +
 agent speech as it generates, frame-synchronously in one backbone, so it handles
 natural turn-taking and barge-in/interruptions.
 
-Input:  optional system prompt + user speech.  Output: agent text + agent speech
-(+ streaming user transcription, RNN-T channel implemented but not yet wired).
+Input:  optional system prompt + user speech.  Output: agent text + agent speech.
 
 INFERENCE PATHS (all live, verified vs the NeMo reference):
     * ``offline_inference`` — batched offline S2S (frame-synchronous perception →
@@ -76,13 +77,10 @@ from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfi
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.audio_features import NemoLogMel
+from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
-from mstar.model.nemotron_duplex.components.conformer import (
-    encoder_kv_config,
-    encoder_state_blocks,
-    front_state_blocks,
-)
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     CODEC_STATE,
@@ -94,6 +92,7 @@ from mstar.model.nemotron_duplex.config import (
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
+    SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_KV,
     TALKER_POS,
@@ -199,7 +198,7 @@ class DuplexStream:
         # exactly as offline_inference prepends the prompt). Primes the nano cache.
         self.prompt_tokens = None if prompt_tokens is None else prompt_tokens.to(device).view(-1)
 
-        self.perception = model.get_submodule("conformer_encoder", device=device).perception
+        self.encoder = model.get_submodule("conformer_encoder", device=device)
         self.nano = model.get_submodule("nano_llm", device=device).language_model
         self.talker = model.get_submodule("eartts_talker", device=device).talker
         self.codec = model.get_submodule("eartts_talker", device=device).codec
@@ -263,11 +262,9 @@ class DuplexStream:
 
     @torch.no_grad()
     def _step_new_frames(self, final: bool = False) -> list[_StreamOutput]:
-        if self._wav.numel() < self.cfg.stt.hop_length:
+        if self._wav.numel() < self.encoder.log_mel.min_samples:   # too short to featurize
             return []
-        sig = self._wav.unsqueeze(0).to(self.device)
-        lens = torch.tensor([self._wav.shape[0]], device=self.device)
-        audio_embeds, _ = self.perception(sig, lens)   # (1, T, H) — causal, re-encoded
+        audio_embeds = self.encoder.encode_clip(self._wav)[None]   # (1, T, H) — causal, re-encoded
         T = audio_embeds.shape[1]
         nano, cfg = self.nano, self.cfg
         embed_tokens = nano.embed_tokens
@@ -465,7 +462,10 @@ class NemotronDuplexModel(Model):
 
     @property
     def max_session_frames(self) -> int:
-        return self.config.stt.num_frames(self.max_session_samples)
+        stt = self.config.stt
+        # without building a featurizer: the conductor asks per request
+        mels = NemoLogMel.frames(self.max_session_samples, stt.hop_length, stt.reflect_edges)
+        return int(stt.encoder.output_lengths(mels))
 
     def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
         """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of max_session_frames, both CFG streams."""
@@ -547,25 +547,9 @@ class NemotronDuplexModel(Model):
             max_num_pages=self.nano_kv_pages(DEFAULT_PAGE_SIZE),
         )
         return [
-            RecurrentStateSpec(
-                resource_key=ENCODER_STATE, nodes={"conformer_encoder"},
-                config=RecurrentStateConfig(
-                    num_layers=self.config.stt.num_layers,
-                    blocks=encoder_state_blocks(self.config.stt),       # in the engine's compute dtype
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            RecurrentStateSpec(
-                resource_key=ENCODER_FRONT, nodes={"conformer_encoder"},
-                config=RecurrentStateConfig(
-                    num_layers=1, blocks=front_state_blocks(self.config.stt),
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            # no sink slot: padding rows read and write nothing in it
-            BoundedKVSpec(
-                resource_key=ENCODER_KV, nodes={"conformer_encoder"},
-                config=encoder_kv_config(self.config.stt, max_slots=self.DEFAULT_SESSIONS),
+            *stream_node_resources(
+                self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
+                kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
             ),
             KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
             AttentionSpec(
@@ -1084,12 +1068,11 @@ class NemotronDuplexModel(Model):
         # --- build the component modules (loads real weights) ---
         conf_sub = self.get_submodule("conformer_encoder", device=device)
         nano_sub = self.get_submodule("nano_llm", device=device)
-        perception = conf_sub.perception
         nano = nano_sub.language_model
         embed_tokens = nano.embed_tokens
 
         # --- perception: audio -> per-frame embeddings (B, T, H) ---
-        audio_embeds, lengths = perception(input_signal.to(device), input_signal_lens.to(device))
+        audio_embeds = conf_sub.encode_clip(input_signal[0, :int(input_signal_lens[0])])[None]
         B, T, H = audio_embeds.shape
 
         # --- prepend the system prompt embeddings, if any ---
@@ -1279,8 +1262,9 @@ class NemotronDuplexModel(Model):
         """meta-build -> cast -> materialize -> load the module's checkpoint subtree.
 
         Each component's ``load_weights`` streams the single composite
-        ``model.safetensors`` and keeps only its own subtree (verified: every
-        checkpoint tensor maps to exactly one component param).
+        ``model.safetensors`` and keeps only its own subtree. Every checkpoint
+        tensor maps to at most one component param; the STT model's RNN-T head
+        (``stt_model.rnnt_*``), which serving doesn't run, is left unloaded.
         """
         from mstar.model.loader import load_weights
 
@@ -1305,19 +1289,23 @@ class NemotronDuplexModel(Model):
     def _create_conformer_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule:
-        from mstar.model.nemotron_duplex.components.conformer import Perception
-        from mstar.model.nemotron_duplex.components.rnnt import RnntDecoder, RnntJoint
-        from mstar.model.nemotron_duplex.submodules import ConformerEncoderSubmodule
+        from mstar.model.components.fastconformer import load_nemo_perception
+        from mstar.model.components.fastconformer_stream import FastConformerStreamSubmodule
+        from mstar.model.loader.iterators import iter_safetensors_shards
 
         local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
-        cfg = self._json_config(local_dir)
-        with torch.device("meta"):
-            perception = Perception(cfg.stt)
-            rnnt_dec, rnnt_joint = RnntDecoder(cfg.rnnt), RnntJoint(cfg.rnnt)
-        perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
-        rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
-        rnnt_joint = self._build_and_load(rnnt_joint, device, autocast_dtype, local_dir)
-        return ConformerEncoderSubmodule(perception, rnnt_dec, rnnt_joint, config=self.config)
+        stt = self._json_config(local_dir).stt
+        prefix = "stt_model.perception."
+        weights = ((name.removeprefix(prefix), tensor)
+                   for name, tensor in iter_safetensors_shards(local_dir, device=device, prefix=prefix))
+        encoder, proj, log_mel = load_nemo_perception(
+            stt.encoder, stt.output_dim, weights, device=device, dtype=autocast_dtype,
+            kv_key=ENCODER_KV, conv_key=ENCODER_STATE, **stt.log_mel_settings,
+        )
+        return FastConformerStreamSubmodule(
+            encoder, log_mel, proj, input_edge=AUDIO_IN, output_edge="audio_frame",
+            front_key=ENCODER_FRONT, batch_sizes=SESSION_BATCH_SIZES,
+        )
 
     def _create_talker_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,

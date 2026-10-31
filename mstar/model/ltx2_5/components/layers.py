@@ -27,6 +27,7 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from mstar.model.components.distributed.sequence_parallel import attention_over_sharded_keys, ulysses_attention
 
 # ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
 # ``L``); see ``mstar.model.components.diffusion.attention``.
@@ -42,6 +43,26 @@ class RotaryTable(NamedTuple):
     def heads(self, start: int, count: int) -> "RotaryTable":
         """This rank's slice of the heads (tensor parallelism shards them)."""
         return RotaryTable(self.cos[:, :, start:start + count], self.sin[:, :, start:start + count])
+
+
+class SeqParallel(NamedTuple):
+    """Ulysses sequence parallelism over a ``[B, L, H, D]`` stream, the video: ``sizes``
+    is each rank's share of its ``L``.
+
+    Only an attention whose queries and keys are both the sharded stream needs the
+    exchange: it attends every token over this rank's head-group (``attend``). A
+    query shard attending a replicated stream needs nothing, and a replicated query
+    attending the sharded keys merges the ranks' partial attentions by their
+    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
+
+    group: CommGroup
+    sizes: list[int]
+
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
+
+    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+        return attention_over_sharded_keys(self.group, q, k, v, run)
 
 
 def apply_split_rope(x: torch.Tensor, rope: RotaryTable) -> torch.Tensor:
@@ -141,7 +162,10 @@ class GatedAttention(nn.Module):
         context: torch.Tensor | None = None,
         q_rope: RotaryTable | None = None,
         k_rope: RotaryTable | None = None,
+        exchange: SeqParallel | None = None,
     ) -> torch.Tensor:
+        """``exchange``: a self-attention over a sequence-parallel stream, attended over
+        every token on this rank's head-group."""
         local = self.local_heads * self.head_dim
         if self.is_self:
             q, k, v = self.to_qkv(x).split([local, local, local], dim=-1)
@@ -155,7 +179,7 @@ class GatedAttention(nn.Module):
             q = apply_split_rope(q, q_rope.heads(self.head_offset, self.local_heads))
             k_rope = q_rope if k_rope is None else k_rope
             k = apply_split_rope(k, k_rope.heads(self.head_offset, self.local_heads))
-        out = attend(q, k, v).to(q.dtype)
+        out = (attend(q, k, v) if exchange is None else exchange.attend(q, k, v, attend)).to(q.dtype)
         if self.to_gate_logits is not None:
             out = out * (2.0 * torch.sigmoid(self.to_gate_logits(x))).unsqueeze(-1)
         return self.to_out(out.flatten(-2))

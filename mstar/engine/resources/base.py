@@ -173,6 +173,11 @@ class Resource(ABC):
         every step."""
         return False
 
+    def after_output_copy(self, step: ResourceStep) -> None:
+        """Called on the worker's main thread once ``step`` has finished on the device and its outputs are
+        sent. A copy to the host queued here runs behind that step's own output copy."""
+        return
+
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
@@ -197,6 +202,17 @@ class Resource(ABC):
         """How many page allocations this resource has made and a hash of their pages in
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
+
+    @classmethod
+    def journals_resident_moves(cls) -> bool:
+        """Whether rank 0 decides this resource's state for the other ranks of a lockstep
+        instance outside the step that uses it (eviction, prefix leases, page trails). They
+        replay each decision with the next step of the node it was journaled under, so
+        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
+        the class a spec's ``resource_class`` names, so the hooks live there, not only on
+        a subclass its ``build`` returns."""
+        return any(getattr(cls, hook) is not getattr(Resource, hook)
+                   for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
 
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.

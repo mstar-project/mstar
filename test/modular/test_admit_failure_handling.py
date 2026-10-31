@@ -776,11 +776,11 @@ def test_a_refused_batch_never_signals_the_launch():
     error has to be written before anything signals.
 
     Here nothing signals at all — the refusal returns from the admit loop before
-    the drive loop is reached, and ``_execute_on_gpu_thread``'s ``finally`` does
-    it instead, well after ``register_admit_error``. If a future change signals
-    from inside the admit loop, the worker reads ``admit_error=None``, builds and
-    broadcasts a yield-away batch for N+1, and then evicts underneath it — the
-    asymmetry that guard exists to prevent.
+    the drive loop is reached, and the step's completion does it instead
+    (``Worker._submit_gpu_step``), well after ``register_admit_error``. If a
+    future change signals from inside the admit loop, the worker reads
+    ``admit_error=None``, builds and broadcasts a yield-away batch for N+1, and
+    then evicts underneath it — the asymmetry that guard exists to prevent.
     """
     engine = _FakeExecEngine(fail_on="b")
     batch = _exec_batch(["a", "b"])

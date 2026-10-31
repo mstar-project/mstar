@@ -58,7 +58,7 @@ from mstar.model.multimodal import (
     text_combined_walks,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens, load_generation_defaults
+from mstar.model.utils import TextOutput, load_generation_defaults
 
 # the sampling knobs a request may set
 SAMPLING_KEYS = (
@@ -131,7 +131,6 @@ class MultimodalDecoderModel(Model):
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
-    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None):
         self.model_path_hf = model_path_hf
@@ -335,14 +334,14 @@ class MultimodalDecoderModel(Model):
     # Output
     # -----------------------------------------------------------------------
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+
     def postprocess(
         self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-            return self._text_detokenizer.to_bytes(ids)
+            return super().postprocess(output, modality, request_kwargs)
         raise ValueError(f"Unsupported modality for {self.NAME}: {modality!r}")
 
     # -----------------------------------------------------------------------
