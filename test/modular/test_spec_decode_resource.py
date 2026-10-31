@@ -547,6 +547,27 @@ def test_attend_rows_reads_one_query_a_row_off_a_verify_plan(monkeypatch):
     assert plan.block_table is table and plan.max_seqlen_k == 1024
 
 
+def test_an_fp8_head_keeps_a_clear_argmax(monkeypatch):
+    from mstar.engine.resources.spec_decode import draft_head as module
+
+    class Platform:
+        name = "test"
+
+        def fp8_dtype(self):
+            return torch.float8_e4m3fnuz
+
+    monkeypatch.setattr(module, "current_platform", Platform())
+    gen = torch.Generator().manual_seed(0)
+    weight = torch.randn(256, 64, generator=gen, dtype=torch.bfloat16) * 0.02
+    head = module.Fp8DraftHead(weight)
+    assert head.weight.dtype == torch.float8_e4m3fnuz
+    # rows along a row of the head: its own dot product stands well clear of the rest
+    x = weight[[3, 200]].float() + 0.001 * torch.randn(2, 64, generator=gen)
+    logits = head(x.to(torch.bfloat16))
+    assert logits.shape == (2, 256) and logits.dtype == torch.bfloat16
+    assert logits.argmax(dim=-1).tolist() == [3, 200]
+
+
 def test_requests_hold_slot_groups_and_return_them():
     k = 3
     h = Harness(k)
