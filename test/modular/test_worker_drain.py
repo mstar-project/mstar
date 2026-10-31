@@ -447,13 +447,14 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     step can run; refused, the step's head would wait for the handle for ever."""
     known = []
     w = _worker(known_rids=known, is_follower=True, tp_follow=("X",))
-    w._my_consumer_connections = []
+    w._all_wg_nodes = {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w._graph_runtime.add_request = lambda request_id, **kw: known.append(request_id) or request_id
     w.request_state.add_request = lambda rid, info: w.request_state.per_request_info.update(
         {rid: SimpleNamespace(stream_buffers={})}
     )
-    w.engine_manager.add_request = lambda rid, cfgs: None
+    w.engine_manager.add_request = lambda rid, cfgs, info: None
+    w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
     w.tensor_manager.register_request = lambda rid, cfg: None
     w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
 
@@ -464,7 +465,9 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
     ))
+    # failed by the drain check, not by an ingest error
     assert known == ["X"] and w.failed == {"X"}
+    assert not [m for _e, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
 
     # the step runs, and READS_DONE goes once
     w.scheduler.pending_tp_follow_count.pop("X")

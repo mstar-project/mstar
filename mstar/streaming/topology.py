@@ -192,7 +192,7 @@ def find_client_stream(
     conn: Connection, walks: Mapping[str, GraphSection], partitions: Mapping[str, PartitionDefinition],
 ) -> ClientStream:
     """``conn``'s consumer: the one node, over every walk, that takes the edge
-    (as ``Worker._build_consumer_node_cache`` resolves it), in a walk of the
+    (as ``mstar.worker.stream_buffers.consumer_nodes`` resolves it), in a walk of the
     partition it flows into; ``ValueError`` for a stream without one."""
     name, partition = conn.edge_name, partitions.get(conn.to_partition)
     if partition is None:
