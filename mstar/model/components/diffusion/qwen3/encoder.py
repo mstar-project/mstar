@@ -5,10 +5,10 @@ a Qwen3 language model (klein: layers 9/18/27 of Qwen3-4B/8B concatenated), not 
 its logits. This module is that encoder built from M*'s transformer components:
 ``DecoderLayer`` + ``GatedMLP`` + an HF-order RMSNorm with a GQA attention that carries
 per-head q/k RMSNorm and plain RoPE, run only through the deepest tapped layer
-(klein skips the last quarter of the LM). MiniMax-H3 taps layer 50 of Qwen3-VL-32B's
-language model the same way (``Qwen3EncoderConfig.from_qwen3_vl``); a prompt with images
-comes in through ``vl_prompt.qwen3_vl_prompt``, which hands ``forward`` the spliced
-embeddings, the 3-D MRoPE tables and the deepstack features.
+(klein skips the last quarter of the LM). A Qwen3-VL checkpoint's language model is tapped
+the same way (``Qwen3EncoderConfig.from_qwen3_vl``); a prompt with images comes in through
+``vl_prompt.qwen3_vl_prompt``, which hands ``forward`` the spliced embeddings, the 3-D
+MRoPE tables and the deepstack features.
 
 Prompts arrive right-padded to one length (the pipelines pad to
 ``max_sequence_length`` and feed every position, pad tokens included, to the
