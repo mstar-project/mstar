@@ -743,6 +743,10 @@ class TensorCommunicationManager(ABC):
         # minted here, so one map serves every request's acks.
         self.slice_uuids: dict[Rid, dict[tuple[int, int, int, tuple[int, ...]], int]] = {}
         self.slice_origins: dict[int, int] = {}
+        # req_id -> locals a later re-read of the same slice replaced. Their
+        # origins go at the request's teardown with the current ones, so an
+        # ack never outlives its origin whatever order acks and frees run in.
+        self.replaced_slice_uuids: dict[Rid, list[int]] = {}
 
         self.req_rx_info: dict[Rid, SourceAndEdgeToRxInfo] = {}
         self.req_tx_info: dict[Rid, EdgeNameToTxInfo] = {}
@@ -1569,6 +1573,8 @@ class TensorCommunicationManager(ABC):
             info.uuid = local
             take(local)
             return True
+        if local is not None:
+            self.replaced_slice_uuids.setdefault(request_id, []).append(local)
         local = self._uuid_minter.mint()
         slices[key] = local
         self.slice_origins[local] = info.uuid
@@ -2168,6 +2174,8 @@ class TensorCommunicationManager(ABC):
 
         self._collect_and_send_acks(ack_edges)
         for local in self.slice_uuids.pop(request_id, {}).values():
+            self.slice_origins.pop(local, None)
+        for local in self.replaced_slice_uuids.pop(request_id, ()):
             self.slice_origins.pop(local, None)
 
     def force_cleanup_request(self, request_id: Rid):

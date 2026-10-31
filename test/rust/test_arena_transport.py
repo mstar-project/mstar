@@ -829,6 +829,71 @@ def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, 
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
+def test_a_slice_read_again_after_its_release_leaves_no_origin_behind(tmp_path, backend):
+    """``B`` holds rows [0, 2) of ``x`` under the producer's uuid, so ``C``'s
+    row 0 is read into a local uuid. ``C`` releases it and reads the slice
+    again on a later step, into a new local. Both reads ack the producer's
+    uuid, and the request's teardown leaves no local -> producer entry for
+    either local."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _manager("worker_1", tmp_path)
+    cons.communicator = _RecordingCommunicator()
+    if backend == "rust":
+        cons.tensor_store = TensorStore(RustTensorBookkeeping())
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    (info,) = prod.store_and_return_tensor_info(
+        7, {"x": [x]}, node_name="A", graph_walk="decode",
+    )["x"]
+
+    def edge(node):
+        return cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=[info]),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+
+    def read(edges):
+        prod.refresh_shm_placement(edges)
+        for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
+            fut.result()
+        return {e.next_node: e.tensor_info[0].uuid for e in cons.get_ready_tensors("decode")[7]}
+
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    first = read([edge("B"), edge("C")])
+    assert first["B"] == info.uuid and first["C"] != info.uuid
+    cons.dereference(first["C"])
+
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    again = read([edge("C")])
+    assert again["C"] not in (info.uuid, first["C"])  # a new local
+    assert torch.equal(cons.get_tensor(again["C"]), x[:1])
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [
+        {info.uuid: 2}, {info.uuid: 1},
+    ]
+
+    cons.dereference(again["C"])
+    cons.dereference(first["B"])
+    cons.cleanup_request(7)
+    assert cons.slice_origins == {}
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
 def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(tmp_path, backend):
     """``x`` holds a tensor with rows and one with none. ``C``'s slice of the
     empty one is ``B``'s, so it is reused while its other slice is new: the
