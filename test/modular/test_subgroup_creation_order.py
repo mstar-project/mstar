@@ -68,9 +68,11 @@ def _mesh(tp: int, sp: int) -> GlobalParallelConfig:
         ranks=ranks,
         tp_size=tp,
         sp_size=sp,
+        cfg_size=1,
         _tp_comm_size=tp,
         _tp_ranks=[ranks[s * tp:(s + 1) * tp] for s in range(sp)] if tp > 1 else [],
         _sp_ranks=[ranks[t::tp] for t in range(tp)] if sp > 1 else [],
+        _cfg_ranks=[],
         _instance_ranks=[ranks],
     )
     return GlobalParallelConfig(
