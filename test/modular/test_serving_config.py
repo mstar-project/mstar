@@ -58,19 +58,8 @@ def test_the_2gpu_config_serves_its_platforms_layout(monkeypatch, platform, expe
     assert load_serving_config(str(CONFIGS / "qwen3omni_2gpu.yaml")) == _shipped(expected)
 
 
-def test_the_ramp_config_is_the_split_layout_with_a_chunk_schedule():
-    ramp = _shipped("qwen3omni_2gpu_ramp4.yaml")
-    assert ramp.pop("model_kwargs") == {"codec_chunk_schedule": [4, 8, 16]}
-    assert ramp == _shipped("qwen3omni_2gpu_split.yaml")
-
-    colocated_ramp = _shipped("qwen3omni_colocated_ramp4.yaml")
-    assert colocated_ramp.pop("model_kwargs") == {"codec_chunk_schedule": [4, 8, 16]}
-    assert colocated_ramp == _shipped("qwen3omni_colocated.yaml")
-
-
 @pytest.mark.parametrize("ramp, base", [
     ("qwen3omni_2gpu_ramp4g.yaml", "qwen3omni_2gpu_split.yaml"),
-    ("qwen3omni_colocated_ramp4g.yaml", "qwen3omni_colocated.yaml"),
     ("qwen3omni_colocated_split3_ramp4g.yaml", "qwen3omni_colocated_split3.yaml"),
 ])
 def test_the_gentle_ramp_configs_are_their_base_with_a_chunk_schedule(ramp, base):

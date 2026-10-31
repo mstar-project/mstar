@@ -441,7 +441,6 @@ RAMPS = [
     pytest.param((1, 2, 4, 8, 16), 25, 25, id="doubling-ramp"),
     pytest.param((4,), 25, 25, id="4-then-25"),
     pytest.param((8, 10, 13, 16, 20), 25, 25, id="early-audio-8-10-13-16-20"),
-    pytest.param((4, 8, 16), 25, 25, id="ramp4-4-8-16-25"),
     pytest.param((4, 5, 6, 8, 10, 13, 16, 20), 25, 25, id="ramp4g-4-5-6-8-10-13-16-20"),
     # a ramp chunk wider than the steady chunk widens the padded window
     pytest.param((30, 10), 25, 25, id="30-10-25"),
@@ -495,8 +494,8 @@ def test_a_batch_mixes_windows_from_different_ramp_stages():
 
 @pytest.mark.parametrize(
     "schedule",
-    [(12, 13), (8, 10, 13, 16, 20), (4, 8, 16), (4, 5, 6, 8, 10, 13, 16, 20)],
-    ids=["default", "early-audio", "ramp4", "ramp4g"],
+    [(12, 13), (8, 10, 13, 16, 20), (4, 5, 6, 8, 10, 13, 16, 20)],
+    ids=["default", "early-audio", "ramp4g"],
 )
 @pytest.mark.parametrize("num_frames", [3, 4, 12, 25, 26, 50, 120])
 def test_real_decoder_streams_the_ramp_like_the_full_decode(tiny_code2wav, num_frames, schedule):
@@ -627,39 +626,7 @@ def test_the_early_audio_ramp_streams_the_full_decode_around_each_boundary(bound
     assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
 
 
-RAMP4_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "qwen3omni_colocated_ramp4.yaml"
-
-
-def test_the_ramp4_config_starts_audio_after_4_frames_inside_the_default_capture():
-    """Every window still pads to the default's 50 frames, so the arm serves
-    the vocoder graphs the default captures."""
-    from mstar.model.qwen3_omni.qwen3_omni_model import apply_code2wav_serving_overrides
-
-    kwargs = dict(yaml.safe_load(RAMP4_CONFIG.read_text())["model_kwargs"])
-    cfg = Code2WavConfig()
-    apply_code2wav_serving_overrides(cfg, kwargs)
-
-    assert cfg.codec_chunk_schedule == (4, 8, 16) and not kwargs
-    assert cfg.codec_max_window == Code2WavConfig().codec_max_window == 50
-    assert _windows(_scheduled_policy(cfg), 110) == [
-        (0, 4), (4, 12), (12, 28), (25, 50), (25, 50), (25, 50), (25, 32),
-    ]
-
-
-@pytest.mark.parametrize("offset", [-1, 0, 1])
-@pytest.mark.parametrize("boundary", [4, 12, 28, 53, 78])
-def test_the_ramp4_schedule_streams_the_full_decode_around_each_boundary(boundary, offset):
-    decoder = _LookaheadDecoder()
-    submodule = Code2WavSubmodule(decoder, _config((4, 8, 16)))
-    codes = _codes(boundary + offset)
-
-    steps = _stream(submodule, codes, _scheduled_policy)
-    full = _to_pcm(decoder(codes.t()[None], torch.arange(boundary + offset)[None]))[0, 0]
-
-    assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
-
-
-RAMP4G_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "qwen3omni_colocated_ramp4g.yaml"
+RAMP4G_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "qwen3omni_2gpu_ramp4g.yaml"
 
 
 def test_the_gentle_ramp4_config_needs_no_more_of_the_talker_than_the_early_audio_one():
