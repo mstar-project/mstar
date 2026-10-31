@@ -2508,9 +2508,8 @@ Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **
 (the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
 ``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
 position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
-``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS``
-caps a mixed step's prompt rows, and ``CAPTURE_COMPILE_MODE`` names the captures'
-``compile_mode``.
+``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, and ``MIXED_MAX_PREFILL_ROWS``
+caps a mixed step's prompt rows.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image
