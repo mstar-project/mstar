@@ -535,7 +535,10 @@ stateless.
   ``store: true``, ``background``). Hints (``metadata``, ``cache_control``,
   ``prompt_cache_key``, ``client_metadata``) are dropped.
 - **MTP** (``mtp_num_draft_tokens > 0``) verifies greedily: a ``temperature`` above 0 is a
-  ``400``, and a request that sets none runs greedy.
+  ``400``, and a request that sets none runs greedy. With ``dsa_long_context`` each step
+  books k + 1 cache rows, so ``max_tokens`` may be at most a (k + 1)th of what the prompt
+  leaves of the window. Claude Code asks for 32,000; ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``
+  lowers that.
 
 An agent's system prompt and tools alone outgrow the 2,048-token window of
 ``glm5_next_tp8.yaml``: serve them with ``glm5_next_tp8_longctx.yaml`` (1M tokens) or
