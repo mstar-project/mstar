@@ -630,12 +630,12 @@ class GDNMixedWrapper(GDNWrapper):
     leading run of decode rows goes to the decode kernel and every row after
     it to the chunked one, each reading the step's tokens in place: the engine
     orders a split walk's rows decode first (``CombinedSplit``), so row i of
-    that run is token i. Both halves run over static shapes. The decode half
-    takes the first ``bs`` tokens, rows past the run on the null slot, which it
-    skips. Under capture the chunked half takes every token, the run as one
-    sequence on the null slot ahead of at most ``max_prefill_rows`` prompt
-    rows, and the decode half's outputs overwrite that sequence's; an eager
-    step's chunked half takes the tokens after the run.
+    that run is token i. Both halves run over static shapes. Under capture
+    the decode half takes the bucket's first ``bs`` tokens (rows past the run
+    on the null slot, outputs dropped), and the chunked half every token: the
+    run as one sequence on the null slot, whose outputs the decode half's
+    overwrite, ahead of at most ``max_prefill_rows`` prompt rows. Eagerly the
+    decode half takes only the run, and the chunked half the tokens after it.
 
     A one-token row without state (a one-token prompt) ends the run: the
     decode kernel would read the slot as it is, and a fresh slot is not
@@ -724,7 +724,10 @@ class GDNMixedWrapper(GDNWrapper):
         if len(prompt) > cap:
             raise RuntimeError(
                 f"GDNMixedWrapper: {len(prompt)} prompt rows in a step "
-                f"captured for {cap}; the scheduler caps a mixed step's prompt rows"
+                f"captured for {cap}. Possible causes: the scheduler let in more "
+                "than max_rows_in_combined allows, a decode row behind a prompt "
+                "row (a broken row order), or a CombinedSplit that leaves out a "
+                "multi-token walk"
             )
         # Under capture the decode half runs the bucket's rows; eagerly, the run's.
         width = max(self._bs or 0, rows) if self._accelerator_graph else run
@@ -802,8 +805,11 @@ class GDNMixedWrapper(GDNWrapper):
         return self._merge(out, rows)
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
-        # Decode first: the chunked half's sequence over the run writes the
-        # null slot only, and reads none of the run's slots.
+        # Which half runs first doesn't change a run row's state: only under
+        # capture does the chunked half run a sequence over the run, and it
+        # starts from zero and writes only the null slot (without a sink, a
+        # live prompt row's slot, or slot 0 with none live, given that row's
+        # own result or what the slot already holds).
         rows = None
         if self._num_rows:
             rows = self._decode.run(

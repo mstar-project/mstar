@@ -6,7 +6,9 @@ tokens in place. Against the chunked path over every row: the same conv and
 delta-rule outputs, the same recurrent and conv state left in every real slot,
 and nothing written for a padding row. The engine orders a mixed step decode
 first; any other order is still computed right, a decode row after the run
-taking the chunked kernel.
+taking the chunked kernel. With the sink slot off, padding rows carry
+NO_SLOT and slot 0 is an ordinary request's, which a padding row must leave as
+the chunked path does.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
 )
-from mstar.engine.resources.recurrent.pool import SINK_SLOT
+from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
@@ -55,6 +57,22 @@ LAYOUTS = {
     # every row a prompt row: no decode run
     "no_decode": [(3, 3, True), (1, 11, False), (5, 12, False), (0, SINK_SLOT, False)],
 }
+
+# with the sink off: the layouts above with padding rows on NO_SLOT, plus
+# slot 0 on a request's row, where a redirected read could address it
+SINK_OFF_LAYOUTS = {
+    **{
+        name: [(s, NO_SLOT if slot == SINK_SLOT else slot, h) for s, slot, h in layout]
+        for name, layout in LAYOUTS.items()
+    },
+    "slot0_in_run": [
+        (1, 0, True), (1, 5, True), (1, 9, True), (6, 7, True),
+        (4, 12, False), (0, NO_SLOT, False),
+    ],
+    "slot0_prompt": [(1, 3, True), (1, 5, True), (6, 0, True), (4, 12, False), (0, NO_SLOT, False)],
+    # no live prompt row
+    "decode_only_slot0": [(1, 0, True), (1, 5, True), (1, 9, True), (0, NO_SLOT, False)],
+}
 MAX_PROMPTS = 5
 
 
@@ -80,20 +98,26 @@ def _inputs(tokens, device):
 
 
 def _pools(device):
+    # one guard row in front of each pool: a kernel that writes slot -1 lands there
     torch.manual_seed(0)
-    state = torch.randn(SLOTS, HEADS, DIM, DIM, device=device) * 0.05
-    conv = torch.randn(SLOTS, CONV_DIM, WIDTH - 1, device=device, dtype=torch.bfloat16)
-    return state, conv
+    state = torch.randn(1 + SLOTS, HEADS, DIM, DIM, device=device) * 0.05
+    conv = torch.randn(1 + SLOTS, CONV_DIM, WIDTH - 1, device=device, dtype=torch.bfloat16)
+    return state[1:], conv[1:]
 
 
-def _reference(device, x, weight, inputs, layout):
+def _guard(pool):
+    return pool.as_strided(pool.shape[1:], pool.stride()[1:], pool.storage_offset() - pool.stride(0))
+
+
+def _reference(device, x, weight, inputs, layout, null_slot=SINK_SLOT):
     SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
     # capture-sized: only a captured step carries padding rows, and the eager
     # wrapper does not size its token mask for their borrowed tokens
     w = GDNPrefillWrapper(
-        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
+        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=null_slot,
         num_tokens=x.shape[0], bs=len(SPANS), accelerator_graph=True,
+        has_sink_state=null_slot != NO_SLOT,
     )
     w.plan(
         SPANS,
@@ -105,7 +129,7 @@ def _reference(device, x, weight, inputs, layout):
     return conv_out, out, state, conv
 
 
-def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None):
+def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=None, null_slot=SINK_SLOT):
     SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
     tokens = x.shape[0]
@@ -114,7 +138,7 @@ def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=Non
         bucket_tokens, bucket_bs = 32, 10
         pad_rows = bucket_bs - len(SPANS)
         spans = SPANS + [0] * pad_rows
-        slots = SLOT_IDS + [SINK_SLOT] * pad_rows
+        slots = SLOT_IDS + [null_slot] * pad_rows
         has = HAS_STATE + [False] * pad_rows
         pad = bucket_tokens - tokens
         x = torch.cat((x, x.new_zeros(pad, x.shape[1])))
@@ -126,9 +150,10 @@ def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=Non
         bucket_tokens = bucket_bs = None
         spans, slots, has = SPANS, SLOT_IDS, HAS_STATE
     w = GDNMixedWrapper(
-        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
+        device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=null_slot,
         num_tokens=bucket_tokens, bs=decode_rows or bucket_bs,
         accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
+        has_sink_state=null_slot != NO_SLOT,
     )
     w.plan(spans, tuple(slots), tuple(has))
     conv_out = w.run_conv(x, conv, weight)[:tokens]
@@ -150,7 +175,7 @@ def _step(device, layout):
     return x, weight, _inputs(tokens, device)
 
 
-def _check(layout, mixed, ref):
+def _check(layout, mixed, ref, null_slot=SINK_SLOT):
     _, SLOT_IDS, _ = _cols(layout)
     real = [i for i, (s, _, _) in enumerate(layout) if s > 0]
     mix_conv, mix_out, mix_state, mix_cstate = mixed
@@ -160,21 +185,35 @@ def _check(layout, mixed, ref):
     real_slots = [SLOT_IDS[i] for i in real]
     _close(mix_state[real_slots], ref_state[real_slots], "recurrent state")
     _close(mix_cstate[real_slots], ref_cstate[real_slots], "conv state")
-    # slots no row addresses are left alone
-    untouched = [s for s in range(SLOTS) if s not in real_slots and s != SINK_SLOT]
+    # slots no row addresses are left alone (with the sink off, slot 0 too)
+    untouched = [s for s in range(SLOTS) if s not in real_slots and s != null_slot]
     fresh_state, fresh_conv = _pools(mix_state.device)
     assert torch.equal(mix_state[untouched], fresh_state[untouched])
     assert torch.equal(mix_cstate[untouched], fresh_conv[untouched])
+    if null_slot == NO_SLOT:
+        assert torch.equal(_guard(mix_state), _guard(fresh_state)), "a padding row wrote slot -1"
+        assert torch.equal(_guard(mix_cstate), _guard(fresh_conv)), "a padding row wrote slot -1"
+
+
+def _split_cases():
+    for null_slot, layouts, sink in ((SINK_SLOT, LAYOUTS, "sink"), (NO_SLOT, SINK_OFF_LAYOUTS, "no_sink")):
+        for name in layouts:
+            for graph, mode in ((False, "eager"), (True, "bucket")):
+                # an eager step drops its padding rows, so a layout that differs
+                # from its sink-on twin only in them adds nothing eagerly
+                if null_slot == NO_SLOT and name in LAYOUTS and not graph:
+                    continue
+                yield pytest.param(null_slot, layouts[name], graph, id=f"{sink}-{name}-{mode}")
 
 
 @requires_gpu
-@pytest.mark.parametrize("layout", list(LAYOUTS))
-@pytest.mark.parametrize("accelerator_graph", [False, True], ids=["eager", "bucket"])
-def test_mixed_split_matches_the_chunked_path(accelerator_graph, layout):
+@pytest.mark.parametrize("null_slot,layout,accelerator_graph", list(_split_cases()))
+def test_mixed_split_matches_the_chunked_path(null_slot, layout, accelerator_graph):
     device = torch.device("cuda")
-    x, weight, inputs = _step(device, LAYOUTS[layout])
-    ref = _reference(device, x, weight, inputs, LAYOUTS[layout])
-    _check(LAYOUTS[layout], _mixed(device, x, weight, inputs, accelerator_graph, LAYOUTS[layout]), ref)
+    x, weight, inputs = _step(device, layout)
+    ref = _reference(device, x, weight, inputs, layout, null_slot=null_slot)
+    mixed = _mixed(device, x, weight, inputs, accelerator_graph, layout, null_slot=null_slot)
+    _check(layout, mixed, ref, null_slot=null_slot)
 
 
 @requires_gpu

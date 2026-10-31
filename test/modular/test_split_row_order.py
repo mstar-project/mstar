@@ -4,7 +4,7 @@
 one-token rows as the step's first tokens, in place, and size their prefill
 half to the prompt rows the scheduler lets in; a decode row behind a prompt
 row would take a prefill row's place. The engine records the order from the
-resources' `CombinedSplit`s, and every batch the worker makes follows it.
+resources' `CombinedSplit`s, and every batch the worker makes follows it (`make_executing_batch`).
 """
 
 from types import SimpleNamespace
@@ -19,7 +19,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.spec import CombinedSplit
-from mstar.worker.worker import Worker
+from mstar.worker.executing_batch import make_executing_batch
 
 SPLIT = CombinedSplit("mixed", ("prefill_text",))
 
@@ -65,13 +65,13 @@ def test_resources_that_disagree_on_a_splits_prompt_walks_are_refused():
         _engine(attn, linear)
 
 
-def test_the_worker_makes_a_mixed_step_decode_first():
-    worker = Worker.__new__(Worker)
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: _engine(*_specs()))
+def test_a_mixed_steps_batch_is_made_decode_first():
+    streams = SimpleNamespace(settle_final=lambda node, final_edges: (set(), set()))
 
-    batch = worker._make_executing_batch(
-        node_name="LLM", graph_walk="mixed", request_ids=[0, 1, 2, 3, 4],
+    batch = make_executing_batch(
+        streams, node_name="LLM", graph_walk="mixed", request_ids=[0, 1, 2, 3, 4],
         per_request_input_tensors={}, per_request_info={}, request_walks=WALKS,
+        engine=_engine(*_specs()),
     )
 
     assert batch.request_ids == (1, 3, 4, 0, 2)

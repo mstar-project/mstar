@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import time as _time
 from copy import deepcopy
-from typing import get_args
+from typing import TYPE_CHECKING, get_args
 
 from mstar_rust import GraphRuntime as _RustGraphRuntime
 
 from mstar.communication import wire
-from mstar.communication.tensor_store import TensorBookkeeping
+from mstar.communication.tensor_store import TensorBookkeeping, _dtype_name
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
@@ -37,6 +37,8 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     FreedTensors,
     GraphRuntime,
+    InlineRoute,
+    InlineRouteStatus,
     ParallelList,
     PopRidsOutput,
     Profiling,
@@ -45,12 +47,16 @@ from mstar.graph.runtime.base import (
     RouteInput,
     RouteOutput,
     SendInput,
+    SpecRows,
     SpeculationOutput,
     SpeculationPrepInput,
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
+
+if TYPE_CHECKING:
+    import torch
 
 # SendInput.profiling's (rx_info, tx_info, graph_timings), by declared type.
 _PROFILING_HINTS = get_args(Profiling)
@@ -585,6 +591,24 @@ class RustGraphRuntime(GraphRuntime):
             self._rust.prep_spec_rids(self._spec_prep_arg(input))
         )
 
+    def prep_spec_rows(
+        self, spec_node_name: str, curr_node_name: str, graph_walk: str,
+        rids: list[int], room_for_continuing: int | None = None,
+    ) -> SpecRows:
+        out = self._rust.prep_spec_rows(
+            spec_node_name=spec_node_name, curr_node_name=curr_node_name,
+            graph_walk=graph_walk, rids=rids, room_for_continuing=room_for_continuing,
+        )
+        edge_rids = out.edge_rids
+        return SpecRows(
+            ready_rids=out.ready_rids, wg_id=out.wg_id, spec_id=out.spec_id,
+            input_edges=ColumnarEdgeSpecs(
+                signal_names=out.signal_names, signal_name_idxs=out.signal_name_idxs,
+                rids=edge_rids, tensors_per_edge=out.tensors_per_edge,
+                is_final_streaming_chunk=out.is_final_streaming_chunk, uuids=out.uuids,
+            ) if edge_rids else None,
+        )
+
     def prep_follow_spec_rids(
         self, input: SpeculationPrepInput,
     ) -> SpeculationPrepOutput | None:
@@ -609,6 +633,10 @@ class RustGraphRuntime(GraphRuntime):
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
         })
+        return self._route_output(out)
+
+    @staticmethod
+    def _route_output(out) -> RouteOutput:
         return RouteOutput(
             completion_id=out.completion_id,
             register_uuids=out.register_uuids,
@@ -631,6 +659,35 @@ class RustGraphRuntime(GraphRuntime):
                 out.freed_input_uuids, out.freed_input_registered,
             ),
         )
+
+    supports_route_and_send_inline = True
+
+    def route_and_send_inline(
+        self, partition: str, graph_walk: str, node_name: str,
+        output_signals: list[str], rids: list[int],
+        inline_signal: str, inline_column: torch.Tensor,
+        row_rids: list[int],
+    ) -> InlineRoute:
+        """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
+        step, one crossing with the GIL released (see the Rust side).
+
+        ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
+        caller keeps alive; Rust reads it in place.
+        """
+        out = self._rust.route_and_send_inline(
+            partition=partition, graph_walk=graph_walk, node_name=node_name,
+            output_signals=list(output_signals), rids=rids, inline_signal=inline_signal,
+            inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
+            inline_stride=inline_column.stride(0),
+            inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
+        )
+        status = InlineRouteStatus(out.status)
+        route = None
+        if status is InlineRouteStatus.ROUTED:
+            route = self._route_output(out.take_route())
+        if PHASE_PERIOD:
+            phase_record("rust.route_and_send_inline.nogil", out.nogil_ns * 1e-9)
+        return InlineRoute(status, out.completion_id, out.sent_rids, route)
 
     def stop_loops_batched(
         self, partition: str, graph_walk: str, last_node_run: str,

@@ -10,7 +10,6 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
-    NameAndDest,
     NodeAndGraphWalk,
     TensorPointerInfo,
 )
@@ -1191,13 +1190,14 @@ class PythonGraphRuntime(GraphRuntime):
             for (wkr, wkr_edge) in fanout.items():
                 streaming_to_workers.setdefault(wkr, []).append(wkr_edge)
 
-        logger.debug(
-            ("Finished processing outputs from rid %s. \n"
-             "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
-            rid, format_graph_edge_list(routed_to_this_worker),
-            format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
-            len(streaming_edges),
-        )
+        if logger.isEnabledFor(logging.DEBUG):  # three edge lists per routed rid
+            logger.debug(
+                ("Finished processing outputs from rid %s. \n"
+                 "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
+                rid, format_graph_edge_list(routed_to_this_worker),
+                format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
+                len(streaming_edges),
+            )
         if completed_worker_graph_ids:
             logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
 
@@ -1259,18 +1259,17 @@ class PythonGraphRuntime(GraphRuntime):
     def _stop_loops_for_rid(
         self, rid: int, partition: str, loop_names: set[str],
         last_node_run: str | None,
-    ) -> set[NameAndDest]:
+    ):
         """Register the finish signal on every worker graph carrying a named
-        loop, and return the union of their loop-back (name, dest) pairs so the
-        caller drops those from the triggering iteration's output routing.
+        loop. Its loop-back edges are dropped when the loop next completes an
+        iteration (``Loop.complete_iter``'s ``filtered_signals``).
 
         In disaggregated mode one loop name can exist on several worker graphs,
         each with its own finish signal, so this still fans out locally.
         """
         part_info = self._request_info[rid].partition_info[partition]
-        stopped: set[NameAndDest] = set()
         for wg_id in part_info.graph_walk_worker_graph_ids:
-            stopped |= self._queues[wg_id].stop_loops(rid, loop_names)
+            self._queues[wg_id].stop_loops(rid, loop_names)
 
         # A stop time is one observation per loop, so only the worker graph
         # owning the last-run node needs to be asked.
@@ -1288,7 +1287,6 @@ class PythonGraphRuntime(GraphRuntime):
                     times[name] = wgio.get_nested_loop_idxs(
                         target_loop_name=name,
                     )
-        return stopped
 
     def _fan_out_loop_stops(
         self, rid: int, partition: str, loop_names: set[str],

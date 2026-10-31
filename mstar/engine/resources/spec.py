@@ -26,8 +26,14 @@ class CombinedSplit:
     ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows).
 
     The engine orders a step of ``combined_walk`` with the rows of
-    ``prefill_walks`` last, so the decode kernel reads its rows as the step's
-    first tokens in place and the prefill kernel the rest, with no gather."""
+    ``prefill_walks`` last, so both kernels read the step's tokens in place:
+    the decode kernel the leading run of one-token rows, the prefill kernel
+    the rows after it (under capture every token, the run as one leading
+    sequence). Every walk of ``combined_walk`` outside ``prefill_walks`` must
+    be one token per row: its rows go first, and a multi-token one there
+    ends the run, so it and every decode row after it count as prompt rows,
+    and a captured step's plan raises if its prompt rows then exceed
+    ``max_prefill_rows``."""
     combined_walk: str
     prefill_walks: tuple[str, ...]
 
