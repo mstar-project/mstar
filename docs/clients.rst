@@ -320,8 +320,9 @@ Endpoints and model coverage:
      - all
      - Lists the served model.
    * - ``POST /v1/chat/completions``
-     - ``bagel``, ``qwen3_omni``
-     - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
+     - ``bagel``, ``qwen3_omni``, ``glm52``, ``glm5_next``
+     - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech. The GLMs take
+       ``tools`` and return ``reasoning_content`` and ``tool_calls`` (not on ``--rust-frontend``).
    * - ``POST /v1/audio/speech``
      - ``kokoro``, ``orpheus``, ``qwen3_omni``
      - Text-to-speech (``kokoro`` streams sentence by sentence with ``stream=True``).

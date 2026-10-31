@@ -231,13 +231,17 @@ def test_adapter_refuses_what_it_cannot_honour(body, tmp_path):
 
 class _RecordingTokenizer:
     chat_template = "{{ messages }}"
+    refuse = False
 
     def __init__(self):
         self.calls = []
 
     def apply_chat_template(self, messages, **kw):
         import torch
+        from jinja2 import TemplateError
 
+        if self.refuse:
+            raise TemplateError("tool messages must follow a call")
         self.calls.append((messages, kw))
         return torch.tensor([[1, 2, 3]])
 
@@ -280,6 +284,11 @@ def test_process_prompt_renders_the_chat(make, tmp_path):
     assert "tokenize" not in kw and kw["enable_thinking"] is False
     with pytest.raises(ValueError, match="messages"):
         m.process_prompt("hello", ["text"], ["text"], messages="hi")
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        m.process_prompt("hello", ["text"], ["text"], chat_template_kwargs="thinking")
+    m._tokenizer.refuse = True
+    with pytest.raises(ValueError, match="refused"):
+        m.process_prompt("hello", ["text"], ["text"])
 
 
 @pytest.mark.parametrize("raw", ["1e400", "[1e309]", "-1e999", '{"x": 1e400}'])

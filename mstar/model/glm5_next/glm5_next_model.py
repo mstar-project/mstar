@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
@@ -49,6 +50,7 @@ from mstar.model.glm5_next.config import (
     SAMPLER,
     Glm5NextModelConfig,
 )
+from mstar.model.multimodal import render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
@@ -448,24 +450,9 @@ class Glm5NextModel(Model):
             vocab = self.config.vocab_size
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        # the checkpoint's chat template over the chat API's messages, else the prompt as one user turn
         elif getattr(self.tokenizer, "chat_template", None):
-            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
-            if not isinstance(messages, list):
-                raise ValueError("messages must be a list of chat messages")
-            # the template's switches only: others collide with apply_chat_template's own
-            switches = {k: v for k, v in (kwargs.get("chat_template_kwargs") or {}).items()
-                        if k in ("enable_thinking", "reasoning_effort", "clear_thinking")}
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                tools=kwargs.get("tools"),
-                add_generation_prompt=True,
-                return_tensors="pt",
-                # transformers 5.x defaults return_dict=True (a BatchEncoding);
-                # keep the bare-tensor return so [0] selects the row
-                return_dict=False,
-                **switches,
-            )[0]
+            input_ids = render_chat_template(
+                self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, TEMPLATE_KWARGS)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 

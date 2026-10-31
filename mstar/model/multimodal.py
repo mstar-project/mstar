@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
+from jinja2 import TemplateError
 
 TEXT = "text"
 
@@ -130,6 +131,42 @@ def messages_from_parts(
     if default_system is not None and not any(m["role"] == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": default_system})
     return messages
+
+
+def render_chat_template(
+    tokenizer, prompt: str, prompt_parts: list[PromptPart] | None, request_kwargs: dict,
+    switches: tuple[str, ...] = (),
+) -> torch.Tensor:
+    """Token ids of a chat through ``tokenizer``'s chat template, with the assistant turn
+    opened: the chat API's ``messages`` and ``tools``, else the prompt's turns, each in its
+    own role. ``chat_template_kwargs`` may set only ``switches``; other keys collide with
+    ``apply_chat_template``'s own arguments. A malformed chat, or one the template refuses,
+    is a ValueError, which reaches the client as a 400."""
+    messages = request_kwargs.get("messages")
+    if messages and not isinstance(messages, list):
+        raise ValueError("messages must be a list of chat messages")
+    if not messages:
+        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
+        messages = [
+            {"role": turn.role, "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
+            for turn in chat_turns(parts)
+        ]
+    template_kwargs = request_kwargs.get("chat_template_kwargs") or {}
+    if not isinstance(template_kwargs, dict):
+        raise ValueError(f"chat_template_kwargs must be an object; got {template_kwargs!r}")
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            messages,
+            tools=request_kwargs.get("tools"),
+            add_generation_prompt=True,
+            return_tensors="pt",
+            # transformers 5.x returns a BatchEncoding by default; [0] wants the bare tensor
+            return_dict=False,
+            **{k: v for k, v in template_kwargs.items() if k in switches},
+        )
+    except TemplateError as exc:
+        raise ValueError(f"the chat template refused the chat: {exc}") from exc
+    return input_ids[0]
 
 
 def prefill_plan(

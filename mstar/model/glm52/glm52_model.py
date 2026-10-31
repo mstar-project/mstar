@@ -5,8 +5,8 @@ import logging
 from pathlib import Path
 
 import torch
-from jinja2 import TemplateError
 
+from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
@@ -40,7 +40,7 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.multimodal import TEXT, PromptPart, chat_turns
+from mstar.model.multimodal import PromptPart, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
@@ -429,7 +429,7 @@ class Glm52Model(Model):
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
         elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = self._render_chat(prompt, prompt_parts, kwargs)
+            input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, TEMPLATE_KWARGS)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
@@ -444,39 +444,6 @@ class Glm52Model(Model):
         return ProcessPromptOutput(
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_RESOURCE: {"main": layout}}},
         )
-
-    def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None, kwargs: dict) -> torch.Tensor:
-        """The chat through the checkpoint's template, which adds ``[gMASK]<sop>`` and opens
-        the assistant turn: the chat API's ``messages``, else the prompt's turns, each in its
-        own role, else the prompt as one user turn."""
-        messages = kwargs.get("messages")
-        if messages and not isinstance(messages, list):
-            raise ValueError("messages must be a list of chat messages")
-        if not messages:
-            parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
-            messages = [
-                {"role": turn.role,
-                 "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
-                for turn in chat_turns(parts)
-            ]
-        # the template's switches only: others collide with apply_chat_template's own
-        switches = {k: v for k, v in (kwargs.get("chat_template_kwargs") or {}).items()
-                    if k in ("enable_thinking", "reasoning_effort", "clear_thinking")}
-        try:
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                tools=kwargs.get("tools"),
-                add_generation_prompt=True,
-                return_tensors="pt",
-                # transformers 5.x defaults return_dict=True (a BatchEncoding);
-                # keep the bare-tensor return so [0] selects the row
-                return_dict=False,
-                **switches,
-            )
-        except TemplateError as exc:
-            # a chat the template refuses is the client's to fix: a 400, not a 500
-            raise ValueError(f"GLM-5.2's chat template refused the chat: {exc}") from exc
-        return input_ids[0]
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
