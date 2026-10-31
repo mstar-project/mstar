@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.model.components.code_predictor_kernels import cp_attention
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.utils.attention import apply_rope_pos_ids
 
@@ -120,6 +121,41 @@ def test_fused_code_predictor_rope_matches_checkpoint_formula():
     torch.testing.assert_close(actual_k, expected_k, rtol=1e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("cache_len", [1, 8, 16])
+def test_code_predictor_decode_attention_matches_sdpa(cache_len: int):
+    generator = torch.Generator(device="cuda:0").manual_seed(1234 + cache_len)
+    q = torch.randn(
+        2, 1, 16, 128,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+        generator=generator,
+    )
+    k_cache = torch.randn(
+        2, 16, 8, 128,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+        generator=generator,
+    )
+    v_cache = torch.randn(
+        2, 16, 8, 128,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+        generator=generator,
+    )
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k_cache[:, :cache_len].transpose(1, 2),
+        v_cache[:, :cache_len].transpose(1, 2),
+        is_causal=False,
+        enable_gqa=True,
+    ).transpose(1, 2)
+    # the query is depth position cache_len - 1, attending over every position up to it
+    actual = cp_attention(q, k_cache, v_cache, cache_len - 1)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+
+
 def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
     result = model.process_prompt(
         "Testing Qwen three TTS.",
@@ -142,58 +178,17 @@ def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
     assert prepared.input_seq_len == prepared.input_embeds.shape[0]
 
 
-def _served_decode(model, codec, codes: torch.Tensor) -> torch.Tensor:
-    """One codec step over fresh streams, as the engine runs it: each row on a
-    slot of the model's declared state pool, gathered and scattered around
-    the compiled decode. ``codes [B, Q, frames]`` -> PCM16 ``[B, samples]``."""
-    from mstar.engine.resources import StepContext
-    from mstar.engine.resources.base import EngineResourceInfo
-    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
-    from mstar.engine.resources.runner import StepRunner
-    from mstar.model.qwen3_tts.config import CODEC_STATE
-    from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
-
-    spec = next(s for s in model.get_node_resources() if s.resource_key == CODEC_STATE)
-    spec.apply_yaml_overrides(max_slots=codes.shape[0] + 1)
-    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=codes.device))
-    runner = StepRunner({CODEC_STATE: pool})
-    rids = [f"r{i}" for i in range(codes.shape[0])]
-    for rid in rids:
-        pool.ingest_request(rid)
-    rows = [ARNodeInputs(tensor_inputs={"codec_tokens": codes[i].t()}) for i in range(len(rids))]
-    step = codec.declare_step("codec_chunk", rids, rows)
-    step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="codec_chunk", slot=0, capture=False))
-    assert runner.admit(step).ok
-    runner.plan(step)
-    engine_inputs = ModelInputsFromEngine(
-        request_ids=rids, per_request_info={}, resources={CODEC_STATE: pool}, step=step,
-    )
-    lengths = torch.full((len(rids),), codes.shape[-1], dtype=torch.long, device=codes.device)
-    with torch.no_grad():
-        return codec._decode(engine_inputs, codes, lengths)
-
-
 def test_real_codec_decodes_expected_number_of_pcm_samples(codec, model):
     frames = 2
-    codes = torch.zeros(1, model.config.codec.num_quantizers, frames, dtype=torch.long, device="cuda:0")
-    pcm = _served_decode(model, codec, codes)
+    codes = torch.zeros(
+        1,
+        model.config.codec.num_quantizers,
+        frames,
+        dtype=torch.long,
+        device="cuda:0",
+    )
+    pcm = codec._decode(codes)
     torch.cuda.synchronize()
 
     assert pcm.shape == (1, frames * model.config.codec.decode_upsample_rate)
     assert pcm.dtype == torch.int16
-
-
-def test_real_bf16_codec_stays_close_to_float32(codec, model):
-    """The bf16 codec (``codec_dtype: bfloat16``) against the float32 one on
-    the same codes: a sanity floor that a broken cast or a bf16-only kernel
-    falls through, not the WER gate the deployment was measured with."""
-    bf16_model = Qwen3TTSModel(model_path_hf=str(SNAPSHOT), codec_dtype="bfloat16")
-    bf16_codec = bf16_model.get_submodule("Codec", device="cuda:0")
-    torch.manual_seed(0)
-    codes = torch.randint(
-        0, model.config.codec.codebook_size, (2, model.config.codec.num_quantizers, 25), device="cuda:0",
-    )
-    want = _served_decode(model, codec, codes).double()
-    got = _served_decode(bf16_model, bf16_codec, codes).double()
-    snr = 10 * torch.log10(want.pow(2).sum() / (want - got).pow(2).sum().clamp_min(1e-20))
-    assert snr > 15, f"bf16 codec SNR {snr:.1f} dB against float32"

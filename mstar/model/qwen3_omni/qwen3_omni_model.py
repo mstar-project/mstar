@@ -1658,7 +1658,7 @@ class Qwen3OmniModel(Model):
             stacked_params=stacked,
             name_remapper=self._thinker_remap,
         )
-        code_predictor.consolidate_stacked_weights(talker_model.model.codec_embedding.weight)
+        code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
 
         talker_sub = TalkerSubmodule(
