@@ -1350,8 +1350,8 @@ class Worker:
                     body=row_input_signals(frame, row),
                 )])
                 continue
-            if row.request_id in self._draining_rids:
-                continue  # as _process_new_inputs: no new reads
+            if not self._takes_input(row.request_id):
+                continue  # as _process_new_inputs: nothing read after READS_DONE
             edge = GraphEdge(
                 next_node=row.next_node, name=row.signal,
                 tensor_info=row_infos(frame, row, dtypes), is_streaming=True,

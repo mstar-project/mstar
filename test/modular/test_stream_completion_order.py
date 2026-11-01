@@ -270,6 +270,7 @@ def _conduct(c, wgds) -> InputSignals:
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
     w = Worker.__new__(Worker)
+    w._reads_done_sent = set()  # takes every input (`_takes_input`)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
     buf = StreamBuffer(1, EDGE, "LLM", policy)
