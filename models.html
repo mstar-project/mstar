@@ -298,7 +298,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -2137,11 +2136,14 @@ serves under the yaml’s <code class="docutils literal notranslate"><span class
 first use. The first DiT call after startup is traced twice (a guard on the
 rotary table), so a server compiles at most two graphs per listed shape plus
 one.</p>
-<p><strong>UniPC runs inline, inside the DiT node.</strong> Unlike cosmos3, the scheduler is not
-a separate stage: the solver state (the order-2 history buffer and the
-corrector’s <code class="docutils literal notranslate"><span class="pre">last_sample</span></code>) is carried on the denoise loop’s own edges, so it
-travels with the request rather than living in a scheduler object on one rank.
-Requests are therefore independent and the loop is resumable across ranks.</p>
+<p><strong>UniPC runs inline, inside the DiT node.</strong> The scheduler is the DiT scaffold’s
+(<code class="docutils literal notranslate"><span class="pre">components/diffusion/unipc.py</span></code>, which cosmos3 runs too), not a separate
+stage: the solver state (the order-2 history buffer and the corrector’s
+<code class="docutils literal notranslate"><span class="pre">last_sample</span></code>) is carried on the denoise loop’s own edges, so it travels with
+the request rather than living in a scheduler object on one rank. Requests are
+therefore independent and the loop is resumable across ranks. <code class="docutils literal notranslate"><span class="pre">dit_max_batch_size</span></code>
+(default 1) lets requests at one latent grid and guidance scale share a forward,
+each row count compiling its own graph.</p>
 <p><strong>What is accelerated by default.</strong> The DiT runs under <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>
 (<code class="docutils literal notranslate"><span class="pre">compile_dit</span></code>) and the untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (<code class="docutils literal notranslate"><span class="pre">vae_decode_fast</span></code>; set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> under the

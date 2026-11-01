@@ -651,7 +651,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -1052,8 +1051,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">max_video_pixels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span> <span class="o">*</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
 
     <span class="c1"># torch.compile the inner DiT region (patchify -&gt; blocks -&gt; head). The UniPC</span>
-    <span class="c1"># solver stays eager — its CPU-resident sigma trips Inductor (see</span>
-    <span class="c1"># Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates</span>
+    <span class="c1"># solver stays eager — its CPU-resident sigma trips Inductor. Default ON in serving; the reference-equivalence gates</span>
     <span class="c1"># build with this False to hold the eager path against the reference.</span>
     <span class="n">compile_dit</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># "WxHxF" request shapes (width x height x num_frames) the compiled DiT</span>
@@ -1063,6 +1061,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># compile on the shared worker. A listed shape compiles at most twice (CFG</span>
     <span class="c1"># on and off).</span>
     <span class="n">compile_dit_sizes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Requests at one latent grid sharing a dit forward. Each row count traces its</span>
+    <span class="c1"># own compiled graph, on top of the shapes above.</span>
+    <span class="n">dit_max_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
     <span class="c1"># VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably</span>
     <span class="c1"># exceeds the estimated untiled peak for the output size and tiles otherwise;</span>

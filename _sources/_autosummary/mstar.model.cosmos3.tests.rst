@@ -28,6 +28,7 @@ mstar.model.cosmos3.tests
    :recursive:
 
    pipeline
+   stubs
    test_action
    test_conditioning
    test_denoise_compile

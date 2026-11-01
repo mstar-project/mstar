@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>mstar.model.cosmos3.tests.test_engine_cache &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.model.cosmos3.tests.stubs &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -46,11 +46,11 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.cosmos3.tests.test_engine_cache';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.cosmos3.tests.stubs';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.cosmos3.tests.test_sound" href="mstar.model.cosmos3.tests.test_sound.html" />
+    <link rel="next" title="mstar.model.cosyvoice3" href="mstar.model.cosyvoice3.html" />
     <link rel="prev" title="mstar.model.cosmos3.tests.pipeline" href="mstar.model.cosmos3.tests.pipeline.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -298,7 +298,6 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4 current active"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -544,7 +543,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.cosmos3.tests.test_engine_cache.rst?plain=1" target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.cosmos3.tests.stubs.rst?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -561,7 +560,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.cosmos3.tests.test_engine_cache.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.cosmos3.tests.stubs.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -591,7 +590,7 @@
       
       
       
-      <li><a href="../_sources/_autosummary/mstar.model.cosmos3.tests.test_engine_cache.rst" target="_blank"
+      <li><a href="../_sources/_autosummary/mstar.model.cosmos3.tests.stubs.rst" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -674,7 +673,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>mstar.model.cosmos3.tests.test_engine_cache</h1>
+    <h1>mstar.model.cosmos3.tests.stubs</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -684,21 +683,11 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_accelerator_graph_matches_eager()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v"><code class="docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact_t2v()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_image_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_video_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_dense_matches_paged()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_engine_release_and_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_matches_reference()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.stubs.StubSampler"><code class="docutils literal notranslate"><span class="pre">StubSampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.stubs.StubSampler.initial_state"><code class="docutils literal notranslate"><span class="pre">StubSampler.initial_state()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.stubs.StubSampler.step"><code class="docutils literal notranslate"><span class="pre">StubSampler.step()</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -710,263 +699,34 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="module-mstar.model.cosmos3.tests.test_engine_cache">
-<span id="mstar-model-cosmos3-tests-test-engine-cache"></span><h1>mstar.model.cosmos3.tests.test_engine_cache<a class="headerlink" href="#module-mstar.model.cosmos3.tests.test_engine_cache" title="Link to this heading">#</a></h1>
-<p>GPU parity for the cache-once engine path of the Cosmos3 generator.</p>
-<p>The understanding tower runs once and writes its per-layer K/V; the generation
-tower then runs each denoise step re-reading that frozen K/V (the text tokens get
-no timestep embedding, so their K/V is denoise-step independent — caching it once
-is exact). This checks the <code class="docutils literal notranslate"><span class="pre">Cosmos3DiTSubmodule</span></code> prefill + denoise loop against
-the fused <code class="docutils literal notranslate"><span class="pre">Cosmos3Pipeline</span></code> that runs the whole transformer every step, for both
-image (single frame) and video (multi-frame, fps-modulated mRoPE) generation.</p>
-<dl class="simple">
-<dt>Two GPU-gated checks per mode (need <code class="docutils literal notranslate"><span class="pre">COSMOS3_NANO_DIR</span></code> + CUDA; skipped otherwise):</dt><dd><ul class="simple">
-<li><p>with an in-process sdpa cache (same attention kernel as the fused pipeline),
-the cache-once output is bit-for-bit identical;</p></li>
-<li><p>with the engine’s FlashInfer paged cache (the served path), the decoded output
-matches the fused pipeline within PSNR &gt;= 30 (FlashInfer-vs-sdpa precision).</p></li>
-</ul>
-</dd>
-</dl>
-<p>Run: COSMOS3_NANO_DIR=&lt;snap&gt; python3 test_engine_cache.py</p>
-<p class="rubric">Functions</p>
+  <section id="module-mstar.model.cosmos3.tests.stubs">
+<span id="mstar-model-cosmos3-tests-stubs"></span><h1>mstar.model.cosmos3.tests.stubs<a class="headerlink" href="#module-mstar.model.cosmos3.tests.stubs" title="Link to this heading">#</a></h1>
+<p>Stand-ins the Cosmos3 DiT tests share.</p>
+<p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager" title="mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_accelerator_graph_matches_eager</span></code></a>()</p></td>
-<td><p>The captured-graph denoise step is the served path's accelerator: both guidance branches run in one captured forward (~2x faster than the eager step).</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full" title="mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full</span></code></a>()</p></td>
-<td><p>Image-to-video only consumes latent frame 0, and the Wan VAE encodes it as a standalone causal anchor, so the encoder node's single-frame i2v encode must give a bit-identical frame 0 to the repeat-padded full-clip encode it runs for action policy / forward-dynamics — at a fraction of the cost.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential" title="mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential</span></code></a>()</p></td>
-<td><p>Running both guidance branches in one batched forward must match running them sequentially.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact" title="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v" title="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact_t2v</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager" title="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v" title="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual" title="mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual</span></code></a>()</p></td>
-<td><p>Several requests denoised together in one batch must reproduce each request run alone.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_dense_fa3_image_psnr</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_engine_cache_path_video_psnr</span></code></a>()</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged" title="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_windowed_kv_dense_matches_paged</span></code></a>()</p></td>
-<td><p>kv-mode denoise on the dense FA3 fast path — whose committed prefix mutates every window and is re-gathered on the stream's generation — against the pure paged FlashInfer backend.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_windowed_kv_engine_release_and_psnr</span></code></a>()</p></td>
-<td><p>The served kv path on the real paged pool (production batched-CFG denoise + commit): pages of aged-out context are freed on the live request by the commit-time retention with exact token accounting, and window 0 matches the reference within the usual FlashInfer-vs-sdpa precision bar.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference" title="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_windowed_kv_matches_reference</span></code></a>()</p></td>
-<td><p>The served kv path — block-causal denoise over committed context, commit passes, page-floor release — must reproduce the hand-rolled reference bit-tightly on the sdpa resources (sequential guidance, the bit-exact regime), window by window.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.stubs.StubSampler" title="mstar.model.cosmos3.tests.stubs.StubSampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StubSampler</span></code></a>(timesteps[, update])</p></td>
+<td><p>A request's sampler reduced to its schedule: <code class="docutils literal notranslate"><span class="pre">update</span></code> is the whole step and nothing rides the loop-back edges.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_accelerator_graph_matches_eager</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_accelerator_graph_matches_eager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager" title="Link to this definition">#</a></dt>
-<dd><p>The captured-graph denoise step is the served path’s accelerator: both
-guidance branches run in one captured forward (~2x faster than the eager
-step). Each captured forward matches eager to within bf16 (the first step
-differs by ~one ULP); the multistep solver amplifies that into a small latent
-spread, but the decoded image is unchanged — so gate the decoded image against
-the fused pipeline, the same bar the eager engine path meets.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.stubs.StubSampler">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.stubs.</span></span><span class="sig-name descname"><span class="pre">StubSampler</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timesteps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">update</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">lambda</span> <span class="pre">sample,</span> <span class="pre">velocity:</span> <span class="pre">...</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/stubs.html#StubSampler"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.stubs.StubSampler" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>A request’s sampler reduced to its schedule: <code class="docutils literal notranslate"><span class="pre">update</span></code> is the whole step
+and nothing rides the loop-back edges. Pair it with <code class="docutils literal notranslate"><span class="pre">sub._solver_state</span> <span class="pre">=</span> <span class="pre">()</span></code>.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.stubs.StubSampler.initial_state">
+<span class="sig-name descname"><span class="pre">initial_state</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sample</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/stubs.html#StubSampler.initial_state"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.stubs.StubSampler.initial_state" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_anchor_encode_matches_full</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_anchor_encode_matches_full"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full" title="Link to this definition">#</a></dt>
-<dd><p>Image-to-video only consumes latent frame 0, and the Wan VAE encodes it
-as a standalone causal anchor, so the encoder node’s single-frame i2v encode
-must give a bit-identical frame 0 to the repeat-padded full-clip encode it
-runs for action policy / forward-dynamics — at a fraction of the cost.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.stubs.StubSampler.step">
+<span class="sig-name descname"><span class="pre">step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_output</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_index</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">solver</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generator</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/stubs.html#StubSampler.step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.stubs.StubSampler.step" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_batched_cfg_matches_sequential</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_batched_cfg_matches_sequential"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential" title="Link to this definition">#</a></dt>
-<dd><p>Running both guidance branches in one batched forward must match running
-them sequentially. The two paths differ only in bf16 GEMM rounding (a batched
-matmul tiles differently), so compare the decoded images by PSNR.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_cache_once_matches_fused_exact</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_cache_once_matches_fused_exact"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_cache_once_matches_fused_exact_t2v</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_cache_once_matches_fused_exact_t2v"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_compile_vae_matches_eager</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_compile_vae_matches_eager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_compile_vae_matches_eager_t2v</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_compile_vae_matches_eager_t2v"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_cross_request_batch_matches_individual</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_cross_request_batch_matches_individual"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual" title="Link to this definition">#</a></dt>
-<dd><p>Several requests denoised together in one batch must reproduce each
-request run alone. Distinct prompts are decoded and compared to the fused
-pipeline: batching must (a) keep each request isolated — its own image far
-closer than any other request’s — and (b) not lose quality versus the bs=1
-path (per-prompt fidelity varies with the FlashInfer kernel, so the bar is
-relative to bs=1, not an absolute PSNR).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_dense_fa3_image_psnr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_dense_fa3_image_psnr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_dense_fa3_video_psnr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_dense_fa3_video_psnr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_engine_cache_path_image_psnr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_engine_cache_path_image_psnr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_engine_cache_path_video_psnr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_engine_cache_path_video_psnr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_windowed_kv_dense_matches_paged</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_windowed_kv_dense_matches_paged"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged" title="Link to this definition">#</a></dt>
-<dd><p>kv-mode denoise on the dense FA3 fast path — whose committed prefix
-mutates every window and is re-gathered on the stream’s generation —
-against the pure paged FlashInfer backend. Same machinery, different
-attention kernel: window 0 must agree at the usual kernel-precision bar;
-later windows compound the kernels’ rounding through the committed
-context (same autoregressive-feedback regime as the reference
-comparison) and get the corruption floor.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_windowed_kv_engine_release_and_psnr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_windowed_kv_engine_release_and_psnr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr" title="Link to this definition">#</a></dt>
-<dd><p>The served kv path on the real paged pool (production batched-CFG
-denoise + commit): pages of aged-out context are freed on the live
-request by the commit-time retention with exact token accounting, and
-window 0 matches the reference within the usual FlashInfer-vs-sdpa
-precision bar. Later windows denoise against committed K/V that already
-carries the kernels’ rounding, so their trajectories legitimately diverge
-(autoregressive feedback, not an implementation error — implementation
-fidelity is the bit-exact sdpa check above); they get a corruption
-floor, not the precision bar.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_windowed_kv_matches_reference</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_windowed_kv_matches_reference"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference" title="Link to this definition">#</a></dt>
-<dd><p>The served kv path — block-causal denoise over committed context,
-commit passes, page-floor release — must reproduce the hand-rolled
-reference bit-tightly on the sdpa resources (sequential guidance, the
-bit-exact regime), window by window.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
-</dd>
-</dl>
 </dd></dl>
 
 </section>
@@ -992,11 +752,11 @@ bit-exact regime), window by window.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.cosmos3.tests.test_sound.html"
+       href="mstar.model.cosyvoice3.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.cosmos3.tests.test_sound</p>
+        <p class="prev-next-title">mstar.model.cosyvoice3</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1018,21 +778,11 @@ bit-exact regime), window by window.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_accelerator_graph_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_accelerator_graph_matches_eager()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_anchor_encode_matches_full"><code class="docutils literal notranslate"><span class="pre">test_anchor_encode_matches_full()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_batched_cfg_matches_sequential"><code class="docutils literal notranslate"><span class="pre">test_batched_cfg_matches_sequential()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact"><code class="docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cache_once_matches_fused_exact_t2v"><code class="docutils literal notranslate"><span class="pre">test_cache_once_matches_fused_exact_t2v()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_compile_vae_matches_eager_t2v"><code class="docutils literal notranslate"><span class="pre">test_compile_vae_matches_eager_t2v()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_cross_request_batch_matches_individual"><code class="docutils literal notranslate"><span class="pre">test_cross_request_batch_matches_individual()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_image_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_video_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_dense_matches_paged()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_engine_release_and_psnr()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_matches_reference()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.stubs.StubSampler"><code class="docutils literal notranslate"><span class="pre">StubSampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.stubs.StubSampler.initial_state"><code class="docutils literal notranslate"><span class="pre">StubSampler.initial_state()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.stubs.StubSampler.step"><code class="docutils literal notranslate"><span class="pre">StubSampler.step()</span></code></a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 

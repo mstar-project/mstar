@@ -297,7 +297,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -3097,10 +3096,14 @@ step count, the ragged-attention <code class="docutils literal notranslate"><spa
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> is whatever has to match for two rows to share a forward, and it is also
 the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.</p>
-<p>A multi-step scheduler that carries solver state between iterations (wan22’s UniPC, with
-<code class="docutils literal notranslate"><span class="pre">unipc_model_outputs</span></code> and <code class="docutils literal notranslate"><span class="pre">unipc_last_sample</span></code>) names it in <code class="docutils literal notranslate"><span class="pre">SOLVER_STATE</span></code>; those
-become loop-back edges alongside <code class="docutils literal notranslate"><span class="pre">latents</span></code>, seeded by <code class="docutils literal notranslate"><span class="pre">seed_loop_back</span></code> and returned
-from <code class="docutils literal notranslate"><span class="pre">denoise</span></code> as a <code class="docutils literal notranslate"><span class="pre">{name:</span> <span class="pre">tensor}</span></code> mapping. A scheduler needing another per-step
+<p>A multi-step scheduler that carries solver state between iterations names it in
+<code class="docutils literal notranslate"><span class="pre">SOLVER_STATE</span></code>; those become loop-back edges alongside <code class="docutils literal notranslate"><span class="pre">latents</span></code>, seeded by
+<code class="docutils literal notranslate"><span class="pre">seed_loop_back</span></code> and returned from <code class="docutils literal notranslate"><span class="pre">denoise</span></code> as a <code class="docutils literal notranslate"><span class="pre">{name:</span> <span class="pre">tensor}</span></code> mapping. UniPC
+comes with the scaffold: a subclass of <code class="docutils literal notranslate"><span class="pre">UniPCDenoiseLoopSubmodule</span></code> implements
+<code class="docutils literal notranslate"><span class="pre">model_output</span></code> in place of <code class="docutils literal notranslate"><span class="pre">denoise</span></code>, and the base carries
+<code class="docutils literal notranslate"><span class="pre">unipc_model_outputs</span></code> and <code class="docutils literal notranslate"><span class="pre">unipc_last_sample</span></code> and steps each row by the loop counter
+from its own tables, with no host read, so rows at different steps share a forward
+(wan22 is the example). A scheduler needing another per-step
 scalar adds a <code class="docutils literal notranslate"><span class="pre">STEP_SCALARS</span></code> entry naming the attribute of its <code class="docutils literal notranslate"><span class="pre">FlowMatchSchedule</span></code>
 to slice it from — the base stages that tensor on the device and slices it per step, so
 nothing in the batching path has to change.</p>
