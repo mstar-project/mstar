@@ -380,9 +380,8 @@ def test_llm_check_stop():
     assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
     # any other walk outside the loop may be followed by one the transition runs
     assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
-    # a budget of 1 ends at the prefill; past it the loop cap, not the check, ends decode
+    # a budget of 1 ends at the prefill, before the loop exists to cap it
     assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
-    assert sub.check_stop("r", info(DECODE_WALK, 8, max_tokens=10), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
@@ -398,14 +397,13 @@ def test_llm_check_stop_batched_agrees_with_per_request():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     # rows in forward order, plus a padding row a replay leaves at the end
-    tokens = torch.tensor([IM_END, 1234, EOT, IM_END, 1234, IM_END, 0])
-    row_rids = ("im_end", "word", "eot", "ignored", "budget", "prefill")
+    tokens = torch.tensor([IM_END, 1234, EOT, IM_END, IM_END, 0])
+    row_rids = ("im_end", "word", "eot", "ignored", "prefill")
     infos = {
         "im_end": info(DECODE_WALK, 0),
         "word": info(DECODE_WALK, 0),
         "eot": info(DECODE_WALK, 0),
         "ignored": info(DECODE_WALK, 0, ignore_eos=True),
-        "budget": info(DECODE_WALK, 9, max_tokens=10),  # the loop cap ends it
         "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order

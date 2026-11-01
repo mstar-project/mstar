@@ -43,6 +43,10 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     # mixed step takes any number of them.
     MIXED_MAX_PREFILL_ROWS = None
 
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # decode streams its token to SNAC, not to the client: nothing to inline
+        return {}
+
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 

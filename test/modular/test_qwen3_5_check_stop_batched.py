@@ -37,7 +37,7 @@ def test_batched_agrees_with_per_request(shape):
     row_rids = ("d", "a", "c", "b", "e")
     infos = {
         "d": _info(),                        # EOS: stops
-        "a": _info(done=99, max_tokens=100), # at its budget: the loop cap ends it
+        "a": _info(),                        # no stop id: keeps going
         "c": _info(ignore_eos=True),         # EOS ignored: keeps going
         "b": _info(),                        # other stop id: stops
         "e": _info(),                        # stopped a step ago, not checked
@@ -153,14 +153,8 @@ def test_rows_out_of_batch_order_still_map_by_request():
     sub.stop_token_ids = frozenset({7})
     rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 7])})
 
-    def info(max_tokens, iters=0):
-        return SimpleNamespace(
-            graph_walk="decode",
-            resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
-            dynamic_loop_iter_counts={"decode_loop": iters}, max_tokens=max_tokens,
-        )
-
-    infos = {"a": info(100), "b": info(100), "c": info(5, iters=4), "d": info(100)}
+    info = SimpleNamespace(graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)})
+    infos = dict.fromkeys("abcd", info)
     stops = LLMSubmodule.check_stop_batched(sub, ["c", "d", "b", "a"], infos, rows)
     assert stops == {"c": {"decode_loop"}, "b": {"decode_loop"}}
     # forward order: the same answer without the row map

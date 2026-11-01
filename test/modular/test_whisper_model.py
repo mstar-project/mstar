@@ -579,8 +579,6 @@ def test_decoder_check_stop_honors_eos():
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    # the loop cap ends decode at the budget, not the stop check
-    assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == set()
 
 
 def test_decoder_check_stop_batched_agrees_with_per_request():
@@ -595,16 +593,15 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
         })()
 
     # rows in forward order, plus two padding rows a replay leaves at the end
-    tokens = torch.tensor([EOT, 1234, EOT, 1234, EOT, 0, 0])
-    row_rids = ("eos", "word", "ignored", "budget", "prefill")
+    tokens = torch.tensor([EOT, 1234, EOT, EOT, 0, 0])
+    row_rids = ("eos", "word", "ignored", "prefill")
     infos = {
         "eos": info(DECODE_WALK, 0, 0),                       # stops
         "word": info(DECODE_WALK, 0, 1),                      # keeps going
         "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
-        "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # at its budget: the cap ends it
         "prefill": info(PREFILL_WALK, 0, 4),                  # never stops the loop
     }
-    check = ["prefill", "budget", "ignored", "word", "eos"]  # not forward order
+    check = ["prefill", "ignored", "word", "eos"]  # not forward order
     batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
     per_request = {}
     for i, rid in enumerate(row_rids):

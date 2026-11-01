@@ -393,13 +393,14 @@ BAGEL lays out its prompt:
    The iterations each named loop may run for this request. The conductor refuses a request
    whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
    positions than its pool's ``max_seq_len``, with a 400. A request that sets no length has
-   the default ``max_output_tokens`` cut to the context its prompt leaves, and a stop check
-   reads that length from ``request_info.max_tokens``, which carries the cut. A model that
-   reads a length from another key lists it in ``LENGTH_KWARGS``. Speculation never runs past a
-   cap. A model whose stop
-   check ends a loop at a count returns that count, so the cap and the stop check end the
-   loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
-   every model. Growth on an uncapped loop is counted to its graph ``max_iters``.
+   the default ``max_output_tokens`` cut to the context its prompt leaves, and
+   ``request_info.max_tokens`` carries the cut. A model that reads a length from another key
+   lists it in ``LENGTH_KWARGS``. Speculation never runs past a cap, so the cap is the
+   loop's budget: a token decoder (``TokenStepNode``) returns ``max_output_tokens - 1`` for
+   its decode loop, the prefill having sampled the first token, and its stop check counts
+   nothing. A model whose own stop check also ends a loop at a count returns that count, so
+   the two end the loop on the same iteration; ``test/modular/test_model_kv_layouts.py``
+   checks this per model. Growth on an uncapped loop is counted to its graph ``max_iters``.
 
 Where ``process_prompt`` computes a length that a walk computes another way, such as a
 media item's rows, the walk asserts the two agree: BAGEL's ViT walk against

@@ -341,8 +341,7 @@ def test_prefill_reserves_each_clips_context_once():
 
 def test_batched_stop_check_agrees_with_the_per_request_one():
     """Rows come in the order the forward ran the requests, which needn't be
-    the order the worker asks in; EOS, ignore_eos, and a row at its token
-    limit, which the loop cap ends rather than the stop check."""
+    the order the worker asks in; EOS and ignore_eos."""
     from types import SimpleNamespace
 
     from mstar.model.canary.config import SAMPLER
@@ -350,14 +349,13 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
 
     node = _tiny_node()
 
-    def info(ignore_eos=False, decoded=0, max_tokens=100):
-        return SimpleNamespace(graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
-                               dynamic_loop_iter_counts={"decode_loop": decoded}, max_tokens=max_tokens)
+    def info(ignore_eos=False):
+        return SimpleNamespace(graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)})
 
-    infos = {"eos": info(), "ignored": info(ignore_eos=True), "limit": info(decoded=9, max_tokens=10), "go": info()}
-    rows = ("go", "limit", "eos", "ignored")
-    tokens = torch.tensor([[7], [7], [3], [3]])
-    asked = ["eos", "ignored", "limit", "go"]
+    infos = {"eos": info(), "ignored": info(ignore_eos=True), "go": info()}
+    rows = ("go", "eos", "ignored")
+    tokens = torch.tensor([[7], [3], [3]])
+    asked = ["eos", "ignored", "go"]
     # called as the engine calls it, with the step's walk
     batched = node.check_stop_batched(
         asked, infos, HostRows(request_ids=rows, buffers={"new_token": tokens}), step_walk="decode",

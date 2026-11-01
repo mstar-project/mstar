@@ -609,6 +609,44 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
 
 
+
+def _token_decoder(name: str):
+    """A token decoder model (one whose LLM node is a ``TokenStepNode``) whose
+    ``get_loop_caps`` reads nothing but its config."""
+    if name == "whisper":
+        return _whisper()
+    if name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
+
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+        return model
+    if name == "qwen3_asr":
+        from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
+        from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
+
+        model = object.__new__(Qwen3ASRModel)
+        model.config = Qwen3ASRModelConfig()
+        return model
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.orpheus.orpheus_model import OrpheusModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    classes = {"canary_qwen": CanaryQwenModel, "higgs": HiggsAudioModel, "orpheus": OrpheusModel,
+               "qwen3_5": Qwen3_5DenseModel}
+    return object.__new__(classes[name])
+
+
+@pytest.mark.parametrize("name", ["canary", "canary_qwen", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"])
+@pytest.mark.parametrize("max_tokens", [2, 64])
+def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
+    """The prefill samples the first token and the decode loop's cap runs the
+    rest: the stop check counts no budget of its own, so the cap alone must
+    leave max_tokens tokens (a budget of 1 ends at the prefill)."""
+    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max_tokens
+
+
 def _whisper():
     from mstar.model.components.audio_features import LogMelSpectrogram
     from mstar.model.whisper.config import WhisperModelConfig
