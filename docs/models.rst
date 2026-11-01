@@ -511,9 +511,8 @@ Qwen3-Omni notes
   No chunk is more than 1.3x the one before, so each one arrives before the
   previous one has played while the Talker gives a request about 16 frames/s.
   The default's 13 to 25 frame step needs about 24, which one MI300X serving
-  32 requests doesn't always give a request over its first chunks. It's the
-  recommended deployment on AMD GPUs. Measured on one MI300X (a VM slice, one
-  run per cell), text prompts: TTFA p50 192 / 436 / 542 ms at c=1 / 16 / 32
+  32 requests doesn't always give a request over its first chunks. Measured on
+  one MI300X (a VM slice, one run per cell), text prompts: TTFA p50 192 / 436 / 542 ms at c=1 / 16 / 32
   against 250 / 529 / 684 ms with the default; at c=32 the harness counts
   every chunk in time for text and image prompts (0.99 and 0.97 with the
   default) at the same text throughput, with image throughput 3% lower in its
@@ -526,10 +525,13 @@ Qwen3-Omni notes
   ``ramp4g`` schedule below. On MI325X, at 32 text requests: 168 audio-s/s against
   135, the same at one request. Other platforms serve one worker and the default
   schedule, and ``configs/qwen3omni_2gpu_stock.yaml`` keeps those everywhere.
-- ``configs/qwen3omni_colocated_split3.yaml`` runs the Thinker with the encoders, the
-  Talker and Code2Wav as three workers on one GPU. On one MI325X (a shared node, three
-  launches): 118 audio-s/s against 82 at 32 text requests, 13.0 against 10.3 and time
-  to first audio 147 against 184 ms at one request, first text 40 against 27 ms.
+- On AMD GPUs ``configs/qwen3omni_colocated.yaml`` runs the Thinker with the encoders,
+  the Talker and Code2Wav as three workers on one GPU, the layout of
+  ``configs/qwen3omni_colocated_split3.yaml``. On one MI325X (a quiet node, one run per
+  cell): 133 audio-s/s against 85 at 32 text requests, 13.1 against 10.8 and time to
+  first audio 146 against 184 ms at one request, first text 40 against 27 ms. Other
+  platforms serve one worker, and ``configs/qwen3omni_colocated_stock.yaml`` keeps it
+  everywhere.
 - ``configs/qwen3omni_2gpu_ramp4g.yaml``, the AMD default above, and
   ``configs/qwen3omni_colocated_split3_ramp4g.yaml`` start audio after 4 frames,
   ``codec_chunk_schedule: [4, 5, 6, 8, 10, 13, 16, 20]``. On MI325X time to first
