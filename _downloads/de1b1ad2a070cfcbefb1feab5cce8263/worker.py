@@ -60,7 +60,12 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows
+from mstar.model.submodule_base import (
+    END_PARTITION,
+    BatchedModelOutput,
+    HostRows,
+    chunk_loop_name,
+)
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.streaming.topology import Connection, ProducerWalkCtx
@@ -98,9 +103,14 @@ from mstar.utils.profiler import (
     range_push,
 )
 from mstar.utils.threads import ThreadPool, pin_thread
+from mstar.worker.batch_builder import BatchBuilderType
+from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import (
+    MicroScheduler,
+    ScheduledBatch,
+)
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
@@ -360,12 +370,19 @@ class _LazyPerRid:
         return self._dict().values()
 
 
+
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
     MicroScheduler, and MooncakeCommunicationManager to execute
     computation via engines.
     """
+
+    # This worker's chunk Loops, set at load. Empty here so a worker built
+    # without one -- any test fake -- chunks nowhere rather than raising from
+    # postprocess.
+    chunk_loops: ChunkLoops = ChunkLoops()
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -518,6 +535,10 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
+        self.chunk_loops = ChunkLoops.from_graphs(
+            my_worker_graphs, (model_config or {}).get("speculate_mid_prefill"),
+            model.chunking_policy_of() if model is not None else {},
+        )
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
@@ -617,12 +638,15 @@ class Worker:
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
+            batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
         )
 
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
         self.scheduler.runtime = self._graph_runtime
+        self.scheduler.chunk_loop_walks = self.chunk_loops.walks_by_node
         self.scheduler.rid_of = self._rid
+        self.scheduler.get_tensor = self.tensor_manager.get_tensor
         self.tensor_manager.rid_to_str = self._rid_str
 
         # wire request id -> messages for requests that are not in the queue.
@@ -1283,8 +1307,9 @@ class Worker:
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
                 walk = walks.get(self._walk_driven_edges.get(edge.name))
-                for info in edge.tensor_info:
-                    stream_buf.pre_read_register(info.uuid, walk)
+                stream_buf.pre_read_register_joined(
+                    [info.uuid for info in edge.tensor_info], walk,
+                )
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.process_inputs")
@@ -1750,6 +1775,7 @@ class Worker:
             final_edges=final_edges,
             per_request_input_metadata=per_request_input_metadata,
             request_walks=batch.request_walks,
+            chunk_ranges=batch.chunk_ranges,
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
         )
         node_batch.read_check_rids = batch.read_check_rids
@@ -1848,6 +1874,14 @@ class Worker:
     # ------------------------------------------------------------------
     # Output handling
     # ------------------------------------------------------------------
+    def _release_finished_prompts(self, batch: ScheduledBatch) -> None:
+        """Let go of the prepared input of each prompt whose last chunk just
+        landed; earlier chunks are cut from it (``Engine._prepare_chunk``)."""
+        engine = self.engine_manager.get_engine(batch.node_name)
+        for rid, chunk in batch.chunk_ranges.items():
+            if chunk.is_final and rid in batch.request_to_worker_graph:
+                engine.release_chunk_inputs(rid, batch.node_name)
+
     def _push_back_batch(self, batch: ScheduledBatch) -> None:
         """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
         rids = list(batch.request_to_worker_graph)
@@ -2020,6 +2054,23 @@ class Worker:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
             self._reset_skip_plan_flags(spec_batch)
             return False
+
+    def _continuing_seq_lens(
+        self, pending: PendingBatch, node_name: str, graph_walk: str,
+        continuing: Collection[int], same_node: bool,
+    ) -> list[int]:
+        """The spans the continuing rows will run, for the merge's token
+        budget: the submodule's estimate, -1 where it has none."""
+        engine = self.engine_manager.get_engine(node_name)
+        prev, info = pending.node_batch, pending.node_batch.per_request_info
+        lens = []
+        for rid in continuing:
+            span = engine.speculative_input_seq_len(
+                node_name, graph_walk, info.get(rid),
+                prev.seq_len_of(rid) if same_node else -1,
+            )
+            lens.append(-1 if span is None else span)
+        return lens
 
     def _reset_skip_plan_flags(self, spec_node_batch: ExecutingBatch) -> None:
         """Drop the pre-plan staged for ``spec_node_batch``.
@@ -2326,6 +2377,7 @@ class Worker:
         refused admit, a raise, an executor that never ran it) sets it on
         completion, so the admit fence and the submitter's wait always lift.
         """
+        batch.chunk_loop_walks = self.chunk_loops.walks_by_node.get(batch.node_name, frozenset())
         event = node_batch.launch_started_event = threading.Event()
         future = gpu_executor.submit(
             self._execute_on_gpu_thread, batch, node_batch, plan_future,
@@ -2723,17 +2775,34 @@ class Worker:
     def _choose_spec_target(self, batch: ScheduledBatch) -> SpeculationTarget | None:
         """The (node, walk) the step after ``batch`` speculates into, with the
         rids of ``batch`` on that walk; None when nothing can be speculated."""
-        # One sample rid per real walk; the runtime filters eligibility per walk,
-        # prep_spec_rids the loop completion per rid.
+        # Every row, grouped by real walk: the runtime filters eligibility per
+        # walk and drops a loop-back no row can take; prep_spec_rids the loop
+        # completion per rid.
         groups = batch.rids_by_walk()
+        if len(groups) == 1:
+            rows = next(iter(groups.values()))
+            counts = None if len(rows) == 1 else [len(rows)]
+        else:
+            rows = [rid for walk_rids in groups.values() for rid in walk_rids]
+            counts = [len(walk_rids) for walk_rids in groups.values()]
         ready_for_spec = self._graph_runtime.speculate_node(
-            batch.node_name, list(groups), [rids[0] for rids in groups.values()],
+            batch.node_name, list(groups), rows, counts,
+            batch.loop_strides(rows),
         )
         if not ready_for_spec:
             return None
         # TODO: use the microscheduler to break ties when ready_for_spec
         # contains multiple ready nodes or walks
         info = ready_for_spec[0]
+        if len(ready_for_spec) > 1 and (info.node_name, info.graph_walk) in self.chunk_loops.walks:
+            # After a mixed step, prefer another walk's loop-back (decode) to
+            # a chunk Loop's tick: the chain continues only its target walk's
+            # rows, a mixing chain takes the rows mid-prefill along too, and
+            # a prompt otherwise lets other ready work go first after each step.
+            info = next(
+                (i for i in ready_for_spec if (i.node_name, i.graph_walk) not in self.chunk_loops.walks),
+                info,
+            )
         return SpeculationTarget(info, groups[info.graph_walk])
 
     def _teardowns_pending(self) -> bool:
@@ -2784,9 +2853,12 @@ class Worker:
         # to run it, since the target's admit would otherwise skip the readiness
         # check. The teardown filter comes first, since the readiness check would
         # queue a torn-down rid or reload its pages.
-        candidates = (
-            [r for r in walk_rids if not self._is_tearing_down(r)]
-            if self._teardowns_pending() else walk_rids
+        # N's rows mid-prefill take their next chunk in this step, not the one
+        # after; their nodes stay off the ready queue until N's chunk lands.
+        candidates, mid_prefill = batch_N.get_continuing_rows(
+            spec_node_name, walk_rids,
+            self._is_tearing_down if self._teardowns_pending() else None,
+            self.chunk_loops.speculated,
         )
         if spec_node_name != batch_N.node_name:
             partition = self.request_state.get_partition_for_node(spec_node_name)
@@ -2799,19 +2871,24 @@ class Worker:
         # Who runs the step: the chain only ever continues its own rows, so
         # rows waiting at its target (backlogged, or on its queues) get the
         # step here or not at all while it runs. Nothing is popped yet.
-        chain = self.scheduler.pick_chain_step(self.request_state, spec_target, candidates)
+        chain = self.scheduler.pick_chain_step(
+            self.request_state, spec_target, candidates, mid_prefill,
+        )
         laps.lap("pick_step")
-        if chain.pick.room == 0:
+        mid_prefill = chain.mid_prefill
+        if chain.pick.room == 0 and not mid_prefill:
             # the waiting rows take the whole step, as a step of their own
             batch = self.scheduler.take_chain_step(self.request_state, chain)
             return None if batch is None else self._yield_away_speculation(batch, gave_way=True)
         # prep keeps the first `room` of the chain's rows, in the pick's order
         prep = self._spec_preparer.prepare(
             batch_N, spec_node_name, graph_walk, chain.pick.continuing, chain.pick.room, laps,
+            batch_N.loop_strides(chain.pick.continuing),
         )
         laps.lap("continuing_inputs")
         continuing = prep.ready_rids
-        if not continuing:
+
+        if not continuing and not mid_prefill:
             return None
         # fresh rows of another walk (a mixing chain): rid -> walk
         other_walks: dict[int, str] = {}
@@ -2821,7 +2898,14 @@ class Worker:
         # Speculation only consumes work compatible with the spec target. In
         # partitioned models, unrelated ready work stays queued for
         # the normal scheduler path.
-        fresh_batch = self.scheduler.take_chain_step(self.request_state, chain)
+        fresh_batch = self.scheduler.take_chain_step(
+            self.request_state, chain, len(continuing),
+            # estimated from their spans in this step, if a token budget needs them
+            lambda: self._continuing_seq_lens(
+                pending, spec_node_name, graph_walk, continuing,
+                spec_node_name == batch_N.node_name,
+            ),
+        )
         laps.lap("fresh_schedule")
 
         if fresh_batch is not None:
@@ -2851,7 +2935,8 @@ class Worker:
                     )
                     continue
 
-                prep.per_request_inputs[rid] = fresh_inputs[rid]
+                # a row mid-prefill has no popped inputs: its chunk is cut from what the engine holds
+                prep.per_request_inputs[rid] = fresh_inputs.get(rid, {})
                 prep.request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
@@ -2865,6 +2950,14 @@ class Worker:
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
         speculation = self._spec_builder.build(
             pending, spec_target_info, prep, other_walks, fresh_final_edges,
+            chunk_ranges=None if fresh_batch is None else fresh_batch.chunk_ranges,
+            incomplete_node_rids=None if fresh_batch is None else fresh_batch.incomplete_node_rids,
+        )
+        # N's rows, not fresh ones: a cleared speculation must not ready their
+        # nodes while N's chunk is in flight; N's settle does that
+        spec_rows = speculation.scheduled_batch.request_to_worker_graph
+        speculation.continuing_rids.update(
+            row.request_id for row in mid_prefill if row.request_id in spec_rows
         )
         if chain.pick.ordered:
             speculation.scheduled_batch.turn_order = chain.pick.taken
@@ -2919,9 +3012,14 @@ class Worker:
         ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
         # a mixed N's rows that looped back on the device arrive empty too
         loopback = getattr(outputs_N, "loopback_rids", frozenset())
+        chunked = speculation.scheduled_batch.chunk_ranges
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
                 continue  # fresh rid — inputs already gathered.
+            if rid in chunked:
+                # mid-prefill: its chunk is cut from the input the engine holds, not N's outputs
+                threaded_continuing.add(rid)
+                continue
             if rid in loopback:
                 inputs = speculation.node_batch.per_request_input_tensors[rid]
                 for input_name, _ in speculation.consumed_edges:
@@ -3316,7 +3414,11 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
-        rids = list(batch_N.batch.request_to_worker_graph)
+        # a row mid-prefill keeps its inputs: its next chunk reads them again
+        held = batch_N.batch.incomplete_node_rids
+        rids = [
+            r for r in batch_N.batch.request_to_worker_graph if r not in held
+        ] if held else list(batch_N.batch.request_to_worker_graph)
         if self._lockstep_unread and batch_N.node_name in self._lockstep_led:
             self._consume_lockstep_reads(batch_N.node_batch)
         # What the runtime dereferenced to zero and cannot reclaim itself: a
@@ -3407,6 +3509,8 @@ class Worker:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 
         _pp_stage("completion_event_sync")
+        if batch_N.batch.chunk_ranges:
+            self._release_finished_prompts(batch_N.batch)
         # Waited on above, so the spans have landed; cut before anything reads
         # the outputs: the stop check, the store, a streaming edge.
         empty_spans: dict[int, list[str]] = {}
@@ -3424,7 +3528,12 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        engine.step_finished(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+        # Until its last chunk a row's sampled token is not a real sample, so it
+        # keys no prefix and decides no stop (`_check_stops`).
+        engine.step_finished(
+            batch_N.node_batch, cpu_outputs, host_rows=host_rows,
+            skip_rids=batch_N.batch.incomplete_node_rids,
+        )
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None
@@ -3517,7 +3626,11 @@ class Worker:
         mixes walks, has no declared policies, or has no column keeps
         check_stop."""
         key = (batch_N.node_name, batch_N.graph_walk)
-        if key not in self._stop_token_signal or len(batch_N.batch.rids_by_walk()) > 1:
+        if (
+            key not in self._stop_token_signal or len(batch_N.batch.rids_by_walk()) > 1
+            # a row mid-prefill decides no stop, so its step keeps check_stop
+            or batch_N.batch.incomplete_node_rids
+        ):
             return False, None
         token_signal = self._stop_token_signal[key]
         if token_signal is None:
@@ -3561,7 +3674,10 @@ class Worker:
         # the loop would spin to ``max_iters`` and the partition would never
         # report done.
         stops: dict[int, set[str]] = {}
+        held = batch.incomplete_node_rids  # mid-prefill: decides no stop
         for rid in batch_N.node_batch.final_stream_rids:
+            if rid in held:
+                continue
             loop_name = self._innermost_loop_by_node.get((batch.walk_of(rid), batch_N.node_name))
             if loop_name is not None:
                 stops.setdefault(rid, set()).add(loop_name)
@@ -3595,6 +3711,7 @@ class Worker:
             # done, so it rides the WGD that also counts this pass's last chunks
             partition_done=list(batch_N.node_batch.partition_done_rids),
             python_send=self.enable_prof,
+            loop_strides=batch.loop_strides(rids),
         )
 
     def _check_stops(
@@ -3604,14 +3721,21 @@ class Worker:
         """The model's ``check_stop``, less the ``END_PARTITION`` stops, which
         end their rows' partitions instead (``partition_done_rids``)."""
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+        # Until its last chunk a row's sampled token is not a real sample: a
+        # stop would cut the prompt short. Its chunk Loop ends by its own count.
+        for rid in batch_N.batch.incomplete_node_rids:
+            stops.pop(rid, None)
         ended = []
         # Only a row outside any loop can end its pass here: inside one it
         # would stop only the innermost loop, and a speculated next iteration
         # would carry no report of it. Returning it from a loop is a model
-        # bug, so the client sees an internal error.
+        # bug, so the client sees an internal error. A row whose innermost
+        # loop is its own chunk Loop is on its last chunk (above), where that
+        # Loop ends by its count, so it counts as outside one.
         for rid in [rid for rid, s in stops.items() if END_PARTITION in s]:
             walk = batch_N.batch.walk_of(rid)
-            if (walk, batch_N.node_name) in self._innermost_loop_by_node:
+            loop = self._innermost_loop_by_node.get((walk, batch_N.node_name))
+            if loop is not None and loop != chunk_loop_name(batch_N.node_name, walk):
                 batch_N.node_batch.register_failure(rid, RuntimeError(
                     f"check_stop of node {batch_N.node_name!r} returned END_PARTITION "
                     f"inside a loop of walk {walk!r}; it may end a partition only "
@@ -3816,16 +3940,20 @@ class Worker:
         streamed: list[int] = []
         for signal, per_signal in route_output.local_streaming_by_signal.items():
             consumer = self._walk_driven_edges.get(signal)
+            by_rid: dict[int, list[int]] = {}
             for rid, uuid in per_signal:
+                by_rid.setdefault(rid, []).append(uuid)
+            for rid, uuids in by_rid.items():
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
                 walks = req_info.per_partition_info[batch_N.partition].current_fwd_info.stream_consumer_walks
-                stream_buf.pre_read_register(
-                    uuid, walks.get(consumer) if consumer else None,
+                stream_buf.pre_read_register_joined(
+                    uuids, walks.get(consumer) if consumer else None,
                 )
-                tensor = self.tensor_manager.get_tensor(uuid)
-                stream_buf.put(uuid, tensor.clone())
-                streamed.append(uuid)
+                for uuid in uuids:
+                    tensor = self.tensor_manager.get_tensor(uuid)
+                    stream_buf.put(uuid, tensor.clone())
+                    streamed.append(uuid)
         # After the loop: one crossing for the batch rather than one per
         # streamed tensor.
         self.tensor_manager.dereference_batch_uniform(streamed)
@@ -4501,9 +4629,16 @@ class Worker:
                 (target.info.node_name, target.info.graph_walk) if target is not None
                 else (pending.node_name, pending.graph_walk)
             )
+            # A prompt chain yields from its first step: speculating its next
+            # chunk must not keep decode rows waiting a second prompt step. A
+            # walk with no token budget runs its prompts whole and keeps
+            # main's order.
             other_ready = (
                 fair.peek
-                and consecutive >= 1
+                and (
+                    consecutive >= 1
+                    or (chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key))
+                )
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
@@ -4530,6 +4665,21 @@ class Worker:
             # without the fairness exclusion — it should be free to pick
             # up the batch ``_handle_admit_failure`` just pushed back.
             if speculation is None and not admit_refused:
+                if (
+                    not must_yield_away and fair.peek and consecutive < 1
+                    and self.scheduler.chunks(pending.node_name, pending.graph_walk)
+                ):
+                    # The chain could not continue, so there is no chain to
+                    # keep going: other ready work goes first, as it would
+                    # after the chain's next step. Without this, the step after
+                    # a prompt step whose prompts all finished (or whose rows
+                    # mid-prefill are not speculated, `speculate_mid_prefill`)
+                    # starts another prompt while decode rows wait out both.
+                    # Only after a step under a token budget: elsewhere a
+                    # prompt runs whole, and main's order stands.
+                    must_yield_away = self.scheduler.has_ready_excluding(
+                        self.request_state, chain_key,
+                    )
                 yield_away_from_target = chain_key if must_yield_away else None
                 with self._span("worker.schedule_yield_away"):
                     batch = self.scheduler.get_next_batch(
@@ -4897,10 +5047,10 @@ class Worker:
                             if not speculation.is_yield_away:
                                 # The step will not run at all: un-ingest every
                                 # staged chunk and hand them all back.
+                                sb = speculation.scheduled_batch
                                 self._settle_speculation(speculation, success=False)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
-                                sb = speculation.scheduled_batch
                                 fresh = [
                                     rid for rid in sb.request_to_worker_graph
                                     if rid not in speculation.continuing_rids

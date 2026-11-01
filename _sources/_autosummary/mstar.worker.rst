@@ -28,6 +28,7 @@
    :recursive:
 
    batch_builder
+   chunk_loops
    engine_manager
    executing_batch
    micro_scheduler

@@ -9,6 +9,13 @@ mstar.model.submodule\_base
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      chunk_loop_name
+      chunk_tick_name
+   
    
 
    
@@ -21,8 +28,10 @@ mstar.model.submodule\_base
       ARNodeSubmodule
       BatchedModelOutput
       BatchedStopCheck
+      ChunkingPolicy
       HostRows
       InputMetadata
+      InputSeqLenInfo
       LazyRequestStates
       ModelInputsFromEngine
       NodeInputs

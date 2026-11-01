@@ -1141,7 +1141,20 @@ methods are:
    ``declare_step`` needs a value that ``forward`` does not use, put that value in
    ``resource_step_info``.
 
-``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, **kwargs) -> SubmoduleStep | None``
+``get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None`` (optional)
+   Return the length of the row's whole input, before any cached prefix is cut --
+   the engine subtracts what the prefix cache already holds. Return ``None`` for a
+   walk that declares no length, or when the inputs it would measure are absent.
+   Read off input shapes alone: this runs before ``prepare_inputs``.
+
+``speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len) -> int | None`` (optional)
+   Estimate the length of a row continuing from the step in flight, before that step's
+   outputs reach it; ``prev_seq_len`` is its length in that step, or -1 if it ran on
+   another node. The default repeats ``prev_seq_len``. Only an estimate: it sizes the
+   token budget left for the rows a speculation merges in beside it. A walk with a fixed
+   length (one token a decode step) should return it.
+
+``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, per_request_info=None, **kwargs) -> SubmoduleStep | None``
    Declare what this batch's step does to the node's resources. See
    `Step 4a — Declare the step`_ below.
 
@@ -1275,6 +1288,48 @@ methods are:
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
+
+**Chunked prefill (optional).** A walk with long prompts can run each across several steps,
+at most a token budget per step, so the decode rows batched beside it keep running. Each
+chunk is one iteration of a Loop around the node, which counts the tokens its chunks ran
+and ends at the prompt's length. To opt a walk in:
+
+- ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
+  naming the ``walks`` it covers. It is declared on the model, not the submodule, because
+  the graph build reads it: ``Model`` wraps each chunkable node in its Loop wherever
+  ``get_graph_walk_graphs`` is read, so the model returns its walks as usual. The fields:
+
+  - ``chunkable=True`` lets the walk's rows be cut.
+  - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
+    chunked rows sets one too, since its steps run under it.
+  - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
+    one item per chunk. Any other edge carries the final chunk's output alone.
+  - ``reuses_cached_prefix``: a callable saying whether a row may start past its cached
+    prefix; ``None`` (the default) is always. Set it where a row may have to write its
+    prefix again.
+  - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
+    whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
+    a walk whose state grows by something other than the tokens a step runs.
+
+  A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
+  (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
+  joins the pieces into that item. Leave it unset for a consumer that can take the
+  pieces as they come.
+- ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
+  input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
+  row whose prepared input turns out another length fails.
+- ``split_inputs(graph_walk, fwd_info, inputs, start, end)`` cuts the whole prepared input
+  to tokens ``[start, end)``. ``ARNodeSubmodule``'s default cuts the token ids or
+  embeddings and any custom position ids, and refuses inputs it cannot see into
+  (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
+
+Each chunk is a full forward, so it samples a token, but only the final chunk's token is
+real (``inputs.is_final_chunk``). The model need not handle that: the sampler commits no
+RNG offset or seen token for a row mid-prefill (it reads ``StepContext.chunk_tokens_after``),
+the Loop carries only the final chunk's outputs, and the worker takes no stop or prefix
+key from a non-final chunk. ``test/modular/test_chunked_prefill.py`` and
+``test/modular/test_bagel_chunked_prefill.py`` show how to test a chunking model. A
+deployment can change the budgets (see *Chunked prefill budgets* in :doc:`serving`).
 
 .. _Step 4a — Declare the step:
 

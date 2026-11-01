@@ -604,6 +604,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -808,6 +809,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -975,8 +977,9 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.engine.resources.step</h1><div class="highlight"><pre>
 <span></span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">KeysView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">KeysView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 
@@ -1035,6 +1038,51 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="SettingValue">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.SettingValue">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">SettingValue</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="n">UNSET</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">SET</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">PARTIAL</span> <span class="o">=</span> <span class="mi">2</span></div>
+
+
+
+<div class="viewcode-block" id="PerReqSetting">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.PerReqSetting">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PerReqSetting</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A step's flag that may hold for only some of its rows."""</span>
+    <span class="n">value</span><span class="p">:</span> <span class="n">SettingValue</span>
+    <span class="c1"># the rows it holds for; set iff ``value`` is PARTIAL</span>
+    <span class="n">set_rids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="PerReqSetting.over">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.PerReqSetting.over">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">over</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">holds</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">bool</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PerReqSetting"</span><span class="p">:</span>
+        <span class="n">set_rids</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span> <span class="k">if</span> <span class="n">holds</span><span class="p">(</span><span class="n">rid</span><span class="p">))</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">set_rids</span><span class="p">)</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">rids</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">ALL_SET</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">set_rids</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">NONE_SET</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">SettingValue</span><span class="o">.</span><span class="n">PARTIAL</span><span class="p">,</span> <span class="n">set_rids</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PerReqSetting.holds_for">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.PerReqSetting.holds_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">holds_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">value</span> <span class="ow">is</span> <span class="n">SettingValue</span><span class="o">.</span><span class="n">PARTIAL</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">rid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">set_rids</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">value</span> <span class="ow">is</span> <span class="n">SettingValue</span><span class="o">.</span><span class="n">SET</span></div>
+</div>
+
+
+
+<span class="n">ALL_SET</span> <span class="o">=</span> <span class="n">PerReqSetting</span><span class="p">(</span><span class="n">SettingValue</span><span class="o">.</span><span class="n">SET</span><span class="p">)</span>
+<span class="n">NONE_SET</span> <span class="o">=</span> <span class="n">PerReqSetting</span><span class="p">(</span><span class="n">SettingValue</span><span class="o">.</span><span class="n">UNSET</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="StepContext">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepContext">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1073,6 +1121,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># plan prefill attention even when every row is one token: a packed</span>
     <span class="c1"># capture's forward reads per-row token offsets</span>
     <span class="n">force_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># rid -&gt; input tokens a chunked row runs after this step</span>
+    <span class="n">chunk_tokens_after</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># the rows whose walk grows its state by those tokens, so a resource may</span>
+    <span class="c1"># reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it</span>
+    <span class="c1"># before reserving by ``chunk_tokens_after``.</span>
+    <span class="n">reserve_whole_prefill</span><span class="p">:</span> <span class="n">PerReqSetting</span> <span class="o">=</span> <span class="n">ALL_SET</span>
 
 <div class="viewcode-block" id="StepContext.walk_of">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepContext.walk_of">[docs]</a>

@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -455,6 +456,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1069,12 +1071,44 @@ event loop, not the network, is the bottleneck.</p></td>
 <td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk of the node’s combined
 walks, or a mapping of walk -&gt; <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code>. On for a walk, a speculation
 chain on it merges ready rows of the other walks of its combined walk, so
-decode steps take in new prompts as they arrive. Off (the default), a chain
+decode steps take in new prompts, and their chunks, as they arrive. Off, a chain
 keeps to its own walk and yields to the others, and a step mixes walks only
-when the scheduler builds one fresh. Naming a node with no combined walk, or a
+when the scheduler builds one fresh. Defaults to on where the combined walk
+has a token budget (<code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code>), and off where it has none, since a
+merged prompt then runs whole. Naming a node with no combined walk, or a
 walk outside its combined walks, fails loading.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code></p></td>
+<td><p><em>(optional)</em> Per node, one token budget for every walk the model budgets, or a
+mapping of walk -&gt; budget; null turns a walk’s chunking off. Overrides the
+model’s defaults. See <em>Chunked prefill budgets</em> below.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">can_override_mixed_max_tokens</span></code></p></td>
+<td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code> to let a walk inside a combined walk take a budget
+of its own under the step’s. See <em>Chunked prefill budgets</em> below.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculate_mid_prefill</span></code></p></td>
+<td><p><em>(optional, default true)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk it chunks,
+or a mapping of walk -&gt; <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code>. On, a prompt mid-prefill takes its
+next chunk in the step speculated during the current one, so a lone long prompt
+pays no scheduling gap between chunks; other ready work still goes first after
+every prompt step. Off, the next chunk waits for the current one to land. Naming
+a node or walk the model does not chunk fails loading.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">batch_builder</span></code></p></td>
+<td><p><em>(optional, default</em> <code class="docutils literal notranslate"><span class="pre">fifo</span></code> <em>)</em> How the worker composes a step under a token
+budget (<code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code>). <code class="docutils literal notranslate"><span class="pre">fifo</span></code> serves prompts in the order they started:
+a prompt mid-prefill takes the budget before a newer one, so it finishes first,
+and prompts short enough for an equal share still go in whole. <code class="docutils literal notranslate"><span class="pre">fair_share</span></code>
+splits the budget max-min fair over every waiting prompt, so each advances every
+step and all finish late together.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code></p></td>
+<td><p><em>(optional, default 128)</em> The fewest tokens a prompt cut by chunked prefill runs
+in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
+chunked walk. See <em>Chunked prefill budgets</em> below.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
 <td><p><em>(optional)</em> Requests the server runs after the workers are ready and before it
 binds, so no client pays a shape’s first-request cost (torch.compile of a step,
 a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
@@ -1092,13 +1126,13 @@ the entry first runs once alone, so that graph also warms its one-request
 shape before the copies reach it together. A malformed or failing warmup
 is logged and skipped.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
 <td><p><em>(optional)</em> Timeout in seconds for the NCCL world group and its parallel
 subgroups during weight load and warmup; serving keeps PyTorch’s default.
 Unset keeps PyTorch’s default throughout. Raise it only where weight load,
 JIT or CUDA-graph capture can exceed that default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
 <td><p><em>(optional)</em> Small-message all-reduce path of every TP and SP group:
 <code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code>, <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>;
 any other value fails at startup. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> sends 2-D bf16 CUDA messages
@@ -1113,17 +1147,17 @@ differs from NCCL’s, so bf16 results can differ at the last bit. Falls back
 to NCCL, with a warning, where the chosen path cannot be set up on every
 rank of the group.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
 <td><p><em>(optional)</em> Largest message, in KiB, the non-NCCL path takes;
 larger ones go to NCCL. It is also the size of the buffer each group
 rendezvouses. Default 512.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
 <td><p><em>(optional)</em> Async scheduling for the parallel nodes: <code class="docutils literal notranslate"><span class="pre">true</span></code>
 (default), <code class="docutils literal notranslate"><span class="pre">false</span></code> or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
@@ -1188,6 +1222,73 @@ It doesn’t replace the cap. With a host pool and the prefix cache on, a cached
 copied to the host once no request holds it, and a later request whose prefix the device
 evicted copies it back from there. So the host pool should hold more pages than the device’s
 prefix cache.</p>
+<p><strong>Chunked prefill budgets.</strong> A walk that supports chunked prefill runs at most its token
+budget per step, and a longer prompt is split across steps. Each model sets its own
+budgets:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p>Node</p></th>
+<th class="head"><p>Chunked walks</p></th>
+<th class="head"><p>Default budget</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Qwen3.5</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> (in <code class="docutils literal notranslate"><span class="pre">mixed</span></code>)</p></td>
+<td><p>2048</p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3-Omni</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Thinker</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>, <code class="docutils literal notranslate"><span class="pre">prefill_audio</span></code>, <code class="docutils literal notranslate"><span class="pre">prefill_vision</span></code> (in <code class="docutils literal notranslate"><span class="pre">thinker_mixed</span></code>)</p></td>
+<td><p>1024</p></td>
+</tr>
+<tr class="row-even"><td><p>BAGEL</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> (in <code class="docutils literal notranslate"><span class="pre">mixed_text</span></code>)</p></td>
+<td><p>1024</p></td>
+</tr>
+<tr class="row-odd"><td><p>Orpheus</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LLM</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill</span></code> (in <code class="docutils literal notranslate"><span class="pre">mixed</span></code>)</p></td>
+<td><p>512</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A deployment can override them per node, either with one budget for every walk
+the model budgets or with a budget per walk; null turns a walk’s chunking off. A prompt
+that is cut runs at least <code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code> tokens a step (default 128), or the whole
+budget if that is smaller. When less than that is left of a step’s budget, the prompt waits
+for the next step rather than running the step over its budget.</p>
+<p>Most chunked walks run inside a combined walk, which batches a node’s prompts and its
+decode rows into one step: <code class="docutils literal notranslate"><span class="pre">mixed</span></code> for Qwen3.5’s and Orpheus’s LLM, <code class="docutils literal notranslate"><span class="pre">mixed_text</span></code> for
+BAGEL’s, <code class="docutils literal notranslate"><span class="pre">thinker_mixed</span></code> for Qwen3-Omni’s Thinker. Such a step runs under the combined
+walk’s budget, so that is the one to set, by naming the node or the combined walk:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">max_batch_tokens</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">LLM</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span><span class="w">                    </span><span class="c1"># every budgeted walk of LLM, its combined walk's too</span>
+<span class="w">  </span><span class="nt">Thinker</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">thinker_mixed</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">       </span><span class="c1"># the budget of a Thinker step</span>
+</pre></div>
+</div>
+<p>A walk inside a combined walk takes a budget of its own only on a node listed in
+<code class="docutils literal notranslate"><span class="pre">can_override_mixed_max_tokens</span></code>. There the walk’s budget, its own or the model’s, caps
+that walk’s rows within each step, under the step’s budget, and null keeps its prompts
+whole:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">can_override_mixed_max_tokens</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">Thinker</span><span class="p">:</span><span class="w"> </span><span class="nv">true</span><span class="p p-Indicator">}</span>
+<span class="nt">max_batch_tokens</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">Thinker</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">prefill_vision</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span><span class="w">       </span><span class="c1"># vision rows take at most 512 of a step's tokens</span>
+<span class="w">    </span><span class="nt">prefill_audio</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span><span class="w">       </span><span class="c1"># audio prompts run whole</span>
+</pre></div>
+</div>
+<p>Loading fails if a node is not in any node group, if a walk is one the model never runs, if
+the model sets no budget for that walk, or if the walk is inside a combined walk and its
+node does not set <code class="docutils literal notranslate"><span class="pre">can_override_mixed_max_tokens</span></code>: there the budget would do nothing.</p>
+<p>Chunked prefill is not supported under tensor or sequence parallelism yet. A node whose
+node group spans more than one rank runs its prefills whole, whatever the model and these
+budgets say, and logs a warning at load.</p>
 <p><strong>Data-parallel routing.</strong> A node group whose <code class="docutils literal notranslate"><span class="pre">ranks</span></code> hold several lockstep instances
 (<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">*</span> <span class="pre">sp_size</span></code> ranks each, or one rank) runs each request on one of them, its
 replica. The conductor picks it per request, at ingest, as the replica with the lowest

@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.worker.rid_table" href="mstar.worker.rid_table.html" />
+    <link rel="next" title="mstar.worker.chunk_loops" href="mstar.worker.chunk_loops.html" />
     <link rel="prev" title="mstar.worker" href="mstar.worker.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -455,6 +456,7 @@
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -691,25 +693,39 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.backlog</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.chunkable"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.chunkable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.continuing"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.continuing</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.fresh"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.fresh</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.graph_walk"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.graph_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.max_batch_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.min_chunk_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.min_chunk_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.node_name"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pick"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pick</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.row_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.row_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.start_order"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.start_order</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_max_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.walk_max_tokens</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.backlog"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.backlog</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.chunk_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.chunk_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.returned"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.returned</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.scheduled"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.scheduled</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuilderType"><code class="docutils literal notranslate"><span class="pre">BatchBuilderType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuilderType.FAIR_SHARE"><code class="docutils literal notranslate"><span class="pre">BatchBuilderType.FAIR_SHARE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuilderType.FIFO"><code class="docutils literal notranslate"><span class="pre">BatchBuilderType.FIFO</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.build_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.pick"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.pick()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.share_token_budget"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.share_token_budget()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FairShareBatchBuilder"><code class="docutils literal notranslate"><span class="pre">FairShareBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FairShareBatchBuilder.share_token_budget"><code class="docutils literal notranslate"><span class="pre">FairShareBatchBuilder.share_token_budget()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder"><code class="docutils literal notranslate"><span class="pre">LineOrder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -740,6 +756,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.taken"><code class="docutils literal notranslate"><span class="pre">StepPick.taken</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.fill_token_budget"><code class="docutils literal notranslate"><span class="pre">fill_token_budget()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.fill_token_budget_in_start_order"><code class="docutils literal notranslate"><span class="pre">fill_token_budget_in_start_order()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.make_batch_builder"><code class="docutils literal notranslate"><span class="pre">make_batch_builder()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.off_group_rids"><code class="docutils literal notranslate"><span class="pre">off_group_rids()</span></code></a></li>
 </ul>
@@ -765,6 +783,12 @@ queues (<code class="docutils literal notranslate"><span class="pre">build_batch
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.fill_token_budget" title="mstar.worker.batch_builder.fill_token_budget"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fill_token_budget</span></code></a>(rids, tokens, chunkable, ...)</p></td>
+<td><p>Max-min fair share of <code class="docutils literal notranslate"><span class="pre">budget</span></code> over <code class="docutils literal notranslate"><span class="pre">rids</span></code>: rows under an equal share go in whole, the rest split what is left (chunkable rows) or sit out.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.fill_token_budget_in_start_order" title="mstar.worker.batch_builder.fill_token_budget_in_start_order"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fill_token_budget_in_start_order</span></code></a>(rids, ...)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">budget</span></code> over <code class="docutils literal notranslate"><span class="pre">rids</span></code> first come, first served.</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.make_batch_builder" title="mstar.worker.batch_builder.make_batch_builder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">make_batch_builder</span></code></a>(kind)</p></td>
 <td><p></p></td>
 </tr>
@@ -780,10 +804,10 @@ queues (<code class="docutils literal notranslate"><span class="pre">build_batch
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BaseBatchBuilder" title="mstar.worker.batch_builder.BaseBatchBuilder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BaseBatchBuilder</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildRequest" title="mstar.worker.batch_builder.BatchBuildRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a>(node_name, graph_walk[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildRequest" title="mstar.worker.batch_builder.BatchBuildRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a>(node_name, graph_walk, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildResult" title="mstar.worker.batch_builder.BatchBuildResult"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a>(scheduled, backlog, returned)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuildResult" title="mstar.worker.batch_builder.BatchBuildResult"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a>(scheduled, backlog, ...)</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.BatchBuilderType" title="mstar.worker.batch_builder.BatchBuilderType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchBuilderType</span></code></a>(*values)</p></td>
@@ -792,13 +816,16 @@ queues (<code class="docutils literal notranslate"><span class="pre">build_batch
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.FIFOBatchBuilder" title="mstar.worker.batch_builder.FIFOBatchBuilder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a>()</p></td>
 <td><p>One capture group per step, up to the cap; who goes first when the rows don't all fit is the node's <cite>StepOrder</cite>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.LineOrder" title="mstar.worker.batch_builder.LineOrder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LineOrder</span></code></a>(key, strict)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.FairShareBatchBuilder" title="mstar.worker.batch_builder.FairShareBatchBuilder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FairShareBatchBuilder</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code> with the token budget shared max-min fair (<code class="docutils literal notranslate"><span class="pre">fill_token_budget</span></code>): every waiting prompt advances each step, so a long prompt's first token waits on every other prompt's prefill too.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.LineOrder" title="mstar.worker.batch_builder.LineOrder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LineOrder</span></code></a>(key, strict)</p></td>
 <td><p>How rows line up for a step that can't take them all.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.StepCandidates" title="mstar.worker.batch_builder.StepCandidates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepCandidates</span></code></a>(graph_walk[, continuing, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.StepCandidates" title="mstar.worker.batch_builder.StepCandidates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepCandidates</span></code></a>(graph_walk[, continuing, ...])</p></td>
 <td><p>Every row that could run one step of a scheduling key, for <code class="docutils literal notranslate"><span class="pre">pick</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepPick</span></code></a>(taken, continuing, room, held_back, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepPick</span></code></a>(taken, continuing, room, held_back, ...)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -862,7 +889,7 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fresh</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pick</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><span class="pre">mstar.worker.batch_builder.StepPick</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fresh</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pick</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><span class="pre">mstar.worker.batch_builder.StepPick</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">continuing</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_batch_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_max_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">int]</span> <span class="pre">|</span> <span class="pre">None</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict[int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">int]</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunkable</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_chunk_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_order</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict[int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">int]</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -872,12 +899,29 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <li><p><strong>backlog</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>fresh</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>pick</strong> (<a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><em>StepPick</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>continuing</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>max_batch_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>walk_max_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>row_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>chunkable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>min_chunk_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>start_order</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.backlog">
 <span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.chunkable">
+<span class="sig-name descname"><span class="pre">chunkable</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.chunkable" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.continuing">
+<span class="sig-name descname"><span class="pre">continuing</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.continuing" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -891,6 +935,16 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.max_batch_tokens">
+<span class="sig-name descname"><span class="pre">max_batch_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.max_batch_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.min_chunk_tokens">
+<span class="sig-name descname"><span class="pre">min_chunk_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.min_chunk_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.node_name">
 <span class="sig-name descname"><span class="pre">node_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.node_name" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -900,11 +954,26 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <span class="sig-name descname"><span class="pre">pick</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><span class="pre">StepPick</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.pick" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.row_tokens">
+<span class="sig-name descname"><span class="pre">row_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.row_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.start_order">
+<span class="sig-name descname"><span class="pre">start_order</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.start_order" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.walk_max_tokens">
+<span class="sig-name descname"><span class="pre">walk_max_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_max_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildResult">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildResult</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">scheduled</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returned</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildResult"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildResult</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">scheduled</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backlog</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returned</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildResult"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -912,6 +981,7 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <li><p><strong>scheduled</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>backlog</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>returned</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>chunk_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -919,6 +989,12 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildResult.backlog">
 <span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult.backlog" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildResult.chunk_tokens">
+<span class="sig-name descname"><span class="pre">chunk_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult.chunk_tokens" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
 </dd></dl>
 
 <dl class="py attribute">
@@ -939,6 +1015,11 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuilderType">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuilderType</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuilderType"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuilderType" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuilderType.FAIR_SHARE">
+<span class="sig-name descname"><span class="pre">FAIR_SHARE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'fair_share'</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuilderType.FAIR_SHARE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuilderType.FIFO">
 <span class="sig-name descname"><span class="pre">FIFO</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'fifo'</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuilderType.FIFO" title="Link to this definition">#</a></dt>
@@ -977,6 +1058,14 @@ set drains before anything new starts. A row held back for any other
 reason – OOM backoff, pending remove, a foreign capture group, a walk the
 combined cap left out – always parks: it cannot run this step whoever
 holds it.</p>
+<p>Under a token budget, of the rows the pick took, prompts are served in
+the order they started (<code class="docutils literal notranslate"><span class="pre">fill_token_budget_in_start_order</span></code>), and the
+caller’s rows mid-prefill come first. A row the budget leaves out always
+parks, ahead of the cap’s leftovers, because a budgeted walk’s backlog is
+its line: the Rust runtime scans ready rows in handle order, so a row
+sent back rejoins behind rows that arrived after it. Such a backlog can
+stay non-empty under sustained load; the worker’s fairness peek still
+hands the step after a prompt step to other ready work.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.FIFOBatchBuilder.build_batch">
 <span class="sig-name descname"><span class="pre">build_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FIFOBatchBuilder.build_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch" title="Link to this definition">#</a></dt>
@@ -1002,6 +1091,59 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><em>StepPick</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.FIFOBatchBuilder.share_token_budget">
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">share_token_budget</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunkable</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">budget</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_chunk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_order</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FIFOBatchBuilder.share_token_budget"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FIFOBatchBuilder.share_token_budget" title="Link to this definition">#</a></dt>
+<dd><p>How the step’s rows share its token budget: (rid -&gt; tokens taken,
+rids left out).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>chunkable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>min_chunk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>start_order</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>], <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.FairShareBatchBuilder">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">FairShareBatchBuilder</span></span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FairShareBatchBuilder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FairShareBatchBuilder" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.worker.batch_builder.FIFOBatchBuilder" title="mstar.worker.batch_builder.FIFOBatchBuilder"><code class="xref py py-class docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a></p>
+<p><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code> with the token budget shared max-min fair
+(<code class="docutils literal notranslate"><span class="pre">fill_token_budget</span></code>): every waiting prompt advances each step, so a
+long prompt’s first token waits on every other prompt’s prefill too.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.FairShareBatchBuilder.share_token_budget">
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">share_token_budget</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunkable</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">budget</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_chunk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_order</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#FairShareBatchBuilder.share_token_budget"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.FairShareBatchBuilder.share_token_budget" title="Link to this definition">#</a></dt>
+<dd><p>How the step’s rows share its token budget: (rid -&gt; tokens taken,
+rids left out).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>chunkable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>min_chunk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>start_order</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>], <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1168,6 +1310,66 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.fill_token_budget">
+<span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">fill_token_budget</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunkable</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">budget</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_chunk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#fill_token_budget"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.fill_token_budget" title="Link to this definition">#</a></dt>
+<dd><p>Max-min fair share of <code class="docutils literal notranslate"><span class="pre">budget</span></code> over <code class="docutils literal notranslate"><span class="pre">rids</span></code>: rows under an equal share
+go in whole, the rest split what is left (chunkable rows) or sit out.
+A cut row takes at least <code class="docutils literal notranslate"><span class="pre">min_chunk</span></code> tokens, or all it has left if that
+is fewer: when the share is smaller, only as many rows as what is left
+holds are cut, and if it holds none, they wait for the next step.
+Never empty while a row exists: the first row runs over budget if it must.
+Returns (rid -&gt; tokens taken, rids left out).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>chunkable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>min_chunk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>], <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.worker.batch_builder.fill_token_budget_in_start_order">
+<span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">fill_token_budget_in_start_order</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunkable</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">budget</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">min_chunk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_order</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#fill_token_budget_in_start_order"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.fill_token_budget_in_start_order" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">budget</span></code> over <code class="docutils literal notranslate"><span class="pre">rids</span></code> first come, first served. Rows under an equal
+share go in whole, and then any row that can finish in what is left,
+shortest first, so a short prompt never waits behind a long one. The rest
+follow in start order – prompts already mid-prefill by when they started
+(<code class="docutils literal notranslate"><span class="pre">start_order</span></code>), then the others as listed – each taking all it needs
+of what is left, so a prompt finishes before the next one starts and its
+first token does not wait on every other prompt’s prefill. The first that
+does not fit is cut to what is left if that is at least <code class="docutils literal notranslate"><span class="pre">min_chunk</span></code>
+tokens, and otherwise waits for the next step; one that cannot be cut sits
+out without holding up the rows behind it. Never empty while a row
+exists: the first row runs over budget if it must.</p>
+<p>The oldest prompt mid-prefill keeps <code class="docutils literal notranslate"><span class="pre">min_chunk</span></code> of the budget out of
+the finishing pass, so a steady stream of short prompts cannot starve it.
+Returns (rid -&gt; tokens taken, rids left out).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>chunkable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>min_chunk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>start_order</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>], <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.make_batch_builder">
 <span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">make_batch_builder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kind</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#make_batch_builder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.make_batch_builder" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1223,11 +1425,11 @@ the first eligible rid’s when no anchor is given.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.worker.rid_table.html"
+       href="mstar.worker.chunk_loops.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.worker.rid_table</p>
+        <p class="prev-next-title">mstar.worker.chunk_loops</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1257,25 +1459,39 @@ the first eligible rid’s when no anchor is given.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.backlog</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.chunkable"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.chunkable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.continuing"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.continuing</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.fresh"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.fresh</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.graph_walk"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.graph_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.max_batch_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.min_chunk_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.min_chunk_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.node_name"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.pick"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.pick</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.row_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.row_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.start_order"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.start_order</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildRequest.walk_max_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildRequest.walk_max_tokens</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.backlog"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.backlog</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.chunk_tokens"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.chunk_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.returned"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.returned</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuildResult.scheduled"><code class="docutils literal notranslate"><span class="pre">BatchBuildResult.scheduled</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuilderType"><code class="docutils literal notranslate"><span class="pre">BatchBuilderType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuilderType.FAIR_SHARE"><code class="docutils literal notranslate"><span class="pre">BatchBuilderType.FAIR_SHARE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.BatchBuilderType.FIFO"><code class="docutils literal notranslate"><span class="pre">BatchBuilderType.FIFO</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.build_batch"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.build_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.pick"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.pick()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FIFOBatchBuilder.share_token_budget"><code class="docutils literal notranslate"><span class="pre">FIFOBatchBuilder.share_token_budget()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FairShareBatchBuilder"><code class="docutils literal notranslate"><span class="pre">FairShareBatchBuilder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.FairShareBatchBuilder.share_token_budget"><code class="docutils literal notranslate"><span class="pre">FairShareBatchBuilder.share_token_budget()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.LineOrder"><code class="docutils literal notranslate"><span class="pre">LineOrder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1306,6 +1522,8 @@ the first eligible rid’s when no anchor is given.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.StepPick.taken"><code class="docutils literal notranslate"><span class="pre">StepPick.taken</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.fill_token_budget"><code class="docutils literal notranslate"><span class="pre">fill_token_budget()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.fill_token_budget_in_start_order"><code class="docutils literal notranslate"><span class="pre">fill_token_budget_in_start_order()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.make_batch_builder"><code class="docutils literal notranslate"><span class="pre">make_batch_builder()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.batch_builder.off_group_rids"><code class="docutils literal notranslate"><span class="pre">off_group_rids()</span></code></a></li>
 </ul>

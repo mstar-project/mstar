@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -455,6 +456,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -858,12 +860,16 @@ the state a pass leaves behind once the graph completes and resets.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.graph.graph_io.WorkerGraphIO.mark_node_complete">
-<span class="sig-name descname"><span class="pre">mark_node_complete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/graph_io.html#WorkerGraphIO.mark_node_complete"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete" title="Link to this definition">#</a></dt>
-<dd><p>Signal that a node has finished executing.</p>
+<span class="sig-name descname"><span class="pre">mark_node_complete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loop_stride</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/graph_io.html#WorkerGraphIO.mark_node_complete"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete" title="Link to this definition">#</a></dt>
+<dd><p>Signal that a node has finished executing. <code class="docutils literal notranslate"><span class="pre">loop_stride</span></code>: see
+<code class="docutils literal notranslate"><span class="pre">GraphNode.complete</span></code>.</p>
 <p>The caller must route each edge in output_edges, skipping any in filtered_signals.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>loop_stride</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.NodeCompletionOutput" title="mstar.graph.base.NodeCompletionOutput"><em>NodeCompletionOutput</em></a></p>

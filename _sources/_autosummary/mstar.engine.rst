@@ -38,6 +38,7 @@
    accelerator_graph_backend
    accelerator_graph_config
    accelerator_graph_runner
+   chunking
    engine
    fp32_precision
    node_dtype

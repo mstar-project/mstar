@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
@@ -455,6 +456,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -724,6 +726,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.reason"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.reason</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting"><code class="docutils literal notranslate"><span class="pre">PerReqSetting</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.holds_for"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.holds_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.over"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.over()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.set_rids"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.set_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.value"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.value</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.RequestOffloading"><code class="docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.RequestOffloading.label"><code class="docutils literal notranslate"><span class="pre">RequestOffloading.label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.RequestOffloading.request_id"><code class="docutils literal notranslate"><span class="pre">RequestOffloading.request_id</span></code></a></li>
@@ -739,6 +748,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.Segment.span"><code class="docutils literal notranslate"><span class="pre">Segment.span</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue"><code class="docutils literal notranslate"><span class="pre">SettingValue</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue.PARTIAL"><code class="docutils literal notranslate"><span class="pre">SettingValue.PARTIAL</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue.SET"><code class="docutils literal notranslate"><span class="pre">SettingValue.SET</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue.UNSET"><code class="docutils literal notranslate"><span class="pre">SettingValue.UNSET</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SlotLease"><code class="docutils literal notranslate"><span class="pre">SlotLease</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SlotLease.bucket"><code class="docutils literal notranslate"><span class="pre">SlotLease.bucket</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SlotLease.slot"><code class="docutils literal notranslate"><span class="pre">SlotLease.slot</span></code></a></li>
@@ -746,6 +761,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext"><code class="docutils literal notranslate"><span class="pre">StepContext</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.capture"><code class="docutils literal notranslate"><span class="pre">StepContext.capture</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.chunk_tokens_after"><code class="docutils literal notranslate"><span class="pre">StepContext.chunk_tokens_after</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.force_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.force_prefill</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.graph_walk"><code class="docutils literal notranslate"><span class="pre">StepContext.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.is_padding_row"><code class="docutils literal notranslate"><span class="pre">StepContext.is_padding_row()</span></code></a></li>
@@ -757,6 +773,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.plan_results"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_results</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.request_ids"><code class="docutils literal notranslate"><span class="pre">StepContext.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.request_walks"><code class="docutils literal notranslate"><span class="pre">StepContext.request_walks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.reserve_whole_prefill</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.set_padded_rids"><code class="docutils literal notranslate"><span class="pre">StepContext.set_padded_rids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.set_piecewise_leases"><code class="docutils literal notranslate"><span class="pre">StepContext.set_piecewise_leases()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.slot"><code class="docutils literal notranslate"><span class="pre">StepContext.slot</span></code></a></li>
@@ -808,14 +825,20 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.FullAdmitOutcome" title="mstar.engine.resources.step.FullAdmitOutcome"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FullAdmitOutcome</span></code></a>(outcome[, failed_resource, ...])</p></td>
 <td><p>What the runner answers with: one resource's outcome, plus which resource gave it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.RequestOffloading" title="mstar.engine.resources.step.RequestOffloading"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a>(message, label, request_id)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.PerReqSetting" title="mstar.engine.resources.step.PerReqSetting"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PerReqSetting</span></code></a>(value[, set_rids])</p></td>
+<td><p>A step's flag that may hold for only some of its rows.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.RequestOffloading" title="mstar.engine.resources.step.RequestOffloading"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a>(message, label, request_id)</p></td>
 <td><p>The request's state is moving to host memory; retry once it is back.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResourceStep</span></code></a>([segments])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResourceStep</span></code></a>([segments])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Segment</span></code></a>(request_id, label, span)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Segment</span></code></a>(request_id, label, span)</p></td>
 <td><p>One step's addition to a request's cache stream.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.step.SettingValue" title="mstar.engine.resources.step.SettingValue"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SettingValue</span></code></a>(*values)</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.step.SlotLease" title="mstar.engine.resources.step.SlotLease"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SlotLease</span></code></a>(slot, bucket)</p></td>
 <td><p>attention <cite>admit</cite> gives to inform which slot to plan and replay</p></td>
@@ -1051,6 +1074,62 @@ eviction to the resource that actually ran out.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.PerReqSetting">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">PerReqSetting</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">set_rids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#PerReqSetting"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.PerReqSetting" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A step’s flag that may hold for only some of its rows.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>value</strong> (<a class="reference internal" href="#mstar.engine.resources.step.SettingValue" title="mstar.engine.resources.step.SettingValue"><em>SettingValue</em></a>)</p></li>
+<li><p><strong>set_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.PerReqSetting.holds_for">
+<span class="sig-name descname"><span class="pre">holds_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#PerReqSetting.holds_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.PerReqSetting.holds_for" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.PerReqSetting.over">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">over</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">holds</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#PerReqSetting.over"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.PerReqSetting.over" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>holds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.step.PerReqSetting" title="mstar.engine.resources.step.PerReqSetting"><em>PerReqSetting</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.PerReqSetting.set_rids">
+<span class="sig-name descname"><span class="pre">set_rids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.step.PerReqSetting.set_rids" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.PerReqSetting.value">
+<span class="sig-name descname"><span class="pre">value</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.step.SettingValue" title="mstar.engine.resources.step.SettingValue"><span class="pre">SettingValue</span></a></span><a class="headerlink" href="#mstar.engine.resources.step.PerReqSetting.value" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.RequestOffloading">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">RequestOffloading</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">message</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#RequestOffloading"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.RequestOffloading" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.engine.resources.step.AdmitFailedReason" title="mstar.engine.resources.step.AdmitFailedReason"><code class="xref py py-class docutils literal notranslate"><span class="pre">AdmitFailedReason</span></code></a></p>
@@ -1136,6 +1215,27 @@ __init__ is the expensive way to do that.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.SettingValue">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">SettingValue</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SettingValue"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.SettingValue" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.SettingValue.PARTIAL">
+<span class="sig-name descname"><span class="pre">PARTIAL</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></span><a class="headerlink" href="#mstar.engine.resources.step.SettingValue.PARTIAL" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.SettingValue.SET">
+<span class="sig-name descname"><span class="pre">SET</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.engine.resources.step.SettingValue.SET" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.SettingValue.UNSET">
+<span class="sig-name descname"><span class="pre">UNSET</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.step.SettingValue.UNSET" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.SlotLease">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">SlotLease</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bucket</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SlotLease"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.SlotLease" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
@@ -1163,7 +1263,7 @@ __init__ is the expensive way to do that.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.StepContext">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">StepContext</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">request_ids:</span> <span class="pre">collections.abc.Sequence[int],</span> <span class="pre">graph_walk:</span> <span class="pre">str,</span> <span class="pre">slot:</span> <span class="pre">int,</span> <span class="pre">capture:</span> <span class="pre">bool,</span> <span class="pre">is_preplan:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">plan_phase:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'res.plan',</span> <span class="pre">plan_results:</span> <span class="pre">dict[str,</span> <span class="pre">typing.Any]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">slot_lease:</span> <span class="pre">mstar.engine.resources.step.SlotLease</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">piecewise_leases:</span> <span class="pre">'Mapping[str,</span> <span class="pre">SlotLease]'</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">_padded_request_ids:</span> <span class="pre">collections.abc.Sequence[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">_real_rids:</span> <span class="pre">frozenset</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">request_walks:</span> <span class="pre">collections.abc.Mapping[int,</span> <span class="pre">str]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">force_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#StepContext"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.StepContext" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.step.</span></span><span class="sig-name descname"><span class="pre">StepContext</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">request_ids:</span> <span class="pre">collections.abc.Sequence[int],</span> <span class="pre">graph_walk:</span> <span class="pre">str,</span> <span class="pre">slot:</span> <span class="pre">int,</span> <span class="pre">capture:</span> <span class="pre">bool,</span> <span class="pre">is_preplan:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">plan_phase:</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'res.plan',</span> <span class="pre">plan_results:</span> <span class="pre">dict[str,</span> <span class="pre">typing.Any]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">slot_lease:</span> <span class="pre">mstar.engine.resources.step.SlotLease</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">piecewise_leases:</span> <span class="pre">'Mapping[str,</span> <span class="pre">SlotLease]'</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">_padded_request_ids:</span> <span class="pre">collections.abc.Sequence[int]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">_real_rids:</span> <span class="pre">frozenset</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">request_walks:</span> <span class="pre">collections.abc.Mapping[int,</span> <span class="pre">str]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">force_prefill:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">chunk_tokens_after:</span> <span class="pre">collections.abc.Mapping[int,</span> <span class="pre">int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">reserve_whole_prefill:</span> <span class="pre">mstar.engine.resources.step.PerReqSetting</span> <span class="pre">=</span> <span class="pre">PerReqSetting(value=&lt;SettingValue.SET:</span> <span class="pre">1&gt;,</span> <span class="pre">set_rids=None)</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#StepContext"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.step.StepContext" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1181,12 +1281,19 @@ __init__ is the expensive way to do that.</p>
 <li><p><strong>_real_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>request_walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>force_prefill</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>chunk_tokens_after</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>reserve_whole_prefill</strong> (<a class="reference internal" href="#mstar.engine.resources.step.PerReqSetting" title="mstar.engine.resources.step.PerReqSetting"><em>PerReqSetting</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.StepContext.capture">
 <span class="sig-name descname"><span class="pre">capture</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.step.StepContext.capture" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.StepContext.chunk_tokens_after">
+<span class="sig-name descname"><span class="pre">chunk_tokens_after</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.step.StepContext.chunk_tokens_after" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1262,6 +1369,11 @@ should reserve, address and commit nothing on its behalf.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.step.StepContext.request_walks">
 <span class="sig-name descname"><span class="pre">request_walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.step.StepContext.request_walks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.step.StepContext.reserve_whole_prefill">
+<span class="sig-name descname"><span class="pre">reserve_whole_prefill</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.step.PerReqSetting" title="mstar.engine.resources.step.PerReqSetting"><span class="pre">PerReqSetting</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">(SettingValue.SET,</span> <span class="pre">None)</span></span><a class="headerlink" href="#mstar.engine.resources.step.StepContext.reserve_whole_prefill" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -1463,6 +1575,13 @@ should reserve, address and commit nothing on its behalf.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.FullAdmitOutcome.reason"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.reason</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting"><code class="docutils literal notranslate"><span class="pre">PerReqSetting</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.holds_for"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.holds_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.over"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.over()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.set_rids"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.set_rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.PerReqSetting.value"><code class="docutils literal notranslate"><span class="pre">PerReqSetting.value</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.RequestOffloading"><code class="docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.RequestOffloading.label"><code class="docutils literal notranslate"><span class="pre">RequestOffloading.label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.RequestOffloading.request_id"><code class="docutils literal notranslate"><span class="pre">RequestOffloading.request_id</span></code></a></li>
@@ -1478,6 +1597,12 @@ should reserve, address and commit nothing on its behalf.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.Segment.span"><code class="docutils literal notranslate"><span class="pre">Segment.span</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue"><code class="docutils literal notranslate"><span class="pre">SettingValue</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue.PARTIAL"><code class="docutils literal notranslate"><span class="pre">SettingValue.PARTIAL</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue.SET"><code class="docutils literal notranslate"><span class="pre">SettingValue.SET</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SettingValue.UNSET"><code class="docutils literal notranslate"><span class="pre">SettingValue.UNSET</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SlotLease"><code class="docutils literal notranslate"><span class="pre">SlotLease</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SlotLease.bucket"><code class="docutils literal notranslate"><span class="pre">SlotLease.bucket</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.SlotLease.slot"><code class="docutils literal notranslate"><span class="pre">SlotLease.slot</span></code></a></li>
@@ -1485,6 +1610,7 @@ should reserve, address and commit nothing on its behalf.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext"><code class="docutils literal notranslate"><span class="pre">StepContext</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.capture"><code class="docutils literal notranslate"><span class="pre">StepContext.capture</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.chunk_tokens_after"><code class="docutils literal notranslate"><span class="pre">StepContext.chunk_tokens_after</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.force_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.force_prefill</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.graph_walk"><code class="docutils literal notranslate"><span class="pre">StepContext.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.is_padding_row"><code class="docutils literal notranslate"><span class="pre">StepContext.is_padding_row()</span></code></a></li>
@@ -1496,6 +1622,7 @@ should reserve, address and commit nothing on its behalf.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.plan_results"><code class="docutils literal notranslate"><span class="pre">StepContext.plan_results</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.request_ids"><code class="docutils literal notranslate"><span class="pre">StepContext.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.request_walks"><code class="docutils literal notranslate"><span class="pre">StepContext.request_walks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">StepContext.reserve_whole_prefill</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.set_padded_rids"><code class="docutils literal notranslate"><span class="pre">StepContext.set_padded_rids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.set_piecewise_leases"><code class="docutils literal notranslate"><span class="pre">StepContext.set_piecewise_leases()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.step.StepContext.slot"><code class="docutils literal notranslate"><span class="pre">StepContext.slot</span></code></a></li>

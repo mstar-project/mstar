@@ -604,6 +604,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -808,6 +809,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1444,6 +1446,16 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># The request's real walk, stamped by the engine; None on capture templates</span>
     <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># Set by the engine on a chunk of a split input: where it starts, and the</span>
+    <span class="c1"># whole input's length. None means not chunked.</span>
+    <span class="n">chunk_start</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">chunk_total</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_final_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_total</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> \
+            <span class="bp">self</span><span class="o">.</span><span class="n">chunk_start</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_seq_len</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_total</span>
+
 <div class="viewcode-block" id="NodeInputs.clone">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs.clone">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clone</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1501,6 +1513,88 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"cannot be told apart; override `split_inputs`"</span>
         <span class="p">)</span>
     <span class="k">return</span> <span class="n">pos_ids</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
+
+
+<div class="viewcode-block" id="ChunkingPolicy">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ChunkingPolicy">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ChunkingPolicy</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""How a walk's prefill may be split across steps; the default is not at all.</span>
+
+<span class="sd">    ``walks``: the walks this policy covers. Declared per node on the model</span>
+<span class="sd">    (``Model.get_chunking_policies``) rather than on the submodule, because</span>
+<span class="sd">    the graph build needs it: a chunkable node is wrapped in a Loop for</span>
+<span class="sd">    exactly these walks, and a chunk is one iteration of it.</span>
+
+<span class="sd">    ``accumulated_outputs``: output edges a consumer needs every chunk of,</span>
+<span class="sd">    gathered on the Loop and handed over as one item per chunk when the</span>
+<span class="sd">    prompt finishes. A streamed edge's consumer gets them joined into one item</span>
+<span class="sd">    by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here</span>
+<span class="sd">    carries the final chunk's tensors alone.</span>
+
+<span class="sd">    ``reserve_whole_prefill``: whether a first chunk reserves the KV the</span>
+<span class="sd">    whole prefill needs, so a part-done row cannot wedge on a full arena.</span>
+<span class="sd">    Counted in tokens, so a walk whose KV grows by something else sets False</span>
+<span class="sd">    and reserves per chunk.</span>
+<span class="sd">    """</span>
+    <span class="n">walks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+    <span class="c1"># rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them</span>
+    <span class="n">chunkable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">accumulated_outputs</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="c1"># most tokens a step of this walk runs; a combined walk that carries chunks sets one too</span>
+    <span class="n">max_batch_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># whether a row may start past its cached prefix, asked before prepare; None is always</span>
+    <span class="n">reuses_cached_prefix</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">CurrentForwardPassInfo</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">reserve_whole_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span></div>
+
+
+
+<span class="n">NO_CHUNKING</span> <span class="o">=</span> <span class="n">ChunkingPolicy</span><span class="p">()</span>
+
+
+<span class="c1"># A chunk Loop's count before its prompt's first chunk sets the real cap (the</span>
+<span class="c1"># prompt's length), and the stride of a row that runs whole: it ends the Loop.</span>
+<span class="c1"># Within the u32 both runtimes hold loop counters in.</span>
+<span class="n">CHUNK_LOOP_END</span> <span class="o">=</span> <span class="mi">2</span><span class="o">**</span><span class="mi">31</span> <span class="o">-</span> <span class="mi">1</span>
+
+
+<div class="viewcode-block" id="chunk_loop_name">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.chunk_loop_name">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">chunk_loop_name</span><span class="p">(</span><span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The Loop a chunkable ``(node, walk)``'s prefill runs as.</span>
+
+<span class="sd">    Derived rather than declared so the graph build, the engine's stop check</span>
+<span class="sd">    and the startup validation all name the same loop without passing it</span>
+<span class="sd">    around. Per walk, not per node: a node can chunk under several walks and</span>
+<span class="sd">    each has its own loop state.</span>
+<span class="sd">    """</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">"chunk_loop:</span><span class="si">{</span><span class="n">node_name</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">graph_walk</span><span class="si">}</span><span class="s2">"</span></div>
+
+
+
+<div class="viewcode-block" id="chunk_tick_name">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.chunk_tick_name">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">chunk_tick_name</span><span class="p">(</span><span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The chunk Loop's loop-back signal, carrying nothing.</span>
+
+<span class="sd">    Speculation offers a next-iteration target only for a node that routes an</span>
+<span class="sd">    edge back to itself, so without this a chunk-only step is a pipeline</span>
+<span class="sd">    bubble. The node declares it as an input too -- an edge it does not read is</span>
+<span class="sd">    no loop-back, just an output nobody consumes -- which leaves it unready for</span>
+<span class="sd">    its FIRST chunk, so the conductor seeds one with the request's inputs.</span>
+<span class="sd">    """</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">chunk_loop_name</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span><span class="w"> </span><span class="n">graph_walk</span><span class="p">)</span><span class="si">}</span><span class="s2">.next_chunk"</span></div>
+
+
+
+<div class="viewcode-block" id="InputSeqLenInfo">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.InputSeqLenInfo">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">InputSeqLenInfo</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A row's token count before ``prepare_inputs``, for admission."""</span>
+    <span class="n">seq_len</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># leading tokens the prefix cache already holds, not counted in ``seq_len``</span>
+    <span class="n">cached_prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span></div>
+
 
 
 <div class="viewcode-block" id="ARNodeInputs">
@@ -1854,6 +1948,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.get_input_sequence_len">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_input_sequence_len</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">InputSeqLenInfo</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This row's token count, read from input shapes alone; None when the</span>
+<span class="sd">        walk does not declare one. A chunkable walk's prompts are cut into</span>
+<span class="sd">        chunks by it, so it must equal ``prepare_inputs().input_seq_len`` of the</span>
+<span class="sd">        whole input (before any cached prefix is removed), or the row fails</span>
+<span class="sd">        at its first chunk."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">kwargs</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.split_batches_by_capture_key">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">split_batches_by_capture_key</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -2069,6 +2178,23 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        declaring and admitting a second time."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">False</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.speculative_input_seq_len">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">speculative_input_seq_len</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">prev_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The span of a row continuing from the step in flight, estimated</span>
+<span class="sd">        before that step's outputs reach it. ``prev_seq_len`` is its span in</span>
+<span class="sd">        that step, or -1 if it ran on another node. The default repeats the</span>
+<span class="sd">        last span on this node and has no estimate otherwise; a walk that</span>
+<span class="sd">        fixes its span (one token a decode step) should say so. Only an</span>
+<span class="sd">        estimate, which sizes the token budget left for the rows merged in</span>
+<span class="sd">        beside it."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span>
+        <span class="k">return</span> <span class="n">prev_seq_len</span> <span class="k">if</span> <span class="n">prev_seq_len</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.device_loopback_signals">

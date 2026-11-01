@@ -23,9 +23,11 @@ mstar.engine.resources.step
       AllocationFailed
       BucketKey
       FullAdmitOutcome
+      PerReqSetting
       RequestOffloading
       ResourceStep
       Segment
+      SettingValue
       SlotLease
       StepContext
       SubmoduleStep

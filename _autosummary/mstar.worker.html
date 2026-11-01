@@ -247,6 +247,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -451,6 +452,7 @@
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="current reference internal" href="#">mstar.worker</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -689,13 +691,16 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.batch_builder.html#module-mstar.worker.batch_builder" title="mstar.worker.batch_builder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">batch_builder</span></code></a></p></td>
 <td><p>Batch composition: which ready rows of one (node, walk) run this step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.chunk_loops.html#module-mstar.worker.chunk_loops" title="mstar.worker.chunk_loops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_loops</span></code></a></p></td>
+<td><p>The worker's side of chunked prefill: which (node, walk) pairs run as a chunk Loop, and how far each step moves them.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
 <td><p>Worker-local integer handles for request ids.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
 <td><p>A speculative step's per-row objects, built as columns.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
 <td><p>The engine worker's metrics, built only while metrics are on.</p></td>
 </tr>
 </tbody>

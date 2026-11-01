@@ -604,6 +604,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -808,6 +809,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1070,7 +1072,24 @@ window.runMermaid = runMermaid;</script>
     <span class="n">backlog</span><span class="p">:</span> <span class="s2">"ScheduledBatch | None"</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">fresh</span><span class="p">:</span> <span class="s2">"ScheduledBatch | None"</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># `pick`'s verdict over these rows.</span>
-    <span class="n">pick</span><span class="p">:</span> <span class="n">StepPick</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">pick</span><span class="p">:</span> <span class="n">StepPick</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The caller's rows whose current chunk is still in flight (not popped):</span>
+    <span class="c1"># first in line for their next chunk. One left out of the step is neither</span>
+    <span class="c1"># parked nor returned; it goes back to its queue when its chunk lands.</span>
+    <span class="n">continuing</span><span class="p">:</span> <span class="s2">"ScheduledBatch | None"</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Token budget for the step; None for none. With it, each row's remaining</span>
+    <span class="c1"># tokens, and the rows that may be cut into chunks.</span>
+    <span class="n">max_batch_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Under a combined walk: walk -&gt; the most tokens that walk's rows may run</span>
+    <span class="c1"># within the step's budget (can_override_mixed_max_tokens); None for none.</span>
+    <span class="n">walk_max_tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">row_tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
+    <span class="c1"># The fewest tokens a cut row runs (the node's floor for its configured</span>
+    <span class="c1"># budget; ``max_batch_tokens`` above is what is left of that budget).</span>
+    <span class="n">min_chunk_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="c1"># Rows already mid-prefill -&gt; when their first chunk was cut; lower is older.</span>
+    <span class="n">start_order</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
 
 
 
@@ -1081,7 +1100,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Parked under this (node, walk) for a later step.</span>
     <span class="n">backlog</span><span class="p">:</span> <span class="s2">"ScheduledBatch | None"</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Popped rows handed back to their ready queues: rid -&gt; worker graph id.</span>
-    <span class="n">returned</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">returned</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Rows cut short this step: rid -&gt; tokens to run.</span>
+    <span class="n">chunk_tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1185,6 +1206,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    reason -- OOM backoff, pending remove, a foreign capture group, a walk the</span>
 <span class="sd">    combined cap left out -- always parks: it cannot run this step whoever</span>
 <span class="sd">    holds it.</span>
+
+<span class="sd">    Under a token budget, of the rows the pick took, prompts are served in</span>
+<span class="sd">    the order they started (``fill_token_budget_in_start_order``), and the</span>
+<span class="sd">    caller's rows mid-prefill come first. A row the budget leaves out always</span>
+<span class="sd">    parks, ahead of the cap's leftovers, because a budgeted walk's backlog is</span>
+<span class="sd">    its line: the Rust runtime scans ready rows in handle order, so a row</span>
+<span class="sd">    sent back rejoins behind rows that arrived after it. Such a backlog can</span>
+<span class="sd">    stay non-empty under sustained load; the worker's fairness peek still</span>
+<span class="sd">    hands the step after a prompt step to other ready work.</span>
 <span class="sd">    """</span>
 
 <div class="viewcode-block" id="FIFOBatchBuilder.pick">
@@ -1273,7 +1303,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">fresh_rids</span> <span class="o">=</span> <span class="p">(</span>
             <span class="nb">set</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">fresh</span><span class="o">.</span><span class="n">request_to_worker_graph</span><span class="p">)</span> <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">fresh</span> <span class="k">else</span> <span class="nb">set</span><span class="p">()</span>
         <span class="p">)</span>
-        <span class="n">batch</span> <span class="o">=</span> <span class="n">_merged</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">backlog</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">fresh</span><span class="p">)</span>
+        <span class="n">batch</span> <span class="o">=</span> <span class="n">_merged</span><span class="p">(</span><span class="n">_merged</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">continuing</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">backlog</span><span class="p">),</span> <span class="n">request</span><span class="o">.</span><span class="n">fresh</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">batch</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
         <span class="n">pick</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">pick</span>
@@ -1282,21 +1312,223 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">taken</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">backlog</span><span class="o">=</span><span class="n">batch</span><span class="p">)</span>
         <span class="n">scheduled</span><span class="p">,</span> <span class="n">remainder</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">split_off_rids</span><span class="p">(</span><span class="n">taken</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">remainder</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="n">scheduled</span><span class="p">)</span>
-        <span class="n">give_back</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">remainder</span><span class="o">.</span><span class="n">request_to_worker_graph</span>
-            <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">fresh_rids</span> <span class="ow">and</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">pick</span><span class="o">.</span><span class="n">held_back</span>
-        <span class="p">}</span> <span class="k">if</span> <span class="n">had_backlog</span> <span class="k">else</span> <span class="nb">set</span><span class="p">()</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">give_back</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="n">scheduled</span><span class="p">,</span> <span class="n">backlog</span><span class="o">=</span><span class="n">remainder</span><span class="p">)</span>
-        <span class="n">parked</span><span class="p">,</span> <span class="n">returned</span> <span class="o">=</span> <span class="n">remainder</span><span class="o">.</span><span class="n">split_off_first</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">exclude_rids</span><span class="o">=</span><span class="n">give_back</span><span class="p">)</span>
+        <span class="n">returned</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">remainder</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">had_backlog</span><span class="p">:</span>
+            <span class="n">give_back</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">remainder</span><span class="o">.</span><span class="n">request_to_worker_graph</span>
+                <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">fresh_rids</span> <span class="ow">and</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">pick</span><span class="o">.</span><span class="n">held_back</span>
+            <span class="p">}</span>
+            <span class="k">if</span> <span class="n">give_back</span><span class="p">:</span>
+                <span class="n">remainder</span><span class="p">,</span> <span class="n">back</span> <span class="o">=</span> <span class="n">remainder</span><span class="o">.</span><span class="n">split_off_first</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">exclude_rids</span><span class="o">=</span><span class="n">give_back</span><span class="p">)</span>
+                <span class="n">returned</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">back</span><span class="o">.</span><span class="n">request_to_worker_graph</span><span class="p">)</span> <span class="k">if</span> <span class="n">back</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">max_batch_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span><span class="n">scheduled</span><span class="p">,</span> <span class="n">backlog</span><span class="o">=</span><span class="n">remainder</span><span class="p">,</span> <span class="n">returned</span><span class="o">=</span><span class="n">returned</span><span class="p">)</span>
+
+        <span class="n">take</span><span class="p">,</span> <span class="n">dropped</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">share_token_budget</span><span class="p">(</span>
+            <span class="nb">list</span><span class="p">(</span><span class="n">scheduled</span><span class="o">.</span><span class="n">request_to_worker_graph</span><span class="p">),</span> <span class="n">request</span><span class="o">.</span><span class="n">row_tokens</span><span class="p">,</span>
+            <span class="n">request</span><span class="o">.</span><span class="n">chunkable</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">max_batch_tokens</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">min_chunk_tokens</span><span class="p">,</span>
+            <span class="n">request</span><span class="o">.</span><span class="n">start_order</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">walk_max_tokens</span><span class="p">:</span>
+            <span class="n">_cap_walks</span><span class="p">(</span>
+                <span class="n">scheduled</span><span class="p">,</span> <span class="n">take</span><span class="p">,</span> <span class="n">dropped</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">chunkable</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">walk_max_tokens</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">share_token_budget</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">min_chunk_tokens</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">start_order</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="n">chunk_tokens</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">rid</span><span class="p">:</span> <span class="n">n</span> <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">take</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">n</span> <span class="o">&lt;</span> <span class="n">request</span><span class="o">.</span><span class="n">row_tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">n</span><span class="p">)</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="n">dropped</span><span class="p">:</span>
+            <span class="c1"># parked ahead of the cap's leftovers (see the class docstring)</span>
+            <span class="n">scheduled</span><span class="p">,</span> <span class="n">out</span> <span class="o">=</span> <span class="n">scheduled</span><span class="o">.</span><span class="n">split_off_first</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">exclude_rids</span><span class="o">=</span><span class="n">dropped</span><span class="p">)</span>
+            <span class="n">remainder</span> <span class="o">=</span> <span class="n">_merged</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">remainder</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">BatchBuildResult</span><span class="p">(</span>
-            <span class="n">scheduled</span><span class="p">,</span> <span class="n">backlog</span><span class="o">=</span><span class="n">parked</span><span class="p">,</span>
-            <span class="n">returned</span><span class="o">=</span><span class="nb">dict</span><span class="p">(</span><span class="n">returned</span><span class="o">.</span><span class="n">request_to_worker_graph</span><span class="p">)</span> <span class="k">if</span> <span class="n">returned</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">scheduled</span><span class="p">,</span> <span class="n">backlog</span><span class="o">=</span><span class="n">remainder</span><span class="p">,</span> <span class="n">returned</span><span class="o">=</span><span class="n">returned</span><span class="p">,</span> <span class="n">chunk_tokens</span><span class="o">=</span><span class="n">chunk_tokens</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="FIFOBatchBuilder.share_token_budget">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.FIFOBatchBuilder.share_token_budget">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">share_token_budget</span><span class="p">(</span>
+        <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">min_chunk</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">start_order</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""How the step's rows share its token budget: (rid -&gt; tokens taken,</span>
+<span class="sd">        rids left out)."""</span>
+        <span class="k">return</span> <span class="n">fill_token_budget_in_start_order</span><span class="p">(</span>
+            <span class="n">rids</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">chunkable</span><span class="p">,</span> <span class="n">budget</span><span class="p">,</span> <span class="n">min_chunk</span><span class="p">,</span> <span class="n">start_order</span><span class="p">,</span>
         <span class="p">)</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="FairShareBatchBuilder">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.FairShareBatchBuilder">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">FairShareBatchBuilder</span><span class="p">(</span><span class="n">FIFOBatchBuilder</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""``FIFOBatchBuilder`` with the token budget shared max-min fair</span>
+<span class="sd">    (``fill_token_budget``): every waiting prompt advances each step, so a</span>
+<span class="sd">    long prompt's first token waits on every other prompt's prefill too."""</span>
+
+<div class="viewcode-block" id="FairShareBatchBuilder.share_token_budget">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.FairShareBatchBuilder.share_token_budget">[docs]</a>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">share_token_budget</span><span class="p">(</span>
+        <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">min_chunk</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">start_order</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+        <span class="k">return</span> <span class="n">fill_token_budget</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">chunkable</span><span class="p">,</span> <span class="n">budget</span><span class="p">,</span> <span class="n">min_chunk</span><span class="p">)</span></div>
+</div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_take_whole</span><span class="p">(</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""The rows of ``rids`` under an equal share of ``budget``, taken whole,</span>
+<span class="sd">    the share recomputed over the rest until none fits. Returns (rid -&gt;</span>
+<span class="sd">    tokens taken, the budget left, the rows not taken)."""</span>
+    <span class="n">take</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="n">left</span> <span class="o">=</span> <span class="n">budget</span>
+    <span class="n">pending</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span>
+    <span class="k">while</span> <span class="n">pending</span><span class="p">:</span>
+        <span class="n">share</span> <span class="o">=</span> <span class="n">left</span> <span class="o">//</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)</span>
+        <span class="n">fits</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">share</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">fits</span><span class="p">:</span>
+            <span class="k">break</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">fits</span><span class="p">:</span>
+            <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="n">left</span> <span class="o">-=</span> <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span>
+        <span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">take</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">take</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span> <span class="n">pending</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_run_head</span><span class="p">(</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">min_chunk</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">take</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">dropped</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Never an empty step while a row exists: the first of ``rids`` runs</span>
+<span class="sd">    over budget if it must. Updates ``take`` and ``dropped`` in place."""</span>
+    <span class="k">if</span> <span class="n">take</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">rids</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="n">head</span> <span class="o">=</span> <span class="n">rids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">need</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">head</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">take</span><span class="p">[</span><span class="n">head</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">need</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">budget</span><span class="p">,</span> <span class="n">min_chunk</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="k">if</span> <span class="n">head</span> <span class="ow">in</span> <span class="n">chunkable</span> <span class="k">else</span> <span class="n">need</span>
+    <span class="n">dropped</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">head</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="fill_token_budget_in_start_order">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.fill_token_budget_in_start_order">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">fill_token_budget_in_start_order</span><span class="p">(</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">min_chunk</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">start_order</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""``budget`` over ``rids`` first come, first served. Rows under an equal</span>
+<span class="sd">    share go in whole, and then any row that can finish in what is left,</span>
+<span class="sd">    shortest first, so a short prompt never waits behind a long one. The rest</span>
+<span class="sd">    follow in start order -- prompts already mid-prefill by when they started</span>
+<span class="sd">    (``start_order``), then the others as listed -- each taking all it needs</span>
+<span class="sd">    of what is left, so a prompt finishes before the next one starts and its</span>
+<span class="sd">    first token does not wait on every other prompt's prefill. The first that</span>
+<span class="sd">    does not fit is cut to what is left if that is at least ``min_chunk``</span>
+<span class="sd">    tokens, and otherwise waits for the next step; one that cannot be cut sits</span>
+<span class="sd">    out without holding up the rows behind it. Never empty while a row</span>
+<span class="sd">    exists: the first row runs over budget if it must.</span>
+
+<span class="sd">    The oldest prompt mid-prefill keeps ``min_chunk`` of the budget out of</span>
+<span class="sd">    the finishing pass, so a steady stream of short prompts cannot starve it.</span>
+<span class="sd">    Returns (rid -&gt; tokens taken, rids left out)."""</span>
+    <span class="n">take</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span> <span class="n">pending</span> <span class="o">=</span> <span class="n">_take_whole</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">budget</span><span class="p">)</span>
+    <span class="n">start_order</span> <span class="o">=</span> <span class="n">start_order</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="n">oldest</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span>
+        <span class="p">(</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">start_order</span> <span class="ow">and</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">chunkable</span><span class="p">),</span>
+        <span class="n">key</span><span class="o">=</span><span class="n">start_order</span><span class="o">.</span><span class="fm">__getitem__</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">reserved</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">min_chunk</span><span class="p">,</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">oldest</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="k">if</span> <span class="n">oldest</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">left</span> <span class="o">&gt;=</span> <span class="n">min_chunk</span> <span class="k">else</span> <span class="mi">0</span>
+    <span class="n">left</span> <span class="o">-=</span> <span class="n">reserved</span>
+    <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">pending</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">rid</span><span class="p">:</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)):</span>
+        <span class="n">need</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">need</span> <span class="o">&gt;</span> <span class="n">left</span> <span class="ow">or</span> <span class="n">rid</span> <span class="o">==</span> <span class="n">oldest</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">need</span>
+        <span class="n">left</span> <span class="o">-=</span> <span class="n">need</span>
+    <span class="n">left</span> <span class="o">+=</span> <span class="n">reserved</span>
+    <span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">take</span><span class="p">]</span>
+    <span class="n">started</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">((</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">start_order</span><span class="p">),</span> <span class="n">key</span><span class="o">=</span><span class="n">start_order</span><span class="o">.</span><span class="fm">__getitem__</span><span class="p">)</span>
+    <span class="n">order</span> <span class="o">=</span> <span class="n">started</span> <span class="o">+</span> <span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">start_order</span><span class="p">]</span>
+    <span class="n">dropped</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+    <span class="n">cut</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">order</span><span class="p">:</span>
+        <span class="n">need</span> <span class="o">=</span> <span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">need</span> <span class="o">&lt;=</span> <span class="n">left</span><span class="p">:</span>
+            <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">need</span>
+            <span class="n">left</span> <span class="o">-=</span> <span class="n">need</span>
+        <span class="k">elif</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">chunkable</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">cut</span> <span class="ow">and</span> <span class="n">left</span> <span class="o">&gt;=</span> <span class="n">min_chunk</span><span class="p">:</span>
+            <span class="c1"># the one row cut. Not to the floor past the budget: a step over</span>
+            <span class="c1"># its budget pays for the next capture bucket up</span>
+            <span class="n">cut</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">left</span>
+            <span class="n">left</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">dropped</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+    <span class="n">_run_head</span><span class="p">(</span><span class="n">order</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">chunkable</span><span class="p">,</span> <span class="n">budget</span><span class="p">,</span> <span class="n">min_chunk</span><span class="p">,</span> <span class="n">take</span><span class="p">,</span> <span class="n">dropped</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">take</span><span class="p">,</span> <span class="n">dropped</span></div>
+
+
+
+<div class="viewcode-block" id="fill_token_budget">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.fill_token_budget">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">fill_token_budget</span><span class="p">(</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">min_chunk</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""Max-min fair share of ``budget`` over ``rids``: rows under an equal share</span>
+<span class="sd">    go in whole, the rest split what is left (chunkable rows) or sit out.</span>
+<span class="sd">    A cut row takes at least ``min_chunk`` tokens, or all it has left if that</span>
+<span class="sd">    is fewer: when the share is smaller, only as many rows as what is left</span>
+<span class="sd">    holds are cut, and if it holds none, they wait for the next step.</span>
+<span class="sd">    Never empty while a row exists: the first row runs over budget if it must.</span>
+<span class="sd">    Returns (rid -&gt; tokens taken, rids left out)."""</span>
+    <span class="n">take</span><span class="p">,</span> <span class="n">left</span><span class="p">,</span> <span class="n">pending</span> <span class="o">=</span> <span class="n">_take_whole</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">budget</span><span class="p">)</span>
+    <span class="n">dropped</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">chunkable</span><span class="p">}</span>
+    <span class="n">cut</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">pending</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">chunkable</span><span class="p">]</span>
+    <span class="n">share</span> <span class="o">=</span> <span class="n">left</span> <span class="o">//</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)</span> <span class="k">if</span> <span class="n">pending</span> <span class="k">else</span> <span class="mi">0</span>
+    <span class="k">if</span> <span class="n">cut</span> <span class="ow">and</span> <span class="n">share</span> <span class="o">&lt;</span> <span class="n">min_chunk</span><span class="p">:</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">cut</span><span class="p">),</span> <span class="nb">max</span><span class="p">(</span><span class="n">left</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">//</span> <span class="n">min_chunk</span><span class="p">)</span>
+        <span class="n">share</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">left</span> <span class="o">//</span> <span class="n">n</span><span class="p">,</span> <span class="n">min_chunk</span><span class="p">)</span> <span class="k">if</span> <span class="n">n</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="n">dropped</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">cut</span><span class="p">[</span><span class="n">n</span><span class="p">:])</span>
+        <span class="n">cut</span> <span class="o">=</span> <span class="n">cut</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span>
+    <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">cut</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">share</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">tokens</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">share</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">dropped</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+    <span class="n">_run_head</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">chunkable</span><span class="p">,</span> <span class="n">budget</span><span class="p">,</span> <span class="n">min_chunk</span><span class="p">,</span> <span class="n">take</span><span class="p">,</span> <span class="n">dropped</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">take</span><span class="p">,</span> <span class="n">dropped</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_cap_walks</span><span class="p">(</span>
+    <span class="n">batch</span><span class="p">:</span> <span class="s2">"ScheduledBatch"</span><span class="p">,</span> <span class="n">take</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">dropped</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="n">chunkable</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">caps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="n">share</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]],</span>
+    <span class="n">min_chunk</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">start_order</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Hold each capped walk's rows to its cap as well as the step's budget:</span>
+<span class="sd">    those rows share the cap as ``share`` (the builder's) shares a budget,</span>
+<span class="sd">    from what the step's budget gave them. A token one gives up is not handed</span>
+<span class="sd">    to another walk. Updates ``take`` and ``dropped`` in place."""</span>
+    <span class="k">for</span> <span class="n">walk</span><span class="p">,</span> <span class="n">cap</span> <span class="ow">in</span> <span class="n">caps</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">rids</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_to_worker_graph</span> <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">take</span> <span class="ow">and</span> <span class="n">batch</span><span class="o">.</span><span class="n">walk_of</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span> <span class="o">==</span> <span class="n">walk</span><span class="p">]</span>
+        <span class="k">if</span> <span class="nb">sum</span><span class="p">(</span><span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">cap</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">walk_take</span><span class="p">,</span> <span class="n">walk_dropped</span> <span class="o">=</span> <span class="n">share</span><span class="p">(</span>
+            <span class="n">rids</span><span class="p">,</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">},</span> <span class="n">chunkable</span><span class="p">,</span> <span class="n">cap</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="n">min_chunk</span><span class="p">,</span> <span class="n">cap</span><span class="p">),</span>
+            <span class="n">start_order</span> <span class="ow">or</span> <span class="p">{},</span>
+        <span class="p">)</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">:</span>
+            <span class="k">del</span> <span class="n">take</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span>
+        <span class="n">take</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">walk_take</span><span class="p">)</span>
+        <span class="n">dropped</span> <span class="o">|=</span> <span class="n">walk_dropped</span>
 
 
 <span class="n">_NO_GROUP</span> <span class="o">=</span> <span class="nb">object</span><span class="p">()</span>
@@ -1384,14 +1616,18 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="BatchBuilderType">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.BatchBuilderType">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">BatchBuilderType</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
-    <span class="n">FIFO</span> <span class="o">=</span> <span class="s2">"fifo"</span></div>
+    <span class="n">FIFO</span> <span class="o">=</span> <span class="s2">"fifo"</span>
+    <span class="n">FAIR_SHARE</span> <span class="o">=</span> <span class="s2">"fair_share"</span></div>
 
 
 
 <div class="viewcode-block" id="make_batch_builder">
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.batch_builder.html#mstar.worker.batch_builder.make_batch_builder">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">make_batch_builder</span><span class="p">(</span><span class="n">kind</span><span class="p">:</span> <span class="n">BatchBuilderType</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseBatchBuilder</span><span class="p">:</span>
-    <span class="k">return</span> <span class="p">{</span><span class="n">BatchBuilderType</span><span class="o">.</span><span class="n">FIFO</span><span class="p">:</span> <span class="n">FIFOBatchBuilder</span><span class="p">}[</span><span class="n">kind</span><span class="p">]()</span></div>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="n">BatchBuilderType</span><span class="o">.</span><span class="n">FIFO</span><span class="p">:</span> <span class="n">FIFOBatchBuilder</span><span class="p">,</span>
+        <span class="n">BatchBuilderType</span><span class="o">.</span><span class="n">FAIR_SHARE</span><span class="p">:</span> <span class="n">FairShareBatchBuilder</span><span class="p">,</span>
+    <span class="p">}[</span><span class="n">kind</span><span class="p">]()</span></div>
 
 </pre></div>
 

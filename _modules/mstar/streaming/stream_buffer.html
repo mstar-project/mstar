@@ -604,6 +604,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -808,6 +809,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1045,6 +1047,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">from_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">policy</span><span class="p">:</span> <span class="n">ChunkPolicy</span>
+    <span class="c1"># dim to join a chunked producer's pieces on; None keeps them separate</span>
+    <span class="n">join_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Items carry the consumer walk the producer assigned them, and a chunk</span>
     <span class="c1"># never spans two walks (set for connections that drive their consumer's</span>
     <span class="c1"># walk)</span>
@@ -1095,6 +1099,33 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">tensor_id</span><span class="p">,</span> <span class="n">walk</span><span class="p">))</span></div>
 
 
+<div class="viewcode-block" id="StreamBuffer.pre_read_register_joined">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pre_read_register_joined">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pre_read_register_joined</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">tensor_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Register ``tensor_ids`` as the pieces of ONE item.</span>
+
+<span class="sd">        A chunked producer emits a piece per chunk; without this each would be</span>
+<span class="sd">        an item of its own and a policy counting items would hand the consumer</span>
+<span class="sd">        only the first. Each piece still counts towards the registered total,</span>
+<span class="sd">        which is in the producer's units (see below).</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">tensor_ids</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">join_dim</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">tensor_id</span> <span class="ow">in</span> <span class="n">tensor_ids</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">pre_read_register</span><span class="p">(</span><span class="n">tensor_id</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">tensor_ids</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="c1"># Counted in the producer's units, one per piece, because that is what</span>
+        <span class="c1"># it reports in ``signal_done`` -- the buffer holding them as one item</span>
+        <span class="c1"># is its own business. Counting the group as one leaves the buffer</span>
+        <span class="c1"># permanently short of the producer's total, so it never agrees the</span>
+        <span class="c1"># producer is finished.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_tensors_registered</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">tensor_ids</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="nb">tuple</span><span class="p">(</span><span class="n">tensor_ids</span><span class="p">),</span> <span class="n">walk</span><span class="p">))</span></div>
+
+
 <div class="viewcode-block" id="StreamBuffer.put">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.put">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">item</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1104,18 +1135,49 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_update_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">tensor_id</span><span class="p">,</span> <span class="n">walk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-            <span class="k">if</span> <span class="n">tensor_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="p">:</span>
-                <span class="k">return</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="p">[</span><span class="n">tensor_id</span><span class="p">])</span>
+            <span class="n">entry</span><span class="p">,</span> <span class="n">walk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="c1"># a lone tensor is every item of an unjoined stream: keep it cheap</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">entry</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="p">:</span>
+                    <span class="k">return</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">entry</span><span class="p">))</span>
+                <span class="c1"># producer's units: see pre_read_register_joined</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">tensor_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span> <span class="k">for</span> <span class="n">tensor_id</span> <span class="ow">in</span> <span class="n">entry</span><span class="p">):</span>
+                    <span class="k">return</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_ids_in_order</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_join</span><span class="p">(</span>
+                    <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">tensor_id</span><span class="p">)</span> <span class="k">for</span> <span class="n">tensor_id</span> <span class="ow">in</span> <span class="n">entry</span><span class="p">]</span>
+                <span class="p">))</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk_tagged</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">walk</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_walk_runs</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">walk</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_num_buffer_writes</span> <span class="o">+=</span> <span class="mi">1</span>
-            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="p">[</span><span class="n">tensor_id</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_join</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pieces</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One item from a chunked producer's pieces, in chunk order.</span>
+
+<span class="sd">        An empty piece is real -- a prompt chunk can be all system prompt,</span>
+<span class="sd">        which the producer drops every position of -- so it is joined, not</span>
+<span class="sd">        skipped.</span>
+
+<span class="sd">        The one place that assumes the buffer holds tensors rather than uuids.</span>
+<span class="sd">        A buffer that stores uuids instead joins here too, by reading the</span>
+<span class="sd">        pieces, concatenating and storing the result under a fresh uuid.</span>
+
+<span class="sd">        A consumer that can take the pieces as they come should do that</span>
+<span class="sd">        instead, and set no ``join_dim`` -- which is where Qwen3-Omni's Talker</span>
+<span class="sd">        is headed. This is for a consumer that genuinely wants the whole</span>
+<span class="sd">        thing: it conditions on the complete prompt, or its shapes are</span>
+<span class="sd">        captured, and it has no use for a prefix.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">pieces</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">pieces</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">join_dim</span><span class="p">)</span>
 
 <div class="viewcode-block" id="StreamBuffer.signal_done">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.signal_done">[docs]</a>

@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -455,6 +456,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -700,6 +702,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.consumer_walk"><code class="docutils literal notranslate"><span class="pre">Connection.consumer_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.edge_name"><code class="docutils literal notranslate"><span class="pre">Connection.edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.from_partition"><code class="docutils literal notranslate"><span class="pre">Connection.from_partition</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.join_dim"><code class="docutils literal notranslate"><span class="pre">Connection.join_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.limits"><code class="docutils literal notranslate"><span class="pre">Connection.limits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.to_partition"><code class="docutils literal notranslate"><span class="pre">Connection.to_partition</span></code></a></li>
 </ul>
@@ -853,7 +856,7 @@ deployment may lower it (<code class="docutils literal notranslate"><span class=
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.topology.Connection">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.topology.</span></span><span class="sig-name descname"><span class="pre">Connection</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">to_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_policy_factory</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">limits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">consumer_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/topology.html#Connection"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.topology.Connection" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.topology.</span></span><span class="sig-name descname"><span class="pre">Connection</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">to_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_policy_factory</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">limits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">join_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">consumer_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/topology.html#Connection"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.topology.Connection" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Defines a streaming connection between two partitions, or from the
 client (<code class="docutils literal notranslate"><span class="pre">from_partition=CLIENT</span></code>) into one. Only a client stream takes
@@ -866,6 +869,7 @@ client (<code class="docutils literal notranslate"><span class="pre">from_partit
 <li><p><strong>edge_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>chunk_policy_factory</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference internal" href="mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy" title="mstar.streaming.chunk_policy.ChunkPolicy"><em>ChunkPolicy</em></a><em>]</em>)</p></li>
 <li><p><strong>limits</strong> (<a class="reference internal" href="#mstar.streaming.topology.ClientStreamLimits" title="mstar.streaming.topology.ClientStreamLimits"><em>ClientStreamLimits</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>join_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>consumer_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference internal" href="#mstar.streaming.topology.ProducerWalkCtx" title="mstar.streaming.topology.ProducerWalkCtx"><em>ProducerWalkCtx</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
@@ -888,6 +892,11 @@ client (<code class="docutils literal notranslate"><span class="pre">from_partit
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.streaming.topology.Connection.from_partition">
 <span class="sig-name descname"><span class="pre">from_partition</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.streaming.topology.Connection.from_partition" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.topology.Connection.join_dim">
+<span class="sig-name descname"><span class="pre">join_dim</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.streaming.topology.Connection.join_dim" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1174,6 +1183,7 @@ the data worker, whose copy of the model is unshaped.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.consumer_walk"><code class="docutils literal notranslate"><span class="pre">Connection.consumer_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.edge_name"><code class="docutils literal notranslate"><span class="pre">Connection.edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.from_partition"><code class="docutils literal notranslate"><span class="pre">Connection.from_partition</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.join_dim"><code class="docutils literal notranslate"><span class="pre">Connection.join_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.limits"><code class="docutils literal notranslate"><span class="pre">Connection.limits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.topology.Connection.to_partition"><code class="docutils literal notranslate"><span class="pre">Connection.to_partition</span></code></a></li>
 </ul>

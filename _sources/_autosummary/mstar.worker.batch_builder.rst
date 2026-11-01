@@ -13,6 +13,8 @@ mstar.worker.batch\_builder
 
    .. autosummary::
    
+      fill_token_budget
+      fill_token_budget_in_start_order
       make_batch_builder
       off_group_rids
    
@@ -29,6 +31,7 @@ mstar.worker.batch\_builder
       BatchBuildResult
       BatchBuilderType
       FIFOBatchBuilder
+      FairShareBatchBuilder
       LineOrder
       StepCandidates
       StepPick

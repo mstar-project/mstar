@@ -251,6 +251,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -455,6 +456,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -728,6 +730,15 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedStopCheck.withheld"><code class="docutils literal notranslate"><span class="pre">BatchedStopCheck.withheld</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.accumulated_outputs"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.accumulated_outputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.chunkable"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.chunkable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.max_batch_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reserve_whole_prefill</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reuses_cached_prefix"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reuses_cached_prefix</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.walks"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.walks</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows"><code class="docutils literal notranslate"><span class="pre">HostRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows.buffers"><code class="docutils literal notranslate"><span class="pre">HostRows.buffers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows.first_values"><code class="docutils literal notranslate"><span class="pre">HostRows.first_values()</span></code></a></li>
@@ -737,6 +748,11 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata"><code class="docutils literal notranslate"><span class="pre">InputMetadata</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.dynamic_loop_iter_counts"><code class="docutils literal notranslate"><span class="pre">InputMetadata.dynamic_loop_iter_counts</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.stream_chunks"><code class="docutils literal notranslate"><span class="pre">InputMetadata.stream_chunks</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputSeqLenInfo"><code class="docutils literal notranslate"><span class="pre">InputSeqLenInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputSeqLenInfo.cached_prefix"><code class="docutils literal notranslate"><span class="pre">InputSeqLenInfo.cached_prefix</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputSeqLenInfo.seq_len"><code class="docutils literal notranslate"><span class="pre">InputSeqLenInfo.seq_len</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.LazyRequestStates"><code class="docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a></li>
@@ -757,9 +773,12 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.chunk_start"><code class="docutils literal notranslate"><span class="pre">NodeInputs.chunk_start</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.chunk_total"><code class="docutils literal notranslate"><span class="pre">NodeInputs.chunk_total</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.clone"><code class="docutils literal notranslate"><span class="pre">NodeInputs.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.graph_walk"><code class="docutils literal notranslate"><span class="pre">NodeInputs.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeInputs.input_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.is_final_chunk"><code class="docutils literal notranslate"><span class="pre">NodeInputs.is_final_chunk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.kwargs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.kwargs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.resource_step_info"><code class="docutils literal notranslate"><span class="pre">NodeInputs.resource_step_info</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.tensor_inputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.tensor_inputs</span></code></a></li>
@@ -786,6 +805,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_autocast_dtype()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_device"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_device()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_input_sequence_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_client_signals()</span></code></a></li>
@@ -800,6 +820,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.speculative_input_seq_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
@@ -868,6 +889,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.walk"><code class="docutils literal notranslate"><span class="pre">TokenStop.walk</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -881,6 +904,18 @@
                   
   <section id="module-mstar.model.submodule_base">
 <span id="mstar-model-submodule-base"></span><h1>mstar.model.submodule_base<a class="headerlink" href="#module-mstar.model.submodule_base" title="Link to this heading">#</a></h1>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.chunk_loop_name" title="mstar.model.submodule_base.chunk_loop_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_loop_name</span></code></a>(node_name, graph_walk)</p></td>
+<td><p>The Loop a chunkable <code class="docutils literal notranslate"><span class="pre">(node,</span> <span class="pre">walk)</span></code>'s prefill runs as.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.chunk_tick_name" title="mstar.model.submodule_base.chunk_tick_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_tick_name</span></code></a>(node_name, graph_walk)</p></td>
+<td><p>The chunk Loop's loop-back signal, carrying nothing.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -896,11 +931,17 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.BatchedStopCheck" title="mstar.model.submodule_base.BatchedStopCheck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchedStopCheck</span></code></a>(stops, withheld)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> for <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>: rid -&gt; what <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> returns for it (loop names or <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code>) and rid -&gt; withheld outputs, rids with none left out of each.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostRows</span></code></a>(request_ids, buffers)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ChunkingPolicy" title="mstar.model.submodule_base.ChunkingPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ChunkingPolicy</span></code></a>([walks, chunkable, ...])</p></td>
+<td><p>How a walk's prefill may be split across steps; the default is not at all.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostRows</span></code></a>(request_ids, buffers)</p></td>
 <td><p>A step's row-addressed outputs (<code class="docutils literal notranslate"><span class="pre">check_stop_buffers</span></code>) on the host.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputMetadata</span></code></a>([stream_chunks, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputMetadata</span></code></a>([stream_chunks, ...])</p></td>
 <td><p>What the worker knows about one request's inputs to this step.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputSeqLenInfo" title="mstar.model.submodule_base.InputSeqLenInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSeqLenInfo</span></code></a>(seq_len[, cached_prefix])</p></td>
+<td><p>A row's token count before <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, for admission.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.LazyRequestStates" title="mstar.model.submodule_base.LazyRequestStates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a>(submodule, rids)</p></td>
 <td><p>The batch's <a href="#id1"><span class="problematic" id="id2">``</span></a>PerRequestState``s, resolved on first read.</p></td>
@@ -943,7 +984,7 @@
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeInputs">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ARNodeInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_inputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_step_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_embeds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">custom_pos_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ARNodeInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_inputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_step_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_start</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_total</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_embeds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">custom_pos_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeInputs</span></code></a></p>
 <p>Unlike in regular ModelInputs, for LLMInputs we expect either input_ids
 or input_embeds to be set (but typically not both), and we require
@@ -959,6 +1000,8 @@ dedicated fields.</p>
 <li><p><strong>resource_step_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>input_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>chunk_start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>chunk_total</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>input_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>input_embeds</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>custom_pos_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
@@ -1352,6 +1395,68 @@ outputs, rids with none left out of each.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ChunkingPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunkable</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">accumulated_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_batch_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reuses_cached_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reserve_whole_prefill</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ChunkingPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>How a walk’s prefill may be split across steps; the default is not at all.</p>
+<p><code class="docutils literal notranslate"><span class="pre">walks</span></code>: the walks this policy covers. Declared per node on the model
+(<code class="docutils literal notranslate"><span class="pre">Model.get_chunking_policies</span></code>) rather than on the submodule, because
+the graph build needs it: a chunkable node is wrapped in a Loop for
+exactly these walks, and a chunk is one iteration of it.</p>
+<p><code class="docutils literal notranslate"><span class="pre">accumulated_outputs</span></code>: output edges a consumer needs every chunk of,
+gathered on the Loop and handed over as one item per chunk when the
+prompt finishes. A streamed edge’s consumer gets them joined into one item
+by its <code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code> (<code class="docutils literal notranslate"><span class="pre">Connection.join_dim</span></code>). An edge not named here
+carries the final chunk’s tensors alone.</p>
+<p><code class="docutils literal notranslate"><span class="pre">reserve_whole_prefill</span></code>: whether a first chunk reserves the KV the
+whole prefill needs, so a part-done row cannot wedge on a full arena.
+Counted in tokens, so a walk whose KV grows by something else sets False
+and reserves per chunk.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>chunkable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>accumulated_outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>max_batch_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reuses_cached_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>reserve_whole_prefill</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.accumulated_outputs">
+<span class="sig-name descname"><span class="pre">accumulated_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.accumulated_outputs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.chunkable">
+<span class="sig-name descname"><span class="pre">chunkable</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.chunkable" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.max_batch_tokens">
+<span class="sig-name descname"><span class="pre">max_batch_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.max_batch_tokens" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill">
+<span class="sig-name descname"><span class="pre">reserve_whole_prefill</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.reuses_cached_prefix">
+<span class="sig-name descname"><span class="pre">reuses_cached_prefix</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><span class="pre">CurrentForwardPassInfo</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.reuses_cached_prefix" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.walks">
+<span class="sig-name descname"><span class="pre">walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.walks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.HostRows">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">HostRows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">buffers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#HostRows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.HostRows" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
@@ -1422,6 +1527,33 @@ keywords: fields get added here rather than as new hook arguments.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.InputMetadata.stream_chunks">
 <span class="sig-name descname"><span class="pre">stream_chunks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Mapping</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><span class="pre">StreamChunkInfo</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.InputMetadata.stream_chunks" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.InputSeqLenInfo">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">InputSeqLenInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seq_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cached_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#InputSeqLenInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.InputSeqLenInfo" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A row’s token count before <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, for admission.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>cached_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.InputSeqLenInfo.cached_prefix">
+<span class="sig-name descname"><span class="pre">cached_prefix</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.InputSeqLenInfo.cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.InputSeqLenInfo.seq_len">
+<span class="sig-name descname"><span class="pre">seq_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.InputSeqLenInfo.seq_len" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
@@ -1543,7 +1675,7 @@ nothing usually looks at.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">NodeInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">'dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">torch.Tensor]'</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'dict'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_step_info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'Any</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">NodeInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">'dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">torch.Tensor]'</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'dict'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_step_info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'Any</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_start</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_total</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1553,9 +1685,21 @@ nothing usually looks at.</p>
 <li><p><strong>resource_step_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>input_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>chunk_start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>chunk_total</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.chunk_start">
+<span class="sig-name descname"><span class="pre">chunk_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.chunk_start" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.chunk_total">
+<span class="sig-name descname"><span class="pre">chunk_total</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.chunk_total" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.clone">
 <span class="sig-name descname"><span class="pre">clone</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeInputs.clone"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.clone" title="Link to this definition">#</a></dt>
@@ -1572,6 +1716,11 @@ its own type back without restating this.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.input_seq_len">
 <span class="sig-name descname"><span class="pre">input_seq_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.input_seq_len" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.is_final_chunk">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">is_final_chunk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.is_final_chunk" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1977,6 +2126,28 @@ dtype it was built in, set that instead.</p>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len">
+<span class="sig-name descname"><span class="pre">get_input_sequence_len</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_input_sequence_len"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len" title="Link to this definition">#</a></dt>
+<dd><p>This row’s token count, read from input shapes alone; None when the
+walk does not declare one. A chunkable walk’s prompts are cut into
+chunks by it, so it must equal <code class="docutils literal notranslate"><span class="pre">prepare_inputs().input_seq_len</span></code> of the
+whole input (before any cached prefix is removed), or the row fails
+at its first chunk.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>fwd_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.InputSeqLenInfo" title="mstar.model.submodule_base.InputSeqLenInfo"><em>InputSeqLenInfo</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs">
 <span class="sig-name descname"><span class="pre">get_piecewise_accelerator_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_piecewise_accelerator_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs" title="Link to this definition">#</a></dt>
 <dd><p>Return the piecewise CUDA graph configs this submodule opts into.</p>
@@ -2230,6 +2401,30 @@ per-request tensor to cut. Empty by default.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len">
+<span class="sig-name descname"><span class="pre">speculative_input_seq_len</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prev_seq_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.speculative_input_seq_len"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len" title="Link to this definition">#</a></dt>
+<dd><p>The span of a row continuing from the step in flight, estimated
+before that step’s outputs reach it. <code class="docutils literal notranslate"><span class="pre">prev_seq_len</span></code> is its span in
+that step, or -1 if it ran on another node. The default repeats the
+last span on this node and has no estimate otherwise; a walk that
+fixes its span (one token a decode step) should say so. Only an
+estimate, which sizes the token budget left for the rows merged in
+beside it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>fwd_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>prev_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2743,6 +2938,49 @@ enforces.</p>
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.chunk_loop_name">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">chunk_loop_name</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#chunk_loop_name"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.chunk_loop_name" title="Link to this definition">#</a></dt>
+<dd><p>The Loop a chunkable <code class="docutils literal notranslate"><span class="pre">(node,</span> <span class="pre">walk)</span></code>’s prefill runs as.</p>
+<p>Derived rather than declared so the graph build, the engine’s stop check
+and the startup validation all name the same loop without passing it
+around. Per walk, not per node: a node can chunk under several walks and
+each has its own loop state.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.chunk_tick_name">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">chunk_tick_name</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#chunk_tick_name"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.chunk_tick_name" title="Link to this definition">#</a></dt>
+<dd><p>The chunk Loop’s loop-back signal, carrying nothing.</p>
+<p>Speculation offers a next-iteration target only for a node that routes an
+edge back to itself, so without this a chunk-only step is a pipeline
+bubble. The node declares it as an input too – an edge it does not read is
+no loop-back, just an output nobody consumes – which leaves it unready for
+its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -2837,6 +3075,15 @@ enforces.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedStopCheck.withheld"><code class="docutils literal notranslate"><span class="pre">BatchedStopCheck.withheld</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.accumulated_outputs"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.accumulated_outputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.chunkable"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.chunkable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.max_batch_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reserve_whole_prefill</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reuses_cached_prefix"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reuses_cached_prefix</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.walks"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.walks</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows"><code class="docutils literal notranslate"><span class="pre">HostRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows.buffers"><code class="docutils literal notranslate"><span class="pre">HostRows.buffers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows.first_values"><code class="docutils literal notranslate"><span class="pre">HostRows.first_values()</span></code></a></li>
@@ -2846,6 +3093,11 @@ enforces.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata"><code class="docutils literal notranslate"><span class="pre">InputMetadata</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.dynamic_loop_iter_counts"><code class="docutils literal notranslate"><span class="pre">InputMetadata.dynamic_loop_iter_counts</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.stream_chunks"><code class="docutils literal notranslate"><span class="pre">InputMetadata.stream_chunks</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputSeqLenInfo"><code class="docutils literal notranslate"><span class="pre">InputSeqLenInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputSeqLenInfo.cached_prefix"><code class="docutils literal notranslate"><span class="pre">InputSeqLenInfo.cached_prefix</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputSeqLenInfo.seq_len"><code class="docutils literal notranslate"><span class="pre">InputSeqLenInfo.seq_len</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.LazyRequestStates"><code class="docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a></li>
@@ -2866,9 +3118,12 @@ enforces.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.chunk_start"><code class="docutils literal notranslate"><span class="pre">NodeInputs.chunk_start</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.chunk_total"><code class="docutils literal notranslate"><span class="pre">NodeInputs.chunk_total</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.clone"><code class="docutils literal notranslate"><span class="pre">NodeInputs.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.graph_walk"><code class="docutils literal notranslate"><span class="pre">NodeInputs.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeInputs.input_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.is_final_chunk"><code class="docutils literal notranslate"><span class="pre">NodeInputs.is_final_chunk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.kwargs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.kwargs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.resource_step_info"><code class="docutils literal notranslate"><span class="pre">NodeInputs.resource_step_info</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.tensor_inputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.tensor_inputs</span></code></a></li>
@@ -2895,6 +3150,7 @@ enforces.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_autocast_dtype()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_device"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_device()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_input_sequence_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_input_sequence_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_accelerator_graph_configs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.inline_client_signals()</span></code></a></li>
@@ -2909,6 +3165,7 @@ enforces.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.speculative_input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.speculative_input_seq_len()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
@@ -2977,6 +3234,8 @@ enforces.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.walk"><code class="docutils literal notranslate"><span class="pre">TokenStop.walk</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
 </ul>
   </nav></div>
 
