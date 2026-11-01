@@ -511,11 +511,12 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
 
     from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
-    from mstar.model.components.aut_encoder_submodule import AUT_ATTN, AuTEncoderSubmodule
+    from mstar.model.qwen3_omni.config import AUDIO_ATTN
+    from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
 
     config = AuTEncoderConfig(d_model=16, encoder_layers=1, encoder_attention_heads=2, encoder_ffn_dim=32,
                               downsample_hidden_size=4, output_dim=8)
-    sub = AuTEncoderSubmodule(AuTEncoder(config, attn_key=AUT_ATTN))
+    sub = AudioEncoderSubmodule(AuTEncoder(config, attn_key=AUDIO_ATTN), config=None)
     for frames in (1234, 3000):
         with _HostReads() as reads:
             row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio"), {

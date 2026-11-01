@@ -61,6 +61,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
        decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
        batched across requests.
+   * - ``voxcpm2``
+     - ``openbmb/VoxCPM2``
+     - Tokenizer-free TTS: MiniCPM-4 base and residual LMs emit continuous latent
+       patches through a local flow-matching DiT, decoded by AudioVAE V2 in
+       streamed chunks. Zero-shot, voice design, and cloning from a clip. 48 kHz.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -468,6 +473,16 @@ tokens; prefill and eager steps are unchanged.
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
 
+With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
+YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
+token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
+token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
+with a 400. Top alternatives and OpenAI's ``logprobs`` are not supported yet. On
+any deployment,
+``"return_token_ids": true`` adds each text chunk's sampled ids
+(``{"token_ids": [...]}``), stop tokens included, so a trainer need not
+re-tokenize the text.
+
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
 
@@ -575,6 +590,25 @@ Kokoro notes
 Qwen3-Omni notes
 ----------------
 
+- The audio and vision encoders attend through ragged attention resources
+  (``audio_attn`` within each 8 s window, ``vision_attn`` within each image or
+  video frame group), FlashInfer by default, so no ``flash-attn`` install is
+  needed. A deployment can pick the kernel under ``resources:`` in its YAML,
+  e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
+  is captured as a CUDA graph per token-count bucket; a request past the
+  largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
+- The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
+  log-mel features: a step's clips (up to 8 requests) go through one packed
+  forward, up to 4096 tokens. A step over 4096 tokens runs its clips one by
+  one, each replayed if it fits a bucket. A clip's last 1 s chunk is
+  zero-padded to a full chunk before the convolutions, as HF's encoder pads
+  it whenever its batch holds a full chunk, so a clip under 1 s encoded alone
+  differs from HF's: in its last conv row and, through the windowed
+  attention, in every embedding of the clip. A clip's embeddings can differ at
+  the last bit with what it is batched beside, since the step's total tokens
+  pick the captured bucket (or the eager GEMMs' shapes), and a prefix-cached
+  audio prefix keeps the embeddings it was first computed with, so a later
+  request reusing it inherits that first batch's rounding.
 - Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
   25-frame chunks behind 25 frames of left context. Playback stays gapless
   while the Talker produces frames at about 1.5x real time over the first 50
@@ -588,21 +622,6 @@ Qwen3-Omni notes
   (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
   steps feed each sampled code into the next, so small differences can change
   later codes at near-ties.
-- The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
-  log-mel features: a step's clips (up to 8 requests) go through one packed
-  forward, attention windowed within each clip through a ragged attention
-  resource, and the 32-layer stack replays a CUDA graph by packed token count
-  up to 4096 tokens (about 5 minutes of audio). A step over 4096 tokens runs
-  its clips one by one, each replayed if it fits a bucket, so only a clip
-  longer than that runs eagerly, on its own. A clip's last 1 s chunk is
-  zero-padded to a full chunk before the convolutions, as HF's encoder pads
-  it whenever its batch holds a full chunk, so a clip under 1 s encoded alone
-  differs from HF's: in its last conv row and, through the windowed
-  attention, in every embedding of the clip. A clip's embeddings can differ
-  at the last bit with what it is batched beside, since the step's total
-  tokens pick the captured bucket (or the eager GEMMs' shapes), and a
-  prefix-cached audio prefix keeps the embeddings it was first computed with,
-  so a later request reusing it inherits that first batch's rounding.
 - The Thinker's text and audio prefill replay captured graphs on the ladder
   ``128 ... 2048`` tokens, and a longer step runs eagerly.
   ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
@@ -817,6 +836,36 @@ Fish Audio S2-Pro notes
   TF32 halves the codec's conv stack, most of the GPU time under concurrency
   (c=32 throughput +35% on an H200), and the audio stays within ~60 dB SNR of
   the exact decode.
+
+VoxCPM2 notes
+-------------
+
+- Install with ``pip install -e '.[voxcpm2]'`` and serve with
+  ``mstar serve voxcpm2 --gpus 0``. ``/v1/audio/speech`` takes the text alone
+  (zero-shot), a voice description in ``instructions`` (voice design), a
+  ``ref_audio`` clip (cloning) or ``ref_audio`` with its transcript in
+  ``ref_text`` (continuation). Output is 48 kHz.
+- The Talker's decode step (both LMs, the local DiT solve, the stop head) is
+  ``torch.compile``'d and captured as CUDA graphs at start-up, so a first
+  start-up with a cold Inductor cache takes 10 to 30 minutes (591 s on a
+  B200, 1,723 s on an H100), and about two minutes once the cache is warm.
+  ``model_kwargs: {compile_talker: false}``
+  in the deployment YAML captures the eager step instead: on a B200 the server
+  is up in about 15 seconds, with about a third less throughput at
+  concurrency 1 and a sixth less at concurrency 8.
+- A request may hold the whole 8,192-position context, and nothing preempts a
+  request once a KV cache is full, so each LM's cache defaults to 2,049 pages
+  (32 such requests and the sink page, about 9.7 GB for both) and the YAML sets
+  ``max_concurrent_requests: 32``; the conductor queues the rest. Start-up
+  refuses a cap the caches cannot hold, so raise ``resources.base_kv`` and
+  ``resources.res_kv`` ``max_num_pages`` with it. Text over
+  ``max_text_tokens`` (1,365 by default) gets a 400: English speech runs at up
+  to about 2.9 patches per token, so longer text may not fit in the
+  4,096-patch (655 s) audio budget.
+- One request with long text can end early: on some seeds the stop head fires
+  mid-text, as it does in the official ``voxcpm`` package (a 983-character
+  Russian text stopped about three quarters of the way in on 5 of 10 seeds
+  there). Split long text into several requests.
 
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
@@ -1479,7 +1528,8 @@ Requests are therefore independent and the loop is resumable across ranks.
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
 resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
-6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA
+6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured
+before #963's one-pass adaLN and fused q/k norm+RoPE
 (``model_kwargs: attention_backend: sdpa`` restores the reference kernel; the
 cross-attention over the 512 text tokens stays on SDPA, which is faster at that
 shape). The untiled VAE decode runs the shared Wan VAE decoder,
@@ -1504,12 +1554,13 @@ the dit as a two-rank lockstep instance (``sp_size: 2``, though nothing splits
 the sequence) that splits the classifier-free guidance batch: each rank runs one
 branch at batch 1 and the two noise predictions are all-gathered
 every step, so a guided step costs one branch's forward (502 vs 1000 ms at
-1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps). The
+1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps;
+measured before #963). The
 text encoder and VAE run on rank 0. Without guidance both ranks compute the same
 step, correct but no faster. For throughput under concurrency,
 ``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
 at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
-decode), while one request takes the 1-GPU time.
+decode; measured before #963), while one request takes the 1-GPU time.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

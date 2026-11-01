@@ -45,6 +45,9 @@ class ResultTokens:
     signal: str
     modality: str
     metadata: dict = field(default_factory=dict)
+    # per request, its sampled token's log-prob or None; None when no
+    # request of the step asked
+    logprobs: list[float | None] | None = None
 
 
 @dataclass
