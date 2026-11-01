@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, HostRows
@@ -18,6 +19,8 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode"):
         resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": done},
         max_tokens=max_tokens,
+        # the conductor marks the step before decode
+        step_metadata={FINAL_PREFILL: True} if walk != "decode" else {},
     )
 
 
@@ -60,12 +63,15 @@ def test_batched_agrees_with_per_request(shape):
 @pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
 def test_a_prefill_stop_token_ends_the_partition(step_walk):
     """A prefill's token comes before decode_loop exists, so its stop ends the
-    partition, on the text walk and on a media walk alike."""
-    tokens = torch.tensor([EOS, EOS, EOS, EOS])
+    partition, on the text walk and on a media walk alike. Only the step the
+    conductor marked `FINAL_PREFILL` samples a real token; an earlier one's
+    stop id stops nothing."""
+    tokens = torch.tensor([EOS, EOS, EOS, EOS, EOS])
     infos = {
         "text": _info(walk="prefill_text"),
         "media": _info(walk="prefill_vision"),
         "ignored": _info(walk="prefill_text", ignore_eos=True),
+        "earlier": SimpleNamespace(**{**vars(_info(walk="prefill_text")), "step_metadata": {}}),
     }
     if step_walk is None:
         infos["dec"] = _info()

@@ -624,7 +624,7 @@ def test_each_image_expands_to_its_tokens_with_one_bos(model_dir, low):
 
     signals = {k: list(v) for k, v in out.items()}
     step = model._prefill_step(signals, layout)
-    assert step.walk == "prefill_vision" and step.metadata == {MEDIA_LAYOUT: layout}
+    assert step.walk == "prefill_vision" and step.step_metadata == {MEDIA_LAYOUT: layout}
 
 
 def test_a_spelled_out_patch_is_a_bad_request(model_dir):

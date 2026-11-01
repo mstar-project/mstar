@@ -27,7 +27,7 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
+from mstar.conductor.request_info import PartitionDefinition, WalkStep
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -211,83 +211,20 @@ class OrpheusModel(Model):
             ),
         ]
 
-    def get_partition_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         if partition_name == "LLM":
-            return self._get_llm_partition_forward(
-                partition_metadata, persist_signals,
-            )
-        elif partition_name == "SNAC":
-            # Extract streaming state from the incoming connection
-            conn = incoming_connections[0] if incoming_connections else None
-            token_buffer_count = conn.token_count if conn else 0
-            producer_done = conn.producer_done if conn else False
-            consumed = conn.consumed_count if conn else 0
-            return self._get_snac_partition_forward(
-                partition_metadata, token_buffer_count, producer_done, consumed,
-            )
+            return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
+        if partition_name == "SNAC":
+            # runs on each window of the LLM's tokens until the worker reports the last
+            return [WalkStep("snac_chunk")]
         raise ValueError(f"Unknown partition: {partition_name!r}")
-
-    def _get_llm_partition_forward(
-        self,
-        metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> ForwardPassArgs:
-        """LLM partition: prefill -> decode loop until EOS."""
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        step_metadata = {
-            "is_prefill": metadata.is_prefill,
-        }
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
-        )
-
-    def _get_snac_partition_forward(
-        self,
-        metadata: CurrentForwardConductorMetadata,
-        token_buffer_count: int,
-        producer_done: bool,
-        consumed: int = 0,
-    ) -> ForwardPassArgs:
-        """SNAC partition: the streaming decode loop is self-triggered,
-        so this function is basically a no-op.
-        """
-        metadata.graph_walk = "snac_chunk"
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=[],
-            unpersist_tensors=[],
-        )
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -332,56 +269,6 @@ class OrpheusModel(Model):
             spans=(Span("ids", "prefill", length, length, "text_inputs"),), growth=(("decode_loop", 1),),
         )
         return ProcessPromptOutput({"text_inputs": [all_input_ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
-
-    # -------------------------------------------------------------------
-    # Model ABC: forward pass args
-    # -------------------------------------------------------------------
-
-    def get_initial_forward_pass_args(
-        self,
-        partition_name: str,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        if partition_name == "LLM":
-            full_metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="prefill",
-                is_prefill=True,
-            )
-
-            graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            graph_edge.tensor_info = input_signals.get("text_inputs", [])
-            inputs = [graph_edge]
-
-            unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-            return ForwardPassArgs(
-                full_metadata=full_metadata,
-                inputs=inputs,
-                unpersist_tensors=unpersist_tensors,
-                step_metadata={
-                    "is_prefill": True,
-                },
-            )
-        elif partition_name == "SNAC":
-            # SNAC starts with snac_chunk walk but no inputs —
-            # it will self-trigger via StreamBuffer when tokens arrive.
-            full_metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="snac_chunk",
-                is_prefill=False,
-            )
-            return ForwardPassArgs(
-                full_metadata=full_metadata,
-                inputs=[],
-                unpersist_tensors=[],
-            )
-        raise ValueError(f"Unknown partition: {partition_name!r}")
 
     # -------------------------------------------------------------------
     # Model ABC: resources

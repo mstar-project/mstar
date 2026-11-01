@@ -3,10 +3,10 @@
 An ``LLM`` node (a `SampledTokenDecoder`) behind the model's media encoders,
 on `mstar.model.multimodal`'s walks. The base owns what every such model
 writes the same way: the walks and the mixed text step, the decode loop's
-cap, media intake, the KV label and layout, the prefill walk, the
-forward-pass args, the sampler (its spec, and each request's config over
-the checkpoint's generation_config defaults), sharding, the submodule
-cache, and where the files come from. A model sets `NAME` and
+cap, media intake, the KV label and layout, the walk plan, the sampler
+(its spec, and each request's config over the checkpoint's
+generation_config defaults), sharding, the submodule cache, and where the
+files come from. A model sets `NAME` and
 `METADATA_FILES`, and writes its own ``__init__`` (calling this one, then
 setting ``config``, with ``max_position_embeddings`` and ``stop_token_ids``,
 ``tokenizer`` and ``media``, a `MediaIntake` per attachment modality),
@@ -27,10 +27,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import WalkStep
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
@@ -43,17 +40,14 @@ from mstar.model.multimodal import (
     VIDEO,
     MediaEncoder,
     MediaPads,
-    PrefillStep,
     PromptPart,
     check_attachments,
     expand_media_pads,
-    initial_prefill_args,
     media_encoders,
     media_layout,
     media_prefill_step,
     media_walk_name,
     media_walks,
-    next_prefill_args,
     parts_from_modalities,
     text_combined_walks,
 )
@@ -375,34 +369,28 @@ class MultimodalDecoderModel(Model):
         return {SAMPLER: SamplingReqConfig(**sampling)}
 
     # -----------------------------------------------------------------------
-    # Forward pass args
+    # Walk plan
     # -----------------------------------------------------------------------
 
     def _prefill_step(
         self, signals: dict[str, list[TensorPointerInfo]], layout: dict | None = None,
-    ) -> PrefillStep:
+    ) -> WalkStep:
         """`media_prefill_step`, carrying `process_prompt`'s media layout."""
         return media_prefill_step(signals, self.encoders, layout, model_name=self.NAME)
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        step = self._prefill_step(input_signals, (model_kwargs or {}).get(MEDIA_LAYOUT))
-        return initial_prefill_args(step, input_modalities, output_modalities)
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        return next_prefill_args(partition_metadata, persist_signals)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the whole prompt, then decode until the stop check ends it
+        return [
+            self._prefill_step(input_signals, model_kwargs.get(MEDIA_LAYOUT)),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -----------------------------------------------------------------------
     # Submodules

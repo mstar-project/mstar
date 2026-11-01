@@ -51,7 +51,7 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
@@ -477,9 +477,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # Post-step
     # ------------------------------------------------------------------
 
-    def _is_prefill_walk(self, walk: str) -> bool:
-        # each is a one-pass prefill that samples the first token
-        return walk == self.PREFILL_WALK or walk in self._media_walks
+    def _is_final_prefill(self, request_info: CurrentForwardPassInfo) -> bool:
+        return request_info.step_metadata.get(FINAL_PREFILL, False)
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each; the prefill walks feed

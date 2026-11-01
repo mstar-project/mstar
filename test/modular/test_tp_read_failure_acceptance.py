@@ -129,14 +129,15 @@ def _span(kind: str, rid: str) -> int:
 
 
 def _step_metadata(kind: str, rid: str) -> dict:
-    """The walk's step metadata: a grid prompt's ``MEDIA_LAYOUT``, as intake
-    lays it out."""
+    """The walk's step metadata: the conductor's mark on the step before
+    decode, and a grid prompt's ``MEDIA_LAYOUT``, as intake lays it out."""
+    from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.model.multimodal import MEDIA_LAYOUT
 
     if kind == "text":
-        return {}
+        return {FINAL_PREFILL: True}
     spec = _PROMPTS[kind][rid]
-    return {MEDIA_LAYOUT: {
+    return {FINAL_PREFILL: True, MEDIA_LAYOUT: {
         "offset": [spec["texts"][0] + 1], "tokens": [_span(kind, rid)],
         "output": ["vision_embeds"], "grid": [list(spec["grid"])],
     }}
