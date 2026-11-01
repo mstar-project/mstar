@@ -239,7 +239,7 @@ class VoxCPM2Model(Model):
             if not isinstance(spec, KVSpec):
                 continue
             override = overrides.get(spec.resource_key) or {}
-            page_size = int(override.get("page_size", spec.config.page_size))
+            page_size = int(override.get("page_size", spec.config.tokens_per_page))
             max_num_pages = int(override.get("max_num_pages", spec.config.max_num_pages))
             per_request = -(-self.config.max_length // page_size)
             need = 1 + cap * per_request
@@ -262,7 +262,7 @@ class VoxCPM2Model(Model):
             )
             # the shipped max_concurrent_requests at the full context, and the
             # sink page: 2049 pages, about 9.7 GB for both LMs
-            config.max_num_pages = 1 + self.DEFAULT_MAX_CONCURRENT * -(-config.max_seq_len // config.page_size)
+            config.max_num_pages = 1 + self.DEFAULT_MAX_CONCURRENT * -(-config.max_seq_len // config.tokens_per_page)
             return config
 
         nodes = {"Talker"}
