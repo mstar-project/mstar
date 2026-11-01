@@ -165,6 +165,7 @@ def test_a_speculation_hands_back_only_what_its_settle_undid(success, dropped, r
     )
     prep = SpeculationPreparer(ctx)._prepare_dicts(
         ScheduledBatch(node_name=NODE, graph_walk="w"), NODE, "w", [1, 2], None, PhaseLaps("t."),
+        None,
     )
     spec = Speculation(
         scheduled_batch=ScheduledBatch(
