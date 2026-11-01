@@ -290,24 +290,6 @@ def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
     ), "the cap and the stop check end decode on different iterations"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.submodules import REASONER_DECODE_LOOP, Cosmos3ReasonerSubmodule
-
-    reasoner = SimpleNamespace(eos_token_id=None)
-
-    def check_stop(request_id, request_info, outputs):
-        return Cosmos3ReasonerSubmodule.check_stop(reasoner, request_id, request_info, outputs)
-
-    cap = Cosmos3Model.get_loop_caps(object.__new__(Cosmos3Model), max_output_tokens=max_tokens)[REASONER_DECODE_LOOP]
-
-    assert cap == _stops_after(
-        check_stop, REASONER_DECODE_LOOP, "reasoner_decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end the reasoner's decode on different iterations"
-
-
 _COSMOS3_COMMITS = {
     "text to image": ("a fox in the snow", ["image"], {}),
     "text to image without guidance": ("a fox in the snow", ["image"], {"guidance_scale": 1.0}),
@@ -624,6 +606,10 @@ def _token_decoder(name: str):
         model = object.__new__(CanaryModel)
         model.config = SimpleNamespace(max_position_embeddings=1024)
         return model
+    if name == "cosmos3":
+        from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+        return object.__new__(Cosmos3Model)
     if name == "qwen3_asr":
         from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
         from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
@@ -641,13 +627,16 @@ def _token_decoder(name: str):
     return object.__new__(classes[name])
 
 
-@pytest.mark.parametrize("name", ["canary", "canary_qwen", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"])
+@pytest.mark.parametrize(
+    "name", ["canary", "canary_qwen", "cosmos3", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"],
+)
 @pytest.mark.parametrize("max_tokens", [2, 64])
 def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
     """The prefill samples the first token and the decode loop's cap runs the
     rest: the stop check counts no budget of its own, so the cap alone must
     leave max_tokens tokens (a budget of 1 ends at the prefill)."""
-    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max_tokens
+    loop = "reasoner_decode_loop" if name == "cosmos3" else "decode_loop"
+    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
 
 
 def _whisper():

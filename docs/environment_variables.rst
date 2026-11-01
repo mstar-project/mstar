@@ -225,13 +225,13 @@ model, so they are named for it.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
      - Cosmos3: any nonempty value disables denoise, prefill and reasoner
-       decode capture. The deployment option
+       captures. The deployment option
        ``model_kwargs.accelerator_graph: false`` also disables all these
        captures and cannot be overridden by this variable.
    * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
      - unset
-     - Cosmos3: any nonempty value disables only the understanding-tower
-       prefill capture. Denoise and reasoner decode captures remain eligible
+     - Cosmos3: any nonempty value disables only the DiT's understanding-tower
+       prefill capture. Denoise and reasoner captures remain eligible
        when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
