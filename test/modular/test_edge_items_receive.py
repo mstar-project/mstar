@@ -2,7 +2,7 @@
 per row, each a single streamed edge. Same reads started, same items
 registered with each stream buffer in the same order, the same rows parked
 (request not here yet) or dropped and ACKed (request removed), and nothing for
-a request being drained -- only the reads start in one call."""
+a request past its READS_DONE -- only the reads start in one call."""
 import logging
 from types import SimpleNamespace
 
@@ -31,7 +31,7 @@ def _info(uuid):
 
 def _frame():
     """Two known requests (one with two items), one not here yet, one
-    removed, one being drained."""
+    removed, one drained past its READS_DONE."""
     b = EdgeItemsBuilder("snac")
     for wire_rid, uuids in [("r1", [1, 2]), ("later", [3]), ("removed", [4]), ("draining", [5]), ("r2", [6])]:
         assert b.try_add(wire_rid, GraphEdge(
@@ -42,6 +42,8 @@ def _frame():
 
 def _worker():
     w = Worker.__new__(Worker)
+    # drained past READS_DONE: it takes no input (`_takes_input`)
+    w._reads_done_sent = {"draining"}
     w.worker_id = "w1"
     w.enable_nvtx = False
     w._walk_driven_edges = {}  # no producer-driven walk transitions here
