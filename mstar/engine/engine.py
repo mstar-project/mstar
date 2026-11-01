@@ -309,9 +309,9 @@ class ExecutingBatch:
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
-    # rids for which this step ends every finite stream into the partition;
-    # this step reports the partition done
-    stream_partition_done_rids: set[int] = field(default_factory=set)
+    # rids for which this step ends every finite stream into the partition, or
+    # whose stop check returned END_PARTITION; this step reports the partition done
+    partition_done_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -434,7 +434,7 @@ class ExecutingBatch:
         # A row that does not run this step must not end its streams on it:
         # the worker would stop its loop and finalize a row it no longer has.
         self.final_stream_rids.difference_update(rids)
-        self.stream_partition_done_rids.difference_update(rids)
+        self.partition_done_rids.difference_update(rids)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids
@@ -1907,7 +1907,8 @@ class Engine:
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
-        """Each rid's ``submodule.check_stop``, as rid -> loops that should stop.
+        """Each rid's ``submodule.check_stop``, as rid -> its stops (loop names,
+        or ``END_PARTITION``).
 
         Reads tensor values, so it belongs on the caller's slow-postprocess
         path rather than in ``exec``, where the ``.item()`` / ``.cpu()`` would

@@ -8,7 +8,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.model.submodule_base import ARNodeInputs, HostRows, NodeInputs
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, NodeInputs
 
 
 class TokenStepNode:
@@ -21,6 +21,11 @@ class TokenStepNode:
 
     DECODE_WALK = "decode"
     DECODE_LOOP = "decode_loop"
+    # The walk that samples the first token, before DECODE_LOOP exists. A stop
+    # there ends the partition (END_PARTITION); a stop id on any other walk
+    # outside the loop stops nothing, since the model's transition may still
+    # have a walk to run.
+    PREFILL_WALK = "prefill"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
     MAX_PREFILL_BATCH_SIZE: int | None
@@ -60,9 +65,26 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
+        """A stop id, or the token budget, on a PREFILL_WALK or decode row.
+        The budget counts the token PREFILL_WALK samples."""
+        walk = request_info.graph_walk
+        if walk == self.DECODE_WALK:
+            generated = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 2
+        elif walk == self.PREFILL_WALK:
+            generated = 1
+        else:
+            return False
         ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
-        decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        return (not ignore_eos and token in self.stop_token_ids) or decoded >= request_info.max_tokens
+        return (not ignore_eos and token in self.stop_token_ids) or generated >= request_info.max_tokens
+
+    def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
+        """``check_stop``'s answer for one row: a decode row stops the loop,
+        and a PREFILL_WALK row, which runs before the loop exists, ends the
+        partition. A batched decode step answers from ``_stops`` without
+        calling this, so an override changes only the other rows."""
+        if not self._stops(token, request_info):
+            return set()
+        return {self.DECODE_LOOP} if request_info.graph_walk == self.DECODE_WALK else {END_PARTITION}
 
     def check_stop(
         self,
@@ -74,7 +96,7 @@ class TokenStepNode:
         tokens = outputs.get("text_inputs") or outputs.get("new_token")
         if not tokens:
             return set()
-        return {self.DECODE_LOOP} if self._stops(tokens[0].item(), request_info) else set()
+        return self._stop_names(tokens[0].item(), request_info)
 
     def check_stop_batched(
         self,
@@ -83,10 +105,15 @@ class TokenStepNode:
         host_rows: HostRows,
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``. The base default
-        ignores ``step_walk``, so prefill's token can end the decode loop too;
-        subclasses may narrow that."""
+        """``check_stop`` for every request off one ``tolist``."""
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
-        return {rid: {self.DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}
+        if step_walk == self.DECODE_WALK:
+            # the hot path: one call a row, and every stop is the loop's
+            return {rid: {self.DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}
+        stops = {}
+        for rid, token in pairs:
+            if names := self._stop_names(token, request_infos[rid]):
+                stops[rid] = names
+        return stops

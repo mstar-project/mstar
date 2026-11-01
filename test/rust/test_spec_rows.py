@@ -271,7 +271,7 @@ def _view(spec, read_inputs: bool = True):
             r: (id(x.info), dict(x.dynamic_loop_iter_counts), x.max_tokens)
             for r, x in nb.per_request_info_wrapped.items()
         },
-        final=(set(nb.final_stream_rids), set(nb.stream_partition_done_rids)),
+        final=(set(nb.final_stream_rids), set(nb.partition_done_rids)),
         ctx=(
             tuple(nb.step_context.request_ids), nb.step_context.graph_walk,
             dict(nb.step_context.request_walks), nb.step_context.slot,

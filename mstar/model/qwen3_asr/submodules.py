@@ -477,7 +477,3 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
             row_outputs={signal: new_tokens},
             check_stop_buffers={"new_token": new_tokens},
         )
-
-    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        # only a decode step's token ends the loop: prefill runs outside it
-        return request_info.graph_walk == DECODE_WALK and super()._stops(token, request_info)

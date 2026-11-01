@@ -583,7 +583,8 @@ class Qwen3_5DenseModel(Model):
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(

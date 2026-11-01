@@ -42,7 +42,7 @@ def _speculation(rids: list[str]) -> Speculation:
             per_request_info={r: object() for r in rids},
             per_request_input_metadata={r: None for r in rids},
             final_stream_rids=set(rids),
-            stream_partition_done_rids=set(rids),
+            partition_done_rids=set(rids),
         ),
         consumed_edges={("tok", NODE)},
         continuing_rids=set(rids),
