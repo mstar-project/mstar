@@ -161,10 +161,13 @@ def specs(sub: ToyDSparkSubmodule, attn: str = "toy", **kwargs):
             else spec
             for spec in drafter
         ]
-    elif "fi_backend" in kwargs:
+    else:
         for spec in drafter:
             if isinstance(spec, AttentionSpec):
-                spec.config = dataclasses.replace(spec.config, flashinfer_backend=kwargs["fi_backend"])
+                spec.config = dataclasses.replace(
+                    spec.config, flashinfer_backend=kwargs.get("fi_backend", "auto"),
+                    rewind_kernel=kwargs.get("rewind_kernel", "auto"),
+                )
     return toy.specs(attn, **kwargs) + drafter
 
 

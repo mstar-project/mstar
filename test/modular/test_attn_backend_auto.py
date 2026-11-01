@@ -297,3 +297,60 @@ def test_yaml_rejects_an_unknown_backend():
     ragged = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())
     with pytest.raises(ValueError, match="'aiter' is not a valid RaggedAttnBackend"):
         ragged.apply_yaml_overrides(backend="aiter")
+
+
+# --- the kernel a verify step runs under device rewind ---------------------------
+
+
+def rewinding_manager(rewind_kernel: str, reason: str | None, monkeypatch) -> FlashInferManager:
+    """A FlashInfer manager of a node that takes its verdicts back on the device, on a GPU where
+    paged FA3 can't run for ``reason`` (None: it can). Nothing allocates before a plan."""
+    from mstar.engine.resources.attn import fa3_paged
+
+    monkeypatch.setattr(fa3_paged, "fa3_paged_unavailable_reason", lambda *args: reason)
+    manager = FlashInferManager(
+        kv_cache="kv", device=torch.device("cuda"), dtype=torch.bfloat16, kv_config=paged_config(),
+        rewind_kernel=rewind_kernel,
+    )
+    manager.device_correct = True
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("rewind_kernel", "reason", "kernel"),
+    [("auto", None, "fa3_paged"), ("auto", "no wheel", "fa2"), ("fa3", None, "fa3_paged"), ("fa2", None, "fa2")],
+)
+def test_a_verify_step_under_device_rewind_runs_the_kernel_rewind_kernel_names(
+    rewind_kernel, reason, kernel, monkeypatch,
+):
+    manager = rewinding_manager(rewind_kernel, reason, monkeypatch)
+    assert manager.corrects_on_device
+    assert manager._prefill_backend(32, 4, verify=True) == kernel
+    # a step that verifies nothing: FA2 for a short block, else the configured backend
+    assert manager._prefill_backend(32, 4) == "fa2"
+    assert manager._prefill_backend(4096, 4) == "auto"
+
+
+def test_rewind_kernel_fa3_is_refused_where_paged_fa3_cant_run(monkeypatch):
+    manager = rewinding_manager("fa3", "flash_attn_3 doesn't import", monkeypatch)
+    with pytest.raises(ValueError, match="rewind_kernel fa3, but paged FA3 can't run: flash_attn_3 doesn't import"):
+        manager._prefill_backend(32, 4, verify=True)
+
+
+@pytest.mark.parametrize(("rewind_kernel", "corrects"), [("auto", False), ("fa3", True)])
+def test_whether_a_node_rewinds_on_the_device_doesnt_depend_on_the_rank(rewind_kernel, corrects, monkeypatch):
+    """With FlashInfer's FA3 named, the node rewinds on the device only if rewind_kernel names paged
+    FA3 too, whether or not this rank can run it: every rank of a lockstep instance answers alike."""
+    for reason in (None, "no wheel"):
+        manager = rewinding_manager(rewind_kernel, reason, monkeypatch)
+        manager._wrapper_kv_kwargs["backend"] = "fa3"
+        assert manager.corrects_on_device is corrects
+
+
+def test_yaml_names_a_rewind_kernel():
+    spec = attention_spec()
+    assert spec.config.rewind_kernel == "auto"
+    spec.apply_yaml_overrides(rewind_kernel="fa2")
+    assert spec.config.rewind_kernel == "fa2"
+    with pytest.raises(ValueError, match="rewind_kernel must be one of"):
+        spec.apply_yaml_overrides(rewind_kernel="fa4")

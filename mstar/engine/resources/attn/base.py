@@ -192,6 +192,7 @@ class AttentionManager(AttentionResource):
                 sliding_window=spec.config.sliding_window,
                 decode_fmha=spec.config.decode_fmha,
                 layers=spec.config.layers,
+                rewind_kernel=spec.config.rewind_kernel,
             )
 
         if backend == AttnBackend.FLEX:

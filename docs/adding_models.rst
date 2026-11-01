@@ -1672,11 +1672,19 @@ readdresses the step's writes, positions shift, FlashInfer shortens each row's l
 host takes them back at the request's next settle, a step later, and the engine reads a step's
 tokens at its stop check, once it has landed, so the step after it is launched while it runs,
 as plain decode's is. A node gets it only when every resource whose plan reads lengths
-(``Resource.plan_reads_lengths``) corrects on the device (``corrects_on_device``: the
-FlashInfer manager on CUDA with backend ``auto`` or ``fa2``, whose verify blocks of 16 tokens
-a row or fewer then plan FA2's prefill kernel, which keeps a row's KV length as its pages and
-last page; a captured plan's KV chunks are planned again in the graph from the shortened
-lengths) and no engine-side proposer drafts; otherwise it waits for each verdict as above.
+(``Resource.plan_reads_lengths``) corrects on the device (``corrects_on_device``) and no
+engine-side proposer drafts; otherwise it waits for each verdict as above. The FlashInfer
+manager corrects on CUDA with ``flashinfer_backend`` ``auto`` or ``fa2``, or with
+``rewind_kernel: fa3``. Its verify steps then run FlashAttention-3's paged kernel where it
+can (the ``flash_attn_3`` wheel on an SM90 GPU, a bf16 or fp16 cache, no sliding window; see
+:doc:`installation`): the kernel reads each row's KV length from the device, so the rewind
+shortens those and computes the split schedule from them in the graph, and a replayed step
+attends exactly as an eager call at the shortened lengths. Elsewhere verify blocks of 16
+tokens a row or fewer plan FlashInfer's FA2 prefill kernel, which keeps a row's KV length as
+its pages and last page; a captured plan's KV chunks are planned again in the graph from the
+shortened lengths. The attention spec's ``rewind_kernel`` picks one: ``auto`` (the default:
+paged FA3 where it runs, else FA2), ``fa3`` (refused at the first verify plan, so at load,
+where it can't run) or ``fa2``.
 Two kinds of drafter need no drafting code of the model's own, and a verify step's forward
 runs either through one helper, ``draft_verify_step(dv, request_ids, inputs, target,
 drafter=None)``: the drafts, ``agree``, ``target`` (the block's ids, flat, to the target's
@@ -2245,7 +2253,8 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
+       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``), ``rewind_kernel``
+       (``auto`` / ``fa3`` / ``fa2``: a verify step's kernel under device rewind)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)

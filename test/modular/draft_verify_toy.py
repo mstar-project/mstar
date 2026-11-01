@@ -345,7 +345,7 @@ def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True
           kv_heads: int = HEADS, sampled_verify: bool = False,
           argmax_prefill: bool | None = None, ngram: dict | None = None,
           taps: tuple[int, ...] = (), tap_dtype: torch.dtype = torch.float32,
-          fi_backend: str = "auto") -> list[NodeResourceSpec]:
+          fi_backend: str = "auto", rewind_kernel: str = "auto") -> list[NodeResourceSpec]:
     # ``kv_heads`` before sharding: a lockstep test gives each rank every head.
     # ``argmax_prefill``: the prefill's token is the argmax, so it draws nothing (on CPU always,
     # where the real draw has no kernel).
@@ -366,7 +366,7 @@ def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True
         out.append(ToyAttentionSpec(resource_key=ATTN, nodes={NODE}))
     else:
         out.append(AttentionSpec(resource_key=ATTN, nodes={NODE}, config=AttentionConfig(
-            kv_cache=KV, backend=AttnBackend(attn), flashinfer_backend=fi_backend)))
+            kv_cache=KV, backend=AttnBackend(attn), flashinfer_backend=fi_backend, rewind_kernel=rewind_kernel)))
     if draft_verify:
         out.append(DraftVerifySpec(resource_key=DV, nodes={NODE}, sampler=SAMPLER))
     if taps:

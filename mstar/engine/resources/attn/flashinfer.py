@@ -1,5 +1,6 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+import logging
 from collections.abc import Mapping
 
 import torch
@@ -27,10 +28,15 @@ from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
-# Under device rewind a verify block (at most this many tokens a row) plans FA2, whose lengths the
-# device can move (`FlashInferPrefillWrapper.correct_kv_lens`); FA3 keeps them in its plan. FA2
-# also reads a row's KV once a KV head, not once a query head: 0.5-0.9x FA3's time at these rows.
+logger = logging.getLogger(__name__)
+
+# Under device rewind a verify step runs paged FA3 where it can (`FA3PagedWrapper`, which reads each
+# row's KV length from the device), else, for a short block (at most this many tokens a row),
+# FlashInfer's FA2, whose lengths the device can move too (`FlashInferPrefillWrapper.correct_kv_lens`);
+# FlashInfer's FA3 keeps them in its plan.
 _SHORT_BLOCK = 16
+# `_prefill_backend`'s name for paged FA3, beside FlashInfer's backends
+_FA3_PAGED = "fa3_paged"
 
 
 class FlashInferManager(AttentionManager):
@@ -47,6 +53,7 @@ class FlashInferManager(AttentionManager):
         sliding_window: int | None = None,
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
+        rewind_kernel: str = "auto",
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -93,6 +100,10 @@ class FlashInferManager(AttentionManager):
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
             and fmha_decode_applies(device)
         )
+        self._rewind_kernel = rewind_kernel
+        # whether a verify step under device rewind runs paged FA3; resolved on first use, since
+        # only such a node imports it (`_verify_on_fa3`)
+        self._fa3_paged: bool | None = None
 
         self._workspaces = WorkspacePool(device)
 
@@ -115,7 +126,7 @@ class FlashInferManager(AttentionManager):
         self._default_layer_idx = layer_idx
 
     def _cg_wrapper(
-        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
+        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool, verify: bool = False,
     ) -> AttentionWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
@@ -139,7 +150,6 @@ class FlashInferManager(AttentionManager):
             return wrapper
 
         bucket = lease.bucket
-        buffer = self._workspaces.get(label, lease.slot)
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
             "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
@@ -163,17 +173,20 @@ class FlashInferManager(AttentionManager):
         elif bucket.bs == bucket.num_tokens and not force_prefill and not self.device_correct:
             # (under device rewind every step plans the prefill wrapper, whose rows' lengths
             # `correct_on_device` can move; the decode kernels split them by length)
-            wrapper = self._fmha_wrapper(buffer, num_rows) or FlashInferDecodeWrapper(
-                workspace_buffer=buffer,
+            workspace = self._workspaces.get(label, lease.slot)
+            wrapper = self._fmha_wrapper(workspace, num_rows) or FlashInferDecodeWrapper(
+                workspace_buffer=workspace,
                 batch_size=num_rows,
                 accelerator_graph=True,
                 use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
+        elif (backend := self._prefill_backend(bucket.num_tokens, num_rows, verify)) == _FA3_PAGED:
+            wrapper = self._fa3_wrapper(num_rows)
         else:
-            kv_kwargs["backend"] = self._prefill_backend(bucket.num_tokens, num_rows)
+            kv_kwargs["backend"] = backend
             wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=buffer,
+                workspace_buffer=self._workspaces.get(label, lease.slot),
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 accelerator_graph=True,
@@ -200,12 +213,45 @@ class FlashInferManager(AttentionManager):
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
-    def _prefill_backend(self, tokens: int, rows: int) -> str:
-        """The prefill wrapper's FlashInfer backend: FA2 for a short block under device rewind
-        (`_SHORT_BLOCK`), else the configured one."""
+    def _prefill_backend(self, tokens: int, rows: int, verify: bool = False) -> str:
+        """The prefill wrapper's backend under device rewind: paged FA3 for a verify step where
+        it runs (`_verify_on_fa3`), else FA2 for a short block (`_SHORT_BLOCK`); else the
+        configured one."""
+        if self.device_correct and verify and self._verify_on_fa3():
+            return _FA3_PAGED
         if self.device_correct and tokens <= _SHORT_BLOCK * rows:
             return "fa2"
         return self._wrapper_kv_kwargs["backend"]
+
+    def _verify_on_fa3(self) -> bool:
+        """Whether a verify step under device rewind runs paged FA3 (``rewind_kernel``: ``auto``
+        where it runs, ``fa3`` or raise, at the first plan, ``fa2`` never). Not over a pool that
+        keeps a window, which no verifying node has (`KVManager.require_lookahead`). Which kernel
+        runs may differ between ranks; neither takes part in a collective."""
+        if self._fa3_paged is None:
+            from mstar.engine.resources.attn.fa3_paged import fa3_paged_unavailable_reason
+
+            reason = None
+            if self._rewind_kernel != "fa2":
+                reason = fa3_paged_unavailable_reason(self._device, self._kv_config.head_dim, self._dtype)
+                if reason is None and (self._window_left >= 0 or len(self._kv_config.groups) > 1):
+                    reason = "a sliding window"
+            if reason is not None and self._rewind_kernel == "fa3":
+                raise ValueError(f"KV {self._kv_cache_name!r}: rewind_kernel fa3, but paged FA3 can't run: {reason}")
+            if reason is not None:
+                logger.info("KV %r: verify steps under device rewind run FA2 (%s)", self._kv_cache_name, reason)
+            self._fa3_paged = self._rewind_kernel != "fa2" and reason is None
+        return self._fa3_paged
+
+    def _fa3_wrapper(self, num_rows: int | None = None):
+        from mstar.engine.resources.attn.fa3_paged import FA3PagedWrapper
+
+        kv = self._kv_config
+        return FA3PagedWrapper(
+            num_qo_heads=kv.num_qo_heads, num_kv_heads=kv.num_kv_heads, head_dim=kv.head_dim,
+            page_size=self._group.page_size, max_seq_len=kv.max_seq_len, device=self._device,
+            batch_size=num_rows, accelerator_graph=num_rows is not None,
+        )
 
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int, backend: str | None = None,
@@ -220,16 +266,18 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode, backend=backend)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            workspace = self._workspaces.get(label, slot)
             if is_decode:
                 wrapper = FlashInferDecodeWrapper(
-                    workspace_buffer=workspace,
+                    workspace_buffer=self._workspaces.get(label, slot),
                     use_tensor_cores=self._decode_tensor_cores,
                     **self._wrapper_kv_kwargs,
                 )
+            elif backend == _FA3_PAGED:
+                wrapper = self._fa3_wrapper()
             else:
                 wrapper = FlashInferPrefillWrapper(
-                    workspace_buffer=workspace, **{**self._wrapper_kv_kwargs, "backend": backend},
+                    workspace_buffer=self._workspaces.get(label, slot),
+                    **{**self._wrapper_kv_kwargs, "backend": backend},
                 )
             self._eager_plan_states[key] = wrapper
         return wrapper
@@ -297,13 +345,14 @@ class FlashInferManager(AttentionManager):
             indptrs = self._indptrs(kv_out, step)
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
-                wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
+                wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill, step.verify)
             else:
                 rows = len(indptrs.qo_indptr) - 1
                 tokens = int(indptrs.qo_indptr[-1])
                 is_decode = not ctx.force_prefill and not self.device_correct and tokens == rows
                 wrapper = self._eager_wrapper(
-                    label, is_decode, ctx.slot, None if is_decode else self._prefill_backend(tokens, rows),
+                    label, is_decode, ctx.slot,
+                    None if is_decode else self._prefill_backend(tokens, rows, step.verify),
                 )
 
             kwargs = indptrs.to_kwargs_dict()
@@ -361,9 +410,12 @@ class FlashInferManager(AttentionManager):
 
     @property
     def corrects_on_device(self) -> bool:
-        # a short block's FA2 prefill kernel reads each row's KV length on the device, from its
-        # last page's length (`FlashInferPrefillWrapper.correct_kv_lens`)
-        return self._device.type == "cuda" and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2")
+        # paged FA3 reads each row's KV length on the device, and so does a short block's FA2
+        # prefill kernel, from its last page's length (`FlashInferPrefillWrapper.correct_kv_lens`).
+        # From the config alone, so every rank of a lockstep instance answers alike.
+        return self._device.type == "cuda" and (
+            self._wrapper_kv_kwargs["backend"] in ("auto", "fa2") or self._rewind_kernel == "fa3"
+        )
 
     @torch.compiler.disable
     def correct_on_device(self, rejected) -> None:

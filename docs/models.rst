@@ -446,7 +446,10 @@ max_num_pages``. ``method: dspark`` with ``model:`` a DSpark drafter trained for
 the checkpoint (``configs/qwen3_8b_dspark.yaml``: DeepSeek's
 ``dspark_qwen3_8b_block7`` for Qwen3-8B) reads five of the target's layers and
 drafts its block (7) in one pass every step, and its KV pool is ``resources:
-dspark_kv``. Under any method ``repetition_penalty`` and ``min_tokens`` are
+dspark_kv``. Its verify steps take the last verdict back on the device, and on an H100/H200
+attend with FlashAttention-3's paged kernel when the ``flash_attn_3`` wheel is installed
+(see :doc:`installation`), else FlashInfer's FA2, about twice as slow on a verify step's
+attention at 32 rows. Under any method ``repetition_penalty`` and ``min_tokens`` are
 refused, prefix caching is off on the node, and a draft model needs a prompt of
 at least two tokens.
 

@@ -32,6 +32,9 @@ class AttnBackend(Enum):
     FLASHINFER_MLA = "flashinfer_mla"
 
 
+REWIND_KERNELS = ("auto", "fa3", "fa2")
+
+
 @dataclass
 class AttentionConfig:
     kv_cache: str # name of the KV cache
@@ -63,8 +66,14 @@ class AttentionConfig:
     # The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's
     # ``max_seq_len`` needs; the pool's other layers keep every token.
     layers: tuple[int, ...] | None = None
+    # FlashInfer only, under device rewind (``DraftPolicy.device_rewind``): the kernel a verify
+    # step runs. ``fa3``: FlashAttention-3's paged kernel (the ``flash_attn_3`` wheel, SM90);
+    # ``fa2``: FlashInfer's FA2; ``auto``: paged FA3 where it runs, else FA2.
+    rewind_kernel: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.rewind_kernel not in REWIND_KERNELS:
+            raise ValueError(f"rewind_kernel must be one of {REWIND_KERNELS}, got {self.rewind_kernel!r}")
         if self.sliding_window is not None and (
             type(self.sliding_window) is not int or self.sliding_window <= 0
         ):
@@ -101,6 +110,7 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
+        rewind_kernel: str | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -116,6 +126,10 @@ class AttentionSpec(NodeResourceSpec):
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
         if decode_fmha is not None:
             self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
+        if rewind_kernel is not None:
+            if rewind_kernel not in REWIND_KERNELS:
+                raise ValueError(f"rewind_kernel must be one of {REWIND_KERNELS}, got {rewind_kernel!r}")
+            self.config.rewind_kernel = rewind_kernel
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
@@ -258,6 +272,8 @@ class AttentionStep(ResourceStep):
     # Each segment's last ``hide_last`` rows are written but no query attends to them (a
     # parallel drafter's placeholder row). Non-causal only; only FlashInfer reads it.
     hide_last: int = 0
+    # a draft-verify block (``with_draft_verify`` sets it): every row spans the same few tokens
+    verify: bool = False
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:
