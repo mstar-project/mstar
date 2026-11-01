@@ -41,6 +41,7 @@ from mstar.model.qwen3_5.config import (
     ROPE,
     Qwen3_5Config,
 )
+from mstar.platforms import current_platform
 
 
 class RopeCache:
@@ -262,6 +263,19 @@ class Qwen3_5LanguageModel(nn.Module):
             out = mixer.o_proj if hasattr(mixer, "o_proj") else mixer.out_proj
             out.reduce_results = False
             layer.mlp.down_proj.reduce_results = False
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse)
+        # The cast to the model's dtype rounds this buffer too. In bf16 a
+        # frequency is off by up to 0.3 %, and the angle error grows with the
+        # distance between two tokens, so long-range attention reads the wrong
+        # keys.
+        if current_platform.is_rocm():
+            self.inv_freq = compute_inv_freq(
+                self.config.rotary_dim, self.config.rope_theta,
+                device=self.inv_freq.device,
+            )
+        return result
 
     def build_cos_sin(
         self, position_ids_3d: torch.Tensor, dtype: torch.dtype,
