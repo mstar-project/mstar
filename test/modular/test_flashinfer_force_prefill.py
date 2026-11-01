@@ -68,3 +68,6 @@ def test_an_eager_step_of_one_token_prompts_samples_every_row(manager):
     assert isinstance(manager._current_plan_states["main"], _Decode)
     hidden = torch.randn(3, 8)
     assert torch.equal(manager.select_last_hidden(hidden), hidden)
+    # a label this step never planned is a caller bug, not one-token rows
+    with pytest.raises(ValueError, match="no plan"):
+        manager.select_last_hidden(hidden, label="other")

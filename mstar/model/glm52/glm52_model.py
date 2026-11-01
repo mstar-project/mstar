@@ -258,10 +258,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # The window, not the request's budget, which is its loop cap
-            # (get_loop_caps): the most decode steps any prompt can take
-            # before the context guard. Sized to the default budget, every
-            # request asking for more was cut short at 1025 tokens.
+            # The window every request's loop cap (get_loop_caps) must fit: the
+            # most decode steps a one-token prompt can take before the context guard.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -312,8 +310,8 @@ class Glm52Model(Model):
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
         elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
+            # The decode Loop ended at a stop id or at the request's loop cap;
+            # either way the request is finished.
             request_done = True
             metadata.kwargs["decode_finished"] = True
 

@@ -94,8 +94,7 @@ class CommandAPlusModel(Model):
                 # sampler, so it stays on the device
                 section=GraphNode(name="LLM", input_names=["text_inputs"], outputs=[
                     GraphEdge(next_node="LLM", name="text_inputs"),
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs",
-                              output_modality="text", conductor_new_token=True),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ]),
             ),
         }

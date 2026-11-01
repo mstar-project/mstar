@@ -119,7 +119,7 @@ class Glm52ModelConfig:
     stop_token_ids: frozenset[int] = frozenset({154820, 154827, 154829})
     pad_token_id: int = 154820
     # None: a request that names no max_tokens may run to the end of the window,
-    # as in vLLM; the submodule caps each request at what its prompt leaves.
+    # as in vLLM; the conductor cuts each request's loop cap to what its prompt leaves.
     max_output_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 0.95

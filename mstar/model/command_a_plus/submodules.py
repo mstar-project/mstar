@@ -62,6 +62,9 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     PREFILL_WALK = "prefill"
     # both attention resources plan the same packing
     ATTN_KEY = LOCAL_ATTN
+    # the ladder it captured before moving onto the scaffold: wider decode
+    # steps are unmeasured on this MoE (graph memory, fused-MoE tiles)
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         # one KV cache, read through a windowed and an unwindowed resource

@@ -181,7 +181,7 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
         if graph_walk == self.PREFILL_WALK:
             tokens = inputs["text_inputs"][0].shape[0]
             if tokens > self.config.max_prompt_tokens:
-                raise RuntimeError(
+                raise ValueError(
                     f"request {fwd_info.request_id}: a prompt of {tokens} tokens "
                     f"exceeds the {self.config.max_prompt_tokens} served"
                 )

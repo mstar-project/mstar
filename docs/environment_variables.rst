@@ -559,7 +559,7 @@ Worker scheduling
        the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
-       Qwen3.5 alone; Orpheus and Higgs-Audio pin their own.
+       Qwen3.5 alone; Orpheus, Higgs-Audio, GLM-5.2 and Command A+ pin their own.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests

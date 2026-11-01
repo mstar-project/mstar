@@ -239,7 +239,7 @@ def test_a_prompt_without_room_fails_alone():
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     fits, full = torch.arange(14) + 3, torch.arange(15) + 3
     sub.prepare_inputs("prefill", _fwd_info("a", 8, True), {"text_inputs": [fits]})
-    with pytest.raises(RuntimeError, match="exceeds the 14 served"):
+    with pytest.raises(ValueError, match="exceeds the 14 served"):
         sub.prepare_inputs("prefill", _fwd_info("b", 8, True), {"text_inputs": [full]})
 
 
