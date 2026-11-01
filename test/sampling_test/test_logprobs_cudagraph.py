@@ -15,11 +15,11 @@ import torch
 
 if not torch.cuda.is_available():
     pytest.skip("requires CUDA", allow_module_level=True)
-pytest.importorskip("flashinfer")
+flashinfer = pytest.importorskip("flashinfer")
 
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB, SamplerStep, SamplingReqConfig  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
-from mstar.engine.resources.sampler.utils import token_logprobs  # noqa: E402
+from mstar.engine.resources.sampler.utils import FilterOrder, processed_logprobs, token_logprobs  # noqa: E402
 from mstar.engine.resources.step import SlotLease, StepContext  # noqa: E402
 
 DEV = torch.device("cuda:0")
@@ -68,9 +68,23 @@ class _Captured:
         return self.tokens.clone(), rows
 
 
-def _resource():
+def _processed_reference(logits, tokens, temperature, top_k, top_p, penalty=1.0, seen=None):
+    """The drawn token under softmax(penalized logits / T) renormed by
+    FlashInfer's own top-k, then top-p."""
+    logits = logits.float()
+    if seen is not None:
+        penalized = torch.where(logits > 0, logits / penalty, logits * penalty)
+        logits = torch.where(seen, penalized, logits)
+    probs = (logits / torch.tensor(temperature, device=DEV)[:, None]).softmax(-1)
+    probs = flashinfer.sampling.top_k_renorm_probs(probs, torch.tensor(top_k, device=DEV))
+    probs = flashinfer.sampling.top_p_renorm_probs(probs, torch.tensor(top_p, device=DEV))
+    return probs.gather(1, tokens.long()[:, None]).squeeze(1).log()
+
+
+def _resource(processed=False):
     res = SamplerResource(
         vocab_size=None, enable_repetion_penalty=False, device=DEV, enable_logprobs=True,
+        enable_processed_logprobs=processed,
     )
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=BS, max_seq_len=1)
     return res
@@ -102,6 +116,11 @@ def test_a_near_certain_token_never_scores_above_zero():
     logits[:, 7] = logits.max(dim=1).values + 12
     tokens = torch.full((256,), 7, device=DEV)
     assert token_logprobs(logits, tokens, torch.full((256,), 0.3, device=DEV)).max() <= 0
+    logits = torch.randn(256, 248_320, device=DEV, generator=gen).mul_(2)
+    logits[:, 7] = logits.max(dim=1).values + 4
+    top_k = torch.zeros(256, device=DEV, dtype=torch.int32)
+    top_p = torch.full((256,), 0.95, device=DEV)
+    assert processed_logprobs((logits / 0.7).softmax(-1), tokens, top_k, top_p).max() <= 0
 
 
 def test_replayed_logprobs_match_log_softmax_with_padding_and_quiet_rows():
@@ -139,3 +158,74 @@ def test_captured_and_eager_agree_on_a_greedy_row():
     assert torch.equal(tokens[:2], eager_tokens)
     torch.testing.assert_close(rows[:2], eager_rows)
     torch.testing.assert_close(eager_rows, _reference(logits, eager_tokens, [0.0, 0.0]).cpu())
+
+
+def _eager_step(res, rids, logits, apply_penalty=False):
+    step = SamplerStep(apply_penalty=apply_penalty)
+    ctx = StepContext(request_ids=tuple(rids), graph_walk="decode", slot=0, capture=False)
+    res.plan(step, ctx)
+    tokens = res.sample(list(rids), logits, apply_penalty=apply_penalty)
+    rows = res.step_host_rows()[SAMPLED_LOGPROB].cpu()
+    res.commit(step, ctx)
+    return tokens, rows
+
+
+# processed and filtered, raw with the same filters, processed and greedy
+MIXED = [
+    SamplingReqConfig(temperature=0.7, top_k=20, top_p=0.9, return_logprobs=True, logprobs_mode="processed"),
+    SamplingReqConfig(temperature=0.7, top_k=20, top_p=0.9, return_logprobs=True),
+    SamplingReqConfig(temperature=0.0, return_logprobs=True, logprobs_mode="processed"),
+]
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_processed_rows_score_the_distribution_the_token_was_drawn_from(graph):
+    res = _resource(processed=True)
+    for rid, cfg in enumerate(MIXED):
+        res.ingest_request(rid, cfg)
+    cap = _Captured(res, [0, 1, 2]) if graph else None
+    for seed in range(4):
+        logits = _logits(seed)
+        if graph:
+            tokens, rows = cap.step([0, 1, 2], logits)
+        else:
+            tokens, rows = _eager_step(res, [0, 1, 2], logits[:3])
+        processed = _processed_reference(logits[:1], tokens[:1], [0.7], [20], [0.9]).cpu()
+        torch.testing.assert_close(rows[:1], processed, rtol=1e-4, atol=1e-4)
+        raw = _reference(logits[1:2], tokens[1:2], [0.7]).cpu()
+        torch.testing.assert_close(rows[1:2], raw, rtol=1e-5, atol=1e-5)
+        assert rows[2] == 0, "a greedy draw is certain"
+
+
+@pytest.mark.parametrize("vocab", [4096, 248_320])
+def test_the_two_renorm_shortcut_matches_the_full_filter(vocab):
+    gen = torch.Generator(device=DEV).manual_seed(vocab)
+    probs = (torch.randn(6, vocab, device=DEV, generator=gen) * 4).softmax(-1)
+    top_k = torch.tensor([0, 0, 5, 50, 5, 0], device=DEV, dtype=torch.int32)
+    top_p = torch.tensor([1.0, 0.9, 1.0, 0.8, 0.5, 0.3], device=DEV)
+    tokens = probs.argmax(-1)
+    every_row_flashinfer_order = FilterOrder(
+        top_p_first=torch.zeros(6, dtype=torch.bool, device=DEV), min_keep=torch.ones(6, dtype=torch.int32, device=DEV),
+    )
+    torch.testing.assert_close(
+        processed_logprobs(probs, tokens, top_k, top_p),
+        processed_logprobs(probs, tokens, top_k, top_p, order=every_row_flashinfer_order),
+        rtol=1e-4, atol=1e-4,
+    )
+
+
+def test_processed_rows_see_the_repetition_penalty():
+    res = SamplerResource(
+        vocab_size=V, enable_repetion_penalty=True, device=DEV,
+        enable_logprobs=True, enable_processed_logprobs=True,
+    )
+    res.ingest_request(0, SamplingReqConfig(
+        temperature=1.0, top_p=0.95, repetition_penalty=1.5, return_logprobs=True, logprobs_mode="processed",
+    ))
+    logits = _logits(11)[:1]
+    seen = torch.zeros(1, V, dtype=torch.bool, device=DEV)
+    for _ in range(4):
+        tokens, rows = _eager_step(res, [0], logits, apply_penalty=True)
+        expected = _processed_reference(logits, tokens, [1.0], [V], [0.95], penalty=1.5, seen=seen).cpu()
+        torch.testing.assert_close(rows, expected, rtol=1e-4, atol=1e-4)
+        seen[0, tokens] = True

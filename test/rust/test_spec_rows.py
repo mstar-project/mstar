@@ -93,7 +93,7 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, state, target, continuing):
+    def pick_chain_step(self, state, target, continuing, mid_prefill=()):
         # the chain keeps its rows up to the cap; the fresh rows come from the take
         rows = list(continuing)
         return ChainPick(target, StepPick(
@@ -101,7 +101,7 @@ class _Scheduler:
             held_back=set(), ordered=False,
         ), [])
 
-    def take_chain_step(self, state, chain):
+    def take_chain_step(self, state, chain, pre_existing_batch_size=0, pre_existing_seq_lens=None):
         return self.get_next_batch()
 
     def _check_ready(self, node_name, rid, fwd_info):

@@ -120,7 +120,7 @@ def _sharding():
     return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
 
-def _python():
+def _python(**kwargs):
     book = PythonTensorBookkeeping()
     tm = _StubTensorManager(book)
     wg = WorkerGraph(
@@ -135,11 +135,12 @@ def _python():
         sharding_config=_sharding(),
         tensor_manager=tm,
         communicator=None,
+        **kwargs,
     )
     return rt, book, tm.tensor_store
 
 
-def _rust():
+def _rust(**kwargs):
     book = RustTensorBookkeeping()
     wg = WorkerGraph(
         section=_graph(), graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
@@ -152,6 +153,7 @@ def _rust():
         node_to_partition=dict.fromkeys(NODES, "default"),
         sharding_config=_sharding(),
         bookkeeping=book,
+        **kwargs,
     )
     return rt, book, None
 
@@ -339,6 +341,9 @@ def test_speculation_agrees(pair):
     ]
     # Speculating must leave nothing behind.
     assert _ready(rt) == []
+
+
+
 
 
 def test_loop_iters_agree(pair):
@@ -2475,3 +2480,477 @@ def test_an_unread_loop_back_sends_nothing():
         ),
     )
     assert out.rids_needing_request_info == frozenset()
+
+
+# --- a loop body that emits only to EMPTY_DESTINATION ------------------------
+#
+# A plain body that emits only to EMPTY_DESTINATION, with no loop-back (the
+# real chunk wrapper adds a tick, which the ``_wrapped_chunk_walk`` tests
+# below cover): each iteration re-runs it on the next slice of the same
+# re-injected input, so only the Loop's declared output carries a chunk's
+# result on. The two runtimes cache loop outputs from different
+# sources: Python from the node's declared ``outputs`` list
+# (``LoopStateRegistry.mark_entity_complete``), Rust from the routed-edge
+# slice (``cache_outputs`` over ``out[from..]``). An edge that routes nowhere
+# is where those two sets could differ, and the failure is silent -- an empty
+# ``Loop.outputs`` drops the final chunk instead of raising.
+
+CHUNK_NODES = {"embed", "llm"}
+
+
+def _chunk_loop_graph(out_edge, max_iters=2):
+    return Sequential(sections=[
+        GraphNode(
+            name="embed", input_names={"prompt"},
+            outputs=[GraphEdge(name="text_inputs", next_node="llm")],
+        ),
+        Loop(
+            name="chunk_loop",
+            section=GraphNode(
+                name="llm", input_names={"text_inputs"},
+                outputs=[GraphEdge(name="new_token", next_node=EMPTY_DESTINATION)],
+            ),
+            outputs=[out_edge],
+            max_iters=max_iters,
+        ),
+    ])
+
+
+# --- the chunk Loop a chunkable walk is wrapped in --------------------------
+#
+# Built by the real `_wrap_node_in_loop`, not a copy of its output: the shape
+# is the contract between the model, the conductor's seed and both runtimes,
+# and a hand-written mirror of it keeps passing after the wrapper changes.
+
+CHUNK_WALK = "prefill_text"
+
+
+def _wrapped_chunk_walk():
+    from mstar.model.base import _wrap_node_in_loop
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    node = GraphNode(
+        name="llm", input_names={"text_inputs"},
+        outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True)],
+    )
+    return _wrap_node_in_loop(
+        node, "llm", CHUNK_WALK,
+        ChunkingPolicy(walks=(CHUNK_WALK,), chunkable=True),
+    )
+
+
+def _chunk_runtime(which):
+    section = _wrapped_chunk_walk()
+    wg = WorkerGraph(
+        section=section, graph_walks={CHUNK_WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {CHUNK_WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(section.get_loops())},
+        all_wg_ids_to_nodes={WG_ID: {"llm"}},
+        node_to_partition={"llm": "default"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    return rt, book
+
+
+def _enter_chunk_walk(rt, seed_tick=True, request_id="r1"):
+    """What the conductor sends on entering the walk: the prompt, and the
+    chunk Loop's loop-back seed."""
+    from mstar.model.submodule_base import chunk_tick_name
+
+    rid = rt.add_request(
+        request_id=request_id, partition="default", graph_walk=CHUNK_WALK,
+        partition_worker_graph_ids=[WG_ID],
+        worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
+    )
+    specs = [_spec("text_inputs", "llm")]
+    if seed_tick:
+        specs.append(_spec(chunk_tick_name("llm", CHUNK_WALK), "llm"))
+    rt.ingest_inputs_batch(_ingest_block([rid] * len(specs), specs))
+    return rid
+
+
+def _run_chunk(rt, book, rid, uuid, stride=1):
+    """One chunk of ``stride`` tokens: the submodule produces a token and
+    nothing for the tick."""
+    signals = rt.get_output_signals("llm", CHUNK_WALK)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)
+    tensors, counts = [], []
+    for signal in signals:
+        if signal == "new_token":
+            tensors.append(uuid)
+            counts.append(1)
+        else:
+            counts.append(0)
+    return rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=CHUNK_WALK, node_name="llm",
+        output_signals=list(signals), wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=tensors, num_tensors=counts, loop_strides=[stride],
+    ))
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_chunk_walk_is_ready_for_its_first_chunk(which):
+    """The loop-back the node declares has no producer before chunk one, so
+    without the conductor's seed the walk never runs at all -- a hang, not an
+    error."""
+    rt, _book = _chunk_runtime(which)
+    assert _ready(rt) == []
+    rid = _enter_chunk_walk(rt)
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_without_the_seed_a_chunk_walk_never_becomes_ready(which):
+    rt, _book = _chunk_runtime(which)
+    _enter_chunk_walk(rt, seed_tick=False)
+    assert _ready(rt) == [], "the seed is what makes the first chunk runnable"
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_the_next_chunk_is_ready_and_speculable(which):
+    """A chunk re-readies the node off the re-injected prompt, and the
+    loop-back makes the next iteration a speculation target -- without it a
+    chunk-only step has nothing queued behind it."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    out = _run_chunk(rt, book, rid, 1)
+
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+    assert [(t.node_name, t.is_new_loop_iter)
+            for t in rt.speculate_node("llm", [CHUNK_WALK], [rid])] == [("llm", True)]
+    assert out.register_uuids == [], "a non-final chunk emits nothing"
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_only_the_final_chunks_token_leaves_the_loop(which):
+    """Earlier chunks' tokens are dropped as the loop advances, which is what
+    takes the engine out of the business of joining them."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 10)
+    _run_chunk(rt, book, rid, 1, stride=4)
+    _run_chunk(rt, book, rid, 2, stride=4)
+    out = _run_chunk(rt, book, rid, 3, stride=2)
+
+    assert sorted(out.register_uuids) == [3]
+    assert _ready(rt) == [], "the loop is over, so the node is not ready again"
+
+
+def _per_chunk_stream_runtime(which):
+    """The chunk walk with a ``per_chunk_outputs`` stream into a sibling
+    graph's consumer, as Qwen3-Omni's Thinker streams into its Talker."""
+    from mstar.model.base import _wrap_node_in_loop
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    node = GraphNode(
+        name="llm", input_names={"text_inputs"},
+        outputs=[
+            GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True),
+            GraphEdge(name="states", next_node="talker", is_streaming=True),
+        ],
+    )
+    section = _wrap_node_in_loop(node, "llm", CHUNK_WALK, ChunkingPolicy(
+        walks=(CHUNK_WALK,), chunkable=True, per_chunk_outputs=frozenset({"states"}),
+    ))
+    llm = WorkerGraph(section=section, graph_walks={CHUNK_WALK}, ranks=[0], worker_graph_id=WG_ID)
+    talker = WorkerGraph(
+        section=GraphNode(
+            name="talker", input_names={"states"},
+            outputs=[GraphEdge(name="kv", next_node=EMPTY_DESTINATION)],
+        ),
+        graph_walks={"talker_prefill"}, ranks=[0], worker_graph_id=1,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[llm, talker],
+        all_wg_ids_to_graph_walks={WG_ID: {CHUNK_WALK}, 1: {"talker_prefill"}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(section.get_loops()), 1: set()},
+        all_wg_ids_to_nodes={WG_ID: {"llm"}, 1: {"talker"}},
+        node_to_partition={"llm": "default", "talker": "Talker"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    from mstar.model.submodule_base import chunk_tick_name
+
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=CHUNK_WALK,
+        partition_worker_graph_ids=[WG_ID, 1],
+        worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
+    )
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
+    ))
+    return rt, book, rid
+
+
+def _run_streaming_chunk(rt, book, rid, token, states):
+    signals = rt.get_output_signals("llm", CHUNK_WALK)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    tensors, counts = [], []
+    for signal in signals:
+        uuid = {"new_token": token, "states": states}.get(signal)
+        if uuid is not None:
+            book.put_tensor(uuid, _info(uuid))
+            book.increment_ref(uuid, 1)
+            tensors.append(uuid)
+        counts.append(int(uuid is not None))
+    return rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=CHUNK_WALK, node_name="llm",
+        output_signals=list(signals), wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=tensors, num_tensors=counts,
+    ))
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_per_chunk_stream_routes_every_chunks_piece_as_it_runs(which):
+    """The consumer gets each chunk's piece on that chunk's step, while the
+    token still leaves the Loop on the final chunk alone."""
+    rt, book, rid = _per_chunk_stream_runtime(which)
+    outs = [_run_streaming_chunk(rt, book, rid, 1, 101), _run_streaming_chunk(rt, book, rid, 2, 102)]
+    rt.stop_loops_batched(
+        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
+        loop_names=ParallelList([rid], [["chunk_loop:llm:prefill_text"]]),
+    )
+    outs.append(_run_streaming_chunk(rt, book, rid, 3, 103))
+
+    assert [out.local_streaming_by_signal["states"].values for out in outs] == [[101], [102], [103]]
+    assert [sorted(out.register_uuids) for out in outs] == [[], [], [3]]
+    assert _ready(rt) == []
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_re_entering_a_chunk_walk_needs_another_seed(which):
+    """A walk entered twice (BAGEL's think-mode prefills twice) gets its seed
+    from every entry, not only the request's first."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 6)
+    _run_chunk(rt, book, rid, 1, stride=4)
+    _run_chunk(rt, book, rid, 2, stride=2)
+    assert _ready(rt) == []
+
+    from mstar.model.submodule_base import chunk_tick_name
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
+    ))
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+
+
+# --- a chunk Loop counts tokens -----------------------------------------------
+#
+# Each chunk moves the Loop by its tokens (``RouteInput.loop_strides``), and
+# the Loop ends at the prompt's length, set as its cap on the first chunk. So
+# the Loop ends itself on the last chunk, and speculation offers no chunk past
+# it, given how far the chunk in flight moves the count.
+
+CHUNK_LOOP = "chunk_loop:llm:prefill_text"
+
+
+def _cap(rt, rid, cap):
+    rt.set_loop_caps("llm", [rid], [CHUNK_WALK], [CHUNK_LOOP], [cap])
+
+
+def _progress(rt, rids):
+    counts, caps = rt.loop_progress("llm", rids, [CHUNK_WALK] * len(rids), [CHUNK_LOOP] * len(rids))
+    return list(zip(counts, caps, strict=True))
+
+
+def _chunk_spec_targets(rt, rids, strides=None):
+    return [
+        (t.node_name, t.is_new_loop_iter)
+        for t in rt.speculate_node("llm", [CHUNK_WALK], rids, [len(rids)], strides)
+    ]
+
+
+def _chunk_prep(rt, rids, strides=None):
+    return rt.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name="llm", curr_node_name="llm", graph_walk=CHUNK_WALK,
+        rids=rids, room_for_continuing=None,
+        streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+        loop_strides=strides,
+    )).ready_rids
+
+
+def _chunk_prep_rows(rt, rids, strides=None):
+    return rt.prep_spec_rows(
+        "llm", "llm", CHUNK_WALK, rids, None, strides,
+    ).ready_rids
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_chunk_loop_counts_its_tokens_up_to_its_cap(which):
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 10)
+    assert _progress(rt, [rid]) == [(0, 10)]
+    _run_chunk(rt, book, rid, 1, stride=4)
+    assert _progress(rt, [rid]) == [(4, 10)]
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+    _run_chunk(rt, book, rid, 2, stride=4)
+    assert _progress(rt, [rid]) == [(8, 10)]
+    out = _run_chunk(rt, book, rid, 3, stride=2)
+    assert sorted(out.register_uuids) == [3], "the last chunk ends the Loop"
+    assert _ready(rt) == []
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_first_chunk_past_a_cached_prefix_counts_from_zero(which):
+    """A first chunk starting at a cached prefix of 6 and ending at 8 moves
+    the Loop by 8, so the Loop's count is the next chunk's start."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 10)
+    _run_chunk(rt, book, rid, 1, stride=8)
+    assert _progress(rt, [rid]) == [(8, 10)]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_row_that_runs_whole_ends_its_loop(which):
+    """A walk with no token budget never caps the Loop; the row's stride
+    ends it."""
+    from mstar.model.submodule_base import CHUNK_LOOP_END
+
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    out = _run_chunk(rt, book, rid, 1, stride=CHUNK_LOOP_END)
+    assert sorted(out.register_uuids) == [1]
+    assert _ready(rt) == []
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_speculation_offers_no_chunk_past_the_last(which):
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 10)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    # the chunk in flight runs [0, 4): another follows
+    assert _chunk_spec_targets(rt, [rid], [4]) == [("llm", True)]
+    assert _chunk_prep(rt, [rid], [4]) == [rid]
+    assert _chunk_prep_rows(rt, [rid], [4]) == [rid]
+    # the chunk in flight runs [0, 10): nothing follows
+    assert _chunk_spec_targets(rt, [rid], [10]) == []
+    assert _chunk_prep(rt, [rid], [10]) == []
+    assert _chunk_prep_rows(rt, [rid], [10]) == []
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_speculation_searches_past_a_first_row_on_its_last_chunk(which):
+    """A first row on its last chunk does not end the walk's speculation: the
+    target stays for the row that continues, and only that row is prepped."""
+    rt, _book = _chunk_runtime(which)
+    done = _enter_chunk_walk(rt, request_id="r1")
+    going = _enter_chunk_walk(rt, request_id="r2")
+    for rid in (done, going):
+        _cap(rt, rid, 10)
+    rt.pop_rids("llm", CHUNK_WALK, [done, going])
+
+    assert _chunk_spec_targets(rt, [done, going], [10, 4]) == [("llm", True)]
+    assert _chunk_prep(rt, [done, going], [10, 4]) == [going]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_each_prompt_sets_its_own_cap(which):
+    """A walk entered twice (BAGEL's think-mode prefills twice) is capped by
+    each prompt's own length: the cap is assigned, not lowered."""
+    from mstar.model.submodule_base import chunk_tick_name
+
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _cap(rt, rid, 4)
+    _run_chunk(rt, book, rid, 1, stride=4)
+    assert _ready(rt) == []
+
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
+    ))
+    _cap(rt, rid, 12)
+    assert _progress(rt, [rid]) == [(0, 12)]
+    _run_chunk(rt, book, rid, 2, stride=8)
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_loop_progress_names_a_row_not_here(which):
+    rt, _book = _chunk_runtime(which)
+    assert _progress(rt, [7]) == [(-1, -1)]
+
+
+def _chunk_loop(which, remote=True):
+    """``embed -> loop(llm)``, llm emitting nowhere, the Loop emitting the
+    last iteration's token. Persisted and remote so staging is observable."""
+    wg = WorkerGraph(
+        section=_chunk_loop_graph(
+            GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True),
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}, 1: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"chunk_loop"}, 1: set()},
+        all_wg_ids_to_nodes={WG_ID: CHUNK_NODES, 1: {"remote"}},
+        node_to_partition={**dict.fromkeys(CHUNK_NODES, "default"), "remote": "default"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    return rt, book, _admit_with_remote(rt, remote)
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_loop_output_reads_an_empty_destination_body_edge(which):
+    """The Loop's output takes the last iteration's tensor off a body edge
+    that routes nowhere. ``[]`` means the runtime never cached it; ``[2, 3]``
+    means it accumulated instead of keeping only the final iteration."""
+    rt, book, rid = _chunk_loop(which)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "embed")]))
+    _route_one(rt, book, None, rid, "embed", "text_inputs", 1)
+
+    out = None
+    for uuid in (2, 3):
+        out = _route_one(rt, book, None, rid, "llm", "new_token", uuid)
+
+    assert sorted(out.register_uuids) == [3]
+    assert out.register_rids == [rid]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_superseded_chunk_output_is_released_on_advance(which):
+    """Only the final iteration's tensor survives, so an earlier chunk's has
+    to be dropped when the loop advances rather than held to loop end."""
+    rt, book, rid = _chunk_loop(which)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "embed")]))
+    _route_one(rt, book, None, rid, "embed", "text_inputs", 1)
+    _route_one(rt, book, None, rid, "llm", "new_token", 2)
+
+    assert _released(book, 2), "the superseded chunk's output was held"
