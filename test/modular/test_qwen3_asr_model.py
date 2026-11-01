@@ -311,7 +311,7 @@ def test_encoder_replays_exactly_when_leased():
     then and runs eagerly otherwise, whatever the runner's buckets allow."""
     from types import SimpleNamespace
 
-    from mstar.model.qwen3_asr.submodules import AUT_ENCODE
+    from mstar.model.components.aut_submodule import AUT_ENCODE
 
     class Runner:
         has_bucket = True
