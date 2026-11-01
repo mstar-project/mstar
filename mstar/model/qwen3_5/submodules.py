@@ -82,6 +82,15 @@ from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 logger = logging.getLogger(__name__)
 
 
+def token_stop(stop_token_ids) -> TokenStop:
+    """The LLM's stop: a decode row's stop id, checked by the graph runtime."""
+    return TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset(stop_token_ids),
+        sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+        last_prefill_flag="last_prefill", runtime_check=True,
+    )
+
+
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
@@ -139,11 +148,7 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
-        self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
-            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
-            last_prefill_flag="last_prefill",
-        )
+        self.token_stop = token_stop(config.stop_token_ids)
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
