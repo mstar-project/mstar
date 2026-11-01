@@ -399,7 +399,10 @@ default, which lowers the token count of short clips. Notes:
   ordinary resolution exceeds the patches, and one over ~64 s with frames
   resized below ~256x256 pixels exceeds the segments.
 - An encoder step packs the images and videos of up to 8 requests into one
-  replay; requests that would overflow it together run one at a time. The
+  replay; requests that would overflow it together run one at a time, and a
+  request too large for a replay alone (a long video) gets a step of its own,
+  so its embeddings are not held back for the others' (measured on 9B, one
+  H200: 60 s video c=32 TTFT p50 5.9 s in 8-request steps, 4.6 s alone). The
   packed GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,

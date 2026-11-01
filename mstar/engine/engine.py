@@ -100,6 +100,16 @@ _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
 
 
+def _splits_by_capture_key(submodule_mgmt: "SubmoduleManagement", graph_walk: str) -> bool:
+    """See ``Engine.splits_by_capture_key``."""
+    if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
+        return False
+    if submodule_mgmt.piecewise_runners:
+        return True
+    cg_runner = submodule_mgmt.accelerator_graph_runner
+    return cg_runner is not None and cg_runner.captures_walk(graph_walk)
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -2312,12 +2322,9 @@ class Engine:
 
     def splits_by_capture_key(self, node_name: str, graph_walk: str) -> bool:
         """Whether ``capture_group`` can tell this walk's requests apart: the
-        submodule opts in and the walk has a capture."""
-        submodule_mgmt = self._submodules[node_name]
-        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
-            return False
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        return cg_runner is not None and cg_runner.captures_walk(graph_walk)
+        submodule opts in and the walk has a capture, its whole forward's or a
+        piecewise region's."""
+        return _splits_by_capture_key(self._submodules[node_name], graph_walk)
 
     def capture_group(
         self, node_name: str, graph_walk: str, request_id: int,
@@ -2334,10 +2341,7 @@ class Engine:
         input facts the lease will see, e.g. the stream chunk it consumes.
         """
         submodule_mgmt = self._submodules[node_name]
-        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
-            return None
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        if cg_runner is None or not cg_runner.captures_walk(graph_walk):
+        if not _splits_by_capture_key(submodule_mgmt, graph_walk):
             return None
         if input_metadata is None:
             return submodule_mgmt.submodule.cg_key_info(graph_walk, {request_id: request_info})
