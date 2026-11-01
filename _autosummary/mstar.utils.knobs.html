@@ -745,10 +745,10 @@ non-empty <code class="docutils literal notranslate"><span class="pre">MSTAR_*</
 <td><p><code class="docutils literal notranslate"><span class="pre">pre_plan</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_PRE_PLAN_SPEC</span></code> (default on): the worker pre-plans the speculative batch on a plan thread while the previous step replays, and the engine double-buffers the resources that support it.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="mstar.utils.knobs.sampler_ingraph_scatter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default off): the captured sampler gathers its RNG offsets from the slot masters and scatters the advanced offsets and the sampled tokens back inside the graph, so a replayed step issues none of those launches on the gpu thread (each is a GIL release the main thread's postprocess can win).</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default on): the captured sampler gathers its RNG offsets from the slot masters and scatters the advanced offsets and the sampled tokens back inside the graph, so a replayed step issues none of those launches on the gpu thread (each is a GIL release the main thread's postprocess can win).</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_slots" title="mstar.utils.knobs.sampler_slots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_slots</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows allocated up front when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): request rows of the masters a captured graph indexes when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>), so the most requests admitted at once on its node.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.step_thread_core" title="mstar.utils.knobs.step_thread_core"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step_thread_core</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code> (default <code class="docutils literal notranslate"><span class="pre">off</span></code>): pin each worker's main, GPU and plan threads, and the API server's result threads, to CPUs of their own.</p></td>
@@ -909,13 +909,14 @@ extra thread is just GIL contention.</p>
 <dt class="sig sig-object py" id="mstar.utils.knobs.sampler_ingraph_scatter">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">sampler_ingraph_scatter</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#sampler_ingraph_scatter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default
-off): the captured sampler gathers its RNG offsets from the slot masters
+on): the captured sampler gathers its RNG offsets from the slot masters
 and scatters the advanced offsets and the sampled tokens back inside the
 graph, so a replayed step issues none of those launches on the gpu thread
 (each is a GIL release the main thread’s postprocess can win). Padding
-rows then address a trash master row, and the masters are allocated once
-for <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> concurrent requests, since a captured graph holds
-their addresses.</p>
+rows then address a trash master row, and the offset and last-token
+masters are allocated once for <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> concurrent requests,
+since a captured graph holds their addresses; a request takes its row at
+admission and waits while none is free.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
@@ -926,9 +927,10 @@ their addresses.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.sampler_slots">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">sampler_slots</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#sampler_slots"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.sampler_slots" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows
-allocated up front when the in-graph scatter is on (see
-<code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): request rows
+of the masters a captured graph indexes when the in-graph scatter is on
+(see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>), so the most requests admitted at once
+on its node.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>

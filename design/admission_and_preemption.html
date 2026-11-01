@@ -841,7 +841,7 @@
 <li><p><strong>Size.</strong> A preemptible request reserves its prompt. A guaranteed one also reserves its growth.</p></li>
 <li><p><strong>Inside a reservation.</strong> A grant always succeeds. A failure there is an accounting bug, and the manager raises.</p></li>
 <li><p><strong>Past a reservation.</strong> A grant takes only from the room, and fails with <code class="docutils literal notranslate"><span class="pre">AllocationFailed(pages_short=...)</span></code> when the room is short.</p></li>
-<li><p><strong>Across pools.</strong> A request takes its reservation in every pool its node asks, the recurrent pool’s slot included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.</p></li>
+<li><p><strong>Across pools.</strong> A request takes its reservation in every pool its node asks, the recurrent pool’s slot and the sampler’s in-graph row included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.</p></li>
 </ul>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">room</span> <span class="o">=</span> <span class="n">free</span> <span class="o">+</span> <span class="n">evictable</span> <span class="o">-</span> <span class="n">_unused</span>
 
@@ -880,7 +880,7 @@
 <section id="preemption">
 <h2>3. Preemption<a class="headerlink" href="#preemption" title="Link to this heading">#</a></h2>
 <p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">Worker._handle_allocation_failure</span></code> (<a class="reference download internal" download="" href="../_downloads/de1b1ad2a070cfcbefb1feab5cce8263/worker.py"><span class="xref download myst">worker.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Worker._preempt</span></code>. In place of today’s 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads first, as it does today (the row last in the refused step’s line), since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
-<p>Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can’t use.</p>
+<p>Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler’s in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can’t use.</p>
 <section id="arrival-numbers">
 <h3>3.1 Arrival numbers<a class="headerlink" href="#arrival-numbers" title="Link to this heading">#</a></h3>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>

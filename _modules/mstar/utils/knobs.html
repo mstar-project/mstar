@@ -1080,23 +1080,25 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.sampler_ingraph_scatter">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">sampler_ingraph_scatter</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default</span>
-<span class="sd">    off): the captured sampler gathers its RNG offsets from the slot masters</span>
+<span class="sd">    on): the captured sampler gathers its RNG offsets from the slot masters</span>
 <span class="sd">    and scatters the advanced offsets and the sampled tokens back inside the</span>
 <span class="sd">    graph, so a replayed step issues none of those launches on the gpu thread</span>
 <span class="sd">    (each is a GIL release the main thread's postprocess can win). Padding</span>
-<span class="sd">    rows then address a trash master row, and the masters are allocated once</span>
-<span class="sd">    for ``sampler_slots`` concurrent requests, since a captured graph holds</span>
-<span class="sd">    their addresses."""</span>
-    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"sampler_ingraph_scatter"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+<span class="sd">    rows then address a trash master row, and the offset and last-token</span>
+<span class="sd">    masters are allocated once for ``sampler_slots`` concurrent requests,</span>
+<span class="sd">    since a captured graph holds their addresses; a request takes its row at</span>
+<span class="sd">    admission and waits while none is free."""</span>
+    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"sampler_ingraph_scatter"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 
 
 <div class="viewcode-block" id="sampler_slots">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.sampler_slots">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">sampler_slots</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): master rows</span>
-<span class="sd">    allocated up front when the in-graph scatter is on (see</span>
-<span class="sd">    ``sampler_ingraph_scatter``)."""</span>
+<span class="w">    </span><span class="sd">"""``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): request rows</span>
+<span class="sd">    of the masters a captured graph indexes when the in-graph scatter is on</span>
+<span class="sd">    (see ``sampler_ingraph_scatter``), so the most requests admitted at once</span>
+<span class="sd">    on its node."""</span>
     <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"sampler_slots"</span><span class="p">,</span> <span class="s2">"4096"</span><span class="p">))</span></div>
 
 

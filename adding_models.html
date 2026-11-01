@@ -2111,6 +2111,11 @@ reads them in <code class="docutils literal notranslate"><span class="pre">prepr
 last step did not keep its value on the device (its first decode step, after the prefill)
 still brings it routed; put it over the one read from the device with
 <code class="docutils literal notranslate"><span class="pre">sampler.overwrite_rows(rows,</span> <span class="pre">(ids,</span> <span class="pre">routed_ids))</span></code>.</p>
+<p>On such a node a captured step writes each row’s token and RNG offset back to the request’s
+row inside the graph (<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, on by default). Those rows are
+allocated once, <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code> of them, so a request takes its row when the runner
+admits it and waits while none is free, as it does for a recurrent state slot. A row the
+step drops (<code class="docutils literal notranslate"><span class="pre">SamplerStep(kept_rids=...)</span></code>) writes the trash row, so it keeps its offset.</p>
 <p>State that a decode loop carries from step to step beside the token, such as Whisper’s
 timestamp rule state, is declared on the sampler, not kept in the model:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">SamplerSpec</span><span class="p">(</span>

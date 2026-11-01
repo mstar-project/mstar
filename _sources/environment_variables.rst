@@ -650,16 +650,27 @@ Worker scheduling
        the position resource's planned positions instead of staging them.
        Experiment knob, measured and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
-     - config's ``knobs: sampler_ingraph_scatter``, else ``0``
+     - config's ``knobs: sampler_ingraph_scatter``, else ``1``
      - The captured sampler gathers its RNG offsets from the slot masters
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
-       postprocess wins). Padding rows then address a trash master row and
-       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` (config's
-       ``knobs: sampler_slots``) concurrent requests (default 4096, a hard
-       cap with this on). Only with the device
-       loop-back on. An experiment knob; measure before turning it on.
+       postprocess wins). Padding rows, and the rows a step drops
+       (``SamplerStep.kept_rids``), write a trash master row. The offset and
+       last-token masters, which the captured graphs index, are allocated
+       once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
+       when the runner admits it (``SamplerResource.reserve``): past them it
+       waits, as for a recurrent state slot, until a removed request frees
+       one. Only for a node that reads its tokens back on the device
+       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
+       rank: above one, where admission doesn't decide, the masters grow and
+       the scatter runs after the replay, as with ``0``.
+   * - ``MSTAR_SAMPLER_SLOTS``
+     - config's ``knobs: sampler_slots``, else ``4096``
+     - Request rows of the sampler masters a captured graph indexes when
+       ``MSTAR_SAMPLER_INGRAPH_SCATTER`` is on (at least the node's largest
+       capture batch): the most requests admitted at once on such a node; the
+       rest wait to be admitted. Read by ``knobs.sampler_slots``.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the
