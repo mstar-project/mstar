@@ -900,6 +900,33 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
 
 
+@pytest.mark.parametrize("make", [
+    lambda: torch.tensor(3.5),
+    lambda: torch.arange(40_000, dtype=torch.float32),
+    lambda: torch.arange(24, dtype=torch.int16).reshape(4, 6).t(),
+], ids=["scalar", "past_torch_grain", "transposed"])
+def test_a_host_source_is_staged_without_tensor_copy(tmp_path, monkeypatch, make):
+    """A host tensor lands in the arena as one memcpy, not through
+    Tensor.copy_, which splits a copy of more than 32K elements over torch's
+    OpenMP pool and leaves that pool spinning on the serving cores."""
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    src = make()
+    infos = prod.store_and_return_tensor_info("r1", {"x": [src]})
+
+    def no_copy(self, *args, **kwargs):
+        raise AssertionError("a host source went through Tensor.copy_")
+
+    monkeypatch.setattr(torch.Tensor, "copy_", no_copy)
+    prod.register_for_send("r1", infos["x"])
+    monkeypatch.undo()
+    cons.start_read_tensors(
+        "r1", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])],
+    )
+    got = cons.tensor_store.get_tensor(infos["x"][0].uuid)
+    assert got.dtype == src.dtype and got.shape == src.shape and torch.equal(got, src)
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
 def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel):
