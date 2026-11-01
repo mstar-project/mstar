@@ -22,11 +22,13 @@ from mstar.api_server.request_types import (
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
+    FINAL_PREFILL,
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
     StreamingConnectionState,
+    WalkStep,
     merge_publish_info,
 )
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -36,8 +38,8 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
-from mstar.model.submodule_base import chunk_tick_name
+from mstar.model.base import ForwardPassArgs, Model, WorkerGraph, streamed_inputs
+from mstar.model.submodule_base import chunk_loop_name, chunk_tick_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
@@ -72,6 +74,25 @@ from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
+
+
+def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
+    """What the conductor needs of each walk to run a plan: the ``(name, node)``
+    inputs it sends on entry (the walk's external and loop-back inputs, less
+    the streamed ones), the names the walk persists, and the walks a stream
+    feeds that are bare nodes (a chunk loop aside), which run once per chunk."""
+    inputs, persists, repeating = {}, {}, set()
+    for walk, graph in model.get_graph_walk_graphs().items():
+        io = graph.get_inputs_outputs()
+        streamed = streamed_inputs(model, walk, graph)
+        inputs[walk] = tuple(sorted((io.ext_inputs | io.loop_back) - streamed))
+        loops = graph.get_loops()
+        edges = [edge for node in graph.get_nodes().values() for edge in node.outputs]
+        edges += [edge for loop in loops.values() for edge in loop.outputs + loop.accumulated_outputs]
+        persists[walk] = frozenset(edge.name for edge in edges if edge.persist)
+        if streamed and set(loops) <= {chunk_loop_name(node, walk) for node in graph.get_nodes()}:
+            repeating.add(walk)
+    return inputs, persists, frozenset(repeating)
 
 
 class DeadWorkerError(RuntimeError):
@@ -610,6 +631,11 @@ class Conductor:
             ipc_socket_path_prefix=socket_path_prefix,
         )
 
+    @property
+    def _plans(self) -> bool:
+        """Whether the model declares `Model.walk_plan`, or is still on the transition hooks."""
+        return getattr(type(self.model), "walk_plan", Model.walk_plan) is not Model.walk_plan
+
     def _max_output_tokens(self, model_kwargs: dict) -> int:
         """The request's output cap: an int >= 1, else ``ValueError`` (a 400).
         Checked here because the cap is compared inside the run loop, where a
@@ -743,11 +769,20 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # A model on `walk_plan` has its walks' inputs derived from the graphs
+        # (`_plan_step`, `_next_plan_args`, `_consumed`); one still on the
+        # transition hooks lists them itself, chunk ticks aside.
+        if self._plans:
+            self._walk_inputs, self._walk_persists, self._repeating_walks = _walk_io(self.model)
+            self._growth_walks = frozenset(
+                walk for labels in self.model.kv_labels().values()
+                for label in labels.values() for walk, _ in label.growth
+            )
         # graph walk -> the chunkable (node, walk) pairs whose Loop needs its
-        # loop-back seeded for the first chunk
+        # loop-back seeded for the first chunk; a plan seeds it as a loop-back
         self._chunk_ticks: dict[str, tuple[tuple[str, str], ...]] = {}
         for (node, walk), policy in self.model.chunking_policy_of().items():
-            if policy.chunkable:
+            if policy.chunkable and not self._plans:
                 self._chunk_ticks.setdefault(walk, ())
                 self._chunk_ticks[walk] += ((node, walk),)
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
@@ -1324,26 +1359,38 @@ class Conductor:
         )
         self.requests[body.request_id] = request_data
 
-        # Kick off all partitions by calling get_initial_forward_pass_args per partition
+        # Kick off all partitions: each one's first step
         partition_fwd_args: dict[str, ForwardPassArgs] = {}
         for p in partitions:
-            fwd_args = self.model.get_initial_forward_pass_args(
-                partition_name=p.name,
-                input_modalities=body.initial_input_modalities,
-                output_modalities=body.initial_output_modalities,
-                input_signals=body.initial_signals,
-                model_kwargs=body.model_kwargs,
-            )
             pstate = partition_states[p.name]
+            if self._plans:
+                pstate.plan = self.model.walk_plan(
+                    p.name, body.initial_input_modalities, body.initial_output_modalities,
+                    body.initial_signals, model_kwargs,
+                )
+                fwd_args = self._plan_step(request_data, pstate, 0) if pstate.plan else ForwardPassArgs(
+                    full_metadata=pstate.metadata, inputs=[], unpersist_tensors=[], request_done=True,
+                )
+            else:
+                fwd_args = self.model.get_initial_forward_pass_args(
+                    partition_name=p.name,
+                    input_modalities=body.initial_input_modalities,
+                    output_modalities=body.initial_output_modalities,
+                    input_signals=body.initial_signals,
+                    model_kwargs=body.model_kwargs,
+                )
+                pstate.metadata = fwd_args.full_metadata
+                pstate.metadata.kwargs.update(fwd_args.step_metadata)
             # if a partition is not active at all in the request, register that here
             pstate.is_done = fwd_args.request_done
-
-            pstate.metadata = fwd_args.full_metadata
-            pstate.metadata.kwargs.update(fwd_args.step_metadata)
             self._set_partition_worker_graph_ids(
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
             partition_fwd_args[p.name] = fwd_args
+        if self._plans:
+            released = self._consumed(request_data, [name for name, ps in partition_states.items() if not ps.is_done])
+        else:
+            released = [info for fwd_args in partition_fwd_args.values() for info in fwd_args.unpersist_tensors]
 
         # after the initial fwd args: the configs are derived from them (BAGEL
         # reads `requires_cfg` off the metadata the model just settled)
@@ -1448,10 +1495,7 @@ class Conductor:
 
         # After the loop: a tensor's reader count must cover every worker and
         # partition it went to before the producer may free it.
-        self._un_persist_tensors(body.request_id, [
-            info for fwd_args in partition_fwd_args.values()
-            for info in fwd_args.unpersist_tensors
-        ])
+        self._un_persist_tensors(body.request_id, released)
 
     def _resolve_worker_partition(
         self, worker_graph_ids: list[int],
@@ -1891,14 +1935,19 @@ class Conductor:
             pstate.is_done = True
 
         prev_walk =  pstate.metadata.graph_walk
-        fwd_args = self.model.get_partition_forward_pass_args(
-            partition_name=partition_name,
-            partition_metadata=pstate.metadata,
-            persist_signals=request_data.persist_signals,
-            incoming_connections=incoming_connections,
-        )
-        pstate.metadata = fwd_args.full_metadata
-        pstate.metadata.kwargs.update(fwd_args.step_metadata)
+        if self._plans:
+            fwd_args = self._next_plan_args(request_data, partition_name, done=(
+                pstate.worker_reported_done or pstate.num_output_tokens >= request_data.max_output_tokens
+            ))
+        else:
+            fwd_args = self.model.get_partition_forward_pass_args(
+                partition_name=partition_name,
+                partition_metadata=pstate.metadata,
+                persist_signals=request_data.persist_signals,
+                incoming_connections=incoming_connections,
+            )
+            pstate.metadata = fwd_args.full_metadata
+            pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
         # The worker's signal is authoritative, whatever walk the model chose:
         # the pass that consumed a stream's final chunk, or whose stop check
@@ -1969,6 +2018,100 @@ class Conductor:
 
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
+
+    def _plan_step(self, request_data: RequestData, pstate: PartitionState, k: int) -> ForwardPassArgs:
+        """Enter step ``k`` of the partition's plan: each input of its walk gets
+        the persisted signal its ``bind`` names, or its own name's, or an
+        empty edge (an empty loop-back seed, a chunk tick); and the step before
+        a KV growth walk is marked `FINAL_PREFILL`."""
+        plan = pstate.plan
+        step = plan[k]
+        held = request_data.persist_signals
+        inputs = [
+            GraphEdge(next_node=node, name=name, tensor_info=list(held.get(step.bind.get(name, name), ())))
+            for name, node in self._walk_inputs[step.walk]
+        ]
+        step_metadata = dict(step.step_metadata)
+        if k + 1 < len(plan) and plan[k + 1].walk in self._growth_walks:
+            step_metadata[FINAL_PREFILL] = True
+        pstate.cursor = k
+        pstate.metadata.graph_walk = step.walk
+        return ForwardPassArgs(
+            full_metadata=pstate.metadata, inputs=inputs, unpersist_tensors=[], step_metadata=step_metadata,
+        )
+
+    def _next_plan_args(self, request_data: RequestData, partition_name: str, done: bool) -> ForwardPassArgs:
+        """Where a report moves a partition's plan, as the args of its next step.
+
+        A walk a stream feeds and that is a bare node runs once per chunk: its
+        step is sent again, and only the worker's final-chunk report ends it.
+        Any other step advances on its report (a Loop walk reports once, when
+        it ends), and the partition is done past the last step. In a partition
+        whose walk the stream moves (`Connection.consumer_walk`), the report
+        names the step that ran; the conductor enters the next step only to
+        send it something, and otherwise leaves it to the stream.
+        """
+        pstate = request_data.partition_states[partition_name]
+        plan, k, walk = pstate.plan, pstate.cursor, pstate.metadata.graph_walk
+        stay = ForwardPassArgs(full_metadata=pstate.metadata, inputs=[], unpersist_tensors=[], request_done=done)
+        if done:
+            return stay
+        if partition_name in self.producer_triggered_partitions:
+            k = next((j for j in range(k, len(plan)) if plan[j].walk == walk), None)
+            if k is None:
+                raise ValueError(f"partition {partition_name!r} ran walk {walk!r}, which its plan has no more of")
+            pstate.cursor = k
+            if k + 1 < len(plan) and not self._walk_inputs[plan[k + 1].walk]:
+                return stay
+        elif walk in self._repeating_walks:
+            # what it read on entry is already released or still held for a later step
+            return self._plan_step(request_data, pstate, k)
+        if k + 1 >= len(plan):
+            stay.request_done = True
+            return stay
+        args = self._plan_step(request_data, pstate, k + 1)
+        args.unpersist_tensors = self._consumed(request_data, [partition_name])
+        return args
+
+    def _reads(self, step: WalkStep) -> set[str]:
+        """The persisted names ``step`` reads."""
+        return {step.bind.get(name, name) for name, _ in self._walk_inputs[step.walk]}
+
+    def _consumed(self, request_data: RequestData, sent: list[str]) -> list[TensorPointerInfo]:
+        """The held tensors to release once the current steps of the ``sent``
+        partitions go out.
+
+        A name one of them reads is released unless a later step of some
+        partition's plan reads it with no walk persisting the name in between,
+        where the sending steps' own walks count: what a step persists replaces
+        what it read. A held name whose next reader comes only after such a
+        walk is released too, so the reader doesn't get both (though one no
+        worker was ever sent has no reader count, and `_un_persist_tensors`
+        leaves it held). Anything else is held, at most to the request's end.
+        """
+        states = request_data.partition_states
+        sending = [states[name].plan[states[name].cursor] for name in sent]
+        read_now = set().union(*(self._reads(step) for step in sending))
+        rewritten = set().union(*(self._walk_persists[step.walk] for step in sending))
+        # a name a later step reads -> whether to release it: only if no
+        # reader would get what is held now
+        release: dict[str, bool] = {}
+        for pstate in states.values():
+            if pstate.is_done or not pstate.plan:
+                continue
+            plan = pstate.plan
+            fresh = rewritten | self._walk_persists[plan[pstate.cursor].walk]
+            for step in plan[pstate.cursor + 1:]:
+                for name in self._reads(step):
+                    if name in fresh:
+                        release.setdefault(name, True)
+                    else:
+                        release[name] = False
+                fresh = fresh | self._walk_persists[step.walk]
+        return [
+            info for name, infos in request_data.persist_signals.items()
+            if release.get(name, name in read_now) for info in infos
+        ]
 
     def _with_chunk_ticks(self, inputs: list, graph_walk: str) -> list:
         """``inputs`` plus a seed for each chunk Loop this walk enters.

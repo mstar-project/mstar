@@ -42,20 +42,16 @@ One vocabulary note for this page. A **tensor bundle** routed between nodes is a
 usually has length 1.
 
 The diagram below shows the request flow at the conductor and model level. Its
-granularity is one graph walk. The conductor is notified when a walk completes, and only
-then asks the model what to do next. Everything that happens inside a walk is described
-in later steps and is omitted here::
+granularity is one graph walk. The model decides at ingest which walks a request runs; the
+conductor runs them in order, moving on as each walk completes. Everything that happens
+inside a walk is described in later steps and is omitted here::
 
    process_prompt()              # text/media -> initial tensors
         │
         ▼
-   get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
+   walk_plan()                   # per partition: the walks to run (e.g. prefill, decode)
         │
-        ▼   (conductor walks the graph, the engine runs each node)
-   get_partition_forward_pass_args() # asked after each graph walk completes:
-                                     #   what's next? done?
-        │
-        ▼
+        ▼   (conductor sends each walk its inputs, the engine runs each node)
    postprocess()                 # model output tensor -> bytes for the client
 
 What you will create
@@ -156,15 +152,28 @@ You must implement these abstract methods:
    separately. :mod:`mstar.model.multimodal` turns either into the prefill plan
    that ``process_prompt`` and the schedule builder both work from.
 
-``get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None) -> ForwardPassArgs``
-   Build the first :class:`mstar.model.base.ForwardPassArgs` for a partition. It names
-   the graph walk to start on and the input edges that feed it.
+``walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs) -> list[WalkStep]``
+   The walks a partition runs for this request, in order, as
+   :class:`mstar.model.base.WalkStep` s; ``[]`` when the request doesn't use the
+   partition. A prefill-decode model returns
+   ``[WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]``.
+   The conductor derives each step's input edges from the walk's graph: every external
+   and loop-back input that no stream feeds gets the persisted signal of its own name,
+   the one ``bind`` names, or an empty edge (a denoise loop's seed, a chunk loop's tick).
+   A persisted tensor is released once no later step of any partition reads it before a
+   walk persists the name afresh. ``step_metadata`` carries request constants to every
+   node of the step's walk. The conductor sets ``FINAL_PREFILL`` (from
+   ``mstar.conductor.request_info``) in the step metadata of a step whose next step's
+   walk grows a KV label (``KVLabel.growth``): the step that samples the first token.
+   A step whose walk a stream feeds and that is a bare node runs once per chunk until the
+   worker reports the stream's final chunk; any other step advances when its walk
+   reports, and the partition is done after its last step. A ``ValueError`` here refuses
+   the request with a 400. Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus
+   and Chatterbox are references.
 
-``get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals, incoming_connections=None) -> ForwardPassArgs``
-   The conductor calls this after each graph walk completes. It returns the next walk,
-   the inputs for that walk, and whether the request is finished
-   (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
-   once, then repeats the decode walk until EOS.
+   Models not yet moved to ``walk_plan`` still implement the two hooks it replaces,
+   ``get_initial_forward_pass_args`` and ``get_partition_forward_pass_args``, which
+   return a ``ForwardPassArgs`` per walk; write ``walk_plan`` for a new model.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
@@ -224,8 +233,9 @@ You must implement these abstract methods:
 
 .. note::
 
-   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
-   request's ``metadata.kwargs``, so a request fact stored under a key that a
+   For a model still on the transition hooks, the conductor merges each walk's
+   ``ForwardPassArgs.step_metadata`` into the request's ``metadata.kwargs``, so a
+   request fact stored under a key that a
    later walk's step metadata also uses is overwritten by that walk's value. Keep
    such facts under their own key: LTX-2.5 nests the request's geometry under
    ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
@@ -1204,7 +1214,7 @@ methods are:
    there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
    the worker reports the partition done with that pass, and the conductor ends it rather
    than start decode. Return it only from a row outside any loop; from inside one the
-   request fails. ``TokenStepNode`` does this for its ``PREFILL_WALK``. It suits a partition
+   request fails. ``TokenStepNode`` does this for the step marked ``FINAL_PREFILL``. It suits a partition
    with nothing left to run once generation stops: a model that runs another walk after its
    loop (an ``align`` walk, or image generation after thinking) or publishes final-only
    state at the loop's stop needs its own transition instead. Keep ``check_stop_batched``,
@@ -2764,8 +2774,7 @@ Checklist
          [ ] get_node_resources
          [ ] get_graph_walk_graphs
          [ ] process_prompt
-         [ ] get_initial_forward_pass_args
-         [ ] get_partition_forward_pass_args
+         [ ] walk_plan
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs

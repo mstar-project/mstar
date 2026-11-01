@@ -373,7 +373,7 @@ def test_llm_check_stop():
     def info(walk, decoded, max_tokens=4096):
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": _Cfg()},
-                              "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded}, "step_metadata": {}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
     # a stop token first ends the request: there is no decode loop yet
@@ -394,7 +394,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
     def info(walk, decoded, max_tokens=4096, ignore_eos=False):
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": type("C", (), {"ignore_eos": ignore_eos})()},
-                              "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded}, "step_metadata": {}})()
 
     # rows in forward order, plus a padding row a replay leaves at the end
     tokens = torch.tensor([IM_END, 1234, EOT, IM_END, IM_END, 0])

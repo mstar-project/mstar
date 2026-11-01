@@ -15,6 +15,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     PartitionDefinition,
     StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
@@ -497,6 +498,20 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
+def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set[tuple[str, str]]:
+    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
+    edge of a connection into the walk's partition (the client's included),
+    at each node of the walk that takes it. The worker graphs and the
+    conductor's walk plans both read this, so they agree on what is streamed."""
+    partition = next(
+        (part.name for part in model.get_partitions() if graph_walk in part.graph_walks), DEFAULT_PARTITION,
+    )
+    names = {conn.edge_name for conn in model.get_partition_topology().connections if conn.to_partition == partition}
+    return {
+        (name, node.name) for node in graph.get_nodes().values() for name in names & set(node.input_names)
+    }
+
+
 @dataclass
 class ForwardPassArgs:
     # full_metadata is at the conductor level
@@ -563,22 +578,12 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = DEFAULT_PARTITION
-        for part in self.get_partitions():
-            if graph_walk in part.graph_walks:
-                partition = part.name
-                break
-        input_streams = set()
-        for conn in self.get_partition_topology().connections:
-            if conn.to_partition == partition:
-                input_streams.add(conn.edge_name)
-
         return _divide_into_worker_graphs(
             graph,
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams,
+            input_streams={name for name, _ in streamed_inputs(self, graph_walk, graph)},
         )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -834,7 +839,29 @@ class Model(ABC):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
 
-    @abstractmethod
+    def walk_plan(
+        self,
+        partition_name: str,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The walks ``partition_name`` runs for this request, in order, decided
+        at ingest; ``[]`` when the request doesn't use the partition.
+
+        The conductor runs the plan: it sends each step's inputs from the walk's
+        graph (see `WalkStep`), releases a persisted tensor once no later step
+        reads it, sets `FINAL_PREFILL` on the step before a walk that grows a KV
+        label, and ends the partition after the last step reports. A step whose
+        walk a stream feeds, and that is a bare node (or its chunk loop), runs
+        once per chunk until the worker reports the stream's final chunk. A
+        ``ValueError`` refuses the request with a 400.
+        """
+        raise NotImplementedError(f"{type(self).__name__} declares no walk_plan")
+
+    # Until every model declares `walk_plan`, the conductor drives a model that
+    # doesn't through these two hooks instead.
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
@@ -843,7 +870,7 @@ class Model(ABC):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        pass
+        raise NotImplementedError(f"{type(self).__name__} declares no walk_plan")
 
     @abstractmethod
     def process_prompt(
@@ -1156,7 +1183,6 @@ class Model(ABC):
             )
         ]
 
-    @abstractmethod
     def get_partition_forward_pass_args(
         self,
         partition_name: str,
@@ -1174,4 +1200,4 @@ class Model(ABC):
         partition; a client stream has no entry. For single-partition models,
         this will be ``None`` or an empty list.
         """
-        pass
+        raise NotImplementedError(f"{type(self).__name__} declares no walk_plan")
