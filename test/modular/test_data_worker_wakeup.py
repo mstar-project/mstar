@@ -277,10 +277,15 @@ def test_a_bad_preprocess_workers_fails_startup(declared, workers):
         )
 
 
-def test_a_deployment_may_size_a_thread_safe_pool_past_the_class_value():
+@pytest.mark.parametrize(("usable", "pinned", "expected"), [(64, None, 16), (8, 0, 7)])
+def test_a_deployment_may_size_a_thread_safe_pool_past_the_class_value(monkeypatch, usable, pinned, expected):
+    """Up to the CPUs the plan leaves unpinned (``step_thread_core`` pinned
+    the API server's result thread in the second case)."""
     from mstar.api_server.data_worker import preprocess_workers
+    from mstar.utils import cpus
 
-    assert preprocess_workers(_SlowModel(), {"preprocess_workers": 16}) == 16
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(usable)), usable, result=pinned))
+    assert preprocess_workers(_SlowModel(), {"preprocess_workers": 16}) == expected
 
 
 def test_a_prepared_request_waits_while_a_peer_cannot_take_more():

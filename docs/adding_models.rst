@@ -281,6 +281,17 @@ There are two ``ResourceReqConfig`` subclasses:
   - ``top_p_first``, ``top_p_min_keep`` (``enable_top_p_first``): HF's order (top-p,
     then top-k) instead of FlashInfer's, and HF's ``min_tokens_to_keep``.
 
+  ``return_logprobs`` (``enable_logprobs``, any device) reports each sampled token's
+  log-prob under ``softmax(logits / T)``, before the penalty and filters, with T = 1
+  for greedy requests; it reaches the client as ``{"logprobs": [...]}`` in the chunk's
+  metadata. The model passes ``return_logprobs`` into its ``SamplingReqConfig`` (the
+  conductor refuses the request otherwise), its forward samples once per step and
+  hands over row-addressed stop buffers (``BatchedModelOutput.check_stop_buffers``):
+  the log-probs ride the same copy to the host. ``logprobs_mode`` is ``"raw"`` only
+  for now. The captured sampler scores every step once it is on, so it is off by
+  default and a deployment turns it on with
+  ``resources: {<sampler key>: {enable_logprobs: true}}``.
+
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
@@ -1507,7 +1518,7 @@ optional. For an autoregressive node, you normally want both. These two mechanis
 the most detailed rules in the submodule interface, so they are described here separately.
 
 **Continuous batching.** The worker's micro-scheduler groups compatible in-flight requests
-into one GPU call. A submodule controls this behavior with three methods:
+into one GPU call. A submodule controls this behavior with these methods:
 
 - ``can_batch(self, batch: ExecutingBatch, model_inputs) -> bool`` returns whether these
   requests can share one forward pass. The default is ``False``, which disables batching.
@@ -1518,6 +1529,16 @@ into one GPU call. A submodule controls this behavior with three methods:
   When a batch runs, the engine calls this method instead of the single-request
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
+- ``step_order(self, graph_walk) -> StepOrder`` says who runs first when more rows are ready
+  than ``max_batch_size`` allows. The default, ``StepOrder.ARRIVAL``, is first come, first served
+  to completion: the requests holding the step keep it, then the request that arrived first.
+  ``StepOrder.TURNS`` is longest-waiting first: a request that just ran gives way to one that
+  waited, so a node capped at one row advances its requests a step each in rotation. Declare it
+  on a walk whose sessions have to keep moving while others run, as LingBot's rollout and
+  Cosmos3's chained windows do. A combined walk takes turns if any of its walks does. The order
+  applies to the rows a speculation chain continues, the backlog and the queued rows alike; when
+  every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
+  last in that same line.
 
 .. _combined-walks:
 
@@ -1927,7 +1948,9 @@ that a misspelled setting is never silently ignored:
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
+     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
+       ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
+       slot for a request is refused at startup.
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``

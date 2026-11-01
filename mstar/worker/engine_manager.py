@@ -239,10 +239,5 @@ class EngineManager:
         """Tear the request down; returns the resources it handed pages back to."""
         return self.engine.remove_request(request_id)
 
-    def evictable_nodes(self) -> list[str]:
-        """Nodes whose state can be reclaimed. The worker keeps the per-request
-        LRU timestamps it needs to pick victims among them."""
-        return [name for name in sorted(self.node_names) if self.engine.evictable(name)]
-
     def shutdown(self) -> None:
         self.engine.shutdown()

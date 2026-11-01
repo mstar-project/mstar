@@ -21,6 +21,7 @@ from mstar.model.media_limits import (
     probe_video,
     read_image,
 )
+from mstar.utils.cpus import CpuPlan
 
 # by path: importing the package would import the Qwen3-Omni model, which needs flashinfer
 _spec = importlib.util.spec_from_file_location(
@@ -682,15 +683,21 @@ def test_vjepa2_without_frame_size_in_the_header_decodes_one_frame_to_check(monk
     assert pulled == [0]
 
 
-@pytest.mark.parametrize("cpus,expected", [(1, 1), (3, 3), (64, 8)])
-def test_video_decodes_thread_within_the_usable_cpus(monkeypatch, cpus, expected):
+@pytest.mark.parametrize("plan,expected", [
+    (CpuPlan(frozenset(range(1)), 1), 1),
+    (CpuPlan(frozenset(range(3)), 3), 3),
+    (CpuPlan(frozenset(range(64)), 64), 8),
+    # step_thread_core pinned the API server's result thread to CPU 0
+    (CpuPlan(frozenset(range(8)), 8, result=0), 7),
+])
+def test_video_decodes_thread_within_the_cpus_the_plan_leaves(monkeypatch, plan, expected):
     """FFmpeg threads per decode follow the CPUs the process's plan leaves
     unpinned, at most 8, and not the API server's small preprocessing pool."""
     from mstar.model.vjepa2.vjepa2_model import VJepa2Model
     from mstar.utils import cpus as cpu_plan
 
     monkeypatch.setattr(torch, "get_num_threads", lambda: 1)
-    monkeypatch.setattr(cpu_plan, "_plan", cpu_plan.CpuPlan(frozenset(range(cpus)), cpus))
+    monkeypatch.setattr(cpu_plan, "_plan", plan)
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 4))
     opened = []
     _fake_torchcodec(monkeypatch, [], opened=opened)

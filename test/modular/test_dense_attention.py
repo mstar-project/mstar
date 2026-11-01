@@ -145,13 +145,13 @@ class TestDensePlan:
         what that wrapper was last planned with skips the plan; another
         layout, another causal flag or the other slot's wrapper plans again."""
         calls = []
-        real_plan = DensePrefixedPrefillWrapper.plan
+        real_plan = DensePrefixedPrefillWrapper._plan_kernel
 
         def counting_plan(self, *args, **kwargs):
             calls.append(self)
             return real_plan(self, *args, **kwargs)
 
-        monkeypatch.setattr(DensePrefixedPrefillWrapper, "plan", counting_plan)
+        monkeypatch.setattr(DensePrefixedPrefillWrapper, "_plan_kernel", counting_plan)
         manager = _manager()
         views = [_view("r0", [0, 1], prefix=3, fresh=2)]
         step = AttentionStep(causal=False)
