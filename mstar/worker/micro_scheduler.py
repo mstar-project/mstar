@@ -417,9 +417,13 @@ class MicroScheduler:
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         speculation_mixes_walks: Mapping[str, Any] | None = None,
+        eager_yield_nodes: Collection[str] = (),
     ):
         self.engine_manager = engine_manager
         self._orders: dict[tuple[str, str], StepOrder] = {}
+        # Nodes whose speculation chains yield to other ready work from their
+        # first step, not their second; see `yields_eagerly`
+        self.eager_yield_nodes = frozenset(eager_yield_nodes)
         # (node, real walk) -> combined walk; scheduling keys use the combined one
         self.combined_walk_of = combined_walk_of or {}
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -568,6 +572,13 @@ class MicroScheduler:
                     )
                 out[(node, walk)] = mixes
         return out
+
+    def yields_eagerly(self, node_name: str) -> bool:
+        """Whether the step just after a yield looks for other ready work too.
+        Off (the default), a chain speculates one step before it looks, so a
+        burst of prompts alternates with decode; on, the burst runs first, and
+        decode takes all of its rows at once afterwards."""
+        return node_name in self.eager_yield_nodes
 
     def speculation_mixes(self, node_name: str, graph_walk: str) -> bool:
         """Whether a speculation chain on ``(node_name, graph_walk)`` merges
