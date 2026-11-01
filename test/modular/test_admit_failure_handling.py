@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -38,7 +39,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.submodule_base import StepOrder
+from mstar.model.submodule_base import NodeSubmodule, StepOrder
 from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -693,12 +694,16 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
 class _FakeMgmt:
     """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
 
-    def __init__(self, submodule, num_slots: int, next_slot: int, seen: list):
+    def __init__(
+        self, submodule, num_slots: int, next_slot: int, seen: list,
+        slot_raise_at: int | None = None,
+    ):
         self.submodule = submodule
         self.num_slots = num_slots
         self.needs_slot_fence = False
         self._next_slot = next_slot
         self._seen = seen
+        self._slot_raise_at = slot_raise_at
 
     @property
     def next_slot(self) -> int:
@@ -711,6 +716,8 @@ class _FakeMgmt:
 
     def set_piecewise_slot(self, slot: int) -> None:
         self._seen.append(slot)
+        if len(self._seen) == self._slot_raise_at:
+            raise RuntimeError("slot setup failed")
 
 
 class _FakeExecEngine:
@@ -721,9 +728,13 @@ class _FakeExecEngine:
 
     def __init__(
         self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
+        raise_on: str | tuple[str, ...] = (), collect_raise_on: str | None = None,
+        slot_raise_at: int | None = None,
     ):
         self._enable_nvtx = False
         self._fail_on = fail_on
+        self._raise_on = {raise_on} if isinstance(raise_on, str) else set(raise_on)
+        self._collect_raise_on = collect_raise_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
         # which rids were driven with `set_launch` — the real path signals
@@ -735,7 +746,9 @@ class _FakeExecEngine:
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
-        self.mgmt = _FakeMgmt(self, num_slots, next_slot, self.piecewise_slots)
+        self.mgmt = _FakeMgmt(
+            self, num_slots, next_slot, self.piecewise_slots, slot_raise_at=slot_raise_at,
+        )
         self._submodules = {"node": self.mgmt}
 
     # --- submodule surface
@@ -773,12 +786,17 @@ class _FakeExecEngine:
             # stands in for `_forward` releasing `launch_started_event`
             self.launch_signals.append(rid)
             self.events.append(("launch", rid))
-        self.events.append(("run", rid))
         self.run_slots.append(ctx.slot)
+        if rid in self._raise_on:
+            self.events.append(("raise", rid))
+            raise RuntimeError(f"forward failed for {rid}")
+        self.events.append(("run", rid))
         return {rid: {"token": 1}}, step
 
     def _collect_outputs(self, *a, **kw):
         del a
+        if kw["request_ids"][0] == self._collect_raise_on:
+            raise RuntimeError("collect failed")
         return dict(kw["request_ids"] and {kw["request_ids"][0]: {"token": 1}})
 
 
@@ -927,3 +945,123 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
 
     assert sizes == [16, alone], f"batch sizes {sizes}, {len(worker.offloaded)} rows offloaded"
     assert len(worker.offloaded) == 1
+
+
+# --- a forward that raises fails only its own rid --------------------------
+
+
+@pytest.mark.parametrize("engine_kwargs, failed", [
+    ({"collect_raise_on": "b"}, {"b"}),  # past commit, collecting its outputs
+    ({"raise_on": ("a", "b", "c")}, {"a", "b", "c"}),
+], ids=["collect", "every_forward"])
+def test_per_request_fails_only_the_rids_that_raised(engine_kwargs, failed):
+    """The rest of the unbatchable batch still runs, and the plan thread is released."""
+    engine = _FakeExecEngine(**engine_kwargs)
+    batch = _exec_batch(["a", "b", "c"])
+
+    out = engine._exec_per_request(batch)
+
+    assert out.per_rid_outputs == {rid: {} if rid in failed else {"token": 1} for rid in "abc"}
+    assert set(batch.failed_requests) == failed
+    assert batch.commit_done.is_set()
+
+
+class _FakeEvent:
+    """A slot fence event that logs which slot it was recorded after and
+    when it is waited on."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self.slot = None
+
+    def record(self):
+        self.slot = self._engine.piecewise_slots[-1]
+        self._engine.events.append(("record", self.slot))
+
+    def synchronize(self):
+        self._engine.events.append(("sync", self.slot))
+
+
+class _LoggedEvent(threading.Event):
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+
+    def set(self):
+        self._events.append(("commit_done", ""))
+        super().set()
+
+
+def _fenced(monkeypatch, **kwargs) -> _FakeExecEngine:
+    engine = _FakeExecEngine(**kwargs)
+    engine.mgmt.needs_slot_fence = True
+    engine.device_capability = SimpleNamespace(
+        is_accelerator=True, is_capturing=lambda: False,
+    )
+    monkeypatch.setattr(torch, "Event", lambda device=None: _FakeEvent(engine))
+    return engine
+
+
+def test_a_raising_rids_slot_is_still_fenced(monkeypatch):
+    """A raising rid's slot is fenced like a finished rid's: d reuses b's slot
+    only after waiting on it, and ``next_slot`` drains before the plan thread
+    is released."""
+    engine = _fenced(monkeypatch, raise_on="b", num_slots=2, next_slot=1)
+    batch = _exec_batch(["a", "b", "c", "d"], slot=0)
+    batch.commit_done = _LoggedEvent(engine.events)
+
+    engine._exec_per_request(batch)
+
+    assert engine.run_slots == [0, 1, 0, 1]
+    assert [e for e in engine.events if e[0] in ("run", "raise", "record", "sync", "commit_done")] == [
+        ("run", "a"), ("record", 0),
+        ("raise", "b"), ("record", 1),
+        ("sync", 0), ("run", "c"), ("record", 0),
+        ("sync", 1), ("run", "d"), ("record", 1),
+        # the counter ends on slot 0, c's
+        ("sync", 0), ("commit_done", ""),
+    ]
+    assert set(batch.failed_requests) == {"b"}
+
+
+def test_per_request_drains_and_releases_when_the_loop_itself_raises(monkeypatch):
+    """A raise outside the per-rid try (setting b's slot) fails the batch, and
+    still drains ``next_slot`` (a's) before releasing the plan thread."""
+    # two declare-loop calls, then a's slot, then b's raises
+    engine = _fenced(monkeypatch, num_slots=2, next_slot=1, slot_raise_at=4)
+    batch = _exec_batch(["a", "b"], slot=0)
+    batch.commit_done = _LoggedEvent(engine.events)
+
+    with pytest.raises(RuntimeError, match="slot setup failed"):
+        engine._exec_per_request(batch)
+
+    assert [e for e in engine.events if e[0] in ("run", "record", "sync", "commit_done")] == [
+        ("run", "a"), ("record", 0), ("sync", 0), ("commit_done", ""),
+    ]
+    assert not batch.failed_requests  # the worker fails the whole batch
+
+
+class _TailSubmodule:
+    batch_postprocess = NodeSubmodule.batch_postprocess
+
+    def __init__(self):
+        self.postprocessed: list[str] = []
+
+    def postprocess(self, request_id, request_info, outputs, inputs):
+        del request_info, inputs
+        self.postprocessed.append(request_id)
+        outputs["token"]  # an empty output can't be finished
+
+
+def test_postprocess_skips_a_rid_whose_forward_raised():
+    """The tail must not run over a failed rid's empty outputs: it would raise
+    again and replace the forward's error with its own."""
+    submodule = _TailSubmodule()
+    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(submodule=submodule)})
+    batch = _exec_batch(["a", "b"])
+    batch.register_failure("b", ValueError("forward failed for b"))
+
+    Engine._postprocess_batch(engine, batch, {"a": {"token": 1}, "b": {}})
+
+    assert submodule.postprocessed == ["a"]
+    assert batch.failed_requests == {"b": "ValueError: forward failed for b"}
