@@ -5,7 +5,6 @@ from itertools import chain
 
 import torch
 
-from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -18,19 +17,30 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
     KV_CACHE,
     LOCAL_ATTN,
-    PREFILL_WALKS,
     ROPE,
     SAMPLER,
     CommandAPlusConfig,
 )
-from mstar.model.multimodal import messages_from_parts, parts_from_modalities
+from mstar.model.multimodal import (
+    MEDIA_LAYOUT,
+    MediaEncoder,
+    MediaPads,
+    PrefillStep,
+    expand_media_pads,
+    initial_prefill_args,
+    media_layout,
+    media_walk_name,
+    messages_from_parts,
+    next_prefill_args,
+    parts_from_modalities,
+)
 
 TEXT_WEIGHTS = ("model.language_model.",)
 VISION_WEIGHTS = ("model.vision_tower.", "model.multi_modal_projector.")
@@ -45,6 +55,12 @@ class CommandAPlusModel(Model):
         config = CommandAPlusConfig.from_json(self.local_dir / "config.json")
         self.config = config.text_config
         self.vision_config = config.vision_config
+        # the image tower, whose output fills the image pads in prompt order;
+        # it names the image walk, `prefill_image`
+        self.image_encoder = MediaEncoder(
+            "image", "vision_encoder", ("pixel_values",), "image_embeds", (self.vision_config.image_token_id,),
+        )
+        self.image_walk = media_walk_name((self.image_encoder,))
         self.max_seq_len = min(8192, self.config.max_position_embeddings) if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= self.config.max_position_embeddings:
             raise ValueError("max_seq_len must be positive and within max_position_embeddings")
@@ -55,73 +71,55 @@ class CommandAPlusModel(Model):
 
     def get_graph_walk_graphs(self):
         def prefill(*inputs):
-            return GraphNode(
-                name="LLM", input_names=["text_inputs", *inputs], outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
-                              output_modality="text", conductor_new_token=True),
-                    # Absent when prefill already finishes the request.
-                    GraphEdge(next_node=EMPTY_DESTINATION, name="decode_input", persist=True),
-                ],
-            )
+            return GraphNode(name="LLM", input_names=["text_inputs", *inputs], outputs=[
+                # persisted: decode starts from it
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", persist=True,
+                          output_modality="text", conductor_new_token=True),
+            ])
 
+        image = self.image_encoder
         return {
             "prefill": prefill(),
-            "prefill_image": Sequential([
-                GraphNode(name="vision_encoder", input_names=["pixel_values"], outputs=[
-                    GraphEdge(next_node="LLM", name="image_embeds"),
+            self.image_walk: Sequential([
+                GraphNode(name=image.node, input_names=list(image.inputs), outputs=[
+                    GraphEdge(next_node="LLM", name=image.output),
                 ]),
-                prefill("image_embeds"),
+                prefill(image.output),
             ]),
             "decode": Loop(
                 # Per-request max_output_tokens ends the loop earlier; this is
                 # only the hard bound, so it must not cap the request's choice.
                 name="decode_loop", max_iters=self.max_seq_len, outputs=[],
+                # every output is the token the node reads back off the
+                # sampler, so it stays on the device
                 section=GraphNode(name="LLM", input_names=["text_inputs"], outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
-                              output_modality="text", conductor_new_token=True),
                     GraphEdge(next_node="LLM", name="text_inputs"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs",
+                              output_modality="text", conductor_new_token=True),
                 ]),
             ),
         }
-
-    @staticmethod
-    def _check_partition(partition_name):
-        if partition_name != DEFAULT_PARTITION:
-            raise ValueError(f"Unknown Command A+ partition: {partition_name!r}")
 
     def get_initial_forward_pass_args(
         self, partition_name, input_modalities, output_modalities, input_signals,
         model_kwargs=None,
     ):
-        self._check_partition(partition_name)
-        if not input_signals.get("text_inputs"):
+        texts = input_signals.get("text_inputs")
+        if not texts:
             raise ValueError("Command A+ prefill requires text_inputs")
-        pixels = input_signals.get("pixel_values", [])
-        inputs = [GraphEdge(next_node="LLM", name="text_inputs", tensor_info=input_signals["text_inputs"])]
-        if pixels:
-            inputs.append(GraphEdge(next_node="vision_encoder", name="pixel_values", tensor_info=pixels))
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                graph_walk="prefill_image" if pixels else "prefill", is_prefill=True,
-                input_modalities=input_modalities, output_modalities=output_modalities,
-            ),
-            inputs=inputs, unpersist_tensors=[info for edge in inputs for info in edge.tensor_info],
-        )
+        inputs = {("LLM", "text_inputs"): texts}
+        pixels = input_signals.get("pixel_values")
+        if not pixels:
+            step = PrefillStep("prefill", inputs)
+        else:
+            inputs[(self.image_encoder.node, "pixel_values")] = pixels
+            step = PrefillStep(self.image_walk, inputs, {MEDIA_LAYOUT: (model_kwargs or {})[MEDIA_LAYOUT]})
+        return initial_prefill_args(step, input_modalities, output_modalities)
 
     def get_partition_forward_pass_args(
         self, partition_name, partition_metadata, persist_signals, incoming_connections=None,
     ):
-        self._check_partition(partition_name)
-        metadata = partition_metadata
-        seeds = persist_signals.get("decode_input", [])
-        if metadata.graph_walk == "decode" or not seeds:
-            return ForwardPassArgs(metadata, [], list(seeds), request_done=True)
-        if metadata.graph_walk not in PREFILL_WALKS:
-            raise ValueError(f"Unexpected graph walk: {metadata.graph_walk!r}")
-        metadata.graph_walk = "decode"
-        metadata.is_prefill = False
-        edge = GraphEdge(next_node="LLM", name="text_inputs", tensor_info=seeds)
-        return ForwardPassArgs(metadata, [edge], list(seeds))
+        return next_prefill_args(partition_metadata, persist_signals)
 
     def get_node_resources(self):
         config = self.config
@@ -207,7 +205,7 @@ class CommandAPlusModel(Model):
         language_model.eval()
         if torch.device(device).type == "cuda":
             language_model.model.fuse_for_inference()
-        return CommandAPlusLLMSubmodule(language_model, self.config, self.vision_config.image_token_id).eval()
+        return CommandAPlusLLMSubmodule(language_model, self.config, (self.image_encoder,)).eval()
 
     def _get_tokenizer(self):
         if self._tokenizer is None:
@@ -224,13 +222,11 @@ class CommandAPlusModel(Model):
         return self._image_processor
 
     def _get_image_tokens(self):
-        """The start and end of image ids, and one tile's tokens ending in its line break."""
+        """The ids that open and close an image, and the one that ends each tile."""
         if self._image_tokens is None:
-            start, end, line_break = self._get_tokenizer().convert_tokens_to_ids(
+            self._image_tokens = tuple(self._get_tokenizer().convert_tokens_to_ids(
                 ["<|START_OF_IMG|>", "<|END_OF_IMG|>", "<|IMG_LINE_BREAK|>"],
-            )
-            tile = [self.vision_config.image_token_id] * self.vision_config.tokens_per_tile + [line_break]
-            self._image_tokens = start, end, tile
+            ))
         return self._image_tokens
 
     def process_prompt(
@@ -250,7 +246,8 @@ class CommandAPlusModel(Model):
                 tokenize=True, add_generation_prompt=True, return_dict=False,
             ), dtype=torch.long)
         max_output_tokens = self.get_max_output_tokens(**kwargs)
-        ids, pixel_values = self._expand_images(ids, tensors.get("image_inputs", []), max_output_tokens)
+        pads, pixel_values = self._expand_images(ids, tensors.get("image_inputs", []), max_output_tokens)
+        ids = pads.ids
         if ids.ndim != 1 or ids.numel() == 0 or ids.numel() > self.max_seq_len:
             raise ValueError("Prompt must contain 1..max_seq_len token IDs")
         if ids.numel() + max_output_tokens > self.max_seq_len:
@@ -264,10 +261,12 @@ class CommandAPlusModel(Model):
         if pixel_values:
             result["pixel_values"] = pixel_values
         # Image rows are not keyed by the placeholder ids they replace.
-        span = Span("rows" if pixel_values else "ids", "prefill_image" if pixel_values else "prefill",
+        span = Span("rows" if pixel_values else "ids", self.image_walk if pixel_values else "prefill",
                     ids.numel(), ids.numel(), "text_inputs")
         layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
-        return ProcessPromptOutput(result, {"kv_layout": {KV_CACHE: {"main": layout}}})
+        # always set, so a layout the client sent never reaches the LLM
+        media = media_layout(pads, {self.image_encoder.pad_ids[0]: self.image_encoder.output})
+        return ProcessPromptOutput(result, {MEDIA_LAYOUT: media, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     @staticmethod
     def _chat_messages(prompt, input_modalities, prompt_parts, messages):
@@ -290,32 +289,38 @@ class CommandAPlusModel(Model):
             raise ValueError("Expected a text prompt")
         return [{"role": "user", "content": prompt}]
 
-    def _expand_images(self, ids, images, max_output_tokens):
-        """Tile each image and widen its one ``<|IMG_PATCH|>`` placeholder to the tiles' tokens."""
-        image_token = self.vision_config.image_token_id
-        positions = (ids == image_token).nonzero().flatten().tolist()
+    def _expand_images(self, ids, images, max_output_tokens) -> tuple[MediaPads, list[torch.Tensor]]:
+        """Tile each image and write its one ``<|IMG_PATCH|>`` placeholder out as
+        the processor lays it out: the image's start, each tile's pads ending
+        in a line break, the image's end. Each tile is one run of pads."""
+        pad = self.image_encoder.pad_ids[0]
+        positions = (ids == pad).nonzero().flatten().tolist()
         if len(positions) != len(images):
             raise ValueError(f"The prompt has {len(positions)} image placeholders for {len(images)} images")
         if not images:
-            return ids, []
-        start_of_image, end_of_image, tile = self._get_image_tokens()
+            return MediaPads(ids, [], [], [], []), []
+        start_of_image, end_of_image, line_break = self._get_image_tokens()
+        tokens = self.vision_config.tokens_per_tile
         pieces, pixel_values, start = [], [], 0
         length = ids.numel() - len(images)
         for position, image in zip(positions, images, strict=True):
             # load_image gives floats in [0, 1]; the processor expects the image's bytes.
             image = (image.cpu() * 255).round().clamp(0, 255).to(torch.uint8)
             tiles = self._get_image_processor()(images=[image], return_tensors="pt")["pixel_values"]
-            length += len(tiles) * len(tile) + 2
+            length += len(tiles) * (tokens + 1) + 2
             if length + max_output_tokens > self.max_seq_len:
                 raise ValueError(
                     f"prompt (at least {length} tokens) + max_output_tokens ({max_output_tokens}) "
                     f"exceeds max_seq_len ({self.max_seq_len})"
                 )
-            pieces += [ids[start:position], torch.tensor([start_of_image, *tile * len(tiles), end_of_image])]
+            # one placeholder a tile, each expanded to its pads below
+            layout = [start_of_image, *[pad, line_break] * len(tiles), end_of_image]
+            pieces += [ids[start:position], torch.tensor(layout)]
             pixel_values.append(tiles.to(torch.bfloat16))
             start = position + 1
         pieces.append(ids[start:])
-        return torch.cat(pieces), pixel_values
+        runs = [tokens] * sum(len(tiles) for tiles in pixel_values)
+        return expand_media_pads(torch.cat(pieces), {pad: runs}), pixel_values
 
     def postprocess(self, output, modality, request_kwargs=None):
         if modality != "text":

@@ -275,21 +275,6 @@ class _Cosmos3Tokenizer:
         return 2
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
-    from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-
-    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0), image_token_id=1)
-
-    cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
@@ -619,17 +604,18 @@ def _token_decoder(name: str):
         model.config = Qwen3ASRModelConfig()
         return model
     from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
     from mstar.model.orpheus.orpheus_model import OrpheusModel
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
-    classes = {"canary_qwen": CanaryQwenModel, "higgs": HiggsAudioModel, "orpheus": OrpheusModel,
-               "qwen3_5": Qwen3_5DenseModel}
+    classes = {"canary_qwen": CanaryQwenModel, "command_a_plus": CommandAPlusModel, "higgs": HiggsAudioModel,
+               "orpheus": OrpheusModel, "qwen3_5": Qwen3_5DenseModel}
     return object.__new__(classes[name])
 
 
 @pytest.mark.parametrize(
-    "name", ["canary", "canary_qwen", "glm52", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"],
+    "name", ["canary", "canary_qwen", "command_a_plus", "glm52", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"],
 )
 @pytest.mark.parametrize("max_tokens", [2, 64])
 def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
