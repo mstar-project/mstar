@@ -43,7 +43,7 @@ from mstar.model.parakeet.config import (
     check_detected_language,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import SentencePieceDetokenizer
+from mstar.model.utils import SentencePieceDetokenizer, check_loaded
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -254,11 +254,16 @@ class ParakeetModel(Model):
             from mstar.model.components.fastconformer import FastConformerEncoder
             from mstar.model.components.fastconformer_submodule import FastConformerEncoderSubmodule
 
-            encoder = FastConformerEncoder.load(
-                self.config.encoder, ((k.removeprefix("encoder."), v) for k, v in self._weights(device, "encoder.")),
-                device=device, dtype=autocast_dtype,
+            with torch.device("meta"):
+                encoder = FastConformerEncoder(self.config.encoder)
+            if autocast_dtype is not None:
+                encoder = encoder.to(autocast_dtype)
+            encoder = encoder.to_empty(device=device)
+            loaded = encoder.load_hf_weights(
+                (k.removeprefix("encoder."), v) for k, v in self._weights(device, "encoder.")
             )
-            return FastConformerEncoderSubmodule(encoder, normalize_features=self.config.normalize_features)
+            check_loaded(encoder, loaded, "encoder")
+            return FastConformerEncoderSubmodule(encoder.eval(), normalize_features=self.config.normalize_features)
         if node_name == "transducer":
             from mstar.model.components.transducer import TransducerHead
             from mstar.model.parakeet.submodules import TransducerSubmodule

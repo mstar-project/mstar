@@ -63,10 +63,7 @@ def _decoder(monkeypatch, vae, *, fast: bool, dtype=torch.float32, tiling: str =
 
 
 def _forward(sub, latents: torch.Tensor) -> torch.Tensor:
-    """The node's emitted ``[F, H, W, 3]`` frames, as the decode's ``[1, 3, F, H, W]``."""
-    frames = sub.forward("video_gen", engine_inputs=None, latents=latents)["video_output"][0]
-    assert frames.is_contiguous() and frames.shape[-1] == 3
-    return frames.permute(3, 0, 1, 2)[None]
+    return sub.forward("video_gen", engine_inputs=None, latents=latents)["video_output"][0]
 
 
 def _stock(vae, latents: torch.Tensor, dtype=torch.float32, tiled: bool = False) -> torch.Tensor:

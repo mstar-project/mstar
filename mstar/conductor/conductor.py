@@ -5,9 +5,12 @@ import multiprocessing as mp
 import os
 import signal
 import socket
+import threading
 import time
 from collections import defaultdict, deque
+from collections.abc import Collection
 from dataclasses import dataclass, field, replace
+from typing import NamedTuple
 
 import torch
 import yaml
@@ -29,7 +32,6 @@ from mstar.conductor.request_info import (
     merge_publish_info,
 )
 from mstar.conductor.routing import ReplicaRouter, RoutingHandle
-from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
@@ -42,14 +44,14 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
-from mstar.streaming.topology import CLIENT, ClientStream, find_client_streams
+from mstar.streaming.topology import CLIENT
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
 from mstar.utils.ipc_format import (
-    ClientStreamRoute,
+    ClientStreamInput,
     ConductorMessageType,
     DrainRequest,
     FailRequests,
@@ -66,7 +68,6 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
-from mstar.utils.threads import Thread
 from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
@@ -223,6 +224,16 @@ def _run_worker(worker) -> None:
         raise stop
 
 
+def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
+    """The device string a worker rank runs on: its own number unless the
+    deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
+    GPU); CPU deployments ignore the mapping."""
+    if device_type == "cpu":
+        return "cpu"
+    index = (rank_devices or {}).get(rank, rank)
+    return f"{device_type}:{index}"
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
@@ -245,12 +256,9 @@ def _worker_process_target(
     tcp_transfer_device="",
     status_interval_s: float | None = None,
     env: dict[str, str] | None = None,
-    local_worker_devices: list[str] | None = None,
-    all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
-    picklability. ``status_interval_s`` turns on the worker's metrics;
-    ``local_worker_devices`` is every worker's device, in ``worker_ids`` order."""
+    picklability. ``status_interval_s`` turns on the worker's metrics."""
     # before anything in this process touches the device runtime; the MPS pipe
     # directory in ``env`` decides whether this process becomes an MPS client
     apply_process_env_defaults()
@@ -274,7 +282,7 @@ def _worker_process_target(
     )
     quiet_noisy_loggers()
     built: list = []  # the Worker, once it exists
-    Thread(
+    threading.Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
         kwargs={"before_hard_exit": lambda: [_unlink_owned_files(w.tensor_manager) for w in built]},
     ).start()
@@ -293,7 +301,6 @@ def _worker_process_target(
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
-            all_worker_graph_ids_to_instances=all_worker_graph_ids_to_instances,
             sharding_config=sharding_config,
             parallel_groups=parallel_groups,
             hostname=hostname,
@@ -305,7 +312,6 @@ def _worker_process_target(
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             status_interval_s=status_interval_s,
-            local_worker_devices=local_worker_devices,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -379,6 +385,14 @@ class RequestData:
             conn for conn in self.streaming_connections.values()
             if conn.to_partition == partition_name
         ]
+
+
+class ClientStream(NamedTuple):
+    """Where a client stream's chunks go: the node that consumes the edge, a
+    walk it runs in (for routing to its workers) and its partition."""
+    node: str
+    graph_walk: str
+    partition: str
 
 
 @dataclass
@@ -478,7 +492,8 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
-        self.device_type = accelerator_type()
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         logger.info(
@@ -488,6 +503,14 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        # Optional ``rank_devices: {rank: device_index}`` places a worker rank
+        # on a device other than the one its number implies, e.g. two workers
+        # sharing one GPU so a light node's steps stop interleaving with a
+        # heavy node's on the same worker loop.
+        self.rank_devices = {
+            int(rank): int(index)
+            for rank, index in (self.model_config.get("rank_devices") or {}).items()
+        }
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -499,9 +522,9 @@ class Conductor:
         # owns the numbering. Workers receive their graphs (and these ids) at
         # spawn, so everyone agrees without the ids having to be negotiated.
         worker_graphs = deployment.worker_graphs
-        # edge name -> where its items go, for each stream the client feeds. After
+        # edge name -> where its chunks go, for each stream the client feeds. After
         # the worker graphs are built: a model may shape them from the deployment (bagel).
-        self._client_streams: dict[str, ClientStream] = find_client_streams(model)
+        self._client_streams = self._find_client_streams(model)
         for index, worker_graph in enumerate(worker_graphs):
             worker_graph.worker_graph_id = index
         self.worker_graphs = {
@@ -553,12 +576,6 @@ class Conductor:
         topology = model.get_partition_topology()
         self.producer_triggered_partitions: set[str] = (
             topology.producer_triggered_partitions() if topology else set()
-        )
-        # Fed by a stream, from another partition or the client: such a
-        # partition self-triggers via StreamBuffer, and its worker signals
-        # partition_done directly.
-        self._stream_fed_partitions: set[str] = (
-            {conn.to_partition for conn in topology.connections} if topology else set()
         )
         if topology:
             topology.check_walk_driving_connections()
@@ -708,11 +725,6 @@ class Conductor:
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
-        # a model that builds its sampler config from its own keys would drop it unseen
-        if model_kwargs.get("return_logprobs") and not any(
-            getattr(cfg, "return_logprobs", False) for cfg in configs.values()
-        ):
-            raise ValueError("this model does not report logprobs; leave return_logprobs unset")
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
@@ -725,7 +737,7 @@ class Conductor:
             for rank in worker_graph.ranks:
                 rank_to_worker_graphs[rank].append(worker_graph)
 
-        self._sorted_ranks, self._worker_devices = deployment_workers(self.model_config, self.device_type)
+        self._sorted_ranks = sorted(rank_to_worker_graphs.keys())
         self.worker_ids = [f"worker_{rank}" for rank in self._sorted_ranks]
 
         # Messages that arrive before all workers report SETUP_DONE; replayed
@@ -750,15 +762,6 @@ class Conductor:
         }
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
-            for worker_graph_id, worker_graph in self.worker_graphs.items()
-        }
-        # each worker graph's lockstep instances, as worker ids; a request of
-        # the worker graph runs on one of them
-        self._all_worker_graph_ids_to_instances: dict[int, list[list[str]]] = {
-            worker_graph_id: [
-                [f"worker_{rank}" for rank in instance]
-                for instance in worker_graph.replica_ranks
-            ]
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
         self._loop_max_iters: dict[str, int] = {}
@@ -808,9 +811,7 @@ class Conductor:
                 raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
             self._mps = MpsDaemon()
             self._mps.start()
-        # every worker runs on this host and builds the same CPU plan from all
-        # of their devices (see mstar.utils.cpus)
-        for worker_id, device in zip(self.worker_ids, self._worker_devices, strict=True):
+        for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
                 kwargs={
@@ -821,7 +822,6 @@ class Conductor:
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
-                    "all_worker_graph_ids_to_instances": self._all_worker_graph_ids_to_instances,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
                     "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
@@ -830,8 +830,7 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": device,
-                    "local_worker_devices": self._worker_devices,
+                    "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
@@ -990,6 +989,26 @@ class Conductor:
         cfg.setup(node_to_workers)
         cfg.assert_stream_consumer_compatibility(self.streaming_consumers)
         return cfg
+
+    @staticmethod
+    def _find_client_streams(model: Model) -> dict[str, ClientStream]:
+        """Where each client stream's chunks go: to the one node that consumes
+        it, in the partition it flows into, as validate_deployment checked."""
+        connections = model.get_partition_topology().client_connections()
+        if not connections:
+            return {}
+        walks = model.get_graph_walk_graphs()
+        partitions = {p.name: p for p in model.get_partitions()}
+        streams: dict[str, ClientStream] = {}
+        for conn in connections:
+            name, partition = conn.edge_name, partitions[conn.to_partition]
+            (consumer,) = {
+                node.name for walk in walks.values() for node in walk.get_nodes().values()
+                if name in node.input_names
+            }
+            walk = max(walk for walk in partition.graph_walks if consumer in walks[walk].get_nodes())
+            streams[name] = ClientStream(consumer, walk, partition.name)
+        return streams
 
     def _split_inputs_to_workers(
         self,
@@ -1164,7 +1183,8 @@ class Conductor:
             return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
-            if body.input_open:
+            ended = body.client_input.ended if body.client_input is not None else ()
+            if self._client_streams.keys() - set(ended):
                 # A live call that waited for a slot would start, and stay, as
                 # far behind its client as it waited.
                 self._reject_request(
@@ -1216,6 +1236,9 @@ class Conductor:
                 self._remove_request(
                     body.request_id, request_data, failure_error=f"Ingest failed: {text}",
                 )
+        else:
+            if body.client_input is not None:
+                self._stream_input(body.client_input)
 
     def _reject_request(self, request_id: str, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
@@ -1335,12 +1358,9 @@ class Conductor:
         placement = self._router.pick(resource_configs, groups_run)
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
 
-        # Build per-connection streaming state. None for a client stream: the
-        # data worker sends and ends it itself.
+        # Build per-connection streaming state
         streaming_connections: dict[tuple[str, str, str], StreamingConnectionState] = {}
         for conn in topology.connections:
-            if conn.from_partition == CLIENT:
-                continue
             # a tuple: names may hold ":" or "->" ("C:x" + "y" vs "C" + "x:y")
             key = (conn.from_partition, conn.to_partition, conn.edge_name)
             streaming_connections[key] = StreamingConnectionState(
@@ -1370,7 +1390,7 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
         )
-        self.requests[body.request_id] = request_data
+        self._register_request(body.request_id, request_data)
 
         for p in partitions:
             self._set_partition_worker_graph_ids(
@@ -1427,21 +1447,6 @@ class Conductor:
 
         request_data.resource_configs = without_layouts(request_data.resource_configs)
 
-        if self._client_streams:
-            # Once dispatch can no longer fail, so every rank the data worker
-            # sends items to holds the request and gets its REMOVE (a rank
-            # parks items that beat its NEW_REQUEST). A stream whose partition
-            # this request doesn't run takes nothing. Each item goes whole to
-            # the ranks a one-rank source fans a replicated edge out to.
-            cfg = request_data.sharding_config
-            self._send_client_route(body.request_id, {
-                name: [] if partition_states[stream.partition].is_done
-                else [dest.worker for dest in cfg.compute_fanout(
-                    name, "", CLIENT, stream.node, [], stream.graph_walk,
-                )]
-                for name, stream in self._client_streams.items()
-            })
-
         # After the loop: a tensor's reader count must cover every worker and
         # partition it went to before the producer may free it.
         self._un_persist_tensors(body.request_id, [
@@ -1480,6 +1485,9 @@ class Conductor:
             for worker_ids in request_data.worker_graph_to_workers.values()
             for worker_id in worker_ids
         }
+
+    def _register_request(self, request_id: str, request_data: RequestData) -> None:
+        self.requests[request_id] = request_data
 
     def _drop_request(self, request_id: str) -> None:
         """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
@@ -1882,8 +1890,10 @@ class Conductor:
         pstate = request_data.partition_states[partition_name]
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
-        stream_fed = partition_name in self._stream_fed_partitions
-        if stream_fed and partition_done_from_worker:
+
+        # For partitions that self-trigger via StreamBuffer (have incoming
+        # connections with topology), worker signals partition_done directly.
+        if incoming_connections and partition_done_from_worker:
             pstate.is_done = True
 
         prev_walk =  pstate.metadata.graph_walk
@@ -1906,7 +1916,7 @@ class Conductor:
         # a worker carries every buffer's count, so a colocated consumer's report
         # could finish this partition while its last step was still running,
         # and that step's output arrived for a request already gone.
-        if stream_fed and partition_done_from_worker:
+        if incoming_connections and partition_done_from_worker:
             fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
@@ -1926,13 +1936,6 @@ class Conductor:
 
         if fwd_args.request_done:
             pstate.is_done = True
-            ended = [
-                name for name, stream in self._client_streams.items()
-                if stream.partition == partition_name
-            ]
-            if ended:
-                # its client streams' later items are answered as late
-                self._send_client_route(request_id, dict.fromkeys(ended, []))
             # Signal producer_done to all outgoing connections, once per
             # consumer partition however many edges lead there
             consumers: set[str] = set()
@@ -2017,10 +2020,11 @@ class Conductor:
         return inputs_per_worker
 
     def _send_producer_done(
-        self, request_id: str, producer_partition: str, consumer_partition_name: str,
+        self, request_id: str, producer_partition: str,
+        consumer_partition_name: str, edges: Collection[str] | None = None,
     ):
-        """Send producer_done signal to the consumer partition's worker(s), for
-        every stream between the two partitions."""
+        """Send producer_done signal to the consumer partition's worker(s): for
+        every stream between the two partitions, or only ``edges``."""
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[consumer_partition_name]
 
@@ -2033,11 +2037,12 @@ class Conductor:
                 consumer_workers.update(worker_ids)
 
         # The worker ends the streams the signal counts, so it names each edge
-        # it ends: every one between the two partitions.
+        # it ends: every one between the two partitions, or ``edges``.
         conns = [
             conn for conn in request_data.streaming_connections.values()
             if conn.from_partition == producer_partition
             and conn.to_partition == consumer_partition_name
+            and (edges is None or conn.edge_name in edges)
         ]
         for worker_id in consumer_workers:
             message = WorkerMessage(
@@ -2063,18 +2068,61 @@ class Conductor:
             )
             self.communicator.send(worker_id, message)
 
-    def _send_client_route(self, request_id: str, workers: dict[str, list[str]]) -> None:
-        """Tell the data worker, which sends a request's client stream items to
-        their consumers itself, where each of ``workers``' streams goes: its
-        consuming node, which the data worker's own copy of the model can't
-        resolve (the deployment never shaped its walks), and the node's ranks."""
-        self.communicator.send(self.PREPROCESS_WORKER, WorkerMessage(
-            message_type=WorkerMessageType.CLIENT_STREAM_ROUTE,
-            body=ClientStreamRoute(
-                request_id=request_id, workers=workers,
-                nodes={name: self._client_streams[name].node for name in workers},
-            ),
-        ))
+    def _stream_input(self, body: ClientStreamInput):
+        """Forward the next chunk of a request's client streams, or end them.
+        A chunk this request can't take fails the request alone."""
+        request_id = body.request_id
+        request_data = self.requests.get(request_id)
+        if request_data is None or request_id in self.draining:
+            # It ended, failed or was aborted (a request still waiting for a
+            # slot has no open input); the preprocess worker frees the chunk
+            # with the request's other tensors.
+            return
+        try:
+            for name, infos in body.signals.items():
+                self._forward_client_chunk(request_id, request_data, name, infos)
+            # each stream ends on its own; the call's input has ended once all have
+            ended: dict[str, list[str]] = {}
+            for name in body.ended:
+                stream = self._client_streams.get(name)
+                if stream is None:
+                    logger.warning("Request %s: %r is not a client stream; not ending it", request_id, name)
+                    continue
+                conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+                if not conn.producer_done:
+                    conn.producer_done = True
+                    ended.setdefault(stream.partition, []).append(name)
+            for partition in sorted(ended):
+                self._send_producer_done(request_id, CLIENT, partition, edges=ended[partition])
+        except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
+            text, _ = client_error_text(exc, f"Client input for request {request_id} failed", log=logger)
+            self._remove_request(request_id, request_data, failure_error=f"client input failed: {text}")
+
+    def _forward_client_chunk(
+        self, request_id: str, request_data: RequestData, name: str,
+        infos: list[TensorPointerInfo],
+    ):
+        """Send one client chunk to the workers of the node that consumes it,
+        the way a partition's inputs are sent, and release its persist hold."""
+        stream = self._client_streams.get(name)
+        if stream is None:
+            logger.warning("Request %s: %r is not a client stream; dropping it", request_id, name)
+            return
+        conn = request_data.streaming_connections[CLIENT, stream.partition, name]
+        pstate = request_data.partition_states[stream.partition]
+        if conn.producer_done or pstate.is_done:
+            return  # nothing reads it any more; freed with the request
+        if not infos:
+            return
+        edge = GraphEdge(next_node=stream.node, name=conn.edge_name, tensor_info=list(infos), is_streaming=True)
+        sent = self._send_inputs(request_id, stream.partition, [edge], stream.graph_walk, {})
+        conn.token_count += len(infos)
+        # each tensor is one stream item; the producer-done signal reports them
+        for worker, edges in sent.items():
+            n = sum(len(e.tensor_info) for e in edges)
+            conn.items_sent[worker] = conn.items_sent.get(worker, 0) + n
+        # After the send: the hold is released with every reader counted.
+        self._un_persist_tensors(request_id, infos)
 
     def _wait_for_workers_ready(self) -> None:
         """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
@@ -2111,6 +2159,8 @@ class Conductor:
             self._fail_requests(message.body)
         elif message.message_type == ConductorMessageType.READS_DONE:
             self._handle_reads_done(message.body)
+        elif message.message_type == ConductorMessageType.CLIENT_STREAM_INPUT:
+            self._stream_input(message.body)
         elif message.message_type == ConductorMessageType.WORKER_STATUS:
             self._worker_metrics[message.body.worker_id] = message.body.metrics
         elif message.message_type == ConductorMessageType.ENABLE_METRICS:

@@ -97,10 +97,10 @@ def _admit(conductor, rid, model_kwargs=None, passes=1):
     router = conductor._router
     groups_run = router.groups_run(["default"])
     placement = router.pick(configs, groups_run)
-    conductor.requests[rid] = SimpleNamespace(
+    conductor._register_request(rid, SimpleNamespace(
         routing=router.add(placement, configs, groups_run),
         partition_states={"default": SimpleNamespace(fwd_pass_number=passes)},
-    )
+    ))
     return conductor._assign_worker_graphs_to_workers(placement.replicas)
 
 
@@ -248,9 +248,9 @@ def test_a_request_that_ends_before_a_pass_comes_back_leaves_nothing_cached():
     )
 
 
-def test_copies_of_one_prompt_off_the_prefix_cache_spread_over_the_replicas():
-    # concurrent copies, before any completes: with the prefix cache off no
-    # predicted hit gathers them
+def test_warmup_copies_of_one_prompt_spread_over_the_replicas():
+    # as the startup warmup sends one copy per replica, before any completes,
+    # with the prefix cache off so that no predicted hit gathers them
     conductor = _kv_conductor()
     picks = [_replica(conductor, rid, {**_prompt("P"), "prefix_cache": False}) for rid in "abcd"]
     assert sorted(picks) == ["worker_0", "worker_0", "worker_1", "worker_1"]

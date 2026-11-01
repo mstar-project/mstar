@@ -137,10 +137,8 @@ class RecurrentStatePool(Resource):
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
     ) -> "RecurrentStatePool":
         config = spec.config
-        world_size = 1
-        if info.joint_comm_group is not None:
-            world_size = info.joint_comm_group.world_size
-            config.shard(world_size)
+        config.shard(info.head_shards)
+        world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
         # no snapshot slots where the engine keeps them from serving a hit
         if spec.resource_key not in info.prefix_caches:
             config = replace(config, prefix_slots=0)

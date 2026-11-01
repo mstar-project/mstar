@@ -175,10 +175,11 @@ class Wan22Model(Model):
         if i2v:
             dit_inputs.append("image_latent")
         # Loop-carried state: see Wan22DitSubmodule's docstring for the
-        # definitive shape/dtype inventory (latents, the order-2 UniPC ring
-        # buffer, and the corrector's last_sample).
+        # definitive shape/dtype inventory (latents, 0-based step index, the
+        # order-2 UniPC ring buffer, and the corrector's last_sample).
         dit_inputs += [
             "latents",
+            "time_index",
             "unipc_model_outputs",
             "unipc_last_sample",
         ]
@@ -190,6 +191,7 @@ class Wan22Model(Model):
                 input_names=dit_inputs,
                 outputs=[
                     GraphEdge(next_node="dit", name="latents"),
+                    GraphEdge(next_node="dit", name="time_index"),
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
@@ -443,7 +445,7 @@ class Wan22Model(Model):
             )
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
+        """Mux the emitted uint8 ``[1, 3, F, H, W]`` video tensor to mp4 bytes.
 
         PyAV is the encoder because it bundles its own FFmpeg; torchcodec needs
         system FFmpeg libraries. ``fps`` is a PLAYBACK rate, not a generation knob:
@@ -465,7 +467,7 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output.cpu().numpy()
+        frames = output[0].permute(1, 2, 3, 0).cpu().numpy()
         buffer = io.BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
         # PyAV rejects float rates, so the rate is handed over as an exact
@@ -621,6 +623,7 @@ class Wan22Model(Model):
             inputs.append(edge)
         inputs += [
             GraphEdge(next_node="dit", name="latents"),
+            GraphEdge(next_node="dit", name="time_index"),
             GraphEdge(next_node="dit", name="unipc_model_outputs"),
             GraphEdge(next_node="dit", name="unipc_last_sample"),
         ]

@@ -107,7 +107,7 @@ def measured(monkeypatch):
     monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", capture)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
     monkeypatch.setattr(
-        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype, **_: (None, run()),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
     )
     return runs
 
@@ -287,7 +287,7 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
     runner.size_captures()
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype, **_: (None, {}),
+        accelerator_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, {}),
     )
 
     for spec in runner.prepare_for_capture():
@@ -666,29 +666,6 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
         signature.bind(*args, **kwargs)
     except TypeError as error:
         pytest.fail(f"torch {torch.__version__} refuses the snapshot call, so every capture would fail: {error}")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the reference is dropped in torch's CUDA snapshot")
-def test_sizing_a_throwaway_capture_keeps_the_references_to_its_pool_id(monkeypatch):
-    """Sizing leaves the id's references as they were: past 256 pools the id is no cached
-    small int, so a dropped reference frees it while the pool's handle still holds it."""
-    pool_id = (0, int("1000007"))
-    held = [pool_id[1]] * 4  # so the id outlives a dropped reference and the count stays readable
-    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: pool_id)
-    monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 0)
-    measured = ExecutableMemory()
-    measured.per_node = 0.0
-    before = sys.getrefcount(pool_id[1])
-
-    memory = accelerator_graph_runner._capture_thrown_away(
-        lambda pool, keep_graph: (object(), {}), "decode", measured,
-    )
-    # read as `before` was: inside the assert, pytest's rewrite holds one more reference
-    after = sys.getrefcount(pool_id[1])
-
-    assert memory is not None
-    assert after == before, "sizing the capture dropped a reference to its pool id"
-    del held
 
 
 def _cost(graph: int, kept: int = 0, peak: int = 0, slots: int = 1) -> CaptureCost:

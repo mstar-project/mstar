@@ -118,10 +118,7 @@ def validate_deployment(
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, config)
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
-    problems += _checked(
-        "checking the client streams", check_client_streams,
-        model, config, deployment.sharding_config if deployment is not None else None,
-    )
+    problems += _checked("checking the client streams", check_client_streams, model, config)
     if deployment is not None:
         problems += _checked(
             "checking the worker graphs", check_worker_graphs,

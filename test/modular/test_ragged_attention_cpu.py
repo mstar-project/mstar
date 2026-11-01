@@ -1,4 +1,5 @@
-"""Ragged attention head-dimension padding checks that need no GPU."""
+"""Ragged attention checks that need no GPU: head-dimension padding, head
+sharding and the custom op's manager registry."""
 
 import sys
 from types import SimpleNamespace
@@ -92,8 +93,7 @@ def test_decode_plan_stages_pinned_indices_only_for_graphs(
         assert planned_indices is indices
 
 
-@pytest.mark.parametrize("tensor_cores", [True, False])
-def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_cores):
+def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
     """The mixed-walk wrapper is only ever built for a captured bucket, so a
     keyword its halves do not take fails every mixed capture."""
     decode = Mock(return_value=SimpleNamespace(plan=Mock()))
@@ -107,16 +107,148 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
         prefill_workspace=torch.empty(8, dtype=torch.uint8),
         num_qo_heads=2, num_kv_heads=2, head_dim=64, page_size=16,
         batch_size=8, max_total_tokens=64, max_num_pages=32, max_prefill_rows=2,
-        device=torch.device("cpu"), use_tensor_cores=tensor_cores,
+        device=torch.device("cpu"),
     )
 
     assert mixed._decode.accelerator_graph and mixed._prefill.accelerator_graph
     assert mixed._decode.batch_size == 8
-    # a sink row ahead of the prompt rows and one behind them
-    assert mixed._prefill.batch_size == 4
-    # the tensor-core decode half is the paged prefill kernel (FA2)
-    built = prefill.call_args_list + decode.call_args_list
-    assert len(built) == 2 and all(c.kwargs["use_cuda_graph"] for c in built)
-    assert decode.call_count == (0 if tensor_cores else 1)
-    if tensor_cores:
-        assert prefill.call_args_list[0].kwargs["backend"] == "fa2"
+    assert mixed._prefill.batch_size == 3
+    assert decode.call_args.kwargs["use_cuda_graph"] is True
+    assert prefill.call_args.kwargs["use_cuda_graph"] is True
+
+
+def _load_heads(kind, splits_heads, tp=1, sp=2, shard_over_sp=True):
+    """Load one resource of ``kind`` (4 heads) for nodes declaring
+    ``splits_heads`` (node -> flag) on a tp x sp lockstep instance, and
+    return the heads one rank holds."""
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.recurrent.config import (
+        RecurrentBlockConfig,
+        RecurrentStateConfig,
+        RecurrentStateSpec,
+    )
+    from mstar.model.submodule_base import NodeSubmodule
+
+    class _Node(NodeSubmodule):
+        def __init__(self, splits):
+            super().__init__()
+            self.splits_heads = splits
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def prepare_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def forward(self, *args, **kwargs):
+            raise NotImplementedError
+
+    class _Rank:
+        rank = 0
+
+        def __init__(self, world_size):
+            self.world_size = world_size
+
+        def barrier(self):
+            pass
+
+    class _Groups:
+        def get_joint_group_for_node(self, node):
+            return SimpleNamespace(world_size=tp * sp, rank=0, tp_group=_Rank(tp), sp_group=_Rank(sp))
+
+        def get_instance_world_size_for_node(self, node):
+            return tp * sp
+
+        def get_instance_rank_for_node(self, node):
+            return 0
+
+        def resource_needs_remote_transfer(self, nodes, local_nodes):
+            return False
+
+    nodes = set(splits_heads)
+    if kind == "ragged":
+        spec = RaggedAttentionSpec(
+            resource_key="res", nodes=nodes,
+            config=RaggedAttentionConfig(
+                num_qo_heads=4, num_kv_heads=4, head_dim=72, dtype=torch.bfloat16, shard_over_sp=shard_over_sp,
+            ),
+        )
+    else:
+        spec = RecurrentStateSpec("res", nodes, RecurrentStateConfig(
+            num_layers=1, max_slots=2,
+            blocks={"state": RecurrentBlockConfig(shape=(4, 8), dtype=torch.float32, shard_dims=(0,))},
+        ))
+    engine = Engine(None, autocast_dtype=None)
+    engine.load_model(
+        submodules={node: _Node(splits) for node, splits in splits_heads.items()}, specs=[spec],
+        parallel_groups=_Groups(), device=torch.device("cpu"), transfer_engine_info=None,
+    )
+    if kind == "ragged":
+        return engine._resources["res"]._kwargs["num_qo_heads"]
+    return spec.config.blocks["state"].shape[0]
+
+
+@pytest.mark.parametrize("tp,sp,splits_heads,heads", [
+    (1, 2, True, 2), (1, 2, False, 4), (2, 1, False, 2), (2, 2, False, 2),
+])
+@pytest.mark.parametrize("kind", ["ragged", "recurrent"])
+def test_a_node_whose_ranks_split_other_work_keeps_every_head(kind, tp, sp, splits_heads, heads):
+    """Every resource the engine builds for a multi-rank node holds one rank's
+    slice of the heads, whatever the resource kind (a ragged resource declaring
+    ``shard_over_sp=False`` is the exception, tested below). A node whose SP ranks
+    split something else (``splits_heads = False``, e.g. guidance branches)
+    keeps every head across them; its TP ranks still split them."""
+    assert _load_heads(kind, {"dit": splits_heads}, tp=tp, sp=sp) == heads
+
+
+@pytest.mark.parametrize("tp,sp,heads", [(1, 2, 4), (2, 2, 2)])
+def test_a_ragged_attention_kept_whole_over_sp_splits_heads_over_tp_only(tp, sp, heads):
+    """``shard_over_sp=False`` keeps a ragged attention's heads whole across the
+    SP ranks of a node that splits heads there; its TP ranks still split them."""
+    assert _load_heads("ragged", {"dit": True}, tp=tp, sp=sp, shard_over_sp=False) == heads
+
+
+def test_nodes_sharing_a_resource_must_agree_on_splitting_heads():
+    """The resource is built once for every node it serves; nodes that would
+    size it differently are refused at load rather than one picked by set
+    order, which could differ across ranks."""
+    with pytest.raises(ValueError, match="split its heads differently"):
+        _load_heads("ragged", {"a": True, "b": False})
+
+
+def test_resource_info_built_without_head_shards_shards_over_its_group():
+    """Built outside the engine (a reference test, the checkpoint validator),
+    an ``EngineResourceInfo`` over a two-rank group gives one rank's heads."""
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    spec = RaggedAttentionSpec(
+        resource_key="by_hand", nodes={"encoder"},
+        config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
+    )
+    mgr = build_resource(spec, EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=SimpleNamespace(world_size=2),
+    ))
+    assert mgr._kwargs["num_qo_heads"] == 2
+
+
+def test_a_dropped_manager_leaves_the_op_registry():
+    """The custom op finds a manager by key; the registry must not keep one
+    alive past the engine that built it, nor hand one engine's key to
+    another's manager over the same resource key."""
+    import gc
+
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.attn.ragged.base import _MANAGERS
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    spec = RaggedAttentionSpec(
+        resource_key="dropped", nodes={"encoder"},
+        config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
+    )
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16)
+    mgr, other = build_resource(spec, info), build_resource(spec, info)
+    assert _MANAGERS[mgr._key] is mgr and _MANAGERS[other._key] is other
+    key = mgr._key
+    del mgr
+    gc.collect()
+    assert key not in _MANAGERS

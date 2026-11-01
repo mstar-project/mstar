@@ -42,7 +42,7 @@ CONFIG_PATH = str(
 )
 
 # The dit node's loop-back edges (see Wan22DitSubmodule for the inventory).
-LOOP_BACK_NAMES = {"latents", "unipc_model_outputs", "unipc_last_sample"}
+LOOP_BACK_NAMES = {"latents", "time_index", "unipc_model_outputs", "unipc_last_sample"}
 
 
 def _make_model() -> Wan22Model:
@@ -472,13 +472,14 @@ def test_wan22_check_stop_without_step_metadata_never_stops():
 # ----------------------------------------------------------------------
 
 
-def _dit_loop_inputs() -> dict:
-    """The dit's inputs as they arrive on any loop iteration past the first."""
+def _dit_loop_inputs(k: int) -> dict:
+    """The dit's inputs as they arrive on loop iteration k >= 1."""
     shape = (1, 4, 2, 2, 2)
     return {
         "text_embeds_pos": [torch.zeros(1, 8, 16)],
         "text_embeds_neg": [torch.zeros(1, 8, 16)],
         "latents": [torch.zeros(shape)],
+        "time_index": [torch.tensor([k], dtype=torch.int64)],
         "unipc_model_outputs": [torch.zeros((2, *shape))],
         "unipc_last_sample": [torch.zeros(shape)],
     }
@@ -491,7 +492,7 @@ def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
     result = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=2),
-        inputs=_dit_loop_inputs(),
+        inputs=_dit_loop_inputs(k=2),
     )
     assert result is None
 
@@ -501,10 +502,10 @@ def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=1),
-        inputs=_dit_loop_inputs(),
+        inputs=_dit_loop_inputs(k=1),
     )
     assert node_inputs is not None
-    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
+    assert int(node_inputs.tensor_inputs["time_index"][0]) == 1
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [
@@ -759,7 +760,7 @@ def test_wan22_i2v_declared_without_image_tensor_raises():
 
 
 def _uint8_video(frames=4, height=64, width=96):
-    return torch.randint(0, 256, (frames, height, width, 3), dtype=torch.uint8)
+    return torch.randint(0, 256, (1, 3, frames, height, width), dtype=torch.uint8)
 
 
 def test_wan22_postprocess_video_encodes_decodable_mp4():

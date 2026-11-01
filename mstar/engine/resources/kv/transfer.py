@@ -16,7 +16,7 @@ import shutil
 import threading
 import uuid
 from abc import ABC, abstractmethod
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -25,7 +25,6 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mstar.engine.resources.kv.cache import KVCache, KVLayout
 from mstar.engine.resources.kv.page_copier import make_page_copier
-from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (
@@ -224,7 +223,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._copy_stream = torch.cuda.Stream(device=self._device)
 
         self._pending: list[Future] = []
-        self._executor = ThreadPool(
+        self._executor = ThreadPoolExecutor(
             max_workers=max_workers, initializer=self._bind_device,
         )
 
@@ -800,13 +799,9 @@ class KVTransferManager:
         elif isinstance(
             transfer_engine_info.transfer_engine, LocalTransferEngine
         ):
-            if not needs_remote_transfer:
-                # not shared: a freed IPC-shared cache stays allocated in torch's IPC
-                # limbo, whose destructor makes CUDA calls after c10's statics are gone
-                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
-            elif kv_cache.device.type == "cuda":
+            if kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
-            else:
+            elif needs_remote_transfer:
                 shm_dir = transfer_engine_info.get_shm_dir()
                 if not shm_dir:
                     raise ValueError(
@@ -818,6 +813,8 @@ class KVTransferManager:
                     shm_dir=shm_dir,
                     resource_key=resource_key,
                 )
+            else:
+                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
         else:
             raise ValueError(f"Unsupported transfer engine type: {type(transfer_engine_info.transfer_engine)}")
 

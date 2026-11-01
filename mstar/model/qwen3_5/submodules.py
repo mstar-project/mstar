@@ -37,21 +37,21 @@ from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
-from mstar.model.components.qwen3_vit import (
-    vision_interpolation,
-    vision_seq_lengths,
-)
-from mstar.model.components.qwen3_vit import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
-    vision_position_ids as vision_grid_position_ids,
-)
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
     vision_position_advance,
     vision_position_ids,
 )
-from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
+from mstar.model.qwen3_5.components.vision import (
+    Qwen3_5VisionModel,
+    vision_interpolation,
+    vision_seq_lengths,
+)
+from mstar.model.qwen3_5.components.vision import (
+    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    vision_position_ids as vision_grid_position_ids,
+)
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -70,10 +70,10 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
     device_loopback_enabled,
 )
 from mstar.utils.knobs import ingraph_decode_rope
@@ -139,6 +139,11 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
+        # only a decode row's token ends decode_loop; a prefill is not in it yet
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
+            sampler=SAMPLER, walk="decode",
+        )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
@@ -619,24 +624,6 @@ class LLMSubmodule(ARNodeSubmodule):
             "last_prefill", False,
         )
 
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        # only a decode row's stop can end decode_loop; a prefill is not in it yet
-        if request_info.graph_walk != "decode" or "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        hit_eos = not ignore_eos and token in self.config.stop_token_ids
-        out_of_budget = (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-            >= request_info.max_tokens
-        )
-        return {"decode_loop"} if hit_eos or out_of_budget else set()
-
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each, like the template; the prefill walks
         # feed `prefill_tokens` from the inputs
@@ -646,39 +633,6 @@ class LLMSubmodule(ARNodeSubmodule):
         # the decode loop's client edge carries the sampled token the stop
         # check already has on the host; prefill's new_token edge is persisted
         return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != "decode":
-            return {}  # as check_stop: only a decode row's stop ends decode_loop
-        pairs = host_rows.first_values("new_token", request_ids)
-        if pairs is None:
-            return None
-        stop_ids = self.config.stop_token_ids
-        stops: dict[str, set[str]] = {}
-        mixed = step_walk is None
-        for rid, value in pairs:
-            info = request_infos[rid]
-            # a mixed step reads each row's walk; a decode step need not
-            if mixed and info.graph_walk != "decode":
-                continue
-            # the set test first: a stop id is rare, the config read behind it
-            # goes through the wrapper
-            if (
-                value in stop_ids
-                and not info.resource_configs[SAMPLER].ignore_eos
-            ) or (
-                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-                >= info.max_tokens
-            ):
-                stops[rid] = {"decode_loop"}
-        return stops
 
 
 # The vision tower's block loop, as a piecewise capture region

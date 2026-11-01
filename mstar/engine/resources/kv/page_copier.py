@@ -4,13 +4,13 @@ two device caches (CUDA IPC KV transfer).
 Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous
 block per layer, a layer stride apart. ``copy_`` of that strided view between
 device and pinned host memory blocks the host until the copy stream drains and
-runs at a fraction of the link's bandwidth. On CUDA and ROCm each run of pages
-adjacent in both caches is instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync``
-with the layer stride as its pitch: async, and run on the copy engines.
+runs at a fraction of the link's bandwidth. On CUDA and ROCm each page is
+instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync`` with the layer stride
+as its pitch: async, and run on the copy engines.
 
 `make_page_copier` picks the first copier that loads and passes a round trip,
-once per process: on CUDA `CudartCopier`, then `CudaBindingsCopier`, whose calls
-drop the GIL; on ROCm `HipCopier`; then `TorchCopier`.
+once per process: on CUDA `CudaBindingsCopier`, then `CudartCopier`; on ROCm
+`HipCopier`; then `TorchCopier`.
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ from __future__ import annotations
 import ctypes
 import functools
 import logging
-import weakref
-from typing import NamedTuple
 
 import torch
 
@@ -70,32 +68,13 @@ class TorchCopier(PageCopier):
             dst.copy_(src, non_blocking=True)
 
 
-class _Layout(NamedTuple):
-    dst: weakref.ref
-    src: weakref.ref
-    width: int
-    height: int
-    dst_ptr: int
-    dst_pitch: int
-    dst_page: int
-    src_ptr: int
-    src_pitch: int
-    src_page: int
-
-
 class _Memcpy2DCopier(PageCopier):
-    """One ``cudaMemcpy2DAsync`` per run of adjacent pages; subclasses supply the call and the device's
-    maximum pitch."""
+    """One ``cudaMemcpy2DAsync`` per page; subclasses supply the call and the
+    device's maximum pitch."""
 
     # Pitches above this are rejected by the runtime, e.g. a layer stride of a
     # cache over 2 GiB a layer; such copies go one row at a time instead.
     _max_pitch: int
-
-    def __init__(self):
-        # Each pair of caches is checked once, keyed by the two tensors' ids. The tensors are held weakly, so
-        # this process-wide copier doesn't keep a freed cache alive, and a later tensor with the same id is
-        # checked again.
-        self._layouts: dict[tuple[int, int], _Layout] = {}
 
     def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream) -> int:
         raise NotImplementedError
@@ -113,37 +92,21 @@ class _Memcpy2DCopier(PageCopier):
         if err != 0:
             raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
 
-    def _check(self, dst: torch.Tensor, src: torch.Tensor) -> _Layout:
+    def copy(self, dst, dst_pages, src, src_pages, stream):
         assert dst[0, 0].is_contiguous() and src[0, 0].is_contiguous()
         assert dst.dtype == src.dtype and dst.shape[0] == src.shape[0]
         assert dst.shape[2:] == src.shape[2:]
-        assert dst.stride(1) == dst[0, 0].numel() and src.stride(1) == src[0, 0].numel(), (
-            "pages must sit back to back in each layer for a run of adjacent pages to be one copy"
-        )
         elt = dst.element_size()
-        return _Layout(
-            weakref.ref(dst), weakref.ref(src), dst[0, 0].numel() * elt, dst.shape[0],
-            dst.data_ptr(), dst.stride(0) * elt, dst.stride(1) * elt,
-            src.data_ptr(), src.stride(0) * elt, src.stride(1) * elt,
-        )
-
-    def copy(self, dst, dst_pages, src, src_pages, stream):
-        layout = self._layouts.get((id(dst), id(src)))
-        if layout is None or layout.dst() is not dst or layout.src() is not src:
-            layout = self._layouts[id(dst), id(src)] = self._check(dst, src)
-        _, _, width, height, dst_ptr, dst_pitch, dst_page, src_ptr, src_pitch, src_page = layout
-        runs: list[list[int]] = []
-        for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
-            if runs and dst_idx == runs[-1][0] + runs[-1][2] and src_idx == runs[-1][1] + runs[-1][2]:
-                runs[-1][2] += 1
-            else:
-                runs.append([dst_idx, src_idx, 1])
+        width = dst[0, 0].numel() * elt
+        dst_pitch, dst_page = dst.stride(0) * elt, dst.stride(1) * elt
+        src_pitch, src_page = src.stride(0) * elt, src.stride(1) * elt
+        dst_ptr, src_ptr = dst.data_ptr(), src.data_ptr()
         handle = stream.cuda_stream
-        for dst_idx, src_idx, pages in runs:
+        for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
             self._copy_2d(
                 dst_ptr + dst_idx * dst_page, dst_pitch,
                 src_ptr + src_idx * src_page, src_pitch,
-                pages * width, height, handle,
+                width, dst.shape[0], handle,
             )
 
     def copy_rows(self, dst, src, stream):
@@ -165,7 +128,6 @@ class CudaBindingsCopier(_Memcpy2DCopier):
     def __init__(self):
         from cuda.bindings import runtime
 
-        super().__init__()
         self._runtime = runtime
         self._default = runtime.cudaMemcpyKind.cudaMemcpyDefault
         err, self._max_pitch = runtime.cudaDeviceGetAttribute(
@@ -188,10 +150,8 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
 
     _lib = _symbol = _attr_symbol = ""
     _max_pitch_attr = 0
-    _dll = ctypes.CDLL
 
     def __init__(self):
-        super().__init__()
         torch.cuda.init()
         with open("/proc/self/maps") as maps:
             paths = {
@@ -199,7 +159,7 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
             }
         if len(paths) != 1:
             raise OSError(f"expected one {self._lib} mapped by torch, found {sorted(paths)}")
-        lib = self._dll(paths.pop())
+        lib = ctypes.CDLL(paths.pop())
         max_pitch = ctypes.c_int()
         err = getattr(lib, self._attr_symbol)(
             ctypes.byref(max_pitch), self._max_pitch_attr, torch.cuda.current_device()
@@ -222,14 +182,11 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
 
 
 class CudartCopier(_MappedRuntimeCopier):
-    """libcudart, the runtime torch loaded, through ``ctypes.PyDLL`` so each call keeps the GIL. Dropping it
-    costs up to a switch interval per call while another thread runs Python. A call that waits on the
-    driver stalls every Python thread."""
+    """libcudart, for torch 2.9, which ships no ``cuda.bindings``."""
 
     name = "libcudart"
     _lib, _symbol = "libcudart", "cudaMemcpy2DAsync"
     _attr_symbol, _max_pitch_attr = "cudaDeviceGetAttribute", 11  # cudaDevAttrMaxPitch
-    _dll = ctypes.PyDLL
 
 
 class HipCopier(_MappedRuntimeCopier):
@@ -241,23 +198,23 @@ class HipCopier(_MappedRuntimeCopier):
 
 
 def _round_trips(copier: PageCopier) -> bool:
-    """Three strided pages, two of them adjacent, to pinned host memory and back, bit for bit."""
+    """Two strided pages to pinned host memory and back, bit for bit."""
     device = torch.arange(3 * 4 * 6, dtype=torch.float32, device="cuda").view(3, 4, 6)
     host = torch.zeros(3, 3, 6).pin_memory()
     back = torch.zeros_like(device)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    copier.copy(host, [0, 1, 2], device, [1, 2, 0], stream)
-    copier.copy(back, [2, 3, 1], host, [0, 1, 2], stream)
+    copier.copy(host, [2, 0], device, [1, 3], stream)
+    copier.copy(back, [0, 2], host, [2, 0], stream)
     stream.synchronize()
-    return torch.equal(back[:, 1:], device[:, :3])
+    return torch.equal(back[:, 0], device[:, 1]) and torch.equal(back[:, 2], device[:, 3])
 
 
 @functools.cache
 def make_page_copier() -> PageCopier:
     """The fastest copier that works here; `TorchCopier` off CUDA and ROCm."""
     if current_platform.is_cuda():
-        candidates = (CudartCopier, CudaBindingsCopier)
+        candidates = (CudaBindingsCopier, CudartCopier)
     elif current_platform.is_rocm():
         candidates = (HipCopier,)
     else:
@@ -266,7 +223,7 @@ def make_page_copier() -> PageCopier:
         try:
             copier = cls()
             if _round_trips(copier):
-                logger.info("KV page copies: one 2D async memcpy a run of pages, via %s", cls.name)
+                logger.info("KV page copies: one 2D async memcpy a page, via %s", cls.name)
                 return copier
             logger.warning("KV page copies: %s returned wrong data; not using it", cls.name)
         except (ImportError, OSError, AttributeError, RuntimeError) as e:

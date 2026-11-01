@@ -6,7 +6,6 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from itertools import repeat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
@@ -24,7 +23,6 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
-from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -60,7 +58,6 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    StepOrder,
     StopCheck,
 )
 from mstar.platforms.compile import with_inductor_overrides
@@ -135,8 +132,6 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
-    # cast and autocast dtype, None if the node opted out; resolved once at load
-    node_dtype: torch.dtype | None = None
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
@@ -298,8 +293,6 @@ class ExecutingBatch:
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
     step: SubmoduleStep | None = None
-    # the step the batch committed last: a batch run row by row commits once per row
-    committed: SubmoduleStep | None = None
 
     # {request_id: {input_name: [tensor]}}, what prepare_inputs reads
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
@@ -382,14 +375,15 @@ class ExecutingBatch:
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
     def __post_init__(self):
-        # Sparse metadata: only rids with stream chunks or loop counters get
-        # an entry, so default like the .get() at prepare_inputs does. Built
-        # with C-level maps: this runs for every step, on every row.
-        rids = self.per_request_info.keys()
-        self.per_request_info_wrapped = dict(zip(rids, map(
-            ForwardPassInfoWrapper, self.per_request_info.values(),
-            map(self.per_request_input_metadata.get, rids, repeat(EMPTY_INPUT_METADATA)),
-        ), strict=True))
+        self.per_request_info_wrapped = {
+            rid: ForwardPassInfoWrapper(
+                # Sparse: only rids with stream chunks or loop counters get an
+                # entry, so default like the .get() at prepare_inputs does.
+                info=info, metadata=self.per_request_input_metadata.get(
+                    rid, EMPTY_INPUT_METADATA,
+                ),
+            ) for rid, info in self.per_request_info.items()
+        }
 
     @property
     def request_ids(self):
@@ -491,8 +485,6 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
-        # (node, combined walk) -> the walks whose rows a step of it runs last
-        self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -529,8 +521,6 @@ class Engine:
 
         node_names = set(submodules.keys())
         node_to_resources = {}
-        # resource -> every node declaring it, on this worker or another
-        declared_by: dict[str, frozenset[str]] = {}
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -548,14 +538,15 @@ class Engine:
             # different workers (for example BAGEL's three CFG branches).
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
-            joint_comm_group = parallel_groups.get_joint_group_for_node(
-                next(iter(relevant_nodes))
-            )
+            joint_comm_group = parallel_groups.get_joint_group_for_node(min(relevant_nodes))
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
                     device=device,
                     joint_comm_group=joint_comm_group,
+                    head_shards=self._head_shards(
+                        spec.resource_key, relevant_nodes, submodules, joint_comm_group,
+                    ),
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
                     needs_remote_transfer=(
@@ -577,8 +568,6 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
-            self._add_split_row_order(spec, relevant_nodes)
-            declared_by[spec.resource_key] = frozenset(spec.nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -589,7 +578,6 @@ class Engine:
             # absent node would fall back to the full sweep
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
-            declared_by=declared_by,
         )
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
@@ -609,8 +597,6 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
-                # the dtype the engine manager cast this node to
-                node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
@@ -677,9 +663,9 @@ class Engine:
                     node_name, exc_info=True
                 )
 
-    def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
-        """This node's resolved dtype, or None for one that opted out."""
-        return self._submodules[node_name].node_dtype
+    def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
+        """This node's autocast dtype, or None for one that opted out."""
+        return None if submodule.disable_autocast else self._autocast_dtype
 
     def warmup(self) -> None:
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -692,7 +678,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=self._autocast_dtype_for(node_name),
+                autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx,
@@ -856,7 +842,7 @@ class Engine:
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
-        node_dtype = self._autocast_dtype_for(node_name)
+        node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
         configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
@@ -1136,10 +1122,6 @@ class Engine:
             return frozenset()
         return mgmt.submodule.device_loopback_signals(graph_walk)
 
-    def after_output_copy(self, batch: ExecutingBatch) -> None:
-        if batch.committed is not None:
-            self._runner.after_output_copy(batch.committed)
-
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
@@ -1304,9 +1286,8 @@ class Engine:
         try:
             # inference-only, under the same scope the capture path used
             with torch.no_grad(), autocast_scope(
-                self._autocast_dtype_for(batch.node_name),
+                self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
                 device_type=self._device.type,
-                node_name=batch.node_name,
             ):
                 laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
@@ -1411,7 +1392,6 @@ class Engine:
                 phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
-            self._add_resource_host_rows(submodule_mgmt, out)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -1436,23 +1416,6 @@ class Engine:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
-
-    @staticmethod
-    def _add_resource_host_rows(
-        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput,
-    ) -> None:
-        """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
-        for key, resource in submodule_mgmt.resources.items():
-            if not (rows := resource.step_host_rows()):
-                continue
-            if out.check_stop_buffers is None:
-                raise RuntimeError(
-                    f"resource {key!r} has rows for the host (e.g. log-probs), but this node's "
-                    "forward hands over no row-addressed stop buffers",
-                )
-            if clash := rows.keys() & out.check_stop_buffers.keys():
-                raise RuntimeError(f"resource {key!r} adds host rows {sorted(clash)} the step already has")
-            out.check_stop_buffers = {**out.check_stop_buffers, **rows}
 
     def _exec_per_request(
         self, batch: ExecutingBatch
@@ -1765,7 +1728,6 @@ class Engine:
             t0 = phase_start()
             try:
                 self._runner.commit(step)
-                batch.committed = step
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -1924,10 +1886,8 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
             try:
-                ctx = batch.step_context
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
-                    step_walk=None if ctx.request_walks else ctx.graph_walk,
                 )
             except Exception:
                 logger.debug(
@@ -2303,32 +2263,29 @@ class Engine:
             per_request_input_metadata={request_id: input_metadata},
         )
 
-    def _add_split_row_order(self, spec: NodeResourceSpec, nodes: set[str]) -> None:
-        """Record the row order ``spec``'s split kernels read (``CombinedSplit``)."""
-        for split in spec.combined_splits():
-            last = frozenset(split.prefill_walks)
-            for node in nodes:
-                key = (node, split.combined_walk)
-                if self._split_prompt_walks.setdefault(key, last) != last:
-                    raise ValueError(
-                        f"resource {spec.resource_key!r}: {node!r} splits combined walk "
-                        f"{split.combined_walk!r} with prefill walks {sorted(last)}, "
-                        f"another resource with {sorted(self._split_prompt_walks[key])}"
-                    )
-
-    def order_split_rows(
-        self, node_name: str, graph_walk: str, request_ids: list[int],
-        request_walks: Mapping[int, str],
-    ) -> list[int]:
-        """``request_ids`` as a step of ``graph_walk`` runs them: a walk run on
-        split kernels takes its prefill walks' rows last, in their order."""
-        last = self._split_prompt_walks.get((node_name, graph_walk))
-        if last is None:
-            return request_ids
-        first = [rid for rid in request_ids if request_walks.get(rid) not in last]
-        if len(first) == len(request_ids):
-            return request_ids
-        return first + [rid for rid in request_ids if request_walks.get(rid) in last]
+    @staticmethod
+    def _head_shards(
+        resource_key: str,
+        nodes: set[str],
+        submodules: dict[str, NodeSubmodule],
+        group: JointGroups | None,
+    ) -> int:
+        """How many ways the ranks of ``nodes`` split the heads of a resource
+        they share: TP ranks always do, SP ranks unless the node declares
+        ``splits_heads = False``. One value for all of them, since the
+        resource is built once."""
+        if group is None:
+            return 1
+        shards: dict[str, int] = {}
+        for node in sorted(nodes):
+            sp = group.sp_group.world_size if getattr(submodules[node], "splits_heads", True) else 1
+            shards[node] = group.tp_group.world_size * sp
+        if len(set(shards.values())) > 1:
+            raise ValueError(
+                f"resource {resource_key!r}: the nodes it serves split its "
+                f"heads differently ({shards}); give them the same splits_heads"
+            )
+        return next(iter(shards.values()))
 
     @staticmethod
     def _max_rows_in_combined(
@@ -2357,10 +2314,6 @@ class Engine:
     def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
         """Rows of ``graph_walk`` a step mixing it with another walk may hold."""
         return self._submodules[node_name].submodule.max_rows_in_combined(graph_walk)
-
-    def get_step_order(self, node_name: str, graph_walk: str) -> StepOrder:
-        """The submodule's ``step_order`` for ``graph_walk``."""
-        return self._submodules[node_name].submodule.step_order(graph_walk)
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
@@ -2847,19 +2800,6 @@ class Engine:
         except Exception:
             self.remove_request(request_id)
             raise
-
-    @property
-    def publisher_nodes(self) -> Mapping[str, frozenset[str]]:
-        """Each publishing resource's declaring nodes, across the deployment."""
-        return self._runner.publisher_nodes
-
-    def skip_publish(self, request_id, keys) -> None:
-        """Never publish ``keys`` for this request (see ``StepRunner.skip_publish``)."""
-        self._runner.skip_publish(request_id, keys)
-
-    def never_publish(self, keys) -> None:
-        """Never publish ``keys`` for any request (see ``StepRunner.never_publish``)."""
-        self._runner.never_publish(keys)
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it

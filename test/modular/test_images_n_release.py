@@ -19,7 +19,6 @@ from fastapi import HTTPException
 
 from mstar.api_server.openai.serving_images import create_images
 from mstar.api_server.request_types import ResultChunk
-from mstar.communication.event import EventWakeup
 
 OK, FAIL, RUNNING, RAISE = "ok", "fail", "running", "raise"
 
@@ -30,7 +29,6 @@ class _ScriptedEngine:
     or makes the submit itself raise (RAISE)."""
 
     def __init__(self, api, plan):
-        self.results_wakeup = EventWakeup()
         self.api = api
         self.plan = plan
         self.submitted = []

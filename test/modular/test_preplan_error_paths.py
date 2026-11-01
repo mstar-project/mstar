@@ -21,7 +21,6 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
@@ -56,9 +55,8 @@ def _fake_worker() -> Worker:
             )
         ),
     )
-    # No stream buffers in the fake, so returning a chunk is a no-op.
+    # No stream buffers in the fake, so _return_streaming_edge no-ops.
     w.request_state = SimpleNamespace(per_request_info={})
-    w.streams = StreamBufferManager(w.request_state, None, [])
     w.engine_manager = SimpleNamespace(
         get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
     )

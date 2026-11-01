@@ -104,9 +104,7 @@ class PartitionDefinition:
 
 @dataclass
 class StreamingConnectionState:
-    """Per-connection streaming state tracked by the conductor, for a stream
-    between two partitions. A client stream has none: the data worker sends
-    and ends it itself."""
+    """Per-connection streaming state tracked by the conductor."""
     from_partition: str
     to_partition: str
     edge_name: str

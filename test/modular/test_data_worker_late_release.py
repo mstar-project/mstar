@@ -20,10 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
-from mstar.communication.event import EventWakeup
-from mstar.model.base import Model
 from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -44,10 +42,6 @@ class _Model:
     def process_prompt(self, *args, **kwargs):
         if self.fail_preprocess:
             raise ValueError("bad knob")
-
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
@@ -152,8 +146,8 @@ class _Rig:
         self.worker = PreprocessWorkerThread(
             in_queue=queue.Queue(),
             result_tensor_queue=queue.Queue(),
-            out_queue=ResultQueue(EventWakeup()),
-            profile_queue=ResultQueue(EventWakeup()),
+            out_queue=queue.Queue(),
+            profile_queue=queue.Queue(),
             cleanup_request_queue=queue.Queue(),
             abort_request_queue=queue.Queue(),
             reads_done_queue=queue.Queue(),
@@ -313,7 +307,7 @@ def test_new_request_reusing_a_removed_id_reads_and_acks(rig):
     r.submit("X")
     assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 2
     acked = len(r.reads_done("X"))
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     chunk = r.worker.out_queue.get(timeout=2)
     assert chunk.request_id == "X" and chunk.data == b"<7>"
 
@@ -409,7 +403,7 @@ def test_late_remove_of_a_finished_request_does_not_swallow_a_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -439,7 +433,7 @@ def test_abort_of_a_queued_retry_does_not_swallow_the_next_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -467,7 +461,7 @@ def test_a_queued_retry_dropped_for_its_abort_does_not_swallow_the_next_retry(ri
     r.submit("X")
     assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 2
 
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -509,7 +503,7 @@ def test_abort_landing_after_the_pending_check_tears_the_retry_down(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -533,7 +527,7 @@ def test_release_queued_just_before_a_retry_does_not_drain_it(rig):
     assert len(r.conductor.sent_of(ConductorMessageType.NEW_REQUEST, "X")) == 2
     assert "X" not in r.worker._draining_rids
 
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)
@@ -556,7 +550,7 @@ def test_two_late_removals_do_not_swallow_a_retry(rig):
     r.conductor.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("X"))
     r.settle()
 
-    r.api.new_result_tokens(["X"], [7], "text_inputs", "text")
+    r.api.new_result_token("X", 7, None, "text_inputs", "text")
     assert r.worker.out_queue.get(timeout=2).data == b"<7>"
     acked = len(r.reads_done("X"))
     r.api.finished_reading("X", drained=True)

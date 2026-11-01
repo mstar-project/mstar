@@ -4,9 +4,8 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import threading
 import time
-
-from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ def watch_parent(
     who: str, parent_name: str, stop_signal: int = signal.SIGTERM
 ) -> None:
     """Start :func:`exit_when_orphaned` on a daemon thread."""
-    Thread(
+    threading.Thread(
         target=exit_when_orphaned,
         args=(who, parent_name, stop_signal),
         daemon=True,

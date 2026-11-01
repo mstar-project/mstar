@@ -33,7 +33,6 @@ from mstar.integrations.dynamo.bridges import (
     TensorBridge,
     get_tensor_spec,
 )
-from mstar.utils import cpus
 from mstar.utils.socket_prefix import per_launch_socket_prefix
 
 if TYPE_CHECKING:
@@ -58,7 +57,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
     from mstar.api_server.auth import keep_api_key_from_children
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target
     from mstar.communication.communicator import CommProtocol
 
     # Dynamo's frontend serves HTTP here; this worker never checks a key, so
@@ -76,11 +75,6 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
 
-    # before the workers exist: under ``auto`` this takes the GPUs' locks
-    try:
-        cpus.install(deployment_cpu_plan(config))
-    except cpus.CpuPlanError as e:
-        raise SystemExit(f"mstar: {e}") from None
     server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,

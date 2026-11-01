@@ -10,12 +10,12 @@ from __future__ import annotations
 import io
 import struct
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 
-from mstar.utils import cpus
-from mstar.utils.threads import ThreadPool
+from mstar.utils.cpus import usable_cpus
 
 
 def patchify_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -81,15 +81,17 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
+PNG_WORKERS = min(8, usable_cpus())
+
+
 def uint8_to_png(
-    image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int | None = None,
+    image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int = PNG_WORKERS,
 ) -> bytes:
     """Encode one uint8 ``[3, H, W]`` (or ``[1, 3, H, W]``) tensor as PNG bytes, losslessly.
 
     The default writer emits every scanline with PNG filter 0 and deflates the image in
-    ``workers`` independent blocks (default: the CPU plan's ``png_threads``) stitched into one
-    zlib stream (pigz-style: each block ends on a byte boundary with a sync flush, one adler32
-    over the whole image). At level 1 on
+    ``workers`` independent blocks stitched into one zlib stream (pigz-style: each block ends
+    on a byte boundary with a sync flush, one adler32 over the whole image). At level 1 on
     8 threads a 1024x1024 image encodes in ~15 ms against ~440 ms for PIL's default
     (adaptive filters, zlib 6), which was half of a served request, at ~30% larger files.
     ``adaptive_filters=True`` hands the encode to PIL at the same zlib level for the smaller
@@ -113,7 +115,7 @@ def uint8_to_png(
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
-        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers or cpus.plan().png_threads)),
+        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers)),
         _png_chunk(b"IEND", b""),
     ))
 
@@ -136,13 +138,25 @@ def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 
         out = compressor.compress(part)
         return out + compressor.flush(zlib.Z_FINISH if index == blocks - 1 else zlib.Z_SYNC_FLUSH)
 
-    with ThreadPool(max_workers=blocks) as pool:
+    with ThreadPoolExecutor(max_workers=blocks) as pool:
         deflated = list(pool.map(deflate, range(blocks), parts))
     # zlib header: deflate, 32K window, no preset dictionary, "fastest" level hint (FCHECK ok)
     return b"\x78\x01" + b"".join(deflated) + struct.pack(">I", zlib.adler32(data) & 0xFFFFFFFF)
 
 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
+
+
+def image_output_format(request_kwargs: dict | None) -> str:
+    """The request's ``output_format`` (default ``png``; ``jpg`` means ``jpeg``), or ValueError
+    for one :func:`encode_image` cannot write. A model calls it at intake too, so a bad value
+    fails the request before generation rather than after."""
+    fmt = str((request_kwargs or {}).get("output_format") or "png").lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    return fmt
 
 
 def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> bytes:
@@ -154,11 +168,7 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     Everything else decodes to the pixels the VAE produced (PNG losslessly).
     """
     kwargs = request_kwargs or {}
-    fmt = str(kwargs.get("output_format") or "png").lower()
-    if fmt == "jpg":
-        fmt = "jpeg"
-    if fmt not in OUTPUT_FORMATS:
-        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    fmt = image_output_format(kwargs)
     if fmt == "png":
         return uint8_to_png(image, compress_level=int(kwargs.get("png_compress_level", 1)))
     from PIL import Image

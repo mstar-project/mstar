@@ -22,6 +22,40 @@ import torch
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ParallelAttention
 
+_fa2_maxlen_patched = False
+
+
+def patch_hf_fa2_int_maxlen() -> None:
+    """Make HF's FA2 encoder path torch.compile-able.
+
+    ``Qwen3OmniMoeAudioAttention`` / ``Qwen3OmniMoeVisionAttention`` compute
+    ``max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()`` and hand that
+    0-dim tensor to ``flash_attn_varlen_func``, whose schema declares
+    ``max_seqlen_q/k`` as ``SymInt``. Eager tolerates it (the arg parser
+    unwraps a 0-dim tensor); dynamo's fake-tensor propagation does not, and
+    the encoder forward dies with "Expected a value of type 'int'".
+
+    Wrap the registered ``flash_attention_2`` interface so those two kwargs
+    arrive as ints. Idempotent, and a no-op for callers already passing ints.
+    """
+    global _fa2_maxlen_patched
+    if _fa2_maxlen_patched:
+        return
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    inner = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+
+    def fa2_int_maxlen(*args, max_length_q=None, max_length_k=None, **kwargs):
+        if isinstance(max_length_q, torch.Tensor):
+            max_length_q = max_length_q.item()
+        if isinstance(max_length_k, torch.Tensor):
+            max_length_k = max_length_k.item()
+        return inner(*args, max_length_q=max_length_q, max_length_k=max_length_k, **kwargs)
+
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", fa2_int_maxlen)
+    _fa2_maxlen_patched = True
+
 
 class Qwen3OmniAttention(ParallelAttention):
     """TP-aware attention with QK-norm and pluggable 1D / 3D RoPE.

@@ -10,6 +10,7 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
+    NameAndDest,
     NodeAndGraphWalk,
     TensorPointerInfo,
 )
@@ -90,8 +91,6 @@ class CompletionState:
     nested_loop_indices: dict[int, NestedLoopIndices]
     # (rid, signal, modality, value) of each emit that rides inline
     emit_inline: list[tuple[int, str, str, int]] = field(default_factory=list)
-    # rid -> the log-prob its client emits carry (``RouteInput.logprobs``)
-    logprobs: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -1168,14 +1167,13 @@ class PythonGraphRuntime(GraphRuntime):
             for (wkr, wkr_edge) in fanout.items():
                 streaming_to_workers.setdefault(wkr, []).append(wkr_edge)
 
-        if logger.isEnabledFor(logging.DEBUG):  # three edge lists per routed rid
-            logger.debug(
-                ("Finished processing outputs from rid %s. \n"
-                 "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
-                rid, format_graph_edge_list(routed_to_this_worker),
-                format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
-                len(streaming_edges),
-            )
+        logger.debug(
+            ("Finished processing outputs from rid %s. \n"
+             "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
+            rid, format_graph_edge_list(routed_to_this_worker),
+            format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
+            len(streaming_edges),
+        )
         if completed_worker_graph_ids:
             logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
 
@@ -1233,17 +1231,18 @@ class PythonGraphRuntime(GraphRuntime):
     def _stop_loops_for_rid(
         self, rid: int, partition: str, loop_names: set[str],
         last_node_run: str | None,
-    ):
+    ) -> set[NameAndDest]:
         """Register the finish signal on every worker graph carrying a named
-        loop. Its loop-back edges are dropped when the loop next completes an
-        iteration (``Loop.complete_iter``'s ``filtered_signals``).
+        loop, and return the union of their loop-back (name, dest) pairs so the
+        caller drops those from the triggering iteration's output routing.
 
         In disaggregated mode one loop name can exist on several worker graphs,
         each with its own finish signal, so this still fans out locally.
         """
         part_info = self._request_info[rid].partition_info[partition]
+        stopped: set[NameAndDest] = set()
         for wg_id in part_info.graph_walk_worker_graph_ids:
-            self._queues[wg_id].stop_loops(rid, loop_names)
+            stopped |= self._queues[wg_id].stop_loops(rid, loop_names)
 
         # A stop time is one observation per loop, so only the worker graph
         # owning the last-run node needs to be asked.
@@ -1261,6 +1260,7 @@ class PythonGraphRuntime(GraphRuntime):
                     times[name] = wgio.get_nested_loop_idxs(
                         target_loop_name=name,
                     )
+        return stopped
 
     def _fan_out_loop_stops(
         self, rid: int, partition: str, loop_names: set[str],
@@ -1351,7 +1351,6 @@ class PythonGraphRuntime(GraphRuntime):
         # no per-request frame. A persisted one keeps the tensor for the conductor.
         inline_on = input.inline_signal is not None and len(input.inline_values) == len(rids)
         emit_inline: list[tuple[int, str, str, int]] = []
-        logprobs = {rid: lp for rid, lp in zip(rids, input.logprobs, strict=False) if lp is not None}
 
         cursor = 0
         for i, (rid, wg_id) in enumerate(zip(rids, wg_ids, strict=True)):
@@ -1392,9 +1391,10 @@ class PythonGraphRuntime(GraphRuntime):
             routing_per_rid[rid] = routing
             if inline_on and routing.emit_to_client:
                 tensor_emits = []
+                value = input.inline_values[i]
                 for edge in routing.emit_to_client:
-                    if edge.name == input.inline_signal and not edge.persist:
-                        emit_inline.append((rid, edge.name, edge.output_modality, input.inline_values[i]))
+                    if value is not None and edge.name == input.inline_signal and not edge.persist:
+                        emit_inline.append((rid, edge.name, edge.output_modality, value))
                     else:
                         tensor_emits.append(edge)
                 routing.emit_to_client = tensor_emits
@@ -1481,7 +1481,6 @@ class PythonGraphRuntime(GraphRuntime):
             nested_loop_indices=nested_idxs,
             rid_walk=rid_walk,
             emit_inline=emit_inline,
-            logprobs=logprobs,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1548,7 +1547,6 @@ class PythonGraphRuntime(GraphRuntime):
                 info.current_output_chunks.extend(
                     edge.name for edge in routing.emit_to_client
                 )
-                logprob = completion.logprobs.get(rid)
                 for edge in routing.emit_to_client:
                     self._communicator.send("api_server", APIServerMessage(
                         message_type="result_tensors",
@@ -1557,7 +1555,7 @@ class PythonGraphRuntime(GraphRuntime):
                             modality=edge.output_modality,
                             graph_edge=edge,
                             loop_indices=nested_idxs.get(rid),
-                            metadata={} if logprob is None else {"logprobs": [logprob]},
+                            metadata={},
                         ),
                     ))
 
@@ -1621,13 +1619,11 @@ class PythonGraphRuntime(GraphRuntime):
             if frame is None:
                 frame = frames[(signal, modality)] = ResultTokens(
                     request_ids=[], values=[], loop_indices=[],
-                    signal=signal, modality=modality, logprobs=[] if completion.logprobs else None,
+                    signal=signal, modality=modality,
                 )
             frame.request_ids.append(self.get_rid_string(rid))
             frame.values.append(value)
             frame.loop_indices.append(completion.nested_loop_indices.get(rid))
-            if frame.logprobs is not None:
-                frame.logprobs.append(completion.logprobs.get(rid))
         return list(frames.values())
 
     def _send_input_signals(

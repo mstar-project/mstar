@@ -36,7 +36,6 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import MicroScheduler
-from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
@@ -727,8 +726,8 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
-        del graph_walk, batch_ids, affected_resources, inside_only
+    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
+        del batch_ids, affected_resources, inside_only
         self.offload_attempts.append(node_name)
         return "victim"
 
@@ -933,7 +932,9 @@ class _ForwardingLeader:
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
+        self._last_active: dict = {}
         self.streaming_buffers: dict = {}
+        self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[str]] = {}
@@ -953,10 +954,9 @@ class _ForwardingLeader:
         )
         self.request_state = SimpleNamespace(remove_request=lambda rid: None)
         self.engine_manager = SimpleNamespace(
-            remove_request=lambda rid: None,
+            remove_request=lambda rid: None, evictable_nodes=lambda: (),
         )
         self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
-        self.streams = StreamBufferManager(self.request_state, self.tensor_manager, [])
         self.profile_info = SimpleNamespace(pop_request=lambda rid: None)
         self.scheduler = SimpleNamespace(
             clear_rid=lambda rid, wire_rid: None,

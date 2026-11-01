@@ -21,10 +21,9 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
-from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.manager import KVManager, PageArena
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import Segment, StepContext
 

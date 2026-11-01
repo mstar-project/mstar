@@ -10,12 +10,13 @@ from mstar.graph.base import GraphEdge, Loop
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import StopCheck
 from mstar.utils.containers import ParallelList
 
 PARTITION = "default"
 
-# (walk, inputs, decode iteration) -> (this request's outputs, the loops check_stop named)
-Step = Callable[[str, dict[str, list[torch.Tensor]], int], tuple[dict, set[str]]]
+# (walk, inputs, decode iteration) -> (this request's outputs, what check_stop returned)
+Step = Callable[[str, dict[str, list[torch.Tensor]], int], tuple[dict, set[str] | StopCheck]]
 
 
 def _edges(section) -> list[GraphEdge]:
@@ -68,6 +69,10 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
             steps += 1
             assert steps <= max_steps, f"no stop after {max_steps} steps: {emitted}"
             out, stops = step(walk, inputs, iteration)
+            if isinstance(stops, StopCheck):
+                # what the check withheld is not routed, as the worker leaves it
+                out = {name: value for name, value in out.items() if name not in stops.withheld}
+                stops = stops.stops
             for edge in edges:
                 tokens = out.get(edge.name)
                 if edge.next_node == EMIT_TO_CLIENT and tokens:

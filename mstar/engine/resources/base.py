@@ -58,6 +58,12 @@ class EngineResourceInfo:
     """
     device: torch.device
     joint_comm_group: JointGroups | None = None
+    # how many ways the node's ranks split its attention heads; each builder
+    # sizes head counts by it, except a ragged resource declaring
+    # ``shard_over_sp=False``, which splits over the TP ranks only. None means
+    # every rank of ``joint_comm_group`` (1 without one); the engine passes the
+    # node's own count (``NodeSubmodule.splits_heads``).
+    head_shards: int | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
     # Whether this logical resource has consumers in another worker instance.
@@ -76,6 +82,11 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+
+    def __post_init__(self):
+        if self.head_shards is None:
+            group = self.joint_comm_group
+            object.__setattr__(self, "head_shards", 1 if group is None else group.world_size)
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -177,11 +188,6 @@ class Resource(ABC):
         every step."""
         return False
 
-    def after_output_copy(self, step: ResourceStep) -> None:
-        """Called on the worker's main thread once ``step`` has finished on the device and its outputs are
-        sent. A copy to the host queued here runs behind that step's own output copy."""
-        return
-
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
@@ -206,17 +212,6 @@ class Resource(ABC):
         """How many page allocations this resource has made and a hash of their pages in
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
-
-    @classmethod
-    def journals_resident_moves(cls) -> bool:
-        """Whether rank 0 decides this resource's state for the other ranks of a lockstep
-        instance outside the step that uses it (eviction, prefix leases, page trails). They
-        replay each decision with the next step of the node it was journaled under, so
-        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
-        the class a spec's ``resource_class`` names, so the hooks live there, not only on
-        a subclass its ``build`` returns."""
-        return any(getattr(cls, hook) is not getattr(Resource, hook)
-                   for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
 
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
@@ -307,11 +302,6 @@ class Resource(ABC):
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """record step consumption"""
         return
-
-    def step_host_rows(self) -> dict[str, torch.Tensor]:
-        """Row-addressed tensors of the step just run, copied to the host with
-        the stop buffers. Read right after the forward and not cloned."""
-        return {}
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None

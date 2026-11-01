@@ -25,7 +25,6 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.platforms import current_platform
@@ -115,15 +114,12 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     return sorted(key for key in step.steps if not resources[key].can_capture())
 
 
-@contextmanager
-def autocast_scope(dtype: torch.dtype | None, device_type: str, node_name: str | None = None):
+def autocast_scope(dtype: torch.dtype | None, device_type: str):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
-    submodule in its own dtype and shuts out any ambient autocast.
-    ``node_name`` names the node in implicit-downcast warnings."""
-    with node_scope(node_name, dtype), torch.amp.autocast(
+    submodule in its own dtype and shuts out any ambient autocast."""
+    return torch.amp.autocast(
         device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
-    ):
-        yield
+    )
 
 
 #: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
@@ -167,10 +163,7 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(
-    run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
-    node_name: str | None = None,
-):
+def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -199,7 +192,7 @@ def capture_into_graph(
     torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
-                autocast_scope(autocast_dtype, backend.device_type, node_name):
+                autocast_scope(autocast_dtype, backend.device_type):
             with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
@@ -215,7 +208,6 @@ def capture_into_graph(
 
 def capture_with_static_outputs(
     run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
-    node_name: str | None = None,
 ):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
@@ -244,7 +236,7 @@ def capture_with_static_outputs(
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph, node_name=node_name)
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph)
     return graph, static_outputs
 
 
@@ -431,25 +423,15 @@ def _capture_thrown_away(
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
-    taken = None if graph is None else _pool_bytes(pool.handle)
+    taken = None if graph is None else sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
+    )
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
-
-
-def _pool_bytes(pool_id) -> int:
-    """The bytes the caching allocator holds for graph pool ``pool_id``, read off the whole
-    snapshot: ``memory_snapshot(pool_id)`` drops a reference to each item of the id (torch
-    2.9-2.13), which past 256 pools frees the id while the pool's handle still holds it.
-    """
-    pool_id = tuple(pool_id)
-    return sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot()
-        if tuple(segment.get("segment_pool_id", ())) == pool_id
-    )
 
 
 def _graph_nodes(graph) -> int:
@@ -876,7 +858,7 @@ class AcceleratorGraphRunner:
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
-                                autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
+                                autocast_dtype=self._autocast_dtype,
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
@@ -912,7 +894,7 @@ class AcceleratorGraphRunner:
                     memory = _capture_thrown_away(
                         partial(
                             capture_into_graph, warmed.run, device=self._device,
-                            autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
+                            autocast_dtype=self._autocast_dtype,
                         ),
                         f"{self._submodule_name} {spec}",
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
@@ -1094,7 +1076,6 @@ class AcceleratorGraphRunner:
             torch.accelerator.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._submodule_name,
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1183,7 +1164,7 @@ class AcceleratorGraphRunner:
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
+                with autocast_scope(self._autocast_dtype, self._device.type):
                     returned = _tensor_bytes(run_forward())
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
@@ -1828,7 +1809,6 @@ class PiecewiseAcceleratorGraphRunner:
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
-                                    node_name=self._node_name,
                                 ),
                                 f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                             )
@@ -1863,7 +1843,6 @@ class PiecewiseAcceleratorGraphRunner:
                         partial(
                             capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
                             device=self._device, autocast_dtype=self._autocast_dtype,
-                            node_name=self._node_name,
                         ),
                         f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
                     )
@@ -1985,7 +1964,6 @@ class PiecewiseAcceleratorGraphRunner:
             graph, static_outputs = capture_with_static_outputs(
                 warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
                 self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._node_name,
             )
 
         self._graphs[PiecewiseGraphKey(
@@ -2031,7 +2009,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # as in `AcceleratorGraphRunner._warmed`
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type, self._node_name):
+                with autocast_scope(self._autocast_dtype, self._device.type):
                     warm_outputs = run_fn()
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
@@ -2147,9 +2125,10 @@ class PiecewiseAcceleratorGraphRunner:
         """The captured bucket serving this call, or None for eager.
 
         BATCHED buckets are fixed by the padded batch size; PACKED ones take
-        the smallest captured token bucket that fits.
+        the smallest captured token bucket that fits. A ``one_row_per_step``
+        region resolves every batch as one row.
         """
-        padded_bs = self._padded_bs(batch_size)
+        padded_bs = self._padded_bs(1 if self._config.one_row_per_step else batch_size)
         if padded_bs is None:
             return None
         if self._config.get_config_type() == PiecewiseConfigType.BATCHED:
@@ -2210,7 +2189,14 @@ class PiecewiseAcceleratorGraphRunner:
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
+
+        A ``one_row_per_step`` region replays the step as one row named by its
+        first request, however many requests or segments it is passed.
         """
+        if self._config.one_row_per_step:
+            real_bs = 1
+            if request_ids is not None:
+                request_ids = request_ids[:1]
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)

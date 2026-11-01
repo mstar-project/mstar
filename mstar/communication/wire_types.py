@@ -35,7 +35,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     AbortRequest,
-    ClientStreamRoute,
+    ClientStreamInput,
     ConductorMessage,
     DrainRequest,
     EnableMetrics,
@@ -75,7 +75,6 @@ _TYPES: dict[str, type] = {
     "stop_loops": StopLoops,
     "schedule_tp_node": ScheduleTPNode,
     "tp_no_speculation": TPNoSpeculation,
-    "client_stream_route": ClientStreamRoute,
     # conductor-bound bodies
     "wgs_done": WorkerGraphsDone,
     "setup_done": SetupDone,
@@ -85,6 +84,7 @@ _TYPES: dict[str, type] = {
     "fail_requests": FailRequests,
     "worker_status": WorkerStatus,
     "enable_metrics": EnableMetrics,
+    "client_stream_input": ClientStreamInput,
     # api-server bodies
     "result_tensors": ResultTensors,
     "result_tokens": ResultTokens,
