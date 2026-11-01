@@ -270,7 +270,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             hidden = attn.select_last_hidden(hidden)
 
         logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,

@@ -107,11 +107,14 @@ def _resource(monkeypatch):
     return res
 
 
-def _ctx(rids, padded_bs, slot):
+def _ctx(rids, padded_bs=None, slot=0):
+    """A leased step of ``rids`` padded to ``padded_bs`` on cg slot ``slot``, or an eager one."""
+    lease = None
+    if padded_bs is not None:
+        lease = SlotLease(slot=slot, bucket=BucketKey(graph_walk="decode", bs=padded_bs, num_tokens=padded_bs))
     return SimpleNamespace(
-        request_ids=list(rids), padded_request_ids=list(rids) + ["pad"] * (padded_bs - len(rids)),
-        slot_lease=SlotLease(slot=slot, bucket=BucketKey(graph_walk="decode", bs=padded_bs, num_tokens=padded_bs)),
-        is_preplan=False, slot=slot, is_padding_row=lambda rid: rid == "pad",
+        request_ids=list(rids), padded_request_ids=list(rids) + ["pad"] * ((padded_bs or len(rids)) - len(rids)),
+        slot_lease=lease, is_preplan=False, slot=slot, is_padding_row=lambda rid: rid == "pad",
     )
 
 
@@ -119,20 +122,22 @@ def test_resource_stores_by_step_and_commit_persists_what_the_step_declares(monk
     res = _resource(monkeypatch)
     for rid in ("a", "b"):
         res.ingest_request(rid)
-    # an eager step reads and writes by request
-    assert res.loopback_state("rules", ["a", "b"]).tolist() == [DEFAULT, DEFAULT]
-    res.store_loopback_state("rules", ["a", "b"], torch.tensor([[1] * 3, [2] * 3]))
-    assert res.loopback_state("rules", ["b"]).tolist() == [[2] * 3]
+    # an eager step reads and writes the rows it was planned with, by request
+    res.plan(SamplerStep(), _ctx(["a", "b"]))
+    assert res.loopback_state("rules").tolist() == [DEFAULT, DEFAULT]
+    res.store_loopback_state("rules", torch.tensor([[1] * 3, [2] * 3]))
+    res.plan(SamplerStep(), _ctx(["b"]))
+    assert res.loopback_state("rules").tolist() == [[2] * 3]
 
     # a leased step: the forward's rows go to the per-step row, commit scatters
     ctx = _ctx(["b", "a"], 4, 1)
     res.plan(SamplerStep(), ctx)
-    assert res.loopback_state("rules", ctx.request_ids).tolist()[:2] == [[2] * 3, [1] * 3]
-    res.store_loopback_state("rules", ctx.request_ids, torch.tensor([[5] * 3, [6] * 3, [0] * 3, [0] * 3]))
+    assert res.loopback_state("rules").tolist()[:2] == [[2] * 3, [1] * 3]
+    res.store_loopback_state("rules", torch.tensor([[5] * 3, [6] * 3, [0] * 3, [0] * 3]))
     res.commit(SamplerStep(), ctx)  # not declared: nothing persisted
     assert res._cg_buffers.loopback_for("rules", ["a", "b"]).tolist() == [[1] * 3, [2] * 3]
     res.plan(SamplerStep(), ctx)
-    res.store_loopback_state("rules", ctx.request_ids, torch.tensor([[5] * 3, [6] * 3, [0] * 3, [0] * 3]))
+    res.store_loopback_state("rules", torch.tensor([[5] * 3, [6] * 3, [0] * 3, [0] * 3]))
     res.commit(SamplerStep(loopback_writes=frozenset({"rules"})), ctx)
     assert res._cg_buffers.loopback_for("rules", ["a", "b"]).tolist() == [[6] * 3, [5] * 3]
 

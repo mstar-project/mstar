@@ -194,9 +194,9 @@ def test_reasoner_logits_and_greedy_tokens_match_reference() -> None:
 
 
 class _FakeSampler:
-    """Greedy stand-in for the sampler resource (``sample(request_ids, logits)``)."""
+    """Greedy stand-in for the sampler resource (``sample(logits)``)."""
 
-    def sample(self, request_ids, logits):
+    def sample(self, logits):
         return logits.argmax(dim=-1)
 
 

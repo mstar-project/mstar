@@ -849,9 +849,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Decode: produce logits for text token sampling
         if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
-            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
-                engine_inputs.request_ids, logits=logits
-            )]
+            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(logits)]
 
         # Pack thinker_states for Talker conditioning ONLY when audio output
         # is requested.  For text-only requests we skip this entirely to
@@ -1040,7 +1038,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if is_prefill:
             last_hidden = attn_manager.select_last_hidden(hidden)
             logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
-            new_tokens = sampler.sample(request_ids, logits)
+            new_tokens = sampler.sample(logits)
             if layer_n_hidden is not None:
                 thinker_states = torch.cat(
                     [layer_0_embed, layer_n_hidden], dim=-1,
@@ -1061,7 +1059,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         # thinker_decode (existing behavior)
         logits = self.model.lm_head(hidden)  # (batch, vocab)
-        new_tokens = sampler.sample(request_ids, logits)
+        new_tokens = sampler.sample(logits)
 
         if layer_n_hidden is not None:
             thinker_states = torch.cat(
@@ -1227,8 +1225,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.code_predictor = code_predictor
         self.talker_code_emb = self.model.model.codec_embedding
         self.config = config
-        self.cp_cfg = config.code_predictor
-        self.num_codes = self.cp_cfg.num_code_groups
 
         # Pre-computed TTS special inputs.
         self._tts_pad_embed_cached: torch.Tensor | None = None
@@ -1243,22 +1239,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         # the text conditioning for this request. We use this flag to
         # inject tts_eos_embed for ONE step before falling back to pad.
         self._eos_embed_sent: set[str] = set()
-
-        # Lazy-built CodePredictor scratch KV cache, overwritten every step.
-        self._cp_kv_cache: torch.Tensor | None = None
-
-    def _get_cp_kv_cache(self):
-        # TODO: make this a resource
-        if self._cp_kv_cache is None:
-            self._cp_kv_cache = torch.zeros((
-                    self.cp_cfg.num_hidden_layers,
-                    self.MAX_BATCH_SIZE, 2, self.num_codes,
-                    self.cp_cfg.num_key_value_heads,
-                    self.cp_cfg.head_dim
-                ), dtype=self.talker_code_emb.weight.dtype,
-                device=self.get_device(),
-            )
-        return self._cp_kv_cache
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
@@ -1481,20 +1461,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
 
         extra_args = {}
-        # codec scratch is decode-only; talker_prefill runs the LLM backbone
-        # alone and interning these would clash (codec_emb_sum's hidden dim
-        # aliases the token-bucket seq dim).
         if graph_walk != "talker_prefill":
             extra_args["suppress_mask"] = self._get_suppress_mask()
-            extra_args["all_codes"] = torch.zeros(
-                (len(inputs), self.num_codes), device=device, dtype=torch.long
-            )
-            extra_args["codec_emb_sum"] = torch.zeros(
-                (len(inputs), self.cp_cfg.hidden_size), device=device
-            )
-            extra_args["pos_buf"] = torch.zeros(
-                (len(inputs), 1), device=device, dtype=torch.long
-            )
         if graph_walk == "talker_last_prefill":
             extra_args["last_token_indices"] = (
                 torch.tensor(seq_lens, device=device, dtype=torch.long).cumsum(0) - 1
@@ -1513,13 +1481,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         return {}
 
     def _forward_decode_like(
-        self, request_ids: list[str],
+        self,
         talker_sampler: SamplerResource,
         code_pred_sampler: SamplerResource,
         suppress_mask: torch.Tensor,
-        all_codes: torch.Tensor,
-        codec_emb_sum: torch.Tensor,
-        pos_buf: torch.Tensor,
         is_batched_decode: bool,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor | None = None,
@@ -1551,46 +1516,16 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Apply the repetition penalty to the Talker's layer-0 codes (the code
         # predictor depth loop below samples through its own aux config and
         # stays penalty-free). The penalty is baked into the captured graph.
-        layer0_codes = talker_sampler.sample(
-            request_ids, logits
+        layer0_codes = talker_sampler.sample(logits)
+
+        # The code predictor fills groups 1..15; its sampler's params come from the
+        # "code_predictor" aux sampler's static buffers, so per-request values
+        # survive graph replay. The embedding sum is kept in fp32 and rounded once,
+        # when the next step's prepare_inputs casts it.
+        all_codes, codec_emb_sum = self.code_predictor.run_depth_loop(
+            last_hidden, layer0_codes, self.talker_code_emb, code_pred_sampler.sample,
+            self.MAX_BATCH_SIZE, sum_dtype=torch.float32,
         )
-
-        # code predictor section
-        embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
-        codec_emb_sum.add_(embed)
-        all_codes[:, 0] = layer0_codes
-        bs = all_codes.shape[0]
-
-        kv_cache = self._get_cp_kv_cache()[:, :bs]
-
-        # forward over [last_hidden] to update kv cache with the Talker's final hidden
-        # state as context for the code prediction. This returns nothing because the
-        # layer 0 code is already provided by the talker LLM
-        cp = self.code_predictor
-        codec_embedding = cp.model.codec_embedding
-        cp.forward_depth_unrolled(
-            last_hidden.unsqueeze(1), pos_buf, kv_cache, cache_pos=0,
-        )
-        pos_buf += 1
-
-        for group_idx in range(1, self.num_codes):
-            hidden = cp.forward_depth_unrolled(
-                embed.unsqueeze(1), pos_buf, kv_cache, cache_pos=group_idx,
-            ).squeeze(1)
-            pos_buf += 1
-
-            logits = torch.matmul(
-                hidden, cp.lm_head_weight[group_idx - 1].t()
-            )
-
-            # Params come from the "code_predictor" aux sampler's static
-            # buffers, so per-request values survive graph replay.
-            tokens = code_pred_sampler.sample(
-                request_ids, logits,
-            )
-            all_codes[:, group_idx] = tokens
-            embed = codec_embedding[group_idx - 1](tokens)
-            codec_emb_sum.add_(embed)
 
         return {
             "talker_input_embeds": [codec_emb_sum],
@@ -1610,7 +1545,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 input_embeds=input_embeds
             )
         return self._forward_decode_like(
-            request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             input_embeds=input_embeds,
@@ -1660,7 +1594,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
 
         fwd_out = self._forward_decode_like(
-            request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             is_batched_decode=True,

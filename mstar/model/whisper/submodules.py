@@ -615,8 +615,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         keep them on the device (the first decode step, after the prefill)
         brings them routed and they override its slot's."""
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        rules = sampler.loopback_state(TS_RULES, engine_inputs.request_ids)
+        ids = sampler.loopback_tokens()
+        rules = sampler.loopback_state(TS_RULES)
         routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
         if routed:
             sampler.overwrite_rows(
@@ -666,7 +666,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             logits = self.process_logits(logits, graph_walk)
             if ts_rules is not None:
                 logits = self.timestamp_rules.apply(logits, ts_rules)
-            new_tokens = sampler.sample(engine_inputs.request_ids, logits=logits)
+            new_tokens = sampler.sample(logits)
         if ts_rules is None:
             return new_tokens, None
         return new_tokens, self.timestamp_rules.advance(ts_rules, new_tokens)
@@ -743,9 +743,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         if graph_walk == DECODE_WALK:
             rows = {"text_inputs": new_tokens}
             if next_rules is not None and self._device_loopback():
-                engine_inputs.resources[SAMPLER].store_loopback_state(
-                    TS_RULES, engine_inputs.request_ids, next_rules,
-                )
+                engine_inputs.resources[SAMPLER].store_loopback_state(TS_RULES, next_rules)
         else:
             rows = {"new_token": new_tokens}
         if next_rules is not None:
