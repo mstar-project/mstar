@@ -69,7 +69,11 @@ def test_graph_structure():
 
 def test_resources_and_dummy_mode():
     assert [s.resource_key for s in _make_model().get_node_resources()] == [DIT_ATTN]
+    for backend in ("auto", "flashinfer"):  # the current and the earlier spelling of the ragged resource
+        assert [s.resource_key for s in _make_model(attention_backend=backend).get_node_resources()] == [DIT_ATTN]
     assert _make_model(attention_backend="sdpa").get_node_resources() == []
+    with pytest.raises(ValueError):
+        _make_model(attention_backend="flash")
     model = _make_model()
     assert all(model.get_submodule(n) is None for n in model.nodes)
     assert model.get_autocast_dtype() is None
