@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes; the dit's attention is the one engine resource):
+Architecture (2 nodes; the dit's rolling K/V and its attention are engine resources):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -33,6 +33,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
@@ -44,7 +45,7 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import DIT_ATTN, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.lingbot_world.submodules import DIT_ATTN, DIT_KV, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -96,48 +97,35 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.config.reference_numerics:
-            return []
+        """The rolling K/V store, and the ragged attention over it unless
+        ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
-        return [RaggedCrossAttentionSpec(
-            resource_key=DIT_ATTN, nodes={"dit"},
-            config=RaggedAttentionConfig(
-                num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                dtype=torch.bfloat16,
+        specs: list[NodeResourceSpec] = [RollingKVSpec(
+            resource_key=DIT_KV, nodes={"dit"},
+            config=RollingKVConfig(
+                num_layers=cfg.num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                max_request_tokens=self.max_request_tokens(), dtype=torch.bfloat16,
             ),
         )]
+        if not cfg.reference_numerics:
+            specs.append(RaggedCrossAttentionSpec(
+                resource_key=DIT_ATTN, nodes={"dit"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+            ))
+        return specs
 
-    def kv_cache_bytes(self, lat_h: int, lat_w: int) -> int:
-        """The rolling self-attention plus text K/V one request allocates at
-        that latent size (``LingBotCausalDiT.new_cache`` and its cross K/V)."""
+    def max_request_tokens(self) -> int:
+        """Tokens of rolling K/V one rollout keeps per layer at the largest area
+        a request may ask for: ``local_attn_size`` latent frames of at most
+        ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``).
+        Each rollout allocates its own window's worth, so this only bounds them."""
         cfg = self.config
-        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
-        tokens = frame_seqlen * cfg.local_attn_size + cfg.text_len
-        return cfg.num_layers * 2 * tokens * cfg.dim * torch.bfloat16.itemsize
-
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse to serve more than one rollout at a time.
-
-        The dit allocates each request's rolling K/V and VAE caches itself, at
-        its first chunk, outside the engine's resources, so the only bound on
-        how many are live is the conductor's admit queue, which exists only
-        when ``max_concurrent_requests`` is set. Several at once run the GPU
-        out of memory mid-rollout instead of queueing.
-        """
-        limit = config.get("max_concurrent_requests")
-        if limit == 1 and not isinstance(limit, bool):
-            return
-        cfg = self.config
-        side = int(np.sqrt(cfg.max_area))
-        gib = [self.kv_cache_bytes(*self.geometry((h, w), h, w)) / 2**30
-               for h, w in ((cfg.default_height, cfg.default_width), (side, side))]
-        raise ValueError(
-            f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            f"Each request holds its own rolling K/V ({gib[0]:.1f} GiB at "
-            f"{cfg.default_height}x{cfg.default_width}, up to {gib[1]:.1f} GiB at the "
-            f"{cfg.max_area}-pixel area limit) plus its VAE caches, allocated by the dit outside the "
-            "engine's resources, so the admit queue that this key enables is the only bound on them."
-        )
+        cell = cfg.vae_stride[1] * cfg.vae_stride[2] * cfg.patch_size[1] * cfg.patch_size[2]
+        frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
+        return frames * (cfg.max_area // cell)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
