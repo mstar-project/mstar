@@ -4,9 +4,10 @@
 splits, and of several tensors at once against one at a time; and
 ``ulysses_attention`` over sharded tokens against one rank attending the whole
 sequence (with fewer key/value heads than query heads too), for the
-``[S, H, D]`` and ``[B, S, H, D]`` layouts; and ``attention_over_sharded_keys``, a
-replicated query over sharded keys merged by log-sum-exp, against one rank attending
-all the keys.
+``[S, H, D]``, ``[1, S, H, D]`` and ``[B, S, H, D]`` layouts, bit for bit against the
+batch exchange on 2, 4 and 8 ranks (and on NCCL with FlashInfer, given two GPUs); and
+``attention_over_sharded_keys``, a replicated query over sharded keys merged by
+log-sum-exp, against one rank attending all the keys.
 """
 
 from __future__ import annotations
@@ -35,12 +36,14 @@ def _group(rank: int, world: int) -> CommGroup:
     return group
 
 
-def _run(fn, world, store_path, *args):
-    mp.spawn(_entry, args=(fn, world, str(store_path), args), nprocs=world)
+def _run(fn, world, store_path, *args, backend="gloo"):
+    mp.spawn(_entry, args=(fn, world, str(store_path), args, backend), nprocs=world)
 
 
-def _entry(rank, fn, world, store_path, args):
-    dist.init_process_group("gloo", init_method=f"file://{store_path}", rank=rank, world_size=world)
+def _entry(rank, fn, world, store_path, args, backend):
+    if backend == "nccl":
+        torch.cuda.set_device(rank)
+    dist.init_process_group(backend, init_method=f"file://{store_path}", rank=rank, world_size=world)
     torch.set_num_threads(1)
     try:
         fn(rank, world, *args)
@@ -125,6 +128,86 @@ def _several_at_once(rank, world, total, batched):
 @pytest.mark.parametrize("world,total", [(2, 6), (3, 11)], ids=["2-even", "3-uneven"])
 def test_all_to_all_of_several_tensors_matches_one_at_a_time(tmp_path, world, total, batched):
     _run(_several_at_once, world, tmp_path / "store", total, batched)
+
+
+# (seq_dim, head_dim, batch); a batch of None is no batch dim
+LAYOUTS = {"SHD": (0, 1, None), "1SHD": (1, 2, 1), "BSHD": (1, 2, 2)}
+
+
+def _general(group, q, k, v, run, sizes, seq_dim, head_dim):
+    """The exchange a batch takes (``CommGroup.all_to_all``), for any layout."""
+    q, k, v = group.all_to_all((q, k, v), scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=sizes)
+    out = run(q=q, k=k, v=v)
+    return group.all_to_all(out, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=sizes)
+
+
+def _mixing(seq_dim, head_dim):
+    """An exact stand-in for attention: every output row reads every key and value row
+    of its head (and the key/value head a group of query heads shares), and a row in
+    the wrong place changes the result. Integer-valued float64, so the sums are exact
+    in any order."""
+    def run(q, k, v):
+        k, v = (t.repeat_interleave(q.shape[head_dim] // t.shape[head_dim], dim=head_dim) for t in (k, v))
+        return q * k.sum(seq_dim, keepdim=True) + v.flip(seq_dim) + v.cumsum(seq_dim)
+    return run
+
+
+def _ints(layout, total, heads, seed):
+    _, _, batch = LAYOUTS[layout]
+    shape = (total, heads, 4) if batch is None else (batch, total, heads, 4)
+    return torch.randint(-3, 4, shape, generator=torch.Generator().manual_seed(seed)).double()
+
+
+def _bit_identical(rank, world, layout, total, kv_heads):
+    group = _group(rank, world)
+    seq_dim, head_dim, _ = LAYOUTS[layout]
+    sizes = sp_seq_split(total, world)
+    start = sum(sizes[:rank])
+    full = [_ints(layout, total, heads, seed) for seed, heads in enumerate((2 * world, kv_heads, kv_heads))]
+    q, k, v = (t.narrow(seq_dim, start, sizes[rank]) for t in full)
+    run = _mixing(seq_dim, head_dim)
+    out = ulysses_attention(group, q, k, v, run, sizes, seq_dim, head_dim)
+    assert torch.equal(out, _general(group, q, k, v, run, sizes, seq_dim, head_dim))
+    assert torch.equal(out, run(*full).narrow(seq_dim, start, sizes[rank]))
+
+
+@pytest.mark.parametrize(
+    "layout,world,total,kv_heads",
+    [("SHD", 2, 6, 4), ("1SHD", 2, 7, 2), ("BSHD", 2, 7, 2), ("SHD", 4, 13, 8), ("1SHD", 4, 12, 4),
+     ("SHD", 4, 3, 4), ("1SHD", 8, 17, 8), ("SHD", 8, 24, 16)],
+    ids=["SHD-2-even", "1SHD-2-uneven-gqa", "BSHD-2-uneven-gqa", "SHD-4-uneven", "1SHD-4-even-gqa",
+         "SHD-4-a-rank-without-rows", "1SHD-8-uneven-gqa", "SHD-8-even"],
+)
+def test_ulysses_attention_is_bit_identical_to_the_batch_exchange(tmp_path, layout, world, total, kv_heads):
+    _run(_bit_identical, world, tmp_path / "store", layout, total, kv_heads)
+
+
+def _on_flashinfer(rank, world, total):
+    from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
+
+    group = _group(rank, world)
+    heads, head_dim, device = 2 * world, 128, torch.device("cuda", rank)
+    sizes = sp_seq_split(total, world)
+    wrapper = FlashInferRaggedPrefillWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device=device), heads // world, heads // world, head_dim,
+        device=device,
+    )
+    wrapper.plan(torch.tensor([0, total], dtype=torch.int32))
+    gen = torch.Generator(device).manual_seed(rank)
+    q, k, v = (torch.randn(1, sizes[rank], heads, head_dim, device=device, dtype=torch.bfloat16, generator=gen)
+               for _ in range(3))
+
+    def run(q, k, v):
+        return wrapper.run(q[0], k[0], v[0])[None]
+
+    out = ulysses_attention(group, q, k, v, run, sizes, 1, 2)
+    assert torch.equal(out, _general(group, q, k, v, run, sizes, 1, 2))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_ulysses_attention_on_flashinfer_is_bit_identical_to_the_batch_exchange(tmp_path):
+    pytest.importorskip("flashinfer")
+    _run(_on_flashinfer, min(4, torch.cuda.device_count()), tmp_path / "store", 4099, backend="nccl")
 
 
 def _sharded_keys(rank, world, total):
