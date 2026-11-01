@@ -65,20 +65,17 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """A stop id, or the token budget, on a prefill or decode row.
-        The budget counts the token the prefill samples."""
+        """A stop id on a prefill or decode row, or a budget of one token on a
+        prefill row. The model's loop cap (``max_tokens - 1``) ends decode on
+        budget, so a decode row checks only the id."""
         walk = request_info.graph_walk
-        if walk == self.DECODE_WALK:
-            generated = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 2
-        elif self._is_prefill_walk(walk):
-            generated = 1
-        else:
+        if walk != self.DECODE_WALK and not self._is_prefill_walk(walk):
             return False
         # the set test first: a stop id is rare, and the config read behind it
         # goes through the wrapper
-        return (
-            token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos
-        ) or generated >= request_info.max_tokens
+        if token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos:
+            return True
+        return walk != self.DECODE_WALK and request_info.max_tokens <= 1
 
     def _is_prefill_walk(self, walk: str) -> bool:
         """Whether ``walk`` samples the request's first token. Override for a

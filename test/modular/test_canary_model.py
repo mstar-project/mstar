@@ -341,7 +341,8 @@ def test_prefill_reserves_each_clips_context_once():
 
 def test_batched_stop_check_agrees_with_the_per_request_one():
     """Rows come in the order the forward ran the requests, which needn't be
-    the order the worker asks in; EOS, ignore_eos and the token limit."""
+    the order the worker asks in; EOS, ignore_eos, and a row at its token
+    limit, which the loop cap ends rather than the stop check."""
     from types import SimpleNamespace
 
     from mstar.model.canary.config import SAMPLER
@@ -363,7 +364,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     )
     one_by_one = {rid: node.check_stop(rid, infos[rid], {"new_token": [tokens[rows.index(rid)]]}) for rid in asked}
     assert batched == {rid: stop for rid, stop in one_by_one.items() if stop} == {
-        "eos": {"decode_loop"}, "limit": {"decode_loop"},
+        "eos": {"decode_loop"},
     }
 
 

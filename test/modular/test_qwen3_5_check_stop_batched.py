@@ -37,7 +37,7 @@ def test_batched_agrees_with_per_request(shape):
     row_rids = ("d", "a", "c", "b", "e")
     infos = {
         "d": _info(),                        # EOS: stops
-        "a": _info(done=99, max_tokens=100), # out of budget: stops
+        "a": _info(done=99, max_tokens=100), # at its budget: the loop cap ends it
         "c": _info(ignore_eos=True),         # EOS ignored: keeps going
         "b": _info(),                        # other stop id: stops
         "e": _info(),                        # stopped a step ago, not checked
@@ -54,7 +54,7 @@ def test_batched_agrees_with_per_request(shape):
         if got:
             per_request[rid] = got
     assert batched == per_request
-    assert batched == {"d": {"decode_loop"}, "a": {"decode_loop"}, "b": {"decode_loop"}}
+    assert batched == {"d": {"decode_loop"}, "b": {"decode_loop"}}
 
 
 @pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
@@ -83,21 +83,21 @@ def test_a_prefill_stop_token_ends_the_partition(step_walk):
 
 
 @pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
-def test_the_budget_counts_the_prefills_token(step_walk):
-    """max_output_tokens=N gives N tokens, the first of them the prefill's."""
+def test_a_one_token_budget_ends_at_the_prefill(step_walk):
+    """The prefill's token is the first of max_output_tokens; past it the loop
+    cap, not the stop check, ends decode."""
     infos = {
         "one": _info(walk="prefill_text", max_tokens=1),
         "two": _info(walk="prefill_text", max_tokens=2),
     }
     if step_walk is None:
         infos["tenth"] = _info(done=8, max_tokens=10)  # the prefill's and 9 decoded
-        infos["ninth"] = _info(done=7, max_tokens=10)
     tokens = torch.full((len(infos),), 3)
     sub = _sub()
     got = LLMSubmodule.check_stop_batched(
         sub, list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
     )
-    assert got == {"one": {END_PARTITION}, **({"tenth": {"decode_loop"}} if step_walk is None else {})}
+    assert got == {"one": {END_PARTITION}}
     for rid, info in infos.items():
         per_request = LLMSubmodule.check_stop(sub, rid, info, {"new_token": [tokens[:1]]})
         assert per_request == got.get(rid, set())
@@ -116,7 +116,7 @@ def test_engine_falls_back_and_attributes_failures():
     from mstar.engine.engine import Engine
 
     failures = {}
-    infos = {"a": _info(done=99, max_tokens=100)}  # "x" missing
+    infos = {"a": _info()}  # "x" missing
     batch = SimpleNamespace(
         node_name="LLM",
         request_ids=["a", "x"],
@@ -131,7 +131,7 @@ def test_engine_falls_back_and_attributes_failures():
         check_stop=lambda rid, info, out: LLMSubmodule.check_stop(_sub(), rid, info, out),
     )
     engine = SimpleNamespace(_submodules={"LLM": SimpleNamespace(submodule=sub)})
-    tokens = torch.tensor([3, 3])
+    tokens = torch.tensor([EOS, 3])
     outputs = {"a": {"new_token": [tokens[0:1]]}, "x": {"new_token": [tokens[1:2]]}}
     stops = Engine.check_stop_for_batch(
         engine, batch, outputs, host_rows=HostRows(("a", "x"), {"new_token": tokens}),
@@ -151,7 +151,7 @@ def test_rows_out_of_batch_order_still_map_by_request():
 
     sub = LLMSubmodule.__new__(LLMSubmodule)
     sub.stop_token_ids = frozenset({7})
-    rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
+    rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 7])})
 
     def info(max_tokens, iters=0):
         return SimpleNamespace(
