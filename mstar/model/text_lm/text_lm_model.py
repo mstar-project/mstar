@@ -66,8 +66,10 @@ class TextLMModel(Model):
     names none."""
 
     # packed prefill captures, in prompt tokens per step; a deployment overrides them in
-    # model_kwargs (an empty list leaves prefill eager)
-    PREFILL_TOKEN_BUCKETS = (512, 1024, 2048, 4096, 8192)
+    # model_kwargs (an empty list leaves prefill eager). A step replays the smallest bucket
+    # that holds its prompts, and chat prompts are mostly under 256 tokens, so the small
+    # buckets keep a short prompt from paying for 512.
+    PREFILL_TOKEN_BUCKETS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
     def __init__(
         self,
