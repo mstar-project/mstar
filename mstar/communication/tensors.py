@@ -15,7 +15,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -31,6 +31,7 @@ from mstar.observability.catalog import TRANSFER_API_SERVER
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.threads import ThreadPool
 
 try:
     from mooncake.engine import TransferEngine
@@ -379,7 +380,7 @@ class AsyncMooncakeReader:
     ):
         self._engine = engine
         self.max_batch_size = max_batch_size
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._executor = ThreadPool(max_workers=max_workers)
         self._pending: list[Future] = []
         # none on the host: host buffers have no GPU work to wait for, and a stream or event would
         # create a CUDA context on a GPU that other processes may have filled

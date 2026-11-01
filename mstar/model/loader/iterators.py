@@ -25,7 +25,7 @@ import os
 import struct
 from collections import deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
@@ -33,6 +33,8 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from safetensors import safe_open
+
+from mstar.utils.threads import ThreadPool
 
 
 class TensorSlice(NamedTuple):
@@ -200,7 +202,7 @@ def _iter_files(
     pending: deque[tuple[str, int, Future, int | None]] = deque()
     in_flight = 0
     todo = jobs()
-    pool = ThreadPoolExecutor(_READ_THREADS, thread_name_prefix="safetensors-read")
+    pool = ThreadPool(_READ_THREADS, thread_name_prefix="safetensors-read")
     try:
         exhausted = False
         while True:

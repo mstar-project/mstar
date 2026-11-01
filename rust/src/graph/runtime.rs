@@ -340,7 +340,7 @@ pub struct GraphRuntime {
             && self
                 .interner
                 .get(partition_name)
-                .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
+                .and_then(|p| self.info(rid).map(|i| i.partition_done(p)))
                 .unwrap_or(false);
 
         let partition = self.interner.get(partition_name);
@@ -1156,6 +1156,8 @@ pub struct SendPlan {
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
     /// (rid, signal, modality, value): emitted inline, one frame per step.
     pub emit_inline: Vec<(u32, String, String, i64)>,
+    /// rid -> the log-prob its emits carry, inline or tensor.
+    pub logprobs: FxHashMap<u32, f64>,
     /// (rid, finished worker graph ids, is_first_tp_rank, the walk the rid
     /// ran -- its own, not a mixed step's combined label)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool, Option<Sym>)>,
@@ -1204,6 +1206,10 @@ pub struct RouteArg {
     /// the plain route input.
     inline_signal: Option<String>,
     inline_values: Vec<i64>,
+    /// The log-prob of the token row i sampled (None without one): it rides
+    /// with the row's client emits, inline or in a tensor emit's metadata.
+    /// Empty (or absent) when no row has one.
+    logprobs: Vec<Option<f64>>,
     /// Rows of several walks in one call: `rids[i]` ran `walks[rid_walk_idx[i]]`.
     /// None, every row ran `graph_walk`.
     walks: Option<Vec<String>>,
@@ -1235,6 +1241,7 @@ impl<'py> FromPyObject<'py> for RouteArg {
             num_tensors: r.num_tensors,
             inline_signal: optional_item(ob, "inline_signal")?,
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+            logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
         })
@@ -1337,6 +1344,8 @@ pub struct Completion {
     /// Per rid: (signal, modality, value) of the emit edge that rides inline
     /// instead of as a tensor. Empty unless the route carried inline values.
     pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
+    /// Per rid: the log-prob its client emits carry (`RouteArg::logprobs`).
+    pub logprobs: FxHashMap<u32, f64>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1843,10 +1852,10 @@ impl GraphRuntime {
             .all(|&wg| self.state(wg, rid).is_none_or(|s| s.is_idle()))
     }
 
-    fn mark_stream_partition_done(&mut self, rid: u32, partition: &str) {
+    fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
-            info.mark_stream_done(p);
+            info.mark_partition_done(p);
         }
     }
 
@@ -2571,6 +2580,12 @@ impl GraphRuntime {
         let inline_on = inline_sym.is_some()
             && input.inline_values.len() == input.rids.len();
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
+        let logprobs: FxHashMap<u32, f64> = input
+            .rids
+            .iter()
+            .zip(&input.logprobs)
+            .filter_map(|(&rid, &lp)| Some((rid, lp?)))
+            .collect();
 
         for (i, &rid) in input.rids.iter().enumerate() {
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
@@ -3137,6 +3152,7 @@ impl GraphRuntime {
                 speculative,
                 nested: nested_snapshot,
                 emit_inline,
+                logprobs,
             },
         );
         Ok(out)
@@ -3235,6 +3251,7 @@ impl GraphRuntime {
                 num_tensors: vec![0; n * n_sig],
                 inline_signal: Some(inline_signal),
                 inline_values: values,
+                logprobs: Vec::new(),
                 walks: None,
                 rid_walk_idx: None,
             })?;
@@ -3508,6 +3525,7 @@ impl GraphRuntime {
         let mut plan = SendPlan {
             partition: c.partition.clone(),
             nested: c.nested.clone(),
+            logprobs: std::mem::take(&mut c.logprobs),
             ..Default::default()
         };
 
@@ -3655,11 +3673,6 @@ impl GraphRuntime {
             }
         }
         Ok(plan)
-    }
-
-    fn stream_partition_done(&self, rid: u32, partition: &str) -> bool {
-        let Some(p) = self.interner.get(partition) else { return false };
-        self.info(rid).is_some_and(|i| i.stream_done(p))
     }
 
     /// Parked routing awaiting a send. Non-zero between
@@ -3920,6 +3933,7 @@ impl GraphRuntime {
                         signal: &signal,
                         infos,
                         loop_indices,
+                        logprob: plan.logprobs.get(&rid).copied(),
                     }
                     .encode(&self.interner, bk.strings())
                 };
@@ -3944,6 +3958,8 @@ impl GraphRuntime {
                     let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
                     let mut values: Vec<i64> = Vec::with_capacity(items.len());
                     let mut loop_indices = Vec::with_capacity(items.len());
+                    let with_logprobs = !plan.logprobs.is_empty();
+                    let mut logprobs: Vec<Option<f64>> = Vec::new();
                     for (rid, value) in items {
                         let request_id = self.rid_name(rid)?;
                         let idx = nested.get(&rid).cloned();
@@ -3953,6 +3969,9 @@ impl GraphRuntime {
                         request_ids.push(request_id);
                         values.push(value);
                         loop_indices.push(idx);
+                        if with_logprobs {
+                            logprobs.push(plan.logprobs.get(&rid).copied());
+                        }
                     }
                     let bytes = frames::ResultTokens {
                         request_ids: &request_ids,
@@ -3960,6 +3979,7 @@ impl GraphRuntime {
                         loop_indices: &loop_indices,
                         signal: &signal,
                         modality: &modality,
+                        logprobs: &logprobs,
                     }
                     .encode(&self.interner);
                     frames.push(("api_server".to_string(), bytes));

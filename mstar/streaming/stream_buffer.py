@@ -86,8 +86,9 @@ class StreamBuffer:
     _num_tensors_registered = 0
     _num_buffer_writes = 0
     # Items the producer sent this worker in total, as the done signal reports
-    # it. The signal comes through the conductor and the items come straight
-    # from the producer, so the signal can arrive first.
+    # it. A partition's end comes through the conductor and its items straight
+    # from the producer, so the signal can arrive first. (A client stream's end
+    # follows its items on the data worker's own FIFO.)
     _num_items_expected = 0
 
     def prime_context(self, context_items: int) -> None:

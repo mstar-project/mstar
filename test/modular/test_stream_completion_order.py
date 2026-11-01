@@ -213,6 +213,8 @@ def _conductor(passes=1):
     c = object.__new__(Conductor)
     c.model = _EndsLLM(passes)
     c.producer_triggered_partitions = set()
+    c._stream_fed_partitions = {"SNAC"}
+    c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}, 1: {"snac_chunk"}}
@@ -267,7 +269,7 @@ def _consumer(policy):
     w._walk_driven_edges = {}
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
-    w._draining_rids = set()
+    w._reads_done_sent = set()
     w.enable_nvtx = False
     w._rid = lambda rid: 1
     w.request_state = SimpleNamespace(per_request_info={

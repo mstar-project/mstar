@@ -83,14 +83,6 @@ class PinnedStager:
         ]
         self._views = [b.numpy() for b in self._bufs]
 
-    def to_device(self, values: Sequence | np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
-        """A new ``device`` tensor holding ``values`` (a sequence, an array or a CPU tensor, any
-        shape) in this stager's dtype, through ``copy_``: one non-blocking H2D, no stream drain."""
-        host = np.asarray(values, dtype=self._np_dtype)
-        out = torch.empty(host.shape, dtype=self.dtype, device=device)
-        self.copy_(out, host.reshape(-1))
-        return out
-
     def copy_(
         self,
         dst: torch.Tensor,
@@ -146,27 +138,43 @@ class PinnedStager:
                 mirror.record(key, values)
 
 
-def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-    """``tensor`` on ``device`` without a host stall.
+def to_device_nonblocking(
+    data: torch.Tensor | Sequence,
+    device: torch.device | str,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """``data`` on ``device`` without a host stall.
 
     A copy from pageable memory blocks the calling thread until it retires, so on
-    the GPU thread it waits out the step still running there. This writes a CPU
-    tensor into a pinned buffer with one memcpy on the calling thread (``copy_``
-    would split it over the intra-op pool, where a descheduled thread holds up the
-    GPU thread) and queues one non-blocking copy from it on the current stream.
-    torch's caching host allocator keeps the pinned buffer until that copy has
-    retired, so nothing is written over an in-flight source.
+    the GPU thread it waits out the step still running there. Host values go
+    through a fresh pinned buffer instead, and one non-blocking copy from it is
+    queued on the current stream. torch's caching host allocator keeps that
+    buffer until the copy has retired, so the caller may reuse its source at once.
 
-    The result is valid on the stream the copy was issued on; another stream has
-    to wait on it, as for any async copy. The host tensor is read as it is, so the
-    device tensor is bit-identical to a pageable copy; a model that packs a draw
-    does so before this.
+    A sequence is built straight into pinned memory as ``torch.tensor(data,
+    dtype=dtype)`` would build it. A pageable CPU tensor is written into the
+    pinned buffer with one memcpy on the calling thread (``copy_`` would split it
+    over the intra-op pool, where a descheduled thread holds up the GPU thread),
+    so the device tensor is bit-identical to a pageable copy. An already-pinned
+    contiguous tensor is copied from in place, so don't write to it until the copy lands;
+    stage a reused buffer through :class:`PinnedStager` instead. The result is valid on the
+    stream the copy was issued on; another stream has to wait on it, as for any
+    async copy. Where the device takes no pinned memory (a CPU device), the result
+    is a plain ``.to(device)``.
     """
     device = torch.device(device)
-    if tensor.device.type != "cpu" or not DeviceCapability.of(device).is_accelerator:
-        return tensor.to(device)
-    source = tensor if tensor.is_contiguous() else tensor.contiguous()
-    pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
+    pin = DeviceCapability.of(device).pin_memory
+    if not isinstance(data, torch.Tensor):
+        host = torch.tensor(data, dtype=dtype, pin_memory=pin)
+        return host.to(device, non_blocking=pin)
+    if dtype is not None:
+        raise ValueError("dtype is for a sequence; convert the tensor before staging it")
+    if not pin or data.device.type != "cpu":
+        return data.to(device)
+    if data.is_pinned() and data.is_contiguous():
+        return data.to(device, non_blocking=True)
+    source = data if data.is_contiguous() else data.contiguous()
+    host = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
     if source.numel():
-        pinned.view(-1).view(torch.uint8).numpy()[:] = source.view(-1).view(torch.uint8).numpy()
-    return pinned.to(device, non_blocking=True)
+        host.view(-1).view(torch.uint8).numpy()[:] = source.view(-1).view(torch.uint8).numpy()
+    return host.to(device, non_blocking=True)

@@ -75,3 +75,40 @@ def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
         assert chosen == str(expected), f"rank {rank} chose {chosen}"
         # a workspace built on some ranks but not all is destroyed, not kept
         assert leaked == "", f"rank {rank} kept {leaked}"
+
+
+def test_a_shared_group_keeps_a_workspace_per_width_and_dtype(monkeypatch):
+    """Two lockstep nodes of one instance share its group, and each sets up
+    fusion for its own width and dtype. Each input takes the workspace built
+    for its (dtype, hidden); one with none, or longer than its workspace,
+    takes NCCL. A larger max_tokens that fails to build keeps the smaller."""
+    import torch
+
+    built, used = [], []
+
+    def create(group, max_tokens, hidden, dtype):
+        built.append((dtype, hidden, max_tokens))
+        return None if max_tokens > 16 else len(built) - 1
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", create)
+    monkeypatch.setattr(
+        ar_fusion, "allreduce_add_rmsnorm",
+        lambda x, residual, weight, eps, bias, ws_id: used.append(ws_id) or (x, residual),
+    )
+    group = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    monkeypatch.setattr(group, "all_reduce", lambda x: used.append("nccl") or x)
+    assert group.init_allreduce_fusion(16, torch.float32, max_tokens=8)
+    assert group.init_allreduce_fusion(8, torch.float32, max_tokens=8)
+    assert group.init_allreduce_fusion(16, torch.bfloat16, max_tokens=8)
+    assert group.init_allreduce_fusion(16, torch.float32, max_tokens=4)       # has one
+    assert group.init_allreduce_fusion(8, torch.float32, max_tokens=16)       # grown
+    assert not group.init_allreduce_fusion(16, torch.float32, max_tokens=32)  # build failed
+    assert built == [(torch.float32, 16, 8), (torch.float32, 8, 8), (torch.bfloat16, 16, 8),
+                     (torch.float32, 8, 16), (torch.float32, 16, 32)]
+
+    for rows, hidden, dtype in ((4, 16, torch.float32), (16, 8, torch.float32),
+                                (4, 16, torch.bfloat16), (4, 32, torch.float32),
+                                (9, 16, torch.float32)):
+        x = torch.ones(rows, hidden, dtype=dtype)
+        group.allreduce_add_rmsnorm(x, torch.zeros_like(x), torch.ones(hidden, dtype=dtype), 1e-6)
+    assert used == [0, 3, 2, "nccl", "nccl"]

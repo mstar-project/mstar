@@ -65,8 +65,7 @@ class CrossAttentionManager(AttentionResource):
         # the context cache's own head counts; see AttentionManager.build
         kv_config = info.dependency(spec.config.kv_cache).config
         backend = resolve_attn_backend(spec.config.backend, info.device)
-        if info.joint_comm_group is not None:
-            kv_config.shard(info.joint_comm_group.world_size)
+        kv_config.shard(info.head_shards)
         if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,
@@ -127,7 +126,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
             head_dim=kv_config.head_dim,
-            page_size=kv_config.page_size,
+            page_size=kv_config.tokens_per_page,
             max_num_pages=kv_config.max_num_pages,
             device=device,
             backend=backend
@@ -304,7 +303,7 @@ class FlashInferCrossManager(CrossAttentionManager):
 
         reuse of the query `qo_indptr` keeps the label major order produced by
         combined CFG plan."""
-        page_size = self._kv_config.page_size
+        page_size = self._kv_config.tokens_per_page
         kv_indptr = [0]
         all_pages: list[int] = []
         last_page_lens: list[int] = []
