@@ -284,20 +284,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         sin: torch.Tensor,
         seq_lengths: tuple[int, ...],
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
-        """The block loop replayed once per request, or None if not leased.
-
-        A leased step declares nothing of its own (`declare_step`), so
-        ``engine_inputs.step`` is None; a bucket that fits is not enough, as
-        ``can_lease`` may have refused the batch. The bucket check keeps a
-        forward driven outside the engine (no declaration either) eager.
-        """
-        runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
-        if runner is None or engine_inputs.step is not None or not runner.can_run(
-            len(engine_inputs.request_ids), int(hidden.shape[0]),
-        ):
+        """The block loop replayed once per request, or None if not leased."""
+        if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
         # one replay for every frame: a second plan overwrites the schedule a queued replay still reads
-        out = runner.run(
+        out = engine_inputs.piecewise_runners[VISION_BLOCK_LOOP].run(
             static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
             request_ids=[engine_inputs.request_ids[0]],
             seq_lens=list(seq_lengths),
