@@ -10,8 +10,9 @@ import torch
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.graph.base import TensorPointerInfo
-from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
+from mstar.streaming.chunk_policy import FixedChunkPolicy, SlidingWindowChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.topology import Connection
 from mstar.worker.stream_buffers import StreamBufferManager
 
 EDGE, NODE, RID = "new_token", "snac_decoder", 1
@@ -24,11 +25,24 @@ class _TM:
     get_tensors = TensorCommunicationManager.get_tensors
     dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
+    increment_ref = TensorCommunicationManager.increment_ref
     increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform
 
     def __init__(self, bookkeeping):
         self.tensor_store = TensorStore(bookkeeping=bookkeeping)
         self.uuid_to_shard_dim = {}
+        self._next_uuid = 1000
+
+    def store_and_return_tensor_info(self, request_id, tensors, skip_cuda_sync=False):
+        """Mints a uuid per tensor and stores it with no references, as the
+        real one does; the descriptor is a stand-in."""
+        out = {}
+        for name, ts in tensors.items():
+            for t in ts:
+                uuid, self._next_uuid = self._next_uuid, self._next_uuid + 1
+                self.tensor_store.put_tensor(request_id, uuid, t, _info(uuid))
+                out.setdefault(name, []).append(_info(uuid))
+        return out
 
     def _cleanup_by_uuid(self, uuid, registered=None):
         if self.tensor_store.check_uuid_presence(uuid):
@@ -114,6 +128,38 @@ def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_cons
     else:
         assert se.uuids == []
     assert not any(present(u) for u in uuids), "every item is released once consumed"
+
+
+@pytest.mark.parametrize("kind", ["python", "rust"])
+def test_a_chunked_producers_pieces_are_joined_into_one_stored_item(kind):
+    """A buffer holding uuids joins a chunked producer's pieces through the
+    manager: one new stored item, which the buffer holds instead of the
+    pieces, and which is released like any other once consumed."""
+    tm = _TM(_bookkeeping(kind))
+    conn = Connection(
+        "Thinker", "Talker", EDGE, lambda: FixedChunkPolicy(chunk_size=1), join_dim=0,
+    )
+    req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
+    streams = StreamBufferManager(SimpleNamespace(per_request_info={RID: req}), tm, [conn])
+    streams.consumer_node = {EDGE: NODE}
+    streams.add_request(RID, SimpleNamespace(partition_name="Talker", stream_lead_items={}))
+    buf = req.stream_buffers[EDGE]
+    pieces = [torch.ones(2, 3), torch.zeros(0, 3), torch.full((1, 3), 2.0)]
+    uuids = [100 + k for k in range(len(pieces))]
+    buf.pre_read_register_joined(uuids)
+    for uuid, piece in zip(uuids, pieces, strict=True):
+        tm.tensor_store.put_tensor(RID, uuid, piece, _info(uuid))
+        tm.tensor_store.increment_ref(uuid, 1)
+        buf.put(uuid, uuid)
+    present = tm.tensor_store.check_uuid_presence
+    se = streams.pop_edge(buf, EDGE, RID)
+    assert len(se.uuids) == 1 and se.uuids[0] not in uuids
+    assert not any(present(u) for u in uuids), "the pieces are released once joined"
+    (joined,) = _consume(streams, tm, se)
+    assert joined.shape == (3, 3) and joined[:2].eq(1).all() and joined[2].eq(2).all()
+    buf.signal_done(len(uuids))
+    assert buf._producer_done_and_all_read()
+    assert not present(se.uuids[0]), "the joined item is released once consumed"
 
 
 def test_whatever_can_ready_a_chunk_marks_the_buffer_for_the_poll():

@@ -7,6 +7,9 @@ chunks a step did not keep, and settles which streams a step ends.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import partial
+
+import torch
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
@@ -86,6 +89,10 @@ class StreamBufferManager:
                     from_partition=conn.from_partition,
                     policy=conn.chunk_policy_factory(),
                     join_dim=conn.join_dim,
+                    joiner=(
+                        partial(self._join_pieces, request_id, conn.edge_name, conn.join_dim)
+                        if conn.join_dim is not None else None
+                    ),
                     walk_tagged=conn.consumer_walk is not None,
                 )
                 req_info.stream_buffers[conn.edge_name] = sbuf
@@ -96,6 +103,22 @@ class StreamBufferManager:
                 lead = request_info.stream_lead_items.get(conn.edge_name)
                 if lead:
                     sbuf.prime_context(lead)
+
+    def _join_pieces(
+        self, request_id: int, edge_name: str, dim: int, uuids: list[int],
+    ) -> int:
+        """A chunked producer's pieces as one stored item; the buffer's
+        reference moves from the pieces to it. Stored without a sync, as the
+        chunks popped from a buffer used to be: the pieces were complete when
+        they were routed here."""
+        tm = self._tensor_manager
+        joined = torch.cat(tm.get_tensors(uuids), dim=dim)
+        (info,) = tm.store_and_return_tensor_info(
+            request_id, {edge_name: [joined]}, skip_cuda_sync=True,
+        )[edge_name]
+        tm.increment_ref(info.uuid)
+        tm.dereference_batch_uniform(uuids)
+        return info.uuid
 
     def remove_request(self, request_id: int) -> None:
         self._rids.discard(request_id)

@@ -1,4 +1,5 @@
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -74,6 +75,8 @@ class StreamBuffer:
     policy: ChunkPolicy
     # dim to join a chunked producer's pieces on; None keeps them separate
     join_dim: int | None = None
+    # joins pieces held by handle into one item; None means they are tensors
+    joiner: Callable[[list], object] | None = None
     # Items carry the consumer walk the producer assigned them, and a chunk
     # never spans two walks (set for connections that drive their consumer's
     # walk)
@@ -185,9 +188,8 @@ class StreamBuffer:
         which the producer drops every position of -- so it is joined, not
         skipped.
 
-        The one place that assumes the buffer holds tensors rather than uuids.
-        A buffer that stores uuids instead joins here too, by reading the
-        pieces, concatenating and storing the result under a fresh uuid.
+        A buffer that holds uuids joins through its ``joiner``, which reads
+        the pieces, concatenates them and stores the result under a fresh uuid.
 
         A consumer that can take the pieces as they come should do that
         instead (``ChunkingPolicy.per_chunk_outputs``), as Qwen3-Omni's Talker
@@ -197,6 +199,8 @@ class StreamBuffer:
         """
         if len(pieces) == 1:
             return pieces[0]
+        if self.joiner is not None:
+            return self.joiner(pieces)
         return torch.cat(pieces, dim=self.join_dim)
 
     def signal_done(self, num_items: int = 0) -> None:
