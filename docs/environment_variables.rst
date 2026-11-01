@@ -638,7 +638,8 @@ Worker scheduling
        with its modulation and residual. Off by default on AMD GPUs
        (``RocmPlatform.knob_defaults``): the eager norms exist to match the
        cuBLAS reference bit for bit, which hipBLASLt's per-M kernel choice
-       rules out there. Read by ``knobs.dit_exact_ops``.
+       rules out there. The FLUX.2 klein configs turn it on there for fp8.
+       Read by ``knobs.dit_exact_ops``.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``0`` (``1`` on ROCm)
      - The captured sampler gathers its RNG offsets from the slot masters

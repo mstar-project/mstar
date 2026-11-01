@@ -469,7 +469,9 @@ its own on AMD GPUs:
          - {node_names: [Code2Wav], ranks: [2]}
        rank_devices: {2: 0}
 
-The server logs which keys an entry replaced.
+An entry replaces a key whole, so one that changes a single ``model_kwargs`` setting merges the
+file's own with a YAML merge key, as ``configs/flux2_klein.yaml`` does. The server logs which keys
+an entry replaced.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
