@@ -25,6 +25,7 @@ mstar.engine.resources.kv.config
    .. autosummary::
    
       KVConfig
+      KVGroup
       KVLayout
       KVReqConfig
       KVSpec

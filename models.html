@@ -1194,7 +1194,8 @@ The ~437 GB of BF16 weights are never downloaded automatically: download the
 checkpoint and set <code class="docutils literal notranslate"><span class="pre">model_kwargs.checkpoint_dir</span></code> in
 <code class="docutils literal notranslate"><span class="pre">configs/command_a_plus_tp4.yaml</span></code>, the default (TP4, 65536-token
 <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
-H200, set <code class="docutils literal notranslate"><span class="pre">resources.kv_cache.max_num_pages</span></code> to 2048. Tokenizer and config
+H200, set <code class="docutils literal notranslate"><span class="pre">resources.kv_cache.max_num_pages</span></code> to 2048. It keeps only the
+sliding layers’ window per request, and no prefix cache yet. Tokenizer and config
 metadata are pinned to one checkpoint revision.
 <code class="docutils literal notranslate"><span class="pre">configs/command_a_plus_tp8.yaml</span></code> targets 8x 80 GB GPUs and keeps NCCL’s
 all-reduce until FlashInfer’s is measured there.</p>
@@ -1207,10 +1208,10 @@ give it a generous <code class="docutils literal notranslate"><span class="pre">
 <p>On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
 Triton kernels, and one all-reduce per layer (<code class="docutils literal notranslate"><span class="pre">tp_allreduce:</span> <span class="pre">flashinfer</span></code> at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
-64 (<code class="docutils literal notranslate"><span class="pre">benchmark/command_a_plus/bench_http.py</span></code>); <code class="docutils literal notranslate"><span class="pre">validate_checkpoint.py</span></code>
+64 (<code class="docutils literal notranslate"><span class="pre">benchmark/command_a_plus/bench_http.py</span></code>, measured before the sliding layers
+kept only their window); <code class="docutils literal notranslate"><span class="pre">validate_checkpoint.py</span></code>
 there checks parity against Hugging Face, with <code class="docutils literal notranslate"><span class="pre">--images</span></code> for image prompts.
-Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
-outside the sliding window.</p>
+Not supported yet: FP8 weights and prefill CUDA graphs.</p>
 </section>
 <section id="kokoro-notes">
 <h2>Kokoro notes<a class="headerlink" href="#kokoro-notes" title="Link to this heading">#</a></h2>

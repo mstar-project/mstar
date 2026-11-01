@@ -1071,6 +1071,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        `AttentionManager`, whose `build` picks a backend subclass.</span>
 <span class="sd">        """</span>
 
+<div class="viewcode-block" id="NodeResourceSpec.derive">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.derive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">derive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"NodeResourceSpec"</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Set what this spec takes from the specs that read it (a KV pool keeps the window its</span>
+<span class="sd">        attentions declare), after a deployment's overrides; return what is wrong with it.</span>
+<span class="sd">        Idempotent: it runs wherever the specs resolve (`resolve_spec_dependencies`)."""</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
+
 <div class="viewcode-block" id="NodeResourceSpec.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.apply_yaml_overrides">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
@@ -1159,12 +1168,34 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">resolve_spec_dependencies</span><span class="p">(</span>
     <span class="n">specs</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""Index specs by resource key, checking uniqueness and ``depends_on``."""</span>
+<span class="w">    </span><span class="sd">"""Index specs by resource key, checking uniqueness and ``depends_on``, and derive what each</span>
+<span class="sd">    takes from the others (`NodeResourceSpec.derive`)."""</span>
+    <span class="n">by_key</span> <span class="o">=</span> <span class="n">_indexed</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
+    <span class="n">_derive</span><span class="p">(</span><span class="n">by_key</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">by_key</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_indexed</span><span class="p">(</span><span class="n">specs</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">]:</span>
     <span class="n">problems</span> <span class="o">=</span> <span class="n">spec_dependency_problems</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">problems</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="n">problems</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
-    <span class="k">return</span> <span class="p">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">:</span> <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">}</span></div>
+    <span class="k">return</span> <span class="p">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">:</span> <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">}</span>
 
+
+<div class="viewcode-block" id="derive_specs">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.derive_specs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">derive_specs</span><span class="p">(</span><span class="n">by_key</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""Run every spec's `NodeResourceSpec.derive`; each problem as (resource key, message)."""</span>
+    <span class="k">return</span> <span class="p">[(</span><span class="n">key</span><span class="p">,</span> <span class="n">message</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">by_key</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">for</span> <span class="n">message</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">derive</span><span class="p">(</span><span class="n">by_key</span><span class="p">)]</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_derive</span><span class="p">(</span><span class="n">by_key</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">problems</span> <span class="o">=</span> <span class="n">derive_specs</span><span class="p">(</span><span class="n">by_key</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">problems</span><span class="p">:</span>
+        <span class="n">key</span><span class="p">,</span> <span class="n">message</span> <span class="o">=</span> <span class="n">problems</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"resource </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">: </span><span class="si">{</span><span class="n">message</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
 
 <span class="n">TOP_LEVEL_KV_CACHE</span> <span class="o">=</span> <span class="p">(</span>
@@ -1193,21 +1224,29 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    ``resources: {&lt;resource_key&gt;: {...}}``, one block per resource, so a model</span>
 <span class="sd">    with two pools of the same kind (whisper's decoder cache and its encoder</span>
-<span class="sd">    context) can have each tuned on its own. An unknown key is an error: it</span>
+<span class="sd">    context) can have each tuned on its own. An unknown key is a ValueError: it</span>
 <span class="sd">    would otherwise be a silently ineffective setting.</span>
+
+<span class="sd">    Then derives what the specs derive (`resolve_spec_dependencies`), with or without</span>
+<span class="sd">    overrides and after them, so a deployment's page size or backend is what the derivation</span>
+<span class="sd">    checks, as validation checks it.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="s2">"kv_cache"</span> <span class="ow">in</span> <span class="n">model_config</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="n">TOP_LEVEL_KV_CACHE</span><span class="p">)</span>
+    <span class="n">by_key</span> <span class="o">=</span> <span class="n">_indexed</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
     <span class="n">overrides</span> <span class="o">=</span> <span class="n">model_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"resources"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">overrides</span><span class="p">:</span>
-        <span class="k">return</span>
-    <span class="n">by_key</span> <span class="o">=</span> <span class="n">resolve_spec_dependencies</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
     <span class="n">unknown</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">overrides</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="o">-</span> <span class="n">by_key</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
     <span class="k">if</span> <span class="n">unknown</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="n">unknown_overrides_message</span><span class="p">(</span><span class="n">unknown</span><span class="p">,</span> <span class="n">by_key</span><span class="p">))</span>
     <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">kwargs</span> <span class="ow">in</span> <span class="n">overrides</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-        <span class="n">by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">apply_yaml_overrides</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
-    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Resource specs after YAML overrides: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span></div>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">apply_yaml_overrides</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">TypeError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="c1"># a key the resource doesn't take: a bad config, as every other problem here is</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"resources.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+    <span class="n">_derive</span><span class="p">(</span><span class="n">by_key</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">overrides</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"Resource specs after YAML overrides: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span></div>
 
 </pre></div>
 

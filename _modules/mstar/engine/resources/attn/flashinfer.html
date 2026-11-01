@@ -1017,6 +1017,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">max_rows_in_combined</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">decode_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">sliding_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_splits</span> <span class="o">=</span> <span class="p">{</span><span class="n">split</span><span class="o">.</span><span class="n">combined_walk</span><span class="p">:</span> <span class="n">split</span> <span class="k">for</span> <span class="n">split</span> <span class="ow">in</span> <span class="n">splits</span><span class="p">}</span>
@@ -1025,6 +1026,16 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="c1"># FlashInfer counts preceding positions; M* counts the current token too.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span> <span class="k">if</span> <span class="n">sliding_window</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">sliding_window</span> <span class="o">-</span> <span class="mi">1</span>
+        <span class="c1"># The index of the group of the pool's layers this reads (`PagedKVConfig.groups`): the</span>
+        <span class="c1"># group of the layers it declares, else the first, the layers no window is kept for.</span>
+        <span class="n">groups</span> <span class="o">=</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">groups</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_group_idx</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">g</span> <span class="k">for</span> <span class="n">g</span><span class="p">,</span> <span class="n">group</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">groups</span><span class="p">)</span> <span class="k">if</span> <span class="n">layers</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">in</span> <span class="n">group</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span> <span class="k">if</span> <span class="n">layers</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_group</span> <span class="o">=</span> <span class="n">groups</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_group_idx</span><span class="p">]</span>
+        <span class="c1"># the layers it runs, where the pool's layers are in more than one group: the ones it</span>
+        <span class="c1"># declares, or the first group's</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_layers</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">groups</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_layers</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">layers</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span>
 
         <span class="c1"># label to plan state</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1043,8 +1054,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">head_dim</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
-            <span class="n">page_size</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
-            <span class="n">max_num_pages</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
+            <span class="n">page_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_group</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
+            <span class="n">max_num_pages</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_units</span><span class="p">,</span>
             <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
             <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
         <span class="p">)</span>
@@ -1056,6 +1067,24 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="p">}</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_layer</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,</span>
+<span class="sd">        since its plans address only that group's pages. Checked in Python, so at eager and</span>
+<span class="sd">        capture time only: warmup and capture raise a miswired layer at startup."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layers</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">layer_idx</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layers</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"layer </span><span class="si">{</span><span class="n">layer_idx</span><span class="si">}</span><span class="s2"> of KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="si">!r}</span><span class="s2"> isn't one this attention runs "</span>
+                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_layers</span><span class="p">)</span><span class="si">}</span><span class="s2">)"</span>
+            <span class="p">)</span>
+
+<div class="viewcode-block" id="FlashInferManager.set_default_layer_idx">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.set_default_layer_idx">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_default_layer_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_layer</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_default_layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_cg_wrapper</span><span class="p">(</span>
@@ -1086,7 +1115,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
         <span class="n">kv_kwargs</span> <span class="o">=</span> <span class="p">{</span>
             <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
-            <span class="s2">"max_num_pages"</span><span class="p">:</span> <span class="n">captured_page_capacity</span><span class="p">(</span><span class="n">num_rows</span><span class="p">,</span> <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="p">),</span>
+            <span class="s2">"max_num_pages"</span><span class="p">:</span> <span class="n">captured_page_capacity</span><span class="p">(</span><span class="n">num_rows</span><span class="p">,</span> <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group</span><span class="p">),</span>
         <span class="p">}</span>
         <span class="n">split</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_splits</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">split</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1183,6 +1212,8 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">plan_outputs</span><span class="p">:</span> <span class="n">KVPlanOutputs</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">plan_outputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Attention Manager expected plan result from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="si">}</span><span class="s2">"</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group_idx</span><span class="p">:</span>
+            <span class="n">plan_outputs</span> <span class="o">=</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">groups</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_group_idx</span><span class="p">]</span>
 
         <span class="c1"># a preplan leases a different cg slot, so its wrappers and workspaces</span>
         <span class="c1"># are disjoint from the ones the in-flight forward reads</span>
@@ -1256,20 +1287,30 @@ window.runMermaid = runMermaid;</script>
         <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-        <span class="c1"># `k`/`v`/`layer_idx` are the dense backend's; here the K/V is already</span>
-        <span class="c1"># in the pages (the layer wrote it through the KV resource) and the</span>
-        <span class="c1"># planned wrapper carries the layout. Accepted and ignored so one</span>
-        <span class="c1"># layer body serves either backend — see `requires_kv_write`.</span>
-        <span class="k">del</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">layer_idx</span>
+        <span class="c1"># `k`/`v` are the dense backend's; here the K/V is already in the pages</span>
+        <span class="c1"># (the layer wrote it through the KV resource) and the planned wrapper</span>
+        <span class="c1"># carries the layout. Accepted and ignored so one layer body serves</span>
+        <span class="c1"># either backend — see `requires_kv_write`. `layer_idx` matters only over</span>
+        <span class="c1"># a pool of more than one group (`set_default_layer_idx`).</span>
+        <span class="k">del</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span>
         <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_default_label</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attend</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attend</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">)</span></div>
 
 
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_attend</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layers</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># an explicit layer over the cursor, checked as the cursor is</span>
+            <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_check_layer</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">_default_layer_idx</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="si">!r}</span><span class="s2"> has more than one group, so its attention needs the "</span>
+                    <span class="s2">"layer it runs: set_layer_idx, or run(layer_idx=)"</span>
+                <span class="p">)</span>
         <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">o</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
             <span class="n">o</span> <span class="o">=</span> <span class="n">o</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>

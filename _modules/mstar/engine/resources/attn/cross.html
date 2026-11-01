@@ -1115,7 +1115,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">head_dim</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
-            <span class="n">page_size</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
+            <span class="n">page_size</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">tokens_per_page</span><span class="p">,</span>
             <span class="n">max_num_pages</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
             <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
             <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
@@ -1301,7 +1301,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        reuse of the query `qo_indptr` keeps the label major order produced by</span>
 <span class="sd">        combined CFG plan."""</span>
-        <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">tokens_per_page</span>
         <span class="n">kv_indptr</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
         <span class="n">all_pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">last_page_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>

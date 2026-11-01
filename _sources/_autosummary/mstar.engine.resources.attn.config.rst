@@ -13,6 +13,7 @@ mstar.engine.resources.attn.config
 
    .. autosummary::
    
+      derive_kv_groups
       refuse_context_only
    
    

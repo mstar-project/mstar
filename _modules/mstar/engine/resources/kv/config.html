@@ -981,6 +981,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">without pulling FlashInfer in behind it.</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
@@ -1065,6 +1066,12 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="n">DEFAULT_PAGE_SIZE</span> <span class="o">=</span> <span class="mi">128</span>
+<span class="c1"># The fewest tokens a page of either group holds when the page size is derived: a window</span>
+<span class="c1"># keeps up to a page past it, and a smaller page adds page-table entries and plan work a token.</span>
+<span class="n">MIN_GROUP_PAGE</span> <span class="o">=</span> <span class="mi">64</span>
+
+
 <div class="viewcode-block" id="PagedKVConfig">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1072,10 +1079,14 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Fixed-size pages, appended to as a sequence grows. The default."""</span>
 
     <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># Pages of ``page_size`` tokens of every layer, or of DEFAULT_PAGE_SIZE tokens where</span>
+    <span class="c1"># ``page_size`` is None: the pool's bytes, whatever page a window derives (`num_units`)</span>
     <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>
-    <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span>
+    <span class="c1"># As declared; None derives the page (`tokens_per_page`)</span>
+    <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">layout</span><span class="p">:</span> <span class="n">KVLayout</span> <span class="o">=</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">NHD</span>
-    <span class="c1"># pages of pinned host memory to keep for offloading; 0 disables it</span>
+    <span class="c1"># pages of pinned host memory to keep for offloading, counted as ``max_num_pages`` counts;</span>
+    <span class="c1"># 0 disables it</span>
     <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># folded into the root, not checked at match time</span>
     <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
@@ -1087,6 +1098,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which</span>
     <span class="c1"># the attention backend would plan; a cache only stored (index keys) needs no query heads</span>
     <span class="n">qo_heads_given</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># whether the serving config's ``resources:`` block turned the prefix cache on itself</span>
+    <span class="n">prefix_cache_given</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># Derived, never declared: the layers cut by page size and retention, the layers no window</span>
+    <span class="c1"># is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,</span>
+    <span class="c1"># before anything builds or sizes from the pool). One group of every layer until then.</span>
+    <span class="n">groups</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="s2">"KVGroup"</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="p">(),</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layout</span> <span class="o">==</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">MLA</span><span class="p">:</span>
@@ -1098,11 +1115,97 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="mi">1</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">keep_window</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="p">())</span>
+
+<div class="viewcode-block" id="PagedKVConfig.keep_window">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.keep_window">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keep_window</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Keep about ``window`` tokens per request of ``layers``, some of the pool's, and every</span>
+<span class="sd">        token of the rest; ``layers`` empty keeps every token of every layer.</span>
+
+<span class="sd">        A page of either group is the same bytes, so both draw from one arena: with F full and</span>
+<span class="sd">        S sliding layers, a page holds ``tokens_per_page`` tokens of the full layers or</span>
+<span class="sd">        ``tokens_per_page·F/S`` of the sliding ones. Derived, it is (S/g)·k, g = gcd(F, S), for</span>
+<span class="sd">        the smallest k that puts at least MIN_GROUP_PAGE tokens in a page of either group."""</span>
+        <span class="n">full</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">)</span> <span class="k">if</span> <span class="n">i</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">layers</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">layers</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">full</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"every layer keeps a window; a pool keeps one only beside layers that keep every token"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="k">elif</span> <span class="n">layers</span><span class="p">:</span>
+            <span class="n">g</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">gcd</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">))</span>
+            <span class="n">tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)</span> <span class="o">//</span> <span class="n">g</span> <span class="o">*</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">MIN_GROUP_PAGE</span> <span class="o">*</span> <span class="n">g</span> <span class="o">//</span> <span class="nb">min</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">tokens</span> <span class="o">=</span> <span class="n">DEFAULT_PAGE_SIZE</span>
+        <span class="n">groups</span> <span class="o">=</span> <span class="p">(</span><span class="n">KVGroup</span><span class="p">(</span><span class="n">full</span><span class="p">,</span> <span class="n">tokens</span><span class="p">),)</span>
+        <span class="k">if</span> <span class="n">layers</span><span class="p">:</span>
+            <span class="n">step</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)</span> <span class="o">//</span> <span class="n">math</span><span class="o">.</span><span class="n">gcd</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">))</span>
+            <span class="k">if</span> <span class="n">tokens</span> <span class="o">%</span> <span class="n">step</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"page_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="si">}</span><span class="s2"> with </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">)</span><span class="si">}</span><span class="s2"> full layers gives the "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)</span><span class="si">}</span><span class="s2"> sliding ones </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2">-token "</span>
+                    <span class="sa">f</span><span class="s2">"pages; use a multiple of </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">page</span> <span class="o">=</span> <span class="n">tokens</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">)</span> <span class="o">//</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)</span>
+            <span class="c1"># the window in whole pages: a stream releases its front pages past it at commit</span>
+            <span class="n">groups</span> <span class="o">+=</span> <span class="p">(</span><span class="n">KVGroup</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">layers</span><span class="p">),</span> <span class="n">page</span><span class="p">,</span> <span class="n">RetentionPolicy</span><span class="p">(</span><span class="n">context_budget</span><span class="o">=-</span><span class="p">(</span><span class="o">-</span><span class="n">window</span> <span class="o">//</span> <span class="n">page</span><span class="p">)</span> <span class="o">*</span> <span class="n">page</span><span class="p">)),)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">groups</span> <span class="o">=</span> <span class="n">groups</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens_per_page</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Tokens a page of the first group's layers holds: ``page_size``, or where it is None</span>
+<span class="sd">        DEFAULT_PAGE_SIZE, or with a window the smallest page whole for both groups</span>
+<span class="sd">        (`keep_window`)."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">groups</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">page_size</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_units</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Arena pages, each a page of one group's layers: the bytes of ``max_num_pages``."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">units</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PagedKVConfig.units">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.units">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">units</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Arena pages in the bytes of ``pages`` pages as ``max_num_pages`` counts them."""</span>
+        <span class="k">return</span> <span class="n">pages</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_counted_page</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_page</span></div>
+
+
+<div class="viewcode-block" id="PagedKVConfig.pages_of">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.pages_of">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages_of</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">units</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">round_up</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``units`` arena pages in pages as ``max_num_pages`` counts them, rounded down (what</span>
+<span class="sd">        they hold), or with ``round_up`` up (what holds them)."""</span>
+        <span class="k">if</span> <span class="n">round_up</span><span class="p">:</span>
+            <span class="k">return</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">units</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_page</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_counted_page</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">units</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_page</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">_counted_page</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_counted_page</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># tokens of every layer in a page as max_num_pages counts it</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">DEFAULT_PAGE_SIZE</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_arena_page</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># tokens of every layer in an arena page, a page of the first group's layers</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_page</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">groups</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Pages requests can hold: all but the sink page the KV manager takes at build."""</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_pages</span> <span class="o">-</span> <span class="mi">1</span>
+<span class="w">        </span><span class="sd">"""Arena pages requests can hold: all but the sink page the KV manager takes at build."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_units</span> <span class="o">-</span> <span class="mi">1</span>
+
+<div class="viewcode-block" id="PagedKVConfig.stream_pages">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.stream_pages">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stream_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layout</span><span class="p">:</span> <span class="s2">"StreamLayout"</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most arena pages a stream laid out as ``layout`` holds at ``caps``: its pages in</span>
+<span class="sd">        every group, each window group's under that group's retention."""</span>
+        <span class="n">first</span><span class="p">,</span> <span class="o">*</span><span class="n">later</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">groups</span>
+        <span class="k">return</span> <span class="n">layout</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">caps</span><span class="p">,</span> <span class="n">first</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span>
+            <span class="n">layout</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">caps</span><span class="p">,</span> <span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span> <span class="n">group</span><span class="o">.</span><span class="n">retention</span><span class="p">)</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">later</span>
+        <span class="p">)</span></div>
+
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">latent_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1133,7 +1236,12 @@ window.runMermaid = runMermaid;</script>
             <span class="p">(</span><span class="s2">"prefix_cache_tp"</span><span class="p">,</span> <span class="n">prefix_cache_tp</span><span class="p">),</span>
         <span class="p">):</span>
             <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">prefix_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache_given</span> <span class="o">=</span> <span class="n">prefix_cache</span>
+        <span class="k">if</span> <span class="n">page_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># every token kept at this page size until the specs derive the window again</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">keep_window</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="p">())</span></div>
 </div>
 
 
@@ -1320,14 +1428,14 @@ window.runMermaid = runMermaid;</script>
             <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">growth</span><span class="p">:</span>
                 <span class="n">n</span> <span class="o">=</span> <span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">-</span> <span class="n">layout</span><span class="o">.</span><span class="n">positions</span><span class="p">(</span><span class="n">caps</span><span class="p">)</span> <span class="o">+</span> <span class="n">slots</span> <span class="o">*</span> <span class="n">caps</span><span class="p">[</span><span class="n">loop</span><span class="p">])</span> <span class="o">//</span> <span class="n">slots</span>
                 <span class="n">room</span><span class="p">[</span><span class="n">loop</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">room</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">loop</span><span class="p">,</span> <span class="n">n</span><span class="p">))</span>
-        <span class="n">pool</span><span class="p">,</span> <span class="n">page_size</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="n">caps</span><span class="p">,</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">pool</span><span class="p">:</span>
+        <span class="n">pool</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="n">caps</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">pool</span><span class="p">:</span>
             <span class="c1"># each loop's room in pages, searched with the other loops at their caps</span>
             <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">cap</span> <span class="ow">in</span> <span class="n">caps</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
                 <span class="n">low</span><span class="p">,</span> <span class="n">high</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">cap</span>
                 <span class="k">while</span> <span class="n">low</span> <span class="o">&lt;</span> <span class="n">high</span><span class="p">:</span>
                     <span class="n">mid</span> <span class="o">=</span> <span class="p">(</span><span class="n">low</span> <span class="o">+</span> <span class="n">high</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
-                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="p">{</span><span class="o">**</span><span class="n">caps</span><span class="p">,</span> <span class="n">loop</span><span class="p">:</span> <span class="n">mid</span><span class="p">},</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">pool</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="p">{</span><span class="o">**</span><span class="n">caps</span><span class="p">,</span> <span class="n">loop</span><span class="p">:</span> <span class="n">mid</span><span class="p">},</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">pool</span><span class="p">:</span>
                         <span class="n">low</span> <span class="o">=</span> <span class="n">mid</span>
                     <span class="k">else</span><span class="p">:</span>
                         <span class="n">high</span> <span class="o">=</span> <span class="n">mid</span> <span class="o">-</span> <span class="mi">1</span>
@@ -1354,11 +1462,13 @@ window.runMermaid = runMermaid;</script>
                     <span class="sa">f</span><span class="s2">"this request needs </span><span class="si">{</span><span class="n">positions</span><span class="si">}</span><span class="s2"> positions of </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">, "</span>
                     <span class="sa">f</span><span class="s2">"past the model's context of </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">"</span>
                 <span class="p">)</span>
-        <span class="n">pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop_caps</span> <span class="ow">or</span> <span class="p">{},</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop_caps</span> <span class="ow">or</span> <span class="p">{},</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">pages</span> <span class="o">&gt;</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="p">:</span>
+            <span class="c1"># counted in arena pages; the message counts pages of every layer, as max_num_pages does</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"this request needs </span><span class="si">{</span><span class="n">pages</span><span class="si">}</span><span class="s2"> pages of </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> for labels "</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span><span class="si">}</span><span class="s2">, and the pool has </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="si">}</span><span class="s2">"</span>
+                <span class="sa">f</span><span class="s2">"this request needs </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">pages_of</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span><span class="w"> </span><span class="n">round_up</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="si">}</span><span class="s2"> pages of "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> for labels </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span><span class="si">}</span><span class="s2">, and the pool "</span>
+                <span class="sa">f</span><span class="s2">"has </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">pages_of</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">request_pages</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
             <span class="p">)</span></div>
 
 
@@ -1390,10 +1500,10 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="KVReqConfig.pages">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.pages">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nodes</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""The most pages the request holds in a pool shared by ``nodes``, at ``caps``."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nodes</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">pool</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most arena pages the request holds in ``pool``, shared by ``nodes``, at ``caps``."""</span>
         <span class="n">layouts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_layout</span> <span class="ow">or</span> <span class="p">{}</span>
-        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">layouts</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">caps</span><span class="p">,</span> <span class="n">page_size</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">(</span><span class="n">nodes</span><span class="p">)</span> <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">layouts</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">pool</span><span class="o">.</span><span class="n">stream_pages</span><span class="p">(</span><span class="n">layouts</span><span class="p">[</span><span class="n">label</span><span class="p">],</span> <span class="n">caps</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">opened_labels</span><span class="p">(</span><span class="n">nodes</span><span class="p">)</span> <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">layouts</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVReqConfig.get_publish_labels">
@@ -1477,6 +1587,15 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Forwarded to the config: which keys are legal is a property of the</span>
 <span class="sd">        storage strategy, so the config answers for them."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">apply_yaml_overrides</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KVSpec.derive">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.derive">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">derive</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># the attentions over a pool decide what it keeps, and their module imports this one</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">derive_kv_groups</span>
+
+        <span class="k">return</span> <span class="n">derive_kv_groups</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span></div>
 </div>
 
 
@@ -1506,7 +1625,31 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_budget</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"context_budget must be &gt; 0, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">context_budget</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"protected_prefix must be &gt;= 0, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"protected_prefix must be &gt;= 0, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
+<div class="viewcode-block" id="RetentionPolicy.max_pages">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.RetentionPolicy.max_pages">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most pages of ``page_size`` a stream under this policy holds, with a step of</span>
+<span class="sd">        ``step`` tokens past its prefix. `KVManager._apply_retention` leaves less than a page over</span>
+<span class="sd">        the budget, so the window peaks at the protected prefix plus the budget, or at the prefix</span>
+<span class="sd">        rounded up to a page if that is larger, plus a page of overrun and the step."""</span>
+        <span class="n">prefix</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">prefix</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_budget</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">prefix</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">page_size</span><span class="p">)</span>
+        <span class="k">return</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">window</span> <span class="o">+</span> <span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">step</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="KVGroup">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVGroup">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KVGroup</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Layers of a paged pool that share a page size and a retention (`PagedKVConfig.groups`)."""</span>
+    <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># applied at each commit: what the group's attention can no longer read goes back to the pool</span>
+    <span class="n">retention</span><span class="p">:</span> <span class="n">RetentionPolicy</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1539,30 +1682,29 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="StreamLayout.pages">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.StreamLayout.pages">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""The most pages the stream can hold, where ``caps`` gives each growth loop's iterations.</span>
-
-<span class="sd">        Under ``retention`` the stream holds a window. `KVManager._apply_retention` leaves</span>
-<span class="sd">        less than a page over the budget, so the window peaks at the protected prefix plus</span>
-<span class="sd">        the budget, or at the prefix rounded up to a page if that is larger. The bound adds</span>
-<span class="sd">        a page of overrun and the largest step past the prefix to that peak.</span>
-<span class="sd">        """</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">retention</span><span class="p">:</span> <span class="s2">"RetentionPolicy | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most pages the stream can hold, where ``caps`` gives each growth loop's iterations;</span>
+<span class="sd">        under ``retention`` (the layout's own where None), its window with the largest step past</span>
+<span class="sd">        the prefix."""</span>
+        <span class="k">if</span> <span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">retention</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span>
         <span class="n">peak</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slots</span><span class="p">(</span><span class="n">caps</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">scratch</span><span class="p">,</span> <span class="mi">0</span>
         <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">:</span>
             <span class="n">peak</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">peak</span><span class="p">,</span> <span class="n">end</span> <span class="o">+</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span>
             <span class="n">end</span> <span class="o">+=</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span>
         <span class="n">pages</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">peak</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">retention</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">pages</span>
-        <span class="n">prefix</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">protected_prefix</span>
+        <span class="n">prefix</span> <span class="o">=</span> <span class="n">retention</span><span class="o">.</span><span class="n">protected_prefix</span>
         <span class="n">step</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">scratch</span><span class="p">,</span> <span class="mi">0</span>
         <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">spans</span><span class="p">:</span>
             <span class="n">end</span> <span class="o">+=</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span>
             <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">end</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span> <span class="o">+</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">prefix</span><span class="p">:</span>
                 <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">span</span><span class="o">.</span><span class="n">length</span><span class="p">,</span> <span class="n">span</span><span class="o">.</span><span class="n">scratch</span><span class="p">)</span>
         <span class="n">step</span> <span class="o">=</span> <span class="nb">max</span><span class="p">([</span><span class="n">step</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="n">slots</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">growth</span><span class="p">)])</span>
-        <span class="n">window</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">prefix</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">context_budget</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">prefix</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">page_size</span><span class="p">)</span>
-        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">window</span> <span class="o">+</span> <span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">step</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">))</span></div>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">pages</span><span class="p">,</span> <span class="n">retention</span><span class="o">.</span><span class="n">max_pages</span><span class="p">(</span><span class="n">page_size</span><span class="p">,</span> <span class="n">step</span><span class="p">))</span></div>
 </div>
 
 

@@ -981,15 +981,20 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">without pulling FlashInfer in behind it.</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">KVLayout</span><span class="p">,</span> <span class="n">PagedKVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">CombinedSplit</span><span class="p">,</span> <span class="n">NodeResourceSpec</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="AttnBackend">
@@ -1028,13 +1033,25 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># narrow GQA, where the tensor-core kernel pads few query heads per KV</span>
     <span class="c1"># head out to a tile.</span>
     <span class="n">decode_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># Each query attends to the last ``sliding_window`` positions, its own included, and the</span>
+    <span class="c1"># pool keeps about that window of K/V per request for this attention's layers and frees</span>
+    <span class="c1"># the rest (`derive_kv_groups`).</span>
     <span class="n">sliding_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's</span>
+    <span class="c1"># ``max_seq_len`` needs; the pool's other layers keep every token.</span>
+    <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sliding_window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
             <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sliding_window</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">int</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">sliding_window</span> <span class="o">&lt;=</span> <span class="mi">0</span>
         <span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"sliding_window must be a positive integer or None"</span><span class="p">)</span></div>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"sliding_window must be a positive integer or None"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sliding_window</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"layers names the layers a sliding_window keeps; it needs one"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"layers must be distinct layers, at least one; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
 
 
 
@@ -1085,6 +1102,72 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">decode_tensor_cores</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_tensor_cores</span> <span class="o">=</span> <span class="n">_yaml_bool</span><span class="p">(</span><span class="s2">"decode_tensor_cores"</span><span class="p">,</span> <span class="n">decode_tensor_cores</span><span class="p">)</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="derive_kv_groups">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.derive_kv_groups">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">derive_kv_groups</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">cfg</span><span class="p">:</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Pool ``name``'s groups (`PagedKVConfig.keep_window`), from the attentions over it whose</span>
+<span class="sd">    ``sliding_window`` is shorter than its ``max_seq_len`` (a longer one keeps every token),</span>
+<span class="sd">    and what about them no pool can serve, before anything builds or sizes from it; a pool</span>
+<span class="sd">    with a problem keeps every token. A pool that keeps a window doesn't prefix cache yet, so</span>
+<span class="sd">    its ``prefix_cache`` goes off. Run by `KVSpec.derive`."""</span>
+    <span class="n">readers</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">spec</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+               <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="p">(</span><span class="n">AttentionSpec</span><span class="p">,</span> <span class="n">CrossAttentionSpec</span><span class="p">))</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span> <span class="o">==</span> <span class="n">name</span><span class="p">}</span>
+    <span class="n">paged</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="ow">and</span> <span class="n">cfg</span><span class="o">.</span><span class="n">layout</span> <span class="o">==</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">NHD</span>
+    <span class="n">problems</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">window_of</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># layer -&gt; its window</span>
+    <span class="n">reads_full</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">reader</span> <span class="ow">in</span> <span class="n">readers</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">reader</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">"sliding_window"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">paged</span><span class="p">:</span>
+            <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"attention </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2"> declares a sliding_window, which only a paged NHD pool keeps"</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">AttentionSpec</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span><span class="n">window</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">window</span> <span class="o">&gt;=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">):</span>
+            <span class="n">reads_full</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">elif</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">reader</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layers</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"attention </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2"> declares a sliding_window without the layers it runs (AttentionConfig.layers)"</span>
+            <span class="p">)</span>
+        <span class="k">elif</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">reader</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">layer</span> <span class="o">&lt;</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_layers</span><span class="p">:</span>
+                    <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"attention </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2"> declares layer </span><span class="si">{</span><span class="n">layer</span><span class="si">}</span><span class="s2">, past the pool's </span><span class="si">{</span><span class="n">cfg</span><span class="o">.</span><span class="n">num_layers</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="k">elif</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">window_of</span><span class="p">:</span>
+                    <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"layer </span><span class="si">{</span><span class="n">layer</span><span class="si">}</span><span class="s2"> is declared by two attentions"</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">window_of</span><span class="p">[</span><span class="n">layer</span><span class="p">]</span> <span class="o">=</span> <span class="n">window</span>
+    <span class="k">if</span> <span class="n">window_of</span><span class="p">:</span>
+        <span class="n">windows</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">window_of</span><span class="o">.</span><span class="n">values</span><span class="p">()))</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">windows</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="c1"># a derived page is whole for one window's layers and the rest</span>
+            <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"keeps one window, not the </span><span class="si">{</span><span class="n">windows</span><span class="si">}</span><span class="s2"> its attentions declare"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">reads_full</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">window_of</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">cfg</span><span class="o">.</span><span class="n">num_layers</span><span class="p">:</span>
+            <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">"keeps every token of the layers outside its window, which no attention reads"</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">reader</span> <span class="ow">in</span> <span class="n">readers</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">reader</span><span class="p">,</span> <span class="n">CrossAttentionSpec</span><span class="p">):</span>
+                <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"keeps a window, whose pages cross attention </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2"> doesn't read"</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">reader</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span><span class="p">,</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">):</span>
+                <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"keeps a window, whose pages only the flashinfer backend reads, "</span>
+                    <span class="sa">f</span><span class="s2">"not attention </span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">'s </span><span class="si">{</span><span class="n">reader</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="o">.</span><span class="n">value</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">paged</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">problems</span>
+    <span class="n">window</span><span class="p">,</span> <span class="n">layers</span> <span class="o">=</span> <span class="p">(</span><span class="n">windows</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">window_of</span><span class="p">)))</span> <span class="k">if</span> <span class="n">window_of</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">problems</span> <span class="k">else</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="p">())</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">cfg</span><span class="o">.</span><span class="n">keep_window</span><span class="p">(</span><span class="n">window</span><span class="p">,</span> <span class="n">layers</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
+        <span class="n">cfg</span><span class="o">.</span><span class="n">keep_window</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="p">())</span>
+        <span class="k">return</span> <span class="n">problems</span>
+    <span class="k">if</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">cfg</span><span class="o">.</span><span class="n">prefix_cache</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">cfg</span><span class="o">.</span><span class="n">prefix_cache_given</span><span class="p">:</span>
+            <span class="n">problems</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">"keeps a sliding window, which doesn't prefix cache yet; drop its prefix_cache: true"</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">problems</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"KV </span><span class="si">%s</span><span class="s2"> keeps a sliding window, which doesn't prefix cache yet: its prefix cache is off"</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+        <span class="n">cfg</span><span class="o">.</span><span class="n">prefix_cache</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">return</span> <span class="n">problems</span></div>
 
 
 

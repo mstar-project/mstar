@@ -1151,7 +1151,10 @@ travels with its other <code class="docutils literal notranslate"><span class="p
 <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp:</span> <span class="pre">true</span></code> is set as well: rank 0 then decides each hit and the other
 ranks adopt it. <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> can’t be combined with <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>, and the
 cache’s nodes must run on one TP group, with no replicas and no walks placed on other
-ranks. Loading fails otherwise.</p>
+ranks. Loading fails otherwise. A cache that keeps
+a sliding window (<code class="docutils literal notranslate"><span class="pre">AttentionConfig.sliding_window</span></code>) has no prefix cache yet: its
+<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> goes off (logged at info), and a serving config that sets
+<code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">true</span></code> on it is refused.</p>
 <p>On a single rank, a request waits at the head of its pool’s queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on
 a page only the prefix index holds counts as a page the request takes. A request that

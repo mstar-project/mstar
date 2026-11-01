@@ -1312,19 +1312,29 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    nowhere else to ride.</span>
 <span class="sd">    """</span>
 
-    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"pre_forks"</span><span class="p">,</span> <span class="s2">"post_forks"</span><span class="p">)</span>
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"pre_forks"</span><span class="p">,</span> <span class="s2">"post_forks"</span><span class="p">,</span> <span class="s2">"later_groups"</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">mapping</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanOutput</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">pre_forks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
         <span class="n">post_forks</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+        <span class="n">later_groups</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanOutput</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">mapping</span> <span class="ow">or</span> <span class="p">{})</span>
         <span class="c1"># applied by `plan`; the consumer mirrors them at plan time</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pre_forks</span> <span class="o">=</span> <span class="n">pre_forks</span>
         <span class="c1"># applied by `commit`, after this step's spans land</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">post_forks</span> <span class="o">=</span> <span class="n">post_forks</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">post_forks</span> <span class="o">=</span> <span class="n">post_forks</span>
+        <span class="c1"># the labels' plans in each group of the pool past the first (`PagedKVConfig.groups`)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">later_groups</span> <span class="o">=</span> <span class="n">later_groups</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">groups</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanOutput</span><span class="p">],</span> <span class="o">...</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The labels' plans in each group: these, then ``later_groups``, as `CacheStream.groups`</span>
+<span class="sd">        holds a stream's pages. Not a field, which would make every step's plan a reference</span>
+<span class="sd">        cycle, held with its indptrs until the cyclic GC runs."""</span>
+        <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">later_groups</span><span class="p">)</span></div>
 
 
 

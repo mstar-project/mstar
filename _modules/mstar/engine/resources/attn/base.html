@@ -995,8 +995,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FlashInferPrefillWrapper</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionResource</span><span class="p">,</span> <span class="n">EngineResourceInfo</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">,</span> <span class="n">RingKVConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">KVGroup</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">,</span> <span class="n">RingKVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 <span class="n">_BACKEND_KV_CONFIG</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">AttnBackend</span><span class="p">,</span> <span class="nb">type</span><span class="p">[</span><span class="n">KVConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
@@ -1040,6 +1041,27 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span></div>
 
 
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_window_pool</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">AttentionSpec</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The FlashInfer kernel to read a pool that keeps a window with. Only the kernels that</span>
+<span class="sd">        take any page size read its per-group page sizes and strided pages: FA2, and FA3 on</span>
+<span class="sd">        SM90 only. ``auto`` picks one of them below SM100, and from SM100 can send short rows</span>
+<span class="sd">        without a window to cuDNN, so there it becomes FA2. What doesn't depend on the device</span>
+<span class="sd">        is refused before any build (`derive_kv_groups`)."""</span>
+        <span class="n">kernel</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span>
+        <span class="n">capability</span> <span class="o">=</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">cuda_capability</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">sm100</span> <span class="o">=</span> <span class="n">capability</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">capability</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="c1"># FlashInfer has fa3 for SM90 only</span>
+        <span class="n">fa3</span> <span class="o">=</span> <span class="n">capability</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">capability</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">9</span>
+        <span class="n">allowed</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"fa2"</span><span class="p">,</span> <span class="s2">"fa3"</span><span class="p">)</span> <span class="k">if</span> <span class="n">fa3</span> <span class="k">else</span> <span class="p">(</span><span class="s2">"auto"</span><span class="p">,</span> <span class="s2">"fa2"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">kernel</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">allowed</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="si">!r}</span><span class="s2"> keeps a window, whose pages only FlashInfer's fa2 and fa3 "</span>
+                <span class="sa">f</span><span class="s2">"(SM90 only) kernels read, so flashinfer_backend=</span><span class="si">{</span><span class="n">kernel</span><span class="si">!r}</span><span class="s2"> can't on this GPU; "</span>
+                <span class="sa">f</span><span class="s2">"use </span><span class="si">{</span><span class="s1">' or '</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">allowed</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="s2">"fa2"</span> <span class="k">if</span> <span class="n">sm100</span> <span class="ow">and</span> <span class="n">kernel</span> <span class="o">==</span> <span class="s2">"auto"</span> <span class="k">else</span> <span class="n">kernel</span>
+
 <div class="viewcode-block" id="AttentionManager.build">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager.build">[docs]</a>
     <span class="nd">@classmethod</span>
@@ -1053,6 +1075,31 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the KV resource's own config, not a copy; per-rank head counts, and</span>
         <span class="c1"># `shard` is idempotent so both builders can call it</span>
         <span class="n">kv_config</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">dependency</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">)</span><span class="o">.</span><span class="n">config</span>
+        <span class="n">windowed</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">kv_config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">kv_config</span><span class="o">.</span><span class="n">groups</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sliding_window</span>
+        <span class="n">keeps_window</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">kv_config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="ow">and</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">window</span> <span class="o">&lt;</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">max_seq_len</span>
+        <span class="k">if</span> <span class="n">keeps_window</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">windowed</span><span class="p">:</span>
+            <span class="c1"># the pool derives its window from its attentions, which resolving the specs does</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"attention </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> declares a sliding_window, but KV </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="si">!r}</span><span class="s2"> "</span>
+                <span class="s2">"keeps no window: resolve the specs (resolve_spec_dependencies) before building them"</span>
+            <span class="p">)</span>
+        <span class="n">flashinfer_backend</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span>
+        <span class="k">if</span> <span class="n">windowed</span><span class="p">:</span>
+            <span class="c1"># the backend as resolved for this device; `derive_kv_groups` refuses a declared one</span>
+            <span class="c1"># earlier, so validation reports it</span>
+            <span class="k">if</span> <span class="n">backend</span> <span class="o">!=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="si">!r}</span><span class="s2"> keeps a window, whose pages only the flashinfer "</span>
+                    <span class="sa">f</span><span class="s2">"backend reads, not attention </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">'s </span><span class="si">{</span><span class="n">backend</span><span class="o">.</span><span class="n">value</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">flashinfer_backend</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_check_window_pool</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">flashinfer_backend</span> <span class="o">!=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="s2">"attention </span><span class="si">%r</span><span class="s2"> reads KV </span><span class="si">%r</span><span class="s2">, which keeps a window: flashinfer_backend=</span><span class="si">%r</span><span class="s2"> "</span>
+                    <span class="s2">"runs as </span><span class="si">%r</span><span class="s2"> on this GPU"</span><span class="p">,</span>
+                    <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span> <span class="n">flashinfer_backend</span><span class="p">,</span>
+                <span class="p">)</span>
         <span class="c1"># Before `shard`, so a mismatch is reported rather than half-applied to</span>
         <span class="c1"># a config the KV resource also holds.</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_BACKEND_KV_CONFIG</span><span class="p">:</span>
@@ -1124,11 +1171,12 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
                 <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
-                <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">flashinfer_backend</span><span class="p">,</span>
                 <span class="n">splits</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">splits</span><span class="p">,</span>
                 <span class="n">max_rows_in_combined</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">max_rows_in_combined</span><span class="p">,</span>
                 <span class="n">decode_tensor_cores</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_tensor_cores</span><span class="p">,</span>
                 <span class="n">sliding_window</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sliding_window</span><span class="p">,</span>
+                <span class="n">layers</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLEX</span><span class="p">:</span>
@@ -1212,18 +1260,23 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="captured_page_capacity">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.captured_page_capacity">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">captured_page_capacity</span><span class="p">(</span><span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">kv_config</span><span class="p">:</span> <span class="n">KVConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Page ids a captured wrapper's index buffer holds for a bucket of</span>
-<span class="sd">    ``num_rows`` rows and ``num_tokens`` tokens.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">captured_page_capacity</span><span class="p">(</span>
+    <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">kv_config</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span> <span class="n">group</span><span class="p">:</span> <span class="n">KVGroup</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Page ids a captured wrapper's index buffer holds for a bucket of ``num_rows`` rows and</span>
+<span class="sd">    ``num_tokens`` tokens, in pages of ``group`` (the pool's first by default).</span>
 
-<span class="sd">    Per row, not per pool: rows that matched one cached prefix all name its</span>
-<span class="sd">    pages, so a step can name more page ids than the pool holds. And at least</span>
-<span class="sd">    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,</span>
-<span class="sd">    whatever the pool's size."""</span>
-    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span>
-        <span class="n">num_rows</span> <span class="o">*</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
-        <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="o">+</span> <span class="n">num_rows</span><span class="p">,</span>
-    <span class="p">)</span></div>
+<span class="sd">    Per row, since rows that matched one cached prefix all name its pages, and at least the</span>
+<span class="sd">    bucket's own sink pages. A pool that keeps a window caches no prefix and forks nothing, so</span>
+<span class="sd">    its rows name at most the pool, or in the window's group a window each, plus the step."""</span>
+    <span class="n">group</span> <span class="o">=</span> <span class="n">group</span> <span class="ow">or</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">groups</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">step_pages</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">group</span><span class="o">.</span><span class="n">retention</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># a page more per row, which a row's share of the step can cross into</span>
+        <span class="k">return</span> <span class="n">num_rows</span> <span class="o">*</span> <span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">max_pages</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="n">step_pages</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">kv_config</span><span class="o">.</span><span class="n">groups</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">num_units</span> <span class="o">+</span> <span class="n">step_pages</span> <span class="o">+</span> <span class="n">num_rows</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="n">num_rows</span> <span class="o">*</span> <span class="n">kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span> <span class="n">step_pages</span> <span class="o">+</span> <span class="n">num_rows</span><span class="p">)</span></div>
 
 
 

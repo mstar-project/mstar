@@ -694,6 +694,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
@@ -707,6 +708,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.derive_specs"><code class="docutils literal notranslate"><span class="pre">derive_specs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.resolve_spec_dependencies"><code class="docutils literal notranslate"><span class="pre">resolve_spec_dependencies()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.spec_dependency_problems"><code class="docutils literal notranslate"><span class="pre">spec_dependency_problems()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.unknown_overrides_message"><code class="docutils literal notranslate"><span class="pre">unknown_overrides_message()</span></code></a></li>
@@ -735,13 +737,16 @@ what those configs already describe.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.apply_yaml_overrides" title="mstar.engine.resources.spec.apply_yaml_overrides"><code class="xref py py-obj docutils literal notranslate"><span class="pre">apply_yaml_overrides</span></code></a>(specs, model_config)</p></td>
 <td><p>Apply a deployment's <code class="docutils literal notranslate"><span class="pre">resources:</span></code> block to the specs it names.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.resolve_spec_dependencies" title="mstar.engine.resources.spec.resolve_spec_dependencies"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_spec_dependencies</span></code></a>(specs)</p></td>
-<td><p>Index specs by resource key, checking uniqueness and <code class="docutils literal notranslate"><span class="pre">depends_on</span></code>.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.derive_specs" title="mstar.engine.resources.spec.derive_specs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">derive_specs</span></code></a>(by_key)</p></td>
+<td><p>Run every spec's <cite>NodeResourceSpec.derive</cite>; each problem as (resource key, message).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.spec_dependency_problems" title="mstar.engine.resources.spec.spec_dependency_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_dependency_problems</span></code></a>(specs)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.resolve_spec_dependencies" title="mstar.engine.resources.spec.resolve_spec_dependencies"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_spec_dependencies</span></code></a>(specs)</p></td>
+<td><p>Index specs by resource key, checking uniqueness and <code class="docutils literal notranslate"><span class="pre">depends_on</span></code>, and derive what each takes from the others (<cite>NodeResourceSpec.derive</cite>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.spec_dependency_problems" title="mstar.engine.resources.spec.spec_dependency_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_dependency_problems</span></code></a>(specs)</p></td>
 <td><p>Every duplicate resource key and undeclared <code class="docutils literal notranslate"><span class="pre">depends_on</span></code> in <code class="docutils literal notranslate"><span class="pre">specs</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.unknown_overrides_message" title="mstar.engine.resources.spec.unknown_overrides_message"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unknown_overrides_message</span></code></a>(unknown, declared)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.unknown_overrides_message" title="mstar.engine.resources.spec.unknown_overrides_message"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unknown_overrides_message</span></code></a>(unknown, declared)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -864,6 +869,22 @@ into <code class="docutils literal notranslate"><span class="pre">EngineResource
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.derive">
+<span class="sig-name descname"><span class="pre">derive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.derive"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.derive" title="Link to this definition">#</a></dt>
+<dd><p>Set what this spec takes from the specs that read it (a KV pool keeps the window its
+attentions declare), after a deployment’s overrides; return what is wrong with it.
+Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies</cite>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.nodes">
 <span class="sig-name descname"><span class="pre">nodes</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.nodes" title="Link to this definition">#</a></dt>
@@ -943,8 +964,11 @@ any worker sees it.</p>
 <dd><p>Apply a deployment’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> block to the specs it names.</p>
 <p><code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{&lt;resource_key&gt;:</span> <span class="pre">{...}}</span></code>, one block per resource, so a model
 with two pools of the same kind (whisper’s decoder cache and its encoder
-context) can have each tuned on its own. An unknown key is an error: it
+context) can have each tuned on its own. An unknown key is a ValueError: it
 would otherwise be a silently ineffective setting.</p>
+<p>Then derives what the specs derive (<cite>resolve_spec_dependencies</cite>), with or without
+overrides and after them, so a deployment’s page size or backend is what the derivation
+checks, as validation checks it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -959,9 +983,24 @@ would otherwise be a silently ineffective setting.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.derive_specs">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.spec.</span></span><span class="sig-name descname"><span class="pre">derive_specs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">by_key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#derive_specs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.derive_specs" title="Link to this definition">#</a></dt>
+<dd><p>Run every spec’s <cite>NodeResourceSpec.derive</cite>; each problem as (resource key, message).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>by_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.spec.resolve_spec_dependencies">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.spec.</span></span><span class="sig-name descname"><span class="pre">resolve_spec_dependencies</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#resolve_spec_dependencies"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.resolve_spec_dependencies" title="Link to this definition">#</a></dt>
-<dd><p>Index specs by resource key, checking uniqueness and <code class="docutils literal notranslate"><span class="pre">depends_on</span></code>.</p>
+<dd><p>Index specs by resource key, checking uniqueness and <code class="docutils literal notranslate"><span class="pre">depends_on</span></code>, and derive what each
+takes from the others (<cite>NodeResourceSpec.derive</cite>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
@@ -1061,6 +1100,7 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.resource_key"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resource_key</span></code></a></li>
@@ -1074,6 +1114,7 @@ would otherwise be a silently ineffective setting.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.derive_specs"><code class="docutils literal notranslate"><span class="pre">derive_specs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.resolve_spec_dependencies"><code class="docutils literal notranslate"><span class="pre">resolve_spec_dependencies()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.spec_dependency_problems"><code class="docutils literal notranslate"><span class="pre">spec_dependency_problems()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.unknown_overrides_message"><code class="docutils literal notranslate"><span class="pre">unknown_overrides_message()</span></code></a></li>

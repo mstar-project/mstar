@@ -732,7 +732,7 @@ naming a backend in a spec does not load the others.</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.captured_page_capacity" title="mstar.engine.resources.attn.base.captured_page_capacity"><code class="xref py py-obj docutils literal notranslate"><span class="pre">captured_page_capacity</span></code></a>(num_rows, num_tokens, ...)</p></td>
-<td><p>Page ids a captured wrapper's index buffer holds for a bucket of <code class="docutils literal notranslate"><span class="pre">num_rows</span></code> rows and <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> tokens.</p></td>
+<td><p>Page ids a captured wrapper's index buffer holds for a bucket of <code class="docutils literal notranslate"><span class="pre">num_rows</span></code> rows and <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> tokens, in pages of <code class="docutils literal notranslate"><span class="pre">group</span></code> (the pool's first by default).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.resolve_attn_backend" title="mstar.engine.resources.attn.base.resolve_attn_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_attn_backend</span></code></a>(backend, device)</p></td>
 <td><p>The concrete backend for <code class="docutils literal notranslate"><span class="pre">backend</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code>.</p></td>
@@ -921,19 +921,19 @@ these outlive any single step.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.base.captured_page_capacity">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">captured_page_capacity</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#captured_page_capacity"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.captured_page_capacity" title="Link to this definition">#</a></dt>
-<dd><p>Page ids a captured wrapper’s index buffer holds for a bucket of
-<code class="docutils literal notranslate"><span class="pre">num_rows</span></code> rows and <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> tokens.</p>
-<p>Per row, not per pool: rows that matched one cached prefix all name its
-pages, so a step can name more page ids than the pool holds. And at least
-the bucket’s own pages: a capture’s rows name a SINK_PAGE per page of span,
-whatever the pool’s size.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">captured_page_capacity</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#captured_page_capacity"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.captured_page_capacity" title="Link to this definition">#</a></dt>
+<dd><p>Page ids a captured wrapper’s index buffer holds for a bucket of <code class="docutils literal notranslate"><span class="pre">num_rows</span></code> rows and
+<code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> tokens, in pages of <code class="docutils literal notranslate"><span class="pre">group</span></code> (the pool’s first by default).</p>
+<p>Per row, since rows that matched one cached prefix all name its pages, and at least the
+bucket’s own sink pages. A pool that keeps a window caches no prefix and forks nothing, so
+its rows name at most the pool, or in the window’s group a window each, plus the step.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>num_rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>num_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>kv_config</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><em>KVConfig</em></a>)</p></li>
+<li><p><strong>kv_config</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><em>PagedKVConfig</em></a>)</p></li>
+<li><p><strong>group</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVGroup" title="mstar.engine.resources.kv.config.KVGroup"><em>KVGroup</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>

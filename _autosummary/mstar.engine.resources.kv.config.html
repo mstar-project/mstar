@@ -693,6 +693,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVConfig.shard"><code class="docutils literal notranslate"><span class="pre">KVConfig.shard()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup"><code class="docutils literal notranslate"><span class="pre">KVGroup</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup.layers"><code class="docutils literal notranslate"><span class="pre">KVGroup.layers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup.page_size"><code class="docutils literal notranslate"><span class="pre">KVGroup.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup.retention"><code class="docutils literal notranslate"><span class="pre">KVGroup.retention</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVLayout"><code class="docutils literal notranslate"><span class="pre">KVLayout</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVLayout.MLA"><code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVLayout.NHD"><code class="docutils literal notranslate"><span class="pre">KVLayout.NHD</span></code></a></li>
@@ -722,6 +728,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec"><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">KVSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.config"><code class="docutils literal notranslate"><span class="pre">KVSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.derive"><code class="docutils literal notranslate"><span class="pre">KVSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 </ul>
@@ -741,18 +748,26 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.cpu_offload_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.cpu_offload_pages</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.groups"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.groups</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.keep_window"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.keep_window()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.kv_lora_rank"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.kv_lora_rank</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.latent_dim"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.latent_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.layout"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.layout</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_num_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_num_pages</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_seq_len"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.num_units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.num_units</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.page_size"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.pages_of"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.pages_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_salt"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_salt</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_tp"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_tp</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qk_rope_head_dim"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qk_rope_head_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qo_heads_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qo_heads_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.request_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.request_pages</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.stream_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.stream_pages()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.tokens_per_page"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.tokens_per_page</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.units()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan"><code class="docutils literal notranslate"><span class="pre">PrefixSpan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -766,6 +781,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy.context_budget"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.context_budget</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy.max_pages"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.max_pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy.protected_prefix"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.protected_prefix</span></code></a></li>
 </ul>
 </li>
@@ -834,37 +850,40 @@ without pulling FlashInfer in behind it.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVConfig</span></code></a>(*, num_layers, num_kv_heads, head_dim)</p></td>
 <td><p>The model geometry every KV storage strategy needs, and nothing else.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVLayout</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVGroup" title="mstar.engine.resources.kv.config.KVGroup"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVGroup</span></code></a>(layers, page_size[, retention])</p></td>
+<td><p>Layers of a paged pool that share a page size and a retention (<cite>PagedKVConfig.groups</cite>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVLayout</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVReqConfig" title="mstar.engine.resources.kv.config.KVReqConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVReqConfig</span></code></a>(needed_labels, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVReqConfig" title="mstar.engine.resources.kv.config.KVReqConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVReqConfig</span></code></a>(needed_labels, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVSpec" title="mstar.engine.resources.kv.config.KVSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVSpec</span></code></a>(resource_key, nodes, config[, leader])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVSpec" title="mstar.engine.resources.kv.config.KVSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVSpec</span></code></a>(resource_key, nodes, config[, leader])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVStep" title="mstar.engine.resources.kv.config.KVStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVStep</span></code></a>(segments, ...] | None = None, commit, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.KVStep" title="mstar.engine.resources.kv.config.KVStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVStep</span></code></a>(segments, ...] | None = None, commit, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></a>(*, num_layers, num_kv_heads, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></a>(*, num_layers, num_kv_heads, ...)</p></td>
 <td><p>Fixed-size pages, appended to as a sequence grows.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.PrefixSpan" title="mstar.engine.resources.kv.config.PrefixSpan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PrefixSpan</span></code></a>(length, advance, walk[, scratch, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.PrefixSpan" title="mstar.engine.resources.kv.config.PrefixSpan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PrefixSpan</span></code></a>(length, advance, walk[, scratch, ...])</p></td>
 <td><p>One write to a keyed stream, as the preprocess worker laid it out.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RetentionPolicy" title="mstar.engine.resources.kv.config.RetentionPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a>(context_budget[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RetentionPolicy" title="mstar.engine.resources.kv.config.RetentionPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a>(context_budget[, ...])</p></td>
 <td><p>FIFO retention for a stream that keeps committing (windowed / rolling generation): once the committed tokens behind <code class="docutils literal notranslate"><span class="pre">protected_prefix</span></code> exceed <code class="docutils literal notranslate"><span class="pre">context_budget</span></code>, the oldest unprotected pages are released.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVConfig" title="mstar.engine.resources.kv.config.RingKVConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVConfig</span></code></a>(*, num_layers, num_kv_heads, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVConfig" title="mstar.engine.resources.kv.config.RingKVConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVConfig</span></code></a>(*, num_layers, num_kv_heads, ...)</p></td>
 <td><p>A fixed horizon of frame slots per layer, overwritten in place.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVLayerConfig" title="mstar.engine.resources.kv.config.RingKVLayerConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVLayerConfig</span></code></a>(ring_frames, ring_buckets, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVLayerConfig" title="mstar.engine.resources.kv.config.RingKVLayerConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVLayerConfig</span></code></a>(ring_frames, ring_buckets, ...)</p></td>
 <td><p>One layer's ring geometry.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVStep" title="mstar.engine.resources.kv.config.RingKVStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVStep</span></code></a>([segments])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.RingKVStep" title="mstar.engine.resources.kv.config.RingKVStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RingKVStep</span></code></a>([segments])</p></td>
 <td><p>One ring clock per request in the step's batch.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamLayout</span></code></a>([spans, growth, scratch, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamLayout</span></code></a>([spans, growth, scratch, ...])</p></td>
 <td><p><cite>LabelLayout</cite> as the KV manager holds it.</p></td>
 </tr>
 </tbody>
@@ -942,6 +961,37 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 </dd>
 </dl>
 </dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVGroup">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">KVGroup</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">retention</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVGroup"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVGroup" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Layers of a paged pool that share a page size and a retention (<cite>PagedKVConfig.groups</cite>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>layers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>retention</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.RetentionPolicy" title="mstar.engine.resources.kv.config.RetentionPolicy"><em>RetentionPolicy</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVGroup.layers">
+<span class="sig-name descname"><span class="pre">layers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVGroup.layers" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVGroup.page_size">
+<span class="sig-name descname"><span class="pre">page_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVGroup.page_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVGroup.retention">
+<span class="sig-name descname"><span class="pre">retention</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.kv.config.RetentionPolicy" title="mstar.engine.resources.kv.config.RetentionPolicy"><span class="pre">RetentionPolicy</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVGroup.retention" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 </dd></dl>
 
@@ -1091,14 +1141,14 @@ resource built from <code class="docutils literal notranslate"><span class="pre"
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVReqConfig.pages">
-<span class="sig-name descname"><span class="pre">pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.pages" title="Link to this definition">#</a></dt>
-<dd><p>The most pages the request holds in a pool shared by <code class="docutils literal notranslate"><span class="pre">nodes</span></code>, at <code class="docutils literal notranslate"><span class="pre">caps</span></code>.</p>
+<span class="sig-name descname"><span class="pre">pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVReqConfig.pages" title="Link to this definition">#</a></dt>
+<dd><p>The most arena pages the request holds in <code class="docutils literal notranslate"><span class="pre">pool</span></code>, shared by <code class="docutils literal notranslate"><span class="pre">nodes</span></code>, at <code class="docutils literal notranslate"><span class="pre">caps</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>pool</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><em>PagedKVConfig</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1178,6 +1228,22 @@ storage strategy, so the config answers for them.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.config">
 <span class="sig-name descname"><span class="pre">config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><span class="pre">KVConfig</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.derive">
+<span class="sig-name descname"><span class="pre">derive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec.derive"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.derive" title="Link to this definition">#</a></dt>
+<dd><p>Set what this spec takes from the specs that read it (a KV pool keeps the window its
+attentions declare), after a deployment’s overrides; return what is wrong with it.
+Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies</cite>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.leader">
@@ -1263,7 +1329,7 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">PagedKVConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_layers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seq_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2048</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">128</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">KVLayout.NHD</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cpu_offload_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_cache_salt</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_cache</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_cache_tp</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_lora_rank</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">qk_rope_head_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">PagedKVConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_layers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seq_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2048</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">KVLayout.NHD</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cpu_offload_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_cache_salt</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_cache</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_cache_tp</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_lora_rank</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">qk_rope_head_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.engine.resources.kv.config.KVConfig" title="mstar.engine.resources.kv.config.KVConfig"><code class="xref py py-class docutils literal notranslate"><span class="pre">KVConfig</span></code></a></p>
 <p>Fixed-size pages, appended to as a sequence grows. The default.</p>
 <dl class="field-list simple">
@@ -1275,7 +1341,7 @@ resource stays free of the manager and its kernels.</p>
 <li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>max_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>max_num_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>layout</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><em>KVLayout</em></a>)</p></li>
 <li><p><strong>cpu_offload_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>prefix_cache_salt</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
@@ -1314,6 +1380,33 @@ resource stays free of the manager and its kernels.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.groups">
+<span class="sig-name descname"><span class="pre">groups</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.kv.config.KVGroup" title="mstar.engine.resources.kv.config.KVGroup"><span class="pre">KVGroup</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.groups" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.keep_window">
+<span class="sig-name descname"><span class="pre">keep_window</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">window</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.keep_window"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.keep_window" title="Link to this definition">#</a></dt>
+<dd><p>Keep about <code class="docutils literal notranslate"><span class="pre">window</span></code> tokens per request of <code class="docutils literal notranslate"><span class="pre">layers</span></code>, some of the pool’s, and every
+token of the rest; <code class="docutils literal notranslate"><span class="pre">layers</span></code> empty keeps every token of every layer.</p>
+<p>A page of either group is the same bytes, so both draw from one arena: with F full and
+S sliding layers, a page holds <code class="docutils literal notranslate"><span class="pre">tokens_per_page</span></code> tokens of the full layers or
+<code class="docutils literal notranslate"><span class="pre">tokens_per_page·F/S</span></code> of the sliding ones. Derived, it is (S/g)·k, g = gcd(F, S), for
+the smallest k that puts at least MIN_GROUP_PAGE tokens in a page of either group.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>window</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>layers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.kv_lora_rank">
 <span class="sig-name descname"><span class="pre">kv_lora_rank</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.kv_lora_rank" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -1339,14 +1432,48 @@ resource stays free of the manager and its kernels.</p>
 <span class="sig-name descname"><span class="pre">max_seq_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_seq_len" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.num_units">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">num_units</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.num_units" title="Link to this definition">#</a></dt>
+<dd><p>the bytes of <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Arena pages, each a page of one group’s layers</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.page_size">
-<span class="sig-name descname"><span class="pre">page_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">128</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.page_size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">page_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.page_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.pages_of">
+<span class="sig-name descname"><span class="pre">pages_of</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">units</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">round_up</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.pages_of"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.pages_of" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">units</span></code> arena pages in pages as <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> counts them, rounded down (what
+they hold), or with <code class="docutils literal notranslate"><span class="pre">round_up</span></code> up (what holds them).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>units</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>round_up</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache">
 <span class="sig-name descname"><span class="pre">prefix_cache</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_given">
+<span class="sig-name descname"><span class="pre">prefix_cache_given</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_given" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1375,7 +1502,52 @@ resource stays free of the manager and its kernels.</p>
 <dd><p>all but the sink page the KV manager takes at build.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Pages requests can hold</p>
+<dd class="field-odd"><p>Arena pages requests can hold</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.stream_pages">
+<span class="sig-name descname"><span class="pre">stream_pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layout</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">caps</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.stream_pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.stream_pages" title="Link to this definition">#</a></dt>
+<dd><p>The most arena pages a stream laid out as <code class="docutils literal notranslate"><span class="pre">layout</span></code> holds at <code class="docutils literal notranslate"><span class="pre">caps</span></code>: its pages in
+every group, each window group’s under that group’s retention.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>layout</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.StreamLayout" title="mstar.engine.resources.kv.config.StreamLayout"><em>StreamLayout</em></a>)</p></li>
+<li><p><strong>caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.tokens_per_page">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">tokens_per_page</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.tokens_per_page" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">page_size</span></code>, or where it is None
+DEFAULT_PAGE_SIZE, or with a window the smallest page whole for both groups
+(<cite>keep_window</cite>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Tokens a page of the first group’s layers holds</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.units">
+<span class="sig-name descname"><span class="pre">units</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pages</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.units"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.units" title="Link to this definition">#</a></dt>
+<dd><p>Arena pages in the bytes of <code class="docutils literal notranslate"><span class="pre">pages</span></code> pages as <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> counts them.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1462,6 +1634,26 @@ text prompt, say) are never released.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.RetentionPolicy.context_budget">
 <span class="sig-name descname"><span class="pre">context_budget</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.RetentionPolicy.context_budget" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.RetentionPolicy.max_pages">
+<span class="sig-name descname"><span class="pre">max_pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#RetentionPolicy.max_pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.RetentionPolicy.max_pages" title="Link to this definition">#</a></dt>
+<dd><p>The most pages of <code class="docutils literal notranslate"><span class="pre">page_size</span></code> a stream under this policy holds, with a step of
+<code class="docutils literal notranslate"><span class="pre">step</span></code> tokens past its prefix. <cite>KVManager._apply_retention</cite> leaves less than a page over
+the budget, so the window peaks at the protected prefix plus the budget, or at the prefix
+rounded up to a page if that is larger, plus a page of overrun and the step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>step</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.RetentionPolicy.protected_prefix">
@@ -1611,17 +1803,16 @@ padding session is a real, addressable span.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.StreamLayout.pages">
-<span class="sig-name descname"><span class="pre">pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">caps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#StreamLayout.pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.StreamLayout.pages" title="Link to this definition">#</a></dt>
-<dd><p>The most pages the stream can hold, where <code class="docutils literal notranslate"><span class="pre">caps</span></code> gives each growth loop’s iterations.</p>
-<p>Under <code class="docutils literal notranslate"><span class="pre">retention</span></code> the stream holds a window. <cite>KVManager._apply_retention</cite> leaves
-less than a page over the budget, so the window peaks at the protected prefix plus
-the budget, or at the prefix rounded up to a page if that is larger. The bound adds
-a page of overrun and the largest step past the prefix to that peak.</p>
+<span class="sig-name descname"><span class="pre">pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">caps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">retention</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#StreamLayout.pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.StreamLayout.pages" title="Link to this definition">#</a></dt>
+<dd><p>The most pages the stream can hold, where <code class="docutils literal notranslate"><span class="pre">caps</span></code> gives each growth loop’s iterations;
+under <code class="docutils literal notranslate"><span class="pre">retention</span></code> (the layout’s own where None), its window with the largest step past
+the prefix.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>retention</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.config.RetentionPolicy" title="mstar.engine.resources.kv.config.RetentionPolicy"><em>RetentionPolicy</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1765,6 +1956,12 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVConfig.shard"><code class="docutils literal notranslate"><span class="pre">KVConfig.shard()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup"><code class="docutils literal notranslate"><span class="pre">KVGroup</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup.layers"><code class="docutils literal notranslate"><span class="pre">KVGroup.layers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup.page_size"><code class="docutils literal notranslate"><span class="pre">KVGroup.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVGroup.retention"><code class="docutils literal notranslate"><span class="pre">KVGroup.retention</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVLayout"><code class="docutils literal notranslate"><span class="pre">KVLayout</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVLayout.MLA"><code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVLayout.NHD"><code class="docutils literal notranslate"><span class="pre">KVLayout.NHD</span></code></a></li>
@@ -1794,6 +1991,7 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec"><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">KVSpec.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.config"><code class="docutils literal notranslate"><span class="pre">KVSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.derive"><code class="docutils literal notranslate"><span class="pre">KVSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 </ul>
@@ -1813,18 +2011,26 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.cpu_offload_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.cpu_offload_pages</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.groups"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.groups</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.keep_window"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.keep_window()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.kv_lora_rank"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.kv_lora_rank</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.latent_dim"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.latent_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.layout"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.layout</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_num_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_num_pages</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_seq_len"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.num_units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.num_units</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.page_size"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.pages_of"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.pages_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_salt"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_salt</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_tp"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_tp</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qk_rope_head_dim"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qk_rope_head_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.qo_heads_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.qo_heads_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.request_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.request_pages</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.stream_pages"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.stream_pages()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.tokens_per_page"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.tokens_per_page</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.units()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan"><code class="docutils literal notranslate"><span class="pre">PrefixSpan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1838,6 +2044,7 @@ before the configs go out with every frame between workers.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy.context_budget"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.context_budget</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy.max_pages"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.max_pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.RetentionPolicy.protected_prefix"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.protected_prefix</span></code></a></li>
 </ul>
 </li>

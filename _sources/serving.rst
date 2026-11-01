@@ -379,7 +379,10 @@ travels with its other ``model_kwargs``. Above one rank the cache stays off unle
 ``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
-ranks. Loading fails otherwise.
+ranks. Loading fails otherwise. A cache that keeps
+a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
+``prefix_cache`` goes off (logged at info), and a serving config that sets
+``prefix_cache: true`` on it is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on
