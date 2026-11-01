@@ -304,6 +304,11 @@ class Resource(ABC):
         """record step consumption"""
         return
 
+    def step_host_rows(self) -> dict[str, torch.Tensor]:
+        """Row-addressed tensors of the step just run, copied to the host with
+        the stop buffers. Read right after the forward and not cloned."""
+        return {}
+
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
 

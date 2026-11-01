@@ -702,6 +702,11 @@ class Conductor:
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        # a model that builds its sampler config from its own keys would drop it unseen
+        if model_kwargs.get("return_logprobs") and not any(
+            getattr(cfg, "return_logprobs", False) for cfg in configs.values()
+        ):
+            raise ValueError("this model does not report logprobs; leave return_logprobs unset")
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs

@@ -61,6 +61,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
        decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
        batched across requests.
+   * - ``voxcpm2``
+     - ``openbmb/VoxCPM2``
+     - Tokenizer-free TTS: MiniCPM-4 base and residual LMs emit continuous latent
+       patches through a local flow-matching DiT, decoded by AudioVAE V2 in
+       streamed chunks. Zero-shot, voice design, and cloning from a clip. 48 kHz.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -375,6 +380,16 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
 
+With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
+YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
+token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
+token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
+with a 400. Top alternatives and OpenAI's ``logprobs`` are not supported yet. On
+any deployment,
+``"return_token_ids": true`` adds each text chunk's sampled ids
+(``{"token_ids": [...]}``), stop tokens included, so a trainer need not
+re-tokenize the text.
+
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
 
@@ -674,6 +689,36 @@ Fish Audio S2-Pro notes
 - Streamed audio matches the whole-utterance decode to within one int16 step:
   each codec window carries the decoder's whole receptive field as context, and
   the codec runs in fp32 with TF32 off.
+
+VoxCPM2 notes
+-------------
+
+- Install with ``pip install -e '.[voxcpm2]'`` and serve with
+  ``mstar serve voxcpm2 --gpus 0``. ``/v1/audio/speech`` takes the text alone
+  (zero-shot), a voice description in ``instructions`` (voice design), a
+  ``ref_audio`` clip (cloning) or ``ref_audio`` with its transcript in
+  ``ref_text`` (continuation). Output is 48 kHz.
+- The Talker's decode step (both LMs, the local DiT solve, the stop head) is
+  ``torch.compile``'d and captured as CUDA graphs at start-up, so a first
+  start-up with a cold Inductor cache takes 10 to 30 minutes (591 s on a
+  B200, 1,723 s on an H100), and about two minutes once the cache is warm.
+  ``model_kwargs: {compile_talker: false}``
+  in the deployment YAML captures the eager step instead: on a B200 the server
+  is up in about 15 seconds, with about a third less throughput at
+  concurrency 1 and a sixth less at concurrency 8.
+- A request may hold the whole 8,192-position context, and nothing preempts a
+  request once a KV cache is full, so each LM's cache defaults to 2,049 pages
+  (32 such requests and the sink page, about 9.7 GB for both) and the YAML sets
+  ``max_concurrent_requests: 32``; the conductor queues the rest. Start-up
+  refuses a cap the caches cannot hold, so raise ``resources.base_kv`` and
+  ``resources.res_kv`` ``max_num_pages`` with it. Text over
+  ``max_text_tokens`` (1,365 by default) gets a 400: English speech runs at up
+  to about 2.9 patches per token, so longer text may not fit in the
+  4,096-patch (655 s) audio budget.
+- One request with long text can end early: on some seeds the stop head fires
+  mid-text, as it does in the official ``voxcpm`` package (a 983-character
+  Russian text stopped about three quarters of the way in on 5 of 10 seeds
+  there). Split long text into several requests.
 
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------

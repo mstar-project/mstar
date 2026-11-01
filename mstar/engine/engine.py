@@ -59,6 +59,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StepOrder,
     StopCheck,
 )
 from mstar.platforms.compile import with_inductor_overrides
@@ -1413,6 +1414,7 @@ class Engine:
                 phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
+            self._add_resource_host_rows(submodule_mgmt, out)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -1437,6 +1439,23 @@ class Engine:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
+
+    @staticmethod
+    def _add_resource_host_rows(
+        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput,
+    ) -> None:
+        """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
+        for key, resource in submodule_mgmt.resources.items():
+            if not (rows := resource.step_host_rows()):
+                continue
+            if out.check_stop_buffers is None:
+                raise RuntimeError(
+                    f"resource {key!r} has rows for the host (e.g. log-probs), but this node's "
+                    "forward hands over no row-addressed stop buffers",
+                )
+            if clash := rows.keys() & out.check_stop_buffers.keys():
+                raise RuntimeError(f"resource {key!r} adds host rows {sorted(clash)} the step already has")
+            out.check_stop_buffers = {**out.check_stop_buffers, **rows}
 
     def _exec_per_request(
         self, batch: ExecutingBatch
@@ -2341,6 +2360,10 @@ class Engine:
     def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
         """Rows of ``graph_walk`` a step mixing it with another walk may hold."""
         return self._submodules[node_name].submodule.max_rows_in_combined(graph_walk)
+
+    def get_step_order(self, node_name: str, graph_walk: str) -> StepOrder:
+        """The submodule's ``step_order`` for ``graph_walk``."""
+        return self._submodules[node_name].submodule.step_order(graph_walk)
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
