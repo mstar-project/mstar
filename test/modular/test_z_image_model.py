@@ -171,6 +171,15 @@ def test_text_node_pads_prompts_to_the_reference_length():
     assert (batch[TEXT_INPUTS][1, 7:] == config.text_encoder.pad_token_id).all()
 
 
+def test_text_encoder_batch_cap_is_a_deployment_key():
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import ZImageTextEncoderSubmodule
+
+    assert _make_model().text_encoder_max_batch_size == 8
+    assert _make_model(text_encoder_max_batch_size=1).text_encoder_max_batch_size == 1
+    assert ZImageTextEncoderSubmodule(None, ZImageConfig(), max_batch_size=1).max_batch_size("encode_text") == 1
+
+
 def test_requests_above_max_image_area_are_rejected():
     """An unbounded size let one request occupy the worker for minutes; the default cap is 2048^2 pixels."""
     import pytest

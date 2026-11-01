@@ -107,6 +107,7 @@ class Flux2KleinModel(Model):
         capture_edit_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        text_encoder_max_batch_size: int | None = None,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         async_scheduling: bool = True,
@@ -139,6 +140,8 @@ class Flux2KleinModel(Model):
         )
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        # prompts in one text encoder step, max_batch_size unless set; see PromptEncoderSubmodule for why 1 exists
+        self.text_encoder_max_batch_size = int(text_encoder_max_batch_size or max_batch_size)
         # largest output (pixels) a request may ask for: an unbounded size lets one request occupy the worker for
         # minutes (8192^2 = 262k tokens of quadratic attention); requests above it are rejected before scheduling
         self.max_image_area = int(max_image_area)
@@ -489,7 +492,7 @@ class Flux2KleinModel(Model):
         if node_name == "text_encoder":
             encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device)
             return Qwen3TextEncoderSubmodule(
-                encoder, self.config.text_encoder, max_batch_size=self.max_batch_size,
+                encoder, self.config.text_encoder, max_batch_size=self.text_encoder_max_batch_size,
                 capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
             )
         if node_name == "vae_encoder":
