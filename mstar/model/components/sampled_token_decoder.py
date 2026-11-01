@@ -78,6 +78,8 @@ from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     SAMPLER = SAMPLER
+    # the text-only prompt's walk; a model whose graph names it otherwise sets this
+    PREFILL_WALK = "prefill_text"
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
 
@@ -193,7 +195,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
             PackedAcceleratorGraphConfig(
-                capture_graph_walk="prefill_text",
+                capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
@@ -225,7 +227,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
 
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
-        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == "prefill_text" else None
+        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == self.PREFILL_WALK else None
 
     # ------------------------------------------------------------------
     # Inputs
@@ -444,8 +446,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def _is_prefill_walk(self, walk: str) -> bool:
-        # every walk but decode is a one-pass prefill that samples the first token
-        return walk == "prefill_text" or walk in self._media_walks
+        # each is a one-pass prefill that samples the first token
+        return walk == self.PREFILL_WALK or walk in self._media_walks
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each; the prefill walks feed
