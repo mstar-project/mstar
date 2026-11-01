@@ -34,6 +34,7 @@ from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSu
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
 from mstar.model.components.diffusion.prompt_encoder import PromptEncoderSubmodule
+from mstar.model.components.diffusion.qwen3.encoder import compiled_encoder_forward
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -93,8 +94,28 @@ class ZImageTextEncoderSubmodule(PromptEncoderSubmodule):
     learned pad token). ``text_inputs`` arrives unpadded; rows are right-padded to the
     encoder's ``max_sequence_length`` (512), as the reference pipeline pads them: the real
     tokens' values do not depend on the padding mathematically, but the attention kernel's
-    accumulation order does, so the padded length is part of bit-exactness. Requests of any
+    accumulation order does, so the padded length is part of bit-exactness. With
+    ``compile_encoder`` rows pad only to the batch's longest caption bucket and the encoder runs
+    compiled, which gives up that last bit for a forward a third of the time. Requests of any
     length batch together."""
+
+    def __init__(
+        self, encoder: nn.Module, config: ZImageConfig, max_batch_size: int = 16, compile_encoder: bool = False,
+    ):
+        super().__init__(encoder, config, max_batch_size)
+        self._compiled_encoder = None
+        if compile_encoder:
+            # dynamo guards on requires_grad, so it is cleared before the warmup, as for the VAE
+            encoder.requires_grad_(False)
+            self._compiled_encoder = compiled_encoder_forward(encoder)
+            self.warmup()
+
+    def warmup(self) -> None:
+        """Compile at load, not in the first requests: one graph for a single row, one for several."""
+        for rows in (1, 2):
+            ids = torch.zeros((rows, SEQ_MULTIPLE), dtype=torch.long)
+            with torch.no_grad():
+                self._encode(ids, torch.ones_like(ids))
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         ids = inputs[TEXT_INPUTS][0]
@@ -103,6 +124,8 @@ class ZImageTextEncoderSubmodule(PromptEncoderSubmodule):
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         lengths = [int(inp.tensor_inputs[TEXT_INPUTS].shape[0]) for inp in inputs]
         width = self.config.text_encoder.max_sequence_length
+        if self._compiled_encoder is not None:
+            width = padded_length(max(lengths))
         pad_id = self.config.text_encoder.pad_token_id
         ids = torch.full((len(inputs), width), pad_id, dtype=torch.long)
         mask = torch.zeros((len(inputs), width), dtype=torch.long)
@@ -114,7 +137,7 @@ class ZImageTextEncoderSubmodule(PromptEncoderSubmodule):
 
     def _encode(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         device = self.get_device()
-        hidden = self.encoder(ids.to(device), mask.to(device)).to(self.encoder.dtype)
+        hidden = (self._compiled_encoder or self.encoder)(ids.to(device), mask.to(device)).to(self.encoder.dtype)
         # zero the pad rows: the DiT replaces them, and the parity tests compare real rows only
         return hidden * mask.to(device=device, dtype=hidden.dtype)[..., None]
 

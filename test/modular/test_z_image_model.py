@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 sys.path.insert(0, ".")
 
@@ -178,6 +180,72 @@ def test_text_encoder_batch_cap_is_a_deployment_key():
     assert _make_model().text_encoder_max_batch_size == 8
     assert _make_model(text_encoder_max_batch_size=1).text_encoder_max_batch_size == 1
     assert ZImageTextEncoderSubmodule(None, ZImageConfig(), max_batch_size=1).max_batch_size("encode_text") == 1
+
+
+def _tiny_encoder():
+    from mstar.model.components.diffusion.qwen3.encoder import Qwen3HiddenStateEncoder
+
+    torch.manual_seed(0)
+    encoder = Qwen3HiddenStateEncoder(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_heads=4, num_kv_heads=2, head_dim=8,
+        rms_norm_eps=1e-6, rope_theta=10000.0, tap_layers=(2,),
+    )
+    for param in encoder.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    return encoder.float().eval()
+
+
+def test_compiled_caption_encoder_is_the_masked_forward(monkeypatch):
+    from mstar.model.components.diffusion.qwen3.encoder import compiled_encoder_forward
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    encoder = _tiny_encoder()
+    forward = compiled_encoder_forward(encoder)
+    ids = torch.randint(1, 64, (2, 12))
+    mask = torch.ones_like(ids)
+    mask[:, 9:] = 0
+    with torch.no_grad():
+        assert torch.equal(forward(ids, mask), encoder(ids, mask))
+        # a batch with no padding takes the mask path too: the choice would be a host sync
+        full = torch.ones_like(ids)
+        assert torch.allclose(forward(ids, full), encoder(ids, full), atol=1e-5)
+
+
+def test_compiled_text_node_pads_to_the_longest_caption_bucket(monkeypatch):
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import TEXT_EMBEDS, TEXT_INPUTS, ZImageTextEncoderSubmodule
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    config = ZImageConfig()
+    config = dataclasses.replace(config, text_encoder=dataclasses.replace(config.text_encoder, pad_token_id=0))
+    node = ZImageTextEncoderSubmodule(_tiny_encoder(), config, compile_encoder=True)
+    rows = []
+    for rid, n in (("a", 40), ("b", 7)):
+        info = CurrentForwardPassInfo(
+            request_id=rid, graph_walk="encode_text", fwd_index=0, random_seed=0, max_tokens=0,
+        )
+        rows.append(node.prepare_inputs("encode_text", info, {TEXT_INPUTS: [torch.arange(1, n + 1) % 64]}))
+    batch = node.preprocess("encode_text", None, rows)
+    assert batch[TEXT_INPUTS].shape == (2, 64) == batch["text_mask"].shape
+    assert batch["text_mask"].sum(dim=1).tolist() == [40, 7]
+    engine_inputs = type("Inputs", (), {"request_ids": ["a", "b"]})()
+    with torch.no_grad():
+        out = node.forward_batched("encode_text", engine_inputs, **batch)
+    # each row comes back at its own caption bucket
+    assert out["a"][TEXT_EMBEDS][0].shape[1] == 64 and out["b"][TEXT_EMBEDS][0].shape[1] == 32
+
+
+def test_text_compile_is_an_amd_override():
+    from mstar.platforms.serving_config import apply_platform_overrides
+
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    assert "text_compile" not in apply_platform_overrides(config, "cuda")["model_kwargs"]
+    rocm = apply_platform_overrides(config, "rocm")["model_kwargs"]
+    assert rocm["text_compile"] is True
+    # the override replaces the key whole, so it has to carry every other setting
+    assert {**rocm, "text_compile": None} == {**config["model_kwargs"], "text_compile": None}
 
 
 def test_requests_above_max_image_area_are_rejected():
