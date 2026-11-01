@@ -86,7 +86,6 @@ class ARSubmodule(ARNodeSubmodule):
     # The top decode bucket is also the cap on rows per AR step; a step
     # costs about the same at 64 rows as at 32, so 64 streams do not run as
     # two alternating batches, and padding a batch up to 32 or 64 is cheap.
-    # Each bucket is a compile of its own (~3 min on a cold Inductor cache).
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     MAX_BATCH_SIZE = DECODE_CAPTURE_BATCH_SIZES[-1]
     # Plain prompts are short (the chat frame around one text). Eager, a
@@ -386,7 +385,7 @@ class ARSubmodule(ARNodeSubmodule):
                     kwargs={"suppress_eos": False},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-                compile=True,
+                compile=False,
             )
         ]
 
