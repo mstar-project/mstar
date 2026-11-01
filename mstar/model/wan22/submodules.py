@@ -1,4 +1,5 @@
-"""Wan2.2-TI2V-5B node submodules (all four declare no engine resources).
+"""Wan2.2-TI2V-5B node submodules (nothing here is cached across steps; the dit's
+attention runs on the engine's ragged attention resources).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
@@ -21,12 +22,23 @@ the v1 engine supplies neither the autocast nor the no-grad wrapper.
 import logging
 import os
 from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import (
+    AttentionStep,
+    RaggedCrossAttentionStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    cross_label,
+)
+from mstar.engine.resources.convenience import RaggedAttentionCallable
+from mstar.model.components.diffusion.attention import RaggedAttentionFn
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.components.unipc import (
     SOLVER_ORDER,
@@ -37,7 +49,7 @@ from mstar.model.wan22.components.unipc import (
     unipc_effective_order,
     unipc_predictor_step,
 )
-from mstar.model.wan22.config import Wan22Config
+from mstar.model.wan22.config import DIT_ATTN, DIT_XATTN, TEXT_SPAN, VIDEO_SPAN, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +188,17 @@ def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, in
     h_lat = int(step_metadata["height"]) // config.vae_scale_factor_spatial
     w_lat = int(step_metadata["width"]) // config.vae_scale_factor_spatial
     return t_lat, h_lat, w_lat
+
+
+class Wan22StepInfo(NamedTuple):
+    """What one request's denoise step attends over: the video tokens of each
+    guidance branch, the text tokens each branch's cross-attention reads, and
+    whether both branches run (CFG). Built in ``prepare_inputs`` from host facts,
+    read back by ``declare_step``."""
+
+    video_tokens: int
+    text_tokens: int
+    cfg: bool
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +373,13 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     is replaced by it and its per-token timestep zeroed, and the conditioning is
     written back into the output latents only on the final iteration, matching the
     reference's post-loop injection.
+
+    With ``use_ragged_attention`` the transformer's attention runs on the engine's
+    ragged resources (``DIT_ATTN`` over each guidance branch's video tokens,
+    ``DIT_XATTN`` over the text): ``prepare_inputs`` stamps the step's spans on
+    ``NodeInputs.resource_step_info`` and ``declare_step`` declares them, one
+    segment per branch in the order of the batch-2 forward, so the engine plans
+    the layouts before the forward. Otherwise the transformer runs SDPA.
     """
 
     # Mirrors Wan22Model.VIDEO_GEN_I2V_WALK; importing the model here would be a
@@ -365,10 +395,14 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     # leaving the solver, CFG combine, and everything touching sigma eager.
     disable_torch_compile = True
 
-    def __init__(self, transformer: nn.Module, config: Wan22Config):
+    def __init__(self, transformer: nn.Module, config: Wan22Config, use_ragged_attention: bool = False):
         super().__init__()
         self.transformer = transformer
         self.config = config
+        self._use_ragged_attention = bool(use_ragged_attention)
+        # one callable per attention kind for the life of a resource binding: the
+        # compiled region guards on their identity
+        self._ragged_fns: tuple[RaggedAttentionFn, RaggedAttentionFn] | None = None
         self._record_fp32_islands()
         # Compile the inner DiT region only (tensors in, tensor out; nothing
         # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
@@ -394,6 +428,68 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 "shapes and the UniPC solver run eager.",
                 sorted(self._compile_grids),
             )
+
+    def bind_node_resources(self, resources) -> None:
+        super().bind_node_resources(resources)
+        self._ragged_fns = None  # the memoized callables hold the old resources
+
+    def _ragged_attention(self) -> tuple[RaggedAttentionFn, RaggedAttentionFn] | None:
+        """The self- and cross-attention callables over the step's packed rows,
+        or None when the transformer runs SDPA (no resource bound)."""
+        if not self._use_ragged_attention:
+            return None
+        if self._ragged_fns is None:
+            self_attn = self.node_resources.get(DIT_ATTN)
+            cross_attn = self.node_resources.get(DIT_XATTN)
+            if self_attn is None or cross_attn is None:
+                return None
+            self._ragged_fns = (
+                RaggedAttentionCallable(self_attn, VIDEO_SPAN),
+                RaggedAttentionCallable(cross_attn, cross_label(VIDEO_SPAN, TEXT_SPAN)),
+            )
+        return self._ragged_fns
+
+    def _step_info(self, tensor_inputs: dict[str, torch.Tensor], step_metadata: dict) -> Wan22StepInfo:
+        """The spans this step's attention declares, from host facts: the latent
+        grid's token count (the patch over ``[1, C, T, H, W]``), the text length,
+        and whether CFG runs both branches (as ``_noise_prediction`` decides)."""
+        _, _, t_lat, h_lat, w_lat = tensor_inputs["latents"].shape
+        p_t, p_h, p_w = self.config.patch_size
+        guidance_scale = float(step_metadata.get("guidance_scale", self.config.guidance_scale))
+        return Wan22StepInfo(
+            video_tokens=(t_lat // p_t) * (h_lat // p_h) * (w_lat // p_w),
+            text_tokens=int(tensor_inputs["text_embeds_pos"].shape[1]),
+            cfg=guidance_scale > 1.0,
+        )
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases=None,
+        **kwargs,
+    ) -> SubmoduleStep | None:
+        """The ragged resources' step: one video segment per guidance branch, in
+        the row order of the CFG forward (conditional first), and the text span
+        each branch's cross-attention reads."""
+        if not self._use_ragged_attention:
+            return None
+        video, text = [], []
+        for rid, inp in zip(request_ids, inputs, strict=True):
+            info: Wan22StepInfo = inp.resource_step_info
+            for _ in range(2 if info.cfg else 1):
+                video.append(Segment(rid, VIDEO_SPAN, info.video_tokens))
+                text.append(Segment(rid, TEXT_SPAN, info.text_tokens))
+        return SubmoduleStep(
+            steps={
+                DIT_ATTN: AttentionStep(segments=tuple(video), causal=False),
+                DIT_XATTN: RaggedCrossAttentionStep(
+                    segments=tuple(video + text), pairs=((VIDEO_SPAN, TEXT_SPAN),),
+                ),
+            },
+        )
 
     def prepare_inputs(
         self,
@@ -444,7 +540,8 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             tensor_inputs["time_index"] = time_index
             tensor_inputs["unipc_model_outputs"] = inputs["unipc_model_outputs"][0]
             tensor_inputs["unipc_last_sample"] = inputs["unipc_last_sample"][0]
-        return NodeInputs(tensor_inputs=tensor_inputs)
+        step_info = self._step_info(tensor_inputs, fwd_info.step_metadata) if self._use_ragged_attention else None
+        return NodeInputs(tensor_inputs=tensor_inputs, resource_step_info=step_info)
 
     def forward(
         self,
@@ -553,10 +650,15 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         transformer = self.transformer
         if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
             transformer = self._eager_forward[1]
+        attention = {}
+        ragged = self._ragged_attention()
+        if ragged is not None:
+            attention = {"ragged_self": ragged[0], "ragged_cross": ragged[1]}
         out = transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+            **attention,
         )
         if not do_cfg:
             return out

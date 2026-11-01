@@ -22,6 +22,7 @@ KNOBS: dict[str, str] = {
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
+    "dit_exact_ops": "MSTAR_DIT_EXACT_OPS",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -204,3 +205,12 @@ def step_thread_core() -> str | int:
     raise ValueError(
         f"MSTAR_STEP_THREAD_CORE must be auto, off or a CPU number, got {value!r}"
     )
+
+
+def dit_exact_ops() -> bool:
+    """``dit_exact_ops`` / ``MSTAR_DIT_EXACT_OPS`` (default on, off for AMD
+    GPUs): whether a compiled DiT transformer keeps the op classes its model
+    config lists under ``compile_exact_ops`` on the eager kernels. Off
+    compiles them with the rest, so inductor can fuse each norm with its
+    modulation and residual."""
+    return _setting("dit_exact_ops", "1") == "1"

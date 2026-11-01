@@ -235,5 +235,6 @@ def test_the_config_examples_uncomment_into_one_model_kwargs_block() -> None:
     text = "\n".join(out)
     assert text.count("\nmodel_kwargs:") == 1
     kwargs = yaml.safe_load(text)["model_kwargs"]
-    assert set(kwargs) == {"vae_decode_fast_sizes", "vae_decode_fast", "compile_dit_sizes", "max_video_pixels"}
+    assert set(kwargs) == {"vae_decode_fast_sizes", "vae_decode_fast", "compile_dit_sizes", "max_video_pixels",
+                           "attention_backend"}
     _model(**kwargs)

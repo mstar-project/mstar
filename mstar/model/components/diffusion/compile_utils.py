@@ -14,6 +14,8 @@ from collections.abc import Iterable, Sequence
 import torch
 from torch import nn
 
+from mstar.utils import knobs
+
 logger = logging.getLogger(__name__)
 
 # Modules whose eager CUDA kernels differ in the last bit from inductor's decompositions, by class:
@@ -67,7 +69,14 @@ def compile_transformer_forward(
     activation decompositions round differently: ``exact_ops`` keeps those modules eager
     (``exclude_from_compile``) and compiles the rest — ``True`` for all of them, or a list of the
     op classes to keep eager (``["norms"]``, ``["activations"]``), since each excluded module is a
-    graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%)."""
+    graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%).
+
+    The ``dit_exact_ops`` knob (off by default on AMD GPUs) drops ``exact_ops``, so a model
+    config can keep its CUDA setting while each platform decides whether it applies."""
+    if exact_ops and not knobs.dit_exact_ops():
+        logger.info("compile_exact_ops %s not applied: the dit_exact_ops knob is off (`knobs: dit_exact_ops: "
+                    "true` keeps those modules eager)", exact_ops)
+        exact_ops = False
     types = exact_op_types(exact_ops)
     if types:
         excluded = exclude_from_compile(transformer, types)
