@@ -347,7 +347,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``load_*`` and ``process_prompt`` are thread-safe, so a value above 1 for a
        class that leaves it at 1 fails at startup, as does a value that is not a
        positive integer. 1 prepares one request at a time on the data-worker thread.
-       Requests are still handed to the conductor in arrival order.
+       The pool takes at most the CPUs left after ``step_thread_core``'s pins, as
+       the API server's other pools do. Requests are still handed to the
+       conductor in arrival order.
    * - ``api_switch_interval_s``
      - *(optional)* GIL switch interval of the API server process, in seconds
        (``sys.setswitchinterval``), a positive number; an explicit ``null`` keeps

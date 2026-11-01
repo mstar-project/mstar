@@ -191,8 +191,10 @@ def _positive_int(name: str, value: Any) -> int:
 
 def preprocess_workers(model: Model | None, model_config: dict | None) -> int:
     """``preprocess_workers`` from the serving config, else the model's
-    ``PREPROCESS_WORKERS``. A class value of 1 says its ``load_*`` and
-    ``process_prompt`` are not thread-safe, so the config cannot add a pool."""
+    ``PREPROCESS_WORKERS``, at most the CPUs the process's plan leaves
+    unpinned, as the other pools are. A class value of 1 says its ``load_*``
+    and ``process_prompt`` are not thread-safe, so the config cannot add a
+    pool."""
     if model is None:
         return 1
     declared = _positive_int(f"{type(model).__name__}.PREPROCESS_WORKERS", model.PREPROCESS_WORKERS)
@@ -202,7 +204,7 @@ def preprocess_workers(model: Model | None, model_config: dict | None) -> int:
             f"preprocess_workers is {workers}, but {type(model).__name__}.PREPROCESS_WORKERS is 1: "
             "its load_* and process_prompt are not declared thread-safe"
         )
-    return workers
+    return min(workers, cpus.plan().left)
 
 
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
