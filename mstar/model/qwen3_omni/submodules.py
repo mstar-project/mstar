@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 #
 # Five submodules covering the full Thinker-Talker dual-AR pipeline:
-#   1. the audio encoder: Qwen3-ASR's AuT node (mstar.model.qwen3_asr)
+#   1. AudioEncoderSubmodule
 #   2. VisionEncoderSubmodule
 #   3. ThinkerSubmodule        (3D MRoPE, MoE, layer captures)
 #   4. TalkerSubmodule         (streaming decode, Code Predictor)
