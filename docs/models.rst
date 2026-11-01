@@ -783,12 +783,11 @@ Fish Audio S2-Pro notes
   it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
   4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
 - Each codec window carries the decoder's whole receptive field as context.
-  With ``model_kwargs: {codec_exact_fp32: true}`` the codec runs in fp32 with
-  TF32 off and the streamed audio matches the whole-utterance decode to within
-  one int16 step. The shipped ``configs/fish_s2_pro.yaml`` sets it to ``false``:
-  TF32 halves the codec's conv stack, most of the GPU time under concurrency
-  (c=32 throughput +35% on an H200), and the audio stays within ~60 dB SNR of
-  the exact decode.
+  The codec decodes with TF32 by default: TF32 halves its conv stack, most of
+  the GPU time under concurrency (c=32 throughput +35% on an H200), and the
+  audio stays within ~60 dB SNR of the exact decode. With
+  ``model_kwargs: {codec_exact_fp32: true}`` it runs in fp32 with TF32 off and
+  the streamed audio matches the whole-utterance decode to within one int16 step.
 
 VoxCPM2 notes
 -------------

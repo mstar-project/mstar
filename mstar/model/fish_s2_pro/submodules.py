@@ -418,7 +418,7 @@ class CodecSubmodule(ARNodeSubmodule):
     disable_autocast = True
     MAX_BATCH_SIZE = 32
 
-    def __init__(self, decoder: FishDACDecoder, config: FishS2ProConfig, *, exact_fp32: bool = True):
+    def __init__(self, decoder: FishDACDecoder, config: FishS2ProConfig, *, exact_fp32: bool = False):
         super().__init__()
         self.decoder = decoder
         self.config = config
