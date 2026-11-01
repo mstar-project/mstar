@@ -79,14 +79,22 @@ logger = logging.getLogger(__name__)
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
     """What the conductor needs of each walk to run a plan: the ``(name, node)``
     inputs it sends on entry (the walk's external and loop-back inputs, less
-    the streamed ones), the names the walk persists, and the walks a stream
-    feeds that are bare nodes (a chunk loop aside), which run once per chunk."""
+    the streamed ones and the loop-backs a node ahead of their Loop feeds), the
+    names the walk persists, and the walks a stream feeds that are bare nodes
+    (a chunk loop aside), which run once per chunk."""
     inputs, persists, repeating = {}, {}, set()
     for walk, graph in model.get_graph_walk_graphs().items():
         io = graph.get_inputs_outputs()
         streamed = streamed_inputs(model, walk, graph)
-        inputs[walk] = tuple(sorted((io.ext_inputs | io.loop_back) - streamed))
         loops = graph.get_loops()
+        # a loop-back whose first iteration a node outside its Loop feeds
+        # (V-JEPA 2's encoder ahead of its rollout) is the walk's own to seed
+        fed = set()
+        for loop in loops.values():
+            inside = loop.get_nodes()
+            fed |= {(edge.name, edge.next_node) for name, node in graph.get_nodes().items() if name not in inside
+                    for edge in node.outputs if edge.next_node in inside}
+        inputs[walk] = tuple(sorted((io.ext_inputs | (io.loop_back - fed)) - streamed))
         edges = [edge for node in graph.get_nodes().values() for edge in node.outputs]
         edges += [edge for loop in loops.values() for edge in loop.outputs + loop.accumulated_outputs]
         persists[walk] = frozenset(edge.name for edge in edges if edge.persist)

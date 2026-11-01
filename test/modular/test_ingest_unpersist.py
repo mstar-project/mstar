@@ -407,6 +407,25 @@ def _diffusion(refine=False):
     ]
 
 
+def _fed_loop():
+    """V-JEPA 2's rollout: the encoder ahead of the loop feeds its first
+    iteration the name the loop then carries, so that loop-back gets no seed."""
+    walks = {"rollout": Sequential([
+        GraphNode(name="enc", input_names=["video"], outputs=[GraphEdge(next_node="roll", name="hidden")]),
+        Loop(name="rollout_loop", max_iters=4, outputs=[], section=GraphNode(
+            name="roll", input_names=["hidden"], outputs=[
+                GraphEdge(next_node="roll", name="hidden"),
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="pred", output_modality="video"),
+            ],
+        )),
+    ])}
+    model = _PlanModel(walks, {"default": [WalkStep("rollout")]}, {"default": ["rollout"]})
+    return model, {"video": [PROMPT]}, {}, [("default", "rollout", {}, False)], [
+        ("NEW_REQUEST", "default", "rollout", {("enc", "video"): [PROMPT]}, False),
+        ("UNPERSIST_TENSORS", PREPROCESS, {PROMPT: 1}),
+    ]
+
+
 def _stream_consumer(consumer_active=True):
     """Chatterbox's S3Gen: a stream consumer that also reads the reference clip
     its producer reads. The clip goes to both on entry and is released once
@@ -479,6 +498,7 @@ _PLANS = {
     "a re-persisted name": _rebound_name,
     "diffusion's empty seed": _diffusion,
     "a later reader keeps it": lambda: _diffusion(refine=True),
+    "a loop fed ahead of it": _fed_loop,
     "stream consumer re-sends": _stream_consumer,
     "inactive consumer": lambda: _stream_consumer(consumer_active=False),
     "walks the stream moves": _stream_moved_walks,
