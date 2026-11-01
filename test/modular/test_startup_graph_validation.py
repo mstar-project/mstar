@@ -399,8 +399,8 @@ _TP2 = {"ranks": [1, 2], "tp_size": 2}
     (_gated_vocoder_then_post, _ONE, _ONE, True),
     # one TP instance on the same ranks shares the flag too
     (_gated_vocoder_then_post, _TP2, _TP2, True),
-    # each node_group picks its own replica, so a request can split across them
-    (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, False),
+    # node_groups on the same ranks, replica for replica, pick one replica together
+    (_gated_vocoder_then_post, {"ranks": [1, 2]}, {"ranks": [1, 2]}, True),
 ], ids=["self_triggered", "gated", "self_triggered_colocated", "gated_colocated", "gated_colocated_tp",
      "gated_dp_replicas"])
 def test_consumer_walk_across_worker_graphs(chunk_walk, vocoder, post, accepted, tmp_path, monkeypatch):

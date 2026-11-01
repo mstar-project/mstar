@@ -490,9 +490,19 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   least recently used snapshot that no request holds.
 
 Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, or when that cache's ``prefix_cache`` is off; in those three cases the pool allocates
-no snapshot slots. Every cache on the node then stays shut, and the engine logs which
-resource kept it shut.
+cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
+off or can't open at the pool's world size; in those cases the pool allocates no snapshot
+slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
+model that names no checkpoint and sets no salt. Every cache on the node of a pool without
+snapshots stays shut, and the engine logs which pool kept it shut.
+``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
+specs. The engine evaluates it once, before it builds any resource, and opens exactly the
+caches it returns of those it holds; the conductor's routing and the API server's prompt
+hashing take, for each rank, the caches the rank holds and its engine opens
+(``prefix_caches_by_rank``). Each spec answers for itself:
+``NodeResourceSpec.keeps_prefix_cache`` says whether the resource keeps a prefix cache of
+its own, and ``restores_prefix`` marks one whose state a hit must restore (the pool, and
+the resource over it), so another resource takes part through its spec alone.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:
 
@@ -1971,6 +1981,49 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
    A top-level ``kv_cache:`` block is no longer read. It raises an error at load time,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
+
+Routing across data-parallel replicas
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a node group has several replicas, the conductor sends each new request to the
+replica where it is cheapest (see "Data-parallel routing" in :doc:`serving`). A resource
+whose state makes a request cheaper on one replica than another takes part through its
+spec, so models declare nothing for it.
+
+**The hook.** ``NodeResourceSpec.routing_mirror(ctx)`` returns a ``RoutingMirror`` or
+``None``, the default. The router asks once per set of node groups with replicas that
+holds one of the spec's nodes, and ``ctx`` (a ``RoutingContext``) gives the replica count,
+the walks of the worker graphs there that hold the spec's nodes, the resource's keyed
+labels with the walks that key each (empty for a resource that is not a KV cache), and
+whether every replica's engine opens its prefix cache, which the router derives with
+``prefix_caches_by_rank``.
+A mirror is conductor-side bookkeeping that follows the resource's own rules as far as
+the conductor's inputs allow. The module that defines one must stay free of kernels,
+since the conductor builds it.
+
+**The mirror's methods.** Each is given the request's ``ResourceReqConfig`` for the
+resource, which the conductor builds and validates before the pick.
+
+- ``facts(config)`` reports the request's ``RoutingFacts`` on each replica: named counts,
+  such as ``work`` (prompt positions) and ``kv_hit`` (of those, the ones predicted cached).
+  The router adds every mirror's row on a replica field by field, then prices the sum
+  once with ``routing_cost`` in ``mstar/conductor/routing.py``, one term per
+  ``routing_weights`` key, each 0 when its facts are absent.
+- ``add_request(config, replica)`` records the placement once the request is dispatched,
+  and returns a handle.
+- ``remove_request(handle, ran)`` releases it when the request leaves. ``ran`` says
+  whether a pass came back for one of the request's partitions with a walk on the
+  resource's node groups.
+
+**Adding a resource.** A new resource adds its fields to ``RoutingFacts``, its mirror,
+and its term to ``routing_cost`` and ``RoutingWeights``. ``ReplicaRouter`` changes only
+if its fields are not counts that add, or if its mirror reads a model declaration other
+than the KV ones, which then becomes a ``RoutingContext`` field that ``ReplicaRouter``
+fills. ``KVSpec`` with a ``PagedKVConfig`` is the one implementation. Its mirror runs the
+worker's own ``PrefixIndex`` and ``PageArena`` per replica, with no storage, takes each
+request's lease, pages and index entries at dispatch, an item's end inside a page among
+them, and exists only where a walk keying the cache runs and ``opening_prefix_caches``
+says the workers open it.
 
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~

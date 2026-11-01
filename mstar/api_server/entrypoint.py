@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Protocol
@@ -1894,7 +1894,10 @@ def _run_warmup_requests(
     concurrent requests to different replicas (the least-loaded one each).
     When some worker graph has fewer replicas than that, each spec first runs
     once alone, since that graph would batch the copies and miss its
-    one-request shape.
+    one-request shape. Past one copy, they run with ``prefix_cache=False``
+    unless the spec sets it, so no predicted hit (``routing_weights.prefix``)
+    gathers them on one replica; the cost is that they leave a prefill from
+    cached pages unwarmed.
     """
     if not isinstance(specs, list):
         logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
@@ -1933,6 +1936,8 @@ def _run_warmup_requests(
                     "warmup request %d/%d (%s) done in %.1f s alone",
                     index + 1, len(specs), ",".join(request.output_modalities), time.perf_counter() - t0,
                 )
+        if replicas.most > 1:
+            request = replace(request, model_kwargs={"prefix_cache": False, **(request.model_kwargs or {})})
         t0 = time.perf_counter()
         try:
             asyncio.run(_all(request, f"warmup-{index}", replicas.most))

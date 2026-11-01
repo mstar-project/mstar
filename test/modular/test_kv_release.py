@@ -20,12 +20,18 @@ import torch
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, RetentionPolicy
+from mstar.engine.resources.kv.config import (
+    KVSpec,
+    KVStep,
+    PagedKVConfig,
+    RetentionPolicy,
+    opening_prefix_caches,
+)
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -554,7 +560,8 @@ def test_window_pool_refusals_and_tp_offload(monkeypatch) -> None:
     # a model that keys labels still starts, without a prefix cache (a limitation for now)
     m = _window_manager()
     assert not m.config.prefix_cache
-    assert not m.enable_prefix_cache(b"root", {"main": KeyedWalks(("prefill",))}) and m._index is None
+    # so the startup rule leaves it shut, for the engines and the router's mirrors alike
+    assert not opening_prefix_caches([KVSpec(resource_key="kv", nodes={"LLM"}, config=m.config)], {"LLM": 1}, True)
     m.ingest_request("r")
     free = m._arena.num_free
     step = KVStep(segments=(Segment("r", "main", 4),), pre_forks=(("main", "other"),))
