@@ -52,6 +52,8 @@ class ConfigTests(unittest.TestCase):
             ("position_embedding_type", "rope"), ("rotary_pct", 0.5),
             ("first_k_dense_replace", 1), ("rms_norm_eps", 1e-5),
             ("layer_types", ["sliding_attention", "chunked_attention"]),
+            ("layer_types", ["full_attention"]),
+            ("layer_types", ["sliding_attention"]),
             ("rope_parameters", {"rope_type": "linear"}),
             ("rope_parameters", {"rope_type": "default", "rope_theta": 10000}),
         ):

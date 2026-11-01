@@ -77,7 +77,7 @@ class ParakeetModel(Model):
         )
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-    def checkpoint_path(self) -> str | None:
+    def checkpoint_path(self) -> str:
         return str(self.local_dir)
 
     def _num_frames(self, num_samples: int) -> int:

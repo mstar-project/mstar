@@ -9,6 +9,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.resources.dsa import manager as dsa_manager  # noqa: E402
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep  # noqa: E402
 from mstar.engine.resources.dsa.manager import (  # noqa: E402
     DSAManager,
@@ -246,8 +247,11 @@ def test_a_selecting_step_stages_its_page_tables_once(monkeypatch):
     """Every layer reads the same page tables: one H2D per step, not one per layer and row."""
     dsa = _manager(topk=4)
     calls = []
-    stage = dsa._page_stager.to_device
-    monkeypatch.setattr(dsa._page_stager, "to_device", lambda v, d: calls.append(v) or stage(v, d))
+    stage = dsa_manager.to_device_nonblocking
+    monkeypatch.setattr(
+        dsa_manager, "to_device_nonblocking",
+        lambda v, d, dtype=None: calls.append(v) or stage(v, d, dtype=dtype),
+    )
     _plan(dsa, [SequenceView("r0", "main", [0, 1], length=6, to_compute=1),
                 SequenceView("r1", "main", [2, 3], length=7, to_compute=1)])
     for _ in range(3):

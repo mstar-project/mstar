@@ -24,8 +24,7 @@ class LinearAttnManager(AttentionResource):
         # the pool's own config, not a copy; `shard` is idempotent so both
         # builders can call it
         pool_config = info.dependency(spec.config.recurrent_state).config
-        if info.joint_comm_group is not None:
-            pool_config.shard(info.joint_comm_group.world_size)
+        pool_config.shard(info.head_shards)
 
         backend = spec.config.backend
         if backend is not LinearAttnBackend.FLASHINFER:

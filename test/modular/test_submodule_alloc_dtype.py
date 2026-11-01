@@ -53,3 +53,4 @@ def test_to_on_meta_is_in_place_and_zero_alloc():
     assert ret is m
     assert all(p.is_meta for p in m.parameters())
     assert all(p.dtype == torch.bfloat16 for p in m.parameters())
+

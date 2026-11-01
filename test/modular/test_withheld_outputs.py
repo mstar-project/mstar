@@ -53,7 +53,7 @@ class _Producer(NodeSubmodule):
     def check_stop(self, request_id, request_info, outputs):
         return self._check(request_id, int(outputs["token"][0].item()))
 
-    def check_stop_batched(self, request_ids, request_infos, host_rows, step_walk=None):
+    def check_stop_batched(self, request_ids, request_infos, host_rows):
         if not self.batched:
             return None
         stops, withheld = {}, {}
@@ -188,7 +188,6 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w._walk_drivers = {}  # no producer-driven walk transitions here
     w._graph_runtime = _RecordingRuntime()

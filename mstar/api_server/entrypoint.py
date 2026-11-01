@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Protocol
@@ -1789,6 +1789,12 @@ class WarmupMedia:
         return cls(path=path, modality=modality)
 
 
+def _positive_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
 @dataclass
 class WarmupRequest:
     """One entry of the deployment's ``warmup_requests``: a ``/generate``
@@ -1811,9 +1817,7 @@ class WarmupRequest:
         text = spec.get("text")
         if text is not None and not isinstance(text, str):
             raise ValueError("text must be a string")
-        repeat = spec.get("repeat", 1)
-        if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
-            raise ValueError(f"repeat must be a positive integer, got {repeat!r}")
+        repeat = _positive_int("repeat", spec.get("repeat", 1))
         if repeat > 1 and not text:
             raise ValueError("repeat needs text")
         out_mods = spec.get("output_modalities") or ["text"]
@@ -1855,13 +1859,45 @@ class WarmupRequest:
         )
 
 
-def _run_warmup_requests(server: APIServer, specs: list) -> None:
+class DataParallelReplicas(NamedTuple):
+    """The most and fewest replicas any worker graph is served by. ``most`` is
+    how many copies of a request it takes for the conductor's placement to
+    reach them all."""
+
+    most: int
+    fewest: int
+
+
+def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
+    """``DataParallelReplicas(1, 1)``, with a warning, when the worker graphs
+    can't be counted: warmup is best effort and must not stop startup."""
+    try:
+        counts = [len(wg.replica_ranks) for wg in model.get_worker_graphs(config_path)]
+        return DataParallelReplicas(most=max(counts), fewest=min(counts))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("warmup: could not count data-parallel replicas (%s); sending one copy", exc)
+        return DataParallelReplicas(1, 1)
+
+
+def _run_warmup_requests(
+    server: APIServer, specs: list, replicas: DataParallelReplicas = DataParallelReplicas(1, 1),
+) -> None:
     """Run the deployment's ``warmup_requests`` once the workers are ready and
     before the server binds, so the first client does not pay what a first
     request of a shape costs (torch.compile of a denoise step, a cold
     inductor cache). Each spec is parsed into a :class:`WarmupRequest`. A
     warmup that is malformed or fails is logged and skipped; it must not keep
     the server from coming up.
+
+    Each spec runs as ``replicas.most`` concurrent copies, which warm every
+    replica of a data-parallel deployment, since the conductor sends
+    concurrent requests to different replicas (the least-loaded one each).
+    When some worker graph has fewer replicas than that, each spec first runs
+    once alone, since that graph would batch the copies and miss its
+    one-request shape. Past one copy, they run with ``prefix_cache=False``
+    unless the spec sets it, so no predicted hit (``routing_weights.prefix``)
+    gathers them on one replica; the cost is that they leave a prefill from
+    cached pages unwarmed.
     """
     if not isinstance(specs, list):
         logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
@@ -1870,26 +1906,50 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
     async def _one(request: WarmupRequest, request_id: str) -> None:
         await server.collect_results(request.submit(server, request_id))
 
+    async def _all(request: WarmupRequest, base_id: str, n: int) -> None:
+        # every copy runs to its end before a failure is reported, so none is
+        # cancelled mid-request and still in the server when the next spec starts
+        results = await asyncio.gather(
+            *(_one(request, f"{base_id}.{copy}") for copy in range(n)), return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+
     for index, spec in enumerate(specs):
         try:
             request = WarmupRequest.from_config(spec)
         except Exception as exc:  # noqa: BLE001 — a repeat too large to build, say
             logger.warning("warmup_requests[%d] skipped: %s", index, exc)
             continue
+        if replicas.fewest < replicas.most:
+            t0 = time.perf_counter()
+            try:
+                asyncio.run(_one(request, f"warmup-{index}.solo"))
+            except Exception as exc:  # noqa: BLE001 — the copies still run
+                logger.warning(
+                    "warmup request %d/%d failed after %.1f s alone: %s",
+                    index + 1, len(specs), time.perf_counter() - t0, getattr(exc, "detail", exc),
+                )
+            else:
+                logger.info(
+                    "warmup request %d/%d (%s) done in %.1f s alone",
+                    index + 1, len(specs), ",".join(request.output_modalities), time.perf_counter() - t0,
+                )
+        if replicas.most > 1:
+            request = replace(request, model_kwargs={"prefix_cache": False, **(request.model_kwargs or {})})
         t0 = time.perf_counter()
         try:
-            asyncio.run(_one(request, f"warmup-{index}"))
+            asyncio.run(_all(request, f"warmup-{index}", replicas.most))
         except Exception as exc:  # noqa: BLE001 — a cold server is better than none
             logger.warning(
                 "warmup request %d/%d failed after %.1f s: %s",
-                index + 1, len(specs), time.perf_counter() - t0,
-                getattr(exc, "detail", exc),
+                index + 1, len(specs), time.perf_counter() - t0, getattr(exc, "detail", exc),
             )
             continue
         logger.info(
             "warmup request %d/%d (%s) done in %.1f s",
-            index + 1, len(specs), ",".join(request.output_modalities),
-            time.perf_counter() - t0,
+            index + 1, len(specs), ",".join(request.output_modalities), time.perf_counter() - t0,
         )
 
 
@@ -2881,8 +2941,12 @@ def main(argv: list[str] | None = None):
         # client never sees the first request of a shape.
         warmups = config.get("warmup_requests") or []
         if warmups:
-            logger.info("Running %d warmup request(s) before binding", len(warmups))
-            _run_warmup_requests(api_server, warmups)
+            replicas = _data_parallel_replicas(model, args.config)
+            logger.info(
+                "Running %d warmup request(s) before binding, %s%d copies at a time (one per replica)",
+                len(warmups), "each once alone, then " if replicas.fewest < replicas.most else "", replicas.most,
+            )
+            _run_warmup_requests(api_server, warmups, replicas)
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:
