@@ -1004,7 +1004,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_RaggedPrefillBase</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""What the self- and cross-attention wrappers share: the graph-mode static</span>
-<span class="sd">    buffers and their padding. A backend subclass plans and runs its kernel.</span>
+<span class="sd">    buffers and their padding, and skipping a plan the wrapper already holds. A</span>
+<span class="sd">    backend subclass plans and runs its kernel.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -1033,6 +1034,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">max_total_kv_tokens</span> <span class="k">if</span> <span class="n">max_total_kv_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">max_total_tokens</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># the layout this wrapper's schedule describes; see ``_plan``</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned_layout</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">if</span> <span class="n">accelerator_graph</span><span class="p">:</span>
             <span class="k">assert</span> <span class="n">max_num_segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">"max_num_segments required for accelerator graph mode"</span>
@@ -1096,13 +1099,37 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">cu</span><span class="p">,</span> <span class="n">total_tokens</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">kv_cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># A wrapper keeps the schedule of its last plan until it is planned again</span>
+        <span class="c1"># and ``run`` only reads it, so a layout it already holds is not replanned:</span>
+        <span class="c1"># a plan costs host time, plus a stream sync on a backend whose plan reads</span>
+        <span class="c1"># the layout back from the device, and a denoising request keeps its</span>
+        <span class="c1"># layout from step to step. Each (label, slot) has its own wrapper, so this</span>
+        <span class="c1"># compares against what this slot's schedule says, never against what the</span>
+        <span class="c1"># previous step ran.</span>
+        <span class="n">layout</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layout_key</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="n">kv_cu_seqlens</span><span class="p">,</span> <span class="n">causal</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">layout</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planned_layout</span><span class="p">:</span>
+            <span class="k">return</span>
         <span class="n">cu</span><span class="p">,</span> <span class="n">total_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cu_seqlens</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">kv_cu_seqlens</span> <span class="ow">is</span> <span class="n">cu_seqlens</span><span class="p">:</span>
             <span class="n">kv_cu</span> <span class="o">=</span> <span class="n">cu</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">kv_cu</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cu_seqlens</span><span class="p">(</span><span class="n">kv_cu_seqlens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_kv_tokens</span><span class="p">,</span> <span class="s2">"key "</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">-</span> <span class="mi">1</span>
+        <span class="c1"># a plan that raises may already have overwritten the schedule</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned_layout</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_plan_kernel</span><span class="p">(</span><span class="n">cu</span><span class="p">,</span> <span class="n">kv_cu</span><span class="p">,</span> <span class="n">total_tokens</span><span class="p">,</span> <span class="n">causal</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned_layout</span> <span class="o">=</span> <span class="n">layout</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_layout_key</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">kv_cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">:</span>
+        <span class="n">q</span> <span class="o">=</span> <span class="n">cu_seqlens</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">q</span><span class="p">,</span> <span class="n">q</span> <span class="k">if</span> <span class="n">kv_cu_seqlens</span> <span class="ow">is</span> <span class="n">cu_seqlens</span> <span class="k">else</span> <span class="n">kv_cu_seqlens</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">causal</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forget_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Replan on the next ``plan``, whatever its layout. For a plan whose</span>
+<span class="sd">        staging the wrapper's next user can't order against (a dropped pre-plan,</span>
+<span class="sd">        whose H2Ds went on the plan stream with nothing left to wait on them)."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned_layout</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_plan_kernel</span><span class="p">(</span>

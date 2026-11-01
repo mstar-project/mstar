@@ -1355,6 +1355,10 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># The dropped plan's H2Ds went on the plan stream, and the step that runs</span>
+        <span class="c1"># instead waits on no event from it, so it must stage its layout itself.</span>
+        <span class="k">for</span> <span class="n">wrapper</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+            <span class="n">wrapper</span><span class="o">.</span><span class="n">forget_plan</span><span class="p">()</span>
         <span class="c1"># rebind rather than clear: a consumed preplan dict is the live one</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1416,7 +1420,6 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_plan_layouts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">plan_states</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">segments</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group_segments_by_label</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">())</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_for</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
-            <span class="c1"># TODO: cache the latest plan state</span>
             <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_cu_seqlens</span><span class="p">(</span><span class="n">segments</span><span class="p">),</span> <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">)</span>
             <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
 
