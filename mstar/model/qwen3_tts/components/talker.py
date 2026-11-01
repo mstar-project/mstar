@@ -124,12 +124,14 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         # module code stays clear of the allocator.
         self.layers[0].self_attn.attend.bind_step(label)
         # Each residual add is deferred into the next norm: one fused add+norm
-        # kernel (in place) per norm instead of an add and a norm.
+        # kernel (in place) per norm instead of an add and a norm. The stream
+        # starts from a copy: ``input_embeds`` is the caller's, and a packed
+        # replay's static input keeps its trailing rows from capture.
         residual = None
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
             if residual is None:
-                residual = hidden_states
+                residual = hidden_states.clone()
                 h = layer.input_layernorm(hidden_states)
             else:
                 h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
