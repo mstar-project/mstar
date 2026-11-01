@@ -116,6 +116,10 @@ class AudioEncoderSubmodule(AuTEncoderSubmodule):
     """The AuT encoder (see ``AuTEncoderSubmodule``) over the unpadded
     ``(num_mel_bins, frames)`` log-mel features ``process_prompt`` made."""
 
+    # One captured batch size: a smaller batch pads to 8 with empty rows, and
+    # each extra size costs a graph per token bucket beside the Thinker.
+    ENCODE_CAPTURE_BATCH_SIZES = [8]
+
     def __init__(self, audio_encoder: AuTEncoder, config: Qwen3OmniModelConfig):
         super().__init__(audio_encoder, attn_key=AUDIO_ATTN)
         self.config = config
@@ -152,7 +156,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
     """
 
     # Patch-count buckets, one request per replay. A larger request runs eagerly.
-    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    # 8192 covers 1920x1080; sizing a 16384 or 32768 graph doesn't fit beside
+    # the Thinker on an 80 GB GPU.
+    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192]
     # Not compiled: the block loop is captured, and around it the forward
     # takes the frame lengths, so a compiled wrapper would recompile per
     # frame count while the prefix cache holds what earlier graphs computed.

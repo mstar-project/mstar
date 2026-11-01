@@ -342,6 +342,9 @@ class Qwen3OmniModel(Model):
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
                     max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(audio),
+                    # Split-KV partials of these shapes stay far below the 512 MB
+                    # default, which costs 2 GB across both encoders and slots.
+                    workspace_mb=64,
                 ),
             ),
             RaggedAttentionSpec(
@@ -354,6 +357,7 @@ class Qwen3OmniModel(Model):
                     # bucket at this many; a request with more frames runs the
                     # block loop eagerly (`VisionEncoderSubmodule._fits_capture`).
                     max_segments_per_request=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                    workspace_mb=64,
                 ),
             ),
         ]
