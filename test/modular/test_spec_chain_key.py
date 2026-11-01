@@ -17,7 +17,7 @@ class _Span:
         return False
 
 
-def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset(), budgeted=True):
+def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset(), budgeted=True, eager=False):
     peeked, excluded = [], []
     fake = SimpleNamespace(
         _can_speculate=lambda batch: True,
@@ -34,6 +34,7 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
             has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
             chunks=lambda node_name, graph_walk: budgeted,
+            yields_eagerly=lambda node: eager,
         ),
     )
     fake._build_speculation = Worker._build_speculation.__get__(fake)
@@ -151,3 +152,22 @@ def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step(
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
 
     assert speculation is chunk and not peeked and not excluded
+_DECODE = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+_CONTINUES = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+
+
+def test_a_chain_speculates_one_step_before_it_looks_for_other_work():
+    worker, peeked, _ = _worker(_DECODE, speculation=_CONTINUES)
+
+    _, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert peeked == [] and yielded_from is None
+
+
+def test_an_eager_yield_node_looks_from_the_chains_first_step():
+    worker, peeked, excluded = _worker(_DECODE, speculation=_CONTINUES, eager=True)
+
+    _, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert peeked == [("LLM", "decode")]
+    assert yielded_from == ("LLM", "decode") and excluded == [("LLM", "decode")]
