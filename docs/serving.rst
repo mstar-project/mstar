@@ -339,20 +339,6 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
-   * - ``api_switch_interval_s``
-     - *(optional)* GIL switch interval of the API server process, in seconds
-       (``sys.setswitchinterval``), a positive number (anything else fails at
-       startup); unset keeps Python's 5 ms. Under streaming load
-       that process keeps three threads busy (event loop, message thread, data
-       worker), and a shorter interval hands the GIL between them sooner:
-       ``0.001`` gave Qwen3.5-0.8B text, c=64, +4 to +8% tok/s, and a
-       model whose preprocessing runs long on the data-worker thread lost from it
-       (Kokoro's G2P: about -3.6% at c=32), so it is per deployment. Both numbers
-       were measured before `#849 <https://github.com/mstar-project/mstar/pull/849>`_
-       and `#939 <https://github.com/mstar-project/mstar/pull/939>`_ changed the
-       message-thread and data-worker path; the knob awaits a
-       re-measure on the current path and is deleted if neutral. Workers take
-       theirs from ``MSTAR_PY_SWITCH_INTERVAL_SEC``.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``
        (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which

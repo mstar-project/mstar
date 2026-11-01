@@ -2779,22 +2779,6 @@ def _set_preprocess_threads(model, config: dict) -> None:
     torch.set_num_threads(int(threads))
 
 
-def _set_switch_interval(config: dict) -> None:
-    """``api_switch_interval_s`` from the config: the GIL switch interval of
-    this process only (the conductor and workers are spawned fresh). Unset
-    keeps Python's 5 ms. Streaming many small chunks keeps three of this
-    process's threads busy (event loop, message thread, data worker); a
-    shorter interval hands the GIL between them sooner, which also preempts a
-    model's preprocessing on the data-worker thread more often."""
-    interval = config.get("api_switch_interval_s")
-    if interval is None:
-        return
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not interval > 0:
-        raise ValueError(f"api_switch_interval_s must be a positive number of seconds, got {interval!r}")
-    sys.setswitchinterval(float(interval))
-    logger.info("API server GIL switch interval: %s s", interval)
-
-
 def main(argv: list[str] | None = None):
     import argparse
 
@@ -2901,7 +2885,6 @@ def main(argv: list[str] | None = None):
      # Create a lightweight model instance for prompt processing
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
-    _set_switch_interval(config)
     model = get_model_class(model_name)(
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},

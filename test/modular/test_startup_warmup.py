@@ -1,14 +1,11 @@
-"""API-server process settings from the deployment yaml. ``warmup_requests``
-run through the API server after the workers are ready and before the server
-binds, as plain /generate requests; a failing one is logged and skipped.
-``api_switch_interval_s`` must be a positive number of seconds."""
+"""``warmup_requests`` in the deployment yaml: run through the API server
+after the workers are ready and before the server binds, as plain /generate
+requests; a failing one is logged and skipped."""
 
 from __future__ import annotations
 
 import logging
 import sys
-
-import pytest
 
 sys.path.insert(0, ".")
 
@@ -269,16 +266,3 @@ def test_a_failing_copy_lets_its_siblings_finish(caplog) -> None:
         entrypoint._run_warmup_requests(fake, [{"text": "a", "concurrency": 3}])
     assert sorted(fake.collected) == ["warmup-0.0.1", "warmup-0.0.2"]
     assert "warmup request 1/1 failed" in caplog.text
-
-
-def test_api_switch_interval_must_be_a_positive_number(monkeypatch) -> None:
-    """``api_switch_interval_s`` is refused unless a positive number of seconds:
-    yaml's ``true`` is not 1 s."""
-    set_to = []
-    monkeypatch.setattr(entrypoint.sys, "setswitchinterval", set_to.append)
-    for bad in (True, 0, -0.001, "1ms"):
-        with pytest.raises(ValueError, match="api_switch_interval_s"):
-            entrypoint._set_switch_interval({"api_switch_interval_s": bad})
-    entrypoint._set_switch_interval({"api_switch_interval_s": 0.001})
-    entrypoint._set_switch_interval({})
-    assert set_to == [0.001]
