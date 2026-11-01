@@ -5,7 +5,7 @@ model: "flux2_klein_9b"
 # not Apache-2.0; check the license before deploying.
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
   # auto: the DiT's joint attention runs on the engine's ragged attention resource with the platform's default
   # kernel: FlashInfer FA3 on an H100 (served as fast as sdpa, 0.355 vs 0.349 s at B=1), AITER's asm flash attention
   # on MI300X/MI325X (where torch's sdpa is AOTriton, well short of it). sdpa keeps torch's kernel inline, the
@@ -18,8 +18,9 @@ model_kwargs:
   # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
   # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
   # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — true: 0.654 s at B=1 vs 0.608 plain; 0.785 without compile; [norms] pending measurement
-  # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
-  # keeps the output off the reference bit for bit either way. MI325X: 0.709 -> 0.660 s at B=1, 1.54 -> 1.68 images/s at c=16.
+  # On AMD GPUs the bf16 config does not apply this (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M
+  # kernel choice keeps the output off the reference bit for bit either way. MI325X: 0.709 -> 0.660 s at B=1, 1.54 -> 1.68
+  # images/s at c=16. This file's AMD default is fp8, which needs it, so the override below turns the knob on.
   compile_exact_ops: [norms]
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
@@ -33,7 +34,8 @@ model_kwargs:
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.34x images/s at
-  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst)
+  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst).
+  # Default bf16, fp8 with the list below on AMD GPUs (platform_overrides at the end of this file)
   # Under linear_dtype: fp8 these stay bf16: the linears with the most image error per ms of fp8 saving on MI325X,
   # about 40% of the saving (ignored under bf16). One-GPU MI325X A/B: median 26.5 dB from diffusers, over the ROCm
   # floor, at ~1.18x bf16 images/s; lists giving back 20-30% fell under the floor (25.2 dB)
@@ -59,3 +61,17 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+# On AMD GPUs 29 of the DiT's 80 declared linears run fp8 (fp8_keep_bf16 keeps the rest), with the norms on the eager
+# kernels. An entry replaces a top-level key whole, so model_kwargs repeats the block above through the merge key. MI325X
+# at c=1/4/8/16: 1.737 / 1.820 / 1.769 / 1.819 images/s against 1.569 / 1.620 / 1.680 / 1.670 on bf16, median 26.48 dB
+# from diffusers (floor 25.46). The typical image loses 1.3 dB against bf16 and the worst 6.5 dB, accepted by eye on the
+# 40 image_v1 images. flux2_klein_9b_bf16.yaml keeps bf16 on every platform. flux2_klein_9b_fp8_bbpf.yaml loses at
+# most 1.65 dB for about 80% of the gain.
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      linear_dtype: fp8
+    knobs:
+      dit_exact_ops: true
