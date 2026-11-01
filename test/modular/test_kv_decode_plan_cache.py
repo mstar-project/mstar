@@ -13,6 +13,8 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.resources.kv import arena as arena_mod  # noqa: E402
+from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
@@ -304,3 +306,42 @@ def test_a_step_with_sink_rows_is_planned_from_the_streams():
     sink = frozenset({("b", "main")})
     got = _decode(kv, ("a", "b"), slot=0, sink=sink, commit=False)[0]
     assert _flat(got) == _flat(_decode(ref, ("a", "b"), slot=0, sink=sink, commit=False)[0])
+
+
+def test_sink_pages_grow_under_the_managers_lock(monkeypatch):
+    """The sink run is a page list the main thread changes under the lock, and
+    a plan may run on the plan thread: growing it takes the lock too. Capture
+    sizes it for the longest captured step. On the Python arena, whose list a
+    spy can wrap."""
+    monkeypatch.setattr(manager_mod, "new_page_arena", lambda n: arena_mod.new_page_arena(n, "python"))
+    kv = _manager(0)
+    owned = []
+    extend = arena_mod._ListStreamPages.extend
+
+    def spy(pages, new):
+        if pages is kv._sink_pages:
+            owned.append(kv._lock._is_owned())
+        extend(pages, new)
+
+    monkeypatch.setattr(arena_mod._ListStreamPages, "extend", spy)
+    kv.ingest_request("b", KVReqConfig())
+    step = KVStep(segments=(Segment("b", "main", 200),), sink=frozenset({("b", "main")}))
+    ctx = StepContext(request_ids=("b",), graph_walk="prefill", slot=0, capture=False)
+    assert kv.admit(step, ctx).ok
+    owned.clear()
+    kv.plan(step, ctx)
+    assert owned and all(owned)
+    assert len(kv._sink_pages) >= -(-200 // PAGE)
+    kv.build_accelerator_graph_buffers([], 4, 512)
+    assert len(kv._sink_pages) == 512 // PAGE
+
+
+def test_remembering_a_full_plan_leaves_its_views_unbuilt():
+    """Full plans run whenever requests come or go; the cache keeps the
+    outputs and builds their views only if the next step hits it."""
+    kv = _manager(1)
+    _prefill(kv, "a", 5)
+    _prefill(kv, "b", 7)
+    res, _, _ = _decode(kv, ("a", "b"), slot=0)
+    assert kv._decode_plan_cache is not None
+    assert all(out._views is None for out in res.values())

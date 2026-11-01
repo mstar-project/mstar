@@ -163,7 +163,7 @@ def test_a_leased_page_is_never_evicted():
     assert kv._streams["b"]["main"].lease == leased, (
         "the lease lost pages to an eviction it was supposed to hold them from"
     )
-    assert all(page not in kv._arena.allocator.free_pages.queue for page in leased), (
+    assert all(page not in kv._arena.free_pages() for page in leased), (
         "a page a request was about to be admitted on was handed to someone else"
     )
     kv.assert_pages_conserved()

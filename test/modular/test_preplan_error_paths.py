@@ -250,3 +250,61 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     fake.reset_pre_plan_for_batch(batch)
     assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
     assert cleared == [True]
+
+
+class _FakeEvent:
+    def __init__(self, device=None):
+        self.recorded_on = "unrecorded"
+
+    def record(self, stream=None):
+        self.recorded_on = stream
+
+
+def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
+    # a later step may skip a copy into a slot buffer this pre-plan issued,
+    # so its plan-stream copies must be waited on even if it never finishes
+    monkeypatch.setattr(torch, "Event", _FakeEvent)
+    fake = SimpleNamespace(
+        _device=torch.device("cpu"),
+        _pre_plan_done={},
+        _order_after_pre_plans=lambda: None,
+        _runner=SimpleNamespace(
+            pre_admit=lambda step: SimpleNamespace(ok=True),
+            pre_plan=_raiser(RuntimeError("plan failed")),
+        ),
+    )
+    step = SimpleNamespace(set_ctx=lambda ctx: None)
+    submodule = SimpleNamespace(declare_step=lambda **kw: step)
+    cg_runner = SimpleNamespace(
+        declare_inputs_for=lambda lease: [], step_ids=lambda lease, rids: rids,
+        plan_stream=lambda: None,
+    )
+    batch = SimpleNamespace(
+        node_name="dit", inputs=None, request_ids=["a"], per_request_info={},
+        step=None, preplan_event=None, preplanned_rids=None,
+        step_context=SimpleNamespace(
+            graph_walk="decode", padded_request_ids=["a"], is_preplan=False,
+            set_padded_rids=lambda rids: None,
+        ),
+    )
+    submodule.step_is_input_free = lambda walk: False
+    mgmt = SimpleNamespace(submodule=submodule, piecewise_runners={})
+    with pytest.raises(RuntimeError):
+        Engine._pre_plan_for_batch(fake, batch, mgmt, cg_runner, object())
+    event = fake._pre_plan_done["dit"]
+    assert isinstance(event, _FakeEvent) and event.recorded_on is None
+    assert batch.preplan_event is None
+
+
+def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> None:
+    # nodes can share a resource's slot buffers, so every node's latest
+    # pre-plan is waited on, not just the stepping node's
+    waits = []
+    stream = SimpleNamespace(wait_event=waits.append)
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: stream)
+    fake = SimpleNamespace(_device=torch.device("cpu"), _pre_plan_done={})
+    Engine._order_after_pre_plans(fake)
+    assert waits == []
+    fake._pre_plan_done.update(enc="e1", dec="e2")
+    Engine._order_after_pre_plans(fake)
+    assert waits == ["e1", "e2"]

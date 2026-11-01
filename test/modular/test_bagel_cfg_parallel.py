@@ -9,6 +9,7 @@ import yaml
 
 from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
@@ -32,7 +33,7 @@ from mstar.model.bagel.submodules import CombineCFGSubmodule
 
 
 def test_offload_reset_preserves_remote_content_epoch():
-    stream = CacheStream(remote_reset_generation=7)
+    stream = CacheStream(page_indices=new_page_arena(1).new_stream(), remote_reset_generation=7)
     stream.reset(content_reset=False)
     assert stream.remote_reset_generation == 7
     stream.reset()

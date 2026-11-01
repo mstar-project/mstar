@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from time import perf_counter, thread_time
@@ -13,7 +14,48 @@ import torch
 # Per-phase wall-clock samples (MSTAR_PHASE_TIMING), shared process-wide so the
 # engine's threads can record into the same buffer the worker flushes.
 PHASE_PERIOD = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
-_PHASE_BUF: dict[str, list[float]] = defaultdict(list)
+
+# the step (``step.<node>.<walk>``) each thread is working on, if any
+_STEP = threading.local()
+
+
+class _BothSamples:
+    """A sample list that appends to two: the phase's and the step's copy."""
+
+    __slots__ = ("_a", "_b")
+
+    def __init__(self, a: list[float], b: list[float]) -> None:
+        self._a, self._b = a, b
+
+    def append(self, x: float) -> None:
+        self._a.append(x)
+        self._b.append(x)
+
+
+class _PhaseBuffer(defaultdict):
+    """Samples by phase name. While a thread has a step key set
+    (``set_step_key``), every phase it records is also recorded as
+    ``<key>.<name>``: a worker that runs several nodes or walks pools them in
+    every phase otherwise. ``unkeyed`` is for a sample about another step."""
+
+    def __getitem__(self, name: str):
+        samples = super().__getitem__(name)
+        key = getattr(_STEP, "key", None)
+        if key is None or name.startswith("step."):
+            return samples
+        return _BothSamples(samples, super().__getitem__(f"{key}.{name}"))
+
+    def unkeyed(self, name: str) -> list[float]:
+        return super().__getitem__(name)
+
+
+_PHASE_BUF: _PhaseBuffer = _PhaseBuffer(list)
+
+
+def set_step_key(key: str | None) -> None:
+    """Record this thread's phases under ``key`` too, from now until it is
+    set to None."""
+    _STEP.key = key
 
 
 def nvtx_enabled(

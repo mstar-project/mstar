@@ -36,7 +36,7 @@ from test_kv_prefix_lease import (
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
     KVSpec,
@@ -47,7 +47,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.keys import chain, fingerprint
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -69,7 +69,8 @@ def _stub_transfer(monkeypatch):
 
 def _walk(kv) -> set[int]:
     """Pages only the index holds, with no page below them held."""
-    index, owners = kv._index, kv._arena.num_owners
+    index = kv._index
+    owners = dict(zip(index.pages(), kv._arena.owners_of(index.pages()), strict=True))
     pinned: set[int] = set()
     for page in index.pages():
         if owners[page] > 1:
@@ -703,7 +704,7 @@ def test_a_grant_that_evicts_counts_the_pages_the_host_has_no_copy_of():
 
 
 def test_a_run_filed_after_a_page_only_the_index_holds_leaves_that_page_evictable():
-    arena = PageArena(kv_cache=None, allocator=PageAllocator(8))
+    arena = new_page_arena(8)
     arena.index = index = PrefixIndex(arena)
     cached, *run = arena.acquire(3)
     index.insert(b"cached", cached)
@@ -729,4 +730,4 @@ def test_two_copies_under_one_parent_page_release_it_once_each_and_leave_it_cach
 
     host._land(kv)
 
-    assert all(kv._arena.num_owners[page] == 1 for page in shared), "a landing left the shared parent pages held"
+    assert all(kv._arena.owners(page) == 1 for page in shared), "a landing left the shared parent pages held"

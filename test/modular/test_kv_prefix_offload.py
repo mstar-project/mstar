@@ -142,7 +142,7 @@ def _paint(kv: KVManager, pages: list[int], base: float) -> torch.Tensor:
 
 
 def _scribble_free(kv: KVManager) -> None:
-    kv.kv_cache.tensor[:, list(kv._arena.allocator.free_pages.queue)] = -99.0
+    kv.kv_cache.tensor[:, kv._arena.free_pages()] = -99.0
 
 
 def _published(kv: KVManager, rid: str, seq_len: int, pages: list[int]):
