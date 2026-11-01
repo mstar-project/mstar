@@ -41,6 +41,9 @@ dependencies = [
     "torchvision>=0.25.0",
     "torchaudio>=2.10.0",
     "uvicorn",
+    # uvicorn's HTTP parser in C: without it uvicorn takes h11, whose Python send
+    # is a quarter of the API process's GIL time when it streams tokens
+    "httptools",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
     "gdown",
