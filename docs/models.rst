@@ -677,8 +677,8 @@ Qwen3-TTS notes
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
   It is the same component as Qwen3-Omni's code predictor
   (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
-  the depth sequence opens with the Talker hidden state and the group-0
-  embedding in one two-token pass, each layer's q/k norm, RoPE and KV write
+  the depth sequence opens with the Talker hidden state in a one-token pass
+  and takes one token per group after it, each layer's q/k norm, RoPE and KV write
   run in one launch and attention in ``cp_attention``, and the frame's 16 codec
   embeddings are summed in fp32 and rounded once to the model dtype. Earlier
   releases rounded the sum after every add, so greedy codes can differ at

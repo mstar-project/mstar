@@ -326,10 +326,11 @@ class ResidualCodePredictor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Groups 1..G-1 of the frames whose group-0 codes the Talker sampled.
 
-        The depth sequence opens with the Talker's hidden state and group 0's
-        embedding, as the reference's code-predictor prefill does: one
-        two-token pass whose second token predicts group 1, then one token per
-        group. Every op is graph-safe, so a capture records the loop as is.
+        The depth sequence opens with the Talker's hidden state at position 0,
+        then one token per group: group ``g - 1``'s embedding at position
+        ``g`` predicts group ``g``. One-token passes throughout, so every pass
+        runs ``bs`` rows. Every op is graph-safe, so a capture records the
+        loop as is.
 
         Args:
             last_hidden: ``[bs, talker_width]``, the Talker's hidden state.
@@ -349,13 +350,12 @@ class ResidualCodePredictor(nn.Module):
         # a copy even when the embeddings are fp32: the sum is updated in place
         embed_sum = layer0_embed.to(torch.float32, copy=True)
         embed = layer0_embed
+        # position 0 only fills the cache: group 0's code is the Talker's
+        self.depth.bind_step(0)
+        self.forward_depth_unrolled(last_hidden.unsqueeze(1))
         for group in range(1, self.num_code_groups):
-            if group == 1:
-                self.depth.bind_step(0)
-                hidden = self.forward_depth_unrolled(torch.stack([last_hidden, embed], dim=1))[:, 1]
-            else:
-                self.depth.bind_step(group)
-                hidden = self.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
+            self.depth.bind_step(group)
+            hidden = self.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
             logits = torch.matmul(hidden, self.lm_head_weight[group - 1].t())
             embed = cp_embed_accumulate(
                 sample(logits), self.model.codec_embedding[group - 1].weight, embed_sum, codes, group,
