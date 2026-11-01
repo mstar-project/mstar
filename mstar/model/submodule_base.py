@@ -1216,8 +1216,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``END_PARTITION`` ends the request's partition after this pass, so
         the conductor starts no further walk: e.g. a prefill whose sampled
         token is a stop token, before its decode loop exists. Return it only
-        from a row outside any loop: from inside one, the request fails with
-        an internal error. Use it only when nothing else must run for the
+        from a row outside any loop, a chunked prefill's included (its chunk
+        Loop ends on the final chunk's pass, and a row mid-prefill decides no
+        stop): from inside another loop, the request fails with an internal
+        error. Use it only when nothing else must run for the
         partition (a later walk, a loop's final-only publication); the
         model's transition still decides those.
 

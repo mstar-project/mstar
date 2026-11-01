@@ -57,7 +57,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, chunk_loop_name
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.streaming.topology import Connection, ProducerWalkCtx
@@ -3528,11 +3528,15 @@ class Worker:
         # END_PARTITION (e.g. a prefill that sampled a stop token) ends the
         # partition on this pass's report. Only a row outside any loop can end
         # its pass here: inside one it would stop only the innermost loop, and
-        # a speculated next iteration would carry no report of it. Returning it
-        # from a loop is a model bug, so the client sees an internal error.
+        # a speculated next iteration would carry no report of it. A chunk
+        # Loop is no such loop: a row mid-prefill took no stop above, so this
+        # is a final chunk, whose Loop ends on this pass by its own count and
+        # is never speculated past. Returning it from any other loop is a model
+        # bug, so the client sees an internal error.
         for rid in [rid for rid, s in stops.items() if END_PARTITION in s]:
             walk = batch_N.batch.walk_of(rid)
-            if (walk, batch_N.node_name) in self._innermost_loop_by_node:
+            loop = self._innermost_loop_by_node.get((walk, batch_N.node_name))
+            if loop is not None and loop != chunk_loop_name(batch_N.node_name, walk):
                 batch_N.node_batch.register_failure(rid, RuntimeError(
                     f"check_stop of node {batch_N.node_name!r} returned END_PARTITION "
                     f"inside a loop of walk {walk!r}; it may end a partition only "

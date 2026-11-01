@@ -9,7 +9,7 @@ info. A dropped row is no longer in the batch, so stopping it raised
 
 Also: an ``END_PARTITION`` stop (a prefill that sampled a stop token) reports
 the partition done on the step and never reaches the runtime as a loop name;
-from a row inside a loop it fails the request.
+from a row inside a loop other than its chunk Loop it fails the request.
 
 Drives the real ``Engine.prepare_inputs``, ``Worker._drop_failed_rids`` and
 ``Worker._postprocess_batch``; the graph runtime and tensor store are stubs
@@ -29,7 +29,7 @@ from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, chunk_loop_name  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
@@ -119,7 +119,7 @@ def _batch(rids, streams=True):
     )
 
 
-def _worker(eng, runtime, in_loop=True):
+def _worker(eng, runtime, in_loop=True, loop=LOOP):
     def _store(*a, **k):
         raise _ReachedRoutingError
 
@@ -135,7 +135,7 @@ def _worker(eng, runtime, in_loop=True):
         store_and_return_tensor_info_batch=_store,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda n: eng)
-    w._innermost_loop_by_node = {(WALK, NODE): LOOP} if in_loop else {}
+    w._innermost_loop_by_node = {(WALK, NODE): loop} if in_loop else {}
     w.reported: dict[int, str] = {}
     w._fail_requests = w.reported.update
     w.request_state = SimpleNamespace(buffer_publish_info=lambda *a: None)
@@ -144,11 +144,13 @@ def _worker(eng, runtime, in_loop=True):
 
 def _postprocess(
     sub, rids=(1, 2), pending_stops=(), streams=True, in_loop=True, cached=(), chunk_loop=False,
+    loop=LOOP, mid_prefill=(),
 ):
     """What ``Worker.run`` does with a finished step: drop and report the rows
     a per-rid stage failed, then postprocess the rest. ``pending_stops`` makes
     the step a speculative new loop iteration whose rows in it already
-    stopped a step earlier."""
+    stopped a step earlier. ``loop`` is the node's innermost loop, and
+    ``mid_prefill`` the rows a chunk runs after this step."""
     eng, runtime = _engine(sub), _Runtime(pending_stops)
     batch = _batch(rids, streams)
     eng.prepare_inputs(batch)
@@ -157,13 +159,14 @@ def _postprocess(
     outputs = BatchedModelOutput(per_rid_outputs={
         r: {"audio": [torch.zeros(1)]} for r in batch.request_ids
     })
-    w = _worker(eng, runtime, in_loop)
+    w = _worker(eng, runtime, in_loop, loop)
     if chunk_loop:
         w.chunk_loops = ChunkLoops({(NODE, WALK)})
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK,
             request_to_worker_graph=dict.fromkeys(rids, 0),
+            incomplete_node_rids=set(mid_prefill),
         ),
         node_batch=batch, node_name=NODE, partition="p", graph_walk=WALK,
         future=Future(), speculative_new_iter=bool(pending_stops),
@@ -227,6 +230,20 @@ def test_an_end_partition_stop_inside_a_loop_fails_the_request():
     assert set(w.reported) == {1}
     assert batch.request_ids == [2] and batch.partition_done_rids == set()
     assert runtime.stopped == []
+
+
+def test_an_end_partition_stop_from_a_final_chunk_reports_the_partition_done():
+    """A chunkable walk's prompt runs inside its chunk Loop, cut or whole, and
+    the Loop ends on the final chunk's pass by its own count: a prefill stop
+    there (a stop id, or a one-token budget) ends the partition as it does
+    outside any loop. A row mid-prefill's stop is no real sample's."""
+    batch, runtime, w = _postprocess(
+        _Sub(stops={1: {END_PARTITION}, 2: {END_PARTITION}}), streams=False,
+        loop=chunk_loop_name(NODE, WALK), mid_prefill={2},
+    )
+    assert not w.reported
+    assert batch.partition_done_rids == {1}
+    assert runtime.loop_names == {}
 
 
 def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
