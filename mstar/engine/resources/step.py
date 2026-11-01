@@ -58,6 +58,9 @@ class StepContext:
 
     # Preplan
     is_preplan: bool = False
+    # the prefix a resource's own plan laps record under, as the runner times
+    # the plan: res.pre_plan, res.plan (promoting a pre-plan) or res.plan_fresh
+    plan_phase: str = "res.plan"
     # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
