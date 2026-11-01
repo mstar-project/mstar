@@ -27,7 +27,7 @@ import torch
 
 torch.set_float32_matmul_precision("high")
 
-from run_parity import DEVICE, drive, frame_stats, fwd_info, same, stats  # noqa: E402
+from run_parity import DEVICE, bind_resources, drive, frame_stats, fwd_info, same, stats  # noqa: E402
 
 from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
@@ -35,7 +35,7 @@ from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS
 from mstar.model.lingbot_world.submodules import first_frame_mask  # noqa: E402
 
 
-def timed_rollout(sub, text, image, cond, poses, intr, md, rid, seed=42):
+def timed_rollout(sub, runner, text, image, cond, poses, intr, md, rid, seed=42):
     events = []
     def mark(tag):
         events.append([tag, torch.cuda.Event(enable_timing=True)])
@@ -54,7 +54,7 @@ def timed_rollout(sub, text, image, cond, poses, intr, md, rid, seed=42):
         events.clear()
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        drive(sub, "rollout", info, inputs)
+        drive(sub, "rollout", info, inputs, runner)
         end.record()
         torch.cuda.synchronize()
         chunk_ms.append(start.elapsed_time(end))
@@ -65,6 +65,7 @@ def timed_rollout(sub, text, image, cond, poses, intr, md, rid, seed=42):
     submodules.encode_condition_chunk = encode
     pre.remove()
     post.remove()
+    runner.remove_request(rid)
     sub.cleanup_request(rid)
     return latents, pixels, chunk_ms, dit_ms
 
@@ -102,21 +103,25 @@ def main():
 
     sub = model.get_submodule("dit", device="cuda").to(DEVICE)
     sub.keep_chunk_outputs = True
+    frame_seqlen = lat_h * lat_w // 4
+    runner = bind_resources(model, sub)
     report = {}
 
     # warm-up pass (kernel selection, allocator), then the timed reference-config pass
-    timed_rollout(sub, text, image, cond, poses, intr, md, rid=10)
-    lat, pix, chunk_ms, dit_ms = timed_rollout(sub, text, image, cond, poses, intr, md, rid=11)
+    timed_rollout(sub, runner, text, image, cond, poses, intr, md, rid=10)
+    lat, pix, chunk_ms, dit_ms = timed_rollout(sub, runner, text, image, cond, poses, intr, md, rid=11)
     report["repeat_bit_exact"] = all(same(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat))
     report["timing_ms"] = [{"chunk": k, "total": c, "dit_5_forwards": d, "decode_and_rest": c - d}
                            for k, (c, d) in enumerate(zip(chunk_ms, dit_ms, strict=True))]
     mstar_video = torch.cat(pix, dim=2)[0]
 
-    lat43, _, _, _ = timed_rollout(sub, text, image, cond, poses, intr, md, rid=12, seed=43)
+    lat43, _, _, _ = timed_rollout(sub, runner, text, image, cond, poses, intr, md, rid=12, seed=43)
     report["seed43_vs_oracle"] = [stats(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat43)]
 
     cfg.local_attn_size = -1
-    lat_full, _, _, _ = timed_rollout(sub, text, image, cond, poses, intr, md, rid=13)
+    # keeping every frame takes more than the windowed bound
+    full = bind_resources(model, sub, {"dit_kv": {"max_request_tokens": lat_f * frame_seqlen}})
+    lat_full, _, _, _ = timed_rollout(sub, full, text, image, cond, poses, intr, md, rid=13)
     cfg.local_attn_size = 18
     report["no_window_vs_oracle"] = [stats(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat_full)]
 

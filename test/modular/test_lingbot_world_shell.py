@@ -16,20 +16,22 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec, RollingKVStep  # noqa: E402
+from mstar.engine.resources.kv.rolling.manager import RollingKVManager  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.base import GraphNode, Loop  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     REFERENCE_ATTENTION,
-    RollingKVCache,
-    attended_frames,
+    ChunkOnlyStore,
 )
 from mstar.model.lingbot_world.components.schedule import make_fast_schedule  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
     DIT_ATTN,
+    DIT_KV,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
-    ChunkSpans,
     EncoderStream,
     LingBotDitSubmodule,
     encode_condition_chunk,
@@ -59,36 +61,52 @@ def test_colliding_timesteps_resolve_first_for_x0_and_second_for_noise():
     assert schedule.noise_sigma(t).item() == schedule.sigmas[matches[1]].item()
 
 
-def _simulate(cache: RollingKVCache, frame_seqlen: int, chunk: int, num_chunks: int, passes: int):
-    """Write each chunk ``passes`` times (denoise steps, then the commit), tagging
-    every token with its absolute latent frame, as the self-attention does."""
-    for c in range(num_chunks):
-        start = c * chunk * frame_seqlen
-        tags = torch.arange(c * chunk, (c + 1) * chunk).repeat_interleave(frame_seqlen).float()
+def _store(cfg, max_request_tokens: int, dtype=torch.float32) -> RollingKVManager:
+    config = RollingKVConfig(num_layers=cfg.num_layers, num_heads=1, head_dim=1, max_request_tokens=max_request_tokens,
+                             dtype=dtype)
+    return RollingKVManager(config, torch.device("cpu"))
+
+
+def _rollout_frames(model, image_hw, num_chunks: int, passes: int = 5):
+    """Step a CPU store as the dit declares its chunks, writing each chunk
+    ``passes`` times (denoise steps, then the commit) tagged with its latent
+    frames; yields the latent frames each chunk attends."""
+    cfg = model.config
+    sub = _bare_dit_submodule(model, {})
+    spans = [sub.chunk_spans(c, image_hw, num_chunks * cfg.chunk_size) for c in range(num_chunks)]
+    fs = spans[0].chunk // cfg.chunk_size
+    store = _store(cfg, max(s.position.sink + s.position.window for s in spans))
+    sub.node_resources = {DIT_KV: store}
+    for c, s in enumerate(spans):
+        step = sub.declare_step(ROLLOUT_WALK, [7], [NodeInputs(resource_step_info=s)]).steps[DIT_KV]
+        ctx = StepContext(request_ids=(7,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+        assert store.admit(step, ctx).ok
+        store.plan(step, ctx)
+        tags = torch.arange(c * cfg.chunk_size, (c + 1) * cfg.chunk_size).repeat_interleave(fs).float()
         for _ in range(passes):
-            plan = cache.plan(start, chunk * frame_seqlen)
-            cache.write(0, tags.view(1, -1, 1, 1), tags.view(1, -1, 1, 1), plan)
-            cache.global_end, cache.local_end = plan.current_end, plan.local_end
-        yield c, cache.k[0][0, :cache.local_end, 0, 0]
+            store.write(0, tags.view(1, -1, 1, 1), tags.view(1, -1, 1, 1))
+        store.commit(step, ctx)
+        held = store.window(0)[0].flatten()
+        assert held.numel() == s.window
+        yield c, held.view(-1, fs)[:, 0].long().tolist()
 
 
-def test_rolling_cache_keeps_the_sink_and_the_latest_window():
-    frame_seqlen, chunk, window, sink = 3, 4, 18, 6
-    cache = RollingKVCache.allocate(1, window * frame_seqlen, 1, 1, sink_tokens=sink * frame_seqlen,
-                                    windowed=True, device="cpu", dtype=torch.float32)
-    for c, held in _simulate(cache, frame_seqlen, chunk, num_chunks=8, passes=5):
-        frames = held.view(-1, frame_seqlen)[:, 0].long().tolist()
-        end = (c + 1) * chunk
+def test_the_store_keeps_the_sink_and_the_latest_window():
+    model = LingBotWorldModel(skip_weight_loading=True)
+    cfg, (window, sink) = model.config, (model.config.local_attn_size, model.config.sink_size)
+    for c, frames in _rollout_frames(model, (48, 64), num_chunks=8):
+        end = (c + 1) * cfg.chunk_size
         if end <= window:
             assert frames == list(range(end))
         else:
             assert frames == list(range(sink)) + list(range(end - (window - sink), end))
 
 
-def test_unwindowed_cache_appends_without_eviction():
-    cache = RollingKVCache.allocate(1, 24 * 2, 1, 1, sink_tokens=0, windowed=False, device="cpu", dtype=torch.float32)
-    *_, (_, held) = _simulate(cache, 2, 4, num_chunks=6, passes=5)
-    assert held.view(-1, 2)[:, 0].long().tolist() == list(range(24))
+def test_without_a_window_the_store_keeps_every_frame():
+    model = LingBotWorldModel(skip_weight_loading=True)
+    model.config.local_attn_size = -1
+    *_, (c, frames) = _rollout_frames(model, (48, 64), num_chunks=6)
+    assert frames == list(range(24))
 
 
 def test_first_frame_mask_marks_only_the_first_video_frame():
@@ -482,13 +500,34 @@ def test_the_engine_attention_dit_builds_without_flash_attn(monkeypatch):
         LingBotWorldModel().get_submodule("dit")
 
 
-def test_the_dit_declares_one_ragged_cross_attention(model):
-    (spec,) = model.get_node_resources()
-    assert isinstance(spec, RaggedCrossAttentionSpec)
-    assert spec.resource_key == DIT_ATTN and spec.nodes == {"dit"}
-    assert (spec.config.num_qo_heads, spec.config.num_kv_heads, spec.config.head_dim) == (12, 12, 128)
-    assert spec.config.dtype == torch.bfloat16
-    assert LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources() == []
+def test_the_dit_declares_the_rolling_kv_and_a_ragged_cross_attention(model):
+    kv, attn = model.get_node_resources()
+    assert isinstance(kv, RollingKVSpec) and kv.resource_key == DIT_KV and kv.nodes == {"dit"}
+    assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim) == (30, 12, 128)
+    assert kv.config.dtype == torch.bfloat16 and kv.config.max_slots == 1
+    assert isinstance(attn, RaggedCrossAttentionSpec)
+    assert attn.resource_key == DIT_ATTN and attn.nodes == {"dit"}
+    assert (attn.config.num_qo_heads, attn.config.num_kv_heads, attn.config.head_dim) == (12, 12, 128)
+    assert attn.config.dtype == torch.bfloat16
+    # the reference's FA2 attends the same store
+    (ref_kv,) = LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources()
+    assert isinstance(ref_kv, RollingKVSpec) and ref_kv.resource_key == DIT_KV
+
+
+def test_the_bound_holds_the_window_of_the_largest_area_at_any_aspect(model):
+    """18 latent frames of at most max_area / 256 tokens: 11.1 GiB of bf16 K/V at
+    720x1280, 4.7 GiB at the default 464x832, each rollout holding its own."""
+    cfg = model.config
+    assert model.max_request_tokens() == 18 * (720 * 1280 // 256)
+    (kv, _) = model.get_node_resources()
+    assert round(kv.config.request_bytes(model.max_request_tokens(), torch.bfloat16) / 2**30, 1) == 11.1
+    default = _bare_dit_submodule(model, {}).chunk_spans(0, (464, 832)).position
+    assert round(kv.config.request_bytes(default.sink + default.window, torch.bfloat16) / 2**30, 1) == 4.7
+    sub = _bare_dit_submodule(model, {})
+    for image_hw in [(720, 1280), (1280, 720), (960, 960), (408, 2256), (2256, 408), (480, 832)]:
+        lat = model.geometry(image_hw, 720, 1280)
+        last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
+        assert last.sink + last.window <= model.max_request_tokens(), image_hw
 
 
 SWITCHES = ("reference_numerics", "dit_compile_autotune")
@@ -539,13 +578,20 @@ def test_a_chunks_step_pairs_its_queries_with_its_window_and_the_text(model):
     assert isinstance(step, RaggedCrossAttentionStep)
     assert [(s.label, s.span) for s in step.segments] == [("chunk", 4 * frame), ("window", 18 * frame), ("text", 512)]
     assert step.pairs == (("chunk", "window"), ("chunk", "text"))
+    # with the store bound, the same step declares the chunk's write and its place in the stream
+    sub.node_resources = {DIT_ATTN: object(), DIT_KV: object()}
+    kv = sub.declare_step(ROLLOUT_WALK, ["r"], inputs).steps[DIT_KV]
+    assert isinstance(kv, RollingKVStep) and [(s.label, s.span) for s in kv.segments] == [("chunk", 4 * frame)]
+    assert kv.positions["r"] == (5 * 4 * frame, 6 * frame, 12 * frame)
 
 
 def test_without_the_resource_only_the_reference_numerics_attend(model):
     sub = _bare_dit_submodule(model, {})
     with pytest.raises(RuntimeError, match=DIT_ATTN):
         sub.attention()  # a silent FA2 fallback would hide a deployment without the resource
-    assert sub.declare_step(ROLLOUT_WALK, ["r"], [NodeInputs(resource_step_info=ChunkSpans(1, 1, 1))]) is None
+    assert sub.declare_step(ROLLOUT_WALK, ["r"], [NodeInputs(resource_step_info=sub.chunk_spans(0, (16, 16)))]) is None
+    with pytest.raises(RuntimeError, match=DIT_KV):
+        sub.kv_store()  # the rolling K/V live only in the engine's store
     reference = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True, reference_numerics=True), {})
     assert reference.attention() is REFERENCE_ATTENTION
 
@@ -566,18 +612,6 @@ def test_the_engine_attention_binds_both_pairs(model):
     assert sub.attention() is attention  # one set of callables per binding
 
 
-def test_the_declared_window_is_what_the_rolling_cache_attends(model):
-    cfg, frame_seqlen = model.config, 3
-    cache = RollingKVCache.allocate(1, cfg.local_attn_size * frame_seqlen, 1, 1,
-                                    sink_tokens=cfg.sink_size * frame_seqlen, windowed=True, device="cpu",
-                                    dtype=torch.float32)
-    for c in range(9):
-        plan = cache.plan(c * cfg.chunk_size * frame_seqlen, cfg.chunk_size * frame_seqlen)
-        window = cache.window(plan)
-        assert window.stop - window.start == attended_frames(cfg, c) * frame_seqlen
-        cache.global_end, cache.local_end = plan.current_end, plan.local_end
-
-
 def test_the_fast_config_only_adds_the_autotuned_compile():
     from pathlib import Path
 
@@ -588,21 +622,19 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
     fast = yaml.safe_load((configs / "lingbot_world_1_3b_fast.yaml").read_text())
     assert fast.pop("model_kwargs") == {"dit_compile_autotune": True}
     assert fast == base
-    LingBotWorldModel(skip_weight_loading=True).validate_config_yaml(fast, "lingbot_world_1_3b_fast.yaml")
 
 
-def test_the_shipped_config_serves_one_rollout_at_a_time(model):
+def test_the_shipped_config_sizes_the_rolling_kv_pool_and_no_longer_caps_requests(model):
+    """Concurrency is the store's slots now: a rollout past them waits at admit."""
     from pathlib import Path
 
     import yaml
 
-    path = Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml"
-    model.validate_config_yaml(yaml.safe_load(path.read_text()), str(path))
-    for limit in (None, 0, 2, 16, True, "1"):
-        config = {"max_concurrent_requests": limit} if limit is not None else {}
-        with pytest.raises(ValueError, match="max_concurrent_requests: 1") as err:
-            model.validate_config_yaml(config, "lingbot.yaml")
-    assert "4.7 GiB at 480x832" in str(err.value) and "up to 11.2 GiB" in str(err.value)
+    config = yaml.safe_load((Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml").read_text())
+    assert "max_concurrent_requests" not in config
+    (kv, _) = model.get_node_resources()
+    kv.apply_yaml_overrides(**config["resources"][DIT_KV])
+    assert kv.config.max_slots == 1 and kv.config.max_request_tokens == model.max_request_tokens()
 
 
 def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
@@ -623,21 +655,36 @@ def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
 
     attention = DitAttention(window=attend, text=attend)
     frame_seqlen, cs = 4, cfg.chunk_size
-    cache = dit.new_cache(frame_seqlen, chunks * cs, "cpu")
-    cache.k = [t.float() for t in cache.k]
-    cache.v = [t.float() for t in cache.v]
+    text_kv = dit.text_kv(torch.randn(3, 8))
+    # warmup traces against a store that keeps nothing, as the submodule's does at load
+    conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), 0)
+    dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
+        conditioning, ChunkOnlyStore(), attention)
+    store = RollingKVManager(RollingKVConfig(num_layers=num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                                             max_request_tokens=cfg.local_attn_size * frame_seqlen,
+                                             dtype=torch.float32),
+                             torch.device("cpu"))
+    sub = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True), {DIT_KV: store})
+    sub.config = cfg
     for chunk in range(chunks):
+        spans = sub.chunk_spans(chunk, (32, 32))
+        step = sub.declare_step(ROLLOUT_WALK, [1], [NodeInputs(resource_step_info=spans)]).steps[DIT_KV]
+        ctx = StepContext(request_ids=(1,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+        assert store.admit(step, ctx).ok
+        store.plan(step, ctx)
         conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), chunk * cs)
         for _ in range(2):
-            dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), torch.randn(3, 8), torch.randn(20, cs, 4, 4),
-                conditioning, cache, chunk * cs * frame_seqlen, attention)
+            dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
+                conditioning, store, attention)
+        store.commit(step, ctx)
     return torch._dynamo.utils.counters["stats"]["unique_graphs"]
 
 
 def test_compiled_blocks_trace_once_for_every_layer_and_chunk():
-    """The cache offsets and the layer index stay out of the compiled blocks,
+    """The store's offsets and the layer index stay out of the compiled blocks,
     so a rollout compiles them once, not once per layer or per chunk (five
-    chunks run past the first eviction)."""
+    chunks run past the first eviction), and the warmup's scratch store traces
+    the same graphs as the engine's."""
     one_chunk = _compiled_rollout_graphs(num_layers=2, chunks=1)
     assert one_chunk > 0
     assert _compiled_rollout_graphs(num_layers=4, chunks=5) == one_chunk
