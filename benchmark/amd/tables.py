@@ -96,7 +96,8 @@ TABLES: dict[str, Table] = {t.name: t for t in [
           ("mstar", "vllm-omni", "vllm-omni-rc", "sglang-diffusion", "sglang-diffusion-compile", "ref-diffusers"),
           ("video-t2v", "video-i2v"),
           note="Text- and image-to-video, time per clip at concurrency 1 and makespan above it"),
-    Table("asr", ("whisper_large",), ("mstar", "mstar-base", "vllm-whisper", "sglang-whisper"), ("asr-libri",),
+    Table("asr", ("whisper_large",), ("mstar", "mstar-split", "mstar-base", "vllm-whisper", "sglang-whisper"),
+          ("asr-libri",),
           note="Whisper large-v3 on the OpenAI transcription route"),
     # Functional runs on one dev slice: every cell type once, no timing value.
     Table("dry-text", ("qwen3_5_0.8b",), ("mstar", "vllm-aiter", "sglang-aiter"), ("text-chat-256",), repeats=1),

@@ -1,7 +1,7 @@
 """Worker phases of one mstar row under a table workload, one window per concurrency.
 
     python -m benchmark.amd.phase_cells --row whisper_large --workload asr-libri --concurrency 8,32
-        --gpus 0 --out DIR --worktree TREE --numa
+        --gpus 0 --out DIR --worktree TREE --numa [--arm mstar-split]
 
 One server with MSTAR_PHASE_TIMING (long_prompt.phase_server) gets one benchmark.runner run per concurrency, with the
 workload's first-repeat warmup, and the phase records are cut by each run's time window: phases.txt has one table
@@ -26,6 +26,9 @@ GAP_S = 5  # between windows, so no phase record straddles two
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--row", required=True, choices=sorted(catalog.ROWS))
+    mstar_arms = sorted(name for name, arm in catalog.ARMS.items() if arm.engine == "mstar")
+    ap.add_argument("--arm", default="mstar", choices=mstar_arms,
+                    help="which mstar arm's config and env to serve (default: mstar)")
     ap.add_argument("--workload", required=True, choices=sorted(tables.WORKLOADS))
     ap.add_argument("--concurrency", required=True, help="comma list, one window each, in this order")
     ap.add_argument("--gpus", required=True)
@@ -36,7 +39,7 @@ def main(argv=None) -> int:
     ap.add_argument("--numa", action="store_true", help="bind the server and the client to the GPU's NUMA node")
     args = ap.parse_args(argv)
 
-    row, arm, wl = catalog.ROWS[args.row], catalog.ARMS["mstar"], tables.WORKLOADS[args.workload]
+    row, arm, wl = catalog.ROWS[args.row], catalog.ARMS[args.arm], tables.WORKLOADS[args.workload]
     if wl.family != row.family:
         raise SystemExit(f"{wl.name} is a {wl.family} workload and {row.name} a {row.family} row")
     conc = [int(c) for c in args.concurrency.split(",")]

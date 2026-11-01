@@ -20,16 +20,20 @@ import torch
 from mstar.platforms.interface import (
     CpuPlatform,
     CudaPlatform,
+    HardwareQueueColocation,
     Platform,
     RocmPlatform,
+    WorkerColocation,
     XpuPlatform,
 )
 
 __all__ = [
     "CpuPlatform",
     "CudaPlatform",
+    "HardwareQueueColocation",
     "Platform",
     "RocmPlatform",
+    "WorkerColocation",
     "XpuPlatform",
     "apply_process_env_defaults",
     "apply_visible_devices",

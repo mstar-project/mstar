@@ -53,7 +53,7 @@ def _launch_token(monkeypatch):
 def _shutdown(p) -> None:
     """The real ``Conductor.shutdown``, on a conductor whose only worker is ``p``."""
     c = Conductor.__new__(Conductor)
-    c._worker_processes, c._mps = [p], None
+    c._worker_processes, c._colocation = [p], None
     c.shutdown()
 
 

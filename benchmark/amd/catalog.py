@@ -109,7 +109,8 @@ ROWS: dict[str, Row] = {r.name: r for r in [
         engine_args={"vllm-omni-tuned": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_omni_rocm_tuned.yaml"))},
         engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0, startup_timeout=5400,
         moe_shapes=QWEN3_OMNI_MOE),
-    Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448),
+    Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448,
+        mstar_configs={"mstar-split": "whisper_large_split"}),
     Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein", generator_device="cpu"),
     Row("flux2_klein_9b", "image", "black-forest-labs/FLUX.2-klein-9B", "flux2_klein_9b", generator_device="cpu"),
     Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo", generator_device="cpu"),
@@ -194,6 +195,10 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         recipe="as the mstar arm, plus MSTAR_TP_ASYNC_SCHED=1 (async scheduling on the TP node)"),
     Arm("mstar-colocated", "mstar", ("tts",), client="ours_openai", rows=("qwen3tts_1p7b",),
         env={"MSTAR_SHM_ARENA": "1"}, recipe="as the mstar arm, on the single-worker config"),
+    # The encoder and the decoder as two worker processes on one GPU (configs/whisper_large_split.yaml, its
+    # mps: true is a no-op on AMD GPUs: the hardware scheduler runs both workers' queues side by side).
+    Arm("mstar-split", "mstar", ("asr",), client="ours_openai", rows=("whisper_large",),
+        env={"MSTAR_SHM_ARENA": "1"}, recipe="as the mstar arm, on the encoder/decoder split config"),
     # The Thinker's and Talker's routed experts on AITER's fused MoE instead of mstar's Triton kernels
     # (MoEBackend in mstar/utils/fused_moe/backend.py), right after the mstar arm on the same GPUs.
     Arm("mstar-aitermoe", "mstar", ("omni",), client="ours_openai", env={"MSTAR_SHM_ARENA": "1"},
