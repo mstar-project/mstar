@@ -210,6 +210,24 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
     assert all(peak == footprint for peak, footprint in held.values()), f"(peak, footprint) by label: {held}"
 
 
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
+    """The prefill emits the first of max_output_tokens, so the decode loop's
+    cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
+    ends at the prefill."""
+    if model_name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
+
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+    else:
+        from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+
+        model = object.__new__(CanaryQwenModel)
+    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max(1, max_tokens - 1)
+
+
 @pytest.mark.parametrize("variant", ["chatterbox", "turbo"])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(variant):
     from mstar.model.chatterbox.components.audio_frontend import resample, trim_reference

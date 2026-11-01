@@ -312,11 +312,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        walk places adds none), so every replica warms. When some worker graph has
        fewer replicas than that, such as one DiT instance beside a replicated VAE,
        the entry first runs once alone, so that graph also warms its one-request
-       shape before the copies reach it together; otherwise a batch size of 1 is
-       warmed only if ``concurrency`` includes 1. ``concurrency: N`` submits N copies per replica at once, so they can batch, for a step that
-       compiles per batch size (whether they share a step is the scheduler's
-       call); a list (``concurrency: [1, 2, 4]``) runs the entry once per size, in
-       order. A malformed or failing warmup is logged and skipped.
+       shape before the copies reach it together. A malformed or failing warmup
+       is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
        subgroups during weight load and warmup; serving keeps PyTorch's default.
@@ -340,20 +337,6 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
-   * - ``api_switch_interval_s``
-     - *(optional)* GIL switch interval of the API server process, in seconds
-       (``sys.setswitchinterval``), a positive number (anything else fails at
-       startup); unset keeps Python's 5 ms. Under streaming load
-       that process keeps three threads busy (event loop, message thread, data
-       worker), and a shorter interval hands the GIL between them sooner:
-       ``0.001`` gave Qwen3.5-0.8B text, c=64, +4 to +8% tok/s, and a
-       model whose preprocessing runs long on the data-worker thread lost from it
-       (Kokoro's G2P: about -3.6% at c=32), so it is per deployment. Both numbers
-       were measured before `#849 <https://github.com/mstar-project/mstar/pull/849>`_
-       and `#939 <https://github.com/mstar-project/mstar/pull/939>`_ changed the
-       message-thread and data-worker path; the knob awaits a
-       re-measure on the current path and is deleted if neutral. Workers take
-       theirs from ``MSTAR_PY_SWITCH_INTERVAL_SEC``.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``
        (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
@@ -404,7 +387,10 @@ travels with its other ``model_kwargs``. Above one rank the cache stays off unle
 ``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run on one TP group, with no replicas and no walks placed on other
-ranks. Loading fails otherwise.
+ranks. Loading fails otherwise. A cache that keeps
+a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
+``prefix_cache`` goes off (logged at info), and a serving config that sets
+``prefix_cache: true`` on it is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on

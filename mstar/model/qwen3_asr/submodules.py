@@ -131,8 +131,6 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.model = llm
         self.config = config
-        # only a decode step's token ends the loop: prefill runs outside it,
-        # and samples the reply's first token
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=config.stop_token_ids,
             sampler=self.SAMPLER, walk=DECODE_WALK, prefill_walks=frozenset({PREFILL_WALK}),
