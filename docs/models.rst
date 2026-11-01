@@ -376,12 +376,13 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 The prefill, mixed and vision captures compile in Inductor's deterministic mode
-whatever ``-O`` says: autotuning them bought no GPU time and took a large part of
-the cold start. The decode capture keeps the ``-O`` level's tuned kernels, which win
-at one row. ``knobs: {compile_deterministic: true}`` compiles it deterministically
-too: greedy output then reproduces across server processes and the cold start
-shrinks again, at a cost to one-row decode (27B TP4 on H200: c=1 151 against 169
-tok/s, ITL 6.48 against 5.47 ms, the same from c=4 up).
+whatever ``-O`` says: autotuning them bought no GPU time and took about a fifth of
+the cold start. The decode capture keeps the ``-O`` level's tuned kernels. ``knobs:
+{compile_deterministic: true}`` compiles it deterministically too: greedy output then
+reproduces across server processes and the cold start more than halves. One-row
+decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
+at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
+c=4 up it makes no difference.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens

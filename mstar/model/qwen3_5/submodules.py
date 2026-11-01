@@ -189,7 +189,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 },
             )
 
-        # Prefill loses nothing to deterministic mode and starts much faster.
+        # Prefill loses nothing to deterministic mode and compiles faster.
         # Decode keeps its tuned kernels, which win at one row, unless the
         # deployment asks for output that reproduces across processes: both
         # the cost and that guarantee sit on this graph.
