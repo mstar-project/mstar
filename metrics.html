@@ -924,6 +924,13 @@ toward <code class="docutils literal notranslate"><span class="pre">max_concurre
 conductor dispatched and has not heard back from. The conductor sees whole passes,
 so a node running a request’s decode loop counts it once for the loop.</p>
 </dd>
+<dt><code class="docutils literal notranslate"><span class="pre">mstar_routing_predicted_saving_total{model_name,</span> <span class="pre">term}</span></code></dt><dd><p>Counter, up to a second old. Per term of the data-parallel replica cost (see
+“Data-parallel routing” in <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>), the saving predicted on the replica each
+request was sent to, in request-equivalents, unweighted. For <code class="docutils literal notranslate"><span class="pre">prefix</span></code>, each request
+adds the share of its prompt predicted cached there, so its rate over the request rate
+is a mean of per-request shares, not the token ratio the workers’ prefix-cache counters
+give.</p>
+</dd>
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_conductor_status_age_seconds{model_name}</span></code></dt><dd><p>Gauge, seconds, computed at scrape time. Time since the API server received the
 conductor’s last status message, or since metrics were enabled if none arrived yet.
 More than a few seconds means the conductor stopped reporting, and the conductor,

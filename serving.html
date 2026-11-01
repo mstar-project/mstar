@@ -1009,12 +1009,23 @@ below).</p></td>
 conductor’s queue, except a live call (open client input), which is refused with
 a 503.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">gpu_memory_fraction</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">routing_weights</span></code></p></td>
+<td><p><em>(optional)</em> The weights of the data-parallel replica pick (see below), one per
+term: <code class="docutils literal notranslate"><span class="pre">load</span></code> for the live requests on a replica, and <code class="docutils literal notranslate"><span class="pre">prefix</span></code> for the share of
+the prompt predicted in its KV prefix cache. Each is a number from 0 to 1e6; <code class="docutils literal notranslate"><span class="pre">load</span></code>
+defaults to 1.0 and <code class="docutils literal notranslate"><span class="pre">prefix</span></code> to 8.0. Any other key, or <code class="docutils literal notranslate"><span class="pre">load:</span> <span class="pre">0</span></code> while another
+weight is above 0, fails loading. <code class="docutils literal notranslate"><span class="pre">prefix:</span> <span class="pre">0</span></code> picks by load alone, and <code class="docutils literal notranslate"><span class="pre">prefix:</span> <span class="pre">1</span></code>
+or less keeps a hit below one live request, so it only breaks ties. At data
+parallelism, warmup copies run with <code class="docutils literal notranslate"><span class="pre">prefix_cache=False</span></code>, so
+they still spread but do not warm the prefill that starts from cached pages; a
+warmup spec that sets <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> keeps its own value.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">gpu_memory_fraction</span></code></p></td>
 <td><p><em>(optional)</em> The share of its GPU each worker may hold once CUDA-graph capture is
 done, for workers that share a GPU (see below). Unset, capture plans against
 whatever is free.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mps</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mps</span></code></p></td>
 <td><p><em>(optional)</em> <code class="docutils literal notranslate"><span class="pre">true</span></code> runs the workers as clients of a CUDA MPS control daemon the
 conductor starts in a private directory, so workers that share a GPU overlap their
 kernels instead of time-slicing (the ASR <code class="docutils literal notranslate"><span class="pre">*_split</span></code> configs). NVIDIA only, and it
@@ -1022,7 +1033,7 @@ needs <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-m
 shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
 <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
 <td><p><em>(optional, default 512)</em> For a model that takes live client input: how many MiB
 of files (and append text) one call may send over its whole life, its opening
 message’s included.
@@ -1031,7 +1042,7 @@ it ends the call with a 400; a one-shot request is not counted. It caps a call�
 decoded input is larger than its files, and how much of it waits in buffers
 depends on how fast the model consumes it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">client_streams</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">client_streams</span></code></p></td>
 <td><p><em>(optional)</em> For a model that takes live client input: per client stream (by
 its edge name, e.g. <code class="docutils literal notranslate"><span class="pre">audio_in</span></code>), overrides of the limits the model declares on
 it (<code class="docutils literal notranslate"><span class="pre">ClientStreamLimits</span></code>, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). <code class="docutils literal notranslate"><span class="pre">max_items</span></code>: what the
@@ -1043,10 +1054,10 @@ model sizes its buffers from its own settings (for <code class="docutils literal
 <code class="docutils literal notranslate"><span class="pre">max_session_s</span></code> instead). An unknown stream, key or value fails loading. Unlike
 <code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code> it counts what the model was handed, not bytes uploaded.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
 <td><p><em>(optional)</em> Server-init model parameters (see below).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
 <td><p><em>(optional, default true)</em> Whether the server offers per-message deflate on its
 WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>); it applies to every route.
 Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
@@ -1055,7 +1066,7 @@ costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, whose configs turn it off. Turn it off where the server’s
 event loop, not the network, is the bottleneck.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
 <td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk of the node’s combined
 walks, or a mapping of walk -&gt; <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code>. On for a walk, a speculation
 chain on it merges ready rows of the other walks of its combined walk, so
@@ -1064,7 +1075,7 @@ keeps to its own walk and yields to the others, and a step mixes walks only
 when the scheduler builds one fresh. Naming a node with no combined walk, or a
 walk outside its combined walks, fails loading.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
 <td><p><em>(optional)</em> Requests the server runs after the workers are ready and before it
 binds, so no client pays a shape’s first-request cost (torch.compile of a step,
 a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
@@ -1082,13 +1093,13 @@ the entry first runs once alone, so that graph also warms its one-request
 shape before the copies reach it together. A malformed or failing warmup
 is logged and skipped.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
 <td><p><em>(optional)</em> Timeout in seconds for the NCCL world group and its parallel
 subgroups during weight load and warmup; serving keeps PyTorch’s default.
 Unset keeps PyTorch’s default throughout. Raise it only where weight load,
 JIT or CUDA-graph capture can exceed that default.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
 <td><p><em>(optional)</em> Small-message all-reduce path of every TP and SP group:
 <code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code>, <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>;
 any other value fails at startup. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> sends 2-D bf16 CUDA messages
@@ -1103,17 +1114,17 @@ differs from NCCL’s, so bf16 results can differ at the last bit. Falls back
 to NCCL, with a warning, where the chosen path cannot be set up on every
 rank of the group.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
 <td><p><em>(optional)</em> Largest message, in KiB, the non-NCCL path takes;
 larger ones go to NCCL. It is also the size of the buffer each group
 rendezvouses. Default 512.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
 <td><p><em>(optional)</em> Async scheduling for the parallel nodes: <code class="docutils literal notranslate"><span class="pre">true</span></code>
 (default), <code class="docutils literal notranslate"><span class="pre">false</span></code> or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
@@ -1178,6 +1189,34 @@ It doesn’t replace the cap. With a host pool and the prefix cache on, a cached
 copied to the host once no request holds it, and a later request whose prefix the device
 evicted copies it back from there. So the host pool should hold more pages than the device’s
 prefix cache.</p>
+<p><strong>Data-parallel routing.</strong> A node group whose <code class="docutils literal notranslate"><span class="pre">ranks</span></code> hold several lockstep instances
+(<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">*</span> <span class="pre">sp_size</span></code> ranks each, or one rank) runs each request on one of them, its
+replica. The conductor picks it per request, at ingest, as the replica with the lowest
+cost: <code class="docutils literal notranslate"><span class="pre">routing_weights.load</span></code> times the live requests on the replica (counted per set of
+groups that pick together, for each request with a partition on them that is not done at
+ingest), plus the price of what the conductor predicts about the request there. Ties go
+at random. Every term is in request-equivalents. Groups whose replicas sit on the same
+ranks, replica for replica, take one pick together.</p>
+<p>Today the one prediction is the KV prefix cache’s, on the replicas that run any walk a
+KV label keys the cache on (<code class="docutils literal notranslate"><span class="pre">kv_labels</span></code>): <code class="docutils literal notranslate"><span class="pre">routing_weights.prefix</span></code>
+times minus the share of the request’s prompt positions (every label’s, keyed or not)
+the replica’s caches are predicted to hold, all the caches on the replica together. At
+the default weights a prompt held whole is worth up to 8 live requests: a request
+follows its prefix to a busier replica, and a hot prefix spreads once its replica runs
+about 8 times its hit share more requests than another. The term is a share rather than
+a token count so that one weight fits models whose prefill and decode costs differ.</p>
+<p>The prediction runs the worker’s own prefix index and page ownership (<code class="docutils literal notranslate"><span class="pre">PrefixIndex</span></code>,
+<code class="docutils literal notranslate"><span class="pre">PageArena</span></code>) per replica, with no storage, and takes a request’s steps at dispatch: its
+lease of the matched pages, its own pages, evicting on a shortfall, the index entries of
+its whole pages, and the page of an image or other item that ends inside one, cached up
+to the item’s end. Its end releases its pages; a request that ends before a pass of it
+comes back (aborted while queued, say) also takes back the entries only it made. Workers send
+nothing for it, so it does not see admit timing, decode growth, preemption or a reply’s
+tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
+With no cache that opens (one replica, <code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">false</span></code>, no walk that keys it,
+replicas above one rank, where the cache stays off: <code class="docutils literal notranslate"><span class="pre">prefix_cache_tp</span></code> on a pool with
+replicas fails at startup, or a keyed node whose recurrent state pool keeps no snapshots,
+<code class="docutils literal notranslate"><span class="pre">prefix_slots:</span> <span class="pre">0</span></code>) the pick is the replica with the fewest live requests.</p>
 <p><strong>Single GPU.</strong> Everything on rank 0:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"bagel"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>
@@ -1505,6 +1544,10 @@ its state; it still counts toward <code class="docutils literal notranslate"><sp
 <code class="docutils literal notranslate"><span class="pre">node_names</span></code> of the config’s <code class="docutils literal notranslate"><span class="pre">node_groups</span></code>), running requests with a pass on that
 node that the conductor dispatched and has not heard back from. The conductor sees
 whole passes, so a node running a request’s decode loop counts it once for the loop.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_routing_predicted_saving_total{model_name,</span> <span class="pre">term}</span></code>: counter, per term of the
+data-parallel replica cost, the saving predicted on the replica each request went to,
+in request-equivalents. For <code class="docutils literal notranslate"><span class="pre">prefix</span></code>, each request adds the share of its prompt
+predicted cached there.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_conductor_status_age_seconds{model_name}</span></code>: seconds since the API server
 received the last status message, or since metrics were enabled before the first one.
 More than a few seconds means the conductor stopped reporting.</p></li>

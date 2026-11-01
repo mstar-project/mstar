@@ -30,5 +30,6 @@
    conductor
    mps
    request_info
+   routing
    workers
 

@@ -988,7 +988,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span> <span class="n">Protocol</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
@@ -1030,6 +1030,72 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="RoutingContext">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.RoutingContext">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RoutingContext</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The data-parallel replicas a routing mirror is built for, and what a</span>
+<span class="sd">    mirror reads of the model's KV declarations, which ``ReplicaRouter`` fills."""</span>
+    <span class="n">num_replicas</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># the walks of the worker graphs that hold the resource's nodes on these replicas</span>
+    <span class="n">walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="c1"># the resource's keyed labels, each with the walks whose writes it keys</span>
+    <span class="n">keyed</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span>
+    <span class="c1"># whether every replica's engine opens the resource's prefix cache (`prefix_caches_by_rank`),</span>
+    <span class="c1"># derived by the router rather than declared</span>
+    <span class="n">prefix_cache_opens</span><span class="p">:</span> <span class="nb">bool</span></div>
+
+
+
+<div class="viewcode-block" id="RoutingFacts">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.RoutingFacts">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RoutingFacts</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a mirror predicts for a new request on one replica, by name, for</span>
+<span class="sd">    the conductor's ``routing_cost`` to price. Every field is a count whose</span>
+<span class="sd">    identity is 0: a mirror leaves the fields it does not report at 0, and the</span>
+<span class="sd">    router adds the rows of every mirror on the replica field by field before</span>
+<span class="sd">    pricing them once."""</span>
+    <span class="c1"># the positions the request's prompt writes, every KV label's</span>
+    <span class="n">work</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># of those, the positions a KV prefix cache is predicted to hold</span>
+    <span class="n">kv_hit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span></div>
+
+
+
+<div class="viewcode-block" id="RoutingMirror">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.RoutingMirror">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RoutingMirror</span><span class="p">(</span><span class="n">Protocol</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A conductor-side prediction of one resource's state on each data-parallel</span>
+<span class="sd">    replica, for choosing a new request's replica. It holds bookkeeping only,</span>
+<span class="sd">    never the resource's data, follows the resource's own rules on what the</span>
+<span class="sd">    conductor sees, and a wrong prediction makes a request slower, never wrong.</span>
+
+<span class="sd">    ``config`` is the request's config for the resource, as the conductor</span>
+<span class="sd">    opens it with: built and validated before the pick.</span>
+<span class="sd">    """</span>
+
+<div class="viewcode-block" id="RoutingMirror.facts">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.RoutingMirror.facts">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">facts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="s2">"ResourceReqConfig"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">RoutingFacts</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The request's facts on each replica."""</span></div>
+
+
+<div class="viewcode-block" id="RoutingMirror.add_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.RoutingMirror.add_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">add_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="s2">"ResourceReqConfig"</span><span class="p">,</span> <span class="n">replica</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Record the request as placed on ``replica``; the handle comes back to ``remove_request``."""</span></div>
+
+
+<div class="viewcode-block" id="RoutingMirror.remove_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.RoutingMirror.remove_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handle</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ran</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Release what ``add_request`` recorded, once the request is gone.</span>
+<span class="sd">        ``ran`` says whether a pass came back for one of the request's</span>
+<span class="sd">        partitions with a walk on the resource's node groups (not necessarily a</span>
+<span class="sd">        walk that uses the resource), so the resource may hold what it left."""</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="NodeResourceSpec">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1061,6 +1127,23 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""</span>
         <span class="k">return</span> <span class="kc">False</span>
 
+<div class="viewcode-block" id="NodeResourceSpec.keeps_prefix_cache">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.keeps_prefix_cache">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keeps_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">checkpoint_named</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether the resource keeps a prefix cache of its own on a lockstep</span>
+<span class="sd">        instance of ``world_size`` ranks, for a model that names its checkpoint</span>
+<span class="sd">        or not. False (the default) keeps nothing across requests.</span>
+<span class="sd">        `opening_prefix_caches` weighs it against the resources on its nodes."""</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">restores_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A hit needs state the resource holds from the skipped tokens, so it</span>
+<span class="sd">        serves one only from a prefix cache of its own, or, keeping none, from</span>
+<span class="sd">        those of the resources it depends on that restore."""</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
     <span class="nd">@property</span>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
@@ -1070,6 +1153,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        The builder, not necessarily the class built: an attention spec names</span>
 <span class="sd">        `AttentionManager`, whose `build` picks a backend subclass.</span>
 <span class="sd">        """</span>
+
+<div class="viewcode-block" id="NodeResourceSpec.routing_mirror">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.routing_mirror">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">routing_mirror</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">RoutingContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RoutingMirror</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A mirror of this resource for the replicas ``ctx`` describes; None</span>
+<span class="sd">        (the default) leaves the resource out of the replica pick there."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
 
 <div class="viewcode-block" id="NodeResourceSpec.derive">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.derive">[docs]</a>

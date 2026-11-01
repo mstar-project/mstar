@@ -722,6 +722,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.max_rows_in_combined</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.needs_remote_transfer"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.needs_remote_transfer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.nodes"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.prefix_caches"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.prefix_caches</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.transfer_engine_info"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.transfer_engine_info</span></code></a></li>
 </ul>
 </li>
@@ -1013,7 +1014,7 @@ stream’s position counter once they are skipped.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">EngineResourceInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">needs_remote_transfer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dependencies</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_rows_in_combined</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#EngineResourceInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">EngineResourceInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">needs_remote_transfer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dependencies</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_rows_in_combined</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_caches</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({})</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#EngineResourceInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>What the engine has to offer a resource at build time.</p>
 <p>One struct rather than per-kind keyword arguments: a resource takes what it
@@ -1030,6 +1031,7 @@ TypeError rather than something silently swallowed by a <code class="docutils li
 <li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>dependencies</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 <li><p><strong>max_rows_in_combined</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>prefix_caches</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1087,6 +1089,11 @@ declaring <code class="docutils literal notranslate"><span class="pre">RaggedAtt
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.nodes">
 <span class="sig-name descname"><span class="pre">nodes</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.nodes" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.prefix_caches">
+<span class="sig-name descname"><span class="pre">prefix_caches</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.prefix_caches" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1386,7 +1393,8 @@ resource that holds only some lengths.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.close_prefix_cache">
 <span class="sig-name descname"><span class="pre">close_prefix_cache</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.close_prefix_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.close_prefix_cache" title="Link to this definition">#</a></dt>
-<dd><p>Undo <cite>enable_prefix_cache</cite>. Called before any request.</p>
+<dd><p>Keep nothing across requests. The engine calls it, before any
+request, on every other resource.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
@@ -1442,8 +1450,8 @@ resource that holds only some lengths.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.enable_prefix_cache">
 <span class="sig-name descname"><span class="pre">enable_prefix_cache</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">root</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.enable_prefix_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.enable_prefix_cache" title="Link to this definition">#</a></dt>
-<dd><p>Open whatever this resource keeps across requests, under <code class="docutils literal notranslate"><span class="pre">root</span></code>;
-True if anything opened.</p>
+<dd><p>Open whatever this resource keeps across requests, under <code class="docutils literal notranslate"><span class="pre">root</span></code>. The
+engine calls it, before any request, on the caches <cite>opening_prefix_caches</cite> opens.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1452,7 +1460,7 @@ True if anything opened.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2067,6 +2075,7 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.max_rows_in_combined</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.needs_remote_transfer"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.needs_remote_transfer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.nodes"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.prefix_caches"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.prefix_caches</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.transfer_engine_info"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.transfer_engine_info</span></code></a></li>
 </ul>
 </li>

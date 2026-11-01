@@ -1024,6 +1024,13 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"dispatched and whose completion it has not received yet."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
+<span class="n">ROUTING_PREDICTED_SAVING</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_routing_predicted_saving_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Per term of the data-parallel replica cost, the saving the mirrors "</span>
+    <span class="s2">"predicted on the replica each request was sent to, in request-equivalents: "</span>
+    <span class="s2">"for prefix, the share of the request's prompt predicted cached there."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"term"</span><span class="p">,),</span>
+<span class="p">)</span>
 <span class="n">REQUEST_QUEUE_SECONDS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_request_queue_seconds"</span><span class="p">,</span> <span class="n">HISTOGRAM</span><span class="p">,</span>
     <span class="s2">"Successful requests: the conductor taking the request in to admitting it "</span>
@@ -1132,7 +1139,7 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#: Families the conductor's status message carries, exported from the latest</span>
 <span class="c1">#: message.</span>
 <span class="n">STATUS_FAMILIES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Family</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CONDUCTOR_REQUESTS</span><span class="p">,</span> <span class="n">COMPONENT_IN_FLIGHT</span><span class="p">)</span>
+    <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CONDUCTOR_REQUESTS</span><span class="p">,</span> <span class="n">COMPONENT_IN_FLIGHT</span><span class="p">,</span> <span class="n">ROUTING_PREDICTED_SAVING</span><span class="p">)</span>
 <span class="p">}</span> <span class="o">|</span> <span class="n">WORKER_FAMILIES</span>
 </pre></div>
 

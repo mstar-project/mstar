@@ -13,7 +13,11 @@ mstar.engine.resources.kv.config
 
    .. autosummary::
    
+      instance_size
+      opening_prefix_caches
+      prefix_caches_by_rank
       refuse_undeclared_labels
+      unrestorable
       without_layouts
    
    

@@ -27,6 +27,7 @@ mstar.engine.resources.kv
    :toctree:
    :recursive:
 
+   arena
    bounded
    cache
    config
@@ -38,5 +39,6 @@ mstar.engine.resources.kv
    plan
    prefix_index
    ring
+   routing
    transfer
 

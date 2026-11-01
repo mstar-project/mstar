@@ -1058,6 +1058,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">max_rows_in_combined</span><span class="p">:</span> <span class="s2">"Mapping[str, int | None]"</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
     <span class="p">)</span>
+    <span class="c1"># the prefix caches this engine opens (`opening_prefix_caches`), decided</span>
+    <span class="c1"># before any resource is built, for one that sizes itself by its own</span>
+    <span class="n">prefix_caches</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1135,16 +1138,17 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Resource.enable_prefix_cache">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.enable_prefix_cache">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">enable_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KeyedWalks</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Open whatever this resource keeps across requests, under ``root``;</span>
-<span class="sd">        True if anything opened."""</span>
-        <span class="k">return</span> <span class="kc">False</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KeyedWalks</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Open whatever this resource keeps across requests, under ``root``. The</span>
+<span class="sd">        engine calls it, before any request, on the caches `opening_prefix_caches` opens."""</span>
+        <span class="k">return</span></div>
 
 
 <div class="viewcode-block" id="Resource.close_prefix_cache">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.close_prefix_cache">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">close_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Undo `enable_prefix_cache`. Called before any request."""</span>
+<span class="w">        </span><span class="sd">"""Keep nothing across requests. The engine calls it, before any</span>
+<span class="sd">        request, on every other resource."""</span>
         <span class="k">return</span></div>
 
 

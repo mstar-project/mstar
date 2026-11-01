@@ -983,12 +983,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">,</span> <span class="n">RoutingContext</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
@@ -1190,6 +1190,20 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_arena_page</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="c1"># tokens of every layer in an arena page, a page of the first group's layers</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_page</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">groups</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PagedKVConfig.keeps_prefix_cache">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.keeps_prefix_cache">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keeps_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">checkpoint_named</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""`NodeResourceSpec.keeps_prefix_cache` for a pool of this config.</span>
+<span class="sd">        Above one rank only with ``prefix_cache_tp``, and a model that names no</span>
+<span class="sd">        checkpoint needs a salt, or builds that differ only in their weights</span>
+<span class="sd">        could not be told apart."""</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache</span>
+            <span class="ow">and</span> <span class="p">(</span><span class="n">world_size</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache_tp</span><span class="p">)</span>
+            <span class="ow">and</span> <span class="p">(</span><span class="n">checkpoint_named</span> <span class="ow">or</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache_salt</span><span class="p">))</span>
+        <span class="p">)</span></div>
+
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_pages</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1561,6 +1575,92 @@ window.runMermaid = runMermaid;</script>
     <span class="p">}</span></div>
 
 
+
+<div class="viewcode-block" id="instance_size">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.instance_size">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">instance_size</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">instance</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What `opening_prefix_caches` sizes ``spec`` at: the smallest lockstep</span>
+<span class="sd">    instance of its nodes in ``instance``, 1 where it has none."""</span>
+    <span class="k">return</span> <span class="nb">min</span><span class="p">((</span><span class="n">instance</span><span class="p">[</span><span class="n">node</span><span class="p">]</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="k">if</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">instance</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="unrestorable">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.unrestorable">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">unrestorable</span><span class="p">(</span><span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">opened</span><span class="p">:</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The resources that can't restore what a hit skips while ``opened`` open:</span>
+<span class="sd">    those that set `NodeResourceSpec.restores_prefix` and keep no open cache of</span>
+<span class="sd">    their own, unless they are over open caches that restore. Each keeps every</span>
+<span class="sd">    cache on its nodes shut."""</span>
+    <span class="k">return</span> <span class="p">[</span>
+        <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">restores_prefix</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">opened</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span>
+            <span class="n">spec</span><span class="o">.</span><span class="n">depends_on</span><span class="p">()</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="n">dep</span> <span class="ow">in</span> <span class="n">opened</span> <span class="ow">and</span> <span class="n">specs</span><span class="p">[</span><span class="n">dep</span><span class="p">]</span><span class="o">.</span><span class="n">restores_prefix</span> <span class="k">for</span> <span class="n">dep</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">depends_on</span><span class="p">())</span>
+        <span class="p">)</span>
+    <span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="opening_prefix_caches">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.opening_prefix_caches">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">opening_prefix_caches</span><span class="p">(</span>
+    <span class="n">specs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">instance</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">checkpoint_named</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The prefix caches that open: those each spec keeps of its own</span>
+<span class="sd">    (`NodeResourceSpec.keeps_prefix_cache`), less those a resource on their</span>
+<span class="sd">    nodes keeps from serving a hit. Every input is fixed at startup, so the</span>
+<span class="sd">    engines, the conductor's routing and the data worker agree.</span>
+
+<span class="sd">    ``instance`` is the lockstep instance of each node the caller places</span>
+<span class="sd">    (`instance_size`). A cache over other caches, such as a recurrent pool's</span>
+<span class="sd">    snapshots over its KV cache's pages, keeps only where they open on all of</span>
+<span class="sd">    its nodes. A node carrying a resource that can't restore what a hit skips</span>
+<span class="sd">    (`unrestorable`) keeps every cache on it shut: a hit there would skip</span>
+<span class="sd">    tokens its state never saw. Closing one cache can close others, so the rule</span>
+<span class="sd">    runs until nothing changes.</span>
+<span class="sd">    """</span>
+    <span class="n">by_key</span> <span class="o">=</span> <span class="p">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">:</span> <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">}</span>
+    <span class="n">opened</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">key</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">by_key</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">keeps_prefix_cache</span><span class="p">(</span><span class="n">instance_size</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">instance</span><span class="p">),</span> <span class="n">checkpoint_named</span><span class="p">)</span>
+    <span class="p">}</span>
+    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+        <span class="n">kept</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">opened</span>
+            <span class="k">if</span> <span class="nb">all</span><span class="p">(</span><span class="n">dep</span> <span class="ow">in</span> <span class="n">opened</span> <span class="ow">and</span> <span class="n">by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&lt;=</span> <span class="n">by_key</span><span class="p">[</span><span class="n">dep</span><span class="p">]</span><span class="o">.</span><span class="n">nodes</span> <span class="k">for</span> <span class="n">dep</span> <span class="ow">in</span> <span class="n">by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">depends_on</span><span class="p">())</span>
+        <span class="p">}</span>
+        <span class="n">blocked</span> <span class="o">=</span> <span class="p">{</span><span class="n">node</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">unrestorable</span><span class="p">(</span><span class="n">by_key</span><span class="p">,</span> <span class="n">kept</span><span class="p">)</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">}</span>
+        <span class="n">now</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kept</span> <span class="k">if</span> <span class="n">by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">nodes</span><span class="o">.</span><span class="n">isdisjoint</span><span class="p">(</span><span class="n">blocked</span><span class="p">)}</span>
+        <span class="k">if</span> <span class="n">now</span> <span class="o">==</span> <span class="n">opened</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">now</span><span class="p">)</span>
+        <span class="n">opened</span> <span class="o">=</span> <span class="n">now</span></div>
+
+
+
+<div class="viewcode-block" id="prefix_caches_by_rank">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.prefix_caches_by_rank">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">prefix_caches_by_rank</span><span class="p">(</span>
+    <span class="n">specs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span>
+    <span class="n">groups</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">,</span> <span class="n">Collection</span><span class="p">[</span><span class="nb">str</span><span class="p">]]],</span>
+    <span class="n">checkpoint_named</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""The caches each rank's engine opens: `opening_prefix_caches` over the</span>
+<span class="sd">    nodes on the rank, each at its lockstep instance size, as `Engine.load_model`</span>
+<span class="sd">    evaluates it, less the caches with no node there, which that engine counts at</span>
+<span class="sd">    one rank for its item encoders but never builds. ``groups`` gives each node</span>
+<span class="sd">    group's ranks, instance size and nodes."""</span>
+    <span class="n">specs</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
+    <span class="n">local</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">ranks</span><span class="p">,</span> <span class="n">size</span><span class="p">,</span> <span class="n">nodes</span> <span class="ow">in</span> <span class="n">groups</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="n">ranks</span><span class="p">:</span>
+            <span class="n">local</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">nodes</span><span class="p">,</span> <span class="n">size</span><span class="p">))</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="n">rank</span><span class="p">:</span> <span class="n">opening_prefix_caches</span><span class="p">(</span><span class="n">specs</span><span class="p">,</span> <span class="n">nodes</span><span class="p">,</span> <span class="n">checkpoint_named</span><span class="p">)</span>
+        <span class="o">&amp;</span> <span class="p">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="o">.</span><span class="n">isdisjoint</span><span class="p">(</span><span class="n">nodes</span><span class="p">)}</span>
+        <span class="k">for</span> <span class="n">rank</span><span class="p">,</span> <span class="n">nodes</span> <span class="ow">in</span> <span class="n">local</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+    <span class="p">}</span></div>
+
+
+
 <div class="viewcode-block" id="KVSpec">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1587,6 +1687,24 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Forwarded to the config: which keys are legal is a property of the</span>
 <span class="sd">        storage strategy, so the config answers for them."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">apply_yaml_overrides</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KVSpec.keeps_prefix_cache">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.keeps_prefix_cache">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keeps_prefix_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">checkpoint_named</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">keeps_prefix_cache</span><span class="p">(</span><span class="n">world_size</span><span class="p">,</span> <span class="n">checkpoint_named</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KVSpec.routing_mirror">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.routing_mirror">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">routing_mirror</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">RoutingContext</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""A mirror of the prefix cache where it opens and a walk that keys it runs."""</span>
+        <span class="n">labels</span> <span class="o">=</span> <span class="p">[</span><span class="n">label</span> <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">walks</span> <span class="ow">in</span> <span class="n">ctx</span><span class="o">.</span><span class="n">keyed</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">walks</span><span class="o">.</span><span class="n">intersection</span><span class="p">(</span><span class="n">walks</span><span class="p">)]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">labels</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">prefix_cache_opens</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.routing</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVRoutingMirror</span>
+
+        <span class="k">return</span> <span class="n">KVRoutingMirror</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">num_replicas</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_units</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">tokens_per_page</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVSpec.derive">
