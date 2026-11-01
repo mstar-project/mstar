@@ -500,7 +500,8 @@ Qwen3-Omni notes
   needed. A deployment can pick the kernel under ``resources:`` in its YAML,
   e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
   is captured as a CUDA graph per token-count bucket; a request past the
-  largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
+  largest bucket (8192 patches, about a 1920x1080 image; 4096 audio tokens)
+  runs it eagerly.
 - Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
   25-frame chunks behind 25 frames of left context. Playback stays gapless
   while the Talker produces frames at about 1.5x real time over the first 50
