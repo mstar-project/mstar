@@ -101,11 +101,21 @@ class SamplerSpec(NodeResourceSpec):
     # Allows ``return_logprobs``. The captured sampler then scores every step,
     # asked or not, so a deployment turns it on in its ``resources:`` block.
     enable_logprobs: bool = False
+    # Allows ``logprobs_mode: "processed"``; the captured sampler then also
+    # renorms every step's distribution again (CUDA only).
+    enable_processed_logprobs: bool = False
 
-    def apply_yaml_overrides(self, enable_logprobs: bool | None = None) -> None:
+    def apply_yaml_overrides(
+        self, enable_logprobs: bool | None = None, enable_processed_logprobs: bool | None = None,
+    ) -> None:
         if enable_logprobs is not None:
             check_bool_knob("enable_logprobs", enable_logprobs)
             self.enable_logprobs = enable_logprobs
+        if enable_processed_logprobs is not None:
+            check_bool_knob("enable_processed_logprobs", enable_processed_logprobs)
+            self.enable_processed_logprobs = enable_processed_logprobs
+        if self.enable_processed_logprobs and not self.enable_logprobs:
+            raise ValueError("enable_processed_logprobs needs enable_logprobs")
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -142,7 +152,8 @@ class SamplingReqConfig(ResourceReqConfig):
     # generated ones to count.
     penalize_prompt: bool = True
     # Report each sampled token's log-prob. "raw" scores softmax(logits / T)
-    # before the penalty and filters, at T = 1 for greedy requests.
+    # before the penalty and filters, at T = 1 for greedy requests;
+    # "processed", the distribution it was drawn from (0 for greedy).
     return_logprobs: bool = False
     logprobs_mode: str = "raw"
     _seed: int = 0 # set by the conductor
@@ -170,8 +181,8 @@ class SamplingReqConfig(ResourceReqConfig):
         for name in BOOL_KNOBS:
             if (value := getattr(self, name)) is not None:
                 check_bool_knob(name, value)
-        if self.logprobs_mode not in (None, "raw"):
-            raise ValueError(f"logprobs_mode must be 'raw'; got {self.logprobs_mode!r}")
+        if self.logprobs_mode not in (None, "raw", "processed"):
+            raise ValueError(f"logprobs_mode must be 'raw' or 'processed'; got {self.logprobs_mode!r}")
         if spec is None:
             return
         # refused here, not ignored: the node's sampler has no such filter
@@ -179,6 +190,8 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
         if self.return_logprobs and not spec.enable_logprobs:
             raise ValueError("this deployment does not report logprobs; leave return_logprobs unset")
+        if self.return_logprobs and self.logprobs_mode == "processed" and not spec.enable_processed_logprobs:
+            raise ValueError("this deployment does not report processed logprobs; use logprobs_mode 'raw'")
         # a windowed penalty counts the generation history, not the seen-token mask
         windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
         if self.repetition_penalty not in (None, 1) and not (spec.enable_repetion_penalty or windowed):
