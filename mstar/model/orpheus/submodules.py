@@ -7,24 +7,17 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import (
-    AcceleratorGraphConfig,
-    BatchedAcceleratorGraphConfig,
-    PackedAcceleratorGraphConfig,
-)
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
+from mstar.engine.resources import AttentionStep, KVStep
+from mstar.engine.resources.step import ResourceStep
+from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.orpheus.config import ATTN, KV_CACHE, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
-    ARNodeSubmodule,
-    BatchedModelOutput,
     InputMetadata,
     ModelInputsFromEngine,
-    NodeInputs,
     NodeSubmodule,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
@@ -32,199 +25,26 @@ from mstar.streaming.stream_buffer import StreamChunkInfo
 logger = logging.getLogger(__name__)
 
 
-class OrpheusLLMSubmodule(ARNodeSubmodule):
-    """Llama 3.2 3B wrapper for Orpheus TTS.
+class OrpheusLLMSubmodule(SampledTokenDecoder):
+    """Llama 3.2 3B for Orpheus TTS: samples the audio tokens the SNAC node decodes."""
 
-    Dispatches on graph_walk:
-      - prefill: embed text tokens, fill KV cache
-      - decode: embed previous token, generate next audio token
-      - mixed: prefill and decode rows in one batch
-    """
-
-    def __init__(
-        self,
-        language_model: nn.Module,
-        config: OrpheusModelConfig,
-    ):
-        super().__init__()
-        self.language_model = language_model
-        self.embed_tokens = language_model.model.embed_tokens
-        self.lm_head = language_model.lm_head
-        self.config = config
-
+    PREFILL_WALK = "prefill"
+    ATTN_KEY = ATTN
+    # The decode step also streams its token to SNAC, so its outputs never all
+    # stay on the device, which the loop-back needs: the sampler keeps no slot
+    # masters for it.
+    reads_device_loopback = False
+    # max-autotune until the default compile level (mstar serve -O) is measured on this model
+    COMPILE_MODE = "max-autotune-no-cudagraphs"
+    # A prompt is a voice and its text, so the ladder stops at 1024: a longer
+    # step runs eagerly rather than every capture being sized for 8192.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    # No split kernel and no recurrent state to size for prompt rows, so a
+    # mixed step takes any number of them.
+    MIXED_MAX_PREFILL_ROWS = None
 
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        return [
-            BatchedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="decode",
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1
-                ),
-            ),
-            PackedAcceleratorGraphConfig(
-                # max-autotune until the default compile level (mstar serve -O) is measured on this model
-                compile_mode="max-autotune-no-cudagraphs",
-                capture_graph_walk="prefill",
-                # a mixed batch is packed rows too, decode rows one token long
-                replay_graph_walks=["prefill", "mixed"],
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=lambda n: ARNodeInputs(
-                    input_ids=torch.zeros(
-                        (n,), dtype=torch.long, device=device,
-                    ), input_seq_len=n
-                ),
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES
-            )
-        ]
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        **kwargs,
-    ) -> ARNodeInputs:
-        return ARNodeInputs(
-            input_ids=inputs["text_inputs"][0],
-            input_seq_len=inputs["text_inputs"][0].shape[0]
-        )
-
-    def declare_step(
-        self, graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        slot_lease: SlotLease | None = None,
-        piecewise_leases: Mapping[str, SlotLease] | None = None,
-        **kwargs,
-    ):
-        prefill_tokens = {
-            rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            if (inp.graph_walk or graph_walk) == "prefill"
-        }
-        return SubmoduleStep(
-            segments=[
-                Segment(
-                    request_id=rid,
-                    label="main",
-                    span=inp.input_seq_len,
-                ) for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens
-                ),
-                ROPE: PositionStep()
-            }
-        )
-
-    def preprocess(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor | Any]:
-        return {
-            "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
-        }
-
-    def _forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
-    ) -> torch.Tensor:
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-        emb = self.embed_tokens(text_inputs)
-        hidden = self.language_model(emb, label="main")
-
-        if graph_walk != "decode":
-            hidden = attn.select_last_hidden(hidden)
-
-        logits = self.lm_head(hidden)
-        return sampler.sample(
-            engine_inputs.request_ids,
-            logits=logits
-        )
-
-
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
-        **kwargs
-    ) -> NameToTensorList:
-        return {
-            "new_token": self._forward(
-                graph_walk=graph_walk,
-                engine_inputs=engine_inputs,
-                text_inputs=text_inputs
-            )
-        }
-
-    def can_batch(
-        self, batch: ExecutingBatch,
-        model_inputs: list[NodeInputs]
-    ) -> bool:
-        return True
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
-        **kwargs
-    ) -> BatchedModelOutput:
-        new_tokens = self._forward(
-            graph_walk=graph_walk,
-            engine_inputs=engine_inputs,
-            text_inputs=text_inputs
-        )
-        # row i is request i; a per-rid dict here would guard the compiled frame on the ids.
-        # As stop buffers too, the stop check reads one host copy of the rows
-        # instead of one per request.
-        return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
-        )
-
-    def postprocess(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs
-    ):
-        # Metadata-only: rebind output name for graph routing. EOS check
-        # moved to check_stop so the GPU thread doesn't sync on .item() here.
-        if "new_token" not in outputs:
-            return
-        outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        eos_token_id = self.config.stop_token_id
-        ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"decode_loop"}
-        return set()
+    def layer_steps(self) -> dict[str, ResourceStep]:
+        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

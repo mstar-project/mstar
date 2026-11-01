@@ -43,6 +43,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.keys import MIXED
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -107,7 +108,7 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return {"LLM": {"mixed": {"prefill", "decode"}}}
+        return {"LLM": {MIXED: {"prefill", "decode"}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
@@ -377,7 +378,8 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The LLM's prompt is its token ids. Its generated audio codes never
@@ -540,10 +542,7 @@ class OrpheusModel(Model):
         load_weights(language_model, local_dir, device=device)
         language_model.eval()
 
-        return OrpheusLLMSubmodule(
-            language_model=language_model,
-            config=self.config,
-        )
+        return OrpheusLLMSubmodule(language_model, self.config)
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.orpheus.components.snac import SNAC

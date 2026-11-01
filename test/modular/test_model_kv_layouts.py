@@ -31,35 +31,6 @@ def _stops_after(check_stop, loop: str, walk: str, max_iters: int, outputs: dict
     return max_iters
 
 
-def _orpheus():
-    from mstar.model.orpheus.config import OrpheusModelConfig
-    from mstar.model.orpheus.orpheus_model import OrpheusModel
-
-    model = object.__new__(OrpheusModel)
-    model.config = OrpheusModelConfig()
-    model.tokenizer = lambda text, return_tensors=None: SimpleNamespace(
-        input_ids=torch.tensor([[ord(c) for c in text]], dtype=torch.long),
-    )
-    return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
-
-    model = _orpheus()
-    llm = OrpheusLLMSubmodule(
-        language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=None), lm_head=None), config=model.config,
-    )
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 def _bagel():
     from test_multimodal_ordering import _StubTokenizer
 

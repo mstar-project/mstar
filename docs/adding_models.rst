@@ -749,8 +749,9 @@ appears in no spec, so it receives no resources:
 
 .. code-block:: python
 
-   # mstar/model/orpheus/config.py
-   KV_CACHE, ATTN, SAMPLER, ROPE = "kv_cache", "attn", "sampler", "rope"
+   # mstar/model/orpheus/config.py: the keys its SampledTokenDecoder reads, and its attention's
+   KV_CACHE, SAMPLER, ROPE = keys.KV_CACHE, keys.SAMPLER, keys.ROPE
+   ATTN = "attn"
 
    # mstar/model/orpheus/orpheus_model.py
    def get_node_resources(self) -> list[NodeResourceSpec]:
@@ -1618,8 +1619,9 @@ in batched guidance that packs the conditional and unconditional sequences toget
 static buffer must hold all of them, and this field scales the buffer independently of the
 per-label span.
 
-For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a packed
-``prefill`` graph:
+For example, a token decoder that captures a batched ``decode`` graph and a packed
+``prefill`` graph declares the following (``SampledTokenDecoder`` builds these, and a
+mixed one, for its subclasses):
 
 .. code-block:: python
 
@@ -2124,8 +2126,9 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
 
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
 the model's start and end tokens, and returns ``{"text_inputs": [ids]}``.
-``get_submodule`` builds either the Llama LLM submodule, which is an ``ARNodeSubmodule``,
-or the SNAC decoder submodule, and caches the result. ``postprocess`` returns the raw
+``get_submodule`` builds either the Llama LLM submodule, a ``SampledTokenDecoder`` that
+declares little beyond its walk names, resource steps and capture buckets, or the SNAC
+decoder submodule, and caches the result. ``postprocess`` returns the raw
 bytes of the audio tensor for the ``audio`` modality.
 
 Orpheus also demonstrates the async partition API, described in the next section. The LLM
