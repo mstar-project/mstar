@@ -1194,7 +1194,11 @@ methods are:
    sets ``capture_cudnn_benchmark = True``: the engine turns
    ``torch.backends.cudnn.benchmark`` on around that node's capture warm-up only, so
    each captured shape is searched once, and eager steps keep the heuristic pick
-   (Kokoro is an example).
+   (Kokoro is an example). The search tries workspaces as large as the GPU has free,
+   so on a deployment that sets ``gpu_memory_fraction`` the engine holds the
+   allocator to that share while it sizes the node's captures, and the boot fails
+   if the node's largest eager step does not fit in it beside what the worker
+   already holds.
 
 ``postprocess(...)`` (optional)
    Metadata-only fixups that run on the GPU thread. This method must not read tensor

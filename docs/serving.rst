@@ -261,7 +261,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free.
+       whatever is free. A node that sets ``capture_cudnn_benchmark`` is held to the
+       share while its captures are sized, so its eager step must fit in it.
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
@@ -354,9 +355,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``load_*`` and ``process_prompt`` are thread-safe, so a value above 1 for a
        class that leaves it at 1 fails at startup, as does a value that is not a
        positive integer. 1 prepares one request at a time on the data-worker thread.
-       The pool takes at most the CPUs left after ``step_thread_core``'s pins, as
-       the API server's other pools do. Requests are still handed to the
-       conductor in arrival order.
+       The pool takes at most the CPUs left after ``step_thread_core``'s pins;
+       each prepare's own FFmpeg threads are not counted against it. Requests
+       are still handed to the conductor in arrival order.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``
        (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
