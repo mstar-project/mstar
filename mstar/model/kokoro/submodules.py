@@ -121,7 +121,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
     # tolerate reduced precision.
     disable_autocast = True
     # cuDNN times the conv algorithms of both captured halves once per bucket,
-    # in their capture warm-up; eager steps keep its heuristic pick, so a new
+    # in their capture sizing; eager steps keep its heuristic pick, so a new
     # frame count does not search again
     capture_cudnn_benchmark = True
 
