@@ -21,7 +21,6 @@ librosa = pytest.importorskip("librosa")
 from safetensors.torch import load_file  # noqa: E402
 
 from mstar.model.chatterbox.components.audio_frontend import (  # noqa: E402
-    mel_filter_bank,
     resample,
     trim_silence,
 )
@@ -75,14 +74,6 @@ def voice_encoders(snapshot):
     mine.load_weights(iter_weights(f"{snapshot}/ve.safetensors"))
     mine.eval()
     return ref, mine
-
-
-def test_mel_filter_banks_match_librosa():
-    for n_mels, fmax in ((40, 8000.0), (128, None)):
-        mine = mel_filter_bank(SR, 400, n_mels, 0.0, fmax).numpy()
-        ref = librosa.filters.mel(sr=SR, n_fft=400, n_mels=n_mels, fmin=0.0, fmax=fmax)
-        assert mine.shape == ref.shape
-        assert np.abs(mine - ref).max() <= 1e-6
 
 
 def test_silence_trim_matches_librosa(signals):

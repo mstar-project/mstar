@@ -51,9 +51,9 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
-from mstar.model.chatterbox.components.audio import kaldi_fbank_80
-from mstar.model.chatterbox.components.audio_frontend import resample
+from mstar.model.chatterbox.components.audio_frontend import kaldi_fbank_80, resample
 from mstar.model.chatterbox.submodules import VoiceCache
+from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.cosyvoice3.components.flow import CosyVoice3FlowRow, ReferenceVoice
 from mstar.model.cosyvoice3.components.hift import HiftStreamState, stream_vocode
 from mstar.model.cosyvoice3.components.sampling import ras_sample
@@ -125,7 +125,7 @@ class ReferenceEncoder:
     from the 24 kHz one, both cut so the mel has exactly two frames a token.
     Shared by the speaker-encoder and flow nodes when they are colocated."""
 
-    def __init__(self, tokenizer: nn.Module, mel: nn.Module | None, campplus: nn.Module | None):
+    def __init__(self, tokenizer: nn.Module, mel: MatchaLogMel, campplus: nn.Module | None):
         self.tokenizer = tokenizer
         self.mel = mel
         self.campplus = campplus
@@ -135,15 +135,8 @@ class ReferenceEncoder:
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
         tokens, lens = self.tokenizer([wav16])
         tokens = tokens[0, : int(lens[0])]
-        frames = self._mel_frames(wav24.numel())
+        frames = self.mel.num_frames(wav24.numel())
         return tokens[: min(int(tokens.numel()), frames // 2)]
-
-    def _mel_frames(self, num_samples: int) -> int:
-        from mstar.model.chatterbox.components.audio import MelSpectrogram24k
-
-        if isinstance(self.mel, MelSpectrogram24k):
-            return self.mel.num_frames(num_samples)
-        return num_samples // 480
 
     @torch.no_grad()
     def voice(self, wav24: torch.Tensor) -> ReferenceVoice:

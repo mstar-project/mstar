@@ -111,10 +111,18 @@ def test_load_speech_file_refuses_a_file_past_the_limit_as_it_decodes(tmp_path):
         clip_samples({"audio_inputs": [torch.zeros(16_000 * 11)]}, 10.0, "this model")
 
 
-def test_librosa_mel_filters_are_bit_identical():
+@pytest.mark.parametrize("sr, n_fft, n_mels, fmin, fmax", [
+    (16_000, 512, 128, 0.0, None),      # NeMo
+    (16_000, 400, 40, 0.0, 8000.0),     # Chatterbox voice encoder
+    (16_000, 400, 128, 0.0, None),      # S3 tokenizer (Chatterbox, CosyVoice3)
+    (24_000, 1920, 80, 0.0, None),      # CosyVoice3's Matcha mel
+    (24_000, 1920, 80, 0.0, 8000.0),    # S3Gen's Matcha mel
+    (24_000, 1024, 128, 0.0, 12000.0),  # Qwen3-TTS speaker mel
+])
+def test_librosa_mel_filters_are_bit_identical(sr, n_fft, n_mels, fmin, fmax):
     librosa = pytest.importorskip("librosa")
-    expected = librosa.filters.mel(sr=16_000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000, norm="slaney")
-    assert np.array_equal(librosa_mel_filters(16_000, 512, 128), expected)
+    expected = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax, norm="slaney")
+    assert np.array_equal(librosa_mel_filters(sr, n_fft, n_mels, fmin, fmax), expected)
 
 
 @pytest.mark.parametrize("seconds", [0.5, 3.37])

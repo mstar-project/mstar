@@ -2158,10 +2158,7 @@ def _ref_info(rid: str, clip: torch.Tensor, layout: list[int]) -> SimpleNamespac
 
 
 def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
-    from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
-        Qwen3TTSSpeakerEncoder,
-    )
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
@@ -2172,7 +2169,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
     )
     encoder = _FakeCodecEncoder(config.codec.num_quantizers)
     submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
     )
     clip = torch.randn(2, 4000) * 0.1   # stereo, averaged to mono
     prepared = submodule.prepare_inputs(
@@ -2199,10 +2196,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
 
 
 def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
-    from mstar.model.qwen3_tts.components.speaker_encoder import (
-        Qwen3TTSMelFrontEnd,
-        Qwen3TTSSpeakerEncoder,
-    )
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
     from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
@@ -2213,7 +2207,7 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     )
     encoder = _FakeCodecEncoder(config.codec.num_quantizers)
     submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
     )
     engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
 

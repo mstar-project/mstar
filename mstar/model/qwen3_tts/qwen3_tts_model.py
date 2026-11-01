@@ -1276,10 +1276,7 @@ class Qwen3TTSModel(Model):
 
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
-        from mstar.model.qwen3_tts.components.speaker_encoder import (
-            Qwen3TTSMelFrontEnd,
-            Qwen3TTSSpeakerEncoder,
-        )
+        from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
         from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
         # The x-vector is computed in the Talker's dtype, as the reference does.
@@ -1319,7 +1316,7 @@ class Qwen3TTSModel(Model):
         codec_encoder.eval()
         return RefEncoderSubmodule(
             speaker_encoder,
-            Qwen3TTSMelFrontEnd(self.config.speaker_encoder).to(device=device),
+            speaker_mel(self.config.speaker_encoder).to(device=device),
             codec_encoder,
             self.config,
         )

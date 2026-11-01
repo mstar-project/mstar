@@ -33,6 +33,7 @@ was read for every contract here; nothing of it runs at serve time.
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -753,9 +754,10 @@ class CosyVoice3Model(Model):
         speaker-encoder and flow nodes share them when colocated."""
         key = f"reference_encoder:{device}"
         if key not in self._shared:
-            from mstar.model.chatterbox.components.audio import MelSpectrogram24k
+
             from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
             from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
+            from mstar.model.components.audio_features import MatchaLogMel
             from mstar.model.cosyvoice3.components.onnx_weights import load_campplus, load_speech_tokenizer
             from mstar.model.cosyvoice3.submodules import ReferenceEncoder
 
@@ -765,7 +767,7 @@ class CosyVoice3Model(Model):
             load_speech_tokenizer(tokenizer, self._path(cfg.speech_tokenizer_onnx))
             campplus = CAMPPlus(cfg.xvector).to(device).eval()
             load_campplus(campplus, self._path(cfg.campplus_onnx), cfg.xvector.feat_dim)
-            mel = MelSpectrogram24k(cfg.mel).to(device)
+            mel = MatchaLogMel(**asdict(cfg.mel)).to(device)
             self._shared[key] = ReferenceEncoder(tokenizer, mel, campplus)
         return self._shared[key]
 

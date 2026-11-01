@@ -22,12 +22,12 @@ Frame bookkeeping a caller must respect:
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
 
-from mstar.model.chatterbox.components.audio import MelSpectrogram24k, kaldi_fbank_80
+from mstar.model.chatterbox.components.audio_frontend import kaldi_fbank_80
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM, ConditionalDecoder
 from mstar.model.chatterbox.components.s3gen_flow import FlowTokenEncoder, lengths_to_mask
 from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs, SolveGraphs, VocoderGraphs
@@ -35,6 +35,7 @@ from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator
 from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
 from mstar.model.chatterbox.config import S3GenConfig
 from mstar.model.chatterbox.loader import fold_weight_norm, load_component
+from mstar.model.components.audio_features import MatchaLogMel
 
 
 @dataclass
@@ -75,7 +76,7 @@ class S3Gen(nn.Module):
     def __init__(self, config: S3GenConfig):
         super().__init__()
         self.config = config
-        self.mel_extractor = MelSpectrogram24k(config.mel)
+        self.mel_extractor = MatchaLogMel(**asdict(config.mel))
         self.speaker_encoder = CAMPPlus(config.xvector)
         self.flow_encoder = FlowTokenEncoder(config)
         self.decoder = CausalConditionalCFM(

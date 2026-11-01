@@ -17,6 +17,7 @@ import importlib.util
 import io
 import math
 import urllib.error
+from dataclasses import asdict
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -1072,13 +1073,14 @@ def test_lm_caps_decode_where_its_stop_check_ends_it(model, budget):
 
 @pytest.mark.parametrize("seconds", [0.5, 1.0 + 1 / SR, 7.3, 30.0])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(seconds):
-    from mstar.model.chatterbox.components.audio import MelSpectrogram24k
+
     from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
+    from mstar.model.components.audio_features import MatchaLogMel
     from mstar.model.cosyvoice3.submodules import ReferenceEncoder, reference_tokens
 
     cfg = CosyVoice3Config()
     # token counts follow from the clip's length alone, so the weights are left as allocated
-    encoder = ReferenceEncoder(S3Tokenizer(cfg.tokenizer).eval(), MelSpectrogram24k(cfg.mel), None)
+    encoder = ReferenceEncoder(S3Tokenizer(cfg.tokenizer).eval(), MatchaLogMel(**asdict(cfg.mel)), None)
     clip = _clip(seconds)
     with torch.no_grad():
         tokens = encoder.tokens(clip)
