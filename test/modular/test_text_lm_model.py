@@ -9,7 +9,7 @@ import torch
 
 from mstar.engine.resources import AttentionSpec, KVSpec, PositionSpec, SamplerSpec, SamplingReqConfig
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import END_PARTITION, HostRows
 from mstar.model.text_lm.config import DECODE_LOOP, DECODE_WALK, LLM_NODE, PREFILL_WALK, SAMPLER
 from mstar.model.text_lm.submodules import TextLMSubmodule
 from mstar.model.text_lm.text_lm_model import TextLMModel
@@ -145,9 +145,9 @@ def _submodule():
     return TextLMSubmodule(torch.nn.Linear(1, 1), frozenset({IM_END, ENDOFTEXT}))
 
 
-def _info(walk, decoded=0, max_tokens=4096, ignore_eos=False):
+def _info(walk, max_tokens=4096, ignore_eos=False):
     return SimpleNamespace(
-        graph_walk=walk, max_tokens=max_tokens, dynamic_loop_iter_counts={DECODE_LOOP: decoded},
+        graph_walk=walk, max_tokens=max_tokens,
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
     )
 
@@ -156,37 +156,26 @@ def _tok(t):
     return {"new_token": [torch.tensor([t])]}
 
 
-def test_stop_tokens_and_budget():
+def test_stop_tokens_end_decode_or_the_reply_at_the_prefill():
     sub = _submodule()
     assert sub.check_stop("a", _info(DECODE_WALK), _tok(IM_END)) == {DECODE_LOOP}
     assert sub.check_stop("a", _info(DECODE_WALK), _tok(ENDOFTEXT)) == {DECODE_LOOP}
     assert sub.check_stop("a", _info(DECODE_WALK), _tok(WORD)) == set()
     assert sub.check_stop("a", _info(DECODE_WALK, ignore_eos=True), _tok(IM_END)) == set()
-    # max_tokens counts the prefill's token: decode iteration k makes token k + 2
-    assert sub.check_stop("a", _info(DECODE_WALK, decoded=7, max_tokens=10), _tok(WORD)) == set()
-    assert sub.check_stop("a", _info(DECODE_WALK, decoded=8, max_tokens=10), _tok(WORD)) == {DECODE_LOOP}
-
-
-def test_a_stop_at_prefill_ends_the_loop_at_its_first_step_without_a_token():
-    sub = _submodule()
-    assert sub.check_stop("a", _info(PREFILL_WALK), _tok(IM_END)) == set()
-    outputs = _tok(WORD)
-    sub.postprocess("a", _info(DECODE_WALK), outputs)
-    assert "new_token" not in outputs and "text_inputs" in outputs
-    assert sub.check_stop("a", _info(DECODE_WALK), outputs) == {DECODE_LOOP}
-    # another request is untouched
-    outputs = _tok(WORD)
-    sub.postprocess("b", _info(DECODE_WALK), outputs)
-    assert torch.equal(outputs["new_token"][0], outputs["text_inputs"][0])
+    # the prefill has no loop to stop: a stop id, or a budget of its one token, ends the reply
+    assert sub.check_stop("a", _info(PREFILL_WALK), _tok(IM_END)) == {END_PARTITION}
+    assert sub.check_stop("a", _info(PREFILL_WALK, max_tokens=1), _tok(WORD)) == {END_PARTITION}
+    assert sub.check_stop("a", _info(PREFILL_WALK), _tok(WORD)) == set()
+    assert sub.check_stop("a", _info(PREFILL_WALK, ignore_eos=True), _tok(IM_END)) == set()
 
 
 def test_batched_stop_check_agrees_with_per_request():
-    rows = ("im_end", "word", "ignored", "budget", "prefill")
-    tokens = torch.tensor([IM_END, WORD, IM_END, WORD, WORD, 0])  # a padding row at the end
+    rows = ("im_end", "word", "ignored", "prefill", "prefill_stop")
+    tokens = torch.tensor([IM_END, WORD, IM_END, WORD, ENDOFTEXT, 0])  # a padding row at the end
     infos = {
         "im_end": _info(DECODE_WALK), "word": _info(DECODE_WALK),
-        "ignored": _info(DECODE_WALK, ignore_eos=True), "budget": _info(DECODE_WALK, 8, max_tokens=10),
-        "prefill": _info(PREFILL_WALK),
+        "ignored": _info(DECODE_WALK, ignore_eos=True), "prefill": _info(PREFILL_WALK),
+        "prefill_stop": _info(PREFILL_WALK),
     }
     batched = _submodule().check_stop_batched(list(reversed(rows)), infos, HostRows(rows, {"new_token": tokens}))
     single = _submodule()
@@ -194,7 +183,7 @@ def test_batched_stop_check_agrees_with_per_request():
         rid: got for i, rid in enumerate(rows)
         if (got := single.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]}))
     }
-    assert batched == per_request == {"im_end": {DECODE_LOOP}, "budget": {DECODE_LOOP}}
+    assert batched == per_request == {"im_end": {DECODE_LOOP}, "prefill_stop": {END_PARTITION}}
 
 
 def test_declared_step_tracks_the_prompt_for_the_penalty_only_at_prefill():

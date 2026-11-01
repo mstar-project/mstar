@@ -17,8 +17,8 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
     ModelInputsFromEngine,
+    TokenStop,
 )
 from mstar.model.text_lm.config import ATTN, DECODE_LOOP, DECODE_WALK, KV_CACHE, PREFILL_WALK, ROPE, SAMPLER
 
@@ -53,9 +53,11 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         self.stop_token_ids = frozenset(stop_token_ids)
         self.accelerator_graph = accelerator_graph
         self.prefill_token_buckets = list(prefill_token_buckets)
-        # Per request, in its request_state: "ended_at_prefill", the prefill sampled a stop
-        # token. The prefill walk has no loop to stop, so the first decode step stops the
-        # loop and emits nothing.
+        # a stop id ends decode, or the reply at the prefill; the budget is the loop's cap
+        self.token_stop = TokenStop(
+            loop=DECODE_LOOP, buffer="new_token", stop_ids=self.stop_token_ids, sampler=SAMPLER,
+            prefill_walks=frozenset({PREFILL_WALK}),
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -133,59 +135,3 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         tokens = self._sample(graph_walk, engine_inputs, input_ids)
         # row i is request i: one clone and one D2H copy per step, not one per request
         return BatchedModelOutput(row_outputs={"new_token": tokens}, check_stop_buffers={"new_token": tokens})
-
-    def postprocess(
-        self, request_id: str, request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]], **kwargs,
-    ):
-        if "new_token" not in outputs:
-            return
-        outputs["text_inputs"] = outputs["new_token"]
-        if self.request_state(request_id).get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
-
-    def check_stop(
-        self, request_id: str, request_info: CurrentForwardPassInfo, outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        token = outputs["new_token"][0].item() if "new_token" in outputs else None
-        return self._stop_loops(request_id, request_info, token)
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
-            return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue  # no row, no output: the per-request path skips it too
-            loops = self._stop_loops(rid, request_infos[rid], values[i])
-            if loops:
-                stops[rid] = loops
-        return stops
-
-    def _stop_loops(self, request_id: str, request_info: CurrentForwardPassInfo, token: int | None) -> set[str]:
-        state = self.request_state(request_id)
-        if state.get("ended_at_prefill"):
-            return {DECODE_LOOP}
-        if token is None:
-            return set()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        is_stop = not ignore_eos and token in self.stop_token_ids
-        if request_info.graph_walk == PREFILL_WALK:
-            # no loop on this walk to stop; the conductor ends a max_tokens of 1 here
-            if is_stop:
-                state.add("ended_at_prefill", True)
-            return set()
-        # max_tokens counts the prefill's token: 1 + (iterations + 1)
-        generated = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 2
-        return {DECODE_LOOP} if is_stop or generated >= request_info.max_tokens else set()
