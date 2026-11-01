@@ -132,6 +132,20 @@ def test_swiglu_limit_reaches_every_activation(tokens, limit, launches):
             assert floats == [7.0 if limit else 0.0]
 
 
+@pytest.mark.parametrize("tokens", [11, 17, 23, 33, 50, 63])
+def test_a_grouped_launch_compiles_as_the_next_power_of_two_does(tokens, launches):
+    """The grouped kernels' compile-time arguments for any token count are those of the next
+    power of two, which a decode capture already compiled: an eager step of another count (a
+    prefill past a cached prefix) compiles nothing new."""
+    def keys(n):
+        launches.clear()
+        decode.experts(*_host_layer(n), block_size=BLOCK)
+        return [(name, {k: v for k, v in kw.items()}) for name, _, _, kw in launches if name != "_sum_kernel"]
+
+    tb = 1 << (tokens - 1).bit_length()
+    assert keys(tokens) == keys(tb)
+
+
 def test_split_x_rounds_hidden_up_to_a_power_of_two(launches):
     decode.experts(*_host_layer(16, hidden=3072), block_size=BLOCK)
     (plan,) = [kw for name, _, _, kw in launches if name == "_plan_kernel"]
