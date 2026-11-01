@@ -67,6 +67,8 @@ node_groups:
 # The typical image loses 1.0 dB against bf16 and the worst 11.4 dB, accepted by eye on the 40 image_v1 images.
 # flux2_klein_bf16.yaml keeps bf16 on every platform. flux2_klein_fp8_bpff.yaml loses at most 1.65 dB for about
 # 40% of the gain.
+# Each prompt encodes alone, the DiT and VAE keep batching. MI325X, shared node: a c=16 image reads 30-34 dB from its c=1 twin
+# against 25-26 batched (41 against 26 on bf16). c=16 images/s stay level, c=4 loses 4%, and the distance from diffusers does not move.
 platform_overrides:
   rocm:
     model_kwargs:
