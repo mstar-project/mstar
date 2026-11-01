@@ -473,6 +473,47 @@ def test_capture_cudnn_benchmark_covers_warmup_only(monkeypatch):
     assert torch.backends.cudnn.benchmark is False
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_capped_deployment_holds_the_cudnn_search_to_its_share(monkeypatch, fails):
+    """The search tries workspaces as large as the device has free: with
+    ``gpu_memory_fraction`` set, the allocator is held to it while a node that
+    searches is sized, and released afterwards, also when sizing raises.
+    Another node's sizing runs uncapped."""
+    class _Tuned(_Recorder):
+        capture_cudnn_benchmark = True
+
+    fraction = [0.9]   # a fraction the process already had is put back
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction",
+                        lambda value, device=None: fraction.__setitem__(0, value))
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda device=None: fraction[0])
+    sized: list[tuple[str, float]] = []
+
+    def sizer(name):
+        def size(*args):
+            sized.append((name, fraction[0]))
+            if fails and name == "tuned":
+                raise RuntimeError("sizing failed")
+            return {}
+        return size
+
+    engine = _engine({"tuned": _Tuned(), "plain": _Recorder()})
+    runners = {name: SimpleNamespace(size_captures=sizer(name), size_lent_captures=sizer(name))
+               for name in ("tuned", "plain")}
+    monkeypatch.setattr(engine, "_device", torch.device("cuda"))
+    monkeypatch.setattr(engine, "_gpu_memory_fraction", 0.55)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 31))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 0)
+    if fails:
+        with pytest.raises(RuntimeError, match="sizing failed"):
+            engine._plan_captures(runners, {"tuned": {}, "plain": {}})
+        assert sized == [("tuned", 0.55)]
+    else:
+        engine._plan_captures(runners, {"tuned": {}, "plain": {}})
+        assert sized == [("tuned", 0.55), ("plain", 0.9)] * 2
+    assert fraction == [0.9]
+
+
 def test_compile_regions_are_compiled_and_warmed(monkeypatch):
     """A node's ``compile_regions`` are compiled by the engine, a module by its
     ``forward`` and a method in place, and warmed with their example

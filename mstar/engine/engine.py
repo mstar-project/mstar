@@ -111,6 +111,26 @@ def _capture_scope(submodule_mgmt) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
+    """Hold the caching allocator to ``gpu_memory_fraction`` while a node that
+    asks for cuDNN's algorithm search (``capture_cudnn_benchmark``) is sized.
+    The search tries workspaces as large as the device has free, and the
+    allocator keeps them until sizing's ``empty_cache``, past the share a
+    co-located worker plans around. A try past the cap fails, and cuDNN
+    skips that algorithm; so does the node's own sizing, which then fails
+    the boot when its eager step does not fit in the share."""
+    if fraction is None or not submodule_mgmt.submodule.capture_cudnn_benchmark:
+        yield
+        return
+    previous = torch.cuda.get_per_process_memory_fraction(device)
+    torch.cuda.set_per_process_memory_fraction(fraction, device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_per_process_memory_fraction(previous, device)
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -832,7 +852,8 @@ class Engine:
             for node_name, submodule_mgmt in self._submodules.items():
                 # sizing runs the forwards and captures (a sized capture runs none of its own),
                 # so under the node's precision and cuDNN search too
-                with _capture_scope(submodule_mgmt):
+                with _capture_scope(submodule_mgmt), \
+                        _search_cap(submodule_mgmt, self._gpu_memory_fraction, self._device):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
