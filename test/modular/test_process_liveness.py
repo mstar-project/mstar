@@ -370,13 +370,15 @@ def test_message_loop_runs_while_the_conductor_lives():
     assert server.fatal_error is None
 
 
-def test_a_failed_message_wait_does_not_end_the_message_loop():
+def test_a_failed_message_wait_does_not_end_the_message_loop(monkeypatch):
     """A transport error from the idle wait is a failed pass, not the end of
-    the thread that delivers every request's results."""
+    the thread that delivers every request's results, and the failed pass
+    backs off rather than spinning."""
     server = _api_server(_Proc(5))
-    waits = []
+    waits, sleeps = [], []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
 
-    def poll(timeout_ms=1):
+    def poll(timeout_ms):
         waits.append(timeout_ms)
         if len(waits) == 1:
             raise RuntimeError("socket closed")
@@ -385,6 +387,7 @@ def test_a_failed_message_wait_does_not_end_the_message_loop():
     server.communicator.poll_for_messages = poll
     server._process_messages()
     assert len(waits) == 2
+    assert sleeps == [0.01], "a failed pass went straight into the next one"
     assert server.fatal_error is None
 
 
