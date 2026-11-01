@@ -206,7 +206,7 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     assert decode.max_iters < guard, (
         f"loop cap {decode.max_iters} can reach the batch-killing context "
         f"guard at {guard}")
-    # check_stop is the only thing enforcing the real per-request budget,
+    # get_loop_caps' loop cap is what enforces the real per-request budget,
     # because the decode edge carries no conductor_new_token.
     assert not any(e.conductor_new_token for e in decode.section.outputs)
 

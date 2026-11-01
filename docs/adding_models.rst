@@ -1191,8 +1191,10 @@ methods are:
    reports the partition done with that pass, and the conductor ends it rather than start
    decode. Return it only from a row outside any loop; from inside one the request fails.
    ``TokenStop`` does this for the walks in its ``prefill_walks``, whose token counts toward
-   the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. It
-   suits a partition with nothing left to run once generation stops: a model that runs
+   the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. A
+   model that prefills a prompt over several passes sets ``last_prefill_flag`` to the
+   ``step_metadata`` flag of its last pass (Qwen3.5: ``"last_prefill"``), or a stop id
+   sampled on its first pass ends the request. It suits a partition with nothing left to run once generation stops: a model that runs
    another walk after its loop (an ``align`` walk, or image generation after thinking) or
    publishes final-only state at the loop's stop needs its own transition instead. Keep
    ``check_stop_batched``, if you write one, in agreement.
