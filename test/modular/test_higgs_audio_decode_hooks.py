@@ -9,7 +9,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-from mstar.model.submodule_base import BatchedStopCheck, HostRows
+from mstar.model.submodule_base import END_PARTITION, HostRows
 
 
 def _submodule(slot_masters=True):
@@ -70,11 +70,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     assert want == {"b": {"decode_loop"}}
     rows = HostRows(("a", "b", "c", "d"), {"new_token": tokens})
     assert sub.check_stop_batched(["d", "c", "b", "a"], infos, rows) == want
-    # A prefill row's stop token has no loop to end yet: the reply ends at the
-    # loop's first step, which sends the client nothing.
-    prefill_step = {rid: _info(walk="prefill_audio") for rid in infos}
-    assert sub.check_stop_batched(list(prefill_step), prefill_step, rows) == {}
-    first = HostRows(("a", "b"), {"new_token": torch.tensor([[11], [11]])})
-    assert sub.check_stop_batched(["a", "b"], infos, first) == BatchedStopCheck(
-        {"b": {"decode_loop"}}, {"b": ("new_token", "text_inputs")},
-    )
+    # a prefill row's stop token ends the partition: there is no loop yet
+    prefill = {rid: SimpleNamespace(**{**vars(info), "graph_walk": "prefill_audio"}) for rid, info in infos.items()}
+    assert sub.check_stop("b", prefill["b"], {"new_token": [tokens[1]]}) == {END_PARTITION}
+    assert sub.check_stop_batched(list(prefill), prefill, rows) == {"b": {END_PARTITION}}

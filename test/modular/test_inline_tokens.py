@@ -17,7 +17,7 @@ from mstar.communication.event import EventWakeup
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model
-from mstar.model.submodule_base import ARNodeSubmodule, DeviceLoopback, HostRows, TokenStop
+from mstar.model.submodule_base import HostRows
 from mstar.worker.worker import Worker
 
 # -- wire --------------------------------------------------------------------
@@ -269,53 +269,9 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
     assert sig == "text_inputs" and vals == [90, 70, 80]
 
 
-def test_a_withheld_output_rides_no_inline_value():
-    """A token the stop check withheld (``StopCheck.withheld``, e.g. the step
-    closing a reply that ended at prefill) is not the client's: that row gets
-    None, which the runtime routes as the row's tensors, of which it has none."""
-    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
-    sig, vals = _worker()._inline_emit_values(
-        _Engine({"new_token": "new_token"}), _Batch(withheld={8: ("new_token",), 7: ("frame",)}),
-        rows, [7, 8], ["new_token"],
-    )
-    assert sig == "new_token" and vals == [70, None]
-
-
-def test_the_step_closing_a_loop_back_reply_that_ended_at_prefill_sends_no_token():
-    """A loop-back decode's client edge carries its loop-back signal, inline off
-    the token's buffer, so the step closing a reply that ended at prefill has
-    to withhold the signal too, or the token sampled after the stop id reaches
-    the client."""
-
-    class _Decoder(ARNodeSubmodule):
-        prepare_inputs = preprocess = forward = None
-
-    sub = _Decoder()
-    sub.token_stop = TokenStop(
-        loop="decode_loop", buffer="new_token", stop_ids=frozenset({0}), sampler="sampler",
-        walk="decode", prefill_walks=frozenset({"prefill"}),
-    )
-    sub.device_loopback = DeviceLoopback(walk="decode", signal="text_inputs", sampler="sampler", buffer="new_token")
-
-    def info(walk):
-        return SimpleNamespace(graph_walk=walk, resource_configs={"sampler": SimpleNamespace(ignore_eos=False)})
-
-    # the prefill samples a stop id for 8, so its first decode step only closes the loop
-    sub.check_stop_batched([7, 8], {7: info("prefill"), 8: info("prefill")},
-                           HostRows((7, 8), {"new_token": torch.tensor([[5], [0]])}))
-    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
-    check = sub.check_stop_batched([7, 8], {7: info("decode"), 8: info("decode")}, rows)
-    assert check.stops == {8: {"decode_loop"}}
-    sig, vals = _worker()._inline_emit_values(
-        _Engine({"text_inputs": "new_token"}), _Batch(withheld=check.withheld), rows, [7, 8], ["text_inputs"],
-    )
-    assert sig == "text_inputs" and vals == [70, None]
-
-
 def test_a_withheld_output_skips_the_fused_route_and_send():
-    """The fused device-loopback call reads every row's value off the column,
-    so a withheld row would still ride inline: such a step takes the general
-    path, which sends that row None."""
+    """The fused device-loopback call routes every row's outputs, so a step
+    whose stop check withheld one takes the general path."""
     class _Fused(_Runtime):
         supports_route_and_send_inline = True
 
@@ -331,7 +287,7 @@ def test_a_withheld_output_skips_the_fused_route_and_send():
     batch = _Batch(withheld={8: ("new_token",)})
     batch.partition = "p"
     batch.batch.output_signals, batch.batch.graph_walk = ["new_token"], "decode"
-    batch.node_batch.stream_partition_done_rids = ()
+    batch.node_batch.partition_done_rids = ()
     rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
     eng = _LoopbackEngine({"new_token": "new_token"})
     assert w._route_and_send_fast(batch, rows, eng, [7, 8], set()) is False

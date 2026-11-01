@@ -23,6 +23,9 @@ class TokenStepNode:
 
     DECODE_WALK = "decode"
     DECODE_LOOP = "decode_loop"
+    # the walk that samples the first token, before DECODE_LOOP exists: a
+    # subclass whose stop there ends the reply names it in ``prefill_walks``
+    PREFILL_WALK = "prefill"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
     MAX_PREFILL_BATCH_SIZE: int | None

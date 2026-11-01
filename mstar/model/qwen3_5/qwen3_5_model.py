@@ -164,9 +164,6 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
-    # token streaming keeps three API-server threads busy: +4 to +8% tok/s on
-    # 0.8B text at c=64 before #849; re-measure pending (docs/serving.rst)
-    API_SWITCH_INTERVAL_S = 0.001
     INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
 
     def __init__(
@@ -643,7 +640,8 @@ class Qwen3_5DenseModel(Model):
         })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
