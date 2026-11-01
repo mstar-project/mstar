@@ -48,12 +48,13 @@ def test_a_malformed_block_fails_on_every_platform(overrides, match):
 
 
 @pytest.mark.parametrize("platform, expected", [
-    (RocmPlatform, "qwen3omni_2gpu_split.yaml"),
+    (RocmPlatform, "qwen3omni_2gpu_ramp4g.yaml"),
     (CudaPlatform, "qwen3omni_2gpu_stock.yaml"),
 ])
 def test_the_2gpu_config_serves_its_platforms_layout(monkeypatch, platform, expected):
-    """On AMD GPUs Code2Wav has its own worker on the Talker's GPU; CUDA keeps
-    one worker. The opt-in configs stay equal to what the default resolves to."""
+    """On AMD GPUs Code2Wav has its own worker on the Talker's GPU and audio
+    starts on the gentle ramp; CUDA keeps one worker and the default chunks. The
+    opt-in configs stay equal to what the default resolves to."""
     monkeypatch.setattr(serving_config, "_built_for", platform)
     assert load_serving_config(str(CONFIGS / "qwen3omni_2gpu.yaml")) == _shipped(expected)
 
