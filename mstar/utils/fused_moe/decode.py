@@ -297,7 +297,7 @@ def _plan(ids, pairs, tiles, TK, E: tl.constexpr, EP: tl.constexpr, NP: tl.const
     tl.store(tiles + 2 * NT + i, 0, mask=(i >= tl.sum(te, 0)) & (i < NT))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "TK"])
 def _plan_kernel(ids, pairs, tiles, x, xq, xs, T, TK, E: tl.constexpr, EP: tl.constexpr,
                  NP: tl.constexpr, BM: tl.constexpr, MT: tl.constexpr, NT: tl.constexpr,
                  NTP: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, PDL: tl.constexpr):
@@ -353,7 +353,7 @@ def _grouped_gate_up(xq, xs, pairs, tiles, w13, s13, act, limit, q, T, stride_we
                  mask=live[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _grouped_gate_up_kernel(
     x, xq, xs, pairs, tiles, w13, s13, sw13, act, limit, T, stride_we, stride_se,
     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
@@ -438,7 +438,7 @@ def _shared_down(act, sw2, part, T, q, K: tl.constexpr, I: tl.constexpr, H: tl.c
     tl.store(part + (T * K + t[None, :]) * H + n[:, None], acc, mask=live[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _grouped_down_kernel(
     act, pairs, tiles, topk_w, w2, s2, sw2, part, T, stride_we, stride_se,
     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
@@ -556,6 +556,15 @@ def _grouped_tiles(T):
                 tbs=tbs, bjs=16, bks=128, bns=64, sum_bn=1024)
 
 
+def _grouped_rows(T: int) -> int:
+    """The token count the grouped kernels are compiled for: T rounded up to a power of two.
+    Their tile, program and pair counts are compile-time constants, and T itself isn't
+    specialized on (``do_not_specialize``), so a decode capture compiles every shape: a step
+    of another count (an eager prefill past a cached prefix) reuses its power of two instead
+    of compiling. Rows past T are masked and tiles past the last are empty."""
+    return triton.next_power_of_2(T)
+
+
 def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, limit, pdl):
     """Experts grouped by expert: a one-program plan sorts the pairs into tiles of up to BM
     pairs of one expert, each gate/up and down program takes one tile's pairs as the rows of
@@ -566,7 +575,8 @@ def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
     K = ids.shape[1]
     E, I = w13.shape[0], w13.shape[1] // 2
     bo, bi = block_size
-    t = _grouped_tiles(T)
+    tb = _grouped_rows(T)
+    t = _grouped_tiles(tb)
     bj, bn, bns = min(t["bj"], bo), min(t["bn"], bo), min(t["bns"], H)
     ng, sum_bn = min(t["ng"], H // bn), min(t["sum_bn"], H)
     clamp = limit is not None
@@ -581,10 +591,10 @@ def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
     plan = buf["pairs"], buf["tiles"]
     _plan_kernel[(1 + T,)](
         ids, *plan, x, buf["xq"], buf["xs"], T, T * K, E=E, EP=triton.next_power_of_2(E + 1),
-        NP=buf["pairs"].numel(), BM=bm, MT=triton.cdiv(T, bm), NT=nt,
+        NP=buf["pairs"].numel(), BM=bm, MT=triton.cdiv(tb, bm), NT=nt,
         NTP=triton.next_power_of_2(nt), H=H, HP=triton.next_power_of_2(H), PDL=pdl,
         num_warps=4, launch_pdl=pdl)
-    ntb = triton.cdiv(T, t["tbs"])
+    ntb = triton.cdiv(tb, t["tbs"])
     ns = ntb * (I // t["bjs"])
     w13 = w13.view(torch.float8_e4m3fn)
     _grouped_gate_up_kernel[(ns + nt * (I // bj),)](
@@ -593,7 +603,7 @@ def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
         K=K, I=I, H=H, BO=bo, BI=bi, BJ=bj, BM=bm, NT=nt, NS=ns, TB=t["tbs"], NTB=ntb,
         BJS=t["bjs"], BKS=min(t["bks"], H), CLAMP=clamp, PDL=pdl, num_warps=t["gu_warps"],
         num_stages=t["gu_stages"], launch_pdl=pdl)
-    nsd = triton.cdiv(T, bm) * (H // bns)
+    nsd = triton.cdiv(tb, bm) * (H // bns)
     _grouped_down_kernel[(nsd + nt * (H // (bn * ng)),)](
         buf["act"], *plan, tw, w2, s2, sw2, buf["part"], T, w2.stride(0), s2.stride(0),
         K=K, I=I, H=H, BO=bo, BI=bi, BN=bn, NG=ng, BM=bm, NT=nt, NSD=nsd, BNS=bns,
@@ -628,10 +638,12 @@ def _expert_buffers(x, K, E, I, pair_max_tokens, out=None):
     buf = dict(act=torch.empty(T * K + T, I, dtype=torch.float32, device=dev), out=out)
     if T > pair_max_tokens:
         # Tiles: each hit expert's pairs in chunks of bm; at most one partial tile per expert.
-        bm = _grouped_tiles(T)["bm"]
+        # Counted for `_grouped_rows(T)`, which the kernels' compile keys follow.
+        tb = _grouped_rows(T)
+        bm = _grouped_tiles(tb)["bm"]
         i32 = dict(dtype=torch.int32, device=dev)
-        buf.update(pairs=torch.empty(triton.next_power_of_2(T * K), **i32),
-                   tiles=torch.empty(3, min(E, T * K) + T * K // bm, **i32),
+        buf.update(pairs=torch.empty(triton.next_power_of_2(tb * K), **i32),
+                   tiles=torch.empty(3, min(E, tb * K) + tb * K // bm, **i32),
                    xq=torch.empty(2, T, H, dtype=torch.float8_e4m3fn, device=dev),
                    xs=torch.empty(T, dtype=torch.float32, device=dev),
                    part=torch.empty(T * K + T, H, dtype=torch.float32, device=dev))

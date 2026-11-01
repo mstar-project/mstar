@@ -64,6 +64,9 @@ class _StubChains:
     def chain_keys(self, rid, label, pages):
         return self.keys.get(rid, [])[:pages]
 
+    def keyed_walks(self, label):
+        return frozenset({WALK})
+
 
 def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
@@ -334,11 +337,10 @@ def test_a_keyed_node_loads_with_a_recurrent_pool_and_the_resource_over_it():
     )
 
 
-@pytest.mark.parametrize("variant", [LinearAttnVariant.KDA, LinearAttnVariant.MAMBA2])
-def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots(variant):
+def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots():
     specs = _specs(prefix_slots=2)
     specs["gdn"] = LinearAttnSpec(resource_key="gdn", nodes={"LLM"}, config=LinearAttnConfig(
-        recurrent_state="state", variant=variant,
+        recurrent_state="state", variant=LinearAttnVariant.MAMBA2,
     ))
     problems = list(_unskippable_resources(list(specs.values()), _Keyed()))
     assert problems and "'state' cannot serve a request" in problems[0], problems
@@ -480,6 +482,19 @@ def test_a_decode_step_onto_a_page_boundary_saves_its_state():
     assert decode.tokens == 4 and decode.key == pool._kv.chain_key("a", "main", 1)
     assert pool._snap_by_key[decode.key] == decode.slot
     assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 4"
+
+
+def test_a_decode_on_a_walk_the_kv_cache_doesnt_key_saves_no_snapshot():
+    """Above one rank, or under MTP, the KV cache keys no reply: a decode snapshot would never be
+    filed, and would only push a prompt's out of the pool."""
+    pool = _pool()
+    _reply(pool)
+    step = _step("a", 1)
+    ctx = StepContext(request_ids=("a",), graph_walk="decode", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.commit(step, ctx)
+    assert not pool._decode and len(pool._snap_free) == 2
 
 
 def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():

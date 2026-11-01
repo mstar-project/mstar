@@ -23,6 +23,10 @@ from mstar.utils.h2d import PinnedStager
 class DSAManager(Resource):
     """DSA for one node's MLA layers over their cache (``config.kv_cache``)."""
 
+    # its index keys sit on the cache's pages, so a hit carries them, and it reads each row's
+    # position off the KV plan, which starts past the hit
+    prefix_skip_safe = True
+
     @classmethod
     def build(cls, spec: DSASpec, info: EngineResourceInfo):
         # `dependency` hands back the SPEC; its `.config` is the KV config, sharded once

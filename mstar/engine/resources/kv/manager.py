@@ -1302,6 +1302,12 @@ class KVManager(AttentionResource):
         """The walks whose writes under ``label`` the prefix cache keys."""
         return self._keyed_walks.get(label, frozenset())
 
+    def lease_tokens(self, rid: str, label: str) -> int:
+        """The tokens the stream's prefix lease holds, 0 without one."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            return stream.lease_len if stream is not None and stream.lease is not None else 0
+
     def chain_key(self, rid: str, label: str, pages: int) -> bytes | None:
         """The index key of the stream's first ``pages`` pages, or None until
         its chain keys that many whole pages."""
@@ -1614,6 +1620,9 @@ class KVManager(AttentionResource):
             self.config.layout.value, self.config.page_size,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
+            # what else a page holds, such as DSA's index keys
+            *([sorted((name, aux.num_layers, aux.width) for name, aux in self.config.aux_planes.items())]
+              if self.config.aux_planes else []),
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
