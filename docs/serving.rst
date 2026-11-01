@@ -300,6 +300,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        keeps to its own walk and yields to the others, and a step mixes walks only
        when the scheduler builds one fresh. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``eager_yield_nodes``
+     - *(optional)* Nodes whose speculation chains look for other ready work from their
+       first step instead of their second. A chain otherwise speculates one step after
+       each yield, so a burst of prompts alternates with decode steps of a few rows; on,
+       the burst prefills first and decode takes its rows together. Throughput at high
+       concurrency, at the cost of decode waiting while prompts run. MI325X, Qwen3.5
+       0.8B, c=64: +0.6 to +2 % tok/s on chat prompts, +4 % on 1k-token prompts. Naming a
+       node of a lockstep instance fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
