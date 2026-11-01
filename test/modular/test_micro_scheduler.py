@@ -2147,6 +2147,26 @@ def test_a_walk_chunks_where_its_scheduling_key_has_a_budget():
     assert not _combined_scheduler(_Engine(max_bs=8)).chunks(NODE, WALK)
 
 
+def test_under_a_budget_a_row_mid_prefill_lines_up_ahead_of_older_unstarted_prompts():
+    """Back from an OOM hold, say, four older requests' prompts that haven't
+    started would otherwise take a mixed step's prompt rows ahead of it."""
+    sched = _combined_scheduler(_BudgetedEngine(max_bs=8))
+    for rid in ("o0", "o1", "o2", "o3", "p0", "h0"):
+        sched.note_arrival(rid)
+    sched.chunk_started[("p0", NODE)] = 0
+    sched.note_ran(ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={"h0": 0}))
+    line = sched._line_order(sched._key(NODE, WALK))
+
+    # the row holding the step stays first, then the row mid-prefill
+    assert sorted(["o0", "o1", "o2", "o3", "p0", "h0"], key=line.key)[:3] == ["h0", "p0", "o0"]
+    unbudgeted = _combined_scheduler(_Engine(max_bs=8))
+    for rid in ("o0", "p0"):
+        unbudgeted.note_arrival(rid)
+    unbudgeted.chunk_started[("p0", NODE)] = 0
+    plain = unbudgeted._line_order(unbudgeted._key(NODE, WALK))
+    assert sorted(["p0", "o0"], key=plain.key) == ["o0", "p0"], "without a budget, arrival order"
+
+
 def test_mixing_defaults_off_without_a_budget():
     """A merged prompt would run whole, so a chain without a budget keeps to its walk."""
     sched = _combined_scheduler(_Engine(max_bs=8))
@@ -2684,9 +2704,10 @@ def test_a_row_mid_prefill_the_merge_leaves_out_is_neither_parked_nor_readied():
     sched.batch_builder = FairShareBatchBuilder()  # so both rows are mid-prefill
     manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10, 2), "p1": (0, 2, 10, 2)}
-    # the step takes the earliest requests: the chain's row, then p0
+    # the step takes the chain's row, which holds the step, then the earliest prompt
     for rid in ("c0", "p0", "p1"):
         sched.note_arrival(rid)
+    sched.note_ran(ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={"c0": 0}))
 
     merged = _chain(
         sched, manager, _chain_rows(1), target=(NODE, WALK),
