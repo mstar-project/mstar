@@ -25,8 +25,8 @@ from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, MTP_LEN, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
-from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import InputMetadata
+from mstar.model.glm5_next.submodules import MTP_VERDICT, Glm5NextLLMSubmodule
+from mstar.model.submodule_base import HostRows, InputMetadata
 
 
 def _batch(**kwargs) -> ExecutingBatch:
@@ -139,7 +139,8 @@ def _info(rid, walk, max_tokens, decode_iter=0, ignore_eos=False):
     )
 
 
-def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_eos=False):
+def _launch(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_eos=False):
+    """One step up to its stop check: (batch, outputs)."""
     rids = list(inputs)
     batch = _batch(
         node_name="LLM",
@@ -160,8 +161,20 @@ def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_e
     outputs = engine.exec_and_postprocess(batch)
     assert batch.admit_error is None, batch.admit_error
     engine.finalize_batch(batch)
-    stops = engine.check_stop_for_batch(batch, outputs)
-    return outputs.per_rid_outputs, stops
+    return batch, outputs
+
+
+def _check(engine, batch, outputs):
+    """The stop check as the worker runs it on a CPU device, off the step's stop buffers."""
+    host_rows = None
+    if outputs.check_stop_buffers is not None and outputs.row_request_ids is not None:
+        host_rows = HostRows(outputs.row_request_ids, outputs.check_stop_buffers)
+    return engine.check_stop_for_batch(batch, outputs, host_rows=host_rows)
+
+
+def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_eos=False):
+    batch, outputs = _launch(engine, walk, inputs, max_tokens, decode_iter, cached, ignore_eos)
+    return outputs.per_rid_outputs, _check(engine, batch, outputs)
 
 
 def _generate(engine, prompts: dict[str, torch.Tensor], max_tokens: int) -> dict[str, list]:
@@ -203,9 +216,11 @@ def _oracle(sub, reference, wrong_every: int | None):
     """Drafts from the reference continuation at each request's position, wrong at every
     ``wrong_every``-th call when given. A step drafts d2..dk in its draft loop, then the next
     step's d1 once its verdict is in (the prefill: the first d1); wrapping the two passes tells
-    the oracle which call is which and how far each request is."""
+    the oracle which call is which, and it counts how far each request is itself, so it does
+    not depend on when the stop check runs."""
     calls = {"n": 0}
     where: dict = {}
+    done: dict = {}  # each request's tokens emitted before its current step
     given: dict[str, list[int]] = {}  # each request's drafts for its current step, d1 first
     real_prefill, real_decode = sub._mtp_prefill, sub._mtp_decode
 
@@ -226,17 +241,14 @@ def _oracle(sub, reference, wrong_every: int | None):
         return real_prefill(engine_inputs, *args)
 
     def decode(engine_inputs, *args):
-        rids = list(engine_inputs.request_ids)
-        # tokens emitted before this step: its first draft is the one at that position
-        where.update(rids=rids, row=0,
-                     done={rid: sub.request_state(rid).get("mtp_generated") for rid in rids})
+        where.update(rids=list(engine_inputs.request_ids), row=0)
         return real_decode(engine_inputs, *args)
 
     def draft(hidden, prev):
         rids = where["rids"]
         if where["row"] is None:
+            done.update(dict.fromkeys(rids, 1))
             return emit(rids, [at(rid, 1) for rid in rids], fresh=True)
-        done = where["done"]
         if where["row"] < sub.mtp_k - 1:
             where["row"] += 1
             return emit(rids, [at(rid, done[rid] + where["row"]) for rid in rids], fresh=False)
@@ -246,7 +258,8 @@ def _oracle(sub, reference, wrong_every: int | None):
             accepted = 0
             while accepted < sub.mtp_k and given[rid][accepted] == at(rid, done[rid] + accepted):
                 accepted += 1
-            nxt.append(at(rid, done[rid] + accepted + 1))
+            done[rid] += accepted + 1
+            nxt.append(at(rid, done[rid]))
         return emit(rids, nxt, fresh=True)
 
     real_windows = sub._prefill_windows
@@ -279,6 +292,73 @@ def test_mtp_output_equals_greedy_without_mtp(reference, k, drafts):
         _oracle(sub, reference, wrong_every=3 if drafts == "oracle_partial" else None)
     got = _generate(engine, dict(PROMPTS), MAX_TOKENS)
     assert got == reference
+
+
+def _generate_lagged(engine, prompts, max_tokens):
+    """``_generate`` in the async worker's order: each decode step is launched before the one
+    it follows is checked, and a step launched past its request's stop is dropped unchecked,
+    as the worker drops it."""
+    for rid in prompts:
+        engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, stops = _step(engine, "prefill", prompts, max_tokens)
+    seqs = {rid: out[rid]["new_token"][0].tolist() for rid in prompts}
+    nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
+    live = [rid for rid in prompts if not stops.get(rid)]
+    step, pending = 0, None
+    while live or pending:
+        launched = None
+        if live:
+            launched = _launch(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens, step)
+            step += 1
+            nxt.update({rid: launched[1].per_rid_outputs[rid]["text_inputs"][0] for rid in live})
+        if pending is not None:
+            batch, outputs = pending
+            stops = _check(engine, batch, outputs)
+            for rid in batch.request_ids:
+                seqs[rid] += outputs.per_rid_outputs[rid]["new_token"][0].tolist()
+            live = [rid for rid in live if not stops.get(rid)]
+            if launched is not None:
+                launched[0].request_ids = [r for r in launched[0].request_ids if r in live]
+        pending = launched
+    for rid in prompts:
+        engine.remove_request(rid)
+    return seqs
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
+def test_mtp_output_is_greedy_when_each_step_launches_before_the_last_check(reference, k, drafts):
+    """The next step is prepared and run before this one's tokens are cut: the cut at a stop
+    token and at max_tokens still lands where greedy decode's does."""
+    engine, sub, _ = _build_engine(k)
+    if drafts != "mtp":
+        _oracle(sub, reference, wrong_every=3 if drafts == "oracle_partial" else None)
+    assert _generate_lagged(engine, dict(PROMPTS), MAX_TOKENS) == reference
+
+
+def test_a_verify_steps_tokens_are_cut_at_a_stop_token_and_max_tokens():
+    """Each row's accepted drafts and the token after them, cut after its first stop token
+    (not under ignore_eos) and at max_tokens counting what it sent before; nothing for a
+    reply that ended at the prefill or a row the batch dropped. A padding row past the real
+    ones is not read."""
+    _, sub, cfg = _build_engine(3)
+    eos = cfg.eos_token_ids[0]
+    rows = {  # the target's argmax per block row, then the accepted count
+        "eos": [5, eos, 7, 8, 3], "ignored": [5, eos, 7, 8, 3], "budget": [5, 6, 7, 8, 2],
+        "none": [9, 6, 7, 8, 0], "ended": [5, 6, 7, 8, 3], "dropped": [5, 6, 7, 8, 3],
+    }
+    sent = {"budget": 10}
+    infos = {}
+    for rid in rows:
+        infos[rid] = _info(rid, "decode", 12, ignore_eos=rid == "ignored")
+        sub.request_state(rid).add("mtp_checked", sent.get(rid, 1))
+    sub.request_state("ended").add("ended_at_prefill", True)
+    verdicts = torch.tensor([*rows.values(), [0, 0, 0, 0, 0]])
+    host = HostRows(tuple(rows), {MTP_VERDICT: verdicts})
+    got = sub.emit_from_host_rows([r for r in rows if r != "dropped"], infos, host,
+                                  step_walk="decode")
+    assert {rid: out["new_token"][0].tolist() for rid, out in got.items()} == {
+        "eos": [5, eos], "ignored": [5, eos, 7, 8], "budget": [5, 6], "none": [9]}
 
 
 def test_oracle_drafts_are_all_accepted():
@@ -314,7 +394,7 @@ def test_decode_stops_while_the_next_block_fits():
         out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
                            step, ignore_eos=True)
         step += 1
-    real = len(prompt) + sub.request_state("r").get("mtp_generated")
+    real = len(prompt) + sub.request_state("r").get("mtp_checked")
     assert real + block <= limit < real + 2 * block
     _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
           ignore_eos=True)
@@ -347,7 +427,6 @@ def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=
     generated = 1
     for step in range(1, 100_000):
         generated += per_step
-        state.add("mtp_generated", generated)
         if stops("decode", step - 1, [7] * per_step):
             return step, generated
     raise AssertionError("never stopped")
@@ -423,9 +502,9 @@ def test_a_padding_row_writes_its_real_rows_token():
 
 
 def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
-    """The next step is in flight when this one is checked, and the GPU thread's count may
-    already include its tokens. 1 + 4 + 4 tokens reach max_tokens=9 at the second verify
-    step, not the first."""
+    """The next step is in flight when this one is checked; the check counts the tokens sent
+    through this step. 1 + 4 + 4 tokens reach max_tokens=9 at the second verify step, not the
+    first."""
     from mstar.model.submodule_base import PerRequestState
 
     state = PerRequestState()
@@ -443,9 +522,7 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
                                      max_tokens=9)
         return Glm5NextLLMSubmodule._mtp_check_stop(sub, "r", info, torch.tensor([7] * n))
 
-    state.add("mtp_generated", 5)  # the first verify step already unpacked
     assert not check("prefill", 0, 1)
-    state.add("mtp_generated", 9)  # and the second
     assert not check("decode", 0, 4)
     assert check("decode", 1, 4)
 
@@ -470,13 +547,17 @@ def _generate_long(engine, sub, prompts, max_tokens):
     live = [rid for rid in prompts if not stops.get(rid)]
     step = 0
     while live:
-        out, stops = _step(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens, step)
+        batch, outputs = _launch(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens,
+                                 step)
+        stops = _check(engine, batch, outputs)
+        out = outputs.per_rid_outputs
         step += 1
         for rid in live:
             seqs[rid] += out[rid]["new_token"][0].tolist()
             nxt[rid] = out[rid]["text_inputs"][0]
             if sub.mtp_k:
-                rows[rid] += sub._read_verdicts([rid])[0][1] + 1
+                row = outputs.row_request_ids.index(rid)
+                rows[rid] += int(outputs.check_stop_buffers[MTP_VERDICT][row, -1]) + 1
                 host[rid] += sub.mtp_block
                 assert kv._streams[rid]["main"].stored_len == host[rid], (rid, step)
                 assert sub.request_state(rid).get("context") == host[rid], (rid, step)
@@ -506,6 +587,18 @@ def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, dr
         _oracle(sub, long_reference, wrong_every=3 if drafts == "oracle_partial" else None)
     got = _generate_long(engine, sub, dict(LONG_PROMPTS), LONG_MAX_TOKENS)
     assert got == long_reference
+
+
+@pytest.mark.parametrize("drafts", ["mtp", "oracle_partial"])
+def test_long_context_mtp_output_is_greedy_when_each_step_launches_before_the_last_check(
+        long_reference, drafts):
+    """Under trims too: the device moves each block's rows, so nothing the next step plans
+    or runs waits for this one's tokens to be cut."""
+    engine, sub, cfg = _build_engine(3, long_context=True)
+    assert cfg.mtp_trims
+    if drafts != "mtp":
+        _oracle(sub, long_reference, wrong_every=3)
+    assert _generate_lagged(engine, dict(LONG_PROMPTS), LONG_MAX_TOKENS) == long_reference
 
 
 # hundreds of index pools against the 16 a query selects, on 16-token pages

@@ -1101,6 +1101,26 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return set()
 
+    def emit_from_host_rows(
+        self, request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, NameToTensorList]:
+        """Outputs cut on the host from the step's stop buffers once it has
+        landed, as rid -> outputs: e.g. a verify step's accepted tokens, whose
+        count only its verdict knows. Optional; called only when overridden.
+
+        The engine merges them into the step's outputs before the stop check,
+        so ``check_stop`` sees them and they are routed. This runs on the main
+        thread off the host copy the worker already made. A cut in
+        ``unpack_packed_outputs`` runs on the GPU thread, so its host read
+        holds back the next step's launch. ``request_ids`` leaves out rows
+        the batch dropped since the step ran (a stopped loop's). A raise fails
+        every one of them.
+        """
+        return {}
+
     def check_stop_batched(
         self, request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
