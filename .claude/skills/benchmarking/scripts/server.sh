@@ -49,7 +49,12 @@ is_ours() {  # is $1 the started process $2 or below it
 }
 
 gpu_memory() {
-  command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null
+  if command -v nvidia-smi >/dev/null; then
+    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null
+  elif command -v amd-smi >/dev/null; then
+    amd-smi metric --mem-usage --csv 2>/dev/null
+  fi
+  return 0
 }
 
 cmd_start() {

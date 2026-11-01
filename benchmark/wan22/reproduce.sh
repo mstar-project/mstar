@@ -36,9 +36,10 @@ CLEAN_MIB="${CLEAN_MIB:-4096}"   # a swept card idles well under this
 # usage: reproduce.sh preflight <gpu>
 preflight() {
   local gpu="$1"
-  local pids; pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$gpu" | tr -d ' ')"
+  # benchmark.gpu_query asks nvidia-smi or amd-smi, whichever the machine has.
+  local pids; pids="$(cd "$MSTAR" && python -m benchmark.gpu_query pids "$gpu" | cut -d' ' -f1)"
   [ -n "$pids" ] && { echo "$pids" | xargs -r kill -9 2>/dev/null || true; sleep 5; }
-  local used; used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu")"
+  local used; used="$(cd "$MSTAR" && python -m benchmark.gpu_query used-mib "$gpu")"
   if [ "$used" -ge "$CLEAN_MIB" ]; then
     echo "[preflight] gpu $gpu still holds ${used} MiB — refusing to measure a dirty card" >&2
     return 1

@@ -14,8 +14,8 @@ and reports what the benchmark protocol asks for:
 Peak VRAM (``memory.used`` of ``--vram-gpu`` sampled by ``nvidia-smi`` during the timed run)
 is recorded when the client runs on the server's node, as the protocol does.
 
-Prompts come from a text file (one per line; the shared protocol set lives under
-``commons/bench/data/image/``), so every engine sees identical inputs. Results are
+Prompts come from a text file (one per line, e.g. ``python -m benchmark.amd.prompts image_v1
+--unique --out prompts.txt``), so every engine sees identical inputs. Results are
 written as JSON (``--out``) with the exact request parameters and timing samples.
 
 Examples::

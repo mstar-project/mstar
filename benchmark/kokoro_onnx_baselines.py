@@ -23,6 +23,25 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# Execution providers by --provider value, best first. "auto" takes the first one onnxruntime has.
+ONNX_PROVIDERS = {
+    "cuda": ["CUDAExecutionProvider"],
+    "migraphx": ["MIGraphXExecutionProvider"],  # onnxruntime-migraphx on AMD GPUs
+    "rocm": ["ROCMExecutionProvider"],  # onnxruntime-rocm (the one vllm-omni's ROCm image ships)
+    "cpu": [],
+    "auto": ["CUDAExecutionProvider", "MIGraphXExecutionProvider", "ROCMExecutionProvider"],
+}
+
+
+def onnx_providers(choice: str, available: list[str]) -> list[str]:
+    """Providers for an InferenceSession, CPU last as onnxruntime's fallback."""
+    wanted = ONNX_PROVIDERS[choice]
+    if choice == "auto":
+        wanted = [p for p in wanted if p in available][:1]
+    elif wanted and wanted[0] not in available:
+        raise RuntimeError(f"--provider {choice}: onnxruntime has {available}, not {wanted[0]}")
+    return wanted + ["CPUExecutionProvider"]
+
 
 def _percentile(values: list[float], q: float) -> float:
     values = sorted(values)
@@ -30,7 +49,7 @@ def _percentile(values: list[float], q: float) -> float:
 
 
 class KokoroOnnxEngine:
-    """thewh1teagle/kokoro-onnx on onnxruntime (CUDA or CPU execution provider)."""
+    """thewh1teagle/kokoro-onnx on onnxruntime (CUDA, MIGraphX, ROCm or CPU execution provider)."""
 
     name = "kokoro-onnx"
 
@@ -42,9 +61,7 @@ class KokoroOnnxEngine:
             ort.preload_dlls()
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
-        providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"] if provider == "cuda" else ["CPUExecutionProvider"]
-        )
+        providers = onnx_providers(provider, ort.get_available_providers())
         session = ort.InferenceSession(model, sess_options=options, providers=providers)
         self.provider = session.get_providers()[0]
         self.kokoro = Kokoro.from_session(session, voices)
@@ -151,7 +168,8 @@ def main() -> None:
     parser.add_argument("--model", help="kokoro-onnx: path to kokoro-v1.0.onnx")
     parser.add_argument("--voices", help="kokoro-onnx: path to voices-v1.0.bin")
     parser.add_argument("--model-dir", help="sherpa-onnx: the kokoro-multi-lang-v1_0 directory")
-    parser.add_argument("--provider", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--provider", choices=sorted(ONNX_PROVIDERS), default="cuda",
+                        help="kokoro-onnx execution provider (sherpa-onnx takes cuda or cpu)")
     parser.add_argument("--voice", default="af_heart", help="kokoro-onnx voice name")
     parser.add_argument("--sid", type=int, default=0, help="sherpa-onnx speaker id")
     parser.add_argument("--threads", type=int, default=4, help="intra-op threads of the ONNX session")
