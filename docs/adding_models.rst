@@ -617,11 +617,11 @@ The spec types are:
        term (``rel_bias``) for relative-position attention. Float32 by default (Triton
        kernels). See `Bounded (sink + window) caches`_.
    * - ``RollingKVSpec(config=RollingKVConfig(...))``
-     - Per-request sink + window K/V kept compacted in stream order, with no attention of
-       its own: a step writes its tokens with ``write`` and hands ``window`` (one
-       contiguous range) to whatever attention the model runs, a ragged one say. For long
-       chunks where that kernel's speed matters (a causal video DiT). See `Rolling
-       (compacted) caches`_.
+     - Per-request sink + window K/V kept compacted in stream order, in regions of a pool
+       reserved at startup (``pool_tokens``), with no attention of its own: a step writes its
+       tokens with ``write`` and hands ``window`` (one contiguous range) to whatever attention
+       the model runs, a ragged one say. For long chunks where that kernel's speed matters (a
+       causal video DiT). See `Rolling (compacted) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
@@ -1093,14 +1093,17 @@ Each step declares its rows' ``RollingPosition(written, sink, window)`` in token
 (``RollingKVStep``), so the retention can follow a request's own geometry. ``plan`` applies
 the shift, once per step even when planned twice; the model then calls ``write(layer, k, v)``
 (as often as its denoise loop rewrites the chunk; the last write stays) and attends
-``window(layer)`` with its own kernel. A request takes a slot at its first step and keeps
-it; with every slot taken, the step is refused with ``AllocationFailed`` and the worker
-holds the request until one frees. Nothing is reserved up front: a request's K/V are
-allocated at its first step at its own size (its sink plus window, at most
-``max_request_tokens`` a layer) and freed with it. When they don't fit in free device memory
-beside other requests' the step is refused the same way, so the request waits rather than
-fails. A step that declares this store runs eager (no capture yet), and it does not shard
-across ranks yet.
+``window(layer)`` with its own kernel.
+
+The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. A request takes a
+contiguous region of exactly its sink plus window at its first step (first fit) and gives it
+back when it ends, so requests of different sizes share the pool instead of each holding
+the largest. When no free gap holds a new request but the free tokens do, the resident
+regions slide left to join the gaps, a copy of what they hold, between steps. A request that
+doesn't fit is refused with ``AllocationFailed`` and the worker holds it until a region
+frees; one larger than the whole pool fails. How many requests run at once is the
+deployment's ``max_concurrent_requests``, not the store's. A step that declares this store
+runs eager (no capture yet), and it does not shard across ranks yet.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -2085,7 +2088,7 @@ that a misspelled setting is never silently ignored:
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``RollingKVSpec``
-     - ``max_slots``, ``max_request_tokens``
+     - ``pool_tokens``
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
    * - ``AttentionSpec``

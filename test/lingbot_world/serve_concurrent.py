@@ -1,7 +1,7 @@
 """Concurrent LingBot-World rollouts through the served path.
 
-Starts the API server on a LingBot config (``--max-slots`` and ``--max-request-tokens``
-override its ``resources: dit_kv:``), streams one rollout alone, then
+Starts the API server on a LingBot config (``--max-concurrent`` sets its
+``max_concurrent_requests``, ``--pool-tokens`` its ``resources: dit_kv: pool_tokens``), streams one rollout alone, then
 ``--sessions`` of the same rollout at once, and checks:
 
   * every concurrent rollout's frames are byte-identical to the solo one: a
@@ -14,8 +14,10 @@ override its ``resources: dit_kv:``), streams one rollout alone, then
 The trajectory is synthetic and the image one of Cosmos3-Edge's assets, as in
 ``run_served_numerics.py``.
 
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc1 --max-slots 1
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2 --max-slots 2
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc1
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2 --max-concurrent 2
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/pool --max-concurrent 2 \
+        --pool-tokens 28080 --expect-waits 1
 """
 
 from __future__ import annotations
@@ -69,8 +71,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--config", type=Path, default=REPO / "configs/lingbot_world_1_3b.yaml")
-    ap.add_argument("--max-slots", type=int)
-    ap.add_argument("--max-request-tokens", type=int)
+    ap.add_argument("--max-concurrent", type=int, help="the YAML's max_concurrent_requests")
+    ap.add_argument("--pool-tokens", type=int, help="the YAML's resources: dit_kv: pool_tokens")
+    ap.add_argument("--expect-waits", type=int,
+                    help="rollouts that must wait for an earlier one; default: sessions - max_concurrent_requests")
     ap.add_argument("--sessions", type=int, default=2)
     ap.add_argument("--chunks", type=int, default=6)
     ap.add_argument("--image")
@@ -83,15 +87,12 @@ def main() -> int:
         args.image = hf_hub_download("nvidia/Cosmos3-Edge", "assets/edge_action_id_av_0_output.png")
 
     config = yaml.safe_load(args.config.read_text())
-    kv = (config.get("resources") or {}).get("dit_kv", {})
-    if args.max_slots is not None or args.max_request_tokens is not None:
-        kv = config.setdefault("resources", {}).setdefault("dit_kv", {})
-        if args.max_slots is not None:
-            kv["max_slots"] = args.max_slots
-        if args.max_request_tokens is not None:
-            kv["max_request_tokens"] = args.max_request_tokens
-    # a config with no rolling KV store serves one request at a time
-    slots = kv.get("max_slots", config.get("max_concurrent_requests", 1))
+    if args.max_concurrent is not None:
+        config["max_concurrent_requests"] = args.max_concurrent
+    if args.pool_tokens is not None:
+        config.setdefault("resources", {}).setdefault("dit_kv", {})["pool_tokens"] = args.pool_tokens
+    concurrent = config.get("max_concurrent_requests", args.sessions)
+    expected_waits = args.expect_waits if args.expect_waits is not None else max(0, args.sessions - concurrent)
     workdir = Path(tempfile.mkdtemp(prefix="lingbot-conc-"))
     config_path = workdir / "lingbot.yaml"
     config_path.write_text(yaml.safe_dump(config))
@@ -106,7 +107,8 @@ def main() -> int:
         stdout=log, stderr=subprocess.STDOUT, cwd=REPO,
     )
     client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=900)
-    report: dict = {"max_slots": slots, "max_request_tokens": kv.get("max_request_tokens"), "sessions": args.sessions}
+    report: dict = {"max_concurrent": concurrent, "pool_tokens": (config.get("resources") or {}).get("dit_kv", {}),
+                    "sessions": args.sessions, "expected_waits": expected_waits}
     try:
         deadline = time.time() + 1200
         while not client.health():
@@ -156,8 +158,7 @@ def main() -> int:
     print(json.dumps(report, indent=2, default=str))
     ok = not report.get("errors") and all(report.get("identical_to_solo", {0: False}).values()) \
         and len(report.get("chunks_each", {})) == args.sessions
-    expected_waits = max(0, args.sessions - slots)
-    if ok and slots < args.sessions and report["waited_for_a_slot"] < expected_waits:
+    if ok and report["waited_for_a_slot"] < expected_waits:
         ok = False
     print("concurrent rollouts", "OK" if ok else "FAILED")
     return 0 if ok else 1
