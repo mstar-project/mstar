@@ -373,7 +373,8 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
-  ``/v1/images/edits`` for image output.
+  ``/v1/images/edits`` for image output, with ``output_format``, ``output_compression``
+  and ``png_compress_level`` via ``extra_body`` as for klein below.
 - **FLUX.2 klein / Z-Image** — ``/v1/images/generations`` (and ``/v1/images/edits`` for
   klein) only: ``size`` as ``WxH`` (multiples of 16); ``seed``; ``num_inference_steps``,
   ``output_format`` (``png`` default, ``jpeg``, ``webp``), ``output_compression`` (JPEG /
