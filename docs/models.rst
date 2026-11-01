@@ -395,8 +395,9 @@ default, which lowers the token count of short clips. Notes:
 - The vision encoder attends within each image and each video frame group
   separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
   segments per prompt. A prompt over either limit runs the encoder without the
-  graph: a long video at ordinary resolution exceeds the patches, and one over
-  ~64 s with frames resized below ~256x256 pixels exceeds the segments.
+  graph (still compiled, so only the launches are extra): a long video at
+  ordinary resolution exceeds the patches, and one over ~64 s with frames
+  resized below ~256x256 pixels exceeds the segments.
 - An encoder step packs the images and videos of up to 8 requests into one
   replay; requests that would overflow it together run one at a time. The
   packed GEMMs' shapes follow the step's total patches, so an image's

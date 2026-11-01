@@ -633,10 +633,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
     # The engine would compile `forward_batched` whole, and its per-step
     # bookkeeping (each request's slice of the output, the segment lengths)
     # guards on the batch size: every new size recompiled (~0.6 s, on a live
-    # request). The tensor stages around the captured block loop are compiled
-    # on their own instead (`compile_regions`), dynamic in the patch count from
-    # the first call. A step past the top capture bucket runs the blocks
-    # eagerly: compiling that rare path stalled its first request for seconds.
+    # request). The tensor stages are compiled on their own instead
+    # (`compile_regions`), dynamic in the patch count, so one graph serves
+    # every capture bucket and the eager steps past the top one. Uncompiled,
+    # the blocks' fp32 rope, norms and activations were over half the tower's
+    # GPU time on long videos.
     disable_torch_compile = True
 
     def __init__(
@@ -721,7 +722,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
         """Warmed at start-up on the smallest image the processor makes (256 x
         256 pixels), in the dtypes a step brings: float32 pixels out of
         `_normalize`, merger rows in the tower's dtype. Dynamic in the patch
-        count from that call, so no image compiles them on a live request."""
+        count from that call, so no image compiles them on a live request. The
+        block loop takes no example (it needs a planned attention step): it
+        compiles in its capture's warm-up, or on the first image when capture
+        is off."""
         device, merge = self.get_device(), self.config.spatial_merge_size
         grid = [(1, 16, 16)]
         indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge, device)
@@ -731,6 +735,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
                            device=device)
         return {
             "model.embed": [(pixels, indices, weights, vision_grid_position_ids(grid, merge, device))],
+            "model.encode": [],
             "model.merger": [(rows,)],
         }
 

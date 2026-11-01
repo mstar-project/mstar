@@ -557,7 +557,7 @@ def test_the_vision_compile_regions_take_their_start_up_examples():
     config = _encoder(max_segments=4).config
     encoder = VisionEncoderSubmodule(Qwen3_5VisionModel(config), config, (torch.zeros(1), torch.ones(1)))
     regions = encoder.compile_regions()
-    assert set(regions) == {"model.embed", "model.merger"}
+    assert set(regions) == {"model.embed", "model.encode", "model.merger"}
     with torch.no_grad():
         hidden, _, _ = encoder.model.embed(*regions["model.embed"][0])
         (rows,) = regions["model.merger"][0]
