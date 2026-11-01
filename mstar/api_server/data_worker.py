@@ -44,10 +44,10 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -108,6 +108,12 @@ def _sha256(path: str) -> bytes:
 def _file_state(path: str) -> tuple[int, int, int]:
     stat = os.stat(path)
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _prefix_cache(model_kwargs: dict) -> bool:
+    """A client's prefix_cache: unset or None is on, otherwise its truth."""
+    value = model_kwargs.get("prefix_cache")
+    return value is None or bool(value)
 
 
 class _FileChangedError(Exception):
@@ -218,13 +224,18 @@ def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
+    YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
+    groups = [
+        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        for group in model_config.get("node_groups") or []
+    ]
+    opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
     return {
-        spec.resource_key: spec.config.page_size
-        for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
+        spec.resource_key: spec.config.tokens_per_page for spec in specs
+        if isinstance(spec, KVSpec) and spec.resource_key in opened
     }
 
 
@@ -881,7 +892,7 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            if model_kwargs.get("prefix_cache") is not False:
+            if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
                 ))
