@@ -236,16 +236,16 @@ def test_compiled_text_node_pads_to_the_longest_caption_bucket(monkeypatch):
     assert out["a"][TEXT_EMBEDS][0].shape[1] == 64 and out["b"][TEXT_EMBEDS][0].shape[1] == 32
 
 
-def test_text_compile_is_an_amd_override():
+@pytest.mark.parametrize("platform", ["cuda", "rocm"])
+def test_text_compile_is_opt_in(platform):
     from mstar.platforms.serving_config import apply_platform_overrides
 
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
-    assert "text_compile" not in apply_platform_overrides(config, "cuda")["model_kwargs"]
-    rocm = apply_platform_overrides(config, "rocm")["model_kwargs"]
-    assert rocm["text_compile"] is True
-    # the override replaces the key whole, so it has to carry every other setting
-    assert {**rocm, "text_compile": None} == {**config["model_kwargs"], "text_compile": None}
+    assert apply_platform_overrides(config, platform)["model_kwargs"]["text_compile"] is False
+    with open(Path(CONFIG_PATH).with_name("z_image_turbo_textcompile.yaml")) as f:
+        named = yaml.safe_load(f)
+    assert named == {**config, "model_kwargs": {**config["model_kwargs"], "text_compile": True}}
 
 
 def test_requests_above_max_image_area_are_rejected():
