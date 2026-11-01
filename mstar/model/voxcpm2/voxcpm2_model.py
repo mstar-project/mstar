@@ -36,11 +36,7 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition, WalkStep
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -53,7 +49,6 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
@@ -508,94 +503,33 @@ class VoxCPM2Model(Model):
         metadata["kv_layout"] = {BASE_KV: {"main": layout}, RES_KV: {"main": layout}}
         return ProcessPromptOutput(outputs, metadata)
 
-    # -- conductor state machine -------------------------------------------------
+    # -- walk plan ------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         if partition_name == "Talker":
             # the mode process_prompt built the prompt for, not the caller's
             # input_modalities: a clip sent with ["text"] still clones
             if PROMPT_MODE_KEY not in model_kwargs:
                 raise ValueError(f"VoxCPM2 request is missing {PROMPT_MODE_KEY}, which process_prompt sets")
             clone = int(model_kwargs[PROMPT_MODE_KEY]) != MODE_ZERO_SHOT
-            walk = "talker_prefill_clone" if clone else "talker_prefill"
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk=walk,
-                is_prefill=True,
-                kwargs={PATCH_BUDGET_KEY: int(model_kwargs.get(PATCH_BUDGET_KEY, 0))},
-            )
-            routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
-            if clone:
-                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
-            inputs = []
-            for name, node in routes:
-                edge = GraphEdge(next_node=node, name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
-                request_done="audio" not in output_modalities,
+            budget = int(model_kwargs.get(PATCH_BUDGET_KEY, 0))
+            if "audio" not in output_modalities:
+                return []
+            prefill = WalkStep(
+                "talker_prefill_clone" if clone else "talker_prefill",
                 step_metadata={key: model_kwargs[key] for key in TALKER_STEP_METADATA if key in model_kwargs},
             )
+            # the prefill's patch spends a one-patch budget; a decode step would only veto itself
+            return [prefill] if budget == 1 else [prefill, WalkStep("talker_decode")]
         if partition_name == "VAEDecoder":
-            return ForwardPassArgs(
-                full_metadata=CurrentForwardConductorMetadata(
-                    input_modalities=input_modalities,
-                    output_modalities=output_modalities,
-                    graph_walk="vae_chunk",
-                    is_prefill=False,
-                ),
-                inputs=[],
-                unpersist_tensors=[],
-                request_done="audio" not in output_modalities,
-            )
-        raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == "Talker":
-            if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
-                if partition_metadata.kwargs.get(PATCH_BUDGET_KEY) == 1:
-                    return ForwardPassArgs(
-                        full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True
-                    )
-                partition_metadata.graph_walk = "talker_decode"
-                partition_metadata.is_prefill = False
-                edge = GraphEdge(next_node="Talker", name="latent_patch")
-                edge.tensor_info = persist_signals.get("latent_patch", [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                )
-            if partition_metadata.graph_walk == "talker_decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-            raise ValueError(f"Talker entered an unexpected graph walk: {partition_metadata.graph_walk!r}")
-        if partition_name == "VAEDecoder":
-            partition_metadata.graph_walk = "vae_chunk"
-            return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[])
+            return [WalkStep("vae_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
 
     # -- output ---------------------------------------------------------------------
