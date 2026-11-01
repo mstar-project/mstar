@@ -501,6 +501,9 @@ Qwen3-Omni notes
   e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
   is captured as a CUDA graph per token-count bucket; a request past the
   largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
+- A prompt runs one Thinker prefill per attachment: each attachment's row also
+  holds the text before it, and the last one the text after it, so text, a clip
+  and text is one step. A prompt with no attachment is one text prefill.
 - Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
   25-frame chunks behind 25 frames of left context. Playback stays gapless
   while the Talker produces frames at about 1.5x real time over the first 50
