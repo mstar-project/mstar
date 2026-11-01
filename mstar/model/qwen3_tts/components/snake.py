@@ -71,10 +71,11 @@ class FusedSnakeBeta(nn.Module):
             inv_beta = self.inv_beta.to(hidden_states.dtype).view(shape)
             return hidden_states + inv_beta * torch.sin(hidden_states * alpha).pow(2)
         if hidden_states.dim() == 4:
-            out = torch.empty_like(hidden_states)
-            numel = hidden_states.numel()
+            x = hidden_states.contiguous(memory_format=torch.channels_last)
+            out = torch.empty_like(x)
+            numel = x.numel()
             _snake_channels_last_kernel[(triton.cdiv(numel, self.BLOCK),)](
-                hidden_states, out, self.alpha, self.inv_beta, hidden_states.shape[1], numel,
+                x, out, self.alpha, self.inv_beta, x.shape[1], numel,
                 BLOCK=self.BLOCK, num_warps=8,
             )
             return out

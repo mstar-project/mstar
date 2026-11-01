@@ -283,6 +283,9 @@ class Qwen3TTSCodePredictor(nn.Module):
         ])
         # set on the worker's device, see ``blackwell_path_measured``
         self.fused_add_norm = False
+        # device -> whether ``qk_norm_rope_kv_write`` serves this module: constant
+        # for a model, and an eager depth loop asks 75 times a frame
+        self._fused_qk: dict[torch.device, bool] = {}
         self.register_buffer(
             # Populated after weight loading. A single contiguous tensor lets
             # the piecewise loop select a residual head without traversing a
@@ -369,7 +372,10 @@ class Qwen3TTSCodePredictor(nn.Module):
         applies: a depth position is also the token's cache slot."""
         seq_len = end - cache_pos
         batch_size = q.shape[0] // seq_len
-        if qk_norm_rope_kv_write_applies(q, kv_layer):
+        fused = self._fused_qk.get(q.device)
+        if fused is None:
+            fused = self._fused_qk[q.device] = qk_norm_rope_kv_write_applies(q, kv_layer)
+        if fused:
             qk_norm_rope_kv_write(
                 q, k, v, attn.q_norm.weight, attn.k_norm.weight, position_ids,
                 kv_layer, batch_rows, position_ids, q.shape[0],

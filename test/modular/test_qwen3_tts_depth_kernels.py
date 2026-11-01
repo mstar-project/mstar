@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 import mstar.model.qwen3_tts.components.talker as talker_module
 from mstar.model.components.norm import RMSNorm
+from mstar.model.qwen3_tts import submodules
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     Qwen3TTSCodePredictorConfig,
@@ -151,6 +152,31 @@ def test_depth_loop_passes(monkeypatch, two_tokens):
     assert codes.shape == (batch, GROUPS)
     assert codes[:, 0].tolist() == [1, 2]
     assert embed_sum.shape == (batch, config.talker.hidden_size)
+
+
+@pytest.mark.parametrize("measured", [True, False])
+def test_one_gate_decides_the_add_norms_and_the_two_token_pass(monkeypatch, measured):
+    monkeypatch.setattr(submodules, "blackwell_path_measured", lambda device: measured)
+    config = _config()
+    talker, predictor = Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config)
+    submodule = TalkerSubmodule(talker, predictor, config)
+    assert submodule.two_token_first_pass is measured
+    assert talker.model.fused_add_norm is measured
+    assert predictor.fused_add_norm is measured
+
+
+def test_predictor_decides_the_q_k_kernel_once(monkeypatch, python_kernels):
+    config = _config()
+    predictor, attn, q, k, v, kv_layer = _attend_inputs(config, 2)
+    calls = []
+    monkeypatch.setattr(
+        talker_module, "qk_norm_rope_kv_write_applies", lambda q, layer: calls.append(q.device) or False,
+    )
+    positions, rows = torch.full((2,), 1), torch.arange(2)
+    with torch.no_grad():
+        for _ in range(3):
+            predictor._norm_rope_attend(attn, q.clone(), k.clone(), v, positions, rows, kv_layer, 1, 2)
+    assert calls == [q.device]
 
 
 class _ScaleAttention(torch.nn.Module):
