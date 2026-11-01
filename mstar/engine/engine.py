@@ -117,9 +117,9 @@ def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None
     asks for cuDNN's algorithm search (``capture_cudnn_benchmark``) is sized.
     The search tries workspaces as large as the device has free, and the
     allocator keeps them until sizing's ``empty_cache``, past the share a
-    co-located worker plans around. A try past the cap fails, and cuDNN
-    skips that algorithm; so does the node's own sizing, which then fails
-    the boot when its eager step does not fit in the share."""
+    co-located worker plans around. A try past the cap fails and cuDNN
+    skips that algorithm. Any other allocation past it fails too, so the
+    boot fails when the node's eager step does not fit in the share."""
     if fraction is None or not submodule_mgmt.submodule.capture_cudnn_benchmark:
         yield
         return
