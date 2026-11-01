@@ -248,12 +248,9 @@ class Glm52Model(Model):
                         next_node="LLM",
                         name="text_inputs",
                     ),
-                    # named as the loop's own edge: a decode step's one output
-                    # signal then stays on the device (device loop-back) and
-                    # reaches the client inline
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
-                        name="text_inputs",
+                        name="new_token",
                         output_modality="text",
                     ),
                 ],

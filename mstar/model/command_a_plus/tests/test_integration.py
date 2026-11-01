@@ -137,9 +137,7 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertEqual((output.name, output.next_node, output.conductor_new_token, output.persist),
                          ("new_token", EMIT_TO_CLIENT, True, True))
         self.assertEqual(walks["decode"].name, "decode_loop")
-        # every decode output is the sampled token, which the node reads back
-        # on the device only when no output leaves it
-        self.assertEqual({e.name for e in walks["decode"].section.outputs}, {"text_inputs"})
+        self.assertEqual({e.name for e in walks["decode"].section.outputs}, {"new_token", "text_inputs"})
         seed = object()  # Metadata only; no tensor transfer in this test.
         first = model.get_initial_forward_pass_args(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [seed]})
         self.assertEqual(first.full_metadata.graph_walk, "prefill")

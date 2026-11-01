@@ -65,6 +65,16 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     # the ladder it captured before moving onto the scaffold: wider decode
     # steps are unmeasured on this MoE (graph memory, fused-MoE tiles)
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    # decode reads its ids back from the routed token and emits a tensor a
+    # request, as before the scaffold; the device path is a measured change
+    reads_device_loopback = False
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        return {}
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        # no prefill is captured, so nothing sizes an image step: uncapped, as before
+        return None
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         # one KV cache, read through a windowed and an unwindowed resource

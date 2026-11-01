@@ -90,11 +90,10 @@ class CommandAPlusModel(Model):
                 # Per-request max_output_tokens ends the loop earlier; this is
                 # only the hard bound, so it must not cap the request's choice.
                 name="decode_loop", max_iters=self.max_seq_len, outputs=[],
-                # every output is the token the node reads back off the
-                # sampler, so it stays on the device
                 section=GraphNode(name="LLM", input_names=["text_inputs"], outputs=[
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
+                              output_modality="text", conductor_new_token=True),
                     GraphEdge(next_node="LLM", name="text_inputs"),
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ]),
             ),
         }
