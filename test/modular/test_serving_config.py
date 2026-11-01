@@ -79,8 +79,50 @@ def test_the_gentle_ramp_configs_are_their_base_with_a_chunk_schedule(ramp, base
     assert config == _shipped(base)
 
 
+@pytest.mark.parametrize("name, bf16, schedule", [
+    ("flux2_klein.yaml", "flux2_klein_bf16.yaml", "flux2_klein_fp8_bpff.yaml"),
+])
+def test_the_klein_configs_serve_bf16_on_cuda_and_a_step_schedule_on_rocm(monkeypatch, name, bf16, schedule):
+    """On AMD GPUs the override serves the named schedule file with the solo text encoder and
+    the knob fp8 needs, and drops none of the file's settings. CUDA serves the bf16 file
+    without its override, so its encoder stays batched."""
+    monkeypatch.setattr(serving_config, "_built_for", CudaPlatform)
+    expected = load_serving_config(str(CONFIGS / bf16))
+    assert OVERRIDES_KEY not in expected
+    assert "text_encoder_max_batch_size" not in expected["model_kwargs"]
+    assert load_serving_config(str(CONFIGS / name)) == expected
+
+    monkeypatch.setattr(serving_config, "_built_for", RocmPlatform)
+    resolved = load_serving_config(str(CONFIGS / name))
+    assert resolved["model_kwargs"] == {**_shipped(schedule)["model_kwargs"], "text_encoder_max_batch_size": 1}
+    assert {k: v for k, v in resolved["model_kwargs"].items() if k in expected["model_kwargs"]} == {
+        **expected["model_kwargs"], **({"fp8_keep_bf16": []} if "fp8_keep_bf16" in expected["model_kwargs"] else {}),
+    }
+    assert resolved["knobs"] == {"dit_exact_ops": True}
+    assert {k: v for k, v in resolved.items() if k not in ("model_kwargs", "knobs")} == {
+        k: v for k, v in expected.items() if k != "model_kwargs"
+    }
+    # a bf16 deployment on AMD GPUs differs from the CUDA one by the solo text encoder alone
+    assert load_serving_config(str(CONFIGS / bf16)) == {
+        **expected, "model_kwargs": {**expected["model_kwargs"], "text_encoder_max_batch_size": 1},
+    }
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform, RocmPlatform])
+@pytest.mark.parametrize("fp8, bf16", [
+    ("flux2_klein_fp8.yaml", "flux2_klein_bf16.yaml"),
+])
+def test_the_named_fp8_klein_configs_are_their_bf16_file_with_fp8_and_the_knob(monkeypatch, platform, fp8, bf16):
+    monkeypatch.setattr(serving_config, "_built_for", platform)
+    expected = load_serving_config(str(CONFIGS / bf16))
+    assert load_serving_config(str(CONFIGS / fp8)) == {
+        **expected,
+        "model_kwargs": {**expected["model_kwargs"], "linear_dtype": "fp8"},
+        "knobs": {"dit_exact_ops": True},
+    }
+
+
 @pytest.mark.parametrize("name, bf16", [
-    ("flux2_klein.yaml", "flux2_klein_bf16.yaml"),
     ("flux2_klein_9b.yaml", "flux2_klein_9b_bf16.yaml"),
 ])
 def test_the_klein_configs_serve_bf16_on_cuda_and_fp8_on_rocm(monkeypatch, name, bf16):
