@@ -150,16 +150,6 @@ def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     setattr(owner, attr, value)
 
 
-def _loop_step(fwd_info: CurrentForwardPassInfo) -> int:
-    """The denoise iteration this step runs, from the engine's loop counter.
-
-    A value carried on a loop-back edge would be the previous step's device
-    output, and reading it on the host waits for that step to finish, which
-    stalls the speculative preparation of this one.
-    """
-    return int(fwd_info.dynamic_loop_iter_counts[DENOISE_LOOP_NAME])
-
-
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
     """(T_lat, H_lat, W_lat) for the request's pixel-space dims (diffusers
     ``prepare_latents``: T=(F-1)//4+1, spatial /16)."""
@@ -389,9 +379,6 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 "shapes and the UniPC solver run eager.",
                 sorted(self._compile_grids),
             )
-
-    def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
-        return _loop_step(fwd_info)
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
         meta = fwd_info.step_metadata

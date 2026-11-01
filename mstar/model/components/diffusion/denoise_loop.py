@@ -314,7 +314,14 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return entry
 
     def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
-        return int(fwd_info.dynamic_loop_iter_counts.get(self.loop_name, 0))
+        """The denoise iteration this step runs, from the engine's loop counter.
+
+        A value carried on a loop-back edge would be the previous step's device
+        output, and reading it on the host waits for that step to finish, which
+        stalls the speculative preparation of this one. A missing counter raises:
+        read as 0, it would reseed from noise every iteration.
+        """
+        return int(fwd_info.dynamic_loop_iter_counts[self.loop_name])
 
     def _ragged(self) -> RaggedAttentionCallable | None:
         """The attention callable for the ``"main"`` span, or None (SDPA)."""
