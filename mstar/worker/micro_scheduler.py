@@ -37,6 +37,8 @@ REMOVED_RID = -1
 
 # Below every turn and arrival: a sort key offset that puts a row ahead of them all
 _AHEAD = 1 << 62
+# between `_AHEAD`'s rows and the rest: a row mid-prefill under a token budget
+_MID_PREFILL = 1 << 61
 
 
 @dataclass
@@ -448,8 +450,8 @@ class MicroScheduler:
         # worker installs the tensor manager's. None skips the room check.
         self.get_tensor: Callable[[int], Any] | None = None
         # (rid, node) -> when its prompt's first chunk was cut, for serving
-        # prompts in start order. Read only for a row whose chunk Loop has
-        # started, so the next prompt's first chunk simply overwrites it.
+        # prompts in start order; held while the prompt is mid-prefill, and
+        # dropped once its last chunk is cut (`_assign_chunks`).
         self.chunk_started: dict[tuple[int, str], int] = {}
         self._chunk_starts = itertools.count()
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
@@ -665,7 +667,19 @@ class MicroScheduler:
         # the rows holding the step, then the earliest request
         def arrival(rid: int) -> int:
             return arrived(rid, 0) - (_AHEAD if turns.get(rid, 0) >= holding else 0)
-        return LineOrder(arrival, strict=True)
+        if not self.chunks(*key):
+            return LineOrder(arrival, strict=True)
+        # Under a token budget a row mid-prefill comes next, in the order the
+        # prompts started, so prompts that haven't started (back from an OOM
+        # hold, say) can't take a mixed step's prompt rows ahead of it.
+        started, node = self.chunk_started, key[0]
+
+        def mid_prefill_next(rid: int) -> int:
+            at = started.get((rid, node))
+            if at is None or turns.get(rid, 0) >= holding:
+                return arrival(rid)
+            return at - _MID_PREFILL
+        return LineOrder(mid_prefill_next, strict=True)
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -1728,6 +1742,8 @@ class MicroScheduler:
                 self.chunk_started[key] = next(self._chunk_starts)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
+            else:
+                self.chunk_started.pop((rid, node), None)
         self.cap_chunk_loops(batch)
 
     def cap_chunk_loops(self, batch: ScheduledBatch) -> None:

@@ -1,9 +1,11 @@
 """Placement checks: walks and partitions, ``node_groups``, the worker graphs
-they divide into, and the parallel groups each worker is handed."""
+they divide into, the parallel groups each worker is handed, and the weights
+that pick a request's replica among them."""
 
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
+from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.spec import NodeResourceSpec
@@ -26,6 +28,37 @@ def node_groups_problems(config: Mapping[str, Any]) -> list[str]:
         problem for i, group in enumerate(node_groups)
         if (problem := _node_group_entry_problem(i, group))
     ]
+
+
+# Far above any useful weight, and low enough that no replica's cost overflows to inf, where
+# inf - inf would make it NaN and fail every pick.
+_MAX_ROUTING_WEIGHT = 1e6
+
+
+def routing_weights_problems(config: Mapping[str, Any]) -> list[str]:
+    """``routing_weights``, the data-parallel replica pick's: one per term of
+    the cost, each a number from 0 to ``_MAX_ROUTING_WEIGHT``, since the cost
+    is a sum of weighted terms, and ``load`` above 0 when another term is, or
+    nothing would spread a hot prefix."""
+    weights = config.get("routing_weights")
+    if weights is None:
+        return []
+    if not isinstance(weights, Mapping):
+        return [f"routing_weights must be a mapping of {list(RoutingWeights._fields)}; got {weights!r}"]
+    problems = []
+    unknown = sorted(set(weights) - set(RoutingWeights._fields), key=str)
+    if unknown:
+        problems.append(f"routing_weights names {unknown}; it takes {list(RoutingWeights._fields)}")
+    for name, weight in weights.items():
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= _MAX_ROUTING_WEIGHT:
+            problems.append(
+                f"routing_weights.{name} must be a number from 0 to {_MAX_ROUTING_WEIGHT:g}; got {weight!r}"
+            )
+    if not problems and not weights.get("load", RoutingWeights._field_defaults["load"]) and any(
+        weights.get(name, default) for name, default in RoutingWeights._field_defaults.items() if name != "load"
+    ):
+        problems.append("routing_weights.load must be above 0 while another weight is")
+    return problems
 
 
 def _is_count(value: Any, least: int) -> bool:
@@ -249,11 +282,9 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
 
 def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
     """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica per node_group, so they share a
-    node_group, or each is a single instance on the same ranks."""
-    if len({wg._group_id for wg in wgs}) == 1:
-        return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+    workers: the conductor picks one replica for every node_group on the same
+    lockstep instances (``ReplicaRouter``), so they share those instances."""
+    return len({tuple(map(tuple, wg.replica_ranks)) for wg in wgs}) == 1
 
 
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
@@ -293,8 +324,8 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
                 f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
                 "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass and every worker graph on the same workers (one "
-                "node_group, or one instance on the same ranks); otherwise run it as "
+                "arrives once per pass and every worker graph on the same workers (node_groups "
+                "on the same ranks, instance for instance); otherwise run it as "
                 "one worker graph, or move the work after the consumer into a "
                 "downstream partition fed by a StreamingGraphEdge."
             )

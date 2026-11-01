@@ -33,7 +33,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import HostRows, ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine, TokenStop  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -188,29 +188,16 @@ def test_prompt_layout_matches_reference_template():
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64, 8192])
-def test_decode_ends_at_the_cap_and_the_loop_holds_any_cap_the_context_does(max_tokens):
-    """The request's cap is the iteration check_stop ends decode on, and the graph's
-    decode loop runs to the context, so a length past the default cap is served
-    rather than refused at intake."""
-    from types import SimpleNamespace
-
-    from mstar.engine.resources import SamplingReqConfig
-    from mstar.model.qwen3_asr.config import DECODE_LOOP, SAMPLER
+def test_the_decode_loop_holds_any_cap_the_context_does(max_tokens):
+    """The request's cap ends decode, and the graph's decode loop runs to the
+    context, so a length past the default cap is served rather than refused at
+    intake."""
+    from mstar.model.qwen3_asr.config import DECODE_LOOP
 
     model = _make_model()
     cap = model.get_loop_caps(max_output_tokens=max_tokens)[DECODE_LOOP]
     assert cap <= model.get_graph_walk_graphs()[DECODE_WALK].max_iters
 
-    llm = Qwen3ASRLLMSubmodule(None, model.config)
-    word = {"new_token": [torch.tensor([1234])]}
-    stopped = next(
-        k + 1 for k in range(cap + 1)
-        if llm.check_stop("r", SimpleNamespace(
-            graph_walk=DECODE_WALK, max_tokens=cap, dynamic_loop_iter_counts={DECODE_LOOP: k},
-            resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
-        ), word)
-    )
-    assert stopped == cap, "the cap and the stop check end decode on different iterations"
 
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
@@ -311,7 +298,7 @@ def test_encoder_replays_exactly_when_leased():
     then and runs eagerly otherwise, whatever the runner's buckets allow."""
     from types import SimpleNamespace
 
-    from mstar.model.qwen3_asr.submodules import AUT_ENCODE
+    from mstar.model.components.aut_submodule import AUT_ENCODE
 
     class Runner:
         has_bucket = True
@@ -344,7 +331,11 @@ def _llm_submodule(cfg):
     sub = object.__new__(Qwen3ASRLLMSubmodule)
     torch.nn.Module.__init__(sub)
     sub.request_states, sub.node_resources = {}, {}
-    sub.config, sub.stop_token_ids = cfg, cfg.stop_token_ids
+    sub.config = cfg
+    sub.token_stop = TokenStop(
+        loop=sub.DECODE_LOOP, buffer="new_token", stop_ids=cfg.stop_token_ids, sampler=sub.SAMPLER, walk=DECODE_WALK,
+        prefill_walks=frozenset({PREFILL_WALK}),
+    )
     embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
     sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
@@ -391,11 +382,17 @@ def test_llm_check_stop():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
-    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == set()
+    # a stop token first ends the request: there is no decode loop yet
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
+    # any other walk outside the loop may be followed by one the transition runs
+    assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
+    # the budget counts the prefill's token, and the loop's cap is at least 1: 1 ends there
+    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == {"decode_loop"}
+    # the budget is the loop cap's to end
+    assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == set()
 
 
 def test_llm_check_stop_batched_agrees_with_per_request():
@@ -419,24 +416,22 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
-    # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
     host_rows = HostRows(row_rids, {"new_token": tokens})
-    batched = sub.check_stop_batched(check, infos, host_rows, step_walk=None)
+    batched = sub.check_stop_batched(check, infos, host_rows)
     per_request = {}
     for i, rid in enumerate(row_rids):
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
     assert batched == per_request == {
-        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "budget": {"decode_loop"},
+        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "prefill": {END_PARTITION},
     }
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 
-@pytest.mark.parametrize("step_walk", [DECODE_WALK, None])
-def test_engine_stop_check_takes_the_batched_path(step_walk):
-    """The engine passes ``step_walk``; a signature without it raised, and the
-    engine silently fell back to one ``check_stop`` per row."""
+def test_engine_stop_check_takes_the_batched_path():
+    """The engine's stop check reaches the batched path rather than falling
+    back to one ``check_stop`` per row."""
     from types import SimpleNamespace
 
     from mstar.engine.engine import Engine
@@ -459,10 +454,6 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
     batch = SimpleNamespace(
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(
-            graph_walk=DECODE_WALK,
-            request_walks=None if step_walk else {"end": DECODE_WALK, "word": DECODE_WALK},
-        ),
     )
     engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([[IM_END], [1234]])

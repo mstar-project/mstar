@@ -37,21 +37,21 @@ from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.qwen3_vit import (
+    vision_interpolation,
+    vision_seq_lengths,
+)
+from mstar.model.components.qwen3_vit import (
+    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    vision_position_ids as vision_grid_position_ids,
+)
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
     vision_position_advance,
     vision_position_ids,
 )
-from mstar.model.qwen3_5.components.vision import (
-    Qwen3_5VisionModel,
-    vision_interpolation,
-    vision_seq_lengths,
-)
-from mstar.model.qwen3_5.components.vision import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
-    vision_position_ids as vision_grid_position_ids,
-)
+from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -70,17 +70,26 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
     device_loopback_enabled,
 )
 from mstar.utils.knobs import ingraph_decode_rope
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 logger = logging.getLogger(__name__)
+
+
+def token_stop(stop_token_ids) -> TokenStop:
+    """The LLM's stop: a decode row's stop id, checked by the graph runtime."""
+    return TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset(stop_token_ids),
+        sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+        last_prefill_flag="last_prefill", runtime_check=True,
+    )
 
 
 class LLMSubmodule(ARNodeSubmodule):
@@ -140,6 +149,7 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
+        self.token_stop = token_stop(config.stop_token_ids)
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
@@ -368,12 +378,14 @@ class LLMSubmodule(ARNodeSubmodule):
         return frozenset()
 
     @staticmethod
-    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
-        """A decode step replayed on a leased slot, or being captured for one.
-        The caller's walk decides (a capture's own context carries the
-        piecewise walk), the lease says the slot's static buffers are in
-        play."""
-        if graph_walk != "decode":
+    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A step of a text walk replayed on a leased slot, or being captured
+        for one, with ``ingraph_decode_rope`` on: its rotary tables come from
+        the planned positions inside the graph. The caller's walk decides (a
+        capture's own context carries the piecewise walk), the lease says the
+        slot's static buffers are in play. Only ``prefill_vision`` rows bring
+        their own 3D positions."""
+        if graph_walk not in ("decode", "prefill_text", LLM_MIXED) or not ingraph_decode_rope():
             return False
         step = getattr(engine_inputs, "step", None)
         ctx = getattr(step, "ctx", None) if step is not None else None
@@ -397,6 +409,34 @@ class LLMSubmodule(ARNodeSubmodule):
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
 
+    @staticmethod
+    def _splice_row_ids(
+        ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool,
+    ) -> torch.Tensor:
+        """``ids`` (one loop-back token per row) with each row that brought
+        its own ids taking them instead, in row order: a mixed step's prompt
+        rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+        rows go in as one slice each, and the splice is device ops only: an
+        index built from a host list would be a synchronous copy behind the
+        step in flight. A decode step keeps the slot's padding rows past
+        ``inputs``, so its length stays the captured one."""
+        pieces: list[torch.Tensor] = []
+        run = None
+        for i, inp in enumerate(inputs):
+            if inp.input_ids is None or (decode and not inp.input_seq_len):
+                if run is None:
+                    run = i
+                continue
+            if run is not None:
+                pieces.append(ids[run:i])
+                run = None
+            pieces.append(inp.input_ids.to(ids.dtype))
+        if run is not None:
+            pieces.append(ids[run:len(inputs)])
+        if decode and ids.shape[0] > len(inputs):
+            pieces.append(ids[len(inputs):])
+        return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
+
     def preprocess(
         self,
         graph_walk: str,
@@ -404,7 +444,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
-        captured = self._captured_decode(engine_inputs, graph_walk)
+        in_graph = self._rope_in_graph(engine_inputs, graph_walk)
         first = inputs[0]
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
@@ -413,30 +453,29 @@ class LLMSubmodule(ARNodeSubmodule):
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
+            laps = PhaseLaps("engine.preprocess.loopback.")
             ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            laps.lap("tokens")
+            decode = graph_walk == "decode"
             # rows whose last step ran elsewhere brought their token
-            routed = [
-                i for i, inp in enumerate(inputs)
-                if inp.input_ids is not None and inp.input_seq_len
-            ]
-            if graph_walk != "decode":
-                # a mixed step packs its decode rows' single tokens beside the
-                # prompts: each row takes its own ids, or its loop-back token
-                ids = torch.cat([
-                    inp.input_ids.to(ids.dtype) if inp.input_ids is not None
-                    else ids[i:i + 1]
-                    for i, inp in enumerate(inputs)
-                ])
-            elif routed:
-                sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
+            if not decode or any(
+                inp.input_ids is not None and inp.input_seq_len for inp in inputs
+            ):
+                ids = self._splice_row_ids(ids, inputs, decode)
+            laps.lap("splice")
             out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
-            if captured and ingraph_decode_rope():
+            if in_graph:
                 # the captured forward builds the rotary tables itself
                 return out
         elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
+            if in_graph:
+                assert all(inp.custom_pos_ids is None for inp in inputs), (
+                    "a text walk's rows take the planned 1D positions"
+                )
+                return out
         else:
             out["input_embeds"] = torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0,
@@ -534,10 +573,9 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        captured = self._captured_decode(engine_inputs, graph_walk)
         if input_ids is None and input_embeds is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
+        if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
             # positions, inside the graph; the static cos/sin stay unread
             num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
@@ -637,24 +675,6 @@ class LLMSubmodule(ARNodeSubmodule):
             "last_prefill", False,
         )
 
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        # only a decode row's stop can end decode_loop; a prefill is not in it yet
-        if request_info.graph_walk != "decode" or "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        hit_eos = not ignore_eos and token in self.config.stop_token_ids
-        out_of_budget = (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-            >= request_info.max_tokens
-        )
-        return {"decode_loop"} if hit_eos or out_of_budget else set()
-
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each, like the template; the prefill walks
         # feed `prefill_tokens` from the inputs
@@ -669,39 +689,6 @@ class LLMSubmodule(ARNodeSubmodule):
         # the decode loop's client edge carries the sampled token the stop
         # check already has on the host; prefill's new_token edge is persisted
         return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != "decode":
-            return {}  # as check_stop: only a decode row's stop ends decode_loop
-        pairs = host_rows.first_values("new_token", request_ids)
-        if pairs is None:
-            return None
-        stop_ids = self.config.stop_token_ids
-        stops: dict[str, set[str]] = {}
-        mixed = step_walk is None
-        for rid, value in pairs:
-            info = request_infos[rid]
-            # a mixed step reads each row's walk; a decode step need not
-            if mixed and info.graph_walk != "decode":
-                continue
-            # the set test first: a stop id is rare, the config read behind it
-            # goes through the wrapper
-            if (
-                value in stop_ids
-                and not info.resource_configs[SAMPLER].ignore_eos
-            ) or (
-                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-                >= info.max_tokens
-            ):
-                stops[rid] = {"decode_loop"}
-        return stops
 
 
 # The vision tower's block loop, as a piecewise capture region

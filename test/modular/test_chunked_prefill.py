@@ -239,7 +239,7 @@ def _batch():
     return SimpleNamespace(
         node_name="LLM", per_request_info_wrapped={0: None},
         per_request_input_tensors={}, final_stream_rids=set(),
-        per_request_input_metadata={},
+        per_request_input_metadata={}, first_chunk_rids=set(), chunk_ranges={},
     )
 
 
@@ -266,6 +266,47 @@ def test_the_whole_input_is_kept_until_the_last_chunk_lands():
 
     engine.release_chunk_inputs(0, "LLM")
     assert not engine._chunking.prepared
+
+
+def _refused_admit(engine, sub, batch):
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, FullAdmitOutcome
+
+    refused = AdmitOutcome(ok=False, reason=AllocationFailed(
+        message="full", pages_short=1, label="main", request_id=0,
+    ))
+    engine._runner = SimpleNamespace(admit=lambda step: FullAdmitOutcome(refused, "main"))
+    batch.register_admit_error = lambda *a: None
+    outcome, _ = engine._declare_and_admit(
+        batch, [0], [], sub, False, None, step=SimpleNamespace(set_ctx=lambda ctx: None),
+    )
+    assert not outcome.ok
+
+
+def test_a_refused_admit_drops_the_input_its_first_chunk_prepared():
+    """The retry prepares it again, so its length and cached prefix are checked
+    against the pages it then finds."""
+    sub = _Prompt(10)
+    engine = _engine_with(sub)
+    batch = _batch()
+    engine._prepare_chunk(batch, 0, "prefill", ChunkRange(0, 4, 10, 4))
+    _refused_admit(engine, sub, batch)
+    assert not engine._chunking.prepared
+
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    assert sub.prepares == 2
+
+
+def test_a_refused_later_chunk_keeps_the_prepared_input():
+    sub = _Prompt(10)
+    engine = _engine_with(sub)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    later = _batch()
+    engine._prepare_chunk(later, 0, "prefill", ChunkRange(4, 10, 10, 6))
+    _refused_admit(engine, sub, later)
+    assert engine._chunking.prepared, "the row's earlier chunks already ran from it"
+    assert sub.prepares == 1
 
 
 def test_a_request_removed_mid_prompt_drops_its_prepared_input():

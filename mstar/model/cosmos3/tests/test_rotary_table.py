@@ -23,6 +23,7 @@ from mstar.model.cosmos3.submodules import (
     UNCOND_LABEL,
     Cosmos3DiTSubmodule,
 )
+from mstar.model.cosmos3.tests.stubs import StubSampler
 from mstar.model.cosmos3.tests.test_edge import _init_all, _tiny_edge_config
 from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources
 
@@ -124,13 +125,13 @@ def test_window_tables_slice_with_the_window(monkeypatch) -> None:
     st.add_all(cond=cond, uncond=uncond, ar_schedule=chained, ar_tokens_per_unit=STRIDE)
     x = torch.zeros(sub._window_latent_shape(64, 64, plan.units))
     head = plan.cond_units * STRIDE
-    sub._commit_window("paged", st, x, torch.tensor([0]), window_index=1)
+    sub._commit_window("paged", st, x, window_index=1)
     (rot, label), = commits
     assert label == CFG_BATCHED_LABEL and len(rot) == 2
     assert _equal(rot[0], tuple(t[head:] for t in cond["rotary"]))
     assert _equal(rot[1], tuple(t[head:] for t in uncond["rotary"]))
     sub.batched_cfg = False
-    sub._commit_window("paged", st, x, torch.tensor([0]), window_index=1)
+    sub._commit_window("paged", st, x, window_index=1)
     assert [c[1] for c in commits[1:]] == [COND_LABEL, UNCOND_LABEL]
     assert _equal(commits[2][0][0], tuple(t[head:] for t in uncond["rotary"]))
 
@@ -236,9 +237,8 @@ def test_served_batched_paths_run_the_real_step() -> None:
     sub, model, cfg, res = _tiny(sound_gen=True, sound_dim=6)
     torch.manual_seed(0)
     gs, rids = 6.0, ["a", "b"]
-    sched = SimpleNamespace(
-        timesteps=torch.tensor([900.0, 500.0]), step=lambda v, t, x, return_dict=False: (x + v,),
-    )
+    sched = StubSampler(torch.tensor([900.0, 500.0]), lambda x, v: x + v)
+    sub._solver_state = ()
 
     def statics(ids, **kwargs):
         return sub._build_static(ids, 64, 64, 9, 24.0, False, "cpu", **kwargs)
@@ -257,8 +257,13 @@ def test_served_batched_paths_run_the_real_step() -> None:
 
     latents = {rid: torch.randn(sub._latent_shape(64, 64, 9)) for rid in rids}
     sound = {rid: torch.randn(1, cfg.sound_dim, 4) for rid in rids}
-    time_index = {"a": torch.tensor([0]), "b": torch.tensor([1])}
-    ei = SimpleNamespace(request_ids=rids, step=None, resources=res.as_dict(), per_request_states=None)
+    ei = SimpleNamespace(
+        request_ids=rids, step=None, resources=res.as_dict(), per_request_states=None,
+        per_request_info={
+            rid: SimpleNamespace(dynamic_loop_iter_counts={"video_sound_gen_loop": i, "video_gen_loop": i})
+            for i, rid in enumerate(rids)
+        },
+    )
 
     def groups(span):
         return [(COND_LABEL, span)] * 2 + [(UNCOND_LABEL, span)] * 2
@@ -267,11 +272,11 @@ def test_served_batched_paths_run_the_real_step() -> None:
     with torch.no_grad():
         state(cond_s, uncond_s, num_sound=4)
         joint = _run(res, CFG_BATCHED_LABEL, groups(n + 4), lambda: sub.forward_batched(
-            C.VIDEO_SOUND_GEN_WALK, ei, latents=latents, sound_latents=sound, time_index=time_index,
+            C.VIDEO_SOUND_GEN_WALK, ei, latents=latents, sound_latents=sound,
         ))
         state(cond, uncond)
         eager = _run(res, CFG_BATCHED_LABEL, groups(n), lambda: sub.forward_batched(
-            C.VIDEO_GEN_WALK, ei, latents=latents, time_index=time_index,
+            C.VIDEO_GEN_WALK, ei, latents=latents,
         ))
         sub._capture_layout = {tuple(latents["a"].shape): cond}
         captured = _run(res, CFG_BATCHED_LABEL, groups(n), lambda: sub.forward_captured(
@@ -310,7 +315,8 @@ def test_captured_inputs_stack_the_tables(monkeypatch) -> None:
     for key in ("cos_cond", "sin_cond", "cos_uncond", "sin_uncond"):
         assert single[key].shape == (3 * STRIDE, cfg.head_dim) and single[key].dtype == torch.bfloat16
 
-    sched = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0]), step_index=None)
+    sched = StubSampler(torch.tensor([900.0, 500.0]))
+    sub._solver_state = ()
     rids, inputs = ["a", "b"], []
     x = torch.zeros(1, cfg.latent_channel, 3, 4, 4, dtype=torch.bfloat16)
     for i, rid in enumerate(rids):
@@ -321,8 +327,10 @@ def test_captured_inputs_stack_the_tables(monkeypatch) -> None:
             cond=cond, uncond=uncond, gs=6.0, guidance_interval=None, scheduler=sched,
             latent_shape=(1, cfg.latent_channel, 3, 4, 4),
         )
-        fwd = SimpleNamespace(request_id=rid, rid_handle=rid, random_seed=0)
-        inp = sub.prepare_inputs(C.VIDEO_GEN_WALK, fwd, {"latents": [x], "time_index": [torch.tensor([1])]})
+        fwd = SimpleNamespace(
+            request_id=rid, rid_handle=rid, random_seed=0, dynamic_loop_iter_counts={"video_gen_loop": 1},
+        )
+        inp = sub.prepare_inputs(C.VIDEO_GEN_WALK, fwd, {"latents": [x]})
         t = inp.tensor_inputs
         assert t["cos_cond"] is cond["rotary"][0] and t["sin_cond"] is cond["rotary"][1]
         assert t["cos_uncond"] is uncond["rotary"][0] and t["sin_uncond"] is uncond["rotary"][1]

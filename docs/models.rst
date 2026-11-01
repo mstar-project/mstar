@@ -384,8 +384,11 @@ With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
 token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
 token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
-with a 400. Top alternatives and OpenAI's ``logprobs`` are not supported yet. On
-any deployment,
+with a 400. Add ``enable_processed_logprobs: true`` and ``"logprobs_mode":
+"processed"`` for the log-prob under the distribution it was actually drawn from
+(penalties and top-k/top-p applied); greedy requests want ``"raw"``, as a greedy
+token scores 0 there. Top alternatives and OpenAI's ``logprobs`` are not
+supported yet. On any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.
@@ -425,7 +428,8 @@ The ~437 GB of BF16 weights are never downloaded automatically: download the
 checkpoint and set ``model_kwargs.checkpoint_dir`` in
 ``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
 ``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
-H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. It keeps only the
+sliding layers' window per request, and no prefix cache yet. Tokenizer and config
 metadata are pinned to one checkpoint revision.
 ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
 all-reduce until FlashInfer's is measured there.
@@ -440,10 +444,10 @@ give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
 On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
 Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
-64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+64 (``benchmark/command_a_plus/bench_http.py``, measured before the sliding layers
+kept only their window); ``validate_checkpoint.py``
 there checks parity against Hugging Face, with ``--images`` for image prompts.
-Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
-outside the sliding window.
+Not supported yet: FP8 weights and prefill CUDA graphs.
 
 Kokoro notes
 ------------
@@ -493,6 +497,13 @@ Kokoro notes
 Qwen3-Omni notes
 ----------------
 
+- The audio and vision encoders attend through ragged attention resources
+  (``audio_attn`` within each 8 s window, ``vision_attn`` within each image or
+  video frame group), FlashInfer by default, so no ``flash-attn`` install is
+  needed. A deployment can pick the kernel under ``resources:`` in its YAML,
+  e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
+  is captured as a CUDA graph per token-count bucket; a request past the
+  largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
 - Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
   25-frame chunks behind 25 frames of left context. Playback stays gapless
   while the Talker produces frames at about 1.5x real time over the first 50
@@ -1346,11 +1357,14 @@ first use. The first DiT call after startup is traced twice (a guard on the
 rotary table), so a server compiles at most two graphs per listed shape plus
 one.
 
-**UniPC runs inline, inside the DiT node.** Unlike cosmos3, the scheduler is not
-a separate stage: the solver state (the order-2 history buffer and the
-corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
-travels with the request rather than living in a scheduler object on one rank.
-Requests are therefore independent and the loop is resumable across ranks.
+**UniPC runs inline, inside the DiT node.** The scheduler is the DiT scaffold's
+(``components/diffusion/unipc.py``, which cosmos3 runs too), not a separate
+stage: the solver state (the order-2 history buffer and the corrector's
+``last_sample``) is carried on the denoise loop's own edges, so it travels with
+the request rather than living in a scheduler object on one rank. Requests are
+therefore independent and the loop is resumable across ranks. ``dit_max_batch_size``
+(default 1) lets requests at one latent grid and guidance scale share a forward,
+each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,

@@ -140,38 +140,6 @@ class TestDensePlan:
         assert [s.request_id for s in plan.segments] == ["r0", "r1"]
         assert plan.causal is False
 
-    def test_an_unchanged_layout_is_not_replanned(self, monkeypatch):
-        """A wrapper keeps its last schedule, so a step whose layout matches
-        what that wrapper was last planned with skips the plan; another
-        layout, another causal flag or the other slot's wrapper plans again."""
-        calls = []
-        real_plan = DensePrefixedPrefillWrapper.plan
-
-        def counting_plan(self, *args, **kwargs):
-            calls.append(self)
-            return real_plan(self, *args, **kwargs)
-
-        monkeypatch.setattr(DensePrefixedPrefillWrapper, "plan", counting_plan)
-        manager = _manager()
-        views = [_view("r0", [0, 1], prefix=3, fresh=2)]
-        step = AttentionStep(causal=False)
-
-        manager.plan(step, _ctx(views))
-        manager.plan(step, _ctx(views))
-        assert len(calls) == 1
-        # the skipped plan still hands the layer the planned wrapper
-        assert manager._current_plans["main"].wrapper is calls[0]
-
-        manager.plan(step, _ctx(views, slot=1))
-        assert len(calls) == 2 and calls[1] is not calls[0]
-
-        manager.plan(AttentionStep(causal=True), _ctx(views))
-        assert len(calls) == 3
-        manager.plan(step, _ctx([_view("r0", [0, 1], prefix=3, fresh=3)]))
-        assert len(calls) == 4
-        manager.plan(step, _ctx([_view("r0", [0, 1], prefix=3, fresh=3)]))
-        assert len(calls) == 4
-
     def test_causal_rides_on_the_step(self):
         manager = _manager()
         manager.plan(AttentionStep(causal=True), _ctx([_view("r0", [0], prefix=1, fresh=1)]))

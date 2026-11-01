@@ -21,7 +21,7 @@ from mstar.engine.resources.sampler.utils import (
     SamplerBuffers,
     SamplingConfig,
 )
-from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -48,11 +48,13 @@ class SamplerResource(Resource):
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
         enable_logprobs: bool = False,
+        enable_processed_logprobs: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._enable_logprobs = enable_logprobs
+        self._enable_processed_logprobs = enable_processed_logprobs
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         self._max_repetition_window = max_repetition_window
         self._enable_top_p_first = enable_top_p_first
@@ -106,6 +108,11 @@ class SamplerResource(Resource):
         self._sampled_this_step = False
         self._device = device
         self._comm_group = comm_group
+        # Admission decides at one rank only, as in `RecurrentStatePool`: the ranks
+        # of a lockstep instance could otherwise hold a request back on one rank and
+        # run it on another. The in-graph rows are fixed, so they need admission;
+        # above one rank the masters grow and the scatter runs after the replay.
+        self._decides = comm_group is None or comm_group.world_size == 1
         self._cg_buffers: SamplerBuffers | None = None
         self._cg_max_bs = 0
         self._cg_slots = 1
@@ -125,7 +132,7 @@ class SamplerResource(Resource):
         # rid -> the prompt tokens a cache hit kept out of each walk's inputs. Keyed by the
         # position after them, so a repeated probe replaces its own entry.
         self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
-        # this step's kept rows (``_kept_rids_of``), for the eager draw
+        # this step's `SamplerStep.kept_rids`, for the eager draw and the in-graph scatter index
         self._kept_rids: frozenset[int] | None = None
         # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
         self._row_stager: PinnedStager | None = None
@@ -157,6 +164,7 @@ class SamplerResource(Resource):
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
             enable_logprobs=spec.enable_logprobs,
+            enable_processed_logprobs=spec.enable_processed_logprobs,
         )
 
     def build_accelerator_graph_buffers(
@@ -186,8 +194,9 @@ class SamplerResource(Resource):
                 history=self._history,
                 stop_ids=self._stop_ids,
                 enable_top_p_first=self._enable_top_p_first,
+                enable_processed_logprobs=self._enable_processed_logprobs,
             ) if self._device.type == "cuda" else {}),
-            ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
+            ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter() and self._decides,
             loopback_state=self._loopback_state,
             enable_logprobs=self._enable_logprobs,
         )
@@ -232,7 +241,8 @@ class SamplerResource(Resource):
             self._logprob_rids.add(rid)
         if self._history is not None:
             self._history.register(rid)
-        if self._cg_buffers is not None:
+        if self._cg_buffers is not None and not self._cg_buffers.ingraph_scatter:
+            # with the in-graph scatter the row is taken at admission (`reserve`)
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )
@@ -268,10 +278,13 @@ class SamplerResource(Resource):
             )
         if cfg.return_logprobs and not self._enable_logprobs:
             return "asks for return_logprobs but the node's SamplerSpec has enable_logprobs=False"
-        if (cfg.uses_history or cfg.uses_filter_order) and self._sampler.device.type != "cuda":
+        processed = cfg.return_logprobs and cfg.logprobs_mode == "processed"
+        if processed and not self._enable_processed_logprobs:
+            return "asks for processed logprobs but the node's SamplerSpec has enable_processed_logprobs=False"
+        if (cfg.uses_history or cfg.uses_filter_order or processed) and self._sampler.device.type != "cuda":
             return (
-                "asks for repetition_window, min_tokens, top_p_first or "
-                f"top_p_min_keep, which are CUDA-only (device {self._sampler.device})"
+                "asks for repetition_window, min_tokens, top_p_first, top_p_min_keep or "
+                f"processed logprobs, which are CUDA-only (device {self._sampler.device})"
             )
         return None
 
@@ -313,6 +326,31 @@ class SamplerResource(Resource):
             self._history.unregister(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
+
+    # Admission: with the in-graph scatter, a request's row in the masters the
+    # captured graphs index, of which there are `sampler_slots`. A request takes
+    # it before its first step and holds it until it is removed, which waits for
+    # the steps still running it, so a row is never handed on while one of them
+    # can still write it.
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        bufs = self._cg_buffers
+        if bufs is None or not bufs.ingraph_scatter or bufs.has_slot(rid):
+            return None
+        return ASKS
+
+    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        room = self._cg_buffers.free_rows
+        if room <= 0:
+            return room
+        self._cg_buffers.register_request(rid, sampling_config=self._sampler._sampling_config[rid])
+        return None
+
+    def unreserve(self, rid: str) -> None:
+        self._cg_buffers.unregister_request(rid)
+
+    def grew_since(self, mark: int) -> bool:
+        return self._cg_buffers.free_rows > mark
 
     def _set_penalty_flags(self, step: SamplerStep, ctx: StepContext):
         """Settle this step's two penalty flags (and whether it filters).
@@ -470,7 +508,7 @@ class SamplerResource(Resource):
             )
         self._cg_buffers.gather_dynamic(
             ctx.request_ids, padded_bs, cg_slot,
-            gather_seen_tokens=self._penalty_needed_this_step,
+            gather_seen_tokens=self._penalty_needed_this_step, kept=self._kept_rids,
         )
         if self._history is not None:
             self._history.gather_step(ctx.request_ids, padded_bs)
@@ -493,7 +531,7 @@ class SamplerResource(Resource):
                 keep_gpu = self._cg_buffers.keep_mask(keep)
             self._history.scatter_step(keep_gpu)
         if self._cg_buffers.ingraph_scatter:
-            # the captured sample scattered both rows itself
+            # the captured sample scattered both rows itself, a dropped row's to the trash row
             if self._penalty_needed_this_step:
                 self._cg_sampler.sync_seen_token_masks(
                     [self._sampler.get_token_mask(rid) for rid in ctx.request_ids],

@@ -101,10 +101,10 @@ def test_a_mid_prefill_row_keys_no_prefix():
     import inspect
 
     src = inspect.getsource(Worker._postprocess_batch)
-    assert "extend_prefix_chains(" in src, "the prefix chain is never extended"
-    call = src[src.index("extend_prefix_chains("):]
-    call = call[: call.index(")")]
-    assert "skip_rids=mid_prefill_rids" in call, (
+    assert "engine.step_finished(" in src, "the prefix chain is never extended"
+    call = src[src.index("engine.step_finished("):]
+    call = call[: call.index("\n        )")]
+    assert "skip_rids=batch_N.batch.incomplete_node_rids" in call, (
         "mid-prefill rows must be skipped, or a non-final chunk's token keys "
         "the prefix cache"
     )
