@@ -17,8 +17,6 @@ model_kwargs:
   # 180 norm graph breaks per step (see compile_exact_ops in docs/models.rst). Default: the fast plain compile; set
   # [norms] for reference-faithful output.
   compile_exact_ops: false
-  # the device's tuned GEMM solutions where it has a table (mstar/platforms/rocm_dit_gemm.py); elsewhere nothing changes
-  tuned_linears: true
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles per
   # batch size inside its first requests and decodes on the eager VAE.
@@ -37,7 +35,7 @@ model_kwargs:
   # c=4 1.05-1.08 -> 1.22 images/s, c=8 1.12-1.14 -> 1.21-1.22,
   # c=16 1.17-1.19 -> 1.23, c=1 unchanged, same peak VRAM. But each graph is a compile of its own:
   # 32 graphs start ~100 s slower than 16 on a warm Inductor cache, ~8 min slower on a cold one,
-  # and the 64 graphs of the two sizes cost 5.3 GiB of VRAM on MI325X.
+  # and the 64 graphs of the two sizes cost 5.3 GiB of VRAM and take a warm start from about 96 s to about 220 s on MI325X.
   # The text encoder captures its own geometric_batch_sizes: powers of two below max_batch_size,
   # then max_batch_size (4 graphs here, any caption length).
   capture_caption_lengths: [32, 64, 96, 128]
