@@ -1,47 +1,53 @@
 model: "flux2_klein"
 
 # MI325X: median 23.61 dB from diffusers (floor 22.43), +4% images/s at c=1 and +11.5% at c=16 over bf16 (shared node)
+# On AMD GPUs flux2_klein.yaml serves this schedule with the solo text encoder, this file keeps the encoder batched
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
   linear_dtype: fp8
-  linear_dtype_steps: [bf16, fp8_partial, fp8, fp8]
-  fp8_partial_keep_bf16:
-    - double_blocks.0.attn.img_out
-    - double_blocks.4.attn.img_out
-    - double_blocks.0.attn.img_qkv
-    - double_blocks.2.attn.img_out
-    - double_blocks.3.attn.img_out
-    - double_blocks.1.attn.img_out
-    - double_blocks.4.attn.img_qkv
-    - single_blocks.0.out
-    - single_blocks.1.out
-    - single_blocks.6.out
-    - single_blocks.3.out
-    - double_blocks.2.attn.img_qkv
-    - single_blocks.2.out
-    - double_blocks.3.attn.img_qkv
-    - double_blocks.0.img_ff.linear_out
-    - double_blocks.3.img_ff.linear_out
-    - single_blocks.7.out
-    - double_blocks.4.img_ff.linear_out
-    - double_blocks.0.img_ff.linear_in
-    - double_blocks.1.img_ff.linear_out
-    - single_blocks.4.out
-    - single_blocks.5.out
-    - single_blocks.12.out
-    - double_blocks.2.img_ff.linear_out
-    - single_blocks.9.out
-    - double_blocks.1.attn.img_qkv
-    - single_blocks.11.out
-    - single_blocks.8.out
-    - single_blocks.10.out
-    - single_blocks.13.out
-    - double_blocks.3.img_ff.linear_in
-    - double_blocks.1.img_ff.linear_in
-    - single_blocks.16.out
-    - single_blocks.0.qkv_mlp
-  attention_backend: auto
+  # The schedule this file names, [bf16, fp8_partial, fp8, fp8], ran its second step with only some linears in fp8
+  # (fp8_partial, not on this tree: main's linear_dtype_steps takes bf16 or the linear_dtype per step); the second step
+  # stays bf16 here until the partial step is ported. The partial step kept these linears bf16:
+  #   double_blocks.0.attn.img_out
+  #   double_blocks.4.attn.img_out
+  #   double_blocks.0.attn.img_qkv
+  #   double_blocks.2.attn.img_out
+  #   double_blocks.3.attn.img_out
+  #   double_blocks.1.attn.img_out
+  #   double_blocks.4.attn.img_qkv
+  #   single_blocks.0.out
+  #   single_blocks.1.out
+  #   single_blocks.6.out
+  #   single_blocks.3.out
+  #   double_blocks.2.attn.img_qkv
+  #   single_blocks.2.out
+  #   double_blocks.3.attn.img_qkv
+  #   double_blocks.0.img_ff.linear_out
+  #   double_blocks.3.img_ff.linear_out
+  #   single_blocks.7.out
+  #   double_blocks.4.img_ff.linear_out
+  #   double_blocks.0.img_ff.linear_in
+  #   double_blocks.1.img_ff.linear_out
+  #   single_blocks.4.out
+  #   single_blocks.5.out
+  #   single_blocks.12.out
+  #   double_blocks.2.img_ff.linear_out
+  #   single_blocks.9.out
+  #   double_blocks.1.attn.img_qkv
+  #   single_blocks.11.out
+  #   single_blocks.8.out
+  #   single_blocks.10.out
+  #   single_blocks.13.out
+  #   double_blocks.3.img_ff.linear_in
+  #   double_blocks.1.img_ff.linear_in
+  #   single_blocks.16.out
+  #   single_blocks.0.qkv_mlp
+  linear_dtype_steps: [bf16, bf16, fp8, fp8]
+  # the text stream's linears (512 rows) are no faster in fp8
+  linear_keep_bf16: ["double_blocks.*.attn.txt_*", "double_blocks.*.txt_ff.*"]
+  # torch's sdpa is the reference kernel on NVIDIA; on AMD GPUs auto runs AITER's asm flash attention
+  attention_backend: sdpa
   compile: true
   compile_eager_rounding: true
   compile_exact_ops: [norms]
@@ -62,3 +68,9 @@ node_groups:
 
 knobs:
   dit_exact_ops: true
+
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      attention_backend: auto
