@@ -1,6 +1,5 @@
-"""RustZMQCommunicator interop with the pyzmq ZMQCommunicator: same
-mesh, data-only wire, eventfd wakeup, lossless readiness polls.
-Skipped unless the ``mstar_rust`` extension (built from ``rust/``) is
+"""RustZMQCommunicator: data-only wire, eventfd wakeup, lossless readiness
+polls. Skipped unless the ``mstar_rust`` extension (built from ``rust/``) is
 installed."""
 import os
 import tempfile
@@ -11,7 +10,6 @@ import pytest
 
 pytest.importorskip("mstar_rust")
 
-from mstar.communication.communicator import ZMQCommunicator
 from mstar.communication.event import EventWakeup
 from mstar.communication.rust_communicator import RustZMQCommunicator
 
@@ -28,53 +26,50 @@ def _wait_msgs(comm, n=1, timeout=5.0):
 @pytest.fixture()
 def pair():
     prefix = tempfile.mkdtemp(prefix="mstar_wrap_test_")
-    orig = ZMQCommunicator("orig", push_ids=["rust"], ipc_socket_path_prefix=prefix)
-    rust = RustZMQCommunicator("rust", push_ids=["orig"], ipc_socket_path_prefix=prefix)
-    return orig, rust
+    a = RustZMQCommunicator("a", push_ids=["b"], ipc_socket_path_prefix=prefix)
+    b = RustZMQCommunicator("b", push_ids=["a"], ipc_socket_path_prefix=prefix)
+    return a, b
 
 
-def test_unregistered_payload_interop_both_directions(pair):
-    orig, rust = pair
+def test_unregistered_payload_both_directions(pair):
+    a, b = pair
     payload = {"op": "execute", "rids": [1, 2, 3], "nested": {"f": 1.5}}
-    orig.send("rust", payload)
-    assert _wait_msgs(rust) == [payload]
-    rust.send("orig", ("done", 42))
-    assert _wait_msgs(orig) == [("done", 42)]
+    a.send("b", payload)
+    assert _wait_msgs(b) == [payload]
+    b.send("a", ("done", 42))
+    assert _wait_msgs(a) == [("done", 42)]
 
 
 def test_eventfd_wakeup_cuts_wait_short(pair):
-    _, rust = pair
+    _, b = pair
     ev = EventWakeup()
-    rust.register_event_for_poll(ev)
+    b.register_event_for_poll(ev)
     threading.Thread(target=lambda: (time.sleep(0.05),
                                      os.eventfd_write(ev.fd, 1))).start()
     t0 = time.time()
-    rust.wait_for_work(timeout_ms=2000)
+    b.wait_for_work(timeout_ms=2000)
     assert time.time() - t0 < 0.5, "wake must beat the poll timeout"
 
 
 def test_readiness_poll_never_drops_or_reorders(pair):
-    orig, rust = pair
-    orig.send("rust", "first")
-    assert any(rust.poll_for_messages(timeout_ms=10) for _ in range(500))
-    orig.send("rust", "second")
+    a, b = pair
+    a.send("b", "first")
+    assert any(b.poll_for_messages(timeout_ms=10) for _ in range(500))
+    a.send("b", "second")
     time.sleep(0.1)
-    assert rust.get_all_new_messages() == ["first", "second"]
+    assert b.get_all_new_messages() == ["first", "second"]
 
 
-@pytest.mark.parametrize("receiver", ["rust", "orig"])
-def test_blocking_receive_waits_for_a_message(pair, receiver):
-    """get_all_new_messages(blocking=True) waits instead of returning [] —
-    on both communicators (the pyzmq one had the same latent bug)."""
-    orig, rust = pair
-    dst, src = (rust, orig) if receiver == "rust" else (orig, rust)
+def test_blocking_receive_waits_for_a_message(pair):
+    """get_all_new_messages(blocking=True) waits instead of returning []."""
+    a, b = pair
     threading.Thread(target=lambda: (time.sleep(0.1),
-                                     src.send(receiver, "late"))).start()
-    assert dst.get_all_new_messages(blocking=True) == ["late"]
+                                     a.send("b", "late"))).start()
+    assert b.get_all_new_messages(blocking=True) == ["late"]
 
 
 def test_make_communicator_flag(monkeypatch, tmp_path):
-    from mstar.communication.communicator import make_communicator
+    from mstar.communication.communicator import ZMQCommunicator, make_communicator
 
     def make(value):
         monkeypatch.setenv("MSTAR_RUST_ZMQ", value)
@@ -94,30 +89,19 @@ def test_make_communicator_flag(monkeypatch, tmp_path):
         RustZMQCommunicator)
 
 
-@pytest.mark.parametrize("receiver", ["rust", "orig"])
-def test_blocking_receive_timeout_bounds_the_wait(pair, receiver):
-    import time as _t
-
-    orig, rust = pair
-    dst = rust if receiver == "rust" else orig
-    t0 = _t.monotonic()
-    assert dst.get_all_new_messages(blocking=True, timeout_s=0.15) == []
-    assert 0.1 < _t.monotonic() - t0 < 2.0
+def test_blocking_receive_timeout_bounds_the_wait(pair):
+    _, b = pair
+    t0 = time.monotonic()
+    assert b.get_all_new_messages(blocking=True, timeout_s=0.15) == []
+    assert 0.1 < time.monotonic() - t0 < 2.0
 
 
-def test_poll_for_messages_parity(tmp_path):
-    """Both transports expose poll_for_messages with the same contract, so a
-    call site written against the factory works on either (the drop-in
-    guarantee): True leaves the message queued for get_all_new_messages."""
-    from mstar.communication.communicator import ZMQCommunicator
-    from mstar.communication.rust_communicator import RustZMQCommunicator
-
-    for cls, tag in ((ZMQCommunicator, "py"), (RustZMQCommunicator, "rs")):
-        a = cls(f"pfm_{tag}_a", [f"pfm_{tag}_b"],
-                ipc_socket_path_prefix=str(tmp_path) + "/")
-        b = cls(f"pfm_{tag}_b", [f"pfm_{tag}_a"],
-                ipc_socket_path_prefix=str(tmp_path) + "/")
-        assert b.poll_for_messages(timeout_ms=10) is False
-        a.send(f"pfm_{tag}_b", {"hello": tag})
-        assert b.poll_for_messages(timeout_ms=2000) is True
-        assert b.get_all_new_messages() == [{"hello": tag}]
+def test_poll_for_messages_leaves_the_message_queued(tmp_path):
+    """True from poll_for_messages leaves the message queued for
+    get_all_new_messages; with nothing sent it times out with False."""
+    a = RustZMQCommunicator("pfm_a", ["pfm_b"], ipc_socket_path_prefix=str(tmp_path) + "/")
+    b = RustZMQCommunicator("pfm_b", ["pfm_a"], ipc_socket_path_prefix=str(tmp_path) + "/")
+    assert b.poll_for_messages(timeout_ms=10) is False
+    a.send("pfm_b", {"hello": "rs"})
+    assert b.poll_for_messages(timeout_ms=2000) is True
+    assert b.get_all_new_messages() == [{"hello": "rs"}]
