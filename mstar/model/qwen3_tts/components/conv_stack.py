@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.platforms import current_platform
-
 
 def conv_stack(decoder: nn.Module) -> list[nn.Module]:
     """The decoder's post-transformer modules, in execution order."""
@@ -73,10 +71,9 @@ def causal_receptive_field_frames(decoder: nn.Module) -> int:
 
 
 def channels_last_applies(device: torch.device) -> bool:
-    """Whether ``ChannelsLastConvStack`` runs on this device. cuDNN picks its
-    kernels per layout and GPU, and these picks were measured on Blackwell;
-    other GPUs keep the reference stack until someone measures them."""
-    return device.type == "cuda" and current_platform.has_cuda_capability(10, 0, device)
+    """Whether ``ChannelsLastConvStack`` runs on this device: cuDNN's NHWC
+    kernels are what it is for."""
+    return device.type == "cuda"
 
 
 class _CausalConv(nn.Module):

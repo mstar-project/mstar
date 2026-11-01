@@ -32,12 +32,33 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
+from mstar.platforms import current_platform
 from mstar.utils.attention import (
     apply_rope_pos_ids,
     decode_attn_nhd,
     qk_norm_rope_kv_write,
     qk_norm_rope_kv_write_applies,
 )
+
+
+def blackwell_path_measured(device: torch.device) -> bool:
+    """Whether this GPU takes the fused add+norms and the two-token first depth
+    pass. Nothing in them is specific to Blackwell, but they were measured only
+    there, so older GPUs keep a plain add and one token per pass until someone
+    measures them."""
+    return device.type == "cuda" and current_platform.has_cuda_capability(10, 0, device)
+
+
+def _add_norm(
+    norm: RMSNorm, hidden_states: torch.Tensor, residual: torch.Tensor, fused: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``r = hidden_states + residual``; returns ``(norm(r), r)``. ``fused`` runs
+    it as one in-place kernel, which consumes both inputs."""
+    if fused:
+        return norm.forward_residual(hidden_states, residual)
+    r = residual + hidden_states
+    return norm(r), r
+
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -109,6 +130,8 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         self.text_embedding = nn.Embedding(
             config.text_vocab_size, config.text_hidden_size
         )
+        # set on the worker's device, see ``blackwell_path_measured``
+        self.fused_add_norm = False
 
     def forward(
         self,
@@ -123,25 +146,26 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         # make inductor specialize on the int. The resources own the pages, so
         # module code stays clear of the allocator.
         self.layers[0].self_attn.attend.bind_step(label)
-        # Each residual add is deferred into the next norm: one fused add+norm
-        # kernel (in place) per norm instead of an add and a norm. The stream
-        # starts from a copy: ``input_embeds`` is the caller's, and a packed
-        # replay's static input keeps its trailing rows from capture.
+        # Each residual add is deferred into the next norm. Fused, that is one
+        # kernel (in place) per norm instead of an add and a norm, and the
+        # stream starts from a copy: ``input_embeds`` is the caller's, and a
+        # packed replay's static input keeps its trailing rows from capture.
+        fused = self.fused_add_norm
         residual = None
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
             if residual is None:
-                residual = hidden_states.clone()
+                residual = hidden_states.clone() if fused else hidden_states
                 h = layer.input_layernorm(hidden_states)
             else:
-                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
+                h, residual = _add_norm(layer.input_layernorm, hidden_states, residual, fused)
             h = layer.self_attn(h)
-            h, residual = layer.post_attention_layernorm.forward_residual(h, residual)
+            h, residual = _add_norm(layer.post_attention_layernorm, h, residual, fused)
             hidden_states = layer.mlp(h)
         # Sequence lengths still advance once per forward, after every layer
         # wrote K/V for the same packed range — the runner does it now, on the
         # step this forward was declared from.
-        normed, _ = self.norm.forward_residual(hidden_states, residual)
+        normed, _ = _add_norm(self.norm, hidden_states, residual, fused)
         return normed
 
 
@@ -231,10 +255,10 @@ class Qwen3TTSCodePredictor(nn.Module):
     """Five-layer decoder that predicts codec groups 1 through 15.
 
     ``forward_depth_unrolled`` runs one pass along the group-depth axis. Callers
-    feed the Talker hidden state and the group-0 embedding as one two-token pass
-    at positions 0-1, then each further codec embedding at positions 2-15.
-    Keeping this as tensor-only code allows the complete depth loop to be
-    CUDA-graph captured.
+    feed the Talker hidden state and the group-0 embedding at positions 0-1,
+    together as one two-token pass or apart, then each further codec embedding
+    at positions 2-15. Keeping this as tensor-only code allows the complete
+    depth loop to be CUDA-graph captured.
 
     Every depth input arrives in the Talker width and passes through
     ``small_to_mtp_projection`` (a biased linear layer on the 1.7B
@@ -257,6 +281,8 @@ class Qwen3TTSCodePredictor(nn.Module):
             nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
             for _ in range(config.num_code_groups - 1)
         ])
+        # set on the worker's device, see ``blackwell_path_measured``
+        self.fused_add_norm = False
         self.register_buffer(
             # Populated after weight loading. A single contiguous tensor lets
             # the piecewise loop select a residual head without traversing a
@@ -302,25 +328,26 @@ class Qwen3TTSCodePredictor(nn.Module):
         end = cache_pos + seq_len
         hidden_states = hidden_states.reshape(-1, hidden_size)
 
-        # Each residual add is deferred into the next norm: one fused add+norm
-        # kernel per norm. These run on every layer of every pass.
+        # Each residual add is deferred into the next norm, on every layer of
+        # every pass. Fused, that is one kernel per norm.
+        fused = self.fused_add_norm
         residual = None
         for layer_idx, layer in enumerate(self.model.layers):
             if residual is None:
                 residual = hidden_states
                 h = layer.input_layernorm(hidden_states)
             else:
-                h, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
+                h, residual = _add_norm(layer.input_layernorm, hidden_states, residual, fused)
             attn = layer.self_attn
             q, k, v = attn._project_qkv(h)
             attn_output = self._norm_rope_attend(
                 attn, q, k, v, position_ids, batch_rows, kv_cache[layer_idx], cache_pos, end,
             )
             attn_output = attn_output.reshape(batch_size * seq_len, -1)
-            h, residual = layer.post_attention_layernorm.forward_residual(attn.o_proj(attn_output), residual)
+            h, residual = _add_norm(layer.post_attention_layernorm, attn.o_proj(attn_output), residual, fused)
             hidden_states = layer.mlp(h)
 
-        normed, _ = self.model.norm.forward_residual(hidden_states, residual)
+        normed, _ = _add_norm(self.model.norm, hidden_states, residual, fused)
         return normed.view(batch_size, seq_len, hidden_size)
 
     @torch.compiler.disable

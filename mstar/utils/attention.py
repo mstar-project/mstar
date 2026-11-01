@@ -2,8 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.platforms import current_platform
-
 
 @triton.autotune(
     configs=[
@@ -367,14 +365,12 @@ def _qk_norm_rope_kv_write_fake(q, k, v, q_weight, k_weight, pos_ids, cache_laye
 
 def qk_norm_rope_kv_write_applies(q: torch.Tensor, cache_layer: torch.Tensor) -> bool:
     """Whether ``qk_norm_rope_kv_write`` can stand in for the separate q/k norm,
-    RoPE and KV write on these tensors: a GPU it has been measured on (nothing
-    in it is specific to Blackwell; older ones stay eager until someone
-    measures them), a power-of-two head dim ``tl.arange`` can load whole, a
-    float dtype shared with the cache, and heads contiguous in both."""
+    RoPE and KV write on these tensors: a GPU, a power-of-two head dim
+    ``tl.arange`` can load whole, a float dtype shared with the cache, and heads
+    contiguous in both."""
     head_dim = q.shape[-1]
     return (
         q.device.type == "cuda"
-        and current_platform.has_cuda_capability(10, 0, q.device)
         and q.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and cache_layer.dtype == q.dtype
         and head_dim >= 2 and head_dim & (head_dim - 1) == 0

@@ -73,7 +73,7 @@ class _Node:
     """The node's resources as the engine builds them and the step cycle around the submodule: with ``capture``, the
     engine's replay path (lease, pad, declare over the padded ids, plan, stage and replay)."""
 
-    def __init__(self, capture: bool):
+    def __init__(self, capture: bool, measured: bool):
         config = _config()
         model = Qwen3TTSModel.__new__(Qwen3TTSModel)
         model.config = config
@@ -95,6 +95,7 @@ class _Node:
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         self.overrides = model.get_request_resource_configs({}, model_kwargs={"do_sample": False})
         self.sub = _submodule(config)
+        self.sub.model.model.fused_add_norm = measured
         self.sub.bind_node_resources(self.resources)
         self.hidden: torch.Tensor | None = None
         self.sub.model.register_forward_hook(self._keep_hidden)
@@ -175,14 +176,15 @@ def _prompts(lengths: tuple[int, ...], seed: int) -> dict[str, torch.Tensor]:
     }
 
 
-def test_packed_replays_leave_the_static_input_alone(monkeypatch):
+@pytest.mark.parametrize("measured", [True, False], ids=["fused", "plain"])
+def test_packed_replays_leave_the_static_input_alone(monkeypatch, measured):
     monkeypatch.setattr(TalkerSubmodule, "PREFILL_TOKEN_BUCKETS", [BUCKET])
     monkeypatch.setattr(TalkerSubmodule, "PREFILL_CAPTURE_BATCH_SIZES", [ROWS])
     packed_only = TalkerSubmodule.get_accelerator_graph_configs
     monkeypatch.setattr(
         TalkerSubmodule, "get_accelerator_graph_configs", lambda self, device, tp=1: packed_only(self, device, tp)[:1],
     )
-    packed, eager = _Node(capture=True), _Node(capture=False)
+    packed, eager = _Node(capture=True, measured=measured), _Node(capture=False, measured=measured)
 
     for seed, lengths in enumerate(STEPS):
         prompts = _prompts(lengths, seed)

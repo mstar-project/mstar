@@ -1938,19 +1938,6 @@ def test_qwen3_tts_codec_selects_the_channels_last_stack(monkeypatch, applies, s
         assert len(calls) == 1 and pcm.dtype == torch.int16
 
 
-@pytest.mark.parametrize(
-    "capability,device_type,expected", [(True, "cuda", True), (False, "cuda", False), (True, "cpu", False)],
-)
-def test_qwen3_tts_channels_last_needs_a_measured_gpu(monkeypatch, capability, device_type, expected):
-    import mstar.model.qwen3_tts.components.conv_stack as stack
-
-    seen = []
-    platform = SimpleNamespace(has_cuda_capability=lambda *args: seen.append(args[:2]) or capability)
-    monkeypatch.setattr(stack, "current_platform", platform)
-    assert stack.channels_last_applies(SimpleNamespace(type=device_type)) is expected
-    assert seen in ([], [(10, 0)])
-
-
 def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():
     config = _tiny_model_config()
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
