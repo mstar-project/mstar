@@ -218,7 +218,8 @@ def test_later_plans_match_a_first_plan(tensor_cores):
         reused.plan(causal=True, dtype=torch.bfloat16, **plan)
         if step > 0:
             assert reused._prefill._planner_args is not None
-            assert reused._decode._planner_args is not None
+            # FlashInfer plans the CUDA-core decode itself (`_decode_plan_is_direct`)
+            assert (reused._decode._planner_args is not None) == tensor_cores
         for a, b in ((first._prefill, reused._prefill), (first._decode, reused._decode)):
             assert list(a.attn_wrapper._plan_info) == list(b.attn_wrapper._plan_info)
         real = int(plan["qo_indptr"][n])
