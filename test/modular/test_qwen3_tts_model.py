@@ -11,7 +11,6 @@ import pytest
 import torch
 import yaml
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -531,7 +530,7 @@ def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monk
     assert model.load_audio(str(ok), "cpu").data.shape == (2 * 24000,)
 
 
-def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
+def test_qwen3_tts_base_declares_clone_walks_and_plans_them_for_reference_audio():
     model = _variant_model("base")
     walks = model.get_graph_walk_graphs()
     assert "talker_prefill_clone" in walks and "codec_chunk_clone" not in walks
@@ -542,29 +541,13 @@ def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
     # Non-Base variants do not even declare the clone walks (config-driven).
     assert "talker_prefill_clone" not in _variant_model("voice_design").get_graph_walk_graphs()
 
-    pointers = {
-        name: [SimpleNamespace(name=name)]
-        for name in (*Qwen3TTSModel.PREFILL_INPUTS, "audio_inputs")
-    }
     prompt = {PROMPT_LAYOUT_KEY: [0, 3, 1, 9, 13], SPEAKER_ID_KEY: -1, LANGUAGE_ID_KEY: -1, REF_CLIP_KEY: "clip"}
-    talker = model.get_initial_forward_pass_args(
-        "Talker", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs=prompt,
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    routes = {(edge.name, edge.next_node) for edge in talker.inputs}
-    assert routes == {("audio_inputs", "RefEncoder"), ("text_inputs", "Talker")}
+    talker = model.walk_plan("Talker", ["audio", "text"], ["audio"], {}, prompt)
+    assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # The layout and the clip's key reach the RefEncoder and the Talker as step metadata.
-    assert {key: talker.step_metadata[key] for key in prompt} == prompt
-    codec = model.get_initial_forward_pass_args(
-        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs={},
-    )
+    assert talker[0].step_metadata == prompt
     # The codec runs its one walk
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == [] and codec.unpersist_tensors == []
-    rearmed = model.get_partition_forward_pass_args("Codec", codec.full_metadata, persist_signals={})
-    assert rearmed.full_metadata.graph_walk == "codec_chunk" and rearmed.inputs == []
+    assert [step.walk for step in model.walk_plan("Codec", ["audio", "text"], ["audio"], {}, {})] == ["codec_chunk"]
 
     # The Base deployment maps the extra node and walks.
     deployment = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base.yaml").read_text(encoding="utf-8"))
@@ -643,79 +626,18 @@ def test_qwen3_tts_rejects_unsupported_requests(
         )
 
 
-def test_qwen3_tts_initial_partition_args_route_expected_inputs():
+def test_qwen3_tts_walk_plan_prefills_then_decodes():
     model = _make_model()
-    pointers = {
-        name: [SimpleNamespace(name=name)]
-        for name in Qwen3TTSModel.PREFILL_INPUTS
-    }
-    assert Qwen3TTSModel.PREFILL_INPUTS == ("text_inputs",)
-
     prompt = {PROMPT_LAYOUT_KEY: [0, 4, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055}
-    talker = model.get_initial_forward_pass_args(
-        "Talker",
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        input_signals=pointers,
-        model_kwargs={"subtalker_top_k": 7, **prompt},
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill"
-    assert [edge.name for edge in talker.inputs] == list(pointers)
-    assert talker.step_metadata == {"is_prefill": True, **prompt}
+    talker = model.walk_plan("Talker", ["text"], ["audio"], {}, {"subtalker_top_k": 7, **prompt})
+    assert [step.walk for step in talker] == ["talker_prefill", "talker_decode"]
+    assert [dict(step.step_metadata) for step in talker] == [prompt, {}]
     # Residual-group sampling rides the code predictor's own per-request
     # sampler config, not step metadata.
-    assert "subtalker_sampling" not in talker.step_metadata
     configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
     assert configs[CODE_PRED_SAMPLER].top_k == 7
 
-    codec = model.get_initial_forward_pass_args(
-        "Codec",
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        input_signals=pointers,
-    )
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == []
-    assert codec.request_done is False
-
-
-def test_qwen3_tts_talker_prefill_transitions_to_decode():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        graph_walk="talker_prefill",
-        is_prefill=True,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="Talker",
-        partition_metadata=metadata,
-        persist_signals={"talker_input_embeds": []},
-    )
-
-    assert result.full_metadata.graph_walk == "talker_decode"
-    assert result.full_metadata.is_prefill is False
-    assert result.inputs[0].name == "talker_input_embeds"
-    assert result.request_done is False
-
-
-def test_qwen3_tts_talker_decode_marks_partition_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["audio"],
-        graph_walk="talker_decode",
-        is_prefill=False,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="Talker",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-
-    assert result.request_done is True
+    assert [step.walk for step in model.walk_plan("Codec", ["text"], ["audio"], {}, {})] == ["codec_chunk"]
 
 
 def test_qwen3_tts_postprocess_encodes_pcm16():
