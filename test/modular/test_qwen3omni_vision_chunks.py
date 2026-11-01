@@ -102,8 +102,8 @@ def test_an_uncut_audio_row_advances_by_its_span(thinker):
 
 
 def test_a_non_final_chunk_still_streams_its_own_states_to_the_talker():
-    """The Loop gathers ``thinker_states`` and ``thinker_mask`` from every
-    chunk (``accumulated_outputs``), so postprocess has to produce them for a
+    """Every chunk streams its ``thinker_states`` and ``thinker_mask`` to the
+    Talker (``per_chunk_outputs``), so postprocess has to produce them for a
     chunk that is not the prompt's last."""
     from types import SimpleNamespace
 

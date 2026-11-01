@@ -2650,6 +2650,96 @@ def test_only_the_final_chunks_token_leaves_the_loop(which):
     assert _ready(rt) == [], "the loop is over, so the node is not ready again"
 
 
+def _per_chunk_stream_runtime(which):
+    """The chunk walk with a ``per_chunk_outputs`` stream into a sibling
+    graph's consumer, as Qwen3-Omni's Thinker streams into its Talker."""
+    from mstar.model.base import _wrap_node_in_loop
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    node = GraphNode(
+        name="llm", input_names={"text_inputs"},
+        outputs=[
+            GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True),
+            GraphEdge(name="states", next_node="talker", is_streaming=True),
+        ],
+    )
+    section = _wrap_node_in_loop(node, "llm", CHUNK_WALK, ChunkingPolicy(
+        walks=(CHUNK_WALK,), chunkable=True, per_chunk_outputs=frozenset({"states"}),
+    ))
+    llm = WorkerGraph(section=section, graph_walks={CHUNK_WALK}, ranks=[0], worker_graph_id=WG_ID)
+    talker = WorkerGraph(
+        section=GraphNode(
+            name="talker", input_names={"states"},
+            outputs=[GraphEdge(name="kv", next_node=EMPTY_DESTINATION)],
+        ),
+        graph_walks={"talker_prefill"}, ranks=[0], worker_graph_id=1,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[llm, talker],
+        all_wg_ids_to_graph_walks={WG_ID: {CHUNK_WALK}, 1: {"talker_prefill"}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(section.get_loops()), 1: set()},
+        all_wg_ids_to_nodes={WG_ID: {"llm"}, 1: {"talker"}},
+        node_to_partition={"llm": "default", "talker": "Talker"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    from mstar.model.submodule_base import chunk_tick_name
+
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=CHUNK_WALK,
+        partition_worker_graph_ids=[WG_ID, 1],
+        worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
+    )
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
+    ))
+    return rt, book, rid
+
+
+def _run_streaming_chunk(rt, book, rid, token, states):
+    signals = rt.get_output_signals("llm", CHUNK_WALK)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    tensors, counts = [], []
+    for signal in signals:
+        uuid = {"new_token": token, "states": states}.get(signal)
+        if uuid is not None:
+            book.put_tensor(uuid, _info(uuid))
+            book.increment_ref(uuid, 1)
+            tensors.append(uuid)
+        counts.append(int(uuid is not None))
+    return rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=CHUNK_WALK, node_name="llm",
+        output_signals=list(signals), wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=tensors, num_tensors=counts,
+    ))
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_per_chunk_stream_routes_every_chunks_piece_as_it_runs(which):
+    """The consumer gets each chunk's piece on that chunk's step, while the
+    token still leaves the Loop on the final chunk alone."""
+    rt, book, rid = _per_chunk_stream_runtime(which)
+    outs = [_run_streaming_chunk(rt, book, rid, 1, 101), _run_streaming_chunk(rt, book, rid, 2, 102)]
+    rt.stop_loops_batched(
+        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
+        loop_names=ParallelList([rid], [["chunk_loop:llm:prefill_text"]]),
+    )
+    outs.append(_run_streaming_chunk(rt, book, rid, 3, 103))
+
+    assert [out.local_streaming_by_signal["states"].values for out in outs] == [[101], [102], [103]]
+    assert [sorted(out.register_uuids) for out in outs] == [[], [], [3]]
+    assert _ready(rt) == []
+
+
 @pytest.mark.parametrize("which", ["python", "rust"])
 def test_re_entering_a_chunk_walk_needs_another_seed(which):
     """A walk entered twice (BAGEL's think-mode prefills twice) gets its seed

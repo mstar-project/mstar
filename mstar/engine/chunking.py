@@ -123,7 +123,7 @@ class ChunkingManagement:
         of such a walk would do nothing, so it is refused; the combined walk
         itself can be named instead.
 
-        ``no_chunking`` names nodes this worker chunks nowhere (TP/SP, which
+        ``no_chunking`` names nodes this worker chunks nowhere (SP, which
         chunked prefill does not support yet). A budget set on one is still
         validated but has no effect, since the deployment, not the config, is
         what turned chunking off there.
