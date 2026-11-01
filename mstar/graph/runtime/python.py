@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -12,6 +12,7 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
+    Loop,
     NodeAndGraphWalk,
     TensorPointerInfo,
 )
@@ -744,19 +745,33 @@ class PythonGraphRuntime(GraphRuntime):
     def speculate_node(
         self, node_name: str,
         graph_walks: list[str],
-        sample_rids: list[int],
+        rids: list[int],
+        walk_counts: list[int] | None = None,
+        loop_strides: list[int] | None = None,
     ) -> list[SpeculationOutput]:
-        return [
-            target
-            for walk, rid in zip(graph_walks, sample_rids, strict=True)
-            for target in self._speculate_walk(node_name, walk, rid)
-        ]
+        if walk_counts is None:
+            walk_counts = [1] * len(graph_walks)
+        if len(walk_counts) != len(graph_walks) or sum(walk_counts) != len(rids):
+            raise ValueError(
+                "speculate_node: walk_counts must give each walk's share of rids"
+            )
+        out: list[SpeculationOutput] = []
+        start = 0
+        for walk, count in zip(graph_walks, walk_counts, strict=True):
+            out.extend(self._speculate_walk(
+                node_name, walk, rids[start:start + count],
+                None if loop_strides is None else loop_strides[start:start + count],
+            ))
+            start += count
+        return out
 
     def _speculate_walk(
-        self, node_name: str, graph_walk: str, sample_rid: int,
+        self, node_name: str, graph_walk: str, rids: list[int],
+        loop_strides: list[int] | None,
     ) -> list[SpeculationOutput]:
         wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
-        wgio = self._queues[wg_id].per_request_queues.get(sample_rid)
+        queues = self._queues[wg_id].per_request_queues
+        wgio = queues.get(rids[0]) if rids else None
         if wgio is None:
             return []
         node = wgio.nodes[node_name]
@@ -786,6 +801,15 @@ class PythonGraphRuntime(GraphRuntime):
                     and info.node_name == node_name
                 ):
                     continue
+            if info.is_new_loop_iter and not any(
+                (r_wgio := queues.get(r)) is not None
+                and self._can_continue_loop(
+                    r, r_wgio, info, graph_walk,
+                    1 if loop_strides is None else loop_strides[i],
+                )
+                for i, r in enumerate(rids)
+            ):
+                continue  # every row's loop ends with this iteration
             out.append(SpeculationOutput(
                 node_name=info.node_name, graph_walk=graph_walk,
                 is_new_loop_iter=info.is_new_loop_iter,
@@ -918,12 +942,17 @@ class PythonGraphRuntime(GraphRuntime):
         staged: list["_SpecRidPrep"] = []
         edges = ColumnarEdgeSpecs.empty()
 
+        strides = (
+            dict(zip(input.rids, input.loop_strides, strict=True))
+            if input.loop_strides is not None else None
+        )
         for rid, indexed_edges in per_rid_edges:
             wgio = queue.per_request_queues.get(rid)
             if wgio is None:
                 continue
             if spec_info is not None and not self._can_continue_loop(
-                rid, wgio, spec_info, input.graph_walk
+                rid, wgio, spec_info, input.graph_walk,
+                1 if strides is None else strides[rid],
             ):
                 continue  # loop already finished; no further work to speculate
             if (
@@ -988,17 +1017,18 @@ class PythonGraphRuntime(GraphRuntime):
             self._undo_spec_ingest(staged_node, into_signals, into_next_iter)
 
     def _can_continue_loop(
-        self, rid: int, wgio, spec_info, graph_walk: str,
+        self, rid: int, wgio, spec_info, graph_walk: str, stride: int = 1,
     ) -> bool:
         """False once this rid's loop has ended: a stop is already pending for
-        it, or the next iteration would be past the last one."""
+        it, or the iteration in flight, moving its count ``stride`` on, is the
+        last one."""
         if not spec_info.is_new_loop_iter:
             return True
         if self.has_pending_loop_stop(rid, graph_walk, spec_info.loop_name):
             return False
         loop = wgio.loops.get(spec_info.loop_name)
         if loop is not None and (
-            loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
+            loop.curr_iter + stride >= loop.max_iters or loop._finish_signal
         ):
             return False
         return True
@@ -1252,12 +1282,12 @@ class PythonGraphRuntime(GraphRuntime):
         return node is None or edge.name in node.input_names
 
     def _mark_node_complete(
-        self, rid: int, wg_id: int, node_name: str,
+        self, rid: int, wg_id: int, node_name: str, loop_stride: int = 1,
     ) -> NodeCompletionOutput:
         """Returns ``output_edges`` (static outputs plus any loop terminal
         outputs) and ``filtered_signals`` (loop-back (name, dest) pairs the
         caller must drop from routing)."""
-        return self._queues[wg_id].mark_node_complete(rid, node_name)
+        return self._queues[wg_id].mark_node_complete(rid, node_name, loop_stride)
 
 
     # --------- Postprocess ----------
@@ -1382,6 +1412,37 @@ class PythonGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._pending_loop_stops.clear()
 
+    def _loops_of(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> Iterator[Loop | None]:
+        """Row i's ``loop_names[i]`` in the worker graph that runs
+        ``node_name`` under ``graph_walks[i]``; None for a row not here."""
+        for rid, walk, name in zip(rids, graph_walks, loop_names, strict=True):
+            wg_id = self.get_worker_graph_id_for_node(node_name, walk)
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            yield None if wgio is None else wgio.loops.get(name)
+
+    def set_loop_caps(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str], caps: list[int],
+    ) -> None:
+        for loop, cap in zip(
+            self._loops_of(node_name, rids, graph_walks, loop_names), caps, strict=True,
+        ):
+            if loop is not None:
+                loop.max_iters = cap
+
+    def loop_progress(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> tuple[list[int], list[int]]:
+        counts, caps = [], []
+        for loop in self._loops_of(node_name, rids, graph_walks, loop_names):
+            counts.append(-1 if loop is None else loop.curr_iter)
+            caps.append(-1 if loop is None else loop.max_iters)
+        return counts, caps
+
     def complete_and_route_batch(
         self, input: RouteInput,
     ) -> RouteOutput:
@@ -1434,7 +1495,10 @@ class PythonGraphRuntime(GraphRuntime):
             nested_idxs[rid] = wgio.get_nested_loop_idxs_for_node(
                 input.node_name
             )
-            completion = self._mark_node_complete(rid, wg_id, input.node_name)
+            completion = self._mark_node_complete(
+                rid, wg_id, input.node_name,
+                1 if input.loop_strides is None else input.loop_strides[i],
+            )
             walk = input.graph_walk
             if input.walks is not None:
                 walk = rid_walk[rid] = input.walks[input.rid_walk_idx[i]]

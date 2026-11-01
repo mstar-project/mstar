@@ -235,6 +235,10 @@ class _Scheduled:
         self._walks = walks
         # rid -> real walk on a mixed step only, as ScheduledBatch keeps it
         self.request_walks = dict(walks) if len(set(walks.values())) > 1 else {}
+        self.incomplete_node_rids = set()  # no row mid-prefill
+
+    def loop_strides(self, rids):
+        return None
 
     def walk_of(self, rid):
         return self._walks.get(rid, "decode")

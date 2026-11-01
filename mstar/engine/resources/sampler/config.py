@@ -224,3 +224,4 @@ class SamplerStep(ResourceStep):
     # The spec's loop-back states this step's forward stores
     # (``store_loopback_state``); commit persists them by slot.
     loopback_writes: frozenset[str] = frozenset()
+

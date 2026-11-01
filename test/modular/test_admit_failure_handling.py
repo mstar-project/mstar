@@ -213,7 +213,8 @@ class _HoldingWorker:
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.scheduler = SimpleNamespace(
-            hold_requests=lambda rids: None, **_NO_LIMITS,
+            hold_requests=lambda rids: None,
+            **_NO_LIMITS,
         )
         self._hold_logged = {}
         # not a sharded node, so this rank runs its own OOM recovery
@@ -272,7 +273,10 @@ class _RefusedWorker(_HoldingWorker):
     def __init__(self):
         super().__init__()
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, **_NO_LIMITS)
+        self.scheduler = SimpleNamespace(
+            hold_requests=self.held.extend,
+            **_NO_LIMITS,
+        )
 
 
 @pytest.mark.parametrize(

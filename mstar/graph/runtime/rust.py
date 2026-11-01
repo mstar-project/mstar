@@ -417,6 +417,18 @@ class RustGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
 
+    def set_loop_caps(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str], caps: list[int],
+    ) -> None:
+        self._rust.set_loop_caps(node_name, rids, graph_walks, loop_names, caps)
+
+    def loop_progress(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> tuple[list[int], list[int]]:
+        return self._rust.loop_progress(node_name, rids, graph_walks, loop_names)
+
     # --------- Inputs ----------
 
     def ingest_inputs_batch(
@@ -524,7 +536,9 @@ class RustGraphRuntime(GraphRuntime):
     # --------- Speculation ----------
 
     def speculate_node(
-        self, node_name: str, graph_walks: list[str], sample_rids: list[int],
+        self, node_name: str, graph_walks: list[str], rids: list[int],
+        walk_counts: list[int] | None = None,
+        loop_strides: list[int] | None = None,
     ) -> list[SpeculationOutput]:
         return [
             SpeculationOutput(
@@ -533,7 +547,7 @@ class RustGraphRuntime(GraphRuntime):
                 output_signals=tuple(signals),
             )
             for n, w, new_iter, loop_name, signals in self._rust.speculate_node(
-                node_name, graph_walks, sample_rids,
+                node_name, graph_walks, rids, walk_counts, loop_strides,
             )
         ]
 
@@ -570,6 +584,7 @@ class RustGraphRuntime(GraphRuntime):
                 } for e in input.streaming_edges
             ],
             "streaming_edges_per_rid": list(input.streaming_edges_per_rid),
+            "loop_strides": input.loop_strides,
         }
 
     @staticmethod
@@ -602,10 +617,12 @@ class RustGraphRuntime(GraphRuntime):
     def prep_spec_rows(
         self, spec_node_name: str, curr_node_name: str, graph_walk: str,
         rids: list[int], room_for_continuing: int | None = None,
+        loop_strides: list[int] | None = None,
     ) -> SpecRows:
         out = self._rust.prep_spec_rows(
             spec_node_name=spec_node_name, curr_node_name=curr_node_name,
             graph_walk=graph_walk, rids=rids, room_for_continuing=room_for_continuing,
+            loop_strides=loop_strides,
         )
         edge_rids = out.edge_rids
         return SpecRows(
@@ -641,6 +658,7 @@ class RustGraphRuntime(GraphRuntime):
             "logprobs": list(input.logprobs),
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
+            "loop_strides": input.loop_strides,
         })
         return self._route_output(out)
 
@@ -729,6 +747,7 @@ class RustGraphRuntime(GraphRuntime):
             inline_signal=None if inline is None else inline.signal,
             inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
             partition_done=list(request.partition_done), python_send=request.python_send,
+            loop_strides=request.loop_strides,
         )
         return self._postprocess_step(out)
 

@@ -229,3 +229,35 @@ def test_missing_limits_leave_the_check_to_the_model(tmp_path):
         wg_ids=ParallelList([rid], [0]), runtime_stops=True, tokens=column, row_rids=[rid],
     ))
     assert step.need is PostprocessNeed.STOPS
+
+
+@pytest.mark.parametrize("drop", [False, True], ids=["all_rows", "a_row_dropped"])
+def test_each_rows_loop_stride_advances_its_loop(tmp_path, drop):
+    """A chunk-Loop step counts tokens: ``loop_strides`` moves each row's loop
+    counter by its own stride, in either implementation, and a dropped row's
+    stride leaves with it."""
+    iters = {}
+    for k, cls in (("native", rust_runtime.RustGraphRuntime), ("reference", _Reference)):
+        d = tmp_path / k
+        d.mkdir()
+        rt = _runtime(cls, str(d))
+        # without limits the runtime defers to the model's check (STOPS)
+        rids = _start(rt, 3, limits=not drop)
+        dropped = [rids[1]] if drop else []
+        got = []
+        for step, strides in enumerate(([2, 1, 3], [1, 1, 1])):
+            live = [r for r in rids if r not in dropped] if step else rids
+            assert rt.pop_rids(NODE, WALK, live) is not None
+            values = {r: 100 * step + i for i, r in enumerate(live)}
+            column = torch.tensor([values[r] for r in live], dtype=torch.int64)
+            _drive(rt, PostprocessRequest(
+                partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+                wg_ids=ParallelList(list(live), [0] * len(live)), runtime_stops=True,
+                tokens=column, row_rids=live, inline=InlineColumn(SIG, column),
+                loop_strides=[s for r, s in zip(rids, strides, strict=True) if r in live],
+            ), values, model_stops={}, dropped=dropped if step == 0 else ())
+            got.append([it[LOOP] for it in rt.get_dynamic_loop_iters(live, PART).values])
+        iters[k] = got
+    assert iters["native"] == iters["reference"]
+    # the dropped row does not move; the last row's 3 + 1 reaches MAX_ITERS and resets
+    assert iters["native"] == ([[2, 0, 3], [3, 0]] if drop else [[2, 1, 3], [3, 2, 0]])

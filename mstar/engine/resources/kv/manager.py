@@ -58,6 +58,7 @@ from mstar.engine.resources.step import (
     AllocationFailed,
     RequestOffloading,
     Segment,
+    SettingValue,
     StepContext,
 )
 from mstar.utils.client_errors import client_error_text
@@ -1954,6 +1955,11 @@ class KVManager(AttentionResource):
 
             page_size = self.config.tokens_per_page
             sink = step.sink
+            # the counts are in tokens; the setting names the rows whose KV
+            # grows by them, so they are a span this label can reserve
+            reserve_ahead = ctx.reserve_whole_prefill
+            ahead = ctx.chunk_tokens_after \
+                if reserve_ahead.value is not SettingValue.UNSET else None
             # One pass for the reservations and the streams the in-flight mark
             # below covers. A segment against the sink (`_sinks`) reserves
             # nothing (`_reserves`) and is not marked.
@@ -1973,17 +1979,21 @@ class KVManager(AttentionResource):
                 if stream is None:
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
-                seq_len = segment.span + stream.stored_len
+                # a chunked row reserves the rest of its walk up front, in every group
+                span = segment.span
+                if ahead and reserve_ahead.holds_for(rid):
+                    span += ahead.get(rid, 0)
+                seq_len = span + stream.stored_len
                 # the common decode row: its pages already cover the token it
                 # appends, so there is nothing to acquire and nothing to record
                 if (
                     not stream.offloaded
                     and len(stream.page_indices) * page_size >= seq_len
-                    and (not stream.later or self._covers(stream, segment.span))
+                    and (not stream.later or self._covers(stream, span))
                 ):
                     continue
                 for g in range(len(self._groups)):
-                    alloc_res = self._alloc(rid, label, segment.span + stream.group(g).stored_len, group=g)
+                    alloc_res = self._alloc(rid, label, span + stream.group(g).stored_len, group=g)
                     if not alloc_res.success:
                         return AdmitOutcome(
                             ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
@@ -2021,7 +2031,7 @@ class KVManager(AttentionResource):
         A request's footprint is every distinct page it would hold after the
         step: the ones its streams hold already, counted once where labels or
         requests share them, plus the ones `admit` would still reserve for each
-        stream. A segment that runs against the sink holds and needs nothing,
+        stream, a chunked row's whole walk included. A segment that runs against the sink holds and needs nothing,
         and a span-0 one needs nothing beyond what it holds, as in `admit`. The
         pool is every page but the sink, cached prefixes included, since those
         can be evicted. ``rows_sized`` is how many real rows were counted.
@@ -2029,6 +2039,9 @@ class KVManager(AttentionResource):
         if not isinstance(error, AllocationFailed):
             return error
         sink = step.sink
+        reserve_ahead = ctx.reserve_whole_prefill
+        ahead = ctx.chunk_tokens_after \
+            if reserve_ahead.value is not SettingValue.UNSET else None
         held: dict[str, set[int]] = {}
         needed: dict[tuple[str, str, int], int] = {}
         for segment in step.segments:
@@ -2045,11 +2058,13 @@ class KVManager(AttentionResource):
                 rows_pages.update(stream.pages())
             if not self._reserves(ctx, sink, segment):
                 continue
+            walk_ahead = ahead.get(rid, 0) if ahead and reserve_ahead.holds_for(rid) else 0
             for g, group in enumerate(self._groups):
                 part = None if stream is None else stream.group(g)
                 pages = () if part is None else part.page_indices
                 stored = 0 if part is None else part.stored_len
-                more = -(-(stored + segment.span) // group.page_size) - len(pages)
+                # as `admit` reserves it: a chunked row's whole walk
+                more = -(-(stored + segment.span + walk_ahead) // group.page_size) - len(pages)
                 key = (rid, segment.label, g)
                 needed[key] = max(needed.get(key, 0), more)
         extra: dict[str, int] = {}
@@ -2702,7 +2717,10 @@ class KVManager(AttentionResource):
         cache.step_segments = step.segments
         cache.pending = 0
         stats["hit"] += 1
-        return KVPlanOutputs(out[0], pre_forks=step.pre_forks, post_forks=step.post_forks, later_groups=tuple(out[1:]))
+        return KVPlanOutputs(
+            out[0], pre_forks=step.pre_forks, post_forks=step.post_forks,
+            fork_rids=step.fork_rids, later_groups=tuple(out[1:]),
+        )
 
     @staticmethod
     def _same_plan(a: "KVPlanOutputs", b: "KVPlanOutputs") -> bool:
@@ -2856,6 +2874,7 @@ class KVManager(AttentionResource):
                 outputs[0],
                 pre_forks=step.pre_forks,
                 post_forks=step.post_forks,
+                fork_rids=step.fork_rids,
                 later_groups=tuple(outputs[1:]),
             )
             if res is not None and not self._same_plan(res, full):

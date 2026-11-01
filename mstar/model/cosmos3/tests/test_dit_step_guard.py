@@ -16,6 +16,7 @@ pytest.importorskip("diffusers")
 
 from diffusers import UniPCMultistepScheduler  # noqa: E402
 
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model  # noqa: E402
@@ -126,6 +127,7 @@ def test_finished_request_re_queued_fails_alone():
         },
         per_request_input_metadata={}, final_stream_rids=set(),
         skipped_rids=set(), failed_requests={}, inputs=None, running_batched=None,
+        chunk_ranges={},
     )
     batch.register_prepare_batch = lambda inputs: setattr(batch, "inputs", inputs)
     batch.drop_rids = lambda rids: setattr(
@@ -135,6 +137,7 @@ def test_finished_request_re_queued_fails_alone():
     eng._submodules = {"dit": SimpleNamespace(submodule=dit, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
+    eng._chunking = ChunkingManagement(eng._submodules)
 
     eng.prepare_inputs(batch)
 

@@ -70,6 +70,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -321,6 +322,23 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             },
         )
+
+    # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
+    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
+    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
+    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        # a vision row's length depends on its image grids; it is admitted whole
+        if graph_walk == "decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        return None
 
     def prepare_inputs(
         self,
@@ -661,6 +679,11 @@ class LLMSubmodule(ARNodeSubmodule):
         # decode rows are one token each, like the template; the prefill walks
         # feed `prefill_tokens` from the inputs
         return graph_walk == "decode"
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop

@@ -101,6 +101,8 @@ pub(super) struct Postprocess {
     pub inline: Option<(String, TokenColumn)>,
     pub partition_done: Vec<u32>,
     pub python_send: bool,
+    /// `RouteInput.loop_strides`, in `rids` order; None is 1 each
+    pub loop_strides: Option<Vec<u32>>,
     phase: Phase,
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
@@ -115,11 +117,12 @@ impl Postprocess {
         rids: Vec<u32>, walks: Option<Vec<String>>, rid_walk_idx: Option<Vec<u32>>,
         known_stops: Vec<(u32, Vec<String>)>, runtime_stops: bool,
         tokens: Option<TokenColumn>, row_rids: Vec<u32>, inline: Option<(String, TokenColumn)>,
-        partition_done: Vec<u32>, python_send: bool,
+        partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
     ) -> Self {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
+            loop_strides,
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -133,6 +136,9 @@ impl Postprocess {
         self.rids = keep.iter().map(|&i| self.rids[i]).collect();
         if let Some(idx) = &self.rid_walk_idx {
             self.rid_walk_idx = Some(keep.iter().map(|&i| idx[i]).collect());
+        }
+        if let Some(strides) = &self.loop_strides {
+            self.loop_strides = Some(keep.iter().map(|&i| strides[i]).collect());
         }
         if let Some(stops) = &mut self.stops {
             stops.retain(|(rid, _)| !dropped.contains(rid));
@@ -166,6 +172,7 @@ impl Postprocess {
             logprobs: s.logprobs,
             walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
             rid_walk_idx: self.rid_walk_idx.clone(),
+            loop_strides: self.loop_strides.clone(),
         }
     }
 
@@ -562,11 +569,14 @@ mod tests {
         let mut pp = Postprocess::new(
             "p".into(), "n".into(), "w".into(), vec!["s".into()], vec![1, 2, 3], None, None,
             vec![(2, vec!["l".into()])], false, None, Vec::new(), None, vec![1, 2], false,
+            Some(vec![4, 5, 6]),
         );
         pp.stops = Some(vec![(2, vec!["l".into()]), (3, vec!["l".into()])]);
         pp.keep_rows(&[2].into_iter().collect());
         assert_eq!(pp.rids, vec![1, 3]);
         assert_eq!(pp.stops, Some(vec![(3, vec!["l".to_string()])]));
         assert_eq!(pp.partition_done, vec![1]);
+        // a dropped row's loop stride leaves with it
+        assert_eq!(pp.loop_strides, Some(vec![4, 6]));
     }
 }
