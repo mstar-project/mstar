@@ -87,8 +87,10 @@ def test_a_message_or_a_timed_check_ends_the_wait(kind, check, tmp_path, monkeyp
     drain = comm.get_all_new_messages
 
     def counted_drain():
+        # after the drain: a message sent once this pass counts can't be read by it
+        messages = drain()
         passes.append(time.perf_counter())
-        return drain()
+        return messages
 
     comm.get_all_new_messages = counted_drain
 
@@ -144,8 +146,9 @@ class _Loop:
         drain = c.communicator.get_all_new_messages
 
         def counted_drain():
+            messages = drain()
             self.passes.append(time.perf_counter())
-            return drain()
+            return messages
 
         c.communicator.get_all_new_messages = counted_drain
         liveness = c._poll_worker_liveness
