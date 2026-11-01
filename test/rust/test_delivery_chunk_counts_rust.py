@@ -1,5 +1,6 @@
-"""The frames ``test/modular/test_delivery_chunk_counts.py``'s runtime sends for
-a script covering every inline-token case, read off real inboxes.
+"""``test/modular/test_delivery_chunk_counts.py`` in the job that runs against
+the built extension, and the frames its runtime sends for a script covering
+every inline-token case, read off real inboxes.
 """
 import sys
 from pathlib import Path
@@ -18,7 +19,10 @@ from test_delivery_chunk_counts import (  # noqa: E402
     LOOP,
     NODE,
     PREFILL,
+    SHAPES,
     WORKER,
+    assert_holds_until_last_chunk,
+    drive,
     new_runtime,
 )
 
@@ -30,6 +34,19 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, RequestWalks, RouteInput
 from mstar.utils.containers import ParallelList
 
 PEER = "worker_1"
+
+
+@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_request_is_held_until_its_last_chunk(shape, inline, tmp_path):
+    prefills, decode_steps = SHAPES[shape]
+    runtime, put, sent = new_runtime(decode_steps, tmp_path)
+    drive(runtime, put, prefills, decode_steps, inline=inline)
+    chunks, reports = sent()
+    assert len(chunks) == prefills + decode_steps
+    tokens = sum(isinstance(c, ResultTokens) for c in chunks)
+    assert tokens == (decode_steps if inline else 0)
+    assert_holds_until_last_chunk(chunks, reports)
 
 
 def _admit(runtime, request_id, workers=(WORKER,)):
