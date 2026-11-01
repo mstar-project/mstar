@@ -2,6 +2,8 @@
 
 import queue
 import threading
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import torch
 import triton
@@ -55,6 +57,32 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
+@dataclass(slots=True)
+class GroupPages:
+    """A stream's tokens in one group of its pool (`PagedKVConfig.groups`), in that group's
+    pages. `CacheStream` holds the first group's itself, in the same fields."""
+    page_indices: list[int] = field(default_factory=list)
+    stored_len: int = 0
+    released: int = 0
+    generation: int = 0
+
+
+def held_pages(groups: Sequence[GroupPages]) -> list[int]:
+    """Every page of ``groups`` (`CacheStream.groups`, or a copy of them), group by group."""
+    return [page for part in groups for page in part.page_indices]
+
+
+def on_pages(groups: Sequence[GroupPages], pages: list[int]) -> tuple[GroupPages, ...]:
+    """Copies of ``groups`` holding ``pages``, which list as many for each group, in turn: where
+    a stream's pages land as they move between the device and the host."""
+    moved, at = [], 0
+    for part in groups:
+        end = at + len(part.page_indices)
+        moved.append(GroupPages(pages[at:end], part.stored_len, part.released, part.generation))
+        at = end
+    return tuple(moved)
+
+
 @triton.jit
 def _kv_scatter_nhd_kernel(
     layer_ptr, k_ptr, v_ptr, page_idx_ptr, cache_idx_ptr,
@@ -90,21 +118,20 @@ def _kv_scatter_mla_eager(
 
 @torch.compiler.disable
 def _kv_scatter_nhd_eager(
-    cache: torch.Tensor, layer_idx: int,
+    layer: torch.Tensor,
     k: torch.Tensor, v: torch.Tensor,
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
-    layer = cache[layer_idx]
     tokens, heads, head_dim = k.shape
     if (
-        cache.is_cuda and tokens > 0
+        layer.is_cuda and tokens > 0
         and k.stride(2) == 1 and v.stride(2) == 1
         and layer.stride(3) == head_dim and layer.stride(4) == 1
         and page_idx.is_contiguous() and cache_idx.is_contiguous()
         # index_put rejects these; the kernel would read or write out of bounds.
         and v.shape == k.shape and layer.shape[-2:] == (heads, head_dim)
         and page_idx.numel() == tokens and cache_idx.numel() == tokens
-        and all(t.device == cache.device for t in (k, v, page_idx, cache_idx))
+        and all(t.device == layer.device for t in (k, v, page_idx, cache_idx))
     ):
         block = triton.next_power_of_2(heads * head_dim)
         # One launch for K and V instead of two index_put kernels.
@@ -118,8 +145,8 @@ def _kv_scatter_nhd_eager(
             num_warps=max(4, min(16, block // 512)),
         )
         return
-    layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
-    layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
+    layer[page_idx, 0, cache_idx] = k.to(layer.dtype)
+    layer[page_idx, 1, cache_idx] = v.to(layer.dtype)
 
 
 class KVCache:
@@ -133,10 +160,14 @@ class KVCache:
         dtype=torch.bfloat16
     ):
         self.config = cfg
-        if cfg.layout == KVLayout.NHD:
+        # layer -> its view; set only when the pool has groups of two page sizes
+        self._layers: list[torch.Tensor] | None = None
+        if len(cfg.groups) > 1:
+            self._allocate_groups(cfg, device, dtype)
+        elif cfg.layout == KVLayout.NHD:
             self.tensor = torch.zeros(
                 cfg.num_layers, cfg.max_num_pages, 2,
-                cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
+                cfg.tokens_per_page, cfg.num_kv_heads, cfg.head_dim,
                 dtype=dtype, device=device,
             ).contiguous()
         elif cfg.layout == KVLayout.MLA:
@@ -144,13 +175,38 @@ class KVCache:
             # column slices as strided views (page/token strides are explicit
             # kernel params, only the last dim must be contiguous)
             self.tensor = torch.zeros(
-                cfg.num_layers, cfg.max_num_pages, cfg.page_size, cfg.latent_dim,
+                cfg.num_layers, cfg.max_num_pages, cfg.tokens_per_page, cfg.latent_dim,
                 dtype=dtype, device=device,
             ).contiguous()
         else:
             raise NotImplementedError(
                 f"KV layout {cfg.layout} is not recognized."
             )
+
+    def _allocate_groups(self, cfg: PagedKVConfig, device: torch.device, dtype) -> None:
+        """One buffer of ``num_units`` equal pages, each holding one page of a group's layers
+        (`PagedKVConfig.groups`). Each group sees it layer-major (``[layers, pages, 2,
+        page_size, heads, head_dim]``), so a layer's view is a page-strided tensor the kernels
+        take as they take any other, and ``tensor`` is ``[1, pages, page_bytes]``, so a
+        whole-page copy (offload) moves any group."""
+        heads, dim = cfg.num_kv_heads, cfg.head_dim
+        own = cfg.groups[0]
+        unit = len(own.layers) * 2 * own.page_size * heads * dim
+        # FlashInfer's FA2 kernels take the page stride as a uint32
+        if unit >= 2**32:
+            raise ValueError(f"a KV page of {unit} elements is past the kernels' 32-bit page stride")
+        buf = torch.zeros(cfg.num_units, unit, dtype=dtype, device=device)
+        self.tensor = buf.unsqueeze(0)
+        self._layers = [None] * cfg.num_layers
+        for group in cfg.groups:
+            view = buf.view(cfg.num_units, len(group.layers), 2, group.page_size, heads, dim).transpose(0, 1)
+            for j, layer in enumerate(group.layers):
+                self._layers[layer] = view[j]
+
+    def _check_ungrouped(self, what: str) -> None:
+        # these index ``tensor`` by layer and token, which a page of two groups doesn't have
+        if self._layers is not None:
+            raise NotImplementedError(f"{what} is not implemented for a cache with full and sliding layers")
 
     @property
     def layout(self) -> KVLayout:
@@ -162,7 +218,7 @@ class KVCache:
 
     @property
     def page_size(self) -> int:
-        return self.config.page_size
+        return self.config.tokens_per_page
 
     @property
     def device(self) -> torch.device:
@@ -191,6 +247,7 @@ class KVCache:
         ``base_ptr`` addresses a remote cache with this same layout/config;
         it defaults to this cache's own storage.
         """
+        self._check_ungrouped("chunk_ptrs")
         if self.layout == KVLayout.MLA:
             layer_stride, page_stride, token_stride = self.tensor.stride()[:3]
             element_size = self.tensor.element_size()
@@ -229,6 +286,8 @@ class KVCache:
         """One layer's pages, in this cache's layout — what an attention
         kernel consumes. NHD: [max_num_pages, 2, page_size, num_kv_heads,
         head_dim]. MLA: [max_num_pages, page_size, latent_dim]."""
+        if self._layers is not None:
+            return self._layers[layer_idx]
         if self.layout not in (KVLayout.NHD, KVLayout.MLA):
             raise NotImplementedError(
                 f"layer_view is not implemented for layout {self.layout}."
@@ -249,7 +308,7 @@ class KVCache:
             raise NotImplementedError(
                 f"read_tokens is not implemented for layout {self.layout}."
             )
-        return self.tensor[layer_idx][page_idx, :, cache_idx]
+        return self.layer_view(layer_idx)[page_idx, :, cache_idx]
 
     def write_tokens(
         self, layer_idx: int,
@@ -272,7 +331,7 @@ class KVCache:
                 f"write_tokens is not implemented for layout {self.layout}."
             )
         _kv_scatter_nhd_eager(
-            self.tensor, layer_idx, k, v, page_idx, cache_idx,
+            self.layer_view(layer_idx), k, v, page_idx, cache_idx,
         )
         if return_tensor:
             return self.read_tokens(layer_idx, page_idx, cache_idx)
@@ -287,6 +346,7 @@ class KVCache:
         rows are each contiguous: one view for a whole page or an MLA token
         range, one each for K and V otherwise. ``tensor`` is as for
         `chunk_view`."""
+        self._check_ungrouped("layer_rows")
         if self.layout not in (KVLayout.NHD, KVLayout.MLA):
             raise NotImplementedError(
                 f"layer_rows is not implemented for layout {self.layout}."
@@ -323,6 +383,7 @@ class KVCache:
 
     def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
         """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
+        self._check_ungrouped("copy_slots")
         # Index with slices rather than tensors. Slices need no copy from the host,
         # so the copy doesn't wait on the stream.
         self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
@@ -336,6 +397,7 @@ class KVCache:
         covering both K and V. ``tensor`` overrides the backing storage (e.g.
         a tensor rebuilt from another process' cache with this same layout).
         """
+        self._check_ungrouped("chunk_view")
         if tensor is None:
             tensor = self.tensor
         if self.layout == KVLayout.MLA:

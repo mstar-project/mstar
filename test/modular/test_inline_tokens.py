@@ -269,22 +269,9 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
     assert sig == "text_inputs" and vals == [90, 70, 80]
 
 
-def test_a_withheld_output_rides_no_inline_value():
-    """A token the stop check withheld (``StopCheck.withheld``, e.g. the step
-    closing a reply that ended at prefill) is not the client's: that row gets
-    None, which the runtime routes as the row's tensors, of which it has none."""
-    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
-    sig, vals = _worker()._inline_emit_values(
-        _Engine({"new_token": "new_token"}), _Batch(withheld={8: ("new_token",), 7: ("frame",)}),
-        rows, [7, 8], ["new_token"],
-    )
-    assert sig == "new_token" and vals == [70, None]
-
-
 def test_a_withheld_output_skips_the_fused_route_and_send():
-    """The fused device-loopback call reads every row's value off the column,
-    so a withheld row would still ride inline: such a step takes the general
-    path, which sends that row None."""
+    """The fused device-loopback call routes every row's outputs, so a step
+    whose stop check withheld one takes the general path."""
     class _Fused(_Runtime):
         supports_route_and_send_inline = True
 
@@ -300,7 +287,7 @@ def test_a_withheld_output_skips_the_fused_route_and_send():
     batch = _Batch(withheld={8: ("new_token",)})
     batch.partition = "p"
     batch.batch.output_signals, batch.batch.graph_walk = ["new_token"], "decode"
-    batch.node_batch.stream_partition_done_rids = ()
+    batch.node_batch.partition_done_rids = ()
     rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
     eng = _LoopbackEngine({"new_token": "new_token"})
     assert w._route_and_send_fast(batch, rows, eng, [7, 8], set()) is False

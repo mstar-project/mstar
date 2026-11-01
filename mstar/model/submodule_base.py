@@ -15,6 +15,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
+# What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
+# a prefill that sampled a stop token, before its decode loop exists. The
+# request's partition ends when this pass completes, and the conductor starts
+# no further walk.
+END_PARTITION = "__end_partition__"
+
 
 class HostRows(NamedTuple):
     """A step's row-addressed outputs (``check_stop_buffers``) on the host.
@@ -40,10 +46,6 @@ class HostRows(NamedTuple):
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
 
 
-# request-state key: a prefill walk sampled a stop id (``TokenStop.prefill_walks``)
-_ENDED_AT_PREFILL = "ended_at_prefill"
-
-
 class TokenStop(NamedTuple):
     """When an AR submodule's sampled token ends its decode loop: on a stop
     id, unless the request's sampler config sets ``ignore_eos``. The token
@@ -62,14 +64,14 @@ class TokenStop(NamedTuple):
     sampler: str
     # the only walk whose rows can stop the loop; None for every walk
     walk: str | None = None
-    # walks that sample the reply's first token before the loop runs. That
-    # token counts toward the budget, so the model's ``get_loop_caps`` gives
-    # the loop ``max_output_tokens - 1`` (GLM-5.2, Command A+). A stop
-    # id sampled there has no loop to stop, so the reply ends at the loop's
-    # first step (``ARNodeSubmodule.ended_at_prefill``), which withholds its
-    # ``buffer`` (``StopCheck.withheld``), so the loop's client edge must
-    # carry ``buffer``
+    # walks that sample the reply's first token before the loop exists. That
+    # token counts toward the budget, so ``get_loop_caps`` gives the loop
+    # ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one
+    # token, ends the partition (``END_PARTITION``)
     prefill_walks: frozenset[str] = frozenset()
+    # for a prompt prefilled over several passes: the ``step_metadata`` flag of
+    # the pass whose token is the reply's (earlier passes' tokens are not)
+    last_prefill_flag: str | None = None
 
 
 class StopCheck(NamedTuple):
@@ -86,8 +88,9 @@ class StopCheck(NamedTuple):
 
 
 class BatchedStopCheck(NamedTuple):
-    """``StopCheck`` for ``check_stop_batched``: rid -> loops to stop and
-    rid -> withheld outputs, rids with none left out of each."""
+    """``StopCheck`` for ``check_stop_batched``: rid -> what ``check_stop``
+    returns for it (loop names or ``END_PARTITION``) and rid -> withheld
+    outputs, rids with none left out of each."""
 
     stops: dict[str, set[str]]
     withheld: dict[str, tuple[str, ...]]
@@ -1122,6 +1125,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         will run for that rid and its output discarded — the standard
         1-wasted-step cost for any stop signal.
 
+        ``END_PARTITION`` ends the request's partition after this pass, so
+        the conductor starts no further walk: e.g. a prefill whose sampled
+        token is a stop token, before its decode loop exists. Return it only
+        from a row outside any loop: from inside one, the request fails with
+        an internal error. Use it only when nothing else must run for the
+        partition (a later walk, a loop's final-only publication); the
+        model's transition still decides those.
+
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
@@ -1137,7 +1148,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, set[str]] | BatchedStopCheck | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
-        Optional. Returns rid -> loops to stop (rids with none left out), or a
+        Optional. Returns rid -> what ``check_stop`` returns for it (loop
+        names or ``END_PARTITION``; rids with nothing left out), or a
         ``BatchedStopCheck`` for a submodule whose ``check_stop`` withholds,
         and must agree with ``check_stop`` for every rid. None, or a raise,
         falls back to the per-request path.
@@ -1183,9 +1195,7 @@ class ARNodeSubmodule(NodeSubmodule):
         token = outputs[stop.buffer][0].reshape(-1)[0].item()
         if not self._token_stops(request_id, token, request_info):
             return set()
-        if stop.prefill_walks and self.ended_at_prefill(request_id):
-            return StopCheck({stop.loop}, withheld=(stop.buffer,))
-        return {stop.loop}
+        return self._stop_names(request_info)
 
     def check_stop_batched(
         self, request_ids: list[str],
@@ -1198,39 +1208,39 @@ class ARNodeSubmodule(NodeSubmodule):
         pairs = host_rows.first_values(stop.buffer, request_ids)
         if pairs is None:
             return None
-        verdict = self._token_stops
-        stops = {rid: {stop.loop} for rid, token in pairs if verdict(rid, token, request_infos[rid])}
-        if stop.prefill_walks and (
-            closing := {rid: (stop.buffer,) for rid in stops if self.ended_at_prefill(rid)}
-        ):
-            return BatchedStopCheck(stops, closing)
-        return stops
-
-    def ended_at_prefill(self, request_id: str) -> bool:
-        """Whether a walk in ``token_stop.prefill_walks`` sampled a stop id for
-        the request, so its next step only closes the loop: that step's token,
-        sampled after the stop id, is withheld from the reply."""
-        # read, never create: the check can run after the state was dropped
-        state = self.request_states.get(request_id)
-        return state is not None and bool(state.get(_ENDED_AT_PREFILL))
+        verdict, names = self._token_stops, self._stop_names
+        return {
+            rid: names(info) for rid, token in pairs
+            if verdict(rid, token, info := request_infos[rid])
+        }
 
     def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
         """Both stop checks' verdict on one row: whether its sampled
-        ``token`` ends ``token_stop.loop``."""
+        ``token`` ends the reply."""
         stop = self.token_stop
         prefill_walks = stop.prefill_walks
-        if prefill_walks and self.ended_at_prefill(request_id):
-            return True
-        # the set test first: a stop id is rare, and the config read behind
-        # it goes through the info wrapper
-        if token not in stop.stop_ids or info.resource_configs[stop.sampler].ignore_eos:
-            return False
-        if prefill_walks and info.graph_walk in prefill_walks:
-            # no loop on this walk to stop: the loop's first step will
-            self.request_state(request_id).add(_ENDED_AT_PREFILL, True)
-            return False
-        # only a row of ``walk`` ends the loop
-        return stop.walk is None or info.graph_walk == stop.walk
+        # the set test first: a stop id is rare, and the reads behind it go
+        # through the info wrapper
+        if token in stop.stop_ids and not info.resource_configs[stop.sampler].ignore_eos:
+            walk = info.graph_walk
+            if walk in prefill_walks:
+                return self._is_reply_token(info)
+            # only a row of ``walk`` ends the loop
+            return stop.walk is None or walk == stop.walk
+        # the loop's cap is at least 1, so a one-token budget ends at the prefill
+        return bool(prefill_walks) and info.max_tokens <= 1 and (
+            info.graph_walk in prefill_walks and self._is_reply_token(info)
+        )
+
+    def _is_reply_token(self, info: CurrentForwardPassInfo) -> bool:
+        flag = self.token_stop.last_prefill_flag
+        return flag is None or bool(info.step_metadata.get(flag, False))
+
+    def _stop_names(self, info: CurrentForwardPassInfo) -> set[str]:
+        """What a row whose token stops returns: a ``prefill_walks`` row has
+        no loop yet, so it ends the partition."""
+        stop = self.token_stop
+        return {END_PARTITION} if info.graph_walk in stop.prefill_walks else {stop.loop}
 
     def split_inputs(
         self,

@@ -63,7 +63,7 @@ def make_executing_batch(
     The context starts unleased and eager; a slot is reserved later, once the
     real token count is known.
     """
-    final_stream_rids, stream_partition_done_rids = streams.settle_final(
+    final_stream_rids, partition_done_rids = streams.settle_final(
         node_name, final_edges or {},
     )
     if request_walks and engine is not None:
@@ -75,7 +75,7 @@ def make_executing_batch(
         per_request_info=per_request_info,
         per_request_input_tensors=per_request_input_tensors,
         final_stream_rids=final_stream_rids,
-        stream_partition_done_rids=stream_partition_done_rids,
+        partition_done_rids=partition_done_rids,
         per_request_input_metadata=per_request_input_metadata or {},
         step_context=StepContext(
             request_ids=tuple(request_ids),

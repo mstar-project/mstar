@@ -33,7 +33,7 @@ GEOMETRY = DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v
 class _StubChains:
     """Keys every whole page of a request as its index."""
 
-    config = type("Config", (), {"page_size": PAGE})()
+    config = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4 * PAGE, page_size=PAGE)
 
     def keyed_label(self, rid, node_name, graph_walk):
         return "main"

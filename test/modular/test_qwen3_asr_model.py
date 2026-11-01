@@ -33,7 +33,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import HostRows, ModelInputsFromEngine, TokenStop  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine, TokenStop  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -198,6 +198,7 @@ def test_the_decode_loop_holds_any_cap_the_context_does(max_tokens):
     cap = model.get_loop_caps(max_output_tokens=max_tokens)[DECODE_LOOP]
     assert cap <= model.get_graph_walk_graphs()[DECODE_WALK].max_iters
 
+
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
     wave = torch.randn(16_000 * 3 + 40)
@@ -333,6 +334,7 @@ def _llm_submodule(cfg):
     sub.config = cfg
     sub.token_stop = TokenStop(
         loop=sub.DECODE_LOOP, buffer="new_token", stop_ids=cfg.stop_token_ids, sampler=sub.SAMPLER, walk=DECODE_WALK,
+        prefill_walks=frozenset({PREFILL_WALK}),
     )
     embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
     sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
@@ -380,7 +382,12 @@ def test_llm_check_stop():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
-    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == set()
+    # a stop token first ends the request: there is no decode loop yet
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
+    # any other walk outside the loop may be followed by one the transition runs
+    assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
+    # the budget counts the prefill's token, and the loop's cap is at least 1: 1 ends there
+    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
@@ -416,7 +423,9 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
-    assert batched == per_request == {"im_end": {"decode_loop"}, "eot": {"decode_loop"}}
+    assert batched == per_request == {
+        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "prefill": {END_PARTITION},
+    }
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 

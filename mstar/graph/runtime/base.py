@@ -484,11 +484,10 @@ class RouteInput(NamedTuple):
     # One output signal whose per-rid value is a host scalar the worker
     # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
     # inline in one frame per step instead of as a tensor per request. The
-    # values are in wg_ids.keys() order; empty means none. A None value keeps
-    # that row's edge on the tensor path. A runtime without
+    # values are in wg_ids.keys() order; empty means none. A runtime without
     # `supports_inline_emit` ignores both.
     inline_signal: str | None = None
-    inline_values: tuple[int | None, ...] | list[int | None] = ()
+    inline_values: tuple[int, ...] | list[int] = ()
     # The log-prob of the token row i sampled (None without one): it rides
     # with the row's client emits of this step, inline or in a tensor emit's
     # metadata. Empty when no row has one.
@@ -731,8 +730,9 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
-    def mark_stream_partition_done(self, rid: int, partition: str):
-        """The consuming pass saw the final streaming chunk. Reported on the
+    def mark_partition_done(self, rid: int, partition: str):
+        """The partition is done: the consuming pass saw the final streaming
+        chunk, or a stop check returned ``END_PARTITION``. Reported on the
         WORKER_GRAPHS_DONE that follows, unless the node was speculative."""
         pass
 

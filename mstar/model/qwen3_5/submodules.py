@@ -139,10 +139,10 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
-        # only a decode row's token ends decode_loop; a prefill is not in it yet
         self.token_stop = TokenStop(
             loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
-            sampler=SAMPLER, walk="decode",
+            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+            last_prefill_flag="last_prefill",
         )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 

@@ -340,7 +340,7 @@ pub struct GraphRuntime {
             && self
                 .interner
                 .get(partition_name)
-                .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
+                .and_then(|p| self.info(rid).map(|i| i.partition_done(p)))
                 .unwrap_or(false);
 
         let partition = self.interner.get(partition_name);
@@ -1201,12 +1201,11 @@ pub struct RouteArg {
     /// One output signal whose per-request value is a scalar the worker
     /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
     /// then rides inline in one frame per step instead of as a tensor per
-    /// request; `inline_values` are in `rids` order, or empty for none. A
-    /// None value keeps that row's edge on the tensor path.
+    /// request; `inline_values` are in `rids` order, or empty for none.
     /// Both keys may be absent or None: a caller with no inline signal sends
     /// the plain route input.
     inline_signal: Option<String>,
-    inline_values: Vec<Option<i64>>,
+    inline_values: Vec<i64>,
     /// The log-prob of the token row i sampled (None without one): it rides
     /// with the row's client emits, inline or in a tensor emit's metadata.
     /// Empty (or absent) when no row has one.
@@ -1853,10 +1852,10 @@ impl GraphRuntime {
             .all(|&wg| self.state(wg, rid).is_none_or(|s| s.is_idle()))
     }
 
-    fn mark_stream_partition_done(&mut self, rid: u32, partition: &str) {
+    fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
-            info.mark_stream_done(p);
+            info.mark_partition_done(p);
         }
     }
 
@@ -2590,7 +2589,6 @@ impl GraphRuntime {
 
         for (i, &rid) in input.rids.iter().enumerate() {
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
-            let inline_value = if inline_on { input.inline_values[i] } else { None };
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
             if several_walks {
@@ -2945,16 +2943,15 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let inline_edge = match inline_value {
-                    Some(value) if matches!(e.dest, Dest::EmitToClient)
-                        && Some(e.name) == inline_sym
-                        && !e.persist =>
-                    {
-                        emit_inline.insert(rid, (e.name, e.modality, value));
-                        true
-                    }
-                    _ => false,
-                };
+                let inline_edge = inline_on
+                    && matches!(e.dest, Dest::EmitToClient)
+                    && Some(e.name) == inline_sym
+                    && !e.persist;
+                if inline_edge {
+                    emit_inline.insert(
+                        rid, (e.name, e.modality, input.inline_values[i]),
+                    );
+                }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
                     || (!is_local
@@ -3016,7 +3013,7 @@ impl GraphRuntime {
                         // An inline emit holds no reference: nothing reads
                         // the tensor on the api server's behalf.
                         Dest::EmitToClient => i64::from(
-                            !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
+                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
                         ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
@@ -3229,17 +3226,15 @@ impl GraphRuntime {
             };
             let n = rids.len();
             let in_order = row_rids.len() >= n && row_rids[..n] == rids[..];
-            // Every row has a value: the caller sends a step with a withheld
-            // output (a None row) through `complete_and_route_batch`.
-            let values: Vec<Option<i64>> = if in_order {
-                (0..n).map(|row| Some(read(row))).collect()
+            let values: Vec<i64> = if in_order {
+                (0..n).map(read).collect()
             } else {
                 let row_of: FxHashMap<u32, usize> =
                     row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
                 let mut v = Vec::with_capacity(n);
                 for r in &rids {
                     match row_of.get(r) {
-                        Some(&i) => v.push(Some(read(i))),
+                        Some(&i) => v.push(read(i)),
                         None => return Ok(FusedRouteOut::default()),
                     }
                 }
@@ -3678,11 +3673,6 @@ impl GraphRuntime {
             }
         }
         Ok(plan)
-    }
-
-    fn stream_partition_done(&self, rid: u32, partition: &str) -> bool {
-        let Some(p) = self.interner.get(partition) else { return false };
-        self.info(rid).is_some_and(|i| i.stream_done(p))
     }
 
     /// Parked routing awaiting a send. Non-zero between

@@ -54,6 +54,7 @@ from mstar.model.glm52.config import (  # noqa: E402
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION  # noqa: E402
 
 
 def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
@@ -322,45 +323,32 @@ def test_glm52_check_stop_batched_agrees_with_check_stop():
     """One tolist for the batch, the same answer per request; a row the step has no token
     for is skipped, as the per-request path skips a request without outputs. A row at its
     token budget goes on: the loop's cap ends it."""
-    from mstar.model.submodule_base import BatchedStopCheck, HostRows, StopCheck
+    from mstar.model.submodule_base import HostRows
 
     sub = _make_submodule(Glm52ModelConfig())
     infos = {
         "eos": _fwd_info(), "mid": _fwd_info(), "budget": _fwd_info(max_tokens=8, iters=6),
-        "ignored": _fwd_info(ignore_eos=True), "ended": _fwd_info(), "absent": _fwd_info(),
+        "ignored": _fwd_info(ignore_eos=True), "prefill": _fwd_info(walk="prefill"),
+        "absent": _fwd_info(),
     }
-    sub.request_state("ended").add("ended_at_prefill", True)
-    rows = ("eos", "mid", "budget", "ignored", "ended")
-    tokens = torch.tensor([154827, 42, 42, 154820, 7])
+    rows = ("eos", "mid", "budget", "ignored", "prefill")
+    tokens = torch.tensor([154827, 42, 42, 154820, 154820])
     batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
     per_request = {
         rid: loops for rid, token in zip(rows, tokens, strict=True)
         if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
     }
-    assert batched == BatchedStopCheck(
-        {"eos": {"decode_loop"}, "ended": {"decode_loop"}}, {"ended": ("new_token",)},
-    )
-    assert per_request == {"eos": {"decode_loop"}, "ended": StopCheck({"decode_loop"}, withheld=("new_token",))}
+    assert batched == per_request == {"eos": {"decode_loop"}, "prefill": {END_PARTITION}}
 
 
-@pytest.mark.parametrize("ignore_eos", [False, True])
-def test_glm52_stop_id_at_prefill_ends_the_reply_at_the_first_decode_step(ignore_eos):
-    """The prefill walk has no loop to stop, so a stop id it samples ends the reply at the
-    first decode step, which withholds its token; both stop checks agree on it."""
-    from mstar.model.submodule_base import BatchedStopCheck, HostRows, StopCheck
-
+@pytest.mark.parametrize(("token", "max_tokens", "ignore_eos", "ends"), [
+    (154820, 100, False, True), (154820, 100, True, False), (42, 1, False, True), (42, 2, False, False),
+])
+def test_glm52_prefill_ends_the_partition_on_a_stop_id_or_a_one_token_budget(token, max_tokens, ignore_eos, ends):
+    """The prefill walk has no loop to stop, and the loop's cap is at least 1."""
     sub = _make_submodule(Glm52ModelConfig())
-    prefill = _fwd_info(ignore_eos=ignore_eos, walk="prefill")
-    assert sub.check_stop("r0", prefill, {"new_token": [torch.tensor([154820])]}) == set()
-    decode = _fwd_info(ignore_eos=ignore_eos)
-    outputs = {"new_token": [torch.tensor([42])]}
-    sub.postprocess("r0", decode, outputs)
-    batched = sub.check_stop_batched(["r0"], {"r0": decode}, HostRows(("r0",), {"new_token": torch.tensor([42])}))
-    if ignore_eos:
-        assert sub.check_stop("r0", decode, outputs) == set() and batched == {}
-    else:
-        assert sub.check_stop("r0", decode, outputs) == StopCheck({"decode_loop"}, withheld=("new_token",))
-        assert batched == BatchedStopCheck({"r0": {"decode_loop"}}, {"r0": ("new_token",)})
+    prefill = _fwd_info(max_tokens=max_tokens, ignore_eos=ignore_eos, walk="prefill")
+    assert sub.check_stop("r0", prefill, {"new_token": [torch.tensor([token])]}) == ({END_PARTITION} if ends else set())
 
 
 # ── submodule: graph configs ──
