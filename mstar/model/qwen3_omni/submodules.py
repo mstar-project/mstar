@@ -634,7 +634,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         mm_mask: torch.Tensor, start_pos: int, media_advance: int,
     ) -> ARNodeInputs:
         """One prefill row of an attachment between the text around it. The row
-        places its own positions and declares its own advance: a prefix hit cuts
+        places its own positions and declares its own advance: a prefix match cuts
         it, but only passing the whole row moves the counter, so a step prepared
         again starts from the same position."""
         embeds, pos_ids, multimodal, included = [media_embeds], [media_pos_ids], [mm_mask], [~mm_mask]

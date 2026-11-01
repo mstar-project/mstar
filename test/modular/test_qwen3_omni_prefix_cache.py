@@ -113,6 +113,31 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
     ), "the Talker masks or deepstack rows kept rows the embeds lost, so they would land on other tokens"
 
 
+def test_a_cut_row_of_text_around_a_clip_is_the_tail_of_the_whole_row(thinker):
+    rope = thinker.node_resources[THINKER_POS]
+    rope._counters[RID] = {"main": 10}
+    before, after = torch.arange(8, 12), torch.arange(12, 15)
+    clip = {"audio_embeds": [torch.randn(28, HIDDEN)], "text_inputs": [before, after]}
+    whole = _prepare(thinker, "prefill_audio", clip)
+
+    # past the text before the clip and most of the clip
+    cut = _prepare(thinker, "prefill_audio", clip, CachedPrefix("main", 24, 10))
+
+    assert cut.input_seq_len == whole.input_seq_len - 24
+    assert torch.equal(cut.input_embeds, whole.input_embeds[24:])
+    assert torch.equal(cut.custom_pos_ids, whole.custom_pos_ids[..., 24:]), (
+        "the row's tail would run at other positions than it had when the cache was written"
+    )
+    assert torch.equal(cut.tensor_inputs["masks_for_talker"], whole.tensor_inputs["masks_for_talker"][:, 24:])
+    assert torch.equal(cut.tensor_inputs["text_token_ids"], torch.cat([before, after]))
+
+    step = thinker.declare_step("prefill_audio", [RID], [cut])
+    rope.commit(step.steps[THINKER_POS], StepContext((RID,), "prefill_audio", slot=0, capture=False))
+    assert rope.position(RID, "main") == 10 + whole.tensor_inputs["mrope_pos_advance"], (
+        "decode would start at another position than it does after the whole row"
+    )
+
+
 def test_each_cut_row_of_a_mixed_step_moves_its_own_counter_past_its_whole_walk(thinker):
     # The cache holds 6 of 12 text tokens, 28 of a clip's 30 slots, and 3 of an image's 8 slots,
     # which advance the counter by 5. A partly held item leaves the counter at its start.

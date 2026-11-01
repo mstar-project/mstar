@@ -445,7 +445,7 @@ overrides** in :doc:`serving`.
 
    The keys cover the label's first ``keyed_spans`` spans. An ids span is keyed by its
    token ids, a digest span by its file. Consecutive spans of one walk are one row of one
-   step: a hit cuts the row, and the row keeps placing its own positions, so its walk
+   step: a match cuts the row, and the row keeps placing its own positions, so its walk
    declares the advance of the whole row whatever the cut left (Qwen3-Omni's prefill of text
    around an attachment).
 
