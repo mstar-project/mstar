@@ -154,6 +154,13 @@ class CpuPlan:
         return max(1, min(4, self.left // 4))
 
     @property
+    def preprocess_workers(self) -> int:
+        """Requests the data worker prepares at once, for a model that
+        declares ``PREPROCESS_PARALLEL``. Each runs ``preprocess_threads`` of
+        its own, so the pool times that stays within the CPUs left."""
+        return max(1, min(8, self.left // self.preprocess_threads))
+
+    @property
     def png_threads(self) -> int:
         """Threads one PNG deflates on (``image_io.uint8_to_png``)."""
         return min(8, self.left)

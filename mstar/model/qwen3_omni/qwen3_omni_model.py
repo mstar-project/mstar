@@ -184,7 +184,7 @@ class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
-
+    PREPROCESS_PARALLEL = True
 
     def __init__(
         self,

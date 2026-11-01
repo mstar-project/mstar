@@ -2047,6 +2047,22 @@ torch's default. It does not size video decoding: each torchcodec decode that as
 ``media_limits.video_decode_threads`` (``Model.load_video`` does) runs FFmpeg with up to 8
 threads, no more than the CPUs the process's CPU plan leaves unpinned (``CpuPlan.left``).
 
+The data worker prepares one request at a time on its own thread, so a request's media
+decode holds up every request behind it and the output chunks of the ones running. A model
+whose ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt`` keep no shared
+state sets ``PREPROCESS_PARALLEL = True``, and requests then prepare on a pool sized to the
+CPUs left (``CpuPlan.preprocess_workers``: at most 8, each with its own intra-op threads).
+Tensors are still stored and requests still reach the conductor from the data worker's thread,
+in arrival order. A deployment sets the pool at the top level of its config; 1 turns it off:
+
+.. code-block:: yaml
+
+   model: "qwen3_omni"
+   preprocess_workers: 2
+
+The pool only helps work that releases the GIL, so measure each stage first. A model with
+client streams always prepares inline, since an append has to follow its request.
+
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
