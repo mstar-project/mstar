@@ -109,6 +109,29 @@ def client_and_stub(monkeypatch):
     return TestClient(app), stub
 
 
+def test_media_json_response_writes_the_stock_bytes():
+    from fastapi.responses import JSONResponse
+
+    from mstar.api_server.openai._util import MediaJSONResponse
+
+    content = {"created": 1, "data": [{"b64_json": "QUJD+/==", "url": None}], "note": 'é"\\\n\u2028', "n": [1, True]}
+    assert MediaJSONResponse(content).body == JSONResponse(content).body
+
+
+def test_image_response_skips_json_dumps(client_and_stub, monkeypatch):
+    # json.dumps over a base64 body held the event loop for 18 ms per image
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("image", b"PNGDATA")]
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the body went through json.dumps")
+
+    monkeypatch.setattr("starlette.responses.json.dumps", refuse)
+    body = client.post("/v1/images/generations", json={"model": "bagel", "prompt": "a cat"}).json()
+    assert base64.b64decode(body["data"][0]["b64_json"]) == b"PNGDATA"
+
+
 def _pcm(vals):
     return np.array(vals, dtype="<i2").tobytes()  # int16 PCM, as the models emit
 
