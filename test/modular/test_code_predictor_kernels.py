@@ -104,18 +104,23 @@ def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
 
 
-def test_code_predictor_depth_loop_matches_its_layers_unfused():
+@pytest.mark.parametrize("embed_sum_dtype", [None, torch.float32])
+def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype):
     """The depth loop drives the kernels with the predictor's own head counts,
     eps and RoPE theta, through an input projection (Qwen3-TTS 1.7B's widths):
     a frame's groups, teacher-forced, against the same layers over the whole
-    depth sequence at once, norms, RoPE and causal attention in fp32."""
+    depth sequence at once, norms, RoPE and causal attention in fp32. The
+    embedding sum is the Talker's own: rounded after every add (Qwen3-TTS) or
+    summed in fp32 and rounded once (Qwen3-Omni)."""
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.config import Qwen3TTSCodePredictorConfig
 
     torch.manual_seed(6)
     cp = Qwen3TTSCodePredictorConfig(num_hidden_layers=2)
     width, bs, groups = 2048, 3, cp.num_code_groups
-    predictor = ResidualCodePredictor(cp, width, max_batch_size=4).to("cuda", torch.bfloat16).eval()
+    predictor = ResidualCodePredictor(
+        cp, width, max_batch_size=4, embed_sum_dtype=embed_sum_dtype,
+    ).to("cuda", torch.bfloat16).eval()
     for name, param in predictor.named_parameters():
         if name.endswith("norm.weight"):
             param.data.uniform_(0.5, 1.5)  # a skipped or swapped norm weight shows
@@ -155,10 +160,10 @@ def test_code_predictor_depth_loop_matches_its_layers_unfused():
             h = h + layer.mlp(_rms(h, layer.post_attention_layernorm.weight, cp.rms_norm_eps).bfloat16()).float()
         h = _rms(h, predictor.model.norm.weight, cp.rms_norm_eps)
         want_logits = [h[:, g] @ predictor.lm_head_weight[g - 1].float().t() for g in range(1, groups)]
-        # summed in fp32 in group order, rounded once to the embeddings' dtype
-        want_sum = layer0_embed.float()
+        # in group order, in the sum's dtype, as torch adds
+        want_sum = layer0_embed.to(embed_sum_dtype or layer0_embed.dtype)
         for embed in embeds:
-            want_sum = want_sum + embed.float()
+            want_sum = want_sum + embed.to(want_sum.dtype)
 
     assert torch.equal(got_codes, codes)
     torch.testing.assert_close(torch.stack(got_logits), torch.stack(want_logits), rtol=5e-2, atol=1e-1)
