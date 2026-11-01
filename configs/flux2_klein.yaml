@@ -5,13 +5,15 @@ model: "flux2_klein"
 max_seq_len: 512
 
 # FLUX.2 [klein] 4B, single GPU, all four nodes colocated. Serving knobs (forwarded to
-# Flux2KleinModel.__init__): attention_backend flashinfer|sdpa, torch.compile of the
+# Flux2KleinModel.__init__): attention_backend auto|sdpa, torch.compile of the
 # transformer per shape, CUDA-graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs:
-  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
-  # reference kernel; flashinfer stays available
-  attention_backend: sdpa
+  # auto: the DiT's joint attention runs on the engine's ragged attention resource with the platform's default
+  # kernel: FlashInfer FA3 on an H100 (served as fast as sdpa, 0.355 vs 0.349 s at B=1), AITER's asm flash attention
+  # on MI300X/MI325X (where torch's sdpa is AOTriton, well short of it). sdpa keeps torch's kernel inline, the
+  # reference pipeline's, for parity runs. `resources: dit_attn: backend: aiter|flashinfer` pins a kernel.
+  attention_backend: auto
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer still lands at a median 37.6 dB from the eager path over the 100 protocol prompts (67 of 100 below 40 dB)
@@ -19,15 +21,25 @@ model_kwargs:
   # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
   # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
   # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — [norms] 0.371 s at B=1 vs 0.356 plain and 0.383 with the activations too; 0.461 without compile
+  # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
+  # keeps the output off the reference bit for bit either way. MI325X: 0.406 -> 0.384 s at B=1, 2.97 -> 3.32 images/s at c=16.
   compile_exact_ops: [norms]
   accelerator_graph: true
-  capture_sizes: [[1024, 1024]]
+  # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
+  # per batch size inside its first requests and decodes on the eager VAE. Edits keep the one bucket. MI325X: the
+  # first 1344x768 request takes 0.4-0.7 s instead of 1.4-1.7 (86 s on a cold server); warm startup 63 -> 72-84 s.
+  capture_sizes: [[1024, 1024], [768, 1344]]
+  capture_edit_sizes: [[1024, 1024]]
   # every batch size up to max_batch_size: a lockstep group of 5-7 requests would otherwise be padded into the 8-graph
   capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
+  # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.19x images/s at
+  # c=1 and 1.21x at c=16 on MI325X; median 22.6 vs 23.9 dB from diffusers (docs/models.rst). Default bf16
+  # On AMD GPUs fp8 needs `knobs: dit_exact_ops: true` (top level). MI325X: 22.6 dB with the knob on, 22.5-22.7
+  # with it off (floor 22.4). The knob costs 7% of fp8 images/s at c=1, leaving 1.13x bf16
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
   # LoRA adapters folded into the transformer at load (diffusers / PEFT or BFL-layout

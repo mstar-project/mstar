@@ -13,6 +13,14 @@ from dataclasses import dataclass
 # A14B variants are a MoE dual-DiT and a separate piece of work.
 WAN22_VARIANT_TI2V_5B = "ti2v_5b"
 
+# The dit node's cacheless attention resources: self-attention over a guidance
+# branch's video tokens, and cross-attention of those tokens over the text; and the
+# span labels its steps declare them under.
+DIT_ATTN = "dit_attn"
+DIT_XATTN = "dit_xattn"
+VIDEO_SPAN = "video"
+TEXT_SPAN = "text"
+
 
 @dataclass
 class Wan22Config:

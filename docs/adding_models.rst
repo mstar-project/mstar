@@ -1439,6 +1439,30 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+**fp8 linears.** A compute-bound model can let a deployment run some of its linears as fp8
+GEMMs (``model_kwargs.linear_dtype: fp8``). The module declares which ones, as fnmatch
+patterns over module names, and ``get_submodule`` hands them to
+``mstar.model.components.fp8_linear.apply_linear_dtype`` after loading (and after any LoRA
+merge) and before compiling:
+
+.. code-block:: python
+
+   class MyDiT(nn.Module):
+       # the GEMMs over the token stream; small modulation/embedding/output projections stay
+       FP8_LINEARS = ("blocks.*.attn.qkv", "blocks.*.attn.out", "blocks.*.mlp.fc*")
+
+   transformer = build_transformer(...)
+   apply_linear_dtype(transformer, self.linear_dtype, transformer.FP8_LINEARS, "MyDiT")
+
+Each matching ``nn.Linear`` or ``FusedColumnLinear`` becomes an ``Fp8Linear``: weights in
+the GPU's e4m3 format (``current_platform.fp8_dtype()``: FNUZ on gfx942, OCP on gfx950 and
+NVIDIA sm_89+) with one scale per output channel, activations quantised per token in plain
+torch so the compiled forward fuses that into the producing norm, and the product on
+``mstar::fp8_rowwise_mm``. Where the platform has no fp8 GEMM the linears stay bf16 with a
+warning. The output moves by e4m3 rounding, so keep the default ``bf16`` unless the model's
+correctness family passes with fp8 on. On AMD GPUs a DiT's result also depends on the
+``dit_exact_ops`` knob, so measure fp8 with the knob set the way the deployment sets it.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs
@@ -1833,10 +1857,23 @@ module docstring. What a model declares and calls:
   ``pending_retract(rid)``, the same amounts negated on ``KVStep.commit_adjust``, and
   ``AttentionStep(row_queries=k + 1)``; no sampler or position step. The forward calls
   ``verify_inputs()`` (tokens and positions), runs the target, ``accept(logits)``,
-  then for each draft pass ``begin_draft_pass(j)``, the draft head, and
-  ``record_draft(j, tokens)``. Pass ``j`` sits at the verify positions plus ``j``, and
-  only each row's last accepted slot (``draft_slots()``) is a real query, so the head's
-  work after attention, and its vocabulary projection, run on that row alone.
+  then for each draft pass the draft head and ``record_draft(j, logits)``. Pass 0 runs
+  over the verify's tokens and the others one token a row, ``j`` positions past each
+  row's last accepted slot (``draft_slots()``). Every pass attends one query a row:
+  ``attend_draft(j, qkv, ...)`` takes the layer's packed projection and does its split,
+  norms, rotation and KV write in one kernel (``mstar::qkv_norm_rope_cache``) before
+  the attention, so the head's work after attention, and its vocabulary projection, run
+  at ``[rows]``. ``record_draft`` writes the token to the next step's register in the
+  same kernels that take the argmax, and returns it as the next pass's input, so nothing
+  between passes reads the host.
+- **Capture.** ``decode_rows=True`` on the decode ``BatchedAcceleratorGraphConfig``,
+  so a platform compiles the verify bucket as decode, by its rows.
+- **The draft's head.** A draft pass needs one argmax, and the target checks it, so
+  ``Fp8DraftHead`` (``mstar/engine/resources/spec_decode/draft_head.py``) can hold an fp8
+  copy of the vocabulary head for the draft alone: half the bytes of the pass's largest
+  kernel, for a little acceptance and no correctness. Verification always reads the
+  checkpoint's head. A vocabulary subset is not offered: it saves as much on Latin-script
+  text and loses a third to a half of the accepted drafts on other scripts.
 - **The prompt's last step.** It declares ``SpecDecodeStep(phase=SEED)`` (budgets
   and ``ignore_eos`` rows) and ``KVStep.commit_adjust`` of ``seed_lookahead`` tokens,
   runs the draft head over the prompt, and calls ``seed(first_token, first_draft)``.

@@ -40,6 +40,18 @@ class HardwareQueueColocation(WorkerColocation):
     def start(self) -> None:
         logger.info("mps: true on ROCm: nothing to start, the GPU schedules the workers' queues itself")
 
+BF16_HEADER_FLAG = "-include hip/hip_bf16.h"
+
+
+def _with_bf16_header(flags: str | None) -> str:
+    """``FLASHINFER_EXTRA_CUDAFLAGS`` with the header amd-flashinfer 0.6.18+amd.1's
+    AITER prefill sources need: their generated config names ``__hip_bfloat16``
+    before anything declares it, since FlashInfer's ``-DUSE_ROCM=1`` turns off
+    the include in torch's ``BFloat16.h``. Later releases include it themselves."""
+    if flags is None:
+        return BF16_HEADER_FLAG
+    return flags if BF16_HEADER_FLAG in flags else f"{flags} {BF16_HEADER_FLAG}"
+
 
 class Platform:
     """One accelerator stack; ``current_platform`` is the one this process runs.
@@ -81,6 +93,13 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
+    def fp8_dtype(self, device=None) -> torch.dtype | None:
+        """The e4m3 format this GPU's matrix units multiply natively, or None
+        where there is no fp8 GEMM. AMD's gfx942 (MI300X/MI325X) takes the FNUZ
+        variant (largest finite 240), gfx950 and NVIDIA the OCP one (448), so
+        fp8 code takes the dtype from here and never from a constant."""
+        return None
+
     def device_facts(self, device=None) -> DeviceFacts:
         """The GPU's architecture, product, compute units, caches and peak
         bandwidth and throughput, for kernel heuristics and the kernel harness
@@ -90,15 +109,24 @@ class Platform:
 
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
+        decode_rows: bool = False,
     ) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
         compiles a forward for ``num_tokens`` tokens in ``rows`` rows, a
         capture bucket's counts, or ``None`` when the forward serves any count.
+        ``decode_rows`` marks a bucket of several tokens a row that still
+        compiles as decode (a speculative verify step).
 
         Meant for inductor codegen settings on this stack (say, which GEMM
         backends to autotune at small sizes), not for picking kernels. Empty
         keeps inductor's defaults.
         """
+        return {}
+
+    def compile_pool_overrides(self) -> dict[str, object]:
+        """``torch._inductor.config`` values in force while a worker builds
+        Inductor's compile pool. Unlike ``inductor_overrides`` these never reach
+        a graph's cache key. Empty keeps inductor's defaults."""
         return {}
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
@@ -171,6 +199,10 @@ class CudaPlatform(Platform):
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
 
+    def fp8_dtype(self, device=None) -> torch.dtype | None:
+        # Ada (sm_89) and newer
+        return torch.float8_e4m3fn if self.has_cuda_capability(8, 9, device) else None
+
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
         return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
@@ -196,6 +228,11 @@ class RocmPlatform(Platform):
         # "gfx942:sramecc+:xnack-": what follows the colon are target features
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
+    FP8_DTYPES = {"gfx942": torch.float8_e4m3fnuz, "gfx950": torch.float8_e4m3fn}
+
+    def fp8_dtype(self, device=None) -> torch.dtype | None:
+        return self.FP8_DTYPES.get(self.arch(device))
+
     # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
     ATEN_GEMM_MAX_TOKENS = 32
     # and one-token-per-row (decode) buckets up to this many rows
@@ -203,6 +240,7 @@ class RocmPlatform(Platform):
 
     def inductor_overrides(
         self, num_tokens: int | None = None, rows: int | None = None,
+        decode_rows: bool = False,
     ) -> dict[str, object]:
         # At decode sizes inductor's autotuner can't reliably pick between its
         # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
@@ -216,9 +254,12 @@ class RocmPlatform(Platform):
         # templates, which win there.
         if num_tokens is None:
             return {}
-        decode = rows is not None and rows == num_tokens
+        decode = rows is not None and (rows == num_tokens or decode_rows)
         limit = self.ATEN_GEMM_MAX_DECODE_ROWS if decode else self.ATEN_GEMM_MAX_TOKENS
-        if num_tokens > limit:
+        # a verify bucket's draft GEMMs run at its rows, its target's at a few
+        # times that, so its rows bound the shapes these choices are about
+        size = rows if decode_rows else num_tokens
+        if size > limit:
             return {}
         overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
         from mstar.platforms.rocm_gemm import (
@@ -231,12 +272,12 @@ class RocmPlatform(Platform):
         )
 
         post = None
-        if num_tokens <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+        if size <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
             # linears of up to 16 rows on AITER's skinny GEMM or the Triton
             # weight stream, as the device's tuned config picks per shape
             overrides["pre_grad_custom_pass"], post = passes
         if (
-            decode and SKINNY_MAX_ROWS < num_tokens <= DECODE_LINEAR_MAX_ROWS
+            decode and SKINNY_MAX_ROWS < num_tokens and size <= DECODE_LINEAR_MAX_ROWS
             and (tuned := decode_linear_pass()) is not None
         ):
             # decode linears still on hipBLASLt take its tuned solution, where the device has one
@@ -245,8 +286,16 @@ class RocmPlatform(Platform):
             overrides["post_grad_custom_post_pass"] = post
         return overrides
 
-    def process_env_defaults(self) -> dict[str, str]:
+    def compile_pool_overrides(self) -> dict[str, object]:
+        # Inductor's sidecar retires a pool that returned nothing for a minute
+        # without waiting for it. A worker of the next pool forked meanwhile
+        # inherits the old pool's shutdown lock held by a thread it doesn't
+        # have, and hangs at its first full GC with the first job it took.
+        return {"quiesce_async_compile_pool": False}
+
+    def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         return {
+            "FLASHINFER_EXTRA_CUDAFLAGS": _with_bf16_header,
             # MIOpen's split-K implicit-GEMM conv solvers are not deterministic. Turning
             # them off costs about 1% and makes same-seed outputs repeat. The backward
             # one runs transposed convs (LTX-2.5's vocoder upsamplers).
@@ -262,7 +311,16 @@ class RocmPlatform(Platform):
         # Step threads stay on the process mask: on MI325X the pin gains no
         # tok/s at c=1 or c=64, raises 0.8B c=64 TTFT (57.5 -> 62.2 ms) and
         # graph-replay launch p95 (0.34-0.47 -> 1.3-3.3 ms).
-        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "step_thread_core": "off"}
+        #
+        # A DiT's eager norms (compile_exact_ops) exist to match cuBLAS/cuDNN
+        # reference output bit for bit. hipBLASLt picks GEMM kernels per M, so
+        # that match does not hold here and the bar is the reference's own
+        # cross-seed spread; the eager norms only cost fusion (one graph break
+        # each, 137 on FLUX.2 klein 9B).
+        return {
+            "ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1", "step_thread_core": "off",
+            "dit_exact_ops": "0",
+        }
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],

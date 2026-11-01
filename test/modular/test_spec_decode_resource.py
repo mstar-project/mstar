@@ -26,10 +26,12 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 sys.path.insert(0, ".")
 
@@ -52,8 +54,9 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.spec_decode.config import SpecDecodeStep, SpecPhase  # noqa: E402
-from mstar.engine.resources.spec_decode.resource import SpecDecodeResource  # noqa: E402
+from mstar.engine.resources.spec_decode.resource import SpecDecodePlan, SpecDecodeResource  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.model.qwen3_5.qwen3_5_model import KV_CACHE, Qwen3_5DenseModel  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "kv_prefix_decode_helpers", pathlib.Path(__file__).with_name("test_kv_prefix_decode.py"),
@@ -258,12 +261,13 @@ class Harness:
         targets = self._target(plan, b, positions)
         out = self.spec.accept_tokens(targets)
         drafted = out.target.reshape(-1)
-        verify_positions = positions
+        keep = self.spec.draft_slots()
         for j in range(self.k):
-            self.spec.begin_draft_pass(j)
-            positions = verify_positions + j
-            self._write(plan, drafted, layer=1)
-            drafted = self.spec.record_draft(j, self._draft(plan, b, positions)[self.spec.draft_slots()])
+            where = self.spec.draft_address(j)
+            self._write_flat(where.slots, drafted, layer=1)
+            query = where.positions[keep] if j == 0 else where.positions
+            guess = self._draft(plan, b, query, where.kv_lens)
+            drafted = self.spec.record_draft(j, torch.nn.functional.one_hot(guess, VOCAB).float())
         self.kv.commit(kv_step, ctx)
         self.pool.commit(pool_step, ctx)
         self.spec.commit(spec_step, ctx)
@@ -278,6 +282,12 @@ class Harness:
 
     def _write(self, plan, tokens, layer):
         pages, offsets = plan.write_pages, plan.write_offsets
+        real = pages != SINK_PAGE
+        self.cache[pages[real], offsets[real], layer] = tokens[real]
+
+    def _write_flat(self, slots, tokens, layer):
+        """A draft pass's KV write, one flat slot per token."""
+        pages, offsets = torch.div(slots, PAGE, rounding_mode="floor"), slots % PAGE
         real = pages != SINK_PAGE
         self.cache[pages[real], offsets[real], layer] = tokens[real]
 
@@ -303,22 +313,18 @@ class Harness:
                 out[r * t + i] = EOS if self.stop_at == seen else next_token(ctx_tokens)
         return out
 
-    def _draft(self, plan, b, positions) -> torch.Tensor:
-        """Query i at position q reads the draft layer's keys 0 .. q (the token
-        after each) and guesses the token at q + 2."""
-        t = self.t
-        lens = plan.kv_lens
-        out = torch.zeros(b * t, dtype=torch.long)
+    def _draft(self, plan, b, positions, kv_lens) -> torch.Tensor:
+        """A row's one query, at position q, reads the draft layer's keys 0 ..
+        q (the token after each) and guesses the token at q + 2."""
+        out = torch.zeros(b, dtype=torch.long)
         for r in range(b):
             if not bool(plan.image.real[r]):
                 continue
-            first = self._read(plan, r, 1, layer=0)
-            for i in range(t):
-                seen = int(lens[r]) - t + i + 1
-                q = int(positions[r * t + i])
-                assert seen == q + 1, "a draft query must see its own position and none after"
-                seq = first + self._read(plan, r, seen, layer=1)
-                out[r * t + i] = self._draft_guess(seq, q + 2) if -1 not in seq else 0
+            seen = int(kv_lens[r])
+            q = int(positions[r])
+            assert seen == q + 1, "a draft query must see its own position and none after"
+            seq = self._read(plan, r, 1, layer=0) + self._read(plan, r, seen, layer=1)
+            out[r] = self._draft_guess(seq, q + 2) if -1 not in seq else 0
         return out
 
     def _recurrent(self, wrapper: GDNVerifyWrapper, ids, b):
@@ -458,6 +464,169 @@ def test_host_gives_back_exactly_what_it_overcounted(k):
     assert stream.stored_len == true_len + (k - 1) + (k + 1 - int(accepted[0]))
 
 
+def test_draft_passes_attend_one_query_a_row():
+    """Pass 0 writes every verify position and attends slot n alone; a later
+    pass runs one token a row, at the position after it. Both reach the
+    attention with each row's keys up to and including its query."""
+    k, rows, heads, kv_heads, dim = 2, 2, 2, 1, 8
+    t = k + 1
+    spec = SpecDecodeResource(device=CPU, num_draft_tokens=k, max_requests=rows, page_size=PAGE,
+                              kv_key="kv", attn_key="attn", stop_token_ids=(EOS,))
+    for r in range(rows):
+        spec.ingest_request(r)
+    image = spec._new_image(rows)
+    image.rows.copy_(torch.tensor([spec._row_of[r] for r in range(rows)], dtype=torch.int32))
+    image.real.fill_(1)
+    width = 16
+    table = (1 + torch.arange(rows * width, dtype=torch.int32)).view(rows, width)
+    from mstar.engine.resources.spec_decode.resource import SpecDecodePlan
+
+    spec._current = SpecDecodePlan(
+        phase=SpecPhase.VERIFY, num_rows=rows, image=image, block_table=table,
+        kv_lens=torch.zeros(rows, dtype=torch.int32), write_pages=torch.zeros(rows * t, dtype=torch.long),
+        write_offsets=torch.zeros(rows * t, dtype=torch.long),
+    )
+    regs = slice(1, rows + 1)
+    spec._seq_len[regs] = torch.tensor([10, 21], dtype=torch.int32)
+    spec._budget[regs] = 1 << 20
+    # row 0 accepts everything, row 1 refuses its first draft
+    spec._tokens[:, regs] = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    ids, _ = spec.verify_inputs()
+    spec.accept_tokens(torch.tensor([3, 5, 9, 8, 8, 8]))
+
+    calls = []
+
+    class Attn:
+        def attend_rows(self, q, layer, kv_lens):
+            calls.append((q.clone(), kv_lens.tolist()))
+            return q
+
+    pages, slots_per_page = 32, PAGE
+    layer = torch.zeros(pages, 2, slots_per_page, kv_heads, dim)
+    spec._kv = type("KV", (), {"layer_view": lambda self, idx: layer})()
+    spec._attn = Attn()
+    cos, sin = torch.ones(64, 2), torch.zeros(64, 2)
+    width_qkv = (2 * heads + 2 * kv_heads) * dim
+    gen = torch.Generator().manual_seed(0)
+    q_w, k_w = torch.zeros(dim), torch.zeros(dim)
+    args = (q_w, k_w, cos, sin, heads, kv_heads, dim, 1e-6, True, 0)
+
+    full = torch.randn(rows * t, width_qkv, generator=gen)
+    out0, gate0 = spec.attend_draft(0, full, *args)
+    assert out0.shape == (rows, heads, dim) and gate0.shape == (rows, heads, dim)
+    # row 0's last accepted slot is 2, row 1's is 0
+    assert spec.draft_slots().tolist() == [2, 3]
+    assert calls[0][1] == [13, 22]
+    pos_pages = [int(table[0, p // PAGE]) for p in (10, 11, 12)]
+    written = layer[pos_pages, 0, [10 % PAGE, 11 % PAGE, 12 % PAGE]]
+    assert written.abs().sum(dim=(1, 2)).min() > 0, "pass 0 writes every verify position of a row"
+
+    one = torch.randn(rows, width_qkv, generator=gen)
+    out1, _ = spec.attend_draft(1, one, *args)
+    assert out1.shape == (rows, heads, dim)
+    assert calls[1][1] == [14, 23]
+    where = spec.draft_address(1)
+    assert where.positions.tolist() == [13, 22]
+    assert where.slots.tolist() == [int(table[r, p // PAGE]) * PAGE + p % PAGE for r, p in enumerate((13, 22))]
+
+
+def test_attend_rows_reads_one_query_a_row_off_a_verify_plan(monkeypatch):
+    from mstar.engine.resources.attn import aiter
+
+    manager = aiter.AiterPagedAttentionManager.__new__(aiter.AiterPagedAttentionManager)
+    manager._device = CPU
+    manager._row_starts, manager._retired_row_starts = None, []
+    manager._reserve_row_starts(3)
+    cu, lens = torch.tensor([0, 3, 6, 9], dtype=torch.int32), torch.zeros(3, dtype=torch.int32)
+    table = torch.zeros(3, 8, dtype=torch.int32)
+    manager._current_plans = {"main": aiter._Staged(cu, lens, table, 3, 1024, 9)}
+    seen = {}
+    monkeypatch.setattr(manager, "_unified", lambda q, plan, layer: seen.update(plan=plan) or q)
+    kv_lens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    manager.attend_rows(torch.zeros(3, 2, 4), None, kv_lens)
+    plan = seen["plan"]
+    assert plan.cu_seqlens_q.tolist() == [0, 1, 2, 3]
+    assert plan.seqused_k is kv_lens and plan.max_seqlen_q == 1 and plan.num_tokens == 3
+    assert plan.block_table is table and plan.max_seqlen_k == 1024
+
+
+def _verify_plan(max_requests: int, rows: int, k: int = 2) -> SpecDecodeResource:
+    """A resource with a verify plan over ``rows`` padding rows."""
+    t = k + 1
+    spec = SpecDecodeResource(device=CPU, num_draft_tokens=k, max_requests=max_requests, page_size=16,
+                              kv_key="kv", attn_key="attn", stop_token_ids=(2,))
+    spec._current = SpecDecodePlan(
+        phase=SpecPhase.VERIFY, num_rows=rows, image=spec._new_image(rows),
+        block_table=torch.zeros(rows, 4, dtype=torch.int32), kv_lens=torch.zeros(rows, dtype=torch.int32),
+        write_pages=torch.zeros(rows * t, dtype=torch.long), write_offsets=torch.zeros(rows * t, dtype=torch.long),
+    )
+    return spec
+
+
+def test_a_bucket_wider_than_the_registers_argmaxes_every_row():
+    rows, t, vocab = 8, 3, 16
+    spec = _verify_plan(max_requests=4, rows=rows)
+    spec.verify_inputs()
+    logits = torch.zeros(rows * t, vocab)
+    logits[:, 3] = 1
+    accepted = spec.accept(logits)
+    assert accepted.target.shape == (rows, t) and accepted.target.eq(3).all()
+    assert spec.record_draft(0, torch.zeros(rows, vocab).index_fill(1, torch.tensor([5]), 1.0)).eq(5).all()
+
+
+def test_a_head_with_no_output_gate_drafts():
+    rows, t, heads, kv_heads, dim = 2, 3, 2, 1, 8
+    spec = _verify_plan(max_requests=4, rows=rows)
+    spec.verify_inputs()
+    spec.accept(torch.zeros(rows * t, 16))
+    layer = torch.zeros(32, 2, 16, kv_heads, dim)
+    spec._kv = SimpleNamespace(layer_view=lambda idx: layer)
+    spec._attn = SimpleNamespace(attend_rows=lambda q, layer, kv_lens: q)
+    qkv = torch.randn(rows * t, (heads + 2 * kv_heads) * dim)
+    weight = torch.zeros(dim)
+    out, _ = spec.attend_draft(0, qkv, weight, weight, torch.ones(64, 2), torch.zeros(64, 2),
+                               heads, kv_heads, dim, 1e-6, False, 0)
+    assert out.shape[0] == rows
+
+
+def test_speculation_refuses_a_context_past_the_rotary_table():
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=1024)
+    model.num_draft_tokens = 2
+    fits, past = ({"resources": {KV_CACHE: {"max_seq_len": n}}} for n in (1024, 1025))
+    model.validate_config_yaml(fits, "x.yaml")
+    with pytest.raises(ValueError, match="max_seq_len=1025"):
+        model.validate_config_yaml(past, "x.yaml")
+    # plain decode builds its rotations from the position
+    model.num_draft_tokens = 0
+    model.validate_config_yaml(past, "x.yaml")
+
+
+def test_an_fp8_head_keeps_a_clear_argmax(monkeypatch):
+    from mstar.engine.resources.spec_decode import draft_head as module
+
+    class Platform:
+        name = "test"
+
+        def fp8_dtype(self):
+            return torch.float8_e4m3fnuz
+
+    monkeypatch.setattr(module, "current_platform", Platform())
+    gen = torch.Generator().manual_seed(0)
+    weight = torch.randn(256, 64, generator=gen, dtype=torch.bfloat16) * 0.02
+    head = module.Fp8DraftHead(weight)
+    assert head.weight.dtype == torch.float8_e4m3fnuz
+    # the engine moves the whole submodule to its dtype
+    bits = head.weight.clone()
+    head = nn.Sequential(head).to(dtype=torch.bfloat16)[0]
+    assert head.weight.dtype == torch.float8_e4m3fnuz and torch.equal(head.weight, bits)
+    # rows along a row of the head: its own dot product stands well clear of the rest
+    x = weight[[3, 200]].float() + 0.001 * torch.randn(2, 64, generator=gen)
+    logits = head(x.to(torch.bfloat16))
+    assert logits.shape == (2, 256) and logits.dtype == torch.bfloat16
+    assert logits.argmax(dim=-1).tolist() == [3, 200]
+
+
 def test_requests_hold_slot_groups_and_return_them():
     k = 3
     h = Harness(k)
@@ -547,7 +716,7 @@ def test_sampled_verification_follows_the_target_distribution(params, monkeypatc
     draft = int(p0.argmax())
     first, after = torch.zeros(vocab), torch.zeros(vocab)
     for _ in range(draws):
-        spec._tokens[regs] = torch.tensor([3, draft])
+        spec._tokens[:, regs] = torch.tensor([[3], [draft]])
         spec._seq_len[regs] = 10
         spec.verify_inputs()
         out = spec.accept(logits.repeat(rows, 1), sample=True)
