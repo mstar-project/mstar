@@ -9,7 +9,7 @@ handle only the gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 import triton.language as tl
@@ -59,6 +59,7 @@ def fused_experts(
     reduce_results: bool = True,
     skip_invalid: bool = False,
     alignment: MoeAlignment | None = None,
+    config: tuple[dict[str, Any], dict[str, Any]] | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -94,6 +95,11 @@ def fused_experts(
     alignment : MoeAlignment, optional
         Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
+    config : tuple of dict, optional
+        Launch parameters for the gate/up GEMM and the down GEMM (tile sizes,
+        ``num_warps``, ``num_stages`` and on AMD compiler options), as
+        :func:`get_config` returns them. Defaults to :func:`get_config` for
+        these sizes.
 
     Returns
     -------
@@ -120,7 +126,7 @@ def fused_experts(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
+    config, down_config = config or get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.

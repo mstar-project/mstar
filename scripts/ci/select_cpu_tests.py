@@ -26,6 +26,7 @@ NOT_CPU_CORE = {
     "test/ci": "the build job runs it with unittest, without PyTorch",
     "test/rust": "the rust-transport job runs it against the built mstar_rust extension",
     "test/integration": "needs a GPU and real weights; skips without the checkpoint",
+    "test/rocm": "AMD GPU kernel tests, run by hand on a ROCm node (pytest test/rocm)",
     "test/asr": "needs a GPU and real weights; skips without CUDA or the checkpoint",
     "test/pi05/batch_test.py": "a load-test script named like a test module; it has no tests",
 }

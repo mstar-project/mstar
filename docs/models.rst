@@ -220,8 +220,9 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
   from ``mstar/utils/fused_moe/configs/`` when one matches the expert shape and
-  GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
-  writes a table for the local GPU.
+  GPU (``E=..,N=..,K=..,device_name=<GPU>.json``), and default tiles otherwise.
+  ``python -m mstar.utils.fused_moe.tune`` writes a table for the local GPU, and
+  on AMD GPUs it tunes Triton's HIP compiler options too.
 - To add a new family, see :doc:`adding_models`.
 
 OmniVoice notes
@@ -320,6 +321,27 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
   together.
+
+Qwen3-Omni notes
+~~~~~~~~~~~~~~~~
+
+- The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
+  kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
+  instead, whose kernels read the expert weights re-tiled once at load. Set it in the
+  serving config's ``model_kwargs:`` block. It's read once when the model is
+  built, so a request's own ``model_kwargs`` can't change it::
+
+      model_kwargs:
+        moe_backend: aiter    # auto (default, Triton) | triton | aiter
+
+  ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
+  (the Talker's experts at TP2 are not) and refuses to start otherwise. Its
+  output isn't bitwise reproducible (identical calls differ in the last bits),
+  so greedy decoding can flip near-tied tokens and repeated requests may not
+  match. The Triton kernels are reproducible.
+- Tuned tables for the Triton kernels ship for MI300X and MI325X, at the
+  Thinker's and Talker's expert sizes without TP or EP (see the fused MoE note
+  under Notes).
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
