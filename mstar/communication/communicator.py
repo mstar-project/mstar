@@ -272,11 +272,10 @@ def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCo
       ``rust/`` extension; see ``communication/rust_communicator.py``) when
       the extension imports successfully, pyzmq otherwise.
     * ``1`` — the Rust communicator; raises if the extension is missing.
-    * ``0`` — always the pyzmq ``ZMQCommunicator``.
+    * ``0`` — always the pyzmq ``ZMQCommunicator``. A worker refuses this: the
+      graph runtime holds a share of the Rust transport.
 
-    The two are wire-compatible (same endpoints, same codec), so the
-    flag can be set per-process — one entity at a time — while the rest of
-    the mesh stays on pyzmq.
+    The two are wire-compatible (same endpoints, same codec).
 
     ``nonblocking_send`` is for a communicator ``OutboxCommunicator`` wraps,
     which needs ``try_send_bytes``: an extension built before

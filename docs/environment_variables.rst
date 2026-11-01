@@ -21,10 +21,10 @@ Communication
        ``AUTO``: the Rust-backed ``RustZMQCommunicator`` when the vendored
        ``rust/`` extension imports successfully, pyzmq otherwise.
        ``1``: the Rust communicator, raising if the extension is missing.
-       ``0``: pyzmq, which only the API server and the conductor can run on.
-       The graph runtime holds a share of the Rust transport, so a worker
-       raises at startup on ``0``, and the conductor refuses it before
-       starting any worker. An extension built before 0.1.1 has no
+       ``0``: pyzmq, which no deployment can run on any more. The graph
+       runtime holds a share of the Rust transport, so a worker raises at
+       startup on ``0``, and the conductor refuses it before starting any
+       worker. An extension built before 0.1.1 has no
        non-blocking ``try_send``, which the API server's preprocess thread
        sends with: for that thread alone, ``AUTO`` then uses pyzmq with a
        warning and ``1`` raises, asking for a rebuild. The conductor, the

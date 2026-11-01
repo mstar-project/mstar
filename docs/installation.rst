@@ -53,7 +53,8 @@ To work on the code, install from source in editable mode:
    uv pip install --torch-backend=auto -e .
 
 This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
-console scripts, ``mstar`` and ``mstar-serve``.
+console scripts, ``mstar`` and ``mstar-serve``. To serve from a checkout, also build the
+extension (see `Rust extension`_).
 
 .. important::
 
@@ -478,7 +479,7 @@ the flags):
   frames a worker sends. It holds a share of the Rust transport and of the Rust
   tensor bookkeeper, and needs the msgpack codec.
 * **ZeroMQ control mesh** — ``MSTAR_RUST_ZMQ``: same endpoints, same wire
-  format as pyzmq, which the API server and the conductor can still run on.
+  format as pyzmq.
 * **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
   transport; requires the extension, interoperates on the same descriptor
   wire (and depends on the transport above only in the sense that both ship
