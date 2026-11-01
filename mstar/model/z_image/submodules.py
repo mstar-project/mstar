@@ -23,6 +23,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine import recompile_limit
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
@@ -151,7 +152,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     Loop state is the fp32 latent ``[16, H/8, W/8]`` (the reference keeps latents fp32 and
     casts to bf16 only for the transformer). Per-shape layout: image-token pad mask and the
-    complex rotary tables for the image and caption spans.
+    rotary tables for the image and caption spans.
     """
 
     # the noise is a function of the latent grid and the seed alone
@@ -175,7 +176,13 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             compile_transformer_forward(
                 transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                recompile_limit=self._recompile_limit(),
             )
+
+    def _recompile_limit(self) -> int:
+        # every block runs one code object, so dynamo's per-code limit counts its shapes over all three spans of every
+        # captured graph, at most two per graph
+        return min(max(recompile_limit(), 2 * len(self.capture_buckets) * len(self.capture_batch_sizes)), 256)
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
@@ -237,7 +244,8 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         image_pad_mask = torch.zeros(bucket_key.image_tokens_padded, dtype=torch.bool)
         image_pad_mask[n_img:] = True
         return {
-            "image_freqs": self.rope(img_ids).to(device), "caption_freqs": self.rope(cap_ids).to(device),
+            "image_rope": tuple(t.to(device) for t in self.rope(img_ids)),
+            "caption_rope": tuple(t.to(device) for t in self.rope(cap_ids)),
             "image_pad_mask": image_pad_mask.to(device),
         }
 
@@ -252,7 +260,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         t_cond = (1000.0 - timestep) / 1000.0
         out = self.transformer(
             tokens, cond[TEXT_EMBEDS], cond[CAP_PAD_MASK], layout["image_pad_mask"].expand(tokens.shape[0], -1),
-            t_cond, layout["image_freqs"], layout["caption_freqs"], ragged=self._ragged_spans(),
+            t_cond, layout["image_rope"], layout["caption_rope"], ragged=self._ragged_spans(),
         )
         channels = self.config.transformer.in_channels
         velocity = -torch.stack([unpatchify_image(row, bucket_key.grid, patch, channels) for row in out.float()])

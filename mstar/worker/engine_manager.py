@@ -12,6 +12,7 @@ from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs
+from mstar.platforms.compile import start_compile_pool
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -136,6 +137,11 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
+        # Before the model does anything: the process's first compile builds the
+        # pool, and a submodule can compile at load (klein warms its VAE decode).
+        if (device_capability or DeviceCapability.of(device)).is_available:
+            start_compile_pool()
+
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
 

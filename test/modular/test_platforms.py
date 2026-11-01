@@ -1,9 +1,13 @@
 """``mstar.platforms``: which hardware the process runs on."""
 
 import copy
+import importlib.util
 import multiprocessing
 import os
 import pickle
+import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +15,7 @@ import torch
 
 from mstar import platforms
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform, current_platform
+from mstar.platforms.interface import BF16_HEADER_FLAG
 
 
 @pytest.fixture
@@ -154,6 +159,60 @@ def test_a_callable_env_default_adds_to_the_value_already_set(monkeypatch):
     assert os.environ["PLATFORM_ENV_TEST_SET"] == "user-default"
 
 
+@pytest.mark.parametrize(
+    ("exported", "expected"),
+    [
+        (None, BF16_HEADER_FLAG),
+        ("-DUSER_FLAG", f"-DUSER_FLAG {BF16_HEADER_FLAG}"),
+        (f"{BF16_HEADER_FLAG} -DUSER_FLAG", f"{BF16_HEADER_FLAG} -DUSER_FLAG"),
+    ],
+)
+def test_rocm_adds_the_bf16_header_to_flashinfer_flags(monkeypatch, exported, expected):
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setenv("FLASHINFER_EXTRA_CUDAFLAGS", "")
+    if exported is None:
+        monkeypatch.delenv("FLASHINFER_EXTRA_CUDAFLAGS")
+    else:
+        monkeypatch.setenv("FLASHINFER_EXTRA_CUDAFLAGS", exported)
+
+    # the conductor applies the defaults, then each worker again
+    platforms.apply_process_env_defaults()
+    platforms.apply_process_env_defaults()
+    assert os.environ["FLASHINFER_EXTRA_CUDAFLAGS"] == expected
+
+
+# aiter's import asks rocminfo for a live GPU; the module generator reads only its path
+_BF16_PREFILL_JIT = """
+import importlib.util, sys, types
+import torch
+aiter = types.ModuleType("aiter")
+aiter.__file__ = importlib.util.find_spec("aiter").origin
+sys.modules["aiter"] = aiter
+from flashinfer.jit.rocm.modules import gen_batch_prefill_module
+bf16 = torch.bfloat16
+gen_batch_prefill_module("aiter", bf16, bf16, bf16, torch.int32, 64, 64, 0, False, False, False).build()
+"""
+
+
+def test_flashinfer_builds_its_bf16_aiter_prefill_with_the_rocm_flags(tmp_path):
+    if importlib.util.find_spec("aiter") is None:
+        pytest.skip("needs AITER")
+    pytest.importorskip("flashinfer.jit.rocm.modules")
+    if shutil.which("amdclang++") is None:
+        pytest.skip("needs amdclang++")
+    env = {
+        **os.environ,
+        "FLASHINFER_EXTRA_CUDAFLAGS": BF16_HEADER_FLAG,
+        "FLASHINFER_ROCM_ARCH_LIST": "gfx942",
+        "FLASHINFER_WORKSPACE_BASE": str(tmp_path),
+    }
+    built = subprocess.run(
+        [sys.executable, "-c", _BF16_PREFILL_JIT],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert built.returncode == 0, built.stderr[-2000:] + built.stdout[-2000:]
+
+
 def test_a_worker_sets_its_env_defaults_before_anything_else(monkeypatch):
     from mstar.conductor import conductor
 
@@ -234,6 +293,74 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
     assert RocmPlatform().process_env_defaults()[solver] == "0"
     for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
         assert solver not in platform.process_env_defaults()
+
+
+def test_only_rocm_builds_inductors_compile_pool_without_its_quiesce():
+    assert RocmPlatform().compile_pool_overrides() == {"quiesce_async_compile_pool": False}
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert platform.compile_pool_overrides() == {}
+
+
+def test_the_compile_pool_keeps_its_settings_out_of_the_cache_key():
+    # a real sidecar, in a process of its own since torch keeps the first pool it builds
+    code = """
+import torch._inductor.config as config
+from torch._inductor.async_compile import AsyncCompile
+from mstar.platforms import RocmPlatform, compile as platform_compile
+
+key = config.save_config_portable()
+platform_compile.current_platform = RocmPlatform()
+platform_compile.start_compile_pool()
+pool = AsyncCompile.process_pool()
+assert pool.timer is None, "the pool would still quiesce"
+assert config.save_config_portable() == key, "a graph's cache key moved"
+pool.shutdown()
+"""
+    subprocess.run([sys.executable, "-c", code], env={**os.environ, "TORCHINDUCTOR_COMPILE_THREADS": "2"}, check=True)
+
+
+@pytest.mark.parametrize(
+    ("platform", "available", "built"),
+    [("RocmPlatform", True, True), ("RocmPlatform", False, False), ("CudaPlatform", True, False)],
+)
+def test_a_worker_builds_the_compile_pool_before_it_touches_the_model(platform, available, built):
+    # a model can compile at load, and the first compile builds the pool under inductor's defaults
+    code = f"""
+from types import SimpleNamespace
+
+import torch
+from torch._inductor.async_compile import AsyncCompile
+
+from mstar import platforms
+from mstar.platforms import compile as platform_compile
+from mstar.worker.engine_manager import EngineManager
+
+
+class ModelTouched(Exception):
+    pass
+
+
+class Model:
+    def __getattr__(self, name):
+        raise ModelTouched
+
+
+platform_compile.current_platform = platforms.{platform}()
+try:
+    EngineManager.build(
+        node_names={{"node"}}, device=torch.device("cpu"), model_config={{}}, parallel_groups=None,
+        transfer_engine_info=None, model=Model(), graph_runtime=None,
+        device_capability=SimpleNamespace(is_available={available}),
+    )
+except ModelTouched:
+    pass
+assert AsyncCompile.process_pool.cache_info().currsize == {int(built)}
+if {built}:
+    pool = AsyncCompile.process_pool()
+    assert pool.timer is None, "the pool would still quiesce"
+    pool.shutdown()
+"""
+    subprocess.run([sys.executable, "-c", code], env={**os.environ, "TORCHINDUCTOR_COMPILE_THREADS": "2"}, check=True)
 
 
 IN_GRAPH_KNOBS = ("ingraph_decode_rope", "sampler_ingraph_scatter")
