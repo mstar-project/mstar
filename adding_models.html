@@ -1991,7 +1991,10 @@ the graph build reads it: <code class="docutils literal notranslate"><span class
 <li><p><code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code>: the most tokens a step runs. A combined walk that carries
 chunked rows sets one too, since its steps run under it.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">accumulated_outputs</span></code>: output edges a consumer needs every chunk of. They arrive as
-one item per chunk. Any other edge carries the final chunk’s output alone.</p></li>
+one item per chunk, all when the prompt finishes.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">per_chunk_outputs</span></code>: streaming edges sent on every chunk as it runs, for a consumer
+that can start on a prefix. Any edge in neither set carries the final chunk’s output
+alone.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">reuses_cached_prefix</span></code>: a callable saying whether a row may start past its cached
 prefix; <code class="docutils literal notranslate"><span class="pre">None</span></code> (the default) is always. Set it where a row may have to write its
 prefix again.</p></li>
@@ -2001,8 +2004,11 @@ a walk whose state grows by something other than the tokens a step runs.</p></li
 </ul>
 <p>A streaming consumer of an accumulated edge whose <code class="docutils literal notranslate"><span class="pre">ChunkPolicy</span></code> expects one item
 (<code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy(1)</span></code>, say) sets <code class="docutils literal notranslate"><span class="pre">Connection.join_dim</span></code>, so its <code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code>
-joins the pieces into that item. Leave it unset for a consumer that can take the
-pieces as they come.</p>
+joins the pieces into that item. A consumer that can take the pieces as they come says
+so with <code class="docutils literal notranslate"><span class="pre">ChunkPolicy.allow_partial_input</span></code> (<code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy(allow_partial=True)</span></code>),
+and the producer then sends the edge per chunk, as Qwen3-Omni’s Thinker does into its
+Talker. A chunked stream its consumer would misread, each piece taken for the whole
+input, is refused at startup.</p>
 </li>
 <li><p><code class="docutils literal notranslate"><span class="pre">get_input_sequence_len(graph_walk,</span> <span class="pre">fwd_info,</span> <span class="pre">inputs)</span></code> gives a row’s length from its
 input shapes, before <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> runs. The scheduler cuts the row by it, and a

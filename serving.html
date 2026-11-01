@@ -1287,9 +1287,10 @@ whole:</p>
 <p>Loading fails if a node is not in any node group, if a walk is one the model never runs, if
 the model sets no budget for that walk, or if the walk is inside a combined walk and its
 node does not set <code class="docutils literal notranslate"><span class="pre">can_override_mixed_max_tokens</span></code>: there the budget would do nothing.</p>
-<p>Chunked prefill is not supported under tensor or sequence parallelism yet. A node whose
-node group spans more than one rank runs its prefills whole, whatever the model and these
-budgets say, and logs a warning at load.</p>
+<p>Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same
+ones. Chunked prefill is not supported under sequence parallelism yet: a node with an SP
+degree above one runs its prefills whole, whatever the model and these budgets say, and
+logs a warning at load.</p>
 <p><strong>Data-parallel routing.</strong> A node group whose <code class="docutils literal notranslate"><span class="pre">ranks</span></code> hold several lockstep instances
 (<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">*</span> <span class="pre">sp_size</span></code> ranks each, or one rank) runs each request on one of them, its
 replica. The conductor picks it per request, at ingest, as the replica with the lowest

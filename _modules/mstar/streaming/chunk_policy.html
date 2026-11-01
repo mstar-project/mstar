@@ -1041,6 +1041,16 @@ window.runMermaid = runMermaid;</script>
         <span class="o">...</span></div>
 
 
+<div class="viewcode-block" id="ChunkPolicy.allow_partial_input">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.allow_partial_input">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">allow_partial_input</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether the consumer takes a chunked prefill a chunk at a time, each</span>
+<span class="sd">        chunk's piece an item of its own (``ChunkingPolicy.per_chunk_outputs``).</span>
+<span class="sd">        Default ``False``: a stream that does so into this consumer is refused</span>
+<span class="sd">        at load, since the consumer would read a piece as the whole input."""</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
 <div class="viewcode-block" id="ChunkPolicy.continue_after_producer_done">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">continue_after_producer_done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1178,14 +1188,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            the producer finishes and all buffered items are consumed. A set</span>
 <span class="sd">            of consumer walks does so only while the consumer is in one of</span>
 <span class="sd">            them; in its other walks the stream just waits.</span>
+<span class="sd">        allow_partial: if True, take a chunked prefill's pieces as they</span>
+<span class="sd">            land (``ChunkPolicy.allow_partial_input``).</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">continue_after_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">allow_partial</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_size</span> <span class="o">=</span> <span class="n">chunk_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span> <span class="o">=</span> <span class="n">continue_after_done</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_allow_partial</span> <span class="o">=</span> <span class="n">allow_partial</span>
 
 <div class="viewcode-block" id="FixedChunkPolicy.is_ready">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.is_ready">[docs]</a>
@@ -1217,6 +1231,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">consumer_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span></div>
+
+
+<div class="viewcode-block" id="FixedChunkPolicy.allow_partial_input">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.allow_partial_input">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">allow_partial_input</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_allow_partial</span></div>
 </div>
 
 

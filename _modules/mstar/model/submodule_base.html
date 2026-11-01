@@ -1530,7 +1530,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    gathered on the Loop and handed over as one item per chunk when the</span>
 <span class="sd">    prompt finishes. A streamed edge's consumer gets them joined into one item</span>
 <span class="sd">    by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here</span>
-<span class="sd">    carries the final chunk's tensors alone.</span>
+<span class="sd">    or in ``per_chunk_outputs`` carries the final chunk's tensors alone.</span>
+
+<span class="sd">    ``per_chunk_outputs``: streaming output edges sent on every chunk as it</span>
+<span class="sd">    runs, each chunk's piece an item of its own, for a consumer that can</span>
+<span class="sd">    start on a prefix (``ChunkPolicy.allow_partial_input``, checked at load).</span>
+<span class="sd">    Disjoint from ``accumulated_outputs``.</span>
 
 <span class="sd">    ``reserve_whole_prefill``: whether a first chunk reserves the KV the</span>
 <span class="sd">    whole prefill needs, so a part-done row cannot wedge on a full arena.</span>
@@ -1541,11 +1546,19 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them</span>
     <span class="n">chunkable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">accumulated_outputs</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="n">per_chunk_outputs</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
     <span class="c1"># most tokens a step of this walk runs; a combined walk that carries chunks sets one too</span>
     <span class="n">max_batch_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># whether a row may start past its cached prefix, asked before prepare; None is always</span>
     <span class="n">reuses_cached_prefix</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">CurrentForwardPassInfo</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">reserve_whole_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span></div>
+    <span class="n">reserve_whole_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">both</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">accumulated_outputs</span> <span class="o">&amp;</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_chunk_outputs</span>
+        <span class="k">if</span> <span class="n">both</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"outputs </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">both</span><span class="p">)</span><span class="si">}</span><span class="s2"> are both gathered and sent per chunk; name each in one"</span>
+            <span class="p">)</span></div>
 
 
 

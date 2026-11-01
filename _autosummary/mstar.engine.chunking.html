@@ -939,7 +939,7 @@ node in <code class="docutils literal notranslate"><span class="pre">override_mi
 it caps that walk’s rows within the step. Elsewhere a per-walk override
 of such a walk would do nothing, so it is refused; the combined walk
 itself can be named instead.</p>
-<p><code class="docutils literal notranslate"><span class="pre">no_chunking</span></code> names nodes this worker chunks nowhere (TP/SP, which
+<p><code class="docutils literal notranslate"><span class="pre">no_chunking</span></code> names nodes this worker chunks nowhere (SP, which
 chunked prefill does not support yet). A budget set on one is still
 validated but has no effect, since the deployment, not the config, is
 what turned chunking off there.</p>
