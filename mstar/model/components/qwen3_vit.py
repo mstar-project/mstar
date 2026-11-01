@@ -232,9 +232,10 @@ class VisionAttention(nn.Module):
         self.ragged_attn = None
 
     def bind_resources(self, resources: dict) -> None:
-        """See ``NodeSubmodule.bind_node_resources``. ``.get``: a deployment
-        that never builds the vision node binds nothing here."""
-        self.ragged_attn = resources.get(self.attn_key)
+        """See ``NodeSubmodule.bind_node_resources``. A node without the resource
+        keeps what was bound before (an owner's own per-frame attention, or nothing:
+        a deployment that never builds the vision node)."""
+        self.ragged_attn = resources.get(self.attn_key, self.ragged_attn)
 
     def forward(
         self,
