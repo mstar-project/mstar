@@ -93,10 +93,7 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     assert isinstance(decode, Loop) and decode.name == REASONER_DECODE_LOOP
     body = decode.section
     assert body.name == REASONER_NODE and set(body.input_names) == {"text_inputs"}
-    # one signal, so the decode step stays on the device
-    assert {(e.next_node, e.name) for e in body.outputs} == {
-        (EMIT_TO_CLIENT, "text_inputs"), (REASONER_NODE, "text_inputs"),
-    }
+    assert {e.name for e in body.outputs} == {"new_token", "text_inputs"}
 
 
 def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:

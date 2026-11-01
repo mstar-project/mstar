@@ -3224,6 +3224,11 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # one vision prefill a step, as before: a video prompt can run to tens of
     # thousands of tokens, and nothing caps a step's tokens
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1]
+    # the decode ladder it captured before moving onto the scaffold
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # decode reads its ids back from the routed token and emits a tensor a
+    # request, as before the scaffold; the device path is a measured change
+    reads_device_loopback = False
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
@@ -3251,8 +3256,15 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
         if not self.config.accelerator_graph or os.environ.get("COSMOS3_DISABLE_ACCELERATOR_GRAPH"):
             return []
         # Prefills stay eager, as before: their captures are unmeasured here, and
-        # the reasoner has no combined walk.
-        return [
+        # the reasoner has no combined walk. A decode step past the top bucket
+        # runs eagerly rather than being capped, as before.
+        decode = [
             config for config in super().get_accelerator_graph_configs(device, tp_world_size)
             if config.capture_graph_walk == self.DECODE_WALK
         ]
+        for config in decode:
+            config.caps_eager_batch_size = False
+        return decode
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        return {}

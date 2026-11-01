@@ -848,10 +848,8 @@ class Cosmos3Model(Model):
             section=GraphNode(
                 name=REASONER_NODE,
                 input_names=["text_inputs"],
-                # every output is the token the node reads back off the
-                # sampler, so it stays on the device
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
                     GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
                 ],
             ),
