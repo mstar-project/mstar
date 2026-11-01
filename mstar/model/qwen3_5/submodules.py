@@ -618,8 +618,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
     ``max_segments_per_step`` segments. A batch that would overflow it or
     the top patch bucket runs its requests one at a time instead, each
     replaying if it fits alone. A request too large alone (a long video)
-    runs the block loop without the graph, in a step of its own
-    (`cg_key_info`).
+    runs the block loop uncaptured; while the block loop is captured for
+    other steps, it gets a step of its own (`cg_key_info`).
     """
 
     # Patch-count buckets of one replay. 16384 patches merge to the LLM's

@@ -111,6 +111,26 @@ def _capture_scope(submodule_mgmt) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
+    """Hold the caching allocator to ``gpu_memory_fraction`` while a node that
+    asks for cuDNN's algorithm search (``capture_cudnn_benchmark``) is sized.
+    The search tries workspaces as large as the device has free, and the
+    allocator keeps them until sizing's ``empty_cache``, past the share a
+    co-located worker plans around. A try past the cap fails and cuDNN
+    skips that algorithm. Any other allocation past it fails too, so the
+    boot fails when the node's eager step does not fit in the share."""
+    if fraction is None or not submodule_mgmt.submodule.capture_cudnn_benchmark:
+        yield
+        return
+    previous = torch.cuda.get_per_process_memory_fraction(device)
+    torch.cuda.set_per_process_memory_fraction(fraction, device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_per_process_memory_fraction(previous, device)
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -832,7 +852,8 @@ class Engine:
             for node_name, submodule_mgmt in self._submodules.items():
                 # sizing runs the forwards and captures (a sized capture runs none of its own),
                 # so under the node's precision and cuDNN search too
-                with _capture_scope(submodule_mgmt):
+                with _capture_scope(submodule_mgmt), \
+                        _search_cap(submodule_mgmt, self._gpu_memory_fraction, self._device):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
@@ -2337,7 +2358,8 @@ class Engine:
     ) -> Any | None:
         """The capture bucket this one request would replay, by
         ``cg_key_info``; None when the walk has no capture or the submodule
-        does not split by it.
+        does not split by it. On a node whose only capture is a piecewise
+        region it is a scheduler group, not a bucket.
 
         A batch spanning two groups matches no capture and runs eager, so the
         scheduler batches each group on its own when the submodule opts in
