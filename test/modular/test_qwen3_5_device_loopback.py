@@ -15,14 +15,19 @@ class _Sampler:
     # the real row override: a routed row's token over the master's
     overwrite_rows = SamplerResource.overwrite_rows
 
-    def __init__(self, masters=True, tokens=None):
+    def __init__(self, masters=True, tokens=None, in_graph=False):
         self.has_slot_masters = masters
+        self.loopback_in_graph = in_graph
         self.tokens = tokens
-        self.asked = None
+        self.asked = 0
         self._row_stager = None
+        self.written = []
 
-    def loopback_tokens(self, request_ids):
-        self.asked = list(request_ids)
+    def write_loopback_tokens(self, rows, tokens):
+        self.written.append((rows, tokens.tolist()))
+
+    def loopback_tokens(self):
+        self.asked += 1
         return self.tokens
 
 
@@ -110,7 +115,7 @@ def test_preprocess_reads_the_step_tokens_off_the_sampler():
     _stub_model(sub, seen)
     out = LLMSubmodule.preprocess(sub, "decode", engine_inputs, rows)
     assert out["input_ids"].tolist() == [3, 4, 0, 0]
-    assert sampler.asked == ["r1", "r2", "pad1", "pad2"]
+    assert sampler.asked == 1
     assert "input_embeds" not in out and seen["n"] == 4
 
 
@@ -158,6 +163,31 @@ def test_in_graph_rope_knob_drops_only_the_staged_tables(monkeypatch):
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
 
 
+def test_a_captured_decode_with_fixed_masters_stages_nothing(monkeypatch):
+    """With the masters fixed in place, the captured forward reads the tokens
+    itself: preprocess stages no input_ids, and a row that brought its token
+    has it written to the masters, except at capture."""
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
+    sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]), in_graph=True)
+    sub = _sub(sampler)
+
+    def leased(capture):
+        return SimpleNamespace(
+            resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
+            step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=object(), graph_walk="decode", capture=capture)),
+        )
+
+    looped = [_prepare(sub, "decode", {}) for _ in range(2)]
+    assert LLMSubmodule.preprocess(sub, "decode", leased(False), looped) == {}
+    assert sampler.asked == 0 and sampler.written == []
+    routed = [looped[0], SimpleNamespace(input_ids=torch.tensor([8]), input_seq_len=1, input_embeds=None)]
+    assert LLMSubmodule.preprocess(sub, "decode", leased(False), routed) == {}
+    assert sampler.written == [([1], [8])]
+    dummies = [SimpleNamespace(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1, input_embeds=None)] * 2
+    assert LLMSubmodule.preprocess(sub, "decode", leased(True), dummies) == {}
+    assert sampler.written == [([1], [8])], "a capture's dummy ids reached the masters"
+
+
 def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
     """A capture hands the region the slot's static input_ids and rotary
     tables. The ids are always the static ones; with the rope knob on, the
@@ -186,7 +216,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
             return pos, pos
 
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
-    sampler.sample = lambda rids, logits: ("sampled", list(rids))
+    sampler.sample = lambda logits: "sampled"
     sub = _sub(sampler)
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
     sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
@@ -201,7 +231,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
         out = LLMSubmodule._forward(
             sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
         )
-        assert out == ("sampled", ["r1", "r2"])
+        assert out == "sampled"
         return dict(calls)
 
     monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)

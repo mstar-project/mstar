@@ -15,7 +15,7 @@ import torch._inductor.config as inductor_config
 from mstar import platforms
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
-from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
+from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, rocm_gemm
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
 
@@ -138,6 +138,71 @@ def test_reset_resolves_again(on_platform):
     assert (cuda.calls, rocm.calls) == (1, 1)
 
 
+class _OnArch(RocmPlatform):
+    """A ROCm process whose GPU is ``arch``; counts the times it is asked."""
+
+    def __init__(self, arch: str):
+        self._arch = arch
+        self.asked = 0
+
+    def arch(self, device=None) -> str:
+        self.asked += 1
+        return self._arch
+
+
+@pytest.mark.parametrize(("arch", "expected"), [("gfx950", "rocm:gfx950"), ("gfx942", "rocm")])
+def test_an_arch_factory_wins_on_its_arch_only(on_platform, arch, expected):
+    on_platform(_OnArch(arch))
+    factories = {"rocm": _Counting("rocm"), "rocm:gfx950": _Counting("rocm:gfx950")}
+    dispatch = PlatformDispatch(
+        "mstar::example", rocm=factories["rocm"], archs={"rocm:gfx950": factories["rocm:gfx950"]},
+    )
+    assert dispatch.selected_key() == expected
+    assert dispatch()[0] == expected
+    assert {key: f.calls for key, f in factories.items()} == {key: int(key == expected) for key in factories}
+
+
+def test_the_arch_is_asked_only_where_the_platform_has_arch_factories(on_platform):
+    platform = on_platform(_OnArch("gfx942"))
+    dispatch = PlatformDispatch("mstar::example", rocm=_Counting("rocm"), archs={"cuda:sm_100": _Counting("sm_100")})
+    assert dispatch()[0] == "rocm"
+    assert platform.asked == 0
+
+
+def test_an_arch_factory_without_a_platform_factory_falls_to_default(on_platform):
+    on_platform(_OnArch("gfx942"))
+    dispatch = PlatformDispatch(
+        "mstar::example", default=_Counting("default"), archs={"rocm:gfx950": _Counting("rocm:gfx950")},
+    )
+    assert dispatch.selected_key() == "default"
+    assert dispatch()[0] == "default"
+
+
+@pytest.mark.parametrize("key", ["gfx950", "rocm", "tpu:v5", "rocm:"])
+def test_a_malformed_arch_key_is_refused(key):
+    with pytest.raises(ValueError, match="'<platform>:<arch>'"):
+        PlatformDispatch("mstar::example", archs={key: _Counting(key)})
+
+
+def test_selecting_runs_no_factory_and_resolve_runs_it_once(on_platform):
+    on_platform(CudaPlatform())
+    cuda = _Counting("cuda")
+    dispatch = _dispatch(cuda=cuda)
+    assert dispatch.selected_key() == "cuda" and cuda.calls == 0
+    impl = dispatch.resolve()
+    assert dispatch.resolve() is impl and cuda.calls == 1
+    assert _dispatch().selected_key() is None
+
+
+def test_reset_all_resets_every_instance(on_platform):
+    on_platform(CudaPlatform())
+    dispatches = [_dispatch(cuda=_Counting("cuda"), rocm=_Counting("rocm")) for _ in range(2)]
+    assert [d()[0] for d in dispatches] == ["cuda", "cuda"]
+    on_platform(RocmPlatform())
+    PlatformDispatch.reset_all()
+    assert [d()[0] for d in dispatches] == ["rocm", "rocm"]
+
+
 # --- with_inductor_overrides ------------------------------------------------
 
 
@@ -147,7 +212,7 @@ class _SmallGemmsOnAten(RocmPlatform):
     def __init__(self):
         self.queries: list[int | None] = []
 
-    def inductor_overrides(self, num_tokens=None):
+    def inductor_overrides(self, num_tokens=None, rows=None):
         self.queries.append(num_tokens)
         if num_tokens is not None and num_tokens <= 32:
             return {"max_autotune_gemm_backends": "ATEN"}
@@ -169,12 +234,20 @@ def test_no_overrides_returns_the_callable_itself(on_platform, platform, num_tok
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "aten_only"), [(1, True), (32, True), (33, False), (1024, False), (None, False)],
+    ("num_tokens", "rows", "aten_only"),
+    [
+        (1, 1, True), (32, 32, True), (32, 4, True), (33, None, False),
+        (64, 64, True), (128, 128, True), (129, 129, False),  # decode buckets
+        (64, 4, False), (128, 16, False), (1024, 16, False),  # packed prefill
+        (None, None, False),
+    ],
 )
-def test_rocm_keeps_small_buckets_gemms_on_aten(num_tokens, aten_only):
-    """Small buckets autotune GEMMs over hipBLASLt only. Bigger ones, and
-    forwards compiled for any token count, keep inductor's defaults."""
-    overrides = RocmPlatform().inductor_overrides(num_tokens)
+def test_rocm_keeps_small_and_decode_buckets_gemms_on_aten(monkeypatch, num_tokens, rows, aten_only):
+    """Small buckets and one-token-per-row buckets up to 128 rows autotune
+    GEMMs over hipBLASLt only. Bigger ones, packed prefills past 32 tokens,
+    and forwards compiled for any token count keep inductor's defaults."""
+    monkeypatch.setattr(rocm_gemm, "skinny_gemm_passes", lambda: None)
+    overrides = RocmPlatform().inductor_overrides(num_tokens, rows)
     assert overrides == ({"max_autotune_gemm_backends": "ATEN"} if aten_only else {})
 
 
@@ -212,7 +285,7 @@ def test_overrides_are_undone_when_the_call_raises(on_platform):
 
 
 class _EverythingOnAten(_SmallGemmsOnAten):
-    def inductor_overrides(self, num_tokens=None):
+    def inductor_overrides(self, num_tokens=None, rows=None):
         self.queries.append(num_tokens)
         return {"max_autotune_gemm_backends": "ATEN"}
 
@@ -247,13 +320,14 @@ class _GraphRunner:
         self._compiled_forwards = {}
 
 
-def _bucket(num_tokens: int):
+def _bucket(num_tokens: int, bs: int | None = None):
     return SimpleNamespace(
         config=SimpleNamespace(
             compile=True, compile_mode=None, capture_forward_method="forward_batched",
         ),
         config_idx=0,
         num_tokens=num_tokens,
+        bs=num_tokens if bs is None else bs,
     )
 
 

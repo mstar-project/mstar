@@ -177,7 +177,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
             # token for each request, never the last row of the whole batch.
             hidden = engine_inputs.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
         logits = self.language_model.compute_logits(hidden)
-        return engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+        return engine_inputs.resources[SAMPLER].sample(logits)
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,

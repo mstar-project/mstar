@@ -8,7 +8,7 @@ import torch
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.utils import Sampler, sample_tokens
-from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 
 pytestmark = pytest.mark.skipif(not torch.xpu.is_available(), reason="requires Intel XPU")
 
@@ -173,7 +173,7 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
     eager_ctx = StepContext(request_ids=rids, graph_walk="decode", slot=0, capture=False)
     captured_ctx = StepContext(
         request_ids=rids, graph_walk="decode", slot=0, capture=False,
-        slot_lease=SlotLease(slot=0, bucket=SimpleNamespace(bs=8)),
+        slot_lease=SlotLease(slot=0, bucket=BucketKey("decode", 8, 8)),
     )
     prompt = SamplerStep(prefill_tracked_tokens={
         rid: torch.tensor([1, 2], device=device) for rid in rids

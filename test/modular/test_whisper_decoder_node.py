@@ -34,7 +34,7 @@ class _Sampler:
     def __init__(self):
         self.logits = []
 
-    def sample(self, request_ids, logits):
+    def sample(self, logits):
         self.logits.append(logits.clone())
         return logits.argmax(-1)
 

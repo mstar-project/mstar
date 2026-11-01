@@ -21,6 +21,7 @@ CPU_TEST_PATHS = (
     "test/sampling_test",
     "mstar/model/*/tests",
     "benchmark/worker_phases",
+    "benchmark/kernels",
 )
 NOT_CPU_CORE = {
     "test/ci": "the build job runs it with unittest, without PyTorch",

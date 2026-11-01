@@ -236,6 +236,15 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
         assert solver not in platform.process_env_defaults()
 
 
+IN_GRAPH_KNOBS = ("ingraph_decode_rope", "sampler_ingraph_scatter")
+
+
+def test_only_rocm_builds_decode_rope_and_sampler_scatter_in_the_graph():
+    assert RocmPlatform().knob_defaults() == {knob: "1" for knob in IN_GRAPH_KNOBS}
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert platform.knob_defaults() == {}
+
+
 @pytest.mark.parametrize("solver", MIOPEN_SPLIT_K)
 @pytest.mark.parametrize(("exported", "expected"), [(None, "0"), ("1", "1")])
 def test_the_miopen_solver_default_keeps_an_exported_value(monkeypatch, solver, exported, expected):
@@ -347,3 +356,19 @@ def test_serve_selects_gpus_through_the_platform(device_env):
     with pytest.raises(SelectedError):
         cli.main(["serve", "kokoro", "--gpus", "2,3"])
     assert selected == ["2,3"]
+
+
+def test_cuda_keeps_nccl_graph_registration_off(monkeypatch):
+    """NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3
+    SP4 images (#915); a branch that rewrites the platform defaults keeps it."""
+    from mstar.platforms import interface
+
+    monkeypatch.setattr(interface, "blackwell_ptxas_env", lambda: {})
+    assert CudaPlatform().process_env_defaults() == {"NCCL_GRAPH_REGISTER": "0"}
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform(), XpuPlatform(), CpuPlatform()], ids=repr)
+def test_env_defaults_are_strings_or_callables(platform):
+    """What ``apply_process_env_defaults`` knows how to apply."""
+    for key, value in platform.process_env_defaults().items():
+        assert isinstance(key, str) and (isinstance(value, str) or callable(value)), key

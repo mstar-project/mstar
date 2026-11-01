@@ -3,8 +3,10 @@
 Each knob is set per deployment in the serving config's ``knobs:`` block
 (``configure`` installs it once per worker process, before the engine is
 built) and can be overridden for a run by its environment variable: a
-non-empty ``MSTAR_*`` value wins over the config, which wins over the default.
+non-empty ``MSTAR_*`` value wins over the config, which wins over the
+platform's default (``Platform.knob_defaults``), then the knob's own default.
 """
+import functools
 import os
 from collections.abc import Mapping
 
@@ -57,13 +59,23 @@ def configure(settings: Mapping[str, object] | None) -> None:
     checked = check(settings)
     _CONFIGURED.clear()
     _CONFIGURED.update(checked)
+    _platform_defaults.cache_clear()
+
+
+@functools.cache
+def _platform_defaults() -> dict[str, str]:
+    from mstar.platforms import current_platform
+
+    return current_platform.knob_defaults()
 
 
 def _setting(key: str, default: str) -> str:
     env = os.environ.get(KNOBS[key])
     if env:
         return env
-    return _CONFIGURED.get(key, default)
+    if key in _CONFIGURED:
+        return _CONFIGURED[key]
+    return _platform_defaults().get(key, default)
 
 
 def device_loopback_enabled() -> bool:
@@ -76,13 +88,13 @@ def device_loopback_enabled() -> bool:
 
 def sampler_ingraph_scatter() -> bool:
     """``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default
-    off): the captured sampler gathers its RNG offsets from the slot masters
-    and scatters the advanced offsets and the sampled tokens back inside the
-    graph, so a replayed step issues none of those launches on the gpu thread
-    (each is a GIL release the main thread's postprocess can win). Padding
-    rows then address a trash master row, and the masters are allocated once
-    for ``sampler_slots`` concurrent requests, since a captured graph holds
-    their addresses."""
+    off, on for AMD GPUs): the captured sampler gathers its RNG offsets from
+    the slot masters and scatters the advanced offsets and the sampled tokens
+    back inside the graph, so a replayed step issues none of those launches on
+    the gpu thread (each is a GIL release the main thread's postprocess can
+    win). Padding rows then address a trash master row, and the masters are
+    allocated once for ``sampler_slots`` concurrent requests, since a captured
+    graph holds their addresses."""
     return _setting("sampler_ingraph_scatter", "0") == "1"
 
 
@@ -94,10 +106,10 @@ def sampler_slots() -> int:
 
 
 def ingraph_decode_rope() -> bool:
-    """``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off): a
-    captured decode step builds its rotary tables inside the graph from the
-    position resource's planned positions instead of staging them before the
-    replay."""
+    """``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off, on
+    for AMD GPUs): a captured decode step builds its rotary tables inside the
+    graph from the position resource's planned positions instead of staging
+    them before the replay."""
     return _setting("ingraph_decode_rope", "0") == "1"
 
 

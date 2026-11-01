@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from mstar.platforms.facts import DeviceFacts, device_facts
 from mstar.platforms.ptxas import blackwell_ptxas_env
 
 logger = logging.getLogger(__name__)
@@ -79,10 +80,19 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
-    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+    def device_facts(self, device=None) -> DeviceFacts:
+        """The GPU's architecture, product, compute units, caches and peak
+        bandwidth and throughput, for kernel heuristics and the kernel harness
+        (see ``mstar.platforms.facts``); never for model code. Unknown fields
+        are None."""
+        return device_facts(self, device)
+
+    def inductor_overrides(
+        self, num_tokens: int | None = None, rows: int | None = None,
+    ) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
-        compiles a forward for ``num_tokens`` tokens, a capture bucket's count,
-        or ``None`` when the forward serves any count.
+        compiles a forward for ``num_tokens`` tokens in ``rows`` rows, a
+        capture bucket's counts, or ``None`` when the forward serves any count.
 
         Meant for inductor codegen settings on this stack (say, which GEMM
         backends to autotune at small sizes), not for picking kernels. Empty
@@ -100,6 +110,12 @@ class Platform:
         defaults and each worker again, so it must return a value that already
         has its addition unchanged.
         """
+        return {}
+
+    def knob_defaults(self) -> dict[str, str]:
+        """This platform's defaults for engine knobs (``mstar.utils.knobs``), by
+        ``knobs:`` key, as strings in the env vars' format. A deployment config's
+        ``knobs:`` block and an exported variable both override them."""
         return {}
 
     def visible_devices_env(
@@ -161,17 +177,52 @@ class RocmPlatform(Platform):
 
     # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
     ATEN_GEMM_MAX_TOKENS = 32
+    # and one-token-per-row (decode) buckets up to this many rows
+    ATEN_GEMM_MAX_DECODE_ROWS = 128
 
-    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+    def inductor_overrides(
+        self, num_tokens: int | None = None, rows: int | None = None,
+    ) -> dict[str, object]:
         # At decode sizes inductor's autotuner can't reliably pick between its
         # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
         # sit above the real kernel time in a graph (6-13 us) and move up to 30%
         # between compiles, so different compiles pick different kernels. On
         # orpheus a bad pick cost 10% of the decode step at concurrency 4.
-        # hipBLASLt alone was the same or better at 1, 4, 16 and 64.
-        if num_tokens is not None and num_tokens <= self.ATEN_GEMM_MAX_TOKENS:
-            return {"max_autotune_gemm_backends": "ATEN"}
-        return {}
+        # hipBLASLt alone was the same or better at 1, 4, 16 and 64. Decode
+        # buckets of 48-128 rows also lose with Triton: it fuses silu*mul into
+        # the down projection's template, 40% slower than hipBLASLt there (9B
+        # c=64: +7.7% tok/s on ATen). Packed prefill buckets keep the Triton
+        # templates, which win there.
+        if num_tokens is None:
+            return {}
+        decode = rows is not None and rows == num_tokens
+        limit = self.ATEN_GEMM_MAX_DECODE_ROWS if decode else self.ATEN_GEMM_MAX_TOKENS
+        if num_tokens > limit:
+            return {}
+        overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
+        from mstar.platforms.rocm_gemm import (
+            DECODE_GEMV_MAX_ROWS,
+            DECODE_LINEAR_MAX_ROWS,
+            SKINNY_MAX_ROWS,
+            ChainedGraphPass,
+            decode_linear_pass,
+            skinny_gemm_passes,
+        )
+
+        post = None
+        if num_tokens <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+            # linears of up to 16 rows on AITER's skinny GEMM or the Triton
+            # weight stream, as the device's tuned config picks per shape
+            overrides["pre_grad_custom_pass"], post = passes
+        if (
+            decode and SKINNY_MAX_ROWS < num_tokens <= DECODE_LINEAR_MAX_ROWS
+            and (tuned := decode_linear_pass()) is not None
+        ):
+            # decode linears still on hipBLASLt take its tuned solution, where the device has one
+            post = tuned if post is None else ChainedGraphPass(post, tuned)
+        if post is not None:
+            overrides["post_grad_custom_post_pass"] = post
+        return overrides
 
     def process_env_defaults(self) -> dict[str, str]:
         return {
@@ -181,6 +232,13 @@ class RocmPlatform(Platform):
             "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC": "0",
             "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_BWD_GTC_XDLOPS_NHWC": "0",
         }
+
+    def knob_defaults(self) -> dict[str, str]:
+        # Each launch next to a replayed decode graph costs about 5 us of GPU
+        # time on MI300X. Building the rope tables and scattering the
+        # sampler's rows inside the graph drops about ten a step (Qwen3.5
+        # 2B/9B: +1-3% tok/s at c=1-4).
+        return {"ingraph_decode_rope": "1", "sampler_ingraph_scatter": "1"}
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
