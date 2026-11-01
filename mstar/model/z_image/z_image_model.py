@@ -70,6 +70,7 @@ class ZImageModel(Model):
         text_encoder_max_batch_size: int | None = None,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
+        text_compile: bool = False,
         async_scheduling: bool = True,
         linear_dtype: str = "bf16",
         fp8_keep_bf16: list[str] | None = None,
@@ -96,6 +97,8 @@ class ZImageModel(Model):
         # largest output (pixels) a request may ask for; larger requests are rejected before scheduling
         self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
+        # the caption encoder compiled, over the caption bucket's width instead of 512 tokens
+        self.text_compile = bool(text_compile)
         # speculative scheduling of the image nodes, on by default (see Flux2KleinModel.async_scheduling)
         self.async_scheduling = bool(async_scheduling)
         # fp8: the DiT blocks' linears (ZImageDiT.FP8_LINEARS) run as fp8 GEMMs where the GPU has them
@@ -309,7 +312,8 @@ class ZImageModel(Model):
 
         if node_name == "text_encoder":
             return ZImageTextEncoderSubmodule(build_text_encoder(self.config, self.snapshot, device), self.config,
-                                              max_batch_size=self.text_encoder_max_batch_size)
+                                              max_batch_size=self.text_encoder_max_batch_size,
+                                              compile_encoder=self.text_compile)
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(
                 build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,

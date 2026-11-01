@@ -42,6 +42,11 @@ model_kwargs:
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
+  # text_compile compiles the caption encoder and runs it over the caption bucket instead of 512 tokens: 21.9 -> 7.3 ms
+  # a request on MI325X, about 1.5% of an image at c=1, for +1 min of startup warm and +2 cold. Off because the caption
+  # features move 2e-3 from the eager forward, and that visibly redraws some images (14 dB on the image set's most
+  # sensitive prompt), too much for the gain. z_image_turbo_textcompile.yaml turns it on. Unmeasured on NVIDIA.
+  text_compile: false
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 

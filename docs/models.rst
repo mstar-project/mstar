@@ -1571,6 +1571,17 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
    36 to 44 GiB compiled.
 
+``text_compile``
+   Z-Image only, off by default. Compiles the caption encoder once for every prompt width
+   and batch size and runs it over the caption bucket rather than the reference's 512
+   tokens: 21.9 to 7.3 ms a request on an MI325X, where the eager forward is launch-bound
+   at any width, or about 1.5% of an image at one request. Caption features land 2e-3 from
+   the eager forward, the same as the width change alone, and that is enough to redraw
+   some images: the image set's most sensitive prompt lands 14 dB from its eager render and
+   looks different, so the default keeps the reference's padding and the eager kernels.
+   ``z_image_turbo_textcompile.yaml`` turns it on. The compile runs at load: startup grows
+   by about a minute with warm caches and two with cold ones.
+
 ``max_image_area``
    Pixels, default 2048². Bounds the output size a request may ask for; larger requests
    are rejected with a 400 before scheduling instead of occupying the worker for minutes
