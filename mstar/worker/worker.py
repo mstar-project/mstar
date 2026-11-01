@@ -758,6 +758,7 @@ class Worker:
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
             batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
+            eager_yield_nodes=(model_config or {}).get("eager_yield_nodes", ()),
         )
         if self.engine_manager.side_keys:
             self.scheduler.lane_of = dict.fromkeys(self.engine_manager.side_keys, SIDE_LANE)
@@ -5076,6 +5077,7 @@ class Worker:
                 fair.peek
                 and (
                     consecutive >= 1
+                    or self.scheduler.yields_eagerly(pending.node_name)
                     or (chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key))
                 )
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
