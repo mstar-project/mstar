@@ -2197,7 +2197,13 @@ class Conductor:
 
     def _ms_to_next_timed_check(self) -> int:
         """How long the run loop can wait for a message: until the liveness
-        check, the earliest expiry deadline or the metrics status.
+        check, the earliest expiry deadline or the metrics status, and at most
+        ``_tick_ms`` while a request is in flight.
+
+        The tick does no work. A timer pending on a core keeps the idle governor
+        out of its deepest states there, so a thread a step wakes on that core
+        mostly skips the exit (see ``mstar.utils.threads``); the wait only runs
+        long when nothing is in flight.
 
         At least 1 ms. The transports read a negative timeout as forever or as
         an error, and a check left due by a pass that raised before reaching it
@@ -2210,11 +2216,15 @@ class Conductor:
         ):
             if deadlines:
                 due = min(due, deadlines[0][0])
-        return max(1, math.ceil((due - time.perf_counter()) * 1000))
+        wait_ms = max(1, math.ceil((due - time.perf_counter()) * 1000))
+        if self._tick_ms > 0 and self.requests:
+            return min(wait_ms, self._tick_ms)
+        return wait_ms
 
     def run(self):
         from mstar.utils.profiler import range_pop, range_push
 
+        self._tick_ms = int(os.environ.get("MSTAR_CONDUCTOR_TICK_MS", "1"))
         self._wait_for_workers_ready()
         # the set-up heap is complete: keep gen-2 collections off it
         freeze_after_setup("Conductor")
