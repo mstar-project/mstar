@@ -381,9 +381,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
-       (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
+       ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
+       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -405,7 +406,7 @@ them by that name:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
 
