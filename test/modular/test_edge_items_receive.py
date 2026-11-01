@@ -40,7 +40,7 @@ def _frame():
     return b.build()
 
 
-def _worker():
+def _worker(join_dim=None):
     w = Worker.__new__(Worker)
     # drained past READS_DONE: it takes no input (`_takes_input`)
     w._reads_done_sent = {"draining"}
@@ -53,7 +53,9 @@ def _worker():
     w._unprocessed_messages = {}
     w._rid = HANDLES.get
     w.request_state = SimpleNamespace(per_request_info={
-        h: SimpleNamespace(stream_buffers={EDGE: StreamBuffer(h, EDGE, "LLM", FixedChunkPolicy(1))})
+        h: SimpleNamespace(stream_buffers={
+            EDGE: StreamBuffer(h, EDGE, "LLM", FixedChunkPolicy(1), join_dim=join_dim),
+        })
         for h in HANDLES.values()
     })
     w.scheduler = SimpleNamespace(failed_rids=set())
@@ -104,6 +106,21 @@ def test_a_frame_does_what_its_rows_as_input_signals_did():
     assert acked == [[4]]
     assert registered == {1: [1, 2], 2: [6], 3: []}
     assert list(parked) == ["later"]
+
+
+def test_a_rows_items_join_as_its_input_signals_did():
+    """A row is one edge's items, so a chunked producer's pieces register as
+    one joined item on a buffer with a ``join_dim``, as INPUT_SIGNALS does."""
+    frame = _frame()
+    batched = _worker(join_dim=0)
+    batched._process_edge_items(frame)
+    one_by_one = _worker(join_dim=0)
+    for row in rows(frame):
+        one_by_one._process_message_list([WorkerMessage(
+            message_type=WorkerMessageType.INPUT_SIGNALS, body=row_input_signals(frame, row),
+        )])
+    assert _state(batched) == _state(one_by_one)
+    assert _state(batched)[2][1] == [(1, 2)]
 
 
 def test_a_frame_starts_its_reads_in_one_call():

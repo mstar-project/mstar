@@ -1360,8 +1360,8 @@ class Worker:
             if stream_buf is None:
                 self._ack_unbuffered(rid, row.request_id, [edge])
                 continue
-            for uuid in frame.uuids[row.start:row.start + row.count]:
-                stream_buf.pre_read_register(uuid)
+            # a row is one edge's items: a chunked producer's pieces join
+            stream_buf.pre_read_register_joined(frame.uuids[row.start:row.start + row.count])
             reads.append((rid, [edge]))
         if reads:
             self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
