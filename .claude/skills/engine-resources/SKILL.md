@@ -19,6 +19,7 @@ Entries marked *open PR* are not on `main` yet. Check the checkout; if your port
 | | `RaggedBlockCausalAttentionSpec` (#381) | each block attends its span's prefix of blocks |
 | a block-causal stream, running only new tokens | paged KV + `BlockCausalAttentionSpec` | a row's new tokens attend its cached blocks and their own |
 | a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #816) | rows at any position in one batch; per-row source; a per-distance score term |
+| a sink plus a sliding window for long chunks (a causal video DiT), attended by the model's own kernel | rolling KV (`RollingKVSpec`) | the window kept compacted, so a step's keys are one contiguous slice for a ragged kernel; per-request sink and window in tokens; no attention of its own, eager only |
 | fixed-size opaque state per request (recurrent, conv tails) | `RecurrentStatePool` | slots read and written through the step's addressing (`gather` / `scatter_`) |
 | per-request adapter weights (LoRA) | `LoraSpec` / `LoraAdapterPool` | a slot per resident adapter, held for a request's lifetime; the step's tokens grouped by slot for the kernels |
 | frame rings (Waypoint) | `RingKVManager` | to be merged into bounded KV |
