@@ -255,8 +255,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget lives in check_stop,
-            # which sees the request's real max_tokens. Sized to the most
+            # Runaway guard only: the per-request budget is the loop cap
+            # (get_loop_caps), set from the request's max_tokens. Sized to the most
             # decode steps any prompt can take before the context guard, not
             # to the default budget: at the default, every request asking for
             # more was cut short at 1025 tokens with no error.

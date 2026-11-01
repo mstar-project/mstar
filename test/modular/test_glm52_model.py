@@ -55,7 +55,6 @@ from mstar.model.glm52.config import (  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import END_PARTITION  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
 def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
@@ -207,7 +206,7 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     assert decode.max_iters < guard, (
         f"loop cap {decode.max_iters} can reach the batch-killing context "
         f"guard at {guard}")
-    # check_stop is the only thing enforcing the real per-request budget,
+    # get_loop_caps' loop cap is what enforces the real per-request budget,
     # because the decode edge carries no conductor_new_token.
     assert not any(e.conductor_new_token for e in decode.section.outputs)
 
@@ -281,11 +280,10 @@ def test_glm52_config_sanity():
 
 
 def _make_submodule(config) -> Glm52LLMSubmodule:
-    # check_stop / preprocess only read self.config; skip nn.Module init.
-    sub = object.__new__(Glm52LLMSubmodule)
-    sub.config = config
-    sub._index_stager = PinnedStager(torch.long)
-    return sub
+    # check_stop / preprocess read only the config and the stop declaration, not the weights
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    return Glm52LLMSubmodule(language_model, config)
 
 
 def _fwd_info(max_tokens=100, ignore_eos=False, iters=0, walk="decode") -> CurrentForwardPassInfo:
@@ -313,23 +311,18 @@ def test_glm52_check_stop_continues_on_normal_token():
     assert sub.check_stop("r0", _fwd_info(), outputs) == set()
 
 
-def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
+def test_glm52_check_stop_ignore_eos_runs_to_the_loop_cap():
+    # the cap (``get_loop_caps``) ends the loop at max_tokens, not the stop check
     sub = _make_submodule(Glm52ModelConfig())
     outputs = {"new_token": [torch.tensor([154820])]}
     assert sub.check_stop("r0", _fwd_info(ignore_eos=True), outputs) == set()
-    # max_tokens counts every generated token, the prefill's included: 1 +
-    # iters+1. For max 8 the stop fires at decode iter 6 (8 total), not 7.
-    assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=5), outputs,
-    ) == set()
-    assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs,
-    ) == {"decode_loop"}
+    assert sub.check_stop("r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs) == set()
 
 
 def test_glm52_check_stop_batched_agrees_with_check_stop():
     """One tolist for the batch, the same answer per request; a row the step has no token
-    for is skipped, as the per-request path skips a request without outputs."""
+    for is skipped, as the per-request path skips a request without outputs. A row at its
+    token budget goes on: the loop's cap ends it."""
     from mstar.model.submodule_base import HostRows
 
     sub = _make_submodule(Glm52ModelConfig())
@@ -345,9 +338,17 @@ def test_glm52_check_stop_batched_agrees_with_check_stop():
         rid: loops for rid, token in zip(rows, tokens, strict=True)
         if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
     }
-    assert batched == per_request == {
-        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "prefill": {END_PARTITION},
-    }
+    assert batched == per_request == {"eos": {"decode_loop"}, "prefill": {END_PARTITION}}
+
+
+@pytest.mark.parametrize(("token", "max_tokens", "ignore_eos", "ends"), [
+    (154820, 100, False, True), (154820, 100, True, False), (42, 1, False, True), (42, 2, False, False),
+])
+def test_glm52_prefill_ends_the_partition_on_a_stop_id_or_a_one_token_budget(token, max_tokens, ignore_eos, ends):
+    """The prefill walk has no loop to stop, and the loop's cap is at least 1."""
+    sub = _make_submodule(Glm52ModelConfig())
+    prefill = _fwd_info(max_tokens=max_tokens, ignore_eos=ignore_eos, walk="prefill")
+    assert sub.check_stop("r0", prefill, {"new_token": [torch.tensor([token])]}) == ({END_PARTITION} if ends else set())
 
 
 # ── submodule: graph configs ──

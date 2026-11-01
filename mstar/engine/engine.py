@@ -543,9 +543,7 @@ class Engine:
             # different workers (for example BAGEL's three CFG branches).
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
-            joint_comm_group = parallel_groups.get_joint_group_for_node(
-                next(iter(relevant_nodes))
-            )
+            joint_comm_group = parallel_groups.get_joint_group_for_node(min(relevant_nodes))
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -1928,10 +1926,8 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
             try:
-                ctx = batch.step_context
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
-                    step_walk=None if ctx.request_walks else ctx.graph_walk,
                 )
             except Exception:
                 logger.debug(

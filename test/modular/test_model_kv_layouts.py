@@ -240,35 +240,21 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_canary_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.canary.canary_model import CanaryModel
-    from mstar.model.canary.submodules import CanaryDecoderSubmodule
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
+    """The prefill emits the first of max_output_tokens, so the decode loop's
+    cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
+    ends at the prefill."""
+    if model_name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
 
-    model = object.__new__(CanaryModel)
-    model.config = SimpleNamespace(max_position_embeddings=1024)
-    decoder = object.__new__(CanaryDecoderSubmodule)
-    decoder.stop_token_ids = frozenset()
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+    else:
+        from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
 
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
-        decoder.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_canary_qwen_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
-    from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
-
-    llm = object.__new__(CanaryQwenLLMSubmodule)
-    llm.stop_token_ids = frozenset()
-
-    assert CanaryQwenModel.get_loop_caps(
-        object.__new__(CanaryQwenModel), max_output_tokens=max_tokens,
-    )["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+        model = object.__new__(CanaryQwenModel)
+    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max(1, max_tokens - 1)
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
@@ -334,21 +320,6 @@ class _Cosmos3Tokenizer:
 
     def convert_tokens_to_ids(self, token):
         return 2
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
-    from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-
-    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0), image_token_id=1)
-
-    cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
@@ -482,41 +453,6 @@ def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
     assert cap == _stops_after(
         llm.check_stop, "decode_loop", "decode", 1024,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-    from mstar.model.qwen3_5.submodules import LLMSubmodule
-
-    llm = SimpleNamespace(config=SimpleNamespace(stop_token_ids=()), _token_is_real=LLMSubmodule._token_is_real)
-
-    def check_stop(request_id, request_info, outputs):
-        return LLMSubmodule.check_stop(llm, request_id, request_info, outputs)
-
-    cap = Qwen3_5DenseModel.get_loop_caps(object.__new__(Qwen3_5DenseModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.glm52.submodules import Glm52LLMSubmodule
-
-    model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
-    llm = object.__new__(Glm52LLMSubmodule)
-    llm.config = model.config
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
 
@@ -686,21 +622,6 @@ def _whisper():
         n_fft=model.config.n_fft, hop_length=model.config.hop_length, chunk_length=model.config.chunk_length,
     )
     return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 1000])
-def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.whisper.config import SAMPLER
-    from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-
-    model = _whisper()
-    bound = model.get_max_output_tokens(max_output_tokens=max_tokens)
-
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
-        WhisperDecoderSubmodule(None, model.config).check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=bound,
-        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
-    ), "the cap and the stop check end decode on different iterations"
 
 
 @pytest.mark.parametrize("language", ["en", None], ids=["forced", "detected"])

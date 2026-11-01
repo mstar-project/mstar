@@ -147,7 +147,7 @@ def test_ragged_spec_builds_its_backend_without_flash_attn(monkeypatch):
     built = {}
 
     class FakeManager:
-        def __init__(self, device, dtype, config):
+        def __init__(self, device, dtype, config, key):
             built.update(device=device, dtype=dtype, config=config)
 
     fake = SimpleNamespace(FlashInferRaggedManager=FakeManager)

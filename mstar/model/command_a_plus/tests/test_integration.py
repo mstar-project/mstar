@@ -104,11 +104,10 @@ class NodeTests(unittest.TestCase):
                 prefill = {"new_token": [torch.tensor([3])]}
                 self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), stop)
 
-    def test_decode_stop_counts_prefill_token_and_respects_ignore_eos(self):
+    def test_decode_stops_on_eos_unless_ignore_eos(self):
+        # a row at its token budget goes on: the loop's cap ends it
         for token, maximum, index, ignore_eos, stops in (
-            (3, 5, 0, False, True), (3, 5, 0, True, False),
-            (7, 2, 0, False, True), (7, 3, 0, False, False),
-            (7, 3, 1, False, True),
+            (3, 5, 0, False, True), (3, 5, 0, True, False), (7, 2, 0, False, False),
         ):
             with self.subTest(token=token, maximum=maximum, index=index, ignore_eos=ignore_eos):
                 request = info("decode", maximum, ignore_eos, index)
@@ -280,6 +279,9 @@ class ModelIntegrationTests(unittest.TestCase):
 
     def test_real_graph_loop_stops_after_total_token_budget(self):
         graph = WorkerGraphIO(self.model.get_graph_walk_graphs()["decode"])
+        # the request's caps, as the worker applies them when the request arrives
+        for name, cap in self.model.get_loop_caps(max_output_tokens=3).items():
+            graph.loops[name].max_iters = min(graph.loops[name].max_iters, cap)
         node = CommandAPlusLLMSubmodule(
             ToyLM(self.model.config.vocab_size), self.model.config, self.model.vision_config.image_token_id,
         )

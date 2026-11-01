@@ -139,10 +139,10 @@ class TransducerSubmodule(NodeSubmodule):
         device = states[0].device
         out = {
             "encoder_states": torch.cat(parts).view(len(states), width, -1),
-            "lengths": to_device_nonblocking(torch.tensor(lengths), device),
+            "lengths": to_device_nonblocking(lengths, device),
         }
         if self.head.prompt_projector is not None:
-            out["prompt_ids"] = to_device_nonblocking(torch.tensor([inp.kwargs[PROMPT_ID] for inp in inputs]), device)
+            out["prompt_ids"] = to_device_nonblocking([inp.kwargs[PROMPT_ID] for inp in inputs], device)
         return out
 
     # -- resources and captures --------------------------------------------------
@@ -266,16 +266,8 @@ class TransducerSubmodule(NodeSubmodule):
         request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
-        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        active = host_rows.buffers.get("active")
-        if not torch.is_tensor(active):
+        pairs = host_rows.first_values("active", request_ids)
+        if pairs is None:
             return None
-        values = active.tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is not None and not values[i]:
-                stops[rid] = {DECODE_LOOP}
-        return stops
+        return {rid: {DECODE_LOOP} for rid, active in pairs if not active}

@@ -46,6 +46,7 @@ Conventions the base fixes:
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
@@ -56,7 +57,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.convenience import RaggedAttentionCallable
+from mstar.model.components.diffusion.attention import RaggedAttentionFn
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
@@ -150,7 +151,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self._seed_pool: ThreadPool | None = None
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
-        self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
+        self._ragged_fns: dict[str, RaggedAttentionFn] = {}
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -308,7 +309,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def step_index(self, fwd_info: CurrentForwardPassInfo) -> int:
         return int(fwd_info.dynamic_loop_iter_counts.get(self.loop_name, 0))
 
-    def _ragged(self) -> RaggedAttentionCallable | None:
+    def _ragged(self) -> RaggedAttentionFn | None:
         """The attention callable for the ``"main"`` span, or None (SDPA)."""
         return self.ragged_for(self.MAIN_SPAN)
 
@@ -316,20 +317,19 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         super().bind_node_resources(resources)
         self._ragged_fns.clear()  # the memoized callables hold the old resource
 
-    def ragged_for(self, label: str) -> RaggedAttentionCallable | None:
+    def ragged_for(self, label: str) -> RaggedAttentionFn | None:
         """``(q, k, v) -> out`` over the segments declared under ``label``, or None
         when no ragged resource is bound (layers then fall back to SDPA).
 
-        One callable per label for the life of the binding: the compiled transformer
-        region guards on the identity of the callables it is handed, and a fresh one
-        per step would recompile it every step until dynamo gave up."""
+        The resource's ``run`` with the label bound, built once per label for the life
+        of the binding rather than per step."""
         if self.attn_resource_key is None:
             return None
         if label not in self._ragged_fns:
             resource = self.node_resources.get(self.attn_resource_key)
             if resource is None:
                 return None
-            self._ragged_fns[label] = RaggedAttentionCallable(resource, label)
+            self._ragged_fns[label] = functools.partial(resource.run, label=label)
         return self._ragged_fns[label]
 
     # --------------------------------------------------------- engine contract

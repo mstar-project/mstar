@@ -130,8 +130,7 @@ class AttentionManager(AttentionResource):
                 f"{AttnBackend.FLASHINFER_MLA.value!r} reads it"
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
-        if info.joint_comm_group is not None:
-            kv_config.shard(info.joint_comm_group.world_size)
+        kv_config.shard(info.head_shards)
         if backend == AttnBackend.DENSE:
             # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
             # that has no kernel for the GPU or does not import, the same pass

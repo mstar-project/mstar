@@ -138,10 +138,9 @@ class RecurrentStatePool(Resource):
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
     ) -> "RecurrentStatePool":
         config = spec.config
-        world_size = 1
-        if info.joint_comm_group is not None:
-            world_size = info.joint_comm_group.world_size
-            config.shard(world_size)
+        config.shard(info.head_shards)
+        group = info.joint_comm_group
+        world_size = group.world_size if group is not None else 1
         kv = info.dependencies.get(config.kv_cache)
         if world_size > 1 or kv is None or not kv.config.prefix_cache:
             # no snapshot slots where the prefix cache can't open

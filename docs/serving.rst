@@ -305,7 +305,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
        comes from the extension, or give ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
-       long prompts take (a long-context prefill). A malformed or failing warmup
+       long prompts take (a long-context prefill). Each entry is sent as many
+       times at once as the most data-parallel replicas any of the model's worker
+       graphs is served by (the replicas the conductor picks from; a node group no
+       walk places adds none), so every replica warms. When some worker graph has
+       fewer replicas than that, such as one DiT instance beside a replicated VAE,
+       the entry first runs once alone, so that graph also warms its one-request
+       shape before the copies reach it together. A malformed or failing warmup
        is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel

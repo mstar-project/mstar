@@ -29,12 +29,12 @@ from mstar.model.command_a_plus.config import (
     CommandAPlusTextConfig,
 )
 from mstar.model.submodule_base import (
-    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
 
 
@@ -89,6 +89,10 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model
         self.config = config
         self.image_token_id = image_token_id
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset({config.eos_token_id}),
+            sampler=SAMPLER, prefill_walks=frozenset(PREFILL_WALKS),
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -207,20 +211,3 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
                 outputs["decode_input"] = outputs["new_token"]
             return
         outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(self, request_id, request_info, outputs) -> set[str]:
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        if request_info.graph_walk in PREFILL_WALKS:
-            # the reply's first token, before decode_loop exists
-            eos = not ignore_eos and outputs["new_token"][0].item() == self.config.eos_token_id
-            return {END_PARTITION} if eos else set()
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        # The loop index is zero-based; include the prefill token and the
-        # token produced by this decode iteration.
-        generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if (not ignore_eos and token == self.config.eos_token_id) or generated >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()
-
