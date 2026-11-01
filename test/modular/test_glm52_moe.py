@@ -246,7 +246,7 @@ def test_submodule_refuses_post_load_dtype_cast():
     scales_before = moe.experts.gate_up_proj_scale_inv.data.clone()
     bias_before = moe.gate.e_score_correction_bias.data.clone()
 
-    sub = Glm52LLMSubmodule(language_model=lm, config=cfg)
+    sub = Glm52LLMSubmodule(lm, cfg)
     sub.to(device="cpu", dtype=torch.bfloat16)  # the engine manager's call
 
     assert moe.experts.gate_up_proj_scale_inv.dtype == torch.float32
@@ -340,7 +340,7 @@ def test_cuda_graphs_return_with_fused_dispatch():
     lm = _torch.nn.Module()
     lm.blk = Glm52SparseMoeBlock(cfg)
     # object.__new__ skipped nn.Module.__init__, so bypass its __setattr__.
-    object.__setattr__(sub, "language_model", lm)
+    object.__setattr__(sub, "model", lm)
 
     lm.blk._use_fused = False
     assert sub.get_accelerator_graph_configs(_torch.device("cpu")) == []

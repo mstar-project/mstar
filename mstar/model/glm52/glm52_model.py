@@ -248,18 +248,20 @@ class Glm52Model(Model):
                         next_node="LLM",
                         name="text_inputs",
                     ),
+                    # named as the loop's own edge: a decode step's one output
+                    # signal then stays on the device (device loop-back) and
+                    # reaches the client inline
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
-                        name="new_token",
+                        name="text_inputs",
                         output_modality="text",
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget lives in check_stop,
-            # which sees the request's real max_tokens. Sized to the most
-            # decode steps any prompt can take before the context guard, not
-            # to the default budget: at the default, every request asking for
-            # more was cut short at 1025 tokens with no error.
+            # The window, not the request's budget, which is its loop cap
+            # (get_loop_caps): the most decode steps any prompt can take
+            # before the context guard. Sized to the default budget, every
+            # request asking for more was cut short at 1025 tokens.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -520,7 +522,7 @@ class Glm52Model(Model):
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model, self.config)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:

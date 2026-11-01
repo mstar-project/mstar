@@ -442,23 +442,6 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     assert model.kv_labels()[KV_CACHE]["main"].keys is None
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.glm52.submodules import Glm52LLMSubmodule
-
-    model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
-    llm = object.__new__(Glm52LLMSubmodule)
-    llm.config = model.config
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
@@ -624,6 +607,10 @@ def _token_decoder(name: str):
         model = object.__new__(CanaryModel)
         model.config = SimpleNamespace(max_position_embeddings=1024)
         return model
+    if name == "glm52":
+        from mstar.model.glm52.glm52_model import Glm52Model
+
+        return Glm52Model(model_path_hf="", tokenizer_mode="byte")
     if name == "qwen3_asr":
         from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
         from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
@@ -641,7 +628,9 @@ def _token_decoder(name: str):
     return object.__new__(classes[name])
 
 
-@pytest.mark.parametrize("name", ["canary", "canary_qwen", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"])
+@pytest.mark.parametrize(
+    "name", ["canary", "canary_qwen", "glm52", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"],
+)
 @pytest.mark.parametrize("max_tokens", [2, 64])
 def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
     """The prefill samples the first token and the decode loop's cap runs the

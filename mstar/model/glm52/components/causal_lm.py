@@ -30,13 +30,13 @@ class Glm52LanguageModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Layer order IS the IndexShare order under dsa_long_context: each FULL
         layer's pick is the one the SHARED layers after it reuse, until the next
         FULL layer (the DSA resource keeps it for the forward)."""
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = input_embeds
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(hidden_states, position_ids)
         return self.norm(hidden_states)
@@ -51,14 +51,23 @@ class Glm52ForCausalLM(nn.Module):
         self.model = Glm52LanguageModel(config, comm_group=comm_group)
         self.lm_head = build_lm_head(config, comm_group=comm_group)
 
+    # The decoder contract `SampledTokenDecoder` drives.
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        *,
+        label: str,
         position_ids: torch.Tensor,
-        **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, position_ids)
-        return self.lm_head(hidden_states)
+        del label  # one KV label, which the layers' resources default to
+        return self.model(input_embeds, position_ids)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden)
 
     def load_weights(self, weights, **kwargs) -> set[str]:
         from mstar.model.glm52.weight_loader import load_glm52_hf_weights
