@@ -37,7 +37,7 @@ import itertools
 import logging
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -56,7 +56,12 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
-from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
+from mstar.model.qwen3_tts.components.conv_stack import (
+    ChannelsLastConvStack,
+    causal_receptive_field_frames,
+    channels_last_applies,
+    conv_stack,
+)
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import (
     Qwen3TTSMelFrontEnd,
@@ -65,6 +70,7 @@ from mstar.model.qwen3_tts.components.speaker_encoder import (
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
+    blackwell_path_measured,
 )
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
@@ -96,6 +102,18 @@ from mstar.utils.h2d import PinnedStager
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
+# what a two-token first depth pass feeds: the Talker hidden state and the group-0 embedding
+FIRST_PASS_TOKENS = 2
+
+
+class DepthAddressing(NamedTuple):
+    """Each depth token's position and batch row, for one batch size. The tensors
+    outlive a capture, so a replay spends no launches rebuilding them."""
+
+    first_positions: torch.Tensor  # [batch * FIRST_PASS_TOKENS], a two-token first pass
+    first_rows: torch.Tensor  # [batch * FIRST_PASS_TOKENS]
+    positions: torch.Tensor  # [groups, batch], the single-token passes
+    rows: torch.Tensor  # [batch]
 
 
 def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
@@ -167,6 +185,11 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         # Lazy frame-local CodePredictor KV scratch, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
+        self._depth_addressing: DepthAddressing | None = None
+        # Decided once, on the device the weights loaded to.
+        self.two_token_first_pass = blackwell_path_measured(self.get_device())
+        talker_model.model.fused_add_norm = self.two_token_first_pass
+        code_predictor.fused_add_norm = self.two_token_first_pass
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -234,6 +257,30 @@ class TalkerSubmodule(ARNodeSubmodule):
                 device=self.get_device(),
             )
         return self._cp_kv_cache[:, :batch_size]
+
+    def _get_depth_addressing(self, batch_size: int) -> DepthAddressing:
+        """The depth loop's addressing, cut to this micro-batch from tables built
+        once on the first (uncaptured) forward."""
+        full = self._depth_addressing
+        if full is None:
+            device = self.get_device()
+            rows = torch.arange(self.MAX_BATCH_SIZE, dtype=torch.long, device=device)
+            # int32 is what the eager RoPE reads, so it casts nothing per layer
+            first = torch.arange(FIRST_PASS_TOKENS, dtype=torch.int32, device=device)
+            full = self._depth_addressing = DepthAddressing(
+                first_positions=first.repeat(self.MAX_BATCH_SIZE),
+                first_rows=rows.repeat_interleave(FIRST_PASS_TOKENS),
+                positions=torch.arange(self.num_codes, dtype=torch.int32, device=device)
+                .unsqueeze(1).repeat(1, self.MAX_BATCH_SIZE),
+                rows=rows,
+            )
+        tokens = batch_size * FIRST_PASS_TOKENS
+        return DepthAddressing(
+            first_positions=full.first_positions[:tokens],
+            first_rows=full.first_rows[:tokens],
+            positions=full.positions[:, :batch_size],
+            rows=full.rows[:batch_size],
+        )
 
     def _project_text(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Map tokenizer embeddings into the Talker hidden width."""
@@ -632,19 +679,28 @@ class TalkerSubmodule(ARNodeSubmodule):
         codec_embed_sum = codec_embed.clone()
 
         cp_cache = self._get_cp_kv_cache(batch_size)
-        pos = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
-        # Position 0 conditions the depth decoder on the Talker hidden state.
-        # Each following position consumes the previous group's embedding.
-        self.code_predictor.forward_depth_unrolled(
-            last_hidden.unsqueeze(1), pos, cp_cache, cache_pos=0
-        )
-        for group_idx in range(1, self.num_codes):
-            pos.fill_(group_idx)
+        addressing = self._get_depth_addressing(batch_size)
+        # Position 0 conditions the depth decoder on the Talker hidden state,
+        # and each following position consumes the previous group's embedding.
+        # Positions 0 and 1 can run as two tokens of one pass, which predicts
+        # group 1.
+        if self.two_token_first_pass:
             cp_hidden = self.code_predictor.forward_depth_unrolled(
-                codec_embed.unsqueeze(1), pos, cp_cache, cache_pos=group_idx
-            ).squeeze(1)
+                torch.stack((last_hidden, codec_embed), dim=1),
+                addressing.first_positions, addressing.first_rows, cp_cache, cache_pos=0,
+            )
+        else:
+            self.code_predictor.forward_depth_unrolled(
+                last_hidden.unsqueeze(1), addressing.positions[0], addressing.rows, cp_cache, cache_pos=0,
+            )
+        for group_idx in range(1, self.num_codes):
+            if group_idx > 1 or not self.two_token_first_pass:
+                cp_hidden = self.code_predictor.forward_depth_unrolled(
+                    codec_embed.unsqueeze(1),
+                    addressing.positions[group_idx], addressing.rows, cp_cache, cache_pos=group_idx,
+                )
             cp_logits = torch.matmul(
-                cp_hidden,
+                cp_hidden[:, -1],
                 self.code_predictor.lm_head_weight[group_idx - 1].t(),
             )
             codes = sample_codes(cp_logits)
@@ -1012,6 +1068,11 @@ class CodecSubmodule(ARNodeSubmodule):
         fuse_snake_activations(decoder)
         self.conv_context = self._split_conv_context(decoder, config) if config.codec.split_decode else None
         self.split_decode = self.conv_context is not None
+        self.channels_last_stack = (
+            ChannelsLastConvStack(decoder)
+            if self.split_decode and channels_last_applies(next(decoder.parameters()).device)
+            else None
+        )
         self._conv_start_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
 
     @staticmethod
@@ -1153,9 +1214,12 @@ class CodecSubmodule(ARNodeSubmodule):
             # that out of its audio.
             index = (conv_start.view(-1, 1) + torch.arange(length, device=hidden.device)).clamp_(max=width - 1)
             hidden = hidden.gather(2, index.unsqueeze(1).expand(-1, hidden.shape[1], -1))
-            for module in conv_stack(decoder):
-                hidden = module(hidden)
-            wav = hidden
+            if self.channels_last_stack is not None:
+                wav = self.channels_last_stack(hidden)
+            else:
+                wav = hidden
+                for module in conv_stack(decoder):
+                    wav = module(wav)
         return (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze(1)
 
     def forward(

@@ -598,11 +598,19 @@ Qwen3-TTS notes
   On its own it lowers first-audio latency at high concurrency; with
   ``mps: true`` in the YAML (see :doc:`serving`) the two workers' kernels also
   overlap, which raised c=32 throughput by about a fifth on an H100.
-- The codec decoder runs in float32 by default, reproducing the reference
-  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
-  deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
-  B300 that is slower, not faster: cuDNN's heuristics run several of its
-  convs on a kernel without tensor cores, so measure before switching.
+- On Blackwell the Talker and the code predictor defer each residual add into
+  the next norm, as one in-place kernel, and the predictor's first pass runs
+  positions 0 and 1 as two tokens. Both were measured only there, so older
+  GPUs run a plain add and one token per pass (``blackwell_path_measured``).
+- The codec decoder runs in float32 by default. On CUDA its conv stack runs
+  channels-last (``ChannelsLastConvStack``), a fifth to a third off a captured
+  decode on a B300 at 91 dB median PSNR against the reference decoder; off
+  CUDA it runs the reference stack, bit for bit. ``model_kwargs: {codec_dtype:
+  bfloat16}`` in the deployment YAML selects a bf16 codec (the Talker is bf16
+  either way). Channels-last on a B300, bf16 is another 7-17% faster but
+  further off: 57 dB median and 36 dB worst PSNR against fp32 over 200
+  sentences. Off that stack it is slower, not faster, because cuDNN's
+  heuristics run several of its convs on a kernel without tensor cores.
 - Opt-in AudioSeal watermark on the codec's output (off by default; install
   ``pip install -e '.[audioseal]'``). Turn it on in the deployment YAML::
 
