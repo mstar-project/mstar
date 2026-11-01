@@ -682,7 +682,8 @@ class Cosmos3OmniTransformer(nn.Module):
             latent = latent.reshape(latent_channel, t_actual, h_patches, p, w_patches, p)
             latent = torch.einsum("cthpwq->thwpqc", latent).reshape(-1, p * p * latent_channel)
             packed_latent.append(latent)
-        return torch.cat(packed_latent, dim=0), original_latent_shapes
+        # the denoise loop keeps its latents in fp32; the projection takes them in the model dtype
+        return torch.cat(packed_latent, dim=0).to(self.proj_in.weight.dtype), original_latent_shapes
 
     def _unpatchify_and_unpack_latents(
         self,
@@ -1294,7 +1295,9 @@ class Cosmos3OmniTransformer(nn.Module):
 
         return _decode(gen_out[:n]), _decode(gen_out[n:])
 
-    def denoise_step_batched(self, requests: list[dict], label: str, attn):
+    def denoise_step_batched(
+        self, requests: list[dict], label: str, attn, cond_branch: bool | None = None,
+    ):
         """Denoise one step for several requests at once (image / video).
 
         Each request carries its own latents, timestep, rotary tables (which
@@ -1312,7 +1315,11 @@ class Cosmos3OmniTransformer(nn.Module):
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``; sound-band
         requests additionally carry ``sound_latents``, ``sound_timesteps``,
         ``sound_token_shapes``, ``sound_noisy_frame_indexes``,
-        ``sound_mse_gen_indexes``."""
+        ``sound_mse_gen_indexes``.
+
+        With ``cond_branch`` set, this rank runs one branch of every request
+        (``GuidanceParallel``): the pack is that branch alone, and each entry of
+        the result is that branch's velocity."""
         gen_seqs, shapes, cos_cond, sin_cond, cos_uncond, sin_uncond = [], [], [], [], [], []
         for req in requests:
             packed, original_latent_shapes = self._patchify_and_pack_latents([req["latents"]])
@@ -1345,11 +1352,16 @@ class Cosmos3OmniTransformer(nn.Module):
             cos_uncond.append(cu)
             sin_uncond.append(su)
 
-        # Conditional block first (all requests), then unconditional block.
-        all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
-        cos = torch.cat(cos_cond + cos_uncond, dim=0)
-        sin = torch.cat(sin_cond + sin_uncond, dim=0)
         self._gen_attend.bind_step(attn=attn, label=label)
+        if cond_branch is None:
+            # Conditional block first (all requests), then unconditional block.
+            all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
+            cos = torch.cat(cos_cond + cos_uncond, dim=0)
+            sin = torch.cat(sin_cond + sin_uncond, dim=0)
+        else:
+            all_gen = torch.cat(gen_seqs, dim=0)
+            cos = torch.cat(cos_cond if cond_branch else cos_uncond, dim=0)
+            sin = torch.cat(sin_cond if cond_branch else sin_uncond, dim=0)
         gen_out = self.gen_layers_batched(all_gen, cos, sin)
 
         sizes = [g.shape[0] for g in gen_seqs]
@@ -1376,9 +1388,12 @@ class Cosmos3OmniTransformer(nn.Module):
         for i, req in enumerate(requests):
             n = sizes[i]
             cond_v = _decode(cond_out[off:off + n], req, shapes[i])
-            uncond_v = _decode(uncond_out[off:off + n], req, shapes[i])
+            if cond_branch is None:
+                uncond_v = _decode(uncond_out[off:off + n], req, shapes[i])
+                results.append((cond_v, uncond_v))
+            else:
+                results.append(cond_v)
             off += n
-            results.append((cond_v, uncond_v))
         return results
 
     def denoise_step_action_batched(

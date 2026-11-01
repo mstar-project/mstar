@@ -956,6 +956,15 @@ Chatterbox notes
   by precision, eager vs. CUDA graph; ``gpu_util.py`` summarises
   ``nvidia-smi dmon`` samples taken during runs).
 
+Cosmos3 on two GPUs
+-------------------
+
+``configs/cosmos3_nano_cfg2.yaml`` runs each guidance branch on its own rank
+(``cfg_size: 2``, see :doc:`serving`) on the image and video walks. Both ranks prefill and
+hold both branches' text K/V, so the KV pool stays replicated and admits alike. The denoise
+steps run eager, with no captured denoise graph; the sound and action walks run both
+branches on both ranks, with no gain over one GPU.
+
 Cosmos3 environment requirements
 --------------------------------
 
@@ -1320,6 +1329,10 @@ a separate stage: the solver state (the order-2 history buffer and the
 corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
 travels with the request rather than living in a scheduler object on one rank.
 Requests are therefore independent and the loop is resumable across ranks.
+
+**Two GPUs.** ``configs/wan22_cfg2.yaml`` runs each guidance branch on its own rank
+(``cfg_size: 2``, see :doc:`serving`) on the scaffold loop, with one captured graph per
+shape and rank at half the rows; ``dit_loop: legacy`` refuses it.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,

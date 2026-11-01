@@ -465,7 +465,7 @@ def _cfg_parallel_pool(node: str, world_size: int = 1) -> KVManager:
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"}, leader="LLM",
         config=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=9, page_size=16),
     )
-    group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size)
+    group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size, head_shards=world_size)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))

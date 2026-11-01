@@ -161,6 +161,12 @@ ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
 
+# Image/video denoise state (initial noise, latents between steps, the guidance
+# combine and the scheduler step) is fp32, as diffusers' pipeline keeps it; only
+# the transformer input is bf16. Windowed rollouts keep their latents in the
+# model dtype.
+LATENT_DTYPE = torch.float32
+
 # The reasoner's walks and its decode loop.
 REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
 REASONER_DECODE_LOOP = "reasoner_decode_loop"
@@ -250,6 +256,13 @@ def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int):
     return np.linspace(1.0 - 1.0 / num_train_timesteps, 0.0, num_inference_steps + 1)[:-1]
 
 
+def _guided(cond_v: torch.Tensor, uncond_v: torch.Tensor, gs: float, dtype: torch.dtype) -> torch.Tensor:
+    """Classifier-free guidance combine in the loop-state dtype."""
+    cond_v = cond_v.to(dtype)
+    uncond_v = uncond_v.to(dtype)
+    return uncond_v + gs * (cond_v - uncond_v)
+
+
 @dataclass(frozen=True)
 class GenStepInfo:
     """What a denoise step's declaration needs and cannot read off the batch.
@@ -334,10 +347,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
+    def __init__(
+        self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None,
+        guidance_parallel=None,
+    ):
         super().__init__()
         self.transformer = transformer
         self.config = config
+        # One guidance branch per rank (see ``_packs_guidance_branches``); None runs both here.
+        self.guidance_parallel = guidance_parallel
         # Re-encodes the frames a chained window (or a resumed session)
         # continues from; built only for deployments serving windowed video.
         self._window_head = (
@@ -1239,7 +1257,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # seeded windowed request is deterministic end to end.
                 st.add("ar_generator", gen)
             latents = torch.randn(
-                st["latent_shape"], generator=gen, device=device, dtype=self.transformer.proj_in.weight.dtype
+                st["latent_shape"], generator=gen, device=device,
+                dtype=self.transformer.proj_in.weight.dtype if windowed else LATENT_DTYPE,
             )
             cond_latents = st.get("cond_latents")
             if cond_latents is not None:
@@ -1510,7 +1529,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 (COND_LABEL, UNCOND_LABEL) if infos[0].cfg else (COND_LABEL,)
             )
             return self._gen_step(
-                request_ids, spans, labels, combined=True, attn_key=attn_key,
+                request_ids, spans, labels, combined=self._packs_guidance_branches(graph_walk), attn_key=attn_key,
             )
 
         if not infos[0].cfg_active:
@@ -1524,8 +1543,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # plans each branch on its own label and runs two forwards.
         return self._gen_step(
             request_ids, spans, (COND_LABEL, UNCOND_LABEL),
-            combined=self.batched_cfg, attn_key=attn_key,
+            combined=self.batched_cfg and self._packs_guidance_branches(graph_walk), attn_key=attn_key,
         )
+
+    def _packs_guidance_branches(self, graph_walk: str) -> bool:
+        """Whether a guided step's branches share one plan and one forward. Under
+        ``GuidanceParallel`` the video and image walks don't, though every rank still
+        declares both labels: the pool's pages are replicated state, and a branch's page
+        count follows its own prompt's length, so a rank that reserved only its own label
+        could admit a step the other rank refuses. Each rank then runs its own label's
+        plan. The sound and action walks run both branches on every rank, as one GPU does."""
+        return self.guidance_parallel is None or graph_walk not in GEN_WALKS
 
     @staticmethod
     def _segments(
@@ -1668,10 +1696,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
-    # Run in the model's native bf16, NOT the engine autocast: autocast keeps
-    # norms in fp32, perturbing the velocity ~1 ULP/step — harmless for one
-    # image step but amplified geometrically over the multi-step video denoise.
-    # The reference pipeline runs pure bf16; parity requires matching it.
+    # Run the transformer in the model's native bf16, NOT the engine autocast:
+    # autocast keeps norms in fp32, perturbing the velocity ~1 ULP/step, which
+    # the multi-step denoise amplifies. The reference runs the transformer in
+    # pure bf16 and the loop state around it in fp32 (LATENT_DTYPE).
     @torch.autocast(device_type="cuda", enabled=False)
     def _states(self, engine_inputs: ModelInputsFromEngine) -> dict:
         """The batch's per-request states: the engine-injected view when
@@ -1782,7 +1810,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cfg_active = self._cfg_active(st, step_index)
 
         if not cfg_active:
-            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
+            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL).to(latents.dtype)
+        elif self.guidance_parallel is not None:
+            placed = self.guidance_parallel
+            mine, label = ("cond", COND_LABEL) if placed.runs_cond else ("uncond", UNCOND_LABEL)
+            cond_v, uncond_v = placed.exchange(self._denoise(attn, st[mine], latents, vision_timesteps, label))
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
         elif self.batched_cfg:
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents,
@@ -1795,11 +1828,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 CFG_BATCHED_LABEL,
                 attn,
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
         else:
             cond_v = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
             uncond_v = self._denoise(attn, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
 
         new_latents = self._scheduler_step(st, velocity, t, latents)
         if st.get("vmask") is not None:
@@ -2105,11 +2138,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             })
             meta.append((rid, st, lat, ti, t, step_index))
 
-        results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
+        placed = self.guidance_parallel
+        if placed is None:
+            results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
+        else:
+            # one exchange per row: rows of one batch may differ in shape
+            label = COND_LABEL if placed.runs_cond else UNCOND_LABEL
+            results = [
+                placed.exchange(velocity)
+                for velocity in self.transformer.denoise_step_batched(reqs, label, attn, cond_branch=placed.runs_cond)
+            ]
 
         out = {}
         for (rid, st, lat, ti, t, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
             new_latents = self._scheduler_step(st, velocity, t, lat)
             if st.get("vmask") is not None:
                 # Video-to-video: re-inject the clean conditioning frames, as in
@@ -2280,7 +2322,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             capture_batch_sizes = [int(x) for x in bs_env.split(",")]
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
-        dtype = self.transformer.proj_in.weight.dtype
+        # the static latents buffer holds the fp32 loop state; windowed bf16
+        # latents copy into it exactly
+        dtype = LATENT_DTYPE
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         # The capture is bit-faithful at every resolution (the rotary tables
@@ -2303,6 +2347,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         tiers = [(h, w, 1, IMAGE_GEN_WALK, None) for h, w in resolutions] + [
             (h, w, f, VIDEO_GEN_WALK, [VIDEO_GEN_WALK, VIDEO_GEN_AR_WALK]) for h, w, f in video_tiers
         ]
+        if self.guidance_parallel is not None:
+            # a denoise graph runs both guidance branches, so under the placement
+            # every denoise step takes the eager path
+            tiers = []
         for height, width, frames, walk, replay_walks in tiers:
             latent_shape = self._latent_shape(height, width, num_frames=frames)
             latent_area = latent_shape[3] * latent_shape[4]
@@ -2514,10 +2562,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if request_info.graph_walk not in GEN_WALKS or "cond_v" not in outputs:
             return
         st = self.request_states[request_id]
-        velocity = outputs["uncond_v"][0] + st["gs"] * (
-            outputs["cond_v"][0] - outputs["uncond_v"][0]
-        )
         latents = inputs.tensor_inputs["latents"]
+        velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
         time_index = inputs.tensor_inputs["time_index"]
         outputs.clear()
         # step_index is in range here: prepare_inputs vetoes the loop's extra

@@ -247,6 +247,12 @@ def test_only_rocm_builds_decode_rope_and_sampler_scatter_in_the_graph():
         assert platform.knob_defaults() == {}
 
 
+def test_only_rocm_turns_tp_async_scheduling_on_by_default():
+    assert RocmPlatform().tp_async_sched_default()
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert not platform.tp_async_sched_default()
+
+
 @pytest.mark.parametrize("solver", MIOPEN_SPLIT_K)
 @pytest.mark.parametrize(("exported", "expected"), [(None, "0"), ("1", "1")])
 def test_the_miopen_solver_default_keeps_an_exported_value(monkeypatch, solver, exported, expected):

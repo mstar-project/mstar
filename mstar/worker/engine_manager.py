@@ -6,6 +6,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.distributed.guidance_parallel import GuidanceParallel
 from mstar.engine.engine import Engine
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -50,6 +51,25 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
                         f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
                         "set enable_async_scheduling=False on one of them"
                     )
+
+
+def parallel_kwargs(
+    node: str, parallel_groups: WorkerParallelGroups, moe_parallel: dict,
+) -> dict:
+    """What ``Model.get_submodule`` takes beyond the TP group for ``node``.
+
+    Each is opt-in per node: passed only when the node takes part in it, so a
+    model without the feature keeps its existing ``get_submodule`` signature."""
+    extra = {}
+    sp_group = parallel_groups.get_sp_config_for_node(node)
+    if sp_group.world_size > 1:
+        extra["sp_group"] = sp_group
+    cfg_group = parallel_groups.get_cfg_config_for_node(node)
+    if cfg_group.world_size > 1:
+        extra["guidance_parallel"] = GuidanceParallel(cfg_group)
+    if node in moe_parallel:
+        extra["moe_parallel"] = moe_parallel[node]
+    return extra
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
@@ -136,20 +156,10 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence parallelism is opt-in per node; only forward the SP
-            # group when this node actually participates in one, so models
-            # that don't support SP keep their existing get_submodule call.
-            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
-            extra = {}
-            node_sp_group = parallel_groups.get_sp_config_for_node(name)
-            if node_sp_group.world_size > 1:
-                extra["sp_group"] = node_sp_group
-            if name in moe_parallel:
-                extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
                 name, device,
                 tp_group=parallel_groups.get_tp_config_for_node(name),
-                autocast_dtype=autocast_dtype, **extra,
+                autocast_dtype=autocast_dtype, **parallel_kwargs(name, parallel_groups, moe_parallel),
             )
             if submodule is None:
                 continue

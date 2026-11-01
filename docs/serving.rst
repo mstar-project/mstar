@@ -242,7 +242,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       ``ep_config`` block picks TP or EP for the group's MoE experts. ``cfg_size: 2``
+       runs one guidance branch per rank, and ``replica_policy`` picks how requests
+       choose among a group's replicas (``random``, the default, or ``round_robin``).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -334,8 +336,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        rendezvouses. Default 512.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
-       overrides it).
+       (default; on AMD GPUs the nodes with ``tp_size`` > 1 and no ``cfg_size`` default
+       to on) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
@@ -470,6 +472,30 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+**Guidance parallelism.** A guided denoise step is two transformer rows that share only
+their inputs. ``cfg_size: 2`` on a node group runs the conditional row on the group's first
+rank and the unconditional row on its second, exchanging the two velocities once per step
+before the solver, so both ranks run the same solver step and the latents stay replicated:
+
+.. code-block:: yaml
+
+   model: "wan22"
+   max_seq_len: 512
+   node_groups:
+     - {node_names: [text_encoder], ranks: [0]}
+     - {node_names: [vae_encoder, vae_decoder], ranks: [0, 1], replica_policy: round_robin}
+     - {node_names: [dit], ranks: [0, 1], cfg_size: 2}
+
+The two ranks are one lockstep instance, so a node that holds one of them (a VAE decode
+here) holds the other too. With decoders on both ranks and requests taking them in turn, two
+concurrent clips decode side by side instead of one after the other; a step of the node runs
+ahead of a decode on its rank, a few steps at most, so a clip one step behind finishes first
+and the two decodes line up. ``cfg_size`` multiplies ``tp_size`` and ``sp_size`` into the
+instance. A node must be declared guidance-parallel by the model;
+``configs/wan22_cfg2.yaml`` and ``configs/cosmos3_nano_cfg2.yaml`` ship it. These nodes run
+the serial lockstep protocol by default: a step here is GPU-bound, and async scheduling
+measured level with it on MI325X (Wan2.2 at concurrency 2, 29.4 against 29.6 clips/min).
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank

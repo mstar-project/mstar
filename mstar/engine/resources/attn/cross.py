@@ -69,7 +69,7 @@ class CrossAttentionManager(AttentionResource):
             spec.config.backend, info.device, kv_config.page_size,
         )
         if info.joint_comm_group is not None:
-            kv_config.shard(info.joint_comm_group.world_size)
+            kv_config.shard(info.joint_comm_group.head_shards)
         if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,
