@@ -113,7 +113,7 @@ class Platform:
         return {}
 
     def compile_pool_overrides(self) -> dict[str, object]:
-        """``torch._inductor.config`` values in force while the engine builds
+        """``torch._inductor.config`` values in force while a worker builds
         Inductor's compile pool. Unlike ``inductor_overrides`` these never reach
         a graph's cache key. Empty keeps inductor's defaults."""
         return {}
