@@ -4,8 +4,6 @@ indptrs (`_compute_plan_state` into the captured state)."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 import torch
 
@@ -50,7 +48,6 @@ def _state():
 
 def test_host_addressing_matches_device_unpacking():
     kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
     kv._device = torch.device("cpu")
     kv._plan_stager = PinnedStager(torch.long)
     rng = np.random.default_rng(0)
@@ -58,9 +55,9 @@ def test_host_addressing_matches_device_unpacking():
         indptrs = _indptrs(rng)
         ref = _state()
         ref.copy_(
-            kv._compute_plan_state(indptrs, total_tokens=int(indptrs.qo_indptr[-1])), CAPTURE,
+            kv._compute_plan_state(indptrs, total_tokens=int(indptrs.qo_indptr[-1]), page_size=PAGE), CAPTURE,
         )
-        got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
+        got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE)
         assert got.total_tokens == ref.total_tokens
         assert torch.equal(got.token_to_page[:CAPTURE], ref.token_to_page[:CAPTURE])
         assert torch.equal(got.token_to_cache[:CAPTURE], ref.token_to_cache[:CAPTURE])
@@ -73,7 +70,6 @@ def test_a_row_past_its_pages_is_refused():
     import pytest
 
     kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
     kv._plan_stager = PinnedStager(torch.long)
     i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
     for kvp, idx, last in (
@@ -85,4 +81,4 @@ def test_a_row_past_its_pages_is_refused():
             paged_kv_last_page_len=i32(last), kv_lens=None,
         )
         with pytest.raises(RuntimeError, match="past its own pages"):
-            kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
+            kv._stage_packed_plan_state(indptrs, _state(), CAPTURE, PAGE)

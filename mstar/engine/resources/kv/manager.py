@@ -2279,11 +2279,10 @@ class KVManager(AttentionResource):
         return pages, offsets
 
     def _stage_packed_plan_state(
-        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int,
+        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int, page_size: int,
     ) -> KVPlanState:
         """``_compute_plan_state`` + ``KVPlanState.copy_``, computed on the host
         from the indptrs the plan built there, in one H2D per buffer."""
-        page_size = self.kv_cache.page_size
         qo = indptrs.qo_indptr.numpy()
         kvp = indptrs.paged_kv_indptr.numpy()
         spans = np.diff(qo)
@@ -2362,7 +2361,7 @@ class KVManager(AttentionResource):
                 # host indptrs, staged as for decode, not unpacked on device
                 plan_state = self._stage_packed_plan_state(
                     indptrs.cpu_indptrs, self._static_plan_state(lease.slot, label),
-                    lease.bucket.num_tokens,
+                    lease.bucket.num_tokens, page_size,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
