@@ -1338,7 +1338,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># all, beyond fitting a captured bucket. For a limit the bucket key does</span>
     <span class="c1"># not express, such as how many attention segments a replay's plan holds.</span>
     <span class="c1"># A batch it rejects gets no lease, so its forward runs the region eagerly</span>
-    <span class="c1"># (`ModelInputsFromEngine.step` is the declaration that tells it so).</span>
+    <span class="c1"># (`ModelInputsFromEngine.piecewise_leases` is what tells it so).</span>
     <span class="c1"># None: every batch that fits a bucket.</span>
     <span class="n">can_lease</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># The region replays a whole step as ONE row, however many requests the</span>

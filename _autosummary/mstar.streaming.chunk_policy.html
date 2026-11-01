@@ -1161,9 +1161,11 @@ the buffer retains older items so the chunk contains the full window.</p>
 larger chunks once the stream is running. Chunk <code class="docutils literal notranslate"><span class="pre">k</span></code> delivers
 <code class="docutils literal notranslate"><span class="pre">schedule[k]</span></code> new items (<code class="docutils literal notranslate"><span class="pre">chunk</span></code> once the schedule is exhausted) with
 up to <code class="docutils literal notranslate"><span class="pre">left_context</span></code> already-delivered items in front of them, so a
-causal decoder can warm up on frames it has processed before. Unlike
-<code class="docutils literal notranslate"><span class="pre">LeftContextChunkPolicy</span></code> the first chunk may be smaller than the
-context: the context is whatever has been delivered so far, capped.</p>
+causal decoder can warm up on frames it has processed before. A primed
+first chunk carries the whole primed lead instead, whatever
+<code class="docutils literal notranslate"><span class="pre">left_context</span></code> is (see <code class="docutils literal notranslate"><span class="pre">prime</span></code>). Unlike <code class="docutils literal notranslate"><span class="pre">LeftContextChunkPolicy</span></code>
+the first chunk may be smaller than the context: the context is whatever
+has been delivered so far, capped.</p>
 <p>Example (Qwen3-TTS, 12 Hz frames): <code class="docutils literal notranslate"><span class="pre">schedule=(4,</span> <span class="pre">8,</span> <span class="pre">16)</span></code>, <code class="docutils literal notranslate"><span class="pre">chunk=25</span></code>,
 <code class="docutils literal notranslate"><span class="pre">left_context=25</span></code> pops windows of 4, 4+8, 12+16, 25+25, 25+25, …
 items and the first audio leaves after four frames instead of 300.</p>
@@ -1213,10 +1215,9 @@ For sliding-window policies this is the stride, not the window.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime">
 <span class="sig-name descname"><span class="pre">prime</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#ScheduledLeftContextChunkPolicy.prime"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime" title="Link to this definition">#</a></dt>
-<dd><p>The stream starts with <code class="docutils literal notranslate"><span class="pre">context_items</span></code> items that count as already
-delivered: they reach the consumer only as context of the first chunk.</p>
-<p>Called before the first chunk. Only policies with a notion of context
-support it.</p>
+<dd><p>The first chunk leads with <code class="docutils literal notranslate"><span class="pre">context_items</span></code> context-only items, however
+many <code class="docutils literal notranslate"><span class="pre">left_context</span></code> allows later chunks (a stateful consumer warms up
+on them once and needs no context after).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>context_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>

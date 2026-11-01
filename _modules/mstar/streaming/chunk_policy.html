@@ -1307,9 +1307,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    larger chunks once the stream is running. Chunk ``k`` delivers</span>
 <span class="sd">    ``schedule[k]`` new items (``chunk`` once the schedule is exhausted) with</span>
 <span class="sd">    up to ``left_context`` already-delivered items in front of them, so a</span>
-<span class="sd">    causal decoder can warm up on frames it has processed before. Unlike</span>
-<span class="sd">    ``LeftContextChunkPolicy`` the first chunk may be smaller than the</span>
-<span class="sd">    context: the context is whatever has been delivered so far, capped.</span>
+<span class="sd">    causal decoder can warm up on frames it has processed before. A primed</span>
+<span class="sd">    first chunk carries the whole primed lead instead, whatever</span>
+<span class="sd">    ``left_context`` is (see ``prime``). Unlike ``LeftContextChunkPolicy``</span>
+<span class="sd">    the first chunk may be smaller than the context: the context is whatever</span>
+<span class="sd">    has been delivered so far, capped.</span>
 
 <span class="sd">    Example (Qwen3-TTS, 12 Hz frames): ``schedule=(4, 8, 16)``, ``chunk=25``,</span>
 <span class="sd">    ``left_context=25`` pops windows of 4, 4+8, 12+16, 25+25, 25+25, ...</span>
@@ -1334,11 +1336,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.prime">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prime</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context_items</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">context_items</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"can prime 0..</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span><span class="si">}</span><span class="s2"> context items before the first chunk, "</span>
-                <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="n">context_items</span><span class="si">}</span><span class="s2">"</span>
-            <span class="p">)</span>
+<span class="w">        </span><span class="sd">"""The first chunk leads with ``context_items`` context-only items, however</span>
+<span class="sd">        many ``left_context`` allows later chunks (a stateful consumer warms up</span>
+<span class="sd">        on them once and needs no context after)."""</span>
+        <span class="k">if</span> <span class="n">context_items</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"can prime context items only before the first chunk, got </span><span class="si">{</span><span class="n">context_items</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">=</span> <span class="n">context_items</span></div>
 
 
@@ -1348,6 +1350,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunk</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_context</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span>   <span class="c1"># what was primed</span>
         <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span><span class="p">)</span>
 
 <div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.is_ready">
