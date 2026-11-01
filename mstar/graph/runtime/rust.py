@@ -658,20 +658,25 @@ class RustGraphRuntime(GraphRuntime):
         self, partition: str, graph_walk: str, node_name: str,
         output_signals: list[str], rids: list[int],
         inline_signal: str, inline_column: torch.Tensor,
-        row_rids: list[int],
+        row_rids: list[int], logprob_column: torch.Tensor | None = None,
     ) -> InlineRoute:
         """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
         step, one crossing with the GIL released (see the Rust side).
 
         ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
-        caller keeps alive; Rust reads it in place.
+        caller keeps alive; Rust reads it in place. ``logprob_column``, the
+        same rows' log-probs, is read the same way.
         """
+        lp = None if logprob_column is None else logprob_column.float()
         out = self._rust.route_and_send_inline(
             partition=partition, graph_walk=graph_walk, node_name=node_name,
             output_signals=list(output_signals), rids=rids, inline_signal=inline_signal,
             inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
             inline_stride=inline_column.stride(0),
             inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
+            logprob_ptr=0 if lp is None else lp.data_ptr(),
+            logprob_rows=0 if lp is None else lp.shape[0],
+            logprob_stride=0 if lp is None else lp.stride(0),
         )
         status = InlineRouteStatus(out.status)
         route = None

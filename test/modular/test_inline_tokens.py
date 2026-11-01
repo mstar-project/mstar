@@ -16,6 +16,7 @@ from mstar.communication import wire
 from mstar.communication.event import EventWakeup
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime.base import InlineRouteStatus
 from mstar.model.base import Model
 from mstar.model.submodule_base import HostRows
 from mstar.worker.worker import Worker
@@ -349,9 +350,27 @@ def test_row_logprobs_follow_the_batch_order():
     assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
 
 
-def test_a_step_with_logprobs_skips_the_fused_route():
-    # the fused route builds no route input, which is where log-probs ride
-    worker = _worker(SimpleNamespace(supports_route_and_send_inline=True))
-    rows = HostRows((7,), {"new_token": torch.tensor([70]), SAMPLED_LOGPROB: torch.tensor([-0.5])})
-    batch_N = SimpleNamespace(batch=SimpleNamespace(output_signals=["text_inputs"]))
-    assert worker._route_and_send_fast(batch_N, rows, None, [7], set()) is False
+def test_a_step_with_logprobs_hands_the_fused_route_its_rows():
+    seen = {}
+
+    class _Fused(_Runtime):
+        supports_route_and_send_inline = True
+
+        def route_and_send_inline(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(status=InlineRouteStatus.NOT_ROUTED)
+
+    class _LoopbackEngine(_Engine):
+        def device_loopback_signals(self, node_name, graph_walk):
+            return ["new_token"]
+
+    w = _worker(_Fused())
+    w.enable_prof, w._device_loopback = False, {}
+    batch = _Batch()
+    batch.partition = "p"
+    batch.batch.output_signals, batch.batch.graph_walk = ["new_token"], "decode"
+    batch.node_batch.partition_done_rids = ()
+    logprobs = torch.tensor([-0.5, float("nan")])
+    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]]), SAMPLED_LOGPROB: logprobs})
+    assert w._route_and_send_fast(batch, rows, _LoopbackEngine({"new_token": "new_token"}), [7, 8], set()) is False
+    assert seen["logprob_column"] is logprobs

@@ -83,11 +83,11 @@ def _start(rt, n):
     return rids
 
 
-def _general_step(rt, rids, values):
+def _general_step(rt, rids, values, logprobs=()):
     out = rt.complete_and_route_batch(RouteInput(
         partition=PART, graph_walk=WALK, node_name=NODE, output_signals=[SIG],
         wg_ids=ParallelList(rids, [0] * len(rids)), tensors=[],
-        num_tensors=[0] * len(rids), inline_signal=SIG, inline_values=values,
+        num_tensors=[0] * len(rids), inline_signal=SIG, inline_values=values, logprobs=logprobs,
     ))
     info = sorted(out.rids_needing_request_info)
     return rt.send_outputs(SendInput(
@@ -97,9 +97,9 @@ def _general_step(rt, rids, values):
     ))
 
 
-def _fused_step(rt, rids, column, row_rids):
+def _fused_step(rt, rids, column, row_rids, logprob_column=None):
     status, _cid, sent, route = rt.route_and_send_inline(
-        PART, WALK, NODE, [SIG], rids, SIG, column, row_rids,
+        PART, WALK, NODE, [SIG], rids, SIG, column, row_rids, logprob_column,
     )
     assert status in (InlineRouteStatus.SENT, InlineRouteStatus.ROUTED)
     if status is InlineRouteStatus.SENT:
@@ -114,9 +114,10 @@ def _fused_step(rt, rids, column, row_rids):
     ))
 
 
+@pytest.mark.parametrize("with_logprobs", [False, True], ids=["", "logprobs"])
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("reverse_rows", [False, True], ids=["in_order", "permuted"])
-def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
+def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows, with_logprobs):
     n = 5
     dirs = {k: tmp_path / k for k in ("g", "f")}
     boxes = {}
@@ -137,8 +138,13 @@ def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
         row_rids = list(reversed(rids)) if reverse_rows else list(rids)
         rows = torch.tensor([values[rids.index(r)] for r in row_rids], dtype=dtype)
         column = rows.reshape(-1, 1).reshape(rows.shape[0], -1)[:, 0]
-        sent_g = _general_step(rts["g"], rids, values)
-        sent_f = _fused_step(rts["f"], rids, column, row_rids)
+        # the second request did not ask
+        logprobs = [None if i == 1 else -0.25 * (step + i) for i in range(n)] if with_logprobs else []
+        lp_rows = torch.tensor(
+            [float("nan") if (lp := logprobs[rids.index(r)]) is None else lp for r in row_rids]
+        ) if with_logprobs else None
+        sent_g = _general_step(rts["g"], rids, values, logprobs)
+        sent_f = _fused_step(rts["f"], rids, column, row_rids, lp_rows)
         assert sent_g == sent_f
         statuses.append(bool(sent_f))
         assert (
@@ -150,6 +156,8 @@ def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
         got = {k: _collect(boxes[k][peer]) for k in boxes}
         assert got["g"] == got["f"], peer
         assert got["g"], peer
+        if with_logprobs and peer == "api_server":
+            assert any(getattr(m.body, "logprobs", None) for m in got["f"])
     for rt in rts.values():
         assert rt._rust.num_parked_completions() == 0
 

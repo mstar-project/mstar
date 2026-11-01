@@ -3170,6 +3170,8 @@ impl GraphRuntime {
     /// ``inline_ptr`` with ``inline_stride`` elements between rows, row i
     /// belonging to ``row_rids[i]``. The caller keeps the tensor alive and
     /// landed for the call (it has waited on the step's completion event).
+    /// ``logprob_ptr``, when non-zero, is the same rows' float32 log-probs
+    /// (NaN where a request did not ask), laid out the same way.
     ///
     /// Returns ``status``:
     ///   0 -- nothing done (a rid has no row, or an unsupported dtype): take
@@ -3183,7 +3185,7 @@ impl GraphRuntime {
     #[pyo3(signature = (
         partition, graph_walk, node_name, output_signals, rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        row_rids,
+        row_rids, logprob_ptr=0, logprob_rows=0, logprob_stride=0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn route_and_send_inline(
@@ -3200,12 +3202,18 @@ impl GraphRuntime {
         inline_stride: usize,
         inline_dtype: &str,
         row_rids: Vec<u32>,
+        logprob_ptr: usize,
+        logprob_rows: usize,
+        logprob_stride: usize,
     ) -> PyResult<FusedRouteOut> {
         let itemsize = match inline_dtype {
             "int64" | "int32" => if inline_dtype == "int64" { 8 } else { 4 },
             _ => return Ok(FusedRouteOut::default()),
         };
-        if inline_ptr == 0 || row_rids.len() > inline_rows {
+        if inline_ptr == 0
+            || row_rids.len() > inline_rows
+            || (logprob_ptr != 0 && row_rids.len() > logprob_rows)
+        {
             return Ok(FusedRouteOut::default());
         }
         let t_nogil = std::time::Instant::now();
@@ -3224,21 +3232,34 @@ impl GraphRuntime {
                     }
                 }
             };
+            let logprob = |row: usize| -> Option<f64> {
+                // SAFETY: as `read`, with logprob_rows >= row_rids.len() checked above.
+                let lp = unsafe {
+                    std::ptr::read_unaligned((logprob_ptr as *const f32).add(row * logprob_stride))
+                };
+                (!lp.is_nan()).then_some(f64::from(lp))
+            };
             let n = rids.len();
             let in_order = row_rids.len() >= n && row_rids[..n] == rids[..];
-            let values: Vec<i64> = if in_order {
-                (0..n).map(read).collect()
+            let rows: Vec<usize> = if in_order {
+                (0..n).collect()
             } else {
                 let row_of: FxHashMap<u32, usize> =
                     row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
                 let mut v = Vec::with_capacity(n);
                 for r in &rids {
                     match row_of.get(r) {
-                        Some(&i) => v.push(read(i)),
+                        Some(&i) => v.push(i),
                         None => return Ok(FusedRouteOut::default()),
                     }
                 }
                 v
+            };
+            let values: Vec<i64> = rows.iter().map(|&r| read(r)).collect();
+            let logprobs: Vec<Option<f64>> = if logprob_ptr == 0 {
+                Vec::new()
+            } else {
+                rows.iter().map(|&r| logprob(r)).collect()
             };
             let n_sig = output_signals.len();
             let route = self.complete_and_route_batch(RouteArg {
@@ -3251,7 +3272,7 @@ impl GraphRuntime {
                 num_tensors: vec![0; n * n_sig],
                 inline_signal: Some(inline_signal),
                 inline_values: values,
-                logprobs: Vec::new(),
+                logprobs,
                 walks: None,
                 rid_walk_idx: None,
             })?;

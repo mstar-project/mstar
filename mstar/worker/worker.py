@@ -3597,9 +3597,7 @@ class Worker:
         batch = batch_N.batch
         signals = batch.output_signals
         if (
-            # log-probs ride the route input, which this path doesn't build
-            host_rows is None or SAMPLED_LOGPROB in host_rows.buffers
-            or batch.request_walks or self.enable_prof
+            host_rows is None or batch.request_walks or self.enable_prof
             or batch_N.node_batch.partition_done_rids
             or batch_N.node_batch.withheld_outputs
             or not getattr(rt, "supports_route_and_send_inline", False)
@@ -3621,6 +3619,7 @@ class Worker:
             node_name=batch_N.node_name, output_signals=signals, rids=rids,
             inline_signal=signal, inline_column=column,
             row_rids=list(host_rows.request_ids),
+            logprob_column=host_rows.buffers.get(SAMPLED_LOGPROB),
         )
         if inline.status is InlineRouteStatus.NOT_ROUTED:
             return False
