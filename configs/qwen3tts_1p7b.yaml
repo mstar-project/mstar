@@ -4,6 +4,15 @@
 # identical across sizes (28 layers, 8 KV heads, head_dim 128).
 model: "qwen3_tts_1p7b"
 max_seq_len: 32768
+# bf16 codec decoder (norms and RoPE stay fp32): about twice a float32 codec
+# step's speed on an H100, within the WER/speaker gate on this checkpoint
+model_kwargs:
+  codec_dtype: bfloat16
+  # A 4-frame first chunk (320 ms of audio, three Talker steps later): with a
+  # 1-frame one (80 ms) the next chunk arrived after the client had played it
+  # under load, the one pause behind the misses near capacity. It costs about
+  # 20 ms of first-audio latency on an idle server.
+  codec_chunk_schedule: [4, 8, 16]
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
 # On B300 (sm_103) FA2 stays the decode backend too: trtllm-gen rebuilds its
@@ -13,6 +22,11 @@ max_seq_len: 32768
 resources:
   talker_attn:
     flashinfer_backend: fa2
+  # One codec stream slot per live request: past saturation the 256-slot
+  # default filled, codec admits failed every step and the backlog never
+  # drained.
+  codec_state:
+    max_slots: 512
 node_groups:
   - node_names: [Talker]
     ranks: [0]
@@ -20,3 +34,8 @@ node_groups:
   - node_names: [Codec]
     ranks: [0]
     graph_walks: [codec_chunk]
+# A large decode step keeps more young objects alive than CPython's 700-object
+# gen-0 threshold, so a collection runs almost every step and now and then a
+# full one (~8 ms), longer than a stream's 10 ms pause budget leaves room for.
+knobs:
+  gc_gen0_threshold: 10000

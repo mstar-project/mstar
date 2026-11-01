@@ -23,6 +23,16 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
+from mstar.model.components.code_predictor_kernels import (
+    STREAM_TILE,
+    DepthAttention,
+    DepthKV,
+    DepthWeights,
+    cp_linear,
+    fold_depth_weights,
+    run_depth_layers,
+)
+from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
@@ -31,7 +41,6 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
-from mstar.utils.attention import apply_rope_pos_ids, decode_attn_nhd
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -50,7 +59,7 @@ class Qwen3TTSResizeMLP(nn.Module):
         return self.linear_fc2(F.silu(self.linear_fc1(hidden_states)))
 
 
-class Qwen3TTSTalkerLayer(nn.Module):
+class Qwen3TTSTalkerLayer(DecoderLayer):
     """One pre-norm Talker block backed by M* tensor-parallel layers."""
 
     def __init__(
@@ -58,46 +67,29 @@ class Qwen3TTSTalkerLayer(nn.Module):
         config: Qwen3TTSTalkerConfig,
         comm_group: CommGroup | None = None,
     ) -> None:
-        super().__init__()
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = ParallelAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            rope_theta=config.rope_theta,
-            qk_norm=True,
-            rms_norm_eps=config.rms_norm_eps,
-            comm_group=comm_group,
-            attn_key=TALKER_ATTN,
-            kv_key=TALKER_KV,
-            pos_key=TALKER_POS,
+        super().__init__(
+            self_attn=ParallelAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                rope_theta=config.rope_theta,
+                qk_norm=True,
+                rms_norm_eps=config.rms_norm_eps,
+                comm_group=comm_group,
+                attn_key=TALKER_ATTN,
+                kv_key=TALKER_KV,
+                pos_key=TALKER_POS,
+            ),
+            mlp=ParallelGatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                activation="silu",
+                comm_group=comm_group,
+            ),
+            input_layernorm=RMSNorm(config.hidden_size, config.rms_norm_eps),
+            post_attention_layernorm=RMSNorm(config.hidden_size, config.rms_norm_eps),
         )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
-        self.mlp = ParallelGatedMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            activation="silu",
-            comm_group=comm_group,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states,
-        )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
 
 
 class Qwen3TTSTalkerLanguageModel(nn.Module):
@@ -125,20 +117,16 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         *,
         label: str,
     ) -> torch.Tensor:
-        hidden_states = input_embeds
         # Which of the node's KV streams the layers write (`label`) and which
         # layer of it are cursors on the shared resources: bind the label once,
         # advance the index per layer. Passing them as arguments instead would
         # make inductor specialize on the int. The resources own the pages, so
         # module code stays clear of the allocator.
         self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states)
-        # Sequence lengths still advance once per forward, after every layer
-        # wrote K/V for the same packed range — the runner does it now, on the
-        # step this forward was declared from.
-        return self.norm(hidden_states)
+        # The residual stream is updated in place, so it starts from a copy:
+        # ``input_embeds`` is the caller's, a packed replay's static input
+        # whose padding rows no copy refreshes.
+        return run_layers(self.layers, input_embeds.clone(), self.norm)
 
 
 class Qwen3TTSTalkerModel(nn.Module):
@@ -173,47 +161,44 @@ class Qwen3TTSTalkerModel(nn.Module):
 # ---------------------------------------------------------------------------
 # CodePredictor: autoregression across codec groups within one frame
 # ---------------------------------------------------------------------------
-# Qwen3-Omni has the same high-level residual-code loop, but currently uses a
-# different attention primitive, checkpoint/config namespace, sampling policy,
-# and CUDA-graph capture path.  Sharing the loop before the auxiliary-sampler
-# work tracked in #199 would couple two independently validated model ports;
-# factor the common implementation after that engine interface is available.
+# Qwen3-Omni's code predictor has the same layers and attends through the same
+# ``cp_attend``; its checkpoint namespace, sampling and capture differ, and its
+# first depth step is two tokens wide, so it still runs ``run_layers``.
 
 
-class Qwen3TTSCodePredictorLayer(nn.Module):
+class Qwen3TTSCodePredictorLayer(DecoderLayer):
     """Parameter container for one replicated residual-code decoder block."""
 
-    def __init__(self, config: Qwen3TTSModelConfig) -> None:
-        super().__init__()
+    def __init__(self, config: Qwen3TTSModelConfig, depth: DepthKV) -> None:
         cp = config.code_predictor
-        self.input_layernorm = RMSNorm(cp.hidden_size, cp.rms_norm_eps)
-        self.self_attn = ParallelAttention(
-            hidden_size=cp.hidden_size,
-            num_heads=cp.num_attention_heads,
-            num_kv_heads=cp.num_key_value_heads,
-            head_dim=cp.head_dim,
-            rope_theta=cp.rope_theta,
-            qk_norm=True,
-            rms_norm_eps=cp.rms_norm_eps,
-        )
-        self.post_attention_layernorm = RMSNorm(
-            cp.hidden_size, cp.rms_norm_eps
-        )
-        self.mlp = ParallelGatedMLP(
-            hidden_size=cp.hidden_size,
-            intermediate_size=cp.intermediate_size,
-            activation="silu",
+        super().__init__(
+            self_attn=DepthAttention(
+                depth,
+                hidden_size=cp.hidden_size,
+                num_heads=cp.num_attention_heads,
+                num_kv_heads=cp.num_key_value_heads,
+                head_dim=cp.head_dim,
+                rope_theta=cp.rope_theta,
+                rms_norm_eps=cp.rms_norm_eps,
+            ),
+            mlp=ParallelGatedMLP(
+                hidden_size=cp.hidden_size,
+                intermediate_size=cp.intermediate_size,
+                activation="silu",
+            ),
+            input_layernorm=RMSNorm(cp.hidden_size, cp.rms_norm_eps),
+            post_attention_layernorm=RMSNorm(cp.hidden_size, cp.rms_norm_eps),
         )
 
 
 class Qwen3TTSCodePredictorInnerModel(nn.Module):
     """Depth decoder and one embedding table per residual codec group."""
 
-    def __init__(self, config: Qwen3TTSModelConfig) -> None:
+    def __init__(self, config: Qwen3TTSModelConfig, depth: DepthKV) -> None:
         super().__init__()
         cp = config.code_predictor
         self.layers = nn.ModuleList([
-            Qwen3TTSCodePredictorLayer(config)
+            Qwen3TTSCodePredictorLayer(config, depth)
             for _ in range(cp.num_hidden_layers)
         ])
         self.norm = RMSNorm(cp.hidden_size, cp.rms_norm_eps)
@@ -226,8 +211,8 @@ class Qwen3TTSCodePredictorInnerModel(nn.Module):
 class Qwen3TTSCodePredictor(nn.Module):
     """Five-layer decoder that predicts codec groups 1 through 15.
 
-    ``forward_depth_unrolled`` performs one position on the group-depth axis.
-    Callers first write the Talker hidden state at position 0, then repeatedly
+    ``depth_step`` performs one position on the group-depth axis. Callers
+    first run the Talker hidden state at position 0 (``depth_input``), then
     feed the preceding codec embedding at positions 1-15. Keeping this as
     tensor-only code allows the complete depth loop to be CUDA-graph captured.
 
@@ -235,14 +220,21 @@ class Qwen3TTSCodePredictor(nn.Module):
     ``small_to_mtp_projection`` (a biased linear layer on the 1.7B
     checkpoints, identity on the 0.6B where both widths are 1024), exactly as
     the reference ``Qwen3TTSTalkerCodePredictorModelForConditionalGeneration``
-    does before its decoder.
+    does before its decoder: the Talker hidden state at step 0, the embedding
+    tables already projected (``input_tables``) after it.
+
+    The layers are parameter containers (checkpoint names, loading): a step
+    runs them through the shared fused kernels (``run_depth_layers``), five
+    launches a layer.
     """
 
     def __init__(self, config: Qwen3TTSModelConfig) -> None:
         super().__init__()
         cp = config.code_predictor
         self.config = cp
-        self.model = Qwen3TTSCodePredictorInnerModel(config)
+        # the frame-local KV cache its layers attend over; see depth_step
+        self.depth = DepthKV()
+        self.model = Qwen3TTSCodePredictorInnerModel(config, self.depth)
         self.small_to_mtp_projection: nn.Module = (
             nn.Linear(config.talker.hidden_size, cp.hidden_size, bias=True)
             if cp.hidden_size != config.talker.hidden_size
@@ -252,6 +244,10 @@ class Qwen3TTSCodePredictor(nn.Module):
             nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
             for _ in range(config.num_code_groups - 1)
         ])
+        # projected embedding tables and the fused layers' weights, built after
+        # weight loading
+        self.input_tables: list[torch.Tensor] | None = None
+        self.fused: DepthWeights | None = None
         self.register_buffer(
             # Populated after weight loading. A single contiguous tensor lets
             # the piecewise loop select a residual head without traversing a
@@ -265,78 +261,51 @@ class Qwen3TTSCodePredictor(nn.Module):
             persistent=False,
         )
 
-    def consolidate_stacked_weights(self) -> None:
-        """Pack the 15 loaded LM heads into graph-friendly contiguous storage."""
+    def consolidate_stacked_weights(self, talker_codec_embedding: torch.Tensor) -> None:
+        """Pack the 15 loaded LM heads into graph-friendly contiguous storage,
+        and, on checkpoints that project the depth inputs, every embedding
+        table the depth loop reads already projected (``input_tables``): a
+        step's input is then a row lookup, not a GEMM over the looked-up
+        row. ``talker_codec_embedding`` embeds group 0, whose embedding is the
+        depth sequence's second input."""
         self.lm_head_weight = torch.stack([
             head.weight.data for head in self.lm_head
         ]).contiguous()
+        self.fused = fold_depth_weights(self.model.layers, self.model.norm, self.lm_head_weight)
+        self.input_tables = None
+        if isinstance(self.small_to_mtp_projection, nn.Linear):
+            with torch.no_grad():
+                self.input_tables = [
+                    self.small_to_mtp_projection(table).contiguous()
+                    for table in [talker_codec_embedding]
+                    + [emb.weight for emb in self.model.codec_embedding[:-1]]
+                ]
 
-    def forward_depth_unrolled(
-        self,
-        inputs_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
-        cache_pos: int,
-    ) -> torch.Tensor:
-        """Run all CodePredictor layers for one depth token.
+    def depth_input(self, last_hidden: torch.Tensor, partials: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """The depth sequence's first input, ``last_hidden (bs, talker_hidden)``
+        projected to the predictor width (a new tensor, so the step may
+        overwrite it), and how many row partials it left in ``partials`` for
+        ``depth_step``."""
+        proj = self.small_to_mtp_projection
+        if isinstance(proj, nn.Linear):
+            x = cp_linear(last_hidden, proj.weight, bias=proj.bias, partials=partials)
+            return x, proj.weight.shape[0] // STREAM_TILE
+        return last_hidden.clone(), 0
 
-        ``kv_cache`` layout is ``[layers, batch, K/V, groups, kv_heads,
-        head_dim]``. Unlike Talker cache, it is frame-local scratch space:
-        every generated frame starts at ``cache_pos=0`` and overwrites it.
+    def depth_step(
+        self, x: torch.Tensor, partials: torch.Tensor, n_part: int = 0, head: int | None = None,
+    ) -> torch.Tensor | None:
+        """One depth step over ``x (bs, predictor_hidden)``, bound first with
+        ``depth.bind_step``, once per call. ``x`` holds the residual stream and
+        is overwritten; ``n_part`` says how many of its row sums of squares a
+        producer left in ``partials`` (0: none). Returns the logits of LM head
+        ``head`` (residual group ``head + 1``), or None.
 
-        ``inputs_embeds`` is ``[batch, 1, talker_hidden]``; the returned
-        hidden state is ``[batch, 1, predictor_hidden]``.
-        """
-        hidden_states = self.small_to_mtp_projection(inputs_embeds)
-        batch_size, seq_len, _ = hidden_states.shape
-        if seq_len != 1:
-            raise ValueError("CodePredictor decode expects exactly one token")
-        end = cache_pos + seq_len
-        flat_position_ids = position_ids.reshape(-1).to(torch.int32)
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
-            attn = layer.self_attn
-            qkv = attn.qkv_proj(hidden_states)
-            q_size = attn.num_heads * attn.head_dim
-            kv_size = attn.num_kv_heads * attn.head_dim
-            q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
-            q = q.view(batch_size, seq_len, attn.num_heads, attn.head_dim)
-            k = k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
-            v = v.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
-            q, k = attn._apply_qk_norm(q, k)
-            # A stride-aware Triton kernel fuses both half rotations. The
-            # previous tensor expression launched multiple elementwise and
-            # concatenation kernels in every one of the 5 layers × 16 groups.
-            q, k = apply_rope_pos_ids(
-                q.reshape(batch_size * seq_len, attn.num_heads, attn.head_dim),
-                k.reshape(
-                    batch_size * seq_len,
-                    attn.num_kv_heads,
-                    attn.head_dim,
-                ),
-                flat_position_ids,
-                float(attn.rope_theta),
-            )
-            q = q.view(batch_size, seq_len, attn.num_heads, attn.head_dim)
-            k = k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
-
-            # Append this depth position, then attend over the prefix already
-            # generated within the same codec frame.
-            kv_cache[layer_idx, :, 0, cache_pos:end].copy_(k)
-            kv_cache[layer_idx, :, 1, cache_pos:end].copy_(v)
-            attn_output = decode_attn_nhd(
-                q,
-                kv_cache[layer_idx, :, 0],
-                kv_cache[layer_idx, :, 1],
-                end,
-            )
-            attn_output = attn_output.reshape(batch_size, seq_len, -1)
-            hidden_states = residual + attn.o_proj(attn_output)
-
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
-            hidden_states = residual + layer.mlp(hidden_states)
-
-        return self.model.norm(hidden_states)
+        Unlike the Talker's, the cache it binds is frame-local scratch space:
+        every generated frame starts at ``cache_pos=0`` and overwrites it. The
+        depth loop binds the step, not this frame, which would compile once
+        per ``cache_pos``."""
+        return run_depth_layers(
+            x, self.fused, self.depth, [layer.self_attn for layer in self.model.layers], partials,
+            n_part=n_part, head=head,
+        )
