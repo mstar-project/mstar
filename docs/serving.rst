@@ -354,8 +354,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        re-measure on the current path and is deleted if neutral. Workers take
        theirs from ``MSTAR_PY_SWITCH_INTERVAL_SEC``.
    * - ``tp_async_sched``
-     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
-       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+     - *(optional)* Async scheduling for the parallel nodes: ``true``
+       (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,

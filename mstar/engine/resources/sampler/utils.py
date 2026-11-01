@@ -743,6 +743,71 @@ def advance_history(rows: HistoryRows, tokens: torch.Tensor) -> None:
     rows.count.add_(1)
 
 
+def token_logprobs(logits: torch.Tensor, tokens: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
+    """Raw log-probs of ``tokens`` under ``softmax(logits / T)``, before the
+    penalty and filters, with T = 1 for greedy rows; graph-safe."""
+    if logits.is_cuda:
+        return _token_logprobs_cuda(logits, tokens, temperature)
+    t = torch.where(temperature > 0, temperature, 1.0).float().unsqueeze(1)
+    # fp32 by promotion against ``t``, without a second [B, V] copy
+    scaled = logits / t
+    norm = scaled.logsumexp(dim=-1, keepdim=True)
+    return (scaled.gather(1, tokens.long().unsqueeze(1)) - norm).squeeze(1)
+
+
+@triton.jit
+def _token_logprob_kernel(
+    chunk_max_ptr, chunk_sum_ptr, logits_ptr, tokens_ptr, temperature_ptr, out_ptr,
+    NSPLIT, part_stride_b, stride_b, stride_v,
+    BLOCK_N: tl.constexpr,
+):
+    """Fold a row's partials into its logsumexp and score its token, scaled
+    as ``_split_partials_kernel`` scales a greedy row (T = 1)."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < NSPLIT
+    base = row * part_stride_b + offs
+    cmax = tl.load(chunk_max_ptr + base, mask=mask, other=-float("inf"))
+    csum = tl.load(chunk_sum_ptr + base, mask=mask, other=0.0)
+    gmax = tl.max(cmax)
+    gsum = tl.sum(tl.where(mask, csum * tl.exp(cmax - gmax), 0.0))
+    temp = tl.load(temperature_ptr + row)
+    inv_temp = tl.where(temp == 0, 1.0, 1.0 / tl.maximum(temp, 1e-30))
+    tok = tl.load(tokens_ptr + row)
+    picked = tl.load(logits_ptr + row * stride_b + tok * stride_v).to(tl.float32) * inv_temp
+    # the partials' approximate exp can put a near-certain token a hair above 0
+    tl.store(out_ptr + row, tl.minimum(picked - gmax - tl.log(gsum), 0.0))
+
+
+def _token_logprobs_cuda(logits: torch.Tensor, tokens: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
+    """``token_logprobs`` in one fp32 pass, on the split-V softmax's partials.
+    Plain torch doubled a captured sampler step at bs 128 on a 248k vocab."""
+    B, V = logits.shape
+    nsplit = _split_count(B, V, logits.device)
+    chunk = -(-V // nsplit)
+    f32 = dict(device=logits.device, dtype=torch.float32)
+    cmax = torch.empty((B, nsplit), **f32)
+    csum = torch.empty((B, nsplit), **f32)
+    carg = torch.empty((B, nsplit), device=logits.device, dtype=torch.int32)
+    out = torch.empty(B, **f32)
+    hist_args, hist_flags = _history_kernel_args(None, logits)
+    with torch.cuda.device(logits.device):
+        _split_partials_kernel[(B, nsplit)](
+            logits, temperature, logits, logits, *hist_args, cmax, csum, carg,
+            V, chunk, logits.stride(0), logits.stride(1), 0, 0, cmax.stride(0),
+            BLOCK_SIZE=min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk)),
+            # for its greedy rows' T = 1; the argmax it also takes goes unread
+            APPLY_PENALTY=False, INCLUDE_GREEDY=True, **hist_flags,
+            num_warps=8, num_stages=2,
+        )
+        _token_logprob_kernel[(B,)](
+            cmax, csum, logits, tokens, temperature, out,
+            nsplit, cmax.stride(0), logits.stride(0), logits.stride(1),
+            BLOCK_N=triton.next_power_of_2(nsplit), num_warps=1,
+        )
+    return out
+
+
 class GenerationHistory:
     """Per-request device state for the history-aware processors: how many
     tokens each request has generated, and a ring of its last ``window``.
@@ -910,6 +975,7 @@ class SamplingConfig:
     top_p_min_keep: int = 1
     # whether the penalty also counts the prompt's tokens; see ``SamplingReqConfig``
     penalize_prompt: bool = True
+    return_logprobs: bool = False
     _seed: int = 0 # set by the conductor
 
     def set_seed(self, seed: int):
@@ -1005,6 +1071,9 @@ class Sampler(BaseSampler):
     history: GenerationHistory | None = None
     stop_ids: torch.Tensor | None = None
     enable_top_p_first: bool = False
+    # The last ``sample``'s sampled-token log-probs, NaN in a row that did not
+    # ask; None when no row asked.
+    logprobs: torch.Tensor | None = None
     _settings_stager: PinnedStager | None = None
 
     def add_request(self, request_id: str):
@@ -1136,6 +1205,11 @@ class Sampler(BaseSampler):
         #       same rid would need to sync, but amortized over a full
         #       generation this is cheap.
         tokens = self._broadcast_tokens(tokens)
+
+        want = [c.return_logprobs for c in configs]
+        self.logprobs = torch.where(
+            torch.tensor(want, device=logits.device), token_logprobs(logits, tokens, temperature), torch.nan,
+        ) if any(want) else None
 
         if history is not None:
             advance_history(history, tokens)
@@ -1620,6 +1694,11 @@ class AcceleratorGraphableSampler(BaseSampler):
     # sample writes the (TP-agreed) token here, and ``commit`` scatters it to
     # the slot master so the next step can read the token on the device.
     last_token_buf: torch.Tensor | None = None
+    # ``[bs]`` per-request ``return_logprobs``, and the per-step row the
+    # captured sample writes each row's log-prob to (NaN where it did not
+    # ask); both ``None`` unless the node's spec enables log-probs.
+    return_logprobs_buf: torch.Tensor | None = None
+    logprob_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
     # In-graph gather/scatter (``MSTAR_SAMPLER_INGRAPH_SCATTER``): the slot
     # masters and this slot's padded index row, all static, so the captured
@@ -1678,6 +1757,9 @@ class AcceleratorGraphableSampler(BaseSampler):
             advance_history(self.history, codes)
         if self.last_token_buf is not None:
             self.last_token_buf.copy_(codes)
+        if self.logprob_buf is not None:
+            chosen = token_logprobs(logits, codes, self.temperature_buf)
+            self.logprob_buf.copy_(torch.where(self.return_logprobs_buf, chosen, torch.nan))
         if self.ingraph_scatter:
             self.scatter_in_graph(codes)
         if apply_penalty and self.seen_tokens_buf is not None:
@@ -2010,6 +2092,10 @@ class SamplerBuffers:
     stop_ids: torch.Tensor | None = None
     top_p_first: "HostBuffer | None" = None
     top_p_min_keep: "HostBuffer | None" = None
+    # Per-request ``return_logprobs`` and the ``[cg_slots, max_bs]`` per-step
+    # log-prob rows the captured sample writes; only when the spec enables them.
+    return_logprobs: "HostBuffer | None" = None
+    logprob: torch.Tensor | None = None
     # Request rows in the masters, trash row excluded; doubles when registrations outgrow it.
     _master_capacity: int = field(default=0, repr=False)
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
@@ -2078,7 +2164,7 @@ class SamplerBuffers:
         bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
         for opt in (
             self.min_p, self.window, self.window_penalty, self.min_tokens,
-            self.top_p_first, self.top_p_min_keep,
+            self.top_p_first, self.top_p_min_keep, self.return_logprobs,
         ):
             if opt is not None:
                 bufs.append(opt)
@@ -2099,6 +2185,7 @@ class SamplerBuffers:
         ingraph_scatter: bool = False,
         slots: int | None = None,
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
+        enable_logprobs: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2161,6 +2248,8 @@ class SamplerBuffers:
             stop_ids=stop_ids,
             top_p_first=mk(torch.bool, False) if enable_top_p_first else None,
             top_p_min_keep=mk(torch.int32, 1) if enable_top_p_first else None,
+            return_logprobs=mk(torch.bool, False) if enable_logprobs else None,
+            logprob=torch.zeros(cg_slots, max_batch_size, device=device) if enable_logprobs else None,
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
@@ -2191,6 +2280,10 @@ class SamplerBuffers:
                 if self.top_p_first is not None else None
             ),
             "last_token_buf": self.last_token.slot_view(cg_slot, bs),
+            "return_logprobs_buf": (
+                self.return_logprobs.slot_view(cg_slot, bs) if self.return_logprobs is not None else None
+            ),
+            "logprob_buf": self.logprob[cg_slot, :bs] if self.logprob is not None else None,
             "tp_group": self.tp_group,
             "offset_master": self.offset.master,
             "last_token_master": self.last_token.master,
@@ -2246,6 +2339,8 @@ class SamplerBuffers:
             if self.top_p_first is not None:
                 self.top_p_first.write_master_row(slot, bool(cfg.top_p_first))
                 self.top_p_min_keep.write_master_row(slot, int(cfg.top_p_min_keep))
+            if self.return_logprobs is not None:
+                self.return_logprobs.write_master_row(slot, bool(cfg.return_logprobs))
         self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
