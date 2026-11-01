@@ -37,7 +37,6 @@ def _entrypoint_prefix(monkeypatch, tmp_path, *argv) -> str:
 
     class _Model:
         PREPROCESS_TORCH_THREADS = None
-        API_SWITCH_INTERVAL_S = None
 
         def __init__(self, **kwargs):
             pass

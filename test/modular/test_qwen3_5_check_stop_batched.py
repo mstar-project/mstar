@@ -7,7 +7,7 @@ import torch
 
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import END_PARTITION, HostRows
 
 EOS = 7
 
@@ -55,20 +55,23 @@ def test_batched_agrees_with_per_request(shape):
     assert batched == {"d": {"decode_loop"}, "b": {"decode_loop"}}
 
 
-def test_only_a_decode_rows_token_can_stop():
-    """A prefill row is not in decode_loop yet, so neither stop path checks it."""
-    tokens = torch.tensor([EOS, EOS, EOS])
+@pytest.mark.parametrize("mixed", [True, False], ids=["mixed", "prefill"])
+def test_a_last_prefill_stop_token_ends_the_partition(mixed):
+    """The last prefill's token comes before decode_loop exists, so its stop
+    ends the partition; an earlier chunk's token is not the request's."""
     infos = {
         "early": _info(walk="prefill_text"),                   # not the last prefill
         "last": _info(walk="prefill_text", last_prefill=True),
-        "dec": _info(),
+        "ignored": _info(walk="prefill_text", last_prefill=True, ignore_eos=True),
+        "one": _info(walk="prefill_text", last_prefill=True, max_tokens=1),  # a one-token budget
     }
-    got = LLMSubmodule.check_stop_batched(
-        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}),
-    )
-    assert got == {"dec": {"decode_loop"}}
-    for rid, info in infos.items():
-        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+    if mixed:
+        infos["dec"] = _info()
+    tokens = torch.tensor([EOS, EOS, EOS, 3, EOS][:len(infos)])
+    got = LLMSubmodule.check_stop_batched(_sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}))
+    assert got == {"last": {END_PARTITION}, "one": {END_PARTITION}, **({"dec": {"decode_loop"}} if mixed else {})}
+    for i, (rid, info) in enumerate(infos.items()):
+        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[i:i + 1]]})
         assert per_request == got.get(rid, set())
 
 

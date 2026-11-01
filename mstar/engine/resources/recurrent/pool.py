@@ -21,7 +21,6 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     CGSlotSpec,
     EngineResourceInfo,
-    KeyedWalks,
     Resource,
 )
 from mstar.engine.resources.kv.keys import fingerprint
@@ -139,11 +138,9 @@ class RecurrentStatePool(Resource):
     ) -> "RecurrentStatePool":
         config = spec.config
         config.shard(info.head_shards)
-        group = info.joint_comm_group
-        world_size = group.world_size if group is not None else 1
-        kv = info.dependencies.get(config.kv_cache)
-        if world_size > 1 or kv is None or not kv.config.prefix_cache:
-            # no snapshot slots where the prefix cache can't open
+        world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
+        # no snapshot slots where the engine keeps them from serving a hit
+        if spec.resource_key not in info.prefix_caches:
             config = replace(config, prefix_slots=0)
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
@@ -447,7 +444,7 @@ class RecurrentStatePool(Resource):
             with self._lock:
                 self._forget_taken(ctx.is_real_row)
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
-        page = self._kv.config.page_size if self._kv is not None else 0
+        page = self._kv.config.tokens_per_page if self._kv is not None else 0
         every: dict[str, int] = {}
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
@@ -601,7 +598,7 @@ class RecurrentStatePool(Resource):
                 self._forget_taken(ctx.is_real_row)
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
-            page = self._kv.config.page_size if self._kv is not None else 0
+            page = self._kv.config.tokens_per_page if self._kv is not None else 0
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
@@ -659,14 +656,9 @@ class RecurrentStatePool(Resource):
         return self._kv.keyed_walks(label) if self._kv is not None else frozenset()
 
     def bind_kv(self, kv: "KVManager") -> None:
-        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names."""
-        self._kv = kv
-
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        del root, walks
-        if not self.config.prefix_slots:
-            self._kv = None
-        return self._kv is not None
+        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
+        A pool with no snapshot slots keys none."""
+        self._kv = kv if self.config.prefix_slots else None
 
     def close_prefix_cache(self) -> None:
         self._kv = None
@@ -702,7 +694,7 @@ class RecurrentStatePool(Resource):
         del node_name, graph_walk
         if self._kv is None:
             return prefix
-        label, page = prefix.label, self._kv.config.page_size
+        label, page = prefix.label, self._kv.config.tokens_per_page
         keys = self._kv.chain_keys(rid, label, prefix.tokens // page)
         with self._lock:
             if rid not in self._slots:
@@ -759,7 +751,7 @@ class RecurrentStatePool(Resource):
         """The checkpoint interval of a step over ``segments``: a page, or for a
         step past the largest captured bucket the smallest page multiple whose
         checkpoints fit that bucket's buffer, which an eager step writes too."""
-        page = self._kv.config.page_size
+        page = self._kv.config.tokens_per_page
         if not self._cg_max_tokens:
             return page
         spans = [seg.span for seg in segments if seg.span > 0 and not ctx.is_padding_row(seg.request_id)]
@@ -777,7 +769,7 @@ class RecurrentStatePool(Resource):
         that starts past token 0 and restores nothing keeps none. A pre-plan
         stages only an unprepared speculative step, which takes neither, and
         `clear_preplan` gives nothing back."""
-        page = self._kv.config.page_size
+        page = self._kv.config.tokens_per_page
         with self._lock:
             start = hit = 0
             lease = self._leases.get(rid)
@@ -800,7 +792,7 @@ class RecurrentStatePool(Resource):
 
     def _reserve_write(self, rid: str, label: str, boundary: int, offset: int) -> None:
         """Caller holds the lock."""
-        key = self._kv.chain_key(rid, label, boundary // self._kv.config.page_size)
+        key = self._kv.chain_key(rid, label, boundary // self._kv.config.tokens_per_page)
         if key is None or key in self._snap_by_key or (rid, label, boundary) in self._snap_writes:
             return
         snap = self._reserve_snapshot()
@@ -814,7 +806,7 @@ class RecurrentStatePool(Resource):
         for key in [k for k in self._snap_writes if k[0] in rids]:
             write = self._snap_writes.pop(key)
             if _DEBUG_ASSERTS:
-                chained = self._kv.chain_key(key[0], key[1], key[2] // self._kv.config.page_size)
+                chained = self._kv.chain_key(key[0], key[1], key[2] // self._kv.config.tokens_per_page)
                 assert write.key == chained, (
                     f"recurrent state: the snapshot of {key[0]}/{key[1]} at {key[2]} tokens is keyed "
                     "apart from the KV chain's key there"
@@ -898,7 +890,7 @@ class RecurrentStatePool(Resource):
     def _file_decodes(self) -> None:
         """File each decode snapshot whose page the KV chain keys by now: its
         ids reach the chain after the step that wrote them. Caller holds the lock."""
-        page = self._kv.config.page_size
+        page = self._kv.config.tokens_per_page
         for key in list(self._unkeyed):
             decode = self._decode[key]
             name = self._kv.chain_key(*key, decode.tokens // page)
@@ -1001,7 +993,7 @@ class RecurrentStatePool(Resource):
             snapshots=snapshots,
             snapshot_every=(
                 self._checkpoint_every(segments, ctx) if snapshots
-                else self._kv.config.page_size if self._kv is not None else 0
+                else self._kv.config.tokens_per_page if self._kv is not None else 0
             ),
         )
 

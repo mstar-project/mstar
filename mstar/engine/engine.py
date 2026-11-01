@@ -38,6 +38,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -321,9 +322,9 @@ class ExecutingBatch:
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
-    # rids for which this step ends every finite stream into the partition;
-    # this step reports the partition done
-    stream_partition_done_rids: set[int] = field(default_factory=set)
+    # rids for which this step ends every finite stream into the partition, or
+    # whose stop check returned END_PARTITION; this step reports the partition done
+    partition_done_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -446,7 +447,7 @@ class ExecutingBatch:
         # A row that does not run this step must not end its streams on it:
         # the worker would stop its loop and finalize a row it no longer has.
         self.final_stream_rids.difference_update(rids)
-        self.stream_partition_done_rids.difference_update(rids)
+        self.partition_done_rids.difference_update(rids)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids
@@ -542,6 +543,10 @@ class Engine:
         # resource -> every node declaring it, on this worker or another
         declared_by: dict[str, frozenset[str]] = {}
         specs_by_key = resolve_spec_dependencies(specs)
+        instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
+        checkpoint = model.checkpoint_path() if model is not None else None
+        # a cache only another engine holds counts here at one rank: its own engine sizes it
+        prefix_caches = opening_prefix_caches(specs, instance, checkpoint_named=checkpoint is not None)
 
         self._classify_tp_roles(node_names, parallel_groups)
 
@@ -574,6 +579,7 @@ class Engine:
                     max_rows_in_combined=self._max_rows_in_combined(
                         spec.resource_key, relevant_nodes, submodules, model,
                     ),
+                    prefix_caches=prefix_caches,
                 ),
             )
 
@@ -595,7 +601,7 @@ class Engine:
             declared_by=declared_by,
         )
 
-        self._open_prefix_caches(specs_by_key, model)
+        self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -925,44 +931,36 @@ class Engine:
             runners[label] = runner
         return runners
 
-    def _open_prefix_caches(self, specs_by_key, model) -> None:
-        """Root each resource's cache in the weights, the preprocessing, and the
-        config of every resource its pages were planned against."""
-        checkpoint = model.checkpoint_path() if model is not None else None
+    def _open_prefix_caches(
+        self, specs_by_key, model, instance: Mapping[str, int], opened: frozenset[str], checkpoint: str | None,
+    ) -> None:
+        """Open the caches built here that ``opened`` names, and close the rest.
+        ``opened`` is `opening_prefix_caches` over ``instance``, the lockstep
+        instance of each node here, for ``model``'s ``checkpoint``. Each cache is
+        rooted in the weights, the preprocessing, and the config of every
+        resource its pages were planned against."""
         shared = [
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
         ]
         declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on, from the keys of every label on a cache the node uses
+        opened_keys = opened & declared.keys()
+        self._log_shut_caches(specs_by_key, declared.keys() - opened, opened, instance, checkpoint is not None)
+        # node -> the walks a probe may run on, from the keys of every label on an open cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
-        for key, by_label in declared.items():
+        for key in opened_keys:
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    walk for label in by_label.values() for walk in label.keys.walks
+                    walk for label in declared[key].values() for walk in label.keys.walks
                 )
-        # a cache another engine holds is taken as open when its config says so
-        opened_keys = {
-            key for key in declared
-            if key not in self._resources and specs_by_key[key].config.prefix_cache
-        }
-        # resources that aren't keyed but opened, such as a recurrent pool's snapshots
-        restoring: set[str] = set()
         for key, spec in specs_by_key.items():
             if key in self._resources and spec.depends_on() <= self._resources.keys():
                 self._resources[key].bind_dependencies({dep: self._resources[dep] for dep in spec.depends_on()})
         for key, resource in self._resources.items():
-            if checkpoint is None and declared.get(key):
-                config = specs_by_key[key].config
-                if config.prefix_cache and not config.prefix_cache_salt:
-                    logger.info(
-                        "KV %s: prefix cache off: %s names no checkpoint, so "
-                        "builds that differ only in their weights cannot be "
-                        "told apart; set prefix_cache_salt to enable it",
-                        key, self._prefix_model,
-                    )
-                    continue
+            if key not in opened:
+                resource.close_prefix_cache()
+                continue
             # its own, then its dependents' in key order, so the root does not
             # move with the order the engine happened to build them in
             parts = [resource.fingerprint()]
@@ -972,15 +970,12 @@ class Engine:
                     mark = built.fingerprint() if built is not None else None
                     if mark is not None:
                         parts.append(mark)
-            opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
+            resource.enable_prefix_cache(fingerprint(*shared, *parts), {
                 label: KeyedWalks(
                     kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
                 )
                 for label, kv_label in declared.get(key, {}).items()
             })
-            if opened:
-                (opened_keys if declared.get(key) else restoring).add(key)
-        self._close_unservable_nodes(specs_by_key, opened_keys, restoring)
         for key in sorted(opened_keys & self._resources.keys()):
             resource = self._resources[key]
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
@@ -1007,35 +1002,37 @@ class Engine:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
 
-    def _close_unservable_nodes(
-        self, specs_by_key: dict[str, NodeResourceSpec], opened_keys: set[str], restoring: set[str],
+    def _log_shut_caches(
+        self, specs_by_key: dict[str, NodeResourceSpec], shut: set[str], opened: frozenset[str],
+        instance: Mapping[str, int], checkpoint_named: bool,
     ) -> None:
-        """Close every prefix cache on a keyed node with a resource that can't
-        serve a cached prefix.
-
-        A resource that opened but isn't keyed serves a hit only when every cache
-        it depends on opened, and so does a resource that depends only on such
-        resources.
-        """
-        restorers = {key for key in restoring if specs_by_key[key].depends_on() <= opened_keys}
-        serving = opened_keys | restorers | {
-            key for key, resource in self._resources.items() if resource.prefix_skip_safe
-        } | {
-            key for key, spec in specs_by_key.items()
-            if spec.depends_on() and spec.depends_on() <= restorers
-        }
-        for node in sorted(self._keyed_walks):
-            on_node = {key for key, spec in specs_by_key.items() if node in spec.nodes and key in self._resources}
-            if on_node <= serving:
+        """Say why each keyed cache here that asks for a prefix cache stays shut,
+        from the pieces of `opening_prefix_caches` that shut it."""
+        for key in sorted(shut & self._resources.keys()):
+            spec = specs_by_key[key]
+            # the cache is on at all: it opens at one rank for a model that names its checkpoint
+            if not spec.keeps_prefix_cache(1, checkpoint_named=True):
                 continue
-            del self._keyed_walks[node]
-            for key in sorted(on_node - serving):
-                logger.info("%s on %s can't serve a cached prefix: the prefix caches on %s stay off",
-                            key, node, node)
-            for key in sorted(on_node & (opened_keys | restoring)):
-                self._resources[key].close_prefix_cache()
-                opened_keys.discard(key)
-                restoring.discard(key)
+            size = instance_size(spec, instance)
+            nodes = ", ".join(sorted(spec.nodes))
+            if not spec.keeps_prefix_cache(size, checkpoint_named=True):
+                logger.info("KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)", key, size)
+            elif not spec.keeps_prefix_cache(size, checkpoint_named):
+                logger.info(
+                    "KV %s: prefix cache off: %s names no checkpoint, so "
+                    "builds that differ only in their weights cannot be "
+                    "told apart; set prefix_cache_salt to enable it",
+                    key, self._prefix_model,
+                )
+            else:
+                restoring = sorted(
+                    over.resource_key for over in unrestorable(specs_by_key, opened)
+                    if not over.nodes.isdisjoint(spec.nodes)
+                )
+                logger.info(
+                    "KV %s: prefix cache off: %s on %s can't restore a cached prefix",
+                    key, ", ".join(restoring) or "a resource", nodes,
+                )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
@@ -1950,7 +1947,8 @@ class Engine:
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
-        """Each rid's ``submodule.check_stop``, as rid -> loops that should stop.
+        """Each rid's ``submodule.check_stop``, as rid -> its stops (loop names,
+        or ``END_PARTITION``).
 
         Reads tensor values, so it belongs on the caller's slow-postprocess
         path rather than in ``exec``, where the ``.item()`` / ``.cpu()`` would
@@ -2312,10 +2310,13 @@ class Engine:
 
     def splits_by_capture_key(self, node_name: str, graph_walk: str) -> bool:
         """Whether ``capture_group`` can tell this walk's requests apart: the
-        submodule opts in and the walk has a capture."""
+        submodule opts in and the node captures, the walk's whole forward or
+        any piecewise region (a region is not tied to a walk)."""
         submodule_mgmt = self._submodules[node_name]
         if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
             return False
+        if submodule_mgmt.piecewise_runners:
+            return True
         cg_runner = submodule_mgmt.accelerator_graph_runner
         return cg_runner is not None and cg_runner.captures_walk(graph_walk)
 
@@ -2333,12 +2334,9 @@ class Engine:
         (``split_batches_by_capture_key``). ``input_metadata`` is the step's
         input facts the lease will see, e.g. the stream chunk it consumes.
         """
+        if not self.splits_by_capture_key(node_name, graph_walk):
+            return None
         submodule_mgmt = self._submodules[node_name]
-        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
-            return None
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        if cg_runner is None or not cg_runner.captures_walk(graph_walk):
-            return None
         if input_metadata is None:
             return submodule_mgmt.submodule.cg_key_info(graph_walk, {request_id: request_info})
         return submodule_mgmt.submodule.cg_key_info(

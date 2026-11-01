@@ -99,7 +99,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
 
     def info(ignore_eos: bool, done: int, max_tokens: int = 100):
         return SimpleNamespace(
-            resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
+            graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
             dynamic_loop_iter_counts={"decode_loop": done}, max_tokens=max_tokens,
         )
 

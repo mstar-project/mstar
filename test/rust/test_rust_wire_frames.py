@@ -634,7 +634,7 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
     """
     mesh = _Mesh(tmp_path, outs=[("out", "", False)])
     rid = mesh.admit()
-    mesh.rt.mark_stream_partition_done(rid, "default")
+    mesh.rt.mark_partition_done(rid, "default")
 
     # Not speculative: the flag rides through as the stream reported it.
     assert mesh.run(rid, uuids=[])["conductor"][0].body.partition_done
