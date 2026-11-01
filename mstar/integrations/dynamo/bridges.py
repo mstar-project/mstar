@@ -208,6 +208,10 @@ class RequestBridge:
         try:
             # the bridge parses no tool call out of a reply, even where the adapter serves them
             _refuse_tool_calls(req)
+            if self.adapter.stop_strings(req):
+                # matched on the decoded answer by the native chat route; the bridge streams
+                # the model's text as it comes and would run past the stop
+                raise ValueError("stop is not supported on this endpoint")
             args = self.adapter.chat_to_request(req, self.server.upload_dir)
         except ValueError as exc:
             raise _BadRequestError(str(exc)) from exc

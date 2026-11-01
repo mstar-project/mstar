@@ -1,0 +1,437 @@
+"""Anthropic's /v1/messages on the GLM chat path: the request translates onto
+the chat adapter, and the reply comes back as a message or its event stream."""
+
+import json
+import sys
+import types
+
+import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from mstar.api_server.entrypoint import APIServer  # noqa: E402
+
+
+class _Chunk:
+    def __init__(self, modality, data, metadata=None):
+        self.modality, self.data, self.metadata = modality, data, metadata or {}
+
+
+def _usage_chunks(*parts, stop=True):
+    """Text chunks as the data worker tags them: per-chunk token counts and the prompt's."""
+    return [_Chunk("text", text, {"tokens": n, "prompt_tokens": 11, "stop_token": stop and i == len(parts) - 1})
+            for i, (text, n) in enumerate(parts)]
+
+
+class _StubAPI:
+    """The APIServer as the agent routes use it: submit, then read the chunks
+    in batches; a reader that stops early aborts the request."""
+
+    open_result_stream = APIServer.open_result_stream
+
+    def __init__(self, model_name):
+        self.model_name = model_name
+        self.model = types.SimpleNamespace()
+        self.upload_dir = "/nonexistent"
+        self.last_submit = None
+        self.next_chunks: list = []
+        self.aborted: list = []
+        self.ended: dict = {}  # how each submission stopped early ended
+
+    def submit_request(self, **kw):
+        self.last_submit = kw
+        return kw["request_id"]
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key, outcome="abort"):
+        # once per submission, as the real one: after a handler ends a whole
+        # reply (a success), the stream's close aborts nothing more
+        if key not in self.ended:
+            self.ended[key] = outcome
+            self.aborted.append(key)
+
+    async def iter_result_chunk_batches(self, request_id):
+        finished = False
+        try:
+            if self.next_chunks:
+                yield list(self.next_chunks)
+            finished = True
+        finally:
+            if not finished:
+                self.abort_submission(request_id)
+
+WEATHER = {"name": "get_weather", "description": "Weather by city",
+           "input_schema": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}
+CALL = b"<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+
+
+@pytest.fixture
+def client_and_stub(monkeypatch):
+    import mstar.api_server
+
+    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
+    stub = _StubAPI("glm52")
+    fake_ep.api_server = stub
+    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
+    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
+
+    from mstar.api_server.openai.router import router
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app), stub
+
+
+def _body(**kw):
+    return {"model": "glm-5.2", "max_tokens": 256, "messages": [{"role": "user", "content": "weather in Paris?"}],
+            **kw}
+
+
+def _events(text):
+    """The data of each server-sent event; the event name must match its type."""
+    out = []
+    for block in text.strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines())
+        data = json.loads(lines["data"])
+        assert lines["event"] == data["type"]
+        out.append(data)
+    return out
+
+
+def test_a_conversation_translates_onto_the_chat_template(client_and_stub):
+    from mstar.api_server.openai import serving_messages
+
+    req, stops = serving_messages.to_chat_request(_body(
+        system=[{"type": "text", "text": "You are terse.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Use tools."}],
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "weather?"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Need it.", "signature": "sig"},
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "no such city"}],
+                 "is_error": True},
+                {"type": "text", "text": "and Rome?"}]},
+        ],
+        tools=[WEATHER], tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+        stop_sequences=["END"], temperature=0.2, top_k=20, metadata={"user_id": "u"},
+        thinking={"type": "enabled", "budget_tokens": 2048}, max_tokens=4096,
+    ))
+    msgs = [m.model_dump(exclude_none=True) for m in req.messages]
+    assert msgs == [
+        {"role": "system", "content": "You are terse.\nUse tools."},
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "Checking.", "reasoning_content": "Need it.", "tool_calls": [{
+            "id": "toolu_1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "Error: no such city"},
+        {"role": "user", "content": "and Rome?"},
+    ]
+    extra = req.model_extra
+    assert extra["tools"] == [{"type": "function", "function": {
+        "name": "get_weather", "parameters": WEATHER["input_schema"], "description": "Weather by city"}}]
+    assert extra["tool_choice"] == "auto" and extra["parallel_tool_calls"] is False
+    assert extra["enable_thinking"] is True and extra["top_k"] == 20 and "metadata" not in extra
+    assert req.max_tokens == 4096 and req.temperature == 0.2 and stops == ["END"]
+
+
+def test_claude_codes_request_translates():
+    # the shape Claude Code 2.1.309 sends: context editing, an effort, adaptive thinking,
+    # and a system message after the first user turn
+    from mstar.api_server.openai import adapters, serving_messages
+
+    adapter = adapters.get_adapter("glm5_next")
+    req, _ = serving_messages.to_chat_request(_body(
+        system=[{"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Be careful.", "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": [{"type": "text", "text": "fix the test"}]},
+                  {"role": "system", "content": [{"type": "text", "text": "# Environment\ncwd: /repo",
+                                                  "cache_control": {"type": "ephemeral"}}]}],
+        tools=[WEATHER], thinking={"type": "adaptive", "display": "updates"},
+        context_management={"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        output_config={"effort": "high"}, metadata={"user_id": "{}"}, max_tokens=32000,
+    ), efforts=adapter.reasoning_efforts)
+    assert [(m.role, m.content) for m in req.messages] == [
+        ("system", "You are Claude Code.\nBe careful."), ("user", "fix the test"),
+        ("system", "# Environment\ncwd: /repo")]
+    mk = adapter.chat_to_request(req, "/nonexistent").model_kwargs
+    assert [m["role"] for m in mk["messages"]] == ["system", "user", "system"]
+    # keep 'all' is the template's clear_thinking off; effort high is the template's high
+    assert mk["chat_template_kwargs"] == {"enable_thinking": True, "clear_thinking": False, "reasoning_effort": "high"}
+
+
+# Claude Code 2.1.309's tool search, as recorded: a deferred tool, the search's call, and its
+# result, which references the tool instead of describing it
+_FETCH = {"name": "WebFetch", "description": "Fetches a URL.", "defer_loading": True,
+          "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}
+_SEARCH = {"name": "ToolSearch", "description": "Fetches deferred tools' schemas.",
+           "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+_LOADED = [
+    {"role": "user", "content": "read https://example.com"},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "call_6a3f", "name": "ToolSearch",
+                                       "input": {"query": "select:WebFetch", "max_results": 1}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_6a3f",
+                                  "content": [{"type": "tool_reference", "tool_name": "WebFetch"}]}]},
+]
+# the two branches of the GLM-5.2 and GLM-5.3 templates that read these: the tool list skips
+# deferred tools, and a result of tool references lists the tools it names
+_REFERENCE_TEMPLATE = (
+    "{% for t in tools %}{% set f = t['function'] %}{% if not f.defer_loading %}<tool>{{ f.name }}</tool>"
+    "{% endif %}{% endfor %}"
+    "{% for m in messages %}{% if m.role == 'tool' and m.content is not string %}<tool_response><tools>"
+    "{% for tr in m.content %}{% for t in tools %}{% if t['function'].name == tr.name %}"
+    "{{ t['function'].name }}:{{ t['function'].parameters | tojson }}{% endif %}{% endfor %}{% endfor %}"
+    "</tools></tool_response>{% endif %}{% endfor %}")
+
+
+def test_a_tool_search_result_lists_the_tool_it_loads():
+    """A deferred tool stays out of the tool list until a result references it, and the
+    reference reaches the template as the tool's name."""
+    import jinja2
+    import torch
+
+    from mstar.api_server.openai import adapters, serving_messages
+    from mstar.model.multimodal import render_chat_template
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, tools=None, **kw):
+            text = jinja2.Environment().from_string(_REFERENCE_TEMPLATE).render(messages=messages, tools=tools)
+            return torch.tensor([list(text.encode())])
+
+    adapter = adapters.get_adapter("glm5_next")
+    req, _ = serving_messages.to_chat_request(_body(messages=_LOADED, tools=[_SEARCH, _FETCH]),
+                                              efforts=adapter.reasoning_efforts)
+    assert req.messages[-1].content == [{"type": "tool_reference", "name": "WebFetch"}]
+    mk = adapter.chat_to_request(req, "/nonexistent").model_kwargs
+    text = bytes(render_chat_template(_Tokenizer(), "", None, mk).tolist()).decode()
+    listed, response = text.split("<tool_response>")
+    assert listed == "<tool>ToolSearch</tool>"
+    assert response.startswith("<tools>WebFetch:") and '"url"' in response
+
+
+def test_a_tool_result_with_text_names_the_tools_it_references():
+    from mstar.api_server.openai import serving_messages
+
+    req, _ = serving_messages.to_chat_request(_body(messages=[
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": "Found one."}, {"type": "tool_reference", "tool_name": "WebFetch"}]}]}]))
+    assert req.messages[-1].content == "Found one.\nTool loaded: WebFetch"
+
+
+def test_a_request_can_turn_its_prefix_cache_off():
+    from mstar.api_server.openai import adapters, serving_messages
+
+    req, _ = serving_messages.to_chat_request(_body(prefix_cache=False))
+    assert adapters.get_adapter("glm52").chat_to_request(req, "/nonexistent").model_kwargs["prefix_cache"] is False
+
+
+@pytest.mark.parametrize("effort, glm52, glm53", [
+    ("low", "high", "low"), ("medium", "high", "high"), ("high", "high", "high"), ("max", "max", "max"),
+])
+def test_effort_maps_onto_each_templates_levels(effort, glm52, glm53):
+    from mstar.api_server.openai import adapters, serving_messages
+
+    for model, want in (("glm52", glm52), ("glm5_next", glm53)):
+        req, _ = serving_messages.to_chat_request(_body(output_config={"effort": effort}),
+                                                  efforts=adapters.get_adapter(model).reasoning_efforts)
+        assert req.model_extra["reasoning_effort"] == want
+
+
+@pytest.mark.parametrize("choice, want", [
+    ({"type": "any"}, "required"),
+    ({"type": "tool", "name": "get_weather"}, {"type": "function", "function": {"name": "get_weather"}}),
+    ({"type": "none"}, "none"),
+])
+def test_tool_choice_maps_onto_chat(choice, want):
+    from mstar.api_server.openai import serving_messages
+
+    req, _ = serving_messages.to_chat_request(_body(tools=[WEATHER], tool_choice=choice))
+    assert req.model_extra["tool_choice"] == want
+
+
+@pytest.mark.parametrize("body, message", [
+    (_body(max_tokens=None), "max_tokens"),
+    (_body(messages=[{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}}]}]), "reads text"),
+    (_body(tools=[{"type": "web_search_20250305", "name": "web_search"}]), "server tool"),
+    (_body(messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Sure:"}]), "prefill"),
+    (_body(thinking={"type": "enabled", "budget_tokens": 512}), "budget_tokens"),
+    (_body(thinking={"type": "enabled", "budget_tokens": 4096}, max_tokens=1024), "less than max_tokens"),
+    (_body(messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": [
+        {"type": "redacted_thinking", "data": "x"}]}, {"role": "user", "content": "go"}]), "redacted_thinking"),
+    (_body(container="c1"), "container"),
+    (_body(stop_sequences=["", "x"]), "stop_sequences"),
+    (_body(tool_choice={"type": "tool"}), "name"),
+    (_body(messages=[{"role": "tool", "content": "x"}]), "role"),
+    (_body(context_management={"edits": [{"type": "clear_tool_uses_20250919"}]}), "context_management"),
+    (_body(context_management={"edits": [{"type": "clear_thinking_20251015",
+                                           "keep": {"type": "thinking_turns", "value": 1}}]}), "keep 'all'"),
+    (_body(output_config={"format": {"type": "json_schema", "schema": {}}}), "constrained decoding"),
+    (_body(output_config={"effort": "extreme"}), "output_config.effort"),
+    (_body(prefix_cache="no"), "prefix_cache"),
+    (_body(messages=[{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+        {"type": "tool_reference"}]}]}]), "tool_name"),
+    # a forced call opens the reply, so Anthropic refuses it with thinking on too
+    (_body(tools=[WEATHER], tool_choice={"type": "any"}, thinking={"type": "enabled", "budget_tokens": 1024},
+           max_tokens=4096), "enable_thinking"),
+])
+def test_what_cannot_be_served_is_an_anthropic_400(client_and_stub, body, message):
+    client, stub = client_and_stub
+    r = client.post("/v1/messages", json={k: v for k, v in body.items() if v is not None})
+    assert r.status_code == 400 and stub.last_submit is None
+    err = r.json()
+    assert err["type"] == "error" and err["error"]["type"] == "invalid_request_error"
+    assert message in err["error"]["message"]
+
+
+def test_a_model_without_the_api_is_an_anthropic_404(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    r = client.post("/v1/messages", json=_body())
+    assert r.status_code == 404 and r.json()["error"]["type"] == "not_found_error"
+
+
+def test_a_reply_is_a_message_with_thinking_text_and_tool_use(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = _usage_chunks((b"Need weather.</think>", 4), (b"Checking. ", 2), (CALL, 9), stop=True)
+    r = client.post("/v1/messages", json=_body(tools=[WEATHER]))
+    assert r.status_code == 200
+    msg = r.json()
+    assert msg["type"] == "message" and msg["role"] == "assistant" and msg["model"] == "glm52"
+    assert msg["content"][:2] == [
+        {"type": "thinking", "thinking": "Need weather.", "signature": ""},
+        {"type": "text", "text": "Checking."},
+    ]
+    use = msg["content"][2]
+    assert use["type"] == "tool_use" and use["name"] == "get_weather" and use["input"] == {"city": "Paris"}
+    assert msg["stop_reason"] == "tool_use" and msg["stop_sequence"] is None
+    assert msg["usage"] == {"input_tokens": 11, "output_tokens": 15}
+    assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 256
+
+
+@pytest.mark.parametrize("stop, reason", [(True, "end_turn"), (False, "max_tokens")])
+def test_why_a_reply_ended(client_and_stub, stop, reason):
+    client, stub = client_and_stub
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (b"Hello", 1), stop=stop)
+    assert client.post("/v1/messages", json=_body()).json()["stop_reason"] == reason
+
+
+def test_a_stop_sequence_ends_the_reply_and_is_named(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (b"one two", 2), (b" three", 1), stop=False)
+    msg = client.post("/v1/messages", json=_body(stop_sequences=["two"])).json()
+    assert msg["content"][-1] == {"type": "text", "text": "one "}
+    assert (msg["stop_reason"], msg["stop_sequence"]) == ("stop_sequence", "two")
+    assert stub.aborted == [stub.last_submit["request_id"]]
+    assert stub.ended == {stub.last_submit["request_id"]: "success"}  # a whole reply, served
+
+
+def test_a_call_cut_off_by_max_tokens_has_no_tool_use(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = _usage_chunks((b"Hm.</think>", 2), (CALL[:60], 6), stop=False)
+    msg = client.post("/v1/messages", json=_body(tools=[WEATHER])).json()
+    assert [b["type"] for b in msg["content"]] == ["thinking"] and msg["stop_reason"] == "max_tokens"
+
+
+def test_the_stream_is_anthropics_event_sequence(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = _usage_chunks((b"Need ", 1), (b"weather.</think>", 3), (b"Checking.", 2),
+                                     (CALL[:45], 5), (CALL[45:], 4), stop=True)
+    r = client.post("/v1/messages", json=_body(tools=[WEATHER], stream=True))
+    assert r.headers["content-type"].startswith("text/event-stream")
+    events = _events(r.text)
+    kinds = [e["type"] for e in events]
+    assert kinds[0] == "message_start" and kinds[-2:] == ["message_delta", "message_stop"]
+    start = events[0]["message"]
+    assert start["content"] == [] and start["usage"]["input_tokens"] == 11 and start["stop_reason"] is None
+    blocks = [e for e in events if e["type"] == "content_block_start"]
+    assert [b["content_block"]["type"] for b in blocks] == ["thinking", "text", "tool_use"]
+    assert [b["index"] for b in blocks] == [0, 1, 2]
+    assert blocks[2]["content_block"]["name"] == "get_weather" and blocks[2]["content_block"]["input"] == {}
+    deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
+    assert "".join(d.get("thinking", "") for d in deltas) == "Need weather."
+    assert "".join(d.get("text", "") for d in deltas) == "Checking."
+    assert json.loads("".join(d.get("partial_json", "") for d in deltas)) == {"city": "Paris"}
+    # each block stops before the next starts
+    assert [e["index"] for e in events if e["type"] == "content_block_stop"] == [0, 1, 2]
+    order = [(e["type"], e.get("index")) for e in events if e["type"].startswith("content_block_")]
+    assert order.index(("content_block_stop", 0)) < order.index(("content_block_start", 1))
+    assert events[-2]["delta"] == {"stop_reason": "tool_use", "stop_sequence": None}
+    assert events[-2]["usage"] == {"output_tokens": 15}
+
+
+def test_a_stream_reports_a_failure_in_band(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("text", b"Hi</think>", {"tokens": 1, "prompt_tokens": 3}),
+                        _Chunk("error", b"worker died", {"status": 500})]
+    events = _events(client.post("/v1/messages", json=_body(stream=True)).text)
+    assert events[-1] == {"type": "error", "error": {"type": "api_error", "message": "worker died"}}
+    assert "message_stop" not in [e["type"] for e in events] and stub.aborted == []
+
+
+def test_a_stream_the_engine_refuses_answers_with_its_status(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("error", b"prompt too long", {"status": 400})]
+    r = client.post("/v1/messages", json=_body(stream=True))
+    assert r.status_code == 400
+    assert r.json() == {"type": "error", "error": {"type": "invalid_request_error", "message": "prompt too long"}}
+    assert stub.aborted == []
+
+
+@pytest.mark.parametrize("model_name", ["glm52", "glm5_next"])
+def test_count_tokens_counts_what_the_real_model_returns(client_and_stub, model_name):
+    """Both GLMs' process_prompt returns a ProcessPromptOutput, not a dict."""
+    from mstar.api_server.openai import serving_messages
+    from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+    from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
+    from mstar.model.glm52.glm52_model import Glm52Model
+
+    client, stub = client_and_stub
+    stub.model_name = model_name
+    stub.model = (Glm52Model("", tokenizer_mode="byte", config_variant="full") if model_name == "glm52"
+                  else Glm5NextModel(model_path_hf="", tokenizer_mode="byte"))
+    body = {"model": "glm", "messages": [{"role": "user", "content": "how many tokens is this?"}]}
+    req, _ = serving_messages.to_chat_request(body, counting=True)
+    args = ADAPTER_REGISTRY[model_name].chat_to_request(req, None)
+    out = stub.model.process_prompt(args.text, args.input_modalities, args.output_modalities, **args.model_kwargs)
+
+    r = client.post("/v1/messages/count_tokens", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"input_tokens": out.new_input_tensors["text_inputs"][0].numel()}
+
+
+def test_count_tokens_renders_the_prompt_as_the_request_does(client_and_stub):
+    """process_prompt gets what the data worker passes it for the request, each turn's
+    role included, and nothing is submitted."""
+    import torch
+
+    client, stub = client_and_stub
+    calls = []
+
+    def process_prompt(text, input_modalities, output_modalities, **kw):
+        calls.append(((text, input_modalities, output_modalities), kw))
+        return {"text_inputs": [torch.zeros(3, dtype=torch.long)]}
+
+    stub.model.process_prompt = process_prompt
+    body = {"system": "Be brief.", "tools": [WEATHER],
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hello."},
+                         {"role": "user", "content": "bye"}]}
+    assert client.post("/v1/messages/count_tokens", json=body).json() == {"input_tokens": 3}
+    assert stub.last_submit is None
+    assert client.post("/v1/messages", json={**body, "model": "glm-5.2", "max_tokens": 8}).status_code == 200
+    ((args, kw),) = calls
+    sent = stub.last_submit
+    assert args == (sent["text"], sent["input_modalities"], sent["output_modalities"])
+    assert kw.pop("prompt_parts") == sent["prompt_parts"]
+    assert [p.role for p in sent["prompt_parts"]] == ["system", "user", "assistant", "user"]
+    # and every model kwarg the request renders with: all but its token budget
+    assert kw == {k: v for k, v in sent["model_kwargs"].items() if k != "max_output_tokens"}
+    r = client.post("/v1/messages/count_tokens", json={**body, "max_tokens": 5})
+    assert r.status_code == 400 and "max_tokens" in r.json()["error"]["message"]
