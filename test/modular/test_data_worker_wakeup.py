@@ -13,8 +13,6 @@ import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 
-import pytest
-
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, ResultQueue
 from mstar.communication.event import EventWakeup
 from mstar.model.base import Model
@@ -297,13 +295,10 @@ def test_a_profile_update_wakes_the_message_thread():
 # -- the API message thread's wait ---------------------------------------------
 
 
-def _communicator(kind, tmp_path):
-    if kind == "rust":
-        pytest.importorskip("mstar_rust")
-        from mstar.communication.rust_communicator import RustZMQCommunicator as Comm
-    else:
-        from mstar.communication.communicator import ZMQCommunicator as Comm
-    return Comm(f"api_{kind}", push_ids=[], ipc_socket_path_prefix=str(tmp_path) + "/")
+def _communicator(tmp_path):
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+
+    return RustZMQCommunicator("api", push_ids=[], ipc_socket_path_prefix=str(tmp_path) + "/")
 
 
 class _Results:
@@ -329,15 +324,14 @@ def _message_thread(server):
     return thread
 
 
-@pytest.mark.parametrize("kind", ["python", "rust"])
-def test_the_message_loop_sleeps_until_signalled(kind, tmp_path):
-    """Between passes the thread waits on the communicator's poll, on either
-    transport: idle it runs a pass per liveness check, and the data worker's
-    signal ends the wait at once and is drained."""
+def test_the_message_loop_sleeps_until_signalled(tmp_path):
+    """Between passes the thread waits on the communicator's poll: idle it
+    runs a pass per liveness check, and the data worker's signal ends the wait
+    at once and is drained."""
     from api_server_helpers import make_test_api_server
 
     results = _Results()
-    server = make_test_api_server(communicator=_communicator(kind, tmp_path), preprocess_worker=results)
+    server = make_test_api_server(communicator=_communicator(tmp_path), preprocess_worker=results)
     thread = _message_thread(server)
     try:
         assert _wait_until(lambda: results.passes >= 1, 1.0)

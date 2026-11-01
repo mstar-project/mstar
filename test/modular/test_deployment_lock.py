@@ -13,15 +13,13 @@ import tempfile
 
 import pytest
 
-from mstar.communication.communicator import (
-    DEPLOYMENT_ANCHOR_ENTITY,
-    CommProtocol,
-    ZMQCommunicator,
-)
+from mstar.communication.communicator import DEPLOYMENT_ANCHOR_ENTITY, CommProtocol
+from mstar.communication.rust_communicator import RustZMQCommunicator
 
 
-def _comm(prefix: str, my_id: str, protocol=CommProtocol.IPC) -> ZMQCommunicator:
-    return ZMQCommunicator(
+def _comm(prefix: str, my_id: str, protocol=CommProtocol.IPC) -> RustZMQCommunicator:
+    # Its sockets close when it is dropped, hence the `del`s below.
+    return RustZMQCommunicator(
         my_id=my_id, push_ids=[], protocol=protocol,
         ipc_socket_path_prefix=prefix,
     )
@@ -30,19 +28,16 @@ def _comm(prefix: str, my_id: str, protocol=CommProtocol.IPC) -> ZMQCommunicator
 def test_second_conductor_on_one_prefix_is_refused():
     with tempfile.TemporaryDirectory() as prefix:
         first = _comm(prefix, DEPLOYMENT_ANCHOR_ENTITY)
-        try:
-            with pytest.raises(RuntimeError, match="already holds"):
-                _comm(prefix, DEPLOYMENT_ANCHOR_ENTITY)
-        finally:
-            first.pull_socket.close()
+        with pytest.raises(RuntimeError, match="already holds"):
+            _comm(prefix, DEPLOYMENT_ANCHOR_ENTITY)
+        del first
 
 
 def test_conductors_on_different_prefixes_both_start():
     with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
         ca = _comm(a, DEPLOYMENT_ANCHOR_ENTITY)
         cb = _comm(b, DEPLOYMENT_ANCHOR_ENTITY)
-        ca.pull_socket.close()
-        cb.pull_socket.close()
+        del ca, cb
 
 
 def test_the_lock_is_released_when_the_holder_exits():
@@ -53,8 +48,7 @@ def test_the_lock_is_released_when_the_holder_exits():
         first = _comm(prefix, DEPLOYMENT_ANCHOR_ENTITY)
         os.close(first._deployment_lock_fd)  # stands in for the process exiting
         second = _comm(prefix, DEPLOYMENT_ANCHOR_ENTITY)
-        second.pull_socket.close()
-        first.pull_socket.close()
+        del first, second
 
 
 def test_only_the_anchor_entity_locks():
@@ -65,8 +59,7 @@ def test_only_the_anchor_entity_locks():
         a = _comm(prefix, "worker_0")
         b = _comm(prefix, "worker_1")
         assert not hasattr(a, "_deployment_lock_fd")
-        a.pull_socket.close()
-        b.pull_socket.close()
+        del a, b
 
 
 def test_tcp_does_not_lock():
@@ -74,7 +67,4 @@ def test_tcp_does_not_lock():
     TCP ignores would refuse unrelated deployments."""
     comm = _comm("/tmp/mstar_unused/", DEPLOYMENT_ANCHOR_ENTITY,
                  protocol=CommProtocol.TCP)
-    try:
-        assert not hasattr(comm, "_deployment_lock_fd")
-    finally:
-        comm.pull_socket.close()
+    assert not hasattr(comm, "_deployment_lock_fd")
