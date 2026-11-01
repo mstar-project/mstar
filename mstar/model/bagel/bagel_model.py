@@ -40,7 +40,6 @@ from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -93,6 +92,7 @@ from mstar.model.base import (
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    WalkStep,
     prompt_spans,
 )
 from mstar.model.loader import iter_safetensors_file, load_hf_weights

@@ -185,7 +185,7 @@ def test_pi05_worker_graphs_from_yaml():
 
 
 # ----------------------------------------------------------------------
-# Forward pass transitions
+# Walk plan
 # ----------------------------------------------------------------------
 
 
@@ -194,16 +194,10 @@ def _pointer() -> TensorPointerInfo:
                              source_session_id="", source_entity="")
 
 
-def test_pi05_plan_is_prefill_then_action_gen():
-    model = _make_model()
-    signals = {"image_inputs": [_pointer()], "text_inputs": [_pointer()]}
-    plan = model.walk_plan("default", ["image", "text"], ["action"], signals, {})
-    assert [(step.walk, dict(step.bind), dict(step.step_metadata)) for step in plan] == [
-        (Pi05Model.PREFILL_WALK, {}, {}), (Pi05Model.ACTION_GEN_WALK, {}, {}),
-    ]
+def test_pi05_plan_refuses_a_request_without_images():
     # without the images the prefill could never run
     with pytest.raises(ValueError, match="image_inputs"):
-        model.walk_plan("default", ["text"], ["action"], {"text_inputs": [_pointer()]}, {})
+        _make_model().walk_plan("default", ["text"], ["action"], {"text_inputs": [_pointer()]}, {})
 
 
 # ----------------------------------------------------------------------

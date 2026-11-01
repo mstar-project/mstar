@@ -41,7 +41,6 @@ from mstar.engine.resources import (  # noqa: E402
     SamplingReqConfig,
 )
 from mstar.graph.base import Loop  # noqa: E402
-from mstar.model.base import WalkStep  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
@@ -132,12 +131,7 @@ def test_glm52_resources_flag_off_is_naive():
     assert attn.config.kv_cache == KV_RESOURCE
 
 
-# ── walk plan ──
-
-
-def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
-    plan = _make_model().walk_plan("default", ["text"], ["text"], {"text_inputs": ["PROMPT"]}, {})
-    assert plan == [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
+# ── walks ──
 
 
 def test_glm52_prefill_emits_only_the_new_token():

@@ -1220,8 +1220,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Loop ends on the final chunk's pass, and a row mid-prefill decides no
         stop): from inside another loop, the request fails with an internal
         error. Use it only when nothing else must run for the
-        partition (a later walk, a loop's final-only publication); the
-        model's transition still decides those.
+        partition (a later step of its walk plan, a loop's final-only
+        publication): it ends the partition whatever the plan has left.
 
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold

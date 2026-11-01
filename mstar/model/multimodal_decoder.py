@@ -27,12 +27,11 @@ from typing import NamedTuple
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import WalkStep
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
-from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
 from mstar.model.keys import KV_CACHE, MIXED, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,

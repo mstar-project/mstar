@@ -55,7 +55,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition, WalkStep
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -76,7 +76,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ClientChunk, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ClientChunk, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart

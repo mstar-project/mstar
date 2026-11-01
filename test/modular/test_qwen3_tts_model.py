@@ -626,20 +626,6 @@ def test_qwen3_tts_rejects_unsupported_requests(
         )
 
 
-def test_qwen3_tts_walk_plan_prefills_then_decodes():
-    model = _make_model()
-    prompt = {PROMPT_LAYOUT_KEY: [0, 4, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055}
-    talker = model.walk_plan("Talker", ["text"], ["audio"], {}, {"subtalker_top_k": 7, **prompt})
-    assert [step.walk for step in talker] == ["talker_prefill", "talker_decode"]
-    assert [dict(step.step_metadata) for step in talker] == [prompt, {}]
-    # Residual-group sampling rides the code predictor's own per-request
-    # sampler config, not step metadata.
-    configs = model.get_request_resource_configs([], [], {"subtalker_top_k": 7})
-    assert configs[CODE_PRED_SAMPLER].top_k == 7
-
-    assert [step.walk for step in model.walk_plan("Codec", ["text"], ["audio"], {}, {})] == ["codec_chunk"]
-
-
 def test_qwen3_tts_postprocess_encodes_pcm16():
     model = _make_model()
 

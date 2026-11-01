@@ -30,8 +30,8 @@ from mstar.model.keys import MIXED
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import NameToTensorList
-    from mstar.conductor.request_info import WalkStep
     from mstar.graph.base import TensorPointerInfo
+    from mstar.model.base import WalkStep
 
 TEXT = "text"
 VIDEO = "video"
@@ -581,7 +581,7 @@ def media_prefill_step(
     (``text_inputs``, one tensor): with media in its ``layout``, the walk over
     the encoders it runs (`media_encoders`), which carries the layout; without,
     ``prefill_text``."""
-    from mstar.conductor.request_info import WalkStep
+    from mstar.model.base import WalkStep
 
     texts = signals.get("text_inputs", [])
     if not texts:

@@ -86,8 +86,9 @@ def merge_publish_info(
 class PartitionDefinition:
     """Defines a partition within a model's computation graph.
 
-    Each partition has its own set of graph walks and transition logic,
-    and can run asynchronously relative to other partitions.
+    Each partition has its own set of graph walks and its own walk plan
+    (`Model.walk_plan`), and can run asynchronously relative to other
+    partitions.
     """
     name: str                                                   # e.g., "LLM", "SNAC"
     graph_walks: set[str]                                       # walks this partition uses
@@ -118,8 +119,6 @@ class StreamingConnectionState:
     from_partition: str
     to_partition: str
     edge_name: str
-    token_count: int = 0
-    consumed_count: int = 0
     producer_done: bool = False
     # destination worker -> stream items the producer sent there, which
     # producer_done carries so the consumer waits for the last of them

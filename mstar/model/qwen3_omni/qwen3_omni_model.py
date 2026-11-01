@@ -37,7 +37,7 @@ from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition, WalkStep
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -61,6 +61,7 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
+    WalkStep,
 )
 from mstar.model.components import MoeParallelConfig
 from mstar.model.media_limits import VideoBudget, probe_video

@@ -411,13 +411,6 @@ class RequestData:
         for uuid in uuids:
             del self.persist_signal_ref_cnt[uuid]
 
-    def get_incoming_connections(self, partition_name: str) -> list[StreamingConnectionState]:
-        """Return all streaming connections where the given partition is the consumer."""
-        return [
-            conn for conn in self.streaming_connections.values()
-            if conn.to_partition == partition_name
-        ]
-
 
 @dataclass
 class DrainingRequest:
@@ -1829,22 +1822,10 @@ class Conductor:
             pstate.resource_publish_info, body.resource_publish_info
         )
 
-        # Absorb-only fields are replicated across TP ranks; only the rank-0
-        # message contributes.
-        if body.is_first_tp_rank:
-            if body.new_token_counts:
-                for name, count in body.new_token_counts.items():
-                    pstate.num_output_tokens += count
-                    for conn in request_data.streaming_connections.values():
-                        if conn.from_partition == partition_name and conn.edge_name == name:
-                            conn.token_count += count
-
-            if body.stream_tokens_consumed:
-                for conn in request_data.streaming_connections.values():
-                    if conn.from_partition == partition_name:
-                        continue  # skip producer connections
-                    consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
-                    conn.consumed_count = max(conn.consumed_count, consumed)
+        # Token counts are replicated across TP ranks; only the rank-0 message
+        # contributes.
+        if body.is_first_tp_rank and body.new_token_counts:
+            pstate.num_output_tokens += sum(body.new_token_counts.values())
 
         # The stream moves a producer-triggered partition's walk on the
         # worker; follow it so the completion check and the plan's cursor

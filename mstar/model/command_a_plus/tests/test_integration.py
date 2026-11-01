@@ -18,7 +18,7 @@ from mstar.engine.resources import AttentionStep, SamplingReqConfig
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import MAX_OUTPUT_TOKENS, WalkStep
+from mstar.model.base import MAX_OUTPUT_TOKENS
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
@@ -162,7 +162,7 @@ class ModelIntegrationTests(unittest.TestCase):
         shutil.copyfile(FIXTURE, Path(self.directory) / "config.json")
         self.model = CommandAPlusModel(self.directory)
 
-    def test_graph_resources_and_prefill_decode_transition(self):
+    def test_graph_and_resources(self):
         model = self.model
         resources = {r.resource_key: r for r in model.get_node_resources()}
         self.assertEqual(resources[LOCAL_ATTN].config.sliding_window, 4)
@@ -181,9 +181,6 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertTrue(any(e.name == "decode_input" and e.next_node == EMPTY_DESTINATION and e.persist
                             for e in output_edges))
         self.assertEqual(walks["decode"].name, "decode_loop")
-        # decode is seeded from the prefill's decode_input
-        plan = model.walk_plan(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [object()]}, {})
-        self.assertEqual(plan, [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "decode_input"})])
         cfg = model.get_request_resource_configs([], [], {"temperature": 0})[SAMPLER]
         self.assertEqual((cfg.temperature, cfg.top_p, cfg.repetition_penalty), (0, 0.95, 1.04))
 

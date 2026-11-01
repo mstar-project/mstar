@@ -39,7 +39,7 @@ import torch
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition, WalkStep
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -55,7 +55,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata, WalkStep
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.config import (
     COND_LABEL,
@@ -124,7 +124,7 @@ MIN_REPETITION_PENALTY = 1e-5
 
 class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
-    per-partition state machine. No GPU compute lives here."""
+    per-partition walk plans. No GPU compute lives here."""
 
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 

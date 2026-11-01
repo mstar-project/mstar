@@ -39,7 +39,7 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition, WalkStep
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -60,6 +60,7 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
+    WalkStep,
 )
 from mstar.model.chatterbox.chatterbox_model import (
     ChatterboxModel,

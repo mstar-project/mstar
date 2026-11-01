@@ -168,12 +168,6 @@ def _two_stream_conductor(tmp_path, monkeypatch, model=None):
     return c
 
 
-def test_parallel_stream_connections_are_both_tracked(tmp_path, monkeypatch):
-    c = _two_stream_conductor(tmp_path, monkeypatch)
-    names = sorted(x.edge_name for x in c.requests["rid"].get_incoming_connections("C"))
-    assert names == ["first", "second"], f"conductor tracks only {names}"
-
-
 def test_producer_done_goes_once_per_consumer_partition(tmp_path, monkeypatch):
     c = _two_stream_conductor(tmp_path, monkeypatch)
     sent = []
@@ -182,15 +176,13 @@ def test_producer_done_goes_once_per_consumer_partition(tmp_path, monkeypatch):
     c._process_done_forward("rid", "P")
 
     assert sent == [("P", "C")]
-    assert all(x.producer_done for x in c.requests["rid"].get_incoming_connections("C"))
+    done = sorted(x.edge_name for x in c.requests["rid"].streaming_connections.values() if x.producer_done)
+    assert done == ["first", "second"], f"conductor ends only {done}"
 
 
 def test_connections_whose_names_join_alike_are_both_tracked(tmp_path, monkeypatch):
     c = _two_stream_conductor(tmp_path, monkeypatch, _ColonNamesModel())
     sent = []
     monkeypatch.setattr(c, "_send_producer_done", lambda rid, src, dst: sent.append((src, dst)))
-    req = c.requests["rid"]
-    assert [x.edge_name for x in req.get_incoming_connections("C:x")] == ["y"]
-    assert [x.edge_name for x in req.get_incoming_connections("C")] == ["x:y"]
     c._process_done_forward("rid", "P")
     assert sorted(sent) == [("P", "C"), ("P", "C:x")]
