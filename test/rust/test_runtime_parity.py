@@ -1706,6 +1706,34 @@ def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):
     assert out.register_uuids == []
 
 
+@pytest.mark.parametrize("producer_runs", [True, False], ids=["consumer-unused", "both-unused"])
+def test_a_partition_the_request_does_not_use_takes_the_empty_walk(streams_to_sibling, producer_runs):
+    """A partition whose walk plan is empty (a TTS request with no audio out)
+    arrives on walk "" with no inputs: both runtimes admit it under the
+    request's one handle, with no live worker graph and nothing ready, and
+    the other partition runs as usual."""
+    rt, _book, _store = streams_to_sibling
+
+    def admit(partition, walk, wg_id):
+        return rt.add_request(
+            request_id="r1", partition=partition, graph_walk=walk,
+            partition_worker_graph_ids=[wg_id],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+
+    rid = admit("default", WALK if producer_runs else "", 0)
+    assert admit("SNAC", "", 1) == rid
+    assert rt.is_partition_idle(rid, "SNAC")
+    assert _ready(rt) == []
+    if producer_runs:
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
+        assert _ready(rt) == [("LLM", WALK, [rid])]
+        assert rt.is_partition_idle(rid, "SNAC")
+    rt.remove_request(rid)
+    assert rt.get_rid_handle("r1") is None
+
+
 def test_the_speculation_target_reports_its_output_signals(pair):
     """A speculated batch never goes through pop_rids, so the target carries
     the names instead -- left empty, completion routes none of the node's
