@@ -395,6 +395,8 @@ class SpeculationPrepInput(NamedTuple):
     room_for_continuing: int
     streaming_edges: list[EdgeSpec]
     streaming_edges_per_rid: list[int]
+    # rids[i]'s ``RouteInput.loop_strides`` in the step in flight; None, 1 each
+    loop_strides: list[int] | None = None
 
 
 class SpeculationPrepOutput(NamedTuple):
@@ -496,6 +498,10 @@ class RouteInput(NamedTuple):
     # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
     walks: list[str] | None = None
     rid_walk_idx: list[int] | None = None
+    # How far each row's enclosing loop counts on when this completion ends
+    # its iteration, in wg_ids.keys() order; None, one each. A chunk loop
+    # counts tokens, so its row's stride is the chunk's.
+    loop_strides: list[int] | None = None
 
 
 class RouteOutput(NamedTuple):
@@ -607,8 +613,8 @@ class GraphRuntime(ABC):
         gets that handle next, which reads as one request inheriting another's
         state. Known handle-keyed maps: MicroScheduler.{failed_rids,
         admit_errors, held_until, backlog, pending_tp_follow_count} (purged by
-        clear_rid), Worker.{_last_active, _pending_removes}, the runtime's
-        pending loop stops, and the tensor manager's per-request maps.
+        clear_rid), Worker._pending_removes, the runtime's pending loop stops
+        and do-not-speculate marks, and the tensor manager's per-request maps.
         """
         pass
 
@@ -857,13 +863,23 @@ class GraphRuntime(ABC):
     def speculate_node(
         self, node_name: str,
         graph_walks: list[str],
-        sample_rids: list[int],
+        rids: list[int],
+        walk_counts: list[int] | None = None,
+        loop_strides: list[int] | None = None,
     ) -> list[SpeculationOutput]:
         """
         The nodes ready for speculation, checking against whether the node is
         async enabled (known internally, per walk) and TP async compatible.
-        Takes one sample rid per walk; returns every walk's targets, each
-        naming its walk, for the caller to pick from.
+        Returns every walk's targets, each naming its walk, for the caller to
+        pick from.
+
+        ``rids`` are the step's rows grouped by walk, ``walk_counts[i]`` of
+        them for ``graph_walks[i]`` (None: one per walk). The first sets the
+        targets; a loop-back target is kept only if some row of the walk can
+        run another iteration of that loop, so a walk whose first row is on
+        its last iteration still speculates for the rest. ``loop_strides[i]``
+        is how far the step in flight moves ``rids[i]``'s loop
+        (``RouteInput.loop_strides``); None, one each.
         """
         pass
 
@@ -882,6 +898,7 @@ class GraphRuntime(ABC):
     def prep_spec_rows(
         self, spec_node_name: str, curr_node_name: str, graph_walk: str,
         rids: list[int], room_for_continuing: int | None = None,
+        loop_strides: list[int] | None = None,
     ) -> "SpecRows":
         """``prep_spec_rids`` with no stream chunks to ingest, as columns, in
         a form a runtime can serve in one crossing (the worker uses it where
@@ -894,6 +911,7 @@ class GraphRuntime(ABC):
             graph_walk=graph_walk, rids=list(rids),
             room_for_continuing=room_for_continuing,
             streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+            loop_strides=loop_strides,
         ))
         wg_ids = set(prep.wg_ids)
         assert len(wg_ids) <= 1, (
@@ -1005,6 +1023,31 @@ class GraphRuntime(ABC):
     @abstractmethod
     def clear_pending_loop_stops(self):
         """Pending stops are good for one iteration only."""
+        pass
+
+    @abstractmethod
+    def set_loop_caps(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str], caps: list[int],
+    ) -> None:
+        """Row i's ``loop_names[i]``, around ``node_name`` under
+        ``graph_walks[i]``, ends once its count reaches ``caps[i]``.
+
+        Assigns the cap, where ``add_request``'s ``loop_caps`` only lower the
+        graph's: a chunk loop's cap is its prompt's length, set when the
+        prompt's first chunk is cut, and the walk's next prompt sets its own.
+        A row this worker does not hold is skipped.
+        """
+        pass
+
+    @abstractmethod
+    def loop_progress(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> tuple[list[int], list[int]]:
+        """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
+        its count so far and the count it ends at; -1 for both for a row this
+        worker does not hold."""
         pass
 
     @abstractmethod

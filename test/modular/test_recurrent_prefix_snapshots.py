@@ -156,6 +156,21 @@ def test_apply_raises_for_a_length_the_pool_does_not_hold():
         pool.apply_cached_prefix("b", NODE, WALK, None, CachedPrefix("main", 4, 4))
 
 
+def test_a_declined_hit_gives_its_snapshot_back_and_restores_nothing():
+    """A chunked row measured with no hit can find one at its first chunk; its
+    chunks are cut from 0, so it applies a zero-token prefix."""
+    pool = _pool()
+    _snapshot(pool, "a", A, 8, 1.0)
+    _probe(pool, "b", A[:12], hit=8)
+
+    pool.apply_cached_prefix("b", NODE, WALK, None, CachedPrefix("main", 0, 0))
+
+    assert not pool._snap_refs, "the declined snapshot is still held"
+    step, ctx = _step("b", 4), _ctx("b")
+    assert pool.admit(step, ctx).ok
+    assert not pool._restores, "a row running from token 0 restored a snapshot"
+
+
 def test_a_full_set_evicts_the_oldest_snapshot_nothing_holds():
     pool = _pool(prefix_slots=2)
     held = _snapshot(pool, "a", A, 8, 1.0)

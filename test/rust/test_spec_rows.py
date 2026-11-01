@@ -29,7 +29,8 @@ from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.batch_builder import StepPick
+from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import SpeculationPreparer
@@ -92,8 +93,16 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def room_for_continuing(self, target):
-        return self.room
+    def pick_chain_step(self, state, target, continuing, mid_prefill=()):
+        # the chain keeps its rows up to the cap; the fresh rows come from the take
+        rows = list(continuing)
+        return ChainPick(target, StepPick(
+            taken=rows if self.room is None else rows[:self.room], continuing=rows, room=self.room,
+            held_back=set(), ordered=False,
+        ), [])
+
+    def take_chain_step(self, state, chain, pre_existing_batch_size=0, pre_existing_seq_lens=None):
+        return self.get_next_batch()
 
     def _check_ready(self, node_name, rid, fwd_info):
         return True

@@ -800,9 +800,13 @@ class KVTransferManager:
         elif isinstance(
             transfer_engine_info.transfer_engine, LocalTransferEngine
         ):
-            if kv_cache.device.type == "cuda":
+            if not needs_remote_transfer:
+                # not shared: a freed IPC-shared cache stays allocated in torch's IPC
+                # limbo, whose destructor makes CUDA calls after c10's statics are gone
+                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
+            elif kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
-            elif needs_remote_transfer:
+            else:
                 shm_dir = transfer_engine_info.get_shm_dir()
                 if not shm_dir:
                     raise ValueError(
@@ -814,8 +818,6 @@ class KVTransferManager:
                     shm_dir=shm_dir,
                     resource_key=resource_key,
                 )
-            else:
-                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
         else:
             raise ValueError(f"Unsupported transfer engine type: {type(transfer_engine_info.transfer_engine)}")
 

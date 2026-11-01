@@ -47,6 +47,8 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     # No split kernel and no recurrent state to size for prompt rows, so a
     # mixed step takes any number of them.
     MIXED_MAX_PREFILL_ROWS = None
+    # tokens a step runs, a prompt's chunk and any decode rows beside it
+    MAX_BATCH_TOKENS = 512
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # decode streams its token to SNAC, not to the client: nothing to inline

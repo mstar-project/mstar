@@ -38,9 +38,10 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, PrefixKeys
+from mstar.model.base import KVLabel, PrefixKeys, _wrap_node_in_loop
+from mstar.model.submodule_base import ChunkingPolicy
 from mstar.streaming.topology import StreamingGraphEdge
-from mstar.validation.resources import _unservable_walks
+from mstar.validation.resources import _unservable_walks, streamed_partitions
 
 KV = "kv"
 ROPE = "rope"
@@ -481,6 +482,42 @@ def test_a_keyed_node_that_streams_into_another_partition_loads():
     assert not list(_unservable_walks([spec], model)), (
         "a keyed node that streams into another partition was refused, though a walk the cache "
         "serves whole leaves its own partition nothing to read"
+    )
+
+
+def _chunked(model):
+    """``model`` with its LLM wrapped in the Loop its chunks run as, which moves
+    the node's real edges onto the Loop."""
+    graphs = model.get_graph_walk_graphs()
+    for walk, graph in graphs.items():
+        if "LLM" in graph.get_nodes():
+            graphs[walk] = _wrap_node_in_loop(graph, "LLM", walk, ChunkingPolicy(walks=(walk,), chunkable=True))
+    return model
+
+
+def _llm_spec():
+    return KVSpec(
+        resource_key=KV, nodes={"LLM"},
+        config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
+    )
+
+
+def test_a_chunked_node_that_feeds_another_node_is_refused_at_startup():
+    problems = list(_unservable_walks([_llm_spec()], _chunked(_laid_out(image_feeds="talker"))))
+
+    assert problems and re.search(r"'prefill_image', where LLM", problems[0]), problems
+
+
+def test_a_chunked_node_still_names_the_partition_it_streams_into():
+    model = _laid_out()
+    for graph in model.get_graph_walk_graphs().values():
+        graph.get_nodes()["LLM"].outputs.append(
+            StreamingGraphEdge(next_node="talker", name="hidden", target_partition="Talker"),
+        )
+    model = _chunked(model)
+
+    assert streamed_partitions([_llm_spec()], model) == {"Talker"}, (
+        "the conductor would cache a request whose Talker reads the chunked node's stream"
     )
 
 

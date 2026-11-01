@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -82,6 +82,17 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
+
+
+class StepOrder(Enum):
+    """Who runs first when more rows of a node are ready than its step takes
+    (``NodeSubmodule.max_batch_size``)."""
+    # First come, first served to completion: the rows that ran the node's last
+    # step keep it, then the request that arrived first. The default.
+    ARRIVAL = "arrival"
+    # Longest-waiting first: a row that just ran gives way to one that waited.
+    # For a session whose stream has to keep moving while others run.
+    TURNS = "turns"
 
 
 class InputMetadata(NamedTuple):
@@ -302,6 +313,16 @@ class NodeInputs:
     # The request's real walk, stamped by the engine; None on capture templates
     graph_walk: str | None = None
 
+    # Set by the engine on a chunk of a split input: where it starts, and the
+    # whole input's length. None means not chunked.
+    chunk_start: int = 0
+    chunk_total: int | None = None
+
+    @property
+    def is_final_chunk(self) -> bool:
+        return self.chunk_total is None or \
+            self.chunk_start + self.input_seq_len >= self.chunk_total
+
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
 
@@ -352,6 +373,76 @@ def _split_pos_ids(
             "cannot be told apart; override `split_inputs`"
         )
     return pos_ids[..., start:end]
+
+
+@dataclass(frozen=True)
+class ChunkingPolicy:
+    """How a walk's prefill may be split across steps; the default is not at all.
+
+    ``walks``: the walks this policy covers. Declared per node on the model
+    (``Model.get_chunking_policies``) rather than on the submodule, because
+    the graph build needs it: a chunkable node is wrapped in a Loop for
+    exactly these walks, and a chunk is one iteration of it.
+
+    ``accumulated_outputs``: output edges a consumer needs every chunk of,
+    gathered on the Loop and handed over as one item per chunk when the
+    prompt finishes. A streamed edge's consumer gets them joined into one item
+    by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here
+    carries the final chunk's tensors alone.
+
+    ``reserve_whole_prefill``: whether a first chunk reserves the KV the
+    whole prefill needs, so a part-done row cannot wedge on a full arena.
+    Counted in tokens, so a walk whose KV grows by something else sets False
+    and reserves per chunk.
+    """
+    walks: tuple[str, ...] = ()
+    # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
+    chunkable: bool = False
+    accumulated_outputs: frozenset[str] = frozenset()
+    # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
+    max_batch_tokens: int | None = None
+    # whether a row may start past its cached prefix, asked before prepare; None is always
+    reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
+    reserve_whole_prefill: bool = True
+
+
+NO_CHUNKING = ChunkingPolicy()
+
+
+# A chunk Loop's count before its prompt's first chunk sets the real cap (the
+# prompt's length), and the stride of a row that runs whole: it ends the Loop.
+# Within the u32 both runtimes hold loop counters in.
+CHUNK_LOOP_END = 2**31 - 1
+
+
+def chunk_loop_name(node_name: str, graph_walk: str) -> str:
+    """The Loop a chunkable ``(node, walk)``'s prefill runs as.
+
+    Derived rather than declared so the graph build, the engine's stop check
+    and the startup validation all name the same loop without passing it
+    around. Per walk, not per node: a node can chunk under several walks and
+    each has its own loop state.
+    """
+    return f"chunk_loop:{node_name}:{graph_walk}"
+
+
+def chunk_tick_name(node_name: str, graph_walk: str) -> str:
+    """The chunk Loop's loop-back signal, carrying nothing.
+
+    Speculation offers a next-iteration target only for a node that routes an
+    edge back to itself, so without this a chunk-only step is a pipeline
+    bubble. The node declares it as an input too -- an edge it does not read is
+    no loop-back, just an output nobody consumes -- which leaves it unready for
+    its FIRST chunk, so the conductor seeds one with the request's inputs.
+    """
+    return f"{chunk_loop_name(node_name, graph_walk)}.next_chunk"
+
+
+class InputSeqLenInfo(NamedTuple):
+    """A row's token count before ``prepare_inputs``, for admission."""
+    seq_len: int
+    # leading tokens the prefix cache already holds, not counted in ``seq_len``
+    cached_prefix: int = 0
 
 
 @dataclass
@@ -665,6 +756,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
 
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        """This row's token count, read from input shapes alone; None when the
+        walk does not declare one. A chunkable walk's prompts are cut into
+        chunks by it, so it must equal ``prepare_inputs().input_seq_len`` of the
+        whole input (before any cached prefix is removed), or the row fails
+        at its first chunk."""
+        del graph_walk, fwd_info, inputs, kwargs
+        return None
+
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
         """Whether the scheduler batches each ``cg_key_info`` group apart.
 
@@ -843,6 +946,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return False
 
+    def speculative_input_seq_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        prev_seq_len: int,
+    ) -> int | None:
+        """The span of a row continuing from the step in flight, estimated
+        before that step's outputs reach it. ``prev_seq_len`` is its span in
+        that step, or -1 if it ran on another node. The default repeats the
+        last span on this node and has no estimate otherwise; a walk that
+        fixes its span (one token a decode step) should say so. Only an
+        estimate, which sizes the token budget left for the rows merged in
+        beside it."""
+        del graph_walk, fwd_info
+        return prev_seq_len if prev_seq_len >= 0 else None
+
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
         """Loop-back input signals of this walk whose per-row value the node
         keeps on the device itself (a sampler's slot master), so the worker
@@ -915,6 +1032,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         mixed step runs the walk's rows on a path sized to a few of them."""
         del graph_walk
         return None
+
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Which rows go first when more are ready than ``max_batch_size``
+        allows. Override it for a walk whose sessions have to keep moving
+        while others run."""
+        del graph_walk
+        return StepOrder.ARRIVAL
 
     def get_autocast_dtype(self) -> torch.dtype | None:
         """This node's dtype in place of the model's: the engine manager casts

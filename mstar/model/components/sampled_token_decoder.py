@@ -69,6 +69,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     device_loopback_enabled,
 )
@@ -300,6 +301,24 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             return ARNodeInputs(input_seq_len=1)
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        # a media row's length depends on its attachments; it is admitted whole
+        if graph_walk == self.DECODE_WALK:
+            return InputSeqLenInfo(1)
+        if graph_walk == self.PREFILL_WALK and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        return None
+
+    def speculative_input_seq_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, prev_seq_len: int,
+    ) -> int | None:
+        if graph_walk == self.DECODE_WALK:
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def uniform_row_inputs(
         self, graph_walk: str, has_loopback: bool = False,

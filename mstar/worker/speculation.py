@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import (
@@ -64,6 +65,9 @@ class Speculation:
     consumed_streaming_edges: dict[int, list[StreamingEdge]] = field(default_factory=dict)
     spec_id: int = 0
     is_yield_away: bool = False
+    # A yield-away the chain built from the rows waiting at its own target
+    # when it gave them the whole step; for fairness it is still the chain's.
+    gave_way: bool = False
     loop_name: str | None = None
     dropped: set[int] = field(default_factory=set)
     plan_future: Future | None = None
@@ -119,22 +123,29 @@ class SpeculationPreparer:
     def prepare(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None = None,
     ) -> PreparedSpeculation:
+        """``loop_strides``: ``candidates``' in N (``RouteInput.loop_strides``),
+        which decide whose loop N ends."""
         if self.rows_eligible():
             return self._prepare_rows(
                 batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+                loop_strides,
             )
         return self._prepare_dicts(
             batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+            loop_strides,
         )
 
     def _prepare_rows(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None,
     ) -> PreparedSpeculation:
         ctx = self._ctx
         rows = ctx.graph_runtime.prep_spec_rows(
             spec_node_name, batch_N.node_name, graph_walk, candidates, max_continuing,
+            loop_strides,
         )
         laps.lap("prep_spec_rows")
         prep = PreparedSpeculation(rows.ready_rids, rows.spec_id, rows.wg_id)
@@ -150,6 +161,7 @@ class SpeculationPreparer:
     def _prepare_dicts(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
         candidates: list[int], max_continuing: int | None, laps: PhaseLaps,
+        loop_strides: list[int] | None,
     ) -> PreparedSpeculation:
         """``prep_spec_rids`` with the stream polls, filling the per-row dicts
         for the ready rids."""
@@ -180,6 +192,7 @@ class SpeculationPreparer:
                 ) for _r, (e, _chunk) in polled
             ],
             streaming_edges_per_rid=per_rid_counts,
+            loop_strides=loop_strides,
         ))
         laps.lap("prep_spec_rids")
 
@@ -222,14 +235,20 @@ class SpeculationBuilder:
         self, pending: PendingBatch, spec_target: SpeculationOutput,
         prep: PreparedSpeculation, other_walks: dict[int, str],
         fresh_final_edges: dict[int, set[str]],
+        chunk_ranges: dict[int, ChunkRange] | None = None,
+        incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """The speculation from ``prep`` plus the fresh rows merged into its
         per-row dicts; ``other_walks`` maps the fresh rows of another walk (a
         mixing chain) to theirs, and ``fresh_final_edges`` the fresh rows whose
         final stream chunk was ingested before this step to its edges."""
-        if prep.rows_wg_id is not None and not other_walks and not fresh_final_edges:
+        if (
+            prep.rows_wg_id is not None and not other_walks and not fresh_final_edges
+            and not chunk_ranges
+        ):
             # the dicts hold only the fresh rows here; a fresh row's final
-            # stream chunk takes the general assembly, which carries it
+            # stream chunk, or a cut chunk, takes the general assembly, which
+            # carries it
             return self.assemble_rows(
                 pending, spec_target, prep.ready_rids, prep.rows_wg_id,
                 fresh_request_to_worker_graph=prep.request_to_worker_graph,
@@ -252,6 +271,7 @@ class SpeculationBuilder:
             request_walks={
                 **dict.fromkeys(request_to_worker_graph, spec_target.graph_walk), **other_walks,
             } if other_walks else None,
+            chunk_ranges=chunk_ranges, incomplete_node_rids=incomplete_node_rids,
         )
 
     def assemble(
@@ -268,6 +288,8 @@ class SpeculationBuilder:
         spec_id: int = 0,
         tp_seq: int = -1,
         request_walks: dict[int, str] | None = None,
+        chunk_ranges: dict[int, ChunkRange] | None = None,
+        incomplete_node_rids: set[int] | None = None,
     ) -> Speculation:
         """Package prepared rids (batch order, which ``make_executing_batch``
         reorders for a split walk) into the ``Speculation`` the main loop runs.
@@ -289,6 +311,8 @@ class SpeculationBuilder:
             graph_walk=label,
             request_to_worker_graph=request_to_worker_graph,
             request_walks=request_walks,
+            chunk_ranges=dict(chunk_ranges) if chunk_ranges else {},
+            incomplete_node_rids=set(incomplete_node_rids) if incomplete_node_rids else set(),
             # Resolved here, on the main thread, so the GPU thread never asks
             # the runtime, which may be mid-call with the GIL released.
             walk_output_signals={
@@ -321,6 +345,7 @@ class SpeculationBuilder:
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
             engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
+            chunk_ranges=chunk_ranges,
         )
         return Speculation(
             scheduled_batch=spec_batch,

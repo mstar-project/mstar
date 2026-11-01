@@ -25,10 +25,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput  # noqa: E402
+from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
@@ -97,6 +99,7 @@ def _engine(sub):
     eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
+    eng._chunking = ChunkingManagement(eng._submodules)
     eng._runner = StepRunner({})
     return eng
 
@@ -125,7 +128,6 @@ def _worker(eng, runtime, in_loop=True):
     w.enable_nvtx = False
     w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(
@@ -140,7 +142,9 @@ def _worker(eng, runtime, in_loop=True):
     return w
 
 
-def _postprocess(sub, rids=(1, 2), pending_stops=(), streams=True, in_loop=True):
+def _postprocess(
+    sub, rids=(1, 2), pending_stops=(), streams=True, in_loop=True, cached=(), chunk_loop=False,
+):
     """What ``Worker.run`` does with a finished step: drop and report the rows
     a per-rid stage failed, then postprocess the rest. ``pending_stops`` makes
     the step a speculative new loop iteration whose rows in it already
@@ -148,10 +152,14 @@ def _postprocess(sub, rids=(1, 2), pending_stops=(), streams=True, in_loop=True)
     eng, runtime = _engine(sub), _Runtime(pending_stops)
     batch = _batch(rids, streams)
     eng.prepare_inputs(batch)
+    # rows the prefix cache served whole: declined by prepare, kept by postprocess
+    batch.cached_rids = set(cached)
     outputs = BatchedModelOutput(per_rid_outputs={
         r: {"audio": [torch.zeros(1)]} for r in batch.request_ids
     })
     w = _worker(eng, runtime, in_loop)
+    if chunk_loop:
+        w.chunk_loops = ChunkLoops({(NODE, WALK)})
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK,
@@ -219,3 +227,21 @@ def test_an_end_partition_stop_inside_a_loop_fails_the_request():
     assert set(w.reported) == {1}
     assert batch.request_ids == [2] and batch.partition_done_rids == set()
     assert runtime.stopped == []
+
+
+def test_a_cache_served_row_ends_its_chunk_loop_without_publishing():
+    """A chunkable walk the prefix cache served whole never runs, but its chunk
+    Loop still has to end, which its route stride does. Finalizing a stop for
+    it once read the row's forward-pass info, which a row that did not run no
+    longer has: ``KeyError``, and every request in the step failed with it."""
+    from mstar.model.submodule_base import CHUNK_LOOP_END
+
+    batch, runtime, w = _postprocess(_Sub(skip={2}), cached={2}, chunk_loop=True)
+    served = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, request_to_worker_graph={2: 0},
+        chunk_loop_walks=w.chunk_loops.walks_by_node[NODE],
+    )
+    assert served.loop_strides([2]) == [CHUNK_LOOP_END], "the served row's loop still ends"
+    assert runtime.stopped == [1], "by its stride, not a stop"
+    assert not w.reported
+    assert 2 not in batch.resource_publish_info
