@@ -1538,26 +1538,36 @@ def test_the_api_server_holds_a_submission_until_it_ends():
     assert not server.is_pending("never#1")
 
 
-def test_input_is_taken_in_arrival_order_up_to_one_request_per_pass():
-    """Appends are cheap next to a new request's preprocess: a pass takes up
-    to MAX_APPENDS_PER_PASS of them, in arrival order, and stops at the first
-    new request."""
+def test_input_is_taken_in_arrival_order_up_to_one_media_request_per_pass():
+    """Appends and text requests are cheap next to a media request's
+    preprocess: a pass takes them in arrival order, up to their caps, and stops
+    at the first request with media."""
     wt, _sent, _tm = _thread()
 
-    def opening(rid):
+    def opening(rid, files=None):
         return PreprocessInput(
-            request_id=rid, text="hi", file_paths=None, input_modalities=["text"],
+            request_id=rid, text="hi", file_paths=files, input_modalities=["text"],
             output_modalities=["text"], model_kwargs={},
         )
 
     def take():
         return [(type(i).__name__, i.request_id) for i in wt._next_inputs()]
 
-    for item in (ClientAppend("r"), opening("u"), ClientAppend("r", ends=END), ClientAppend("u")):
+    media = {"image": ["a.png"]}
+    for item in (ClientAppend("r"), opening("u", media), ClientAppend("r", ends=END), ClientAppend("u")):
         wt.in_queue.put(item)
     assert take() == [("ClientAppend", "r"), ("PreprocessInput", "u")]
     assert take() == [("ClientAppend", "r"), ("ClientAppend", "u")]
     assert take() == []
+
+    for item in (opening("t"), ClientAppend("r"), opening("u", media), opening("v")):
+        wt.in_queue.put(item)
+    assert take() == [("PreprocessInput", "t"), ("ClientAppend", "r"), ("PreprocessInput", "u")]
+    assert take() == [("PreprocessInput", "v")]
+
+    for i in range(wt.MAX_TEXT_REQUESTS_PER_PASS + 1):
+        wt.in_queue.put(opening(f"t{i}"))
+    assert len(take()) == wt.MAX_TEXT_REQUESTS_PER_PASS and len(take()) == 1
 
     for i in range(wt.MAX_APPENDS_PER_PASS + 3):
         wt.in_queue.put(ClientAppend(f"c{i}"))
