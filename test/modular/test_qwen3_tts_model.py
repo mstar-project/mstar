@@ -795,7 +795,9 @@ def _tiny_model_config() -> Qwen3TTSModelConfig:
 
 
 def _code_predictor(config: Qwen3TTSModelConfig) -> ResidualCodePredictor:
-    return ResidualCodePredictor(config.code_predictor, config.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE)
+    return ResidualCodePredictor(
+        config.code_predictor, config.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE, embed_sum_dtype=None,
+    )
 
 
 def test_qwen3_tts_talker_builds_official_streaming_prefill():

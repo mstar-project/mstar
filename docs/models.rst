@@ -680,9 +680,9 @@ Qwen3-TTS notes
   the depth sequence opens with the Talker hidden state in a one-token pass
   and takes one token per group after it, each layer's q/k norm, RoPE and KV write
   run in one launch and attention in ``cp_attention``, and the frame's 16 codec
-  embeddings are summed in fp32 and rounded once to the model dtype. Earlier
-  releases rounded the sum after every add, so greedy codes can differ at
-  near-ties.
+  embeddings are summed in one launch per group. Each Talker keeps its own
+  sum: Qwen3-TTS accumulates in the model dtype, rounding after every add, and
+  Qwen3-Omni in fp32, rounded once.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.

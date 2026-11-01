@@ -110,7 +110,9 @@ def _cp_embed_accumulate_kernel(
         e = tl.load(W + tok * s_w + h0 + offs)
         tl.store(Emb + b * s_emb + h0 + offs, e)
         acc = tl.load(Sum + b * s_sum + h0 + offs)
-        tl.store(Sum + b * s_sum + h0 + offs, acc + e.to(acc.dtype))
+        # in fp32, rounded once to the sum's dtype, as torch's add_ computes it
+        total = acc.to(tl.float32) + e.to(tl.float32)
+        tl.store(Sum + b * s_sum + h0 + offs, total.to(acc.dtype))
     tl.store(Codes + b * s_codes + group, tok.to(Codes.dtype.element_ty))
 
 
@@ -120,8 +122,8 @@ def cp_embed_accumulate(
     all_codes: torch.Tensor, group: int,
 ) -> torch.Tensor:
     """For a depth step's sampled ``tokens (bs,)``: record them as ``all_codes[:, group]``,
-    look up their embeddings in ``weight (V, H)`` and add those to ``emb_sum (bs, H)`` in
-    its dtype. Returns the embeddings, the next depth step's input. One launch for what
+    look up their embeddings in ``weight (V, H)`` and add those to ``emb_sum (bs, H)``,
+    rounded to its dtype. Returns the embeddings, the next depth step's input. One launch for what
     was an index_select, a copy and a promoting add."""
     bs, hidden = tokens.shape[0], weight.shape[1]
     assert tokens.is_contiguous() and weight.stride(1) == 1 and emb_sum.stride(1) == 1 and hidden % 256 == 0
@@ -261,11 +263,16 @@ class ResidualCodePredictor(nn.Module):
     the checkpoint's ``talker.code_predictor.*``: ``model.layers``,
     ``model.norm``, ``model.codec_embedding.{g - 1}`` (group ``g``'s table),
     ``lm_head.{g - 1}`` and the projection. ``max_batch_size`` sizes the depth
-    cache: the most rows a depth loop runs at once.
+    cache: the most rows a depth loop runs at once. ``embed_sum_dtype`` is the
+    dtype a frame's embedding sum accumulates in (None: the embeddings' own,
+    rounding after every add), as each Talker's reference sums them.
     """
 
-    def __init__(self, cp: Any, talker_width: int, max_batch_size: int) -> None:
+    def __init__(
+        self, cp: Any, talker_width: int, max_batch_size: int, *, embed_sum_dtype: torch.dtype | None,
+    ) -> None:
         super().__init__()
+        self.embed_sum_dtype = embed_sum_dtype
         self.num_code_groups = cp.num_code_groups
         residual = cp.num_code_groups - 1
         self.depth = DepthKV((
@@ -339,14 +346,14 @@ class ResidualCodePredictor(nn.Module):
 
         Returns:
             The frames' codes ``[bs, G]``, and the sum of their G embeddings,
-            the Talker's next input: accumulated in fp32 and returned in
-            ``layer0_embed``'s dtype.
+            the Talker's next input: accumulated in ``embed_sum_dtype`` and
+            returned in ``layer0_embed``'s dtype.
         """
         bs = layer0_codes.shape[0]
         codes = torch.empty(bs, self.num_code_groups, dtype=torch.long, device=layer0_codes.device)
         codes[:, 0] = layer0_codes
-        # a copy even when the embeddings are fp32: the sum is updated in place
-        embed_sum = layer0_embed.to(torch.float32, copy=True)
+        # a copy even when the dtypes match: the sum is updated in place
+        embed_sum = layer0_embed.to(self.embed_sum_dtype or layer0_embed.dtype, copy=True)
         embed = layer0_embed
         # position 0 only fills the cache: group 0's code is the Talker's
         self.depth.bind_step(0)
