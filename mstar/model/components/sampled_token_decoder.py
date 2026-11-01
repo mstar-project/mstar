@@ -109,6 +109,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # near the top bucket (4 fit ~1000 tokens a request: a ~1000 px square
     # image plus text). Chunked prefill replaces this cap.
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # Every capture's torch.compile mode; None takes the deployment's compile
+    # level (mstar serve -O).
+    COMPILE_MODE: str | None = None
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
@@ -193,18 +196,21 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 capture_graph_walk="decode",
                 single_request_inputs=ids(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                compile_mode=self.COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile_mode=self.COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=MIXED,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
+                compile_mode=self.COMPILE_MODE,
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
             ),
@@ -218,6 +224,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 capture_token_lengths=self.PREFILL_MEDIA_TOKEN_BUCKETS,
                 make_node_input=media,
                 capture_batch_sizes=self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES,
+                compile_mode=self.COMPILE_MODE,
                 # a media buffer is [tokens, hidden], and hidden can equal a bucket
                 input_seq_dims={e.output: 0 for e in self._encoders},
             ))
