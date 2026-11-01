@@ -1,5 +1,5 @@
 """A serving YAML's ``platform_overrides``: what each platform serves, and the
-Qwen3-Omni 2-GPU config that relies on them."""
+Qwen3-Omni configs that rely on them."""
 
 from pathlib import Path
 
@@ -57,6 +57,16 @@ def test_the_2gpu_config_serves_its_platforms_layout(monkeypatch, platform, expe
     opt-in configs stay equal to what the default resolves to."""
     monkeypatch.setattr(serving_config, "_built_for", platform)
     assert load_serving_config(str(CONFIGS / "qwen3omni_2gpu.yaml")) == _shipped(expected)
+
+
+@pytest.mark.parametrize("platform, expected", [
+    (RocmPlatform, "qwen3omni_colocated_split3.yaml"),
+    (CudaPlatform, "qwen3omni_colocated_stock.yaml"),
+])
+def test_the_colocated_config_serves_its_platforms_layout(monkeypatch, platform, expected):
+    """On AMD GPUs three workers share the one GPU; CUDA keeps one worker."""
+    monkeypatch.setattr(serving_config, "_built_for", platform)
+    assert load_serving_config(str(CONFIGS / "qwen3omni_colocated.yaml")) == _shipped(expected)
 
 
 @pytest.mark.parametrize("ramp, base", [
