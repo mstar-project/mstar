@@ -22,3 +22,4 @@ node_groups:
 #   stream_hop_tokens: 0               # decode once at the end, full attention (reference stream=False)
 #   llm_weights: llm.rl.pt             # the checkpoint's RL-tuned LM
 #   flow_estimator_dtype: float32      # the reference's flow precision (default bfloat16: more throughput)
+#   flow_capture_frame_buckets: []     # capture no flow solve (faster startup, less GPU memory, eager solves)
