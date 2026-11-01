@@ -1005,10 +1005,15 @@ for greedy requests; it reaches the client as <code class="docutils literal notr
 metadata. The model passes <code class="docutils literal notranslate"><span class="pre">return_logprobs</span></code> into its <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> (the
 conductor refuses the request otherwise), its forward samples once per step and
 hands over row-addressed stop buffers (<code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.check_stop_buffers</span></code>):
-the log-probs ride the same copy to the host. <code class="docutils literal notranslate"><span class="pre">logprobs_mode</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;raw&quot;</span></code> only
-for now. The captured sampler scores every step once it is on, so it is off by
-default and a deployment turns it on with
-<code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{&lt;sampler</span> <span class="pre">key&gt;:</span> <span class="pre">{enable_logprobs:</span> <span class="pre">true}}</span></code>.</p>
+the log-probs ride the same copy to the host. The captured sampler scores every
+step once it is on, so it is off by default and a deployment turns it on with
+<code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{&lt;sampler</span> <span class="pre">key&gt;:</span> <span class="pre">{enable_logprobs:</span> <span class="pre">true}}</span></code>.
+<code class="docutils literal notranslate"><span class="pre">logprobs_mode:</span> <span class="pre">&quot;processed&quot;</span></code> (<code class="docutils literal notranslate"><span class="pre">enable_processed_logprobs</span></code>, CUDA) scores the
+distribution the token was drawn from instead: after the penalty, temperature,
+min-p, top-k/top-p and min-tokens floor. A greedy token scores 0 there, so a
+trainer sampling greedily wants <code class="docutils literal notranslate"><span class="pre">&quot;raw&quot;</span></code>. It renorms every step’s distribution
+again, about 0.15 ms at batch 1 and 0.5 ms at batch 128 on a GB200 with a 248k
+vocabulary, so it is a separate switch.</p>
 <p><code class="docutils literal notranslate"><span class="pre">SamplerStep(apply_filters=False)</span></code> samples a step with top-k/top-p off (e.g. a
 TTS’s first code); declare it the same way on every step of a walk.</p>
 </li>

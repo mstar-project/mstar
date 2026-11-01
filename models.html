@@ -1155,8 +1155,11 @@ via <code class="docutils literal notranslate"><span class="pre">extra_body</spa
 YAML, <code class="docutils literal notranslate"><span class="pre">&quot;return_logprobs&quot;:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> on <code class="docutils literal notranslate"><span class="pre">/generate</span></code> puts each
 token’s raw log-prob in its chunk’s <code class="docutils literal notranslate"><span class="pre">metadata</span></code> (<code class="docutils literal notranslate"><span class="pre">{&quot;logprobs&quot;:</span> <span class="pre">[...]}</span></code>, one per
 token, as <code class="docutils literal notranslate"><span class="pre">token_ids</span></code>). Qwen3.5 reports them; other models refuse the request
-with a 400. Top alternatives and OpenAI’s <code class="docutils literal notranslate"><span class="pre">logprobs</span></code> are not supported yet. On
-any deployment,
+with a 400. Add <code class="docutils literal notranslate"><span class="pre">enable_processed_logprobs:</span> <span class="pre">true</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;logprobs_mode&quot;:</span>
+<span class="pre">&quot;processed&quot;</span></code> for the log-prob under the distribution it was actually drawn from
+(penalties and top-k/top-p applied); greedy requests want <code class="docutils literal notranslate"><span class="pre">&quot;raw&quot;</span></code>, as a greedy
+token scores 0 there. Top alternatives and OpenAI’s <code class="docutils literal notranslate"><span class="pre">logprobs</span></code> are not
+supported yet. On any deployment,
 <code class="docutils literal notranslate"><span class="pre">&quot;return_token_ids&quot;:</span> <span class="pre">true</span></code> adds each text chunk’s sampled ids
 (<code class="docutils literal notranslate"><span class="pre">{&quot;token_ids&quot;:</span> <span class="pre">[...]}</span></code>), stop tokens included, so a trainer need not
 re-tokenize the text.</p>
