@@ -82,7 +82,7 @@ def sample_video(path: str, video_processor) -> SampledVideo:
             f"transformers uses; {reason}"
         )
 
-    from mstar.model.base import video_metadata_dict
+    from mstar.model.components.media_io import video_metadata_dict
     from mstar.model.media_limits import VideoBudget
 
     budget = VideoBudget()

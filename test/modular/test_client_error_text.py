@@ -373,8 +373,10 @@ def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_erro
     """A header longer than the model's window makes the frontend decode the
     upload (``WindowPlanner.prepare``). When that decode fails with an
     unexpected error, here the FFmpeg fallback naming the saved upload as
-    torchcodec does, the client gets an error id and the upload is deleted."""
+    torchcodec does on a box without a working FFmpeg decoder, the client gets
+    an error id and the upload is deleted."""
     from mstar.api_server import media_io
+    from mstar.model.components import audio_features
 
     seen = []
 
@@ -382,7 +384,8 @@ def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_erro
         seen.append(path)
         raise RuntimeError(f"Could not open input file: {path} ({SECRET})")
 
-    monkeypatch.setattr(media_io, "decode_torchcodec_capped", ffmpeg_fails)
+    monkeypatch.setattr(media_io, "decode_media_capped", ffmpeg_fails)
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: False)
     response = _openai_client(monkeypatch, "whisper_large", tmp_path).post(
         "/v1/audio/transcriptions", files={"file": ("lecture.flac", _corrupt_flac(40))},
     )

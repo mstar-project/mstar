@@ -861,18 +861,19 @@ def test_streaming_parallel_error_releases_the_other_windows(client_and_stub):
 def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
     client, stub = client_and_stub
 
+    from mstar.model.components import audio_features
+
     def refuse(*args, **kwargs):
         raise RuntimeError("Error opening 'long.wav': Format not recognised.")
 
-    class _Decoder:
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("decode_av_frame: /src/torchcodec/_core/SingleStreamDecoder.cpp")
+    def ffmpeg_refuses(*args, **kwargs):
+        raise RuntimeError("decode_av_frame: /src/torchcodec/_core/SingleStreamDecoder.cpp")
 
-    # the header reads fine, the payload does not: libsndfile and FFmpeg both refuse it
+    # the header reads fine, the payload does not: libsndfile and FFmpeg (torchcodec where it works,
+    # else PyAV) both refuse it, and an FFmpeg decoder is there to refuse, so the file is the client's error
     monkeypatch.setattr(serving_transcriptions.media_io, "read_soundfile_capped", refuse)
-    decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
-    monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    monkeypatch.setattr(serving_transcriptions.media_io, "decode_media_capped", ffmpeg_refuses)
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: True)
     data = {"model": "whisper_large", "long_form": "parallel"}
     r = _post(client, data, filename="long.wav", content=_wav_bytes(61))
     assert r.status_code == 400 and "could not decode" in r.text and "torchcodec" not in r.text
