@@ -7,17 +7,21 @@ ChatML prompt and writes ``language {Name}<asr_text>{transcript}``. Forcing
 the language pre-fills ``language {Name}<asr_text>`` into the assistant
 turn, so the model emits the transcript alone.
 
-Architecture (2 nodes, single partition):
+Two nodes on the shared decoder scaffold (`MultimodalDecoderModel`):
     audio_encoder  — packed AuT, 8 s attention windows through the ragged
                      attention resource (no cache)
-    LLM            — dense Qwen3; paged KV cache; prefill captured on packed
-                     token buckets, decode per batch size
+    LLM            — dense Qwen3 (`SampledTokenDecoder`); paged KV cache;
+                     prefill captured on packed token buckets, decode per
+                     batch size
 
 Graph walks:
-    prefill — audio_encoder -> LLM over the whole prompt with the audio
-              embeddings spliced over the ``<|audio_pad|>`` placeholders;
-              samples the first token
-    decode  — LLM loop; each step feeds the sampled token back
+    prefill_audio — audio_encoder -> LLM over the whole prompt as one row,
+                    the audio embeddings spliced in at the ``<|audio_pad|>``
+                    placeholders; samples the first token
+    decode        — LLM loop; each step feeds the sampled token back
+
+Every request carries its one clip, so the scaffold's text-only walk and
+mixed step are not built (``TEXT_PROMPTS``).
 
 Prompt (the reference SDK's chat template, system turn included):
     <|im_start|>system\\n{context}<|im_end|>\\n
@@ -26,15 +30,9 @@ Prompt (the reference SDK's chat template, system turn included):
 """
 
 import logging
-from pathlib import Path
 
 import torch
 
-from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -49,22 +47,19 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
+from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
+from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
     ATTN,
     AUT_ATTN,
-    DECODE_LOOP,
-    DECODE_WALK,
     ENCODER_NODE,
     KV_CACHE,
     LANGUAGE_PREFIX,
     LLM_NODE,
-    PREFILL_WALK,
     ROPE,
     SAMPLER,
     Qwen3ASRModelConfig,
@@ -75,27 +70,20 @@ from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 logger = logging.getLogger(__name__)
 
 
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        logger.warning("Error downloading from HuggingFace: %s", str(e))
-        return repo_id
-    return str(Path(local_dir))
+def audio_encoder(pad_id: int) -> MediaEncoder:
+    """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
+    audio pad out."""
+    return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", (pad_id,))
 
 
-class Qwen3ASRModel(Model):
+class Qwen3ASRModel(MultimodalDecoderModel):
     """Qwen3-ASR: AuT encoder + dense Qwen3 decoder."""
 
-    # Where process_prompt put the audio placeholders, so prefill splices the
-    # audio embeddings in by slice instead of finding them on the device.
-    INTERNAL_KWARGS = ("audio_slot", "audio_tokens")
+    NAME = "Qwen3-ASR"
+    # the API server and conductor fetch the whole snapshot too, as they always have
+    METADATA_FILES = ("*",)
+    # every request carries its one clip
+    TEXT_PROMPTS = False
 
     # Concurrency the default cache sizing targets: 20 minutes of audio is
     # ~16k tokens, a LibriSpeech utterance ~300, so the pool is sized for a
@@ -103,19 +91,13 @@ class Qwen3ASRModel(Model):
     # ``resources:`` in their YAML.
     KV_PAGES = 1024
 
-    # The API server decodes uploads and stages their tensors with small CPU
-    # ops; a thread per core spins between them and starves its event loop.
-    PREPROCESS_TORCH_THREADS = 4
-
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
         **kwargs,
     ):
-        self.cache_dir = cache_dir
-        self.model_path_hf = model_path_hf
-        self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        super().__init__(model_path_hf, cache_dir)
         self.config = Qwen3ASRModelConfig.from_pretrained(self.local_dir)
 
         from transformers import AutoTokenizer
@@ -132,7 +114,8 @@ class Qwen3ASRModel(Model):
             hop_length=self.config.hop_length,
         )
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        pad = self.config.audio_token_id
+        self.media = (MediaIntake("audio", audio_encoder(pad), pad, self._audio_intake),)
 
     # -------------------------------------------------------------------
     # Model ABC: resources
@@ -200,7 +183,7 @@ class Qwen3ASRModel(Model):
         }
 
     # -------------------------------------------------------------------
-    # Model ABC: graph walk definitions
+    # Serving config and budget
     # -------------------------------------------------------------------
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -221,110 +204,8 @@ class Qwen3ASRModel(Model):
     def get_max_output_tokens(self, **model_kwargs):
         return checked_request_kwargs(model_kwargs).get("max_output_tokens", self.config.max_new_tokens)
 
-    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        prefill = Sequential([
-            GraphNode(
-                name=ENCODER_NODE,
-                input_names=["audio"],
-                outputs=[GraphEdge(next_node=LLM_NODE, name="audio_embeds")],
-            ),
-            GraphNode(
-                name=LLM_NODE,
-                input_names=["audio_embeds", "text_inputs"],
-                outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        output_modality="text",
-                        persist=True,
-                    ),
-                ],
-            ),
-        ])
-        decode = Loop(
-            name=DECODE_LOOP,
-            section=GraphNode(
-                name=LLM_NODE,
-                input_names=["text_inputs"],
-                outputs=[
-                    # One signal: the sampled token loops back as the next
-                    # input and goes to the client. The node keeps the loop-back
-                    # on the device and the worker sends the batch's tokens
-                    # inline, one frame a step, so a decode step stores no
-                    # tensor per request (the client joins the text chunks).
-                    GraphEdge(next_node=LLM_NODE, name="text_inputs"),
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
-                ],
-            ),
-            max_iters=self.config.text.max_position_embeddings,
-            outputs=[],
-        )
-        return {PREFILL_WALK: prefill, DECODE_WALK: decode}
-
     # -------------------------------------------------------------------
-    # Model ABC: forward pass args
-    # -------------------------------------------------------------------
-
-    @staticmethod
-    def _edge(node: str, name: str, tensor_info: list[TensorPointerInfo]) -> GraphEdge:
-        edge = GraphEdge(next_node=node, name=name)
-        edge.tensor_info = list(tensor_info)
-        return edge
-
-    def get_initial_forward_pass_args(
-        self,
-        partition_name: str,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        inputs = [
-            self._edge(ENCODER_NODE, "audio", input_signals.get("audio", [])),
-            self._edge(LLM_NODE, "text_inputs", input_signals.get("text_inputs", [])),
-        ]
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk=PREFILL_WALK,
-                is_prefill=True,
-            ),
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={
-                "is_prefill": True,
-                "audio_slot": (model_kwargs or {}).get("audio_slot"),
-                "audio_tokens": (model_kwargs or {}).get("audio_tokens"),
-            },
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Single-partition state machine: prefill -> decode loop -> done."""
-        metadata = partition_metadata
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = DECODE_WALK
-        elif metadata.graph_walk == DECODE_WALK:
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True,
-            )
-        inputs = [self._edge(LLM_NODE, "text_inputs", persist_signals.get("new_token", []))]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": False},
-        )
-
-    # -------------------------------------------------------------------
-    # Model ABC: media loading + prompt processing
+    # Media loading + intake
     # -------------------------------------------------------------------
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
@@ -352,123 +233,78 @@ class Qwen3ASRModel(Model):
             prompt += f"{LANGUAGE_PREFIX}{language}{ASR_TEXT_TAG}"
         return prompt + assistant_prefix
 
-    def prompt_ids(
-        self, num_audio_tokens: int, context: str = "", language: str | None = None,
-        assistant_prefix: str = "",
-    ) -> list[int]:
-        # One placeholder in the text, expanded in ids: tokenizing thousands
-        # of repeated special tokens is slow and adds nothing.
-        ids = self.tokenizer.encode(
-            self.prompt_text(1, context, language, assistant_prefix), add_special_tokens=False,
-        )
-        if ids.count(self.config.audio_token_id) != 1:
-            raise ValueError("the prompt must not contain <|audio_pad|>")
-        slot = ids.index(self.config.audio_token_id)
-        return ids[:slot] + [self.config.audio_token_id] * num_audio_tokens + ids[slot + 1:]
+    def max_input_files(self) -> dict[str, int]:
+        # none refused before decoding: intake refuses a second clip and ignores other files
+        return {}
 
-    def process_prompt(
-        self,
-        prompt: str | None,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        tensors: NameToTensorList | None = None,
-        **kwargs,
-    ) -> NameToTensorList:
-        """Log-mel of the whole clip plus the ChatML prompt.
-
-        The text ``prompt`` (or ``initial_prompt``) is the system-turn context
-        the reference SDK calls ``context`` (hot words, domain hints);
-        ``language`` (ISO code or name) forces the output language and turns
-        off the model's own language line; ``assistant_prefix`` is model
-        output to continue from (the streaming route's stable hypothesis).
-        """
-        raw_audio_inputs = (tensors or {}).get("audio_inputs", [])
-        if len(raw_audio_inputs) != 1:
+    def intake(self, prompt, input_modalities, tensors=None, prompt_parts=None, **kwargs):
+        """The one clip, checked first, then the prompt around it. The text is
+        the system-turn context; the request's layout and any other
+        attachment are ignored, as they always were."""
+        clips = (tensors or {}).get("audio_inputs", [])
+        if len(clips) != 1:
+            raise ValueError(f"{self.NAME} expects one audio input per request, got {len(clips)}.")
+        clip = clips[0].reshape(-1).to(torch.float32).cpu()
+        if clip.numel() == 0:
+            raise ValueError(f"{self.NAME} received an empty audio input.")
+        if clip.numel() > self.config.max_audio_samples:
             raise ValueError(
-                f"Qwen3-ASR expects one audio input per request, got {len(raw_audio_inputs)}."
-            )
-        waveform = raw_audio_inputs[0].reshape(-1).to(torch.float32).cpu()
-        if waveform.numel() == 0:
-            raise ValueError("Qwen3-ASR received an empty audio input.")
-        if waveform.numel() > self.config.max_audio_samples:
-            raise ValueError(
-                f"Qwen3-ASR takes at most {self.config.max_audio_seconds:.0f} s of audio per request; "
-                f"got {waveform.numel() / self.config.sampling_rate:.1f} s. Split the file first."
+                f"{self.NAME} takes at most {self.config.max_audio_seconds:.0f} s of audio per request; "
+                f"got {clip.numel() / self.config.sampling_rate:.1f} s. Split the file first."
             )
         # the encoder's first conv needs a few frames. The reference pads
         # sub-0.5 s clips with silence too
         min_samples = self.config.sampling_rate // 2
-        if waveform.numel() < min_samples:
-            waveform = torch.nn.functional.pad(waveform, (0, min_samples - waveform.numel()))
+        if clip.numel() < min_samples:
+            clip = torch.nn.functional.pad(clip, (0, min_samples - clip.numel()))
+        return super().intake(prompt, [TEXT, "audio"], {"audio_inputs": [clip]}, None, **kwargs)
 
-        # The samples go to the encoder as they are. The log-mel is its first
-        # step on the GPU (spectrograms on the data worker's CPU threads were
-        # the serving bottleneck). The prompt only needs the frame count.
-        num_frames = self.log_mel.num_frames(waveform.numel())
-        num_audio_tokens = self.config.audio.tokens_for_frames(num_frames)
+    def _prompt_ids(
+        self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
+    ) -> torch.Tensor:
+        """The prompt with its one ``<|audio_pad|>``. The text (or
+        ``initial_prompt``) is the system-turn context the reference SDK calls
+        ``context`` (hot words, domain hints); ``language`` (ISO code or name)
+        forces the output language and turns off the model's own language
+        line; ``assistant_prefix`` is model output to continue from (the
+        streaming route's stable hypothesis)."""
         kw = checked_request_kwargs(kwargs)
-        context = kw.get("initial_prompt") or prompt or ""
+        context = kw.get("initial_prompt") or "".join(p.text or "" for p in parts if p.modality == TEXT)
         language = self.config.language_name(kw.get("language"))
-        ids = self.prompt_ids(
-            num_audio_tokens, context=context, language=language,
-            assistant_prefix=kwargs.get("assistant_prefix") or "",
+        # One placeholder in the text, expanded in ids by intake: tokenizing
+        # thousands of repeated special tokens is slow and adds nothing.
+        ids = self.tokenizer.encode(
+            self.prompt_text(1, context, language, kwargs.get("assistant_prefix") or ""),
+            add_special_tokens=False,
         )
-        return ProcessPromptOutput(
-            new_input_tensors={
-                "audio": [waveform.contiguous()],
-                "text_inputs": [torch.tensor(ids, dtype=torch.long)],
-            },
-            metadata={
-                "audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens,
-                "kv_layout": {KV_CACHE: {"main": LabelLayout(
-                    spans=(Span("rows", PREFILL_WALK, len(ids), len(ids), "text_inputs"),),
-                    growth=((DECODE_LOOP, 1),),
-                )}},
-            },
-        )
+        if ids.count(self.config.audio_token_id) != 1:
+            raise ValueError("the prompt must not contain <|audio_pad|>")
+        return torch.tensor(ids, dtype=torch.long)
 
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
-
-    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
-
-    # -------------------------------------------------------------------
-    # Model ABC: postprocess
-    # -------------------------------------------------------------------
+    def _audio_intake(self, clip: torch.Tensor, metadata: dict) -> PreparedMedia:
+        """The samples go to the encoder as they are. The log-mel is its first
+        step on the GPU (spectrograms on the data worker's CPU threads were
+        the serving bottleneck). The prompt only needs the frame count."""
+        tokens = self.config.audio.tokens_for_frames(self.log_mel.num_frames(clip.numel()))
+        return PreparedMedia({"audio": clip.contiguous()}, [tokens])
 
     def text_output(self) -> TextOutput:
         return TextOutput(self._detokenizer)
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, **kwargs)
-        raise ValueError(f"Unsupported modality for Qwen3-ASR: {modality!r}")
-
     # -------------------------------------------------------------------
-    # Model ABC: sharding + submodule loading
+    # Submodules
     # -------------------------------------------------------------------
 
-    def get_default_sharding_config(self):
-        from mstar.distributed.base import ShardingConfig
-
-        return ShardingConfig(groups=[], tp_enabled_nodes={LLM_NODE}, shard_dim={})
-
-    def get_submodule(
-        self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
+    def _create_submodule(
+        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
     ) -> NodeSubmodule | None:
-        if node_name in self._submodule_cache:
-            return self._submodule_cache[node_name]
         if node_name == ENCODER_NODE:
             submodule = self._create_encoder_submodule(device, autocast_dtype)
         elif node_name == LLM_NODE:
             submodule = self._create_llm_submodule(device, tp_group, autocast_dtype)
         else:
-            submodule = None
+            return None
         logger.info("Successfully loaded Qwen3-ASR submodule for %s", node_name)
-        self._submodule_cache[node_name] = submodule
         return submodule
 
     def _create_encoder_submodule(self, device: str, autocast_dtype: torch.dtype | None) -> NodeSubmodule:
@@ -481,7 +317,7 @@ class Qwen3ASRModel(Model):
             encoder = encoder.to(autocast_dtype)
         encoder.to_empty(device=device)
         prefix = "thinker.audio_tower."
-        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
+        weights = iter_safetensors_shards(self._resolve_weights(), device=device, prefix=prefix)
         encoder.load_weights((k.removeprefix(prefix), v) for k, v in weights)
         encoder.eval()
 
@@ -509,7 +345,7 @@ class Qwen3ASRModel(Model):
         if autocast_dtype is not None:
             llm = llm.to(autocast_dtype)
         llm.to_empty(device=device)
-        weights = iter_safetensors_shards(self.local_dir, device=device, prefix="thinker.")
+        weights = iter_safetensors_shards(self._resolve_weights(), device=device, prefix="thinker.")
         llm.load_weights(
             (mapped, v) for k, v in weights
             if (mapped := self._llm_remap(k)) is not None
@@ -517,4 +353,4 @@ class Qwen3ASRModel(Model):
         llm.eval()
 
         from mstar.model.qwen3_asr.submodules import Qwen3ASRLLMSubmodule
-        return Qwen3ASRLLMSubmodule(llm=llm, config=self.config)
+        return Qwen3ASRLLMSubmodule(llm, self.config, self.encoders, text_prompts=self.TEXT_PROMPTS)

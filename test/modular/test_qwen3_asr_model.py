@@ -3,12 +3,13 @@
 Config reading from the checkpoint JSON, the reference SDK's prompt layout
 (placeholder count, forced-language prefix), audio-token arithmetic, the
 encoder submodule's window declaration and packing, the LLM submodule's
-embedding splice and stop rules, the request state machine, and the
+captures and stop rules, the request state machine, and the
 registry/CLI/benchmark wiring.
 """
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,17 +21,17 @@ from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
+from mstar.model.multimodal import MEDIA_LAYOUT  # noqa: E402
+from mstar.model.multimodal_decoder import MediaIntake  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
     AUT_ATTN,
-    DECODE_WALK,
     ENCODER_NODE,
     KV_CACHE,
     LLM_NODE,
-    PREFILL_WALK,
     Qwen3ASRModelConfig,
 )
-from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
+from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
 from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine  # noqa: E402
@@ -39,6 +40,8 @@ REPO = Path(__file__).resolve().parents[2]
 
 IM_START, IM_END, EOT = 151644, 151645, 151643
 AUDIO_START, AUDIO_END, AUDIO_PAD, ASR_TEXT = 151669, 151670, 151676, 151704
+# the scaffold's walks: the whole prompt with its clip, then the decode loop
+AUDIO_WALK, DECODE_WALK = "prefill_audio", "decode"
 
 
 class _FakeTokenizer:
@@ -106,6 +109,8 @@ def _make_model(config: Qwen3ASRModelConfig | None = None) -> Qwen3ASRModel:
 
     model._detokenizer = ByteLevelDetokenizer(model.tokenizer)
     model._submodule_cache = {}
+    pad = model.config.audio_token_id
+    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
     return model
 
 
@@ -172,70 +177,69 @@ def test_prompt_layout_matches_reference_template():
     assert model.prompt_text(1, context="ctx", language="English").endswith(
         f"<|im_start|>assistant\nlanguage English{ASR_TEXT_TAG}"
     )
-    ids = model.prompt_ids(5, context="", language=None)
-    assert ids.count(AUDIO_PAD) == 5
-    start, end = ids.index(AUDIO_START), ids.index(AUDIO_END)
-    assert end - start == 6 and ids[start + 1:end] == [AUDIO_PAD] * 5
-    assert ids[0] == IM_START and ids[-1] not in (ASR_TEXT,)
-    forced = model.prompt_ids(2, context="", language="German")
-    assert forced[-1] == ASR_TEXT and forced.count(AUDIO_PAD) == 2
-    # streaming continues from the stable part of the previous hypothesis
-    continued = model.prompt_ids(2, context="", language="German", assistant_prefix=" so far")
-    assert continued[:len(forced)] == forced and continued[len(forced):] == model.tokenizer.encode(" so far")
-    # a placeholder in the client's text would take the audio's slot
-    with pytest.raises(ValueError, match="audio_pad"):
-        model.prompt_ids(2, context="hello <|audio_pad|> world")
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64, 8192])
 def test_the_decode_loop_holds_any_cap_the_context_does(max_tokens):
     """The graph's decode loop runs to the context, so a length past the default
     cap is served rather than refused at intake."""
-    from mstar.model.qwen3_asr.config import DECODE_LOOP
-
     model = _make_model()
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)[DECODE_LOOP]
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
     assert cap <= model.get_graph_walk_graphs()[DECODE_WALK].max_iters
 
+
 def test_process_prompt_builds_features_and_prompt():
+    """The ids are the reference template's with the clip's placeholders, as
+    tokenizing the whole template gives them; the clip is the prompt's one
+    media run, prefilled with it as one row on the audio walk."""
     model = _make_model()
     wave = torch.randn(16_000 * 3 + 40)
-    result = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
-    out = result.new_input_tensors
-    assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder makes the mel
     n_tokens = model.config.audio.tokens_for_frames(wave.numel() // 160)  # one frame per hop, unpadded
-    ids = out["text_inputs"][0].tolist()
-    assert ids.count(AUDIO_PAD) == n_tokens and ids[-1] == ASR_TEXT
-    # prefill splices the audio in at the run process_prompt reports
-    slot, count = result.metadata["audio_slot"], result.metadata["audio_tokens"]
-    assert count == n_tokens and ids[slot:slot + count] == [AUDIO_PAD] * count
-    assert set(result.metadata) <= {*model.INTERNAL_KWARGS, "kv_layout"}
-    # the prompt span is what the prefill writes: every id, audio run included
-    assert [span.length for span in result.metadata["kv_layout"][KV_CACHE]["main"].spans] == [len(ids)]
 
-    free = model.process_prompt("hot words", ["audio", "text"], ["text"], {"audio_inputs": [wave]})
-    free_ids = free.new_input_tensors["text_inputs"][0].tolist()
-    assert free_ids[-1] != ASR_TEXT  # model reports the language itself
-    assert model.tokenizer.encode("hot words")[0] in free_ids
-    slot = free.metadata["audio_slot"]
-    assert free_ids[slot:slot + n_tokens] == [AUDIO_PAD] * n_tokens and free_ids[slot - 1] != AUDIO_PAD
+    def ids_of(out):
+        return out.new_input_tensors["text_inputs"][0].tolist()
 
-    prefixed = model.process_prompt(
-        None, ["audio"], ["text"], {"audio_inputs": [wave]}, assistant_prefix="language English<asr_text> hi",
+    for text, kwargs, context, language, prefix in [
+        (None, {"language": "en"}, "", "English", ""),
+        # the model reports the language itself
+        ("hot words", {}, "hot words", None, ""),
+        ("hot words", {"initial_prompt": "names: Ada"}, "names: Ada", None, ""),
+        # streaming continues from the stable part of the previous hypothesis
+        (None, {"language": "de", "assistant_prefix": " so far"}, "", "German", " so far"),
+    ]:
+        out = model.process_prompt(text, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, **kwargs)
+        ids = ids_of(out)
+        assert ids == model.tokenizer.encode(model.prompt_text(n_tokens, context, language, prefix))
+        layout = out.metadata[MEDIA_LAYOUT]
+        assert (layout["offset"], layout["tokens"], layout["output"]) == (
+            [ids.index(AUDIO_PAD)], [n_tokens], ["audio_embeds"],
+        )
+        # the prompt span is what the prefill writes: every id, audio run included
+        [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+        assert (span.kind, span.walk, span.length) == ("rows", AUDIO_WALK, len(ids))
+        assert set(out.metadata) == {MEDIA_LAYOUT, "kv_layout"}
+    assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
+
+    # the request's layout and any other attachment are ignored, as they always were
+    other = model.process_prompt(
+        None, ["image", "audio", "audio"], ["text"], {"audio_inputs": [wave], "image_inputs": [torch.zeros(3, 4, 4)]},
+        language="en",
     )
-    prefixed_ids = prefixed.new_input_tensors["text_inputs"][0].tolist()
-    assert [span.length for span in prefixed.metadata["kv_layout"][KV_CACHE]["main"].spans] == [len(prefixed_ids)]
-    assert prefixed_ids[-3:] == model.tokenizer.encode("<asr_text> hi")[-3:]
-    slot = prefixed.metadata["audio_slot"]
-    assert prefixed_ids[slot:slot + n_tokens] == [AUDIO_PAD] * n_tokens
+    assert ids_of(other) == model.tokenizer.encode(model.prompt_text(n_tokens, "", "English"))
+    assert model.max_input_files() == {}
 
     short = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.randn(1600)]})
     assert short.new_input_tensors["audio"][0].numel() == 8000  # padded to 0.5 s
     with pytest.raises(ValueError, match="at most"):
         model.process_prompt(None, ["audio"], ["text"],
                              {"audio_inputs": [torch.zeros(model.config.max_audio_samples + 16_000)]})
-    with pytest.raises(ValueError, match="one audio input"):
-        model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []})
+    # a text-only request, or one with nothing, is refused for its missing clip
+    for text, modalities in (("hello", ["text"]), (None, ["audio"]), (None, ["text"])):
+        with pytest.raises(ValueError, match=r"^Qwen3-ASR expects one audio input per request, got 0\.$"):
+            model.process_prompt(text, modalities, ["text"], {"audio_inputs": []})
+    # a placeholder in the client's text would take the audio's slot
+    with pytest.raises(ValueError, match="must not contain <\\|audio_pad\\|>"):
+        model.process_prompt("hello <|audio_pad|> world", ["audio", "text"], ["text"], {"audio_inputs": [wave]})
 
 
 def test_postprocess_keeps_asr_text_tag_and_drops_specials():
@@ -269,33 +273,31 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     sub = _encoder_submodule(cfg)
     fwd = type("F", (), {"request_id": "a"})()
     # samples in (one mel frame per hop), features made on the fly
-    rows = [sub.prepare_inputs(PREFILL_WALK, fwd, {"audio": [torch.randn(n * cfg.hop_length)]})
+    rows = [sub.prepare_inputs(AUDIO_WALK, fwd, {"audio": [torch.randn(n * cfg.hop_length)]})
             for n in (230, 150, 305)]
     assert [r.tensor_inputs["audio_features"].shape for r in rows] == [(cfg.num_mel_bins, n) for n in (230, 150, 305)]
     assert [r.input_seq_len for r in rows] == [cfg.audio.tokens_for_frames(n) for n in (230, 150, 305)]
-    step = sub.declare_step(PREFILL_WALK, ["a", "b", "c"], rows)
+    step = sub.declare_step(AUDIO_WALK, ["a", "b", "c"], rows)
     assert step.steps[AUT_ATTN].causal is False
     expected = [(rid, w) for rid, r in zip("abc", rows, strict=True) for w in cfg.audio.window_lengths(r.input_seq_len)]
     assert [(s.request_id, s.span) for s in step.segments] == expected
     assert all(s.label == "main" for s in step.segments)
 
-    batch = sub.preprocess(PREFILL_WALK, _engine_inputs("abc"), rows)
+    batch = sub.preprocess(AUDIO_WALK, _engine_inputs("abc"), rows)
     assert batch["audio_features"].shape == (3, cfg.num_mel_bins, 305) and batch["feature_lens"] == [230, 150, 305]
     with torch.no_grad():
-        out = sub.forward_batched(PREFILL_WALK, _engine_inputs("abc"), **batch)
-        single = sub.forward(PREFILL_WALK, _engine_inputs("b"),
+        out = sub.forward_batched(AUDIO_WALK, _engine_inputs("abc"), **batch)
+        single = sub.forward(AUDIO_WALK, _engine_inputs("b"),
                              audio_features=rows[1].tensor_inputs["audio_features"], feature_lens=[150])
     assert [out[r]["audio_embeds"][0].shape[0] for r in "abc"] == [r.input_seq_len for r in rows]
     assert out["a"]["audio_embeds"][0].shape[1] == cfg.audio.output_dim
     assert torch.allclose(out["b"]["audio_embeds"][0], single["audio_embeds"][0], atol=1e-5)
-    assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
+    assert sub.max_batch_size(AUDIO_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
 
 
 def test_encoder_replays_exactly_when_leased():
     """A leased step declares nothing of its own, so the forward replays
     then and runs eagerly otherwise, whatever the runner's buckets allow."""
-    from types import SimpleNamespace
-
     from mstar.model.qwen3_asr.submodules import AUT_ENCODE
 
     class Runner:
@@ -326,41 +328,23 @@ def test_encoder_replays_exactly_when_leased():
 
 
 def _llm_submodule(cfg):
-    sub = object.__new__(Qwen3ASRLLMSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states, sub.node_resources = {}, {}
-    sub.config, sub.stop_token_ids = cfg, cfg.stop_token_ids
-    embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
-    sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
-    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    return sub
+    return Qwen3ASRLLMSubmodule(
+        SimpleNamespace(embed_dtype=torch.float32), cfg, (audio_encoder(cfg.audio_token_id),), text_prompts=False,
+    )
 
 
-def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
+def test_llm_captures_decode_and_the_whole_prompt_only():
+    """Every prompt carries its clip: decode and the audio prefill capture, no
+    text-only or mixed step. A captured prefill is capped by its capture and
+    an eager one not at all, as before the scaffold."""
     cfg = _tiny_config()
     sub = _llm_submodule(cfg)
-    ids = torch.tensor([IM_START, 1001, AUDIO_START, AUDIO_PAD, AUDIO_PAD, AUDIO_PAD, AUDIO_END, 1002])
-    audio = torch.arange(3 * cfg.text.hidden_size, dtype=torch.float32).view(3, -1)
-    # where process_prompt put the placeholder run, carried in the prefill's step_metadata
-    fwd = type("F", (), {"request_id": "r", "step_metadata": {"audio_slot": 3, "audio_tokens": 3}})()
-    row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [ids], "audio_embeds": [audio]})
-    assert row.input_seq_len == 8 and row.input_embeds.shape == (8, cfg.text.hidden_size)
-    assert torch.equal(row.input_embeds[3:6], audio)
-    assert torch.equal(row.input_embeds[0], sub.model.embed_tokens(ids[:1])[0])
-    with pytest.raises(ValueError, match="placeholders"):
-        sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [ids], "audio_embeds": [audio[:2]]})
-    batch = sub.preprocess(PREFILL_WALK, _engine_inputs("r"), [row])
-    assert set(batch) == {"input_embeds"}
-
-    decode_row = sub.prepare_inputs(DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
-    assert decode_row.input_seq_len == 1 and decode_row.input_embeds is None
-    assert sub.preprocess(DECODE_WALK, _engine_inputs("r"), [decode_row])["input_ids"].tolist() == [42]
-    step = sub.declare_step(PREFILL_WALK, ["r"], [row])
-    assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
-    (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    assert decode.capture_batch_sizes == sub.DECODE_CAPTURE_BATCH_SIZES
-    assert prefill.capture_token_lengths == sub.PREFILL_TOKEN_BUCKETS
-    assert prefill.make_node_input(7).input_embeds.shape == (7, cfg.text.hidden_size)
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    assert {walk for c in configs for walk in c.replay_graph_walks} == {DECODE_WALK, AUDIO_WALK}
+    assert set(_make_model().get_graph_walk_graphs()) == {DECODE_WALK, AUDIO_WALK}
+    (prefill,) = [c for c in configs if AUDIO_WALK in c.replay_graph_walks]
+    assert prefill.make_node_input(7).tensor_inputs["audio_embeds"].shape == (7, cfg.text.hidden_size)
+    assert prefill.caps_eager_batch_size and sub.max_batch_size(AUDIO_WALK) is None
 
 
 def test_llm_check_stop():
@@ -377,11 +361,11 @@ def test_llm_check_stop():
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
     # a stop token first ends the request: there is no decode loop yet
-    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
+    assert sub.check_stop("r", info(AUDIO_WALK, 0), im_end) == {END_PARTITION}
     # any other walk outside the loop may be followed by one the transition runs
     assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
     # a budget of 1 ends at the prefill, before the loop exists to cap it
-    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
+    assert sub.check_stop("r", info(AUDIO_WALK, 0, max_tokens=1), word) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
@@ -404,7 +388,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "word": info(DECODE_WALK, 0),
         "eot": info(DECODE_WALK, 0),
         "ignored": info(DECODE_WALK, 0, ignore_eos=True),
-        "prefill": info(PREFILL_WALK, 0),
+        "prefill": info(AUDIO_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
     # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
@@ -425,8 +409,6 @@ def test_llm_check_stop_batched_agrees_with_per_request():
 def test_engine_stop_check_takes_the_batched_path(step_walk):
     """The engine passes ``step_walk``; a signature without it raised, and the
     engine silently fell back to one ``check_stop`` per row."""
-    from types import SimpleNamespace
-
     from mstar.engine.engine import Engine
 
     sub = _llm_submodule(_tiny_config())
@@ -468,7 +450,7 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
 def test_graph_resources_and_state_machine():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
-    assert set(walks) == {PREFILL_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
+    assert set(walks) == {AUDIO_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
     specs = model.get_node_resources()
     ragged = next(s for s in specs if isinstance(s, RaggedAttentionSpec))
     assert ragged.nodes == {ENCODER_NODE} and ragged.config.num_qo_heads == 4 and ragged.config.head_dim == 16
@@ -482,13 +464,14 @@ def test_graph_resources_and_state_machine():
     assert attn.config.decode_tensor_cores is False  # narrow GQA: the CUDA-core decode kernel
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
+    layout = {"offset": [5], "tokens": [37], "output": ["audio_embeds"], "grid": [[]]}
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
-        model_kwargs={"audio_slot": 5, "audio_tokens": 37},
+        model_kwargs={MEDIA_LAYOUT: layout},
     )
-    assert args.full_metadata.graph_walk == PREFILL_WALK
-    assert args.step_metadata == {"is_prefill": True, "audio_slot": 5, "audio_tokens": 37}
-    assert [(e.next_node, e.name) for e in args.inputs] == [(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")]
+    assert args.full_metadata.graph_walk == AUDIO_WALK
+    assert args.step_metadata == {"is_prefill": True, MEDIA_LAYOUT: layout}
+    assert {(e.next_node, e.name) for e in args.inputs} == {(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")}
     nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
     assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill
     assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
@@ -616,9 +599,9 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     sub = _llm_submodule(cfg)
     sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs"})
-    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.device_loopback_signals(AUDIO_WALK) == frozenset()
     assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
-    assert sub.inline_client_signals(PREFILL_WALK) == {}
+    assert sub.inline_client_signals(AUDIO_WALK) == {}
     # a loop-back row brings no ids; preprocess reads them off the sampler
     row = sub.prepare_inputs(DECODE_WALK, None, {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
