@@ -98,7 +98,7 @@ def _conductor(*ticks, requests):
     batches = [list(t) for t in ticks]
     c.communicator = SimpleNamespace(
         send=lambda entity, msg: c.sent.append((entity, msg)),
-        poll_for_messages=lambda timeout_ms=1: False, get_all_new_messages=lambda: batches.pop(0) if batches else [],
+        get_all_new_messages=lambda: batches.pop(0) if batches else [],
     )
     c.model = _Model()
     c.enable_nvtx = False
@@ -152,25 +152,6 @@ def test_two_healthy_requests_complete_in_one_tick():
     _run(c)
     assert set(_to_client(c, "request_complete")) == {"a", "b"}
     assert _to_client(c, "request_failed") == {}
-
-
-def test_a_failed_wait_for_messages_does_not_end_the_loop(monkeypatch):
-    """A transport error from the idle wait (ZMQError, the Rust runtime's
-    RuntimeError) is a failed pass, not the conductor's exit, and the failed
-    pass still backs off rather than spinning."""
-    c = _conductor([_done("a")], [_done("b")], requests={"a": _request(), "b": _request()})
-    fails = [RuntimeError("socket closed")]
-    sleeps = []
-    monkeypatch.setattr(conductor_mod.time, "sleep", sleeps.append)
-
-    def poll(timeout_ms=1):
-        if fails:
-            raise fails.pop()
-        return False
-    c.communicator.poll_for_messages = poll
-    _run(c)
-    assert {"a", "b"} <= set(_to_client(c, "request_complete"))
-    assert sleeps, "a failed pass went straight into the next one"
 
 
 def test_a_failing_pass_does_not_strand_the_other_requests_in_its_tick():

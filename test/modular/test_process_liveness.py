@@ -96,7 +96,7 @@ def _conductor(procs, inbox=()):
     c.sent = []
     c.communicator = SimpleNamespace(
         send=lambda entity, msg: c.sent.append((entity, msg)),
-        poll_for_messages=lambda timeout_ms=1: False, get_all_new_messages=_inbox(inbox),
+        get_all_new_messages=_inbox(inbox),
     )
     c.worker_ids = [f"worker_{i}" for i in range(len(procs))]
     c._worker_processes = list(procs)
