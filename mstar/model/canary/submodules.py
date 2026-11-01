@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from mstar.engine.resources import AttentionStep, KVStep
 from mstar.engine.resources.step import ResourceStep
-from mstar.model.canary.config import ATTN, CONTEXT_LABEL, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE
+from mstar.model.canary.config import ATTN, CONTEXT_LABEL, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE, POS
 from mstar.model.components.encoder_decoder import EncoderDecoderNode
 
 
@@ -15,6 +15,7 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
 
     PREFILL_WALK = "prefill"
     ATTN_KEY = ATTN
+    POS_KEY = POS
     CROSS_KV_CACHE = CROSS_KV_CACHE
     CROSS_ATTN = CROSS_ATTN
     CONTEXT_LABEL = CONTEXT_LABEL

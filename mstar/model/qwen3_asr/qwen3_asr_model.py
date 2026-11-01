@@ -15,10 +15,10 @@ Two nodes on the shared decoder scaffold (`MultimodalDecoderModel`):
                      batch size
 
 Graph walks:
-    prefill_audio — audio_encoder -> LLM over the whole prompt as one row,
-                    the audio embeddings spliced in at the ``<|audio_pad|>``
-                    placeholders; samples the first token
-    decode        — LLM loop; each step feeds the sampled token back
+    prefill — audio_encoder -> LLM over the whole prompt as one row, the
+              audio embeddings spliced in at the ``<|audio_pad|>``
+              placeholders; samples the first token
+    decode  — LLM loop; each step feeds the sampled token back
 
 Every request carries its one clip, so the scaffold's text-only walk and
 mixed step are not built (``TEXT_PROMPTS``).
@@ -72,8 +72,8 @@ logger = logging.getLogger(__name__)
 
 def audio_encoder(pad_id: int) -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
-    audio pad out."""
-    return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", (pad_id,))
+    audio pad out, on the ``prefill`` walk (configs and metrics read walk names)."""
+    return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", (pad_id,), walk="prefill")
 
 
 class Qwen3ASRModel(MultimodalDecoderModel):

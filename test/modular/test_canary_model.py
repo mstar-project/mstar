@@ -274,7 +274,7 @@ def test_decoder_matches_hf():
 
     transformers = pytest.importorskip("transformers")
     modeling = pytest.importorskip("transformers.models.canary.modeling_canary")
-    from mstar.model.canary.config import ATTN, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE, ROPE, SAMPLER
+    from mstar.model.canary.config import ATTN, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE, POS, SAMPLER
     from mstar.model.canary.submodules import CanaryDecoderSubmodule
     from mstar.model.components.fastconformer import FastConformerConfig
     from mstar.model.loader import WHISPER_STACKED_PARAMS, load_hf_weights
@@ -307,7 +307,7 @@ def test_decoder_matches_hf():
     def run(walk, inputs, positions):
         """One step as the engine runs it, with a sampler that hands back its logits."""
         engine_inputs = SimpleNamespace(request_ids=["a"], resources={
-            ROPE: SimpleNamespace(pos_ids=lambda label: positions), ATTN: last_rows,
+            POS: SimpleNamespace(pos_ids=lambda label: positions), ATTN: last_rows,
             SAMPLER: SimpleNamespace(sample=lambda request_ids, logits: logits),
         })
         rows = [node.prepare_inputs(walk, None, inputs)]
@@ -396,8 +396,10 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
 def test_decoder_node_caps_captures_and_names(snapshot):
     """What the shared decoder gives Canary's node, as before the scaffold:
     prefill batches capped, only decode captured on its ladder, the sampled
-    token fed back, and the walk, loop and sampler names of Canary's graph."""
-    from mstar.model.canary.config import SAMPLER
+    token fed back, the walk, loop and sampler names of Canary's graph, and
+    positions advanced on the resource the model declares, under its key."""
+    from mstar.model.canary.config import POS, SAMPLER
+    from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
     assert node.max_batch_size("prefill") == 32 and node.max_batch_size("decode") is None
@@ -406,5 +408,9 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"]
-    walks = CanaryModel(str(snapshot)).get_graph_walk_graphs()
+    model = CanaryModel(str(snapshot))
+    walks = model.get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
+    step = node.declare_step("decode", ["a"], [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1)])
+    # the resource key YAML overrides name
+    assert POS == "positions" and POS in step.steps and POS in {s.resource_key for s in model.get_node_resources()}

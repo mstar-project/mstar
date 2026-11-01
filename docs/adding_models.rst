@@ -2558,9 +2558,11 @@ A tower builds on the pieces in ``mstar/model/components/vit.py``:
 through the ragged resource, rope in fp32), which a tower subclasses with its q/k/v
 projections. An encoder of another medium need only send its ``MediaEncoder.output``,
 a row per pad in prompt order: Higgs-Audio's audio tower and Qwen3-ASR's packed AuT
-encoder are plain ``NodeSubmodule`` s on the ``prefill_audio`` walk. A model whose graph
-is not ``MultimodalDecoderModel``'s (Canary-Qwen's LLM node is ``llm``) writes its own
-walks and hands its LLM node its ``MediaEncoder`` s and ``text_prompts`` itself, with
+encoder are plain ``NodeSubmodule`` s on the audio walk. That walk is ``prefill_audio``
+unless the lone encoder's ``MediaEncoder.walk`` names it: Qwen3-ASR's keeps ``prefill``,
+the name its configs and metrics read. A model whose graph is not
+``MultimodalDecoderModel``'s (Canary-Qwen's LLM node is ``llm``) writes its own walks and
+hands its LLM node its ``MediaEncoder`` s and ``text_prompts`` itself, with
 ``MEDIA_LAYOUT`` on the prefill step.
 
 Advanced: async partitions and streaming

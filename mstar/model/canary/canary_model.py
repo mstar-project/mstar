@@ -47,8 +47,8 @@ from mstar.model.canary.config import (
     CROSS_ATTN,
     CROSS_KV_CACHE,
     KV_CACHE,
+    POS,
     PROMPT_LENGTH,
-    ROPE,
     SAMPLER,
     CanaryModelConfig,
 )
@@ -132,7 +132,7 @@ class CanaryModel(Model):
                 ),
             ),
             # no RoPE: the counter's planned ids drive the sinusoid lookup
-            PositionSpec(resource_key=ROPE, nodes={"decoder"}, config=PositionConfig(kv_cache=KV_CACHE)),
+            PositionSpec(resource_key=POS, nodes={"decoder"}, config=PositionConfig(kv_cache=KV_CACHE)),
             SamplerSpec(
                 resource_key=SAMPLER, nodes={"decoder"},
                 vocab_size=cfg.vocab_size,

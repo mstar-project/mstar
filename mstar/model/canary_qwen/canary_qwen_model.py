@@ -14,9 +14,9 @@ Architecture (2 nodes, single partition):
     llm           — Qwen3 with a paged KV cache (a `SampledTokenDecoder`)
 
 Graph walks:
-    prefill_audio — audio_encoder -> llm (the whole prompt as one row, the
-                    audio spliced in at its placeholders)
-    decode        — llm loop
+    prefill — audio_encoder -> llm (the whole prompt as one row, the audio
+              spliced in at its placeholders)
+    decode  — llm loop
 """
 
 import json
@@ -89,8 +89,8 @@ def merge_lora(
 
 def audio_encoder(pad_id: int) -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
-    audio placeholder out."""
-    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", (pad_id,))
+    audio placeholder out, on the ``prefill`` walk (configs and metrics read walk names)."""
+    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", (pad_id,), walk="prefill")
 
 
 # the media walk the LLM node knows its prompts by, named from the encoder

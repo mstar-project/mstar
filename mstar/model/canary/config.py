@@ -13,12 +13,12 @@ from mstar.model import keys
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.utils import GRANARY_LANGUAGES, base_language
 
-# decoder node resources; the shared decoder reads `keys`' sampler and positions
+# decoder node resources; the shared decoder reads `keys`' sampler
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 SAMPLER = keys.SAMPLER
-# no RoPE: the position counter whose planned ids drive the sinusoid lookup
-ROPE = keys.ROPE
+# no RoPE: declared for the position counter that drives the sinusoid lookup
+POS = "positions"
 # the encoder output, written once at prefill, in a cache of its own so the
 # self-attention resource never plans over it
 CROSS_KV_CACHE = "cross_kv_cache"

@@ -41,7 +41,7 @@ REPO = Path(__file__).resolve().parents[2]
 IM_START, IM_END, EOT = 151644, 151645, 151643
 AUDIO_START, AUDIO_END, AUDIO_PAD, ASR_TEXT = 151669, 151670, 151676, 151704
 # the scaffold's walks: the whole prompt with its clip, then the decode loop
-AUDIO_WALK, DECODE_WALK = "prefill_audio", "decode"
+PREFILL_WALK, DECODE_WALK = "prefill", "decode"
 
 
 class _FakeTokenizer:
@@ -216,7 +216,7 @@ def test_process_prompt_builds_features_and_prompt():
         )
         # the prompt span is what the prefill writes: every id, audio run included
         [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
-        assert (span.kind, span.walk, span.length) == ("rows", AUDIO_WALK, len(ids))
+        assert (span.kind, span.walk, span.length) == ("rows", PREFILL_WALK, len(ids))
         assert set(out.metadata) == {MEDIA_LAYOUT, "kv_layout"}
     assert torch.equal(out.new_input_tensors["audio"][0], wave)  # samples as they are; the encoder makes the mel
 
@@ -273,26 +273,26 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     sub = _encoder_submodule(cfg)
     fwd = type("F", (), {"request_id": "a"})()
     # samples in (one mel frame per hop), features made on the fly
-    rows = [sub.prepare_inputs(AUDIO_WALK, fwd, {"audio": [torch.randn(n * cfg.hop_length)]})
+    rows = [sub.prepare_inputs(PREFILL_WALK, fwd, {"audio": [torch.randn(n * cfg.hop_length)]})
             for n in (230, 150, 305)]
     assert [r.tensor_inputs["audio_features"].shape for r in rows] == [(cfg.num_mel_bins, n) for n in (230, 150, 305)]
     assert [r.input_seq_len for r in rows] == [cfg.audio.tokens_for_frames(n) for n in (230, 150, 305)]
-    step = sub.declare_step(AUDIO_WALK, ["a", "b", "c"], rows)
+    step = sub.declare_step(PREFILL_WALK, ["a", "b", "c"], rows)
     assert step.steps[AUT_ATTN].causal is False
     expected = [(rid, w) for rid, r in zip("abc", rows, strict=True) for w in cfg.audio.window_lengths(r.input_seq_len)]
     assert [(s.request_id, s.span) for s in step.segments] == expected
     assert all(s.label == "main" for s in step.segments)
 
-    batch = sub.preprocess(AUDIO_WALK, _engine_inputs("abc"), rows)
+    batch = sub.preprocess(PREFILL_WALK, _engine_inputs("abc"), rows)
     assert batch["audio_features"].shape == (3, cfg.num_mel_bins, 305) and batch["feature_lens"] == [230, 150, 305]
     with torch.no_grad():
-        out = sub.forward_batched(AUDIO_WALK, _engine_inputs("abc"), **batch)
-        single = sub.forward(AUDIO_WALK, _engine_inputs("b"),
+        out = sub.forward_batched(PREFILL_WALK, _engine_inputs("abc"), **batch)
+        single = sub.forward(PREFILL_WALK, _engine_inputs("b"),
                              audio_features=rows[1].tensor_inputs["audio_features"], feature_lens=[150])
     assert [out[r]["audio_embeds"][0].shape[0] for r in "abc"] == [r.input_seq_len for r in rows]
     assert out["a"]["audio_embeds"][0].shape[1] == cfg.audio.output_dim
     assert torch.allclose(out["b"]["audio_embeds"][0], single["audio_embeds"][0], atol=1e-5)
-    assert sub.max_batch_size(AUDIO_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
+    assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
 
 
 def test_encoder_replays_exactly_when_leased():
@@ -340,11 +340,11 @@ def test_llm_captures_decode_and_the_whole_prompt_only():
     cfg = _tiny_config()
     sub = _llm_submodule(cfg)
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    assert {walk for c in configs for walk in c.replay_graph_walks} == {DECODE_WALK, AUDIO_WALK}
-    assert set(_make_model().get_graph_walk_graphs()) == {DECODE_WALK, AUDIO_WALK}
-    (prefill,) = [c for c in configs if AUDIO_WALK in c.replay_graph_walks]
+    assert {walk for c in configs for walk in c.replay_graph_walks} == {DECODE_WALK, PREFILL_WALK}
+    assert set(_make_model().get_graph_walk_graphs()) == {DECODE_WALK, PREFILL_WALK}
+    (prefill,) = [c for c in configs if PREFILL_WALK in c.replay_graph_walks]
     assert prefill.make_node_input(7).tensor_inputs["audio_embeds"].shape == (7, cfg.text.hidden_size)
-    assert prefill.caps_eager_batch_size and sub.max_batch_size(AUDIO_WALK) is None
+    assert prefill.caps_eager_batch_size and sub.max_batch_size(PREFILL_WALK) is None
 
 
 def test_llm_check_stop():
@@ -361,11 +361,11 @@ def test_llm_check_stop():
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
     # a stop token first ends the request: there is no decode loop yet
-    assert sub.check_stop("r", info(AUDIO_WALK, 0), im_end) == {END_PARTITION}
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
     # any other walk outside the loop may be followed by one the transition runs
     assert sub.check_stop("r", info("detect_language", 0), im_end) == set()
     # a budget of 1 ends at the prefill, before the loop exists to cap it
-    assert sub.check_stop("r", info(AUDIO_WALK, 0, max_tokens=1), word) == {END_PARTITION}
+    assert sub.check_stop("r", info(PREFILL_WALK, 0, max_tokens=1), word) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
@@ -388,7 +388,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "word": info(DECODE_WALK, 0),
         "eot": info(DECODE_WALK, 0),
         "ignored": info(DECODE_WALK, 0, ignore_eos=True),
-        "prefill": info(AUDIO_WALK, 0),
+        "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
     # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
@@ -450,7 +450,7 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
 def test_graph_resources_and_state_machine():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
-    assert set(walks) == {AUDIO_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
+    assert set(walks) == {PREFILL_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
     specs = model.get_node_resources()
     ragged = next(s for s in specs if isinstance(s, RaggedAttentionSpec))
     assert ragged.nodes == {ENCODER_NODE} and ragged.config.num_qo_heads == 4 and ragged.config.head_dim == 16
@@ -469,7 +469,7 @@ def test_graph_resources_and_state_machine():
         "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
         model_kwargs={MEDIA_LAYOUT: layout},
     )
-    assert args.full_metadata.graph_walk == AUDIO_WALK
+    assert args.full_metadata.graph_walk == PREFILL_WALK
     assert args.step_metadata == {"is_prefill": True, MEDIA_LAYOUT: layout}
     assert {(e.next_node, e.name) for e in args.inputs} == {(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")}
     nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
@@ -599,9 +599,9 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     sub = _llm_submodule(cfg)
     sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs"})
-    assert sub.device_loopback_signals(AUDIO_WALK) == frozenset()
+    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
     assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
-    assert sub.inline_client_signals(AUDIO_WALK) == {}
+    assert sub.inline_client_signals(PREFILL_WALK) == {}
     # a loop-back row brings no ids; preprocess reads them off the sampler
     row = sub.prepare_inputs(DECODE_WALK, None, {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1

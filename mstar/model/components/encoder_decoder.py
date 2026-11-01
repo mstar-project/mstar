@@ -10,10 +10,8 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.keys import ROPE
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 
 
@@ -41,14 +39,7 @@ class EncoderDecoderNode(SampledTokenDecoder):
     CROSS_KV_CACHE: str
     CROSS_ATTN: str
     CONTEXT_LABEL: str
-
-    def get_accelerator_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[AcceleratorGraphConfig]:
-        return [
-            config for config in super().get_accelerator_graph_configs(device, tp_world_size)
-            if config.capture_graph_walk == self.DECODE_WALK
-        ]
+    CAPTURE_PREFILL = False
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         if graph_walk == self.PREFILL_WALK:
@@ -108,4 +99,4 @@ class EncoderDecoderNode(SampledTokenDecoder):
     ) -> dict[str, Any]:
         # the position resource's planned ids (a slot buffer when captured),
         # and on prefill the encoder output
-        return {"position_ids": engine_inputs.resources[ROPE].pos_ids("main")[:num_tokens], **tensors}
+        return {"position_ids": engine_inputs.resources[self.POS_KEY].pos_ids("main")[:num_tokens], **tensors}

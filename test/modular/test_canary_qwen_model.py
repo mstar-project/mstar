@@ -294,8 +294,8 @@ def test_llm_loads_from_the_checkpoints_names(tmp_path):
 
 def test_llm_node_caps_captures_and_names():
     """What the shared SampledTokenDecoder gives the LLM node: prefill batches
-    capped, decode bounded by its captures, both stop tokens, and the walk,
-    loop and sampler names of Canary-Qwen's graph."""
+    capped, only decode captured, both stop tokens, and the walk, loop and
+    sampler names of Canary-Qwen's graph."""
     from mstar.model.canary_qwen.config import SAMPLER
     from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
     from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
@@ -317,5 +317,7 @@ def test_llm_node_caps_captures_and_names():
     ]
     walks = object.__new__(CanaryQwenModel).get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
-    # the node splices the audio only on a walk it knows as its encoder's
-    assert set(walks) == {PREFILL_WALK, node.DECODE_WALK} and node._is_prefill_walk(PREFILL_WALK)
+    # the walk names configs and metrics read; the node splices the audio only
+    # on a walk it knows as its encoder's
+    assert set(walks) == {PREFILL_WALK, node.DECODE_WALK} == {"prefill", "decode"}
+    assert node._is_prefill_walk(PREFILL_WALK)
