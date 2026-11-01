@@ -1914,6 +1914,24 @@ its steps, with the request’s first <code class="docutils literal notranslate"
 starting early on a thread of the submodule’s own; it must not touch the device. The
 DiT scaffold draws a request’s seeded noise here (<code class="docutils literal notranslate"><span class="pre">PREFETCH_SEEDS</span></code>).</p>
 </dd>
+<dt><code class="docutils literal notranslate"><span class="pre">get_stop_policies(self,</span> <span class="pre">graph_walk)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">StopPolicy]</span> <span class="pre">|</span> <span class="pre">None</span></code> (optional)</dt><dd><p>Declare what <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> amounts to on a walk, per loop it can stop, when it is
+only the common checks; the graph runtime then runs them over the step’s token column
+without calling <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>. That takes the batched output carrying the policies’
+<code class="docutils literal notranslate"><span class="pre">token_signal</span></code> as a stop buffer (<code class="docutils literal notranslate"><span class="pre">BatchedModelOutput(check_stop_buffers={...})</span></code>,
+as Qwen3.5 and Orpheus return); a step without one, or one that mixes walks,
+still calls <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>. <code class="docutils literal notranslate"><span class="pre">StopPolicy(StopKind.AR,</span> <span class="pre">token_signal=...,</span>
+<span class="pre">eos_tokens=...,</span> <span class="pre">sampler=...)</span></code> stops its loop on an EOS token (unless the <code class="docutils literal notranslate"><span class="pre">sampler</span></code>
+resource’s request config sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>) or when the loop’s iteration count plus
+one reaches <code class="docutils literal notranslate"><span class="pre">max_iters</span></code> (<code class="docutils literal notranslate"><span class="pre">info.max_tokens</span></code> unless given). <code class="docutils literal notranslate"><span class="pre">StopKind.ITER</span></code> checks
+only the count, and <code class="docutils literal notranslate"><span class="pre">StopKind.EOS</span></code> only the token, for a loop whose cap is its budget.
+The limits are computed from the request’s forward-pass info whenever
+the worker receives it, not per step. Return <code class="docutils literal notranslate"><span class="pre">{}</span></code> for a
+walk on which <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> never stops a loop, and <code class="docutils literal notranslate"><span class="pre">None</span></code> (the default) to keep
+calling <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>. The policies must agree with <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> for every row;
+<code class="docutils literal notranslate"><span class="pre">test/modular/test_stop_policies.py</span></code> checks the models that declare them. A
+<code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> with <code class="docutils literal notranslate"><span class="pre">runtime_check=True</span></code> declares them for you: its loop’s stop ids,
+as <code class="docutils literal notranslate"><span class="pre">StopKind.EOS</span></code>, on <code class="docutils literal notranslate"><span class="pre">walk</span></code>; its <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code> keep <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>.</p>
+</dd>
 <dt><code class="docutils literal notranslate"><span class="pre">cleanup_request(self,</span> <span class="pre">request_id)</span></code> (optional)</dt><dd><p>Free per-request state held inside the submodule when a request finishes: buffers,
 per-request caches, counters. See Qwen3-Omni’s <code class="docutils literal notranslate"><span class="pre">Code2WavSubmodule</span></code> for an example.</p>
 </dd>

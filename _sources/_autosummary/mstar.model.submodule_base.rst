@@ -31,6 +31,9 @@ mstar.model.submodule\_base
       StackingMethod
       StepOrder
       StopCheck
+      StopKind
+      StopLimits
+      StopPolicy
       TokenStop
    
    
