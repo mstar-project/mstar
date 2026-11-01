@@ -44,7 +44,8 @@ SENDER, RECEIVER = "worker_0", "worker_1"
 
 #: control: the bytes ride in a control message (serialize, send, deserialize).
 #: tcp / rdma: M*'s Mooncake path (register, descriptor, read, ack, cleanup).
-#: shm / arena: M*'s same-host paths (per-uuid file, Rust arena).
+#: shm / arena: same host; the per-uuid file protocol on its own (the arena's
+#: spill path) and the Rust arena, which is M*'s SHM transport.
 #: tcp-pool / rdma-pool: Mooncake reads from a buffer registered once, copied
 #: into (or, with --pool-mode zerocopy, produced in) per send. Not an M* path
 #: today; the contrast with tcp shows what per-tensor registration costs.
@@ -209,8 +210,13 @@ def make_manager(path: str, my_id: str, device: str, comm, args):
     from mstar.communication.communicator import CommProtocol
     from mstar.communication.tensors import create_tensor_communication_manager
     host = args.sender_host if my_id == SENDER else args.receiver_host
-    if path in ("shm", "arena"):
-        os.environ["MSTAR_SHM_ARENA"] = "1" if path == "arena" else "0"
+    if path == "shm":
+        from mstar.communication.tensors import SharedMemoryCommunicationManager
+        return SharedMemoryCommunicationManager(
+            my_entity_id=my_id, hostname=host, device=device, communicator=comm,
+            shm_dir=args.shm_dir,
+        )
+    if path == "arena":
         return create_tensor_communication_manager(
             protocol=CommProtocol.SHM, my_entity_id=my_id, hostname=host,
             device=device, communicator=comm, shm_dir=args.shm_dir,

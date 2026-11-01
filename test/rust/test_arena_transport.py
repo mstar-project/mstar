@@ -201,10 +201,9 @@ def test_strict_mode_backpressures_then_fails(tmp_path):
 
 
 def test_transport_mismatch_fails_loudly(tmp_path):
-    """A mixed deployment (arena producer + file consumer, or the reverse)
-    fails with an explicit MSTAR_SHM_ARENA message where data would be
-    unreachable (arena producer -> file consumer); the reverse direction
-    interops via the arena consumer's file fallback."""
+    """The file manager on its own (the spill path) cannot read an arena slot
+    and says so; the reverse direction interops via the arena consumer's
+    file fallback."""
     arena_prod = _manager("mx0", tmp_path)
     file_cons = SharedMemoryCommunicationManager(
         my_entity_id="mx1", hostname="localhost", device="cpu",
@@ -213,7 +212,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
         "rm", {"x": [torch.randn(4)]})
     arena_prod.register_for_send("rm", [infos["x"][0]])
     edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
-    with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
+    with pytest.raises(RuntimeError, match="staged in an SHM arena"):
         file_cons.start_read_tensors("rm", [edge])
 
     # The reverse direction now INTEROPS: a file-producer's tensors carry
@@ -232,20 +231,13 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     assert torch.equal(got, y)
 
 
-def test_factory_flag(tmp_path, monkeypatch):
-    def make(value):
-        monkeypatch.setenv("MSTAR_SHM_ARENA", value)
-        return create_tensor_communication_manager(
-            protocol=CommProtocol.SHM, my_entity_id=f"f_{value}",
-            hostname="localhost", device="cpu",
-            communicator=_NullCommunicator(), shm_dir=str(tmp_path),
-        )
-
-    assert type(make("0")) is SharedMemoryCommunicationManager
-    assert type(make("1")) is ArenaShmCommunicationManager
-    assert type(make("AUTO")) is ArenaShmCommunicationManager
-    with pytest.raises(ValueError):
-        make("yes")
+def test_the_shm_protocol_builds_the_arena(tmp_path):
+    mgr = create_tensor_communication_manager(
+        protocol=CommProtocol.SHM, my_entity_id="f0",
+        hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    assert type(mgr) is ArenaShmCommunicationManager
 
 
 def test_instance_unique_names_no_collision(tmp_path):
@@ -1201,7 +1193,7 @@ def _run_in_small_dev_shm(tmp_path, source: str, *args: str):
     script = tmp_path / "small_dev_shm.py"
     script.write_text(source)
     env = [f"{k}={v}" for k, v in os.environ.items()
-           if not k.startswith("MSTAR_SHM_ARENA")]
+           if not k.startswith("MSTAR_SHM_ARENA_")]
     inner = shlex.join([
         "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}",
         "--clear-groups", "env", "-i", *env,
