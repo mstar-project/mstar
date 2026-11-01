@@ -426,6 +426,8 @@ class MicroScheduler:
         self._mixing_chains = self._parse_speculation_mixes_walks(
             speculation_mixes_walks or {},
         )
+        # scheduling key -> whether its steps run under a token budget; see `chunks`
+        self._budgeted: dict[tuple[str, str], bool] = {}
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
@@ -570,12 +572,20 @@ class MicroScheduler:
         key = (node_name, graph_walk)
         mixes = self._mixing_chains.get(key)
         if mixes is None:
-            combined = self.combined_walk_of.get(key)
-            mixes = combined is not None and self.engine_manager.get_engine(
-                node_name,
-            ).get_max_batch_tokens(node_name, combined) is not None
+            mixes = key in self.combined_walk_of and self.chunks(node_name, graph_walk)
             self._mixing_chains[key] = mixes
         return mixes
+
+    def chunks(self, node_name: str, graph_walk: str) -> bool:
+        """Whether steps of ``(node_name, graph_walk)`` run under a token
+        budget: its scheduling key's, which is the combined walk's under one.
+        A walk without one runs its prompts whole, even inside a chunk Loop."""
+        key = self._key(node_name, graph_walk)
+        budgeted = self._budgeted.get(key)
+        if budgeted is None:
+            budgeted = self.engine_manager.get_engine(key[0]).get_max_batch_tokens(*key) is not None
+            self._budgeted[key] = budgeted
+        return budgeted
 
     @property
     def last_consumed_tp_seq(self) -> int:

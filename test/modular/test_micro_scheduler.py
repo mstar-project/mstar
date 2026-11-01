@@ -2139,6 +2139,14 @@ def test_mixing_defaults_on_where_the_combined_walk_has_a_budget():
     assert sched.speculation_mixes(NODE, "prefill")
 
 
+def test_a_walk_chunks_where_its_scheduling_key_has_a_budget():
+    """A walk of a combined walk runs under the combined walk's budget."""
+    sched = _combined_scheduler(_BudgetedEngine(max_bs=8))
+
+    assert sched.chunks(NODE, WALK) and sched.chunks(NODE, "prefill")
+    assert not _combined_scheduler(_Engine(max_bs=8)).chunks(NODE, WALK)
+
+
 def test_mixing_defaults_off_without_a_budget():
     """A merged prompt would run whole, so a chain without a budget keeps to its walk."""
     sched = _combined_scheduler(_Engine(max_bs=8))

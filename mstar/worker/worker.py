@@ -4648,10 +4648,15 @@ class Worker:
                 else (pending.node_name, pending.graph_walk)
             )
             # A prompt chain yields from its first step: speculating its next
-            # chunk must not keep decode rows waiting a second prompt step.
+            # chunk must not keep decode rows waiting a second prompt step. A
+            # walk with no token budget runs its prompts whole and keeps
+            # main's order.
             other_ready = (
                 fair.peek
-                and (consecutive >= 1 or chain_key in self.chunk_loops.speculated)
+                and (
+                    consecutive >= 1
+                    or (chain_key in self.chunk_loops.speculated and self.scheduler.chunks(*chain_key))
+                )
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
@@ -4678,13 +4683,18 @@ class Worker:
             # without the fairness exclusion — it should be free to pick
             # up the batch ``_handle_admit_failure`` just pushed back.
             if speculation is None and not admit_refused:
-                if not must_yield_away and fair.peek and consecutive < 1:
+                if (
+                    not must_yield_away and fair.peek and consecutive < 1
+                    and self.scheduler.chunks(pending.node_name, pending.graph_walk)
+                ):
                     # The chain could not continue, so there is no chain to
                     # keep going: other ready work goes first, as it would
                     # after the chain's next step. Without this, the step after
                     # a prompt step whose prompts all finished (or whose rows
                     # mid-prefill are not speculated, `speculate_mid_prefill`)
                     # starts another prompt while decode rows wait out both.
+                    # Only after a step under a token budget: elsewhere a
+                    # prompt runs whole, and main's order stands.
                     must_yield_away = self.scheduler.has_ready_excluding(
                         self.request_state, chain_key,
                     )

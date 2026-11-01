@@ -17,7 +17,7 @@ class _Span:
         return False
 
 
-def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset()):
+def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset(), budgeted=True):
     peeked, excluded = [], []
     fake = SimpleNamespace(
         _can_speculate=lambda batch: True,
@@ -33,6 +33,7 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
+            chunks=lambda node_name, graph_walk: budgeted,
         ),
     )
     fake._build_speculation = Worker._build_speculation.__get__(fake)
@@ -128,3 +129,25 @@ def test_without_the_peek_a_step_that_cannot_continue_does_not_yield():
     worker._build_speculation(_pending(), 0, _SpecFairness(peek=False, max_consecutive=8))
 
     assert not peeked and excluded == [None]
+
+
+def test_a_step_with_no_token_budget_that_cannot_continue_keeps_mains_order():
+    """Its prompts ran whole (``max_batch_tokens: null``, or a model that never
+    chunks), so there is no chunk step to yield after."""
+    worker, peeked, excluded = _worker(_PROMPT, budgeted=False)
+
+    worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert not peeked and excluded == [None]
+
+
+def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step():
+    """Inside its chunk Loop but never cut: it speculates on as on main."""
+    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    worker, peeked, excluded = _worker(
+        _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}), budgeted=False,
+    )
+
+    speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert speculation is chunk and not peeked and not excluded
