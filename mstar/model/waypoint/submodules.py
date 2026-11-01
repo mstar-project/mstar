@@ -74,36 +74,6 @@ def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
 _COMPILE_MODE = "max-autotune-no-cudagraphs"
 
 
-class _SingleRequestMixin:
-    """Serve one request per step, through the engine's batched entry point.
-
-    The v1 engine always dispatches to ``forward_batched``, so a submodule
-    that only defines ``forward`` never runs. Copied from the wan22 idiom
-    rather than imported, since the two models share no other code.
-    """
-
-    def max_batch_size(self, graph_walk: str):
-        return 1
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-        assert len(request_ids) == 1, (
-            f"{type(self).__name__} does not batch a step; got "
-            f"{len(request_ids)} requests in one step (max_batch_size should "
-            "have capped it at 1)"
-        )
-        return {
-            request_ids[0]: self.forward(
-                graph_walk, engine_inputs=engine_inputs, **kwargs
-            )
-        }
-
-
 class _FunctionalAeMixin:
     """Shared fixed-shape facts for the captured functional AE paths."""
 
@@ -644,7 +614,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         super().cleanup_request(request_id)
 
 
-class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodule):
+class WaypointVaeEncoderSubmodule(_FunctionalAeMixin, NodeSubmodule):
     """TAEHV encoder: ``temporal_compression`` raw frames -> one latent frame.
 
     ``image_inputs`` ``[4, 720, 1280, 3]`` uint8 -> ``latent``
@@ -661,6 +631,10 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         validate_taehv_architecture(taehv)
         self.taehv = taehv
         self.config = config
+
+    def max_batch_size(self, graph_walk: str):
+        # one seed clip per step: the capture buckets hold a single row
+        return 1
 
     def prepare_inputs(
         self,
@@ -695,6 +669,17 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         # [B, C, h, w] -> [B, 1, C, h, w]: the dit's frame axis, added where the
         # reference adds it (``WorldEngine.append_frame``).
         return {"latent": [latent.unsqueeze(1)]}
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        # what the capture config runs: a replayed graph's outputs are mapped
+        # back to requests by row id
+        (rid,) = engine_inputs.request_ids
+        return {rid: self.forward(graph_walk, engine_inputs=engine_inputs, **kwargs)}
 
     @property
     def _capture_hw(self) -> tuple[tuple[int, int], ...]:

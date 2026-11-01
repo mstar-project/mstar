@@ -51,7 +51,6 @@ from mstar.model.lingbot_world.components.dit import (
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.submodules import _SingleRequestMixin
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +165,7 @@ def encode_condition_chunk(
         return torch.concat([msk, latent])
 
 
-class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
+class LingBotDitSubmodule(NodeSubmodule):
     """One rollout iteration is one chunk of ``chunk_size`` latent frames:
 
       * the chunk's I2V condition (``encode_condition_chunk``, continuing the
@@ -234,6 +233,10 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
         self.keep_chunk_outputs = False
+
+    def max_batch_size(self, graph_walk: str):
+        # not batched: each request rolls out its own K/V cache, generator and VAE caches
+        return 1
 
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)

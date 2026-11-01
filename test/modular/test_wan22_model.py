@@ -21,7 +21,6 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
@@ -30,9 +29,7 @@ from mstar.model.wan22.submodules import (
     Wan22DitSubmodule,
     Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
-    Wan22VaeEncoderSubmodule,
     _inference_ctx,
-    _SingleRequestMixin,
     normalize_decode_tiling_mode,
 )
 from mstar.model.wan22.wan22_model import Wan22Model
@@ -113,53 +110,6 @@ def test_wan22_declares_no_engine_resources():
     model = _make_model()
     assert model.get_node_resources() == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
-
-
-def test_wan22_submodules_route_through_forward_batched():
-    """The v1 worker builds every batch ``running_batched=True``, so the engine
-    only ever calls ``forward_batched``. Each node has to answer there."""
-    for cls in (
-        Wan22TextEncoderSubmodule,
-        Wan22VaeEncoderSubmodule,
-        Wan22DitSubmodule,
-        Wan22VaeDecoderSubmodule,
-    ):
-        assert cls.forward_batched is not NodeSubmodule.forward_batched, cls.__name__
-        # ...and each caps the batch at one, which is what keeps that
-        # delegation honest (the scheduler reads this).
-        assert cls.max_batch_size(cls, Wan22Model.VIDEO_GEN_WALK) == 1, cls.__name__
-
-
-def test_wan22_forward_batched_delegates_to_forward():
-    class _Node(_SingleRequestMixin, NodeSubmodule):
-        def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-            raise AssertionError("not exercised")
-
-        def forward(self, graph_walk, engine_inputs, **kwargs):
-            return {"walk": [graph_walk], "seen": [kwargs["latents"]]}
-
-    node = _Node()
-    engine_inputs = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
-    latents = torch.zeros(1)
-    out = node.forward_batched(
-        Wan22Model.VIDEO_GEN_WALK, engine_inputs=engine_inputs, latents=latents,
-    )
-    assert set(out) == {"r0"}
-    assert out["r0"]["walk"] == [Wan22Model.VIDEO_GEN_WALK]
-    assert out["r0"]["seen"][0] is latents
-
-
-def test_wan22_forward_batched_rejects_a_multi_request_batch():
-    class _Node(_SingleRequestMixin, NodeSubmodule):
-        def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-            raise AssertionError("not exercised")
-
-        def forward(self, graph_walk, engine_inputs, **kwargs):
-            raise AssertionError("must not reach the forward")
-
-    engine_inputs = ModelInputsFromEngine(request_ids=["r0", "r1"], per_request_info={})
-    with pytest.raises(AssertionError, match="does not batch"):
-        _Node().forward_batched(Wan22Model.VIDEO_GEN_WALK, engine_inputs=engine_inputs)
 
 
 def test_wan22_forwards_run_without_autograd():

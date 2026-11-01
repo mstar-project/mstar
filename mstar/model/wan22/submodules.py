@@ -112,44 +112,6 @@ class _Fp32IslandMixin:
         return result
 
 
-class _SingleRequestMixin:
-    """Serve one request per step, through the engine's batched entry point.
-
-    The v1 engine always dispatches to ``forward_batched`` — the worker builds
-    every batch with ``running_batched=True``, and nothing flips it back — so a
-    submodule that only defines ``forward`` never runs. None of the wan22 nodes
-    batch: a request's latent grid is sized by its own height/width/num_frames,
-    so two requests in one step would have to be padded to a common grid, and
-    the DiT step is large enough that the padding would cost more than the
-    batching saves. So they cap the batch at one and hand that row to
-    ``forward``, rather than pretending to a batching they do not implement.
-
-    ``max_batch_size`` is what actually keeps the batch at one: the micro
-    scheduler reads it (``Engine.get_max_batch_size``) and chunks accordingly.
-    The assert below is the backstop, not the mechanism.
-    """
-
-    def max_batch_size(self, graph_walk: str):
-        return 1
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-        assert len(request_ids) == 1, (
-            f"{type(self).__name__} does not batch; got {len(request_ids)} "
-            "requests in one step (max_batch_size should have capped it at 1)"
-        )
-        return {
-            request_ids[0]: self.forward(
-                graph_walk, engine_inputs=engine_inputs, **kwargs
-            )
-        }
-
-
 def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     owner_path, _, attr = dotted_name.rpartition(".")
     owner = module.get_submodule(owner_path) if owner_path else module
@@ -179,7 +141,7 @@ def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, in
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """UMT5-XXL prompt encoder.
 
     Consumes ``text_inputs`` = ``[positive_ids, negative_ids]``; emits
@@ -198,6 +160,10 @@ class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmo
         self.text_encoder = text_encoder
         self.config = config
         self._record_fp32_islands()
+
+    def max_batch_size(self, graph_walk: str):
+        # not batched: it runs once per request, before the denoise loop
+        return 1
 
     def prepare_inputs(
         self,
@@ -253,7 +219,7 @@ class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmo
 # vae_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE first-frame encoder (I2V requests only).
 
     Consumes ``image_inputs`` (one ``[C, H, W]`` image, float in ``[0, 1]`` or
@@ -272,6 +238,10 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         self.vae = vae
         self.config = config
         self._record_fp32_islands()
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each request has its own latent grid
+        return 1
 
     def prepare_inputs(
         self,
@@ -322,7 +292,7 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
 # dit
 # ---------------------------------------------------------------------------
 
-class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """Dense 5B video DiT with the UniPC step run inline.
 
     One loop iteration is one batch-2 transformer forward (the positive and
@@ -390,6 +360,10 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 "shapes and the UniPC solver run eager.",
                 sorted(self._compile_grids),
             )
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each request has its own latent grid
+        return 1
 
     def prepare_inputs(
         self,
@@ -581,7 +555,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
 # vae_decoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE latent -> pixel decoder (tiled).
 
     Consumes the loop's final ``latents`` and emits ``video_output`` as uint8
@@ -649,6 +623,10 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 "other sizes decode stock",
                 ", ".join(f"{w}x{h}" for w, h in sorted(self._fast_sizes)),
             )
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each request has its own latent grid
+        return 1
 
     def _decode_dtype(self):
         # TODO: pull conv3d-dtype resolution into a common helper shared with
