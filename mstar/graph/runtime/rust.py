@@ -260,8 +260,7 @@ class RustGraphRuntime(GraphRuntime):
             me=my_worker_id,
             # A share of the same transport, so the frames Rust decides on can
             # be sent from there rather than handed back one at a time. None
-            # under the pyzmq communicator, which has no shareable object --
-            # the worker's guard refuses that pairing anyway.
+            # for a communicator built without a socket (the tests' stand-ins).
             communicator=getattr(communicator, "_inner", None),
             combined_walks=(
                 [node for node, _ in combined_walk_of],

@@ -1533,8 +1533,8 @@ class Conductor:
     def _send_for_teardown(self, request_id: str, entity: str, message):
         """Send one teardown message; a send that raises is logged so it can't
         skip the sends, drain record or free that follow it. A dead peer does
-        not raise on either transport (the send queues, then blocks at the
-        high-water mark), so this is only a backstop."""
+        not raise (the send queues, then blocks at the high-water mark), so
+        this is only a backstop."""
         try:
             self.communicator.send(entity, message)
         except Exception:
