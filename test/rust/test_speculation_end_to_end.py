@@ -1,5 +1,5 @@
-"""Speculation over a real graph runtime, Python and Rust, on the paths the
-parity tests in ``test_spec_rows`` do not reach.
+"""Speculation over the real graph runtime, on the paths the parity tests in
+``test_spec_rows`` do not reach.
 
 * A decode loop that consumes a stream, run under random speculation outcomes
   (kept, refused, a row dropped). Every item a producer sends must reach the
@@ -15,14 +15,12 @@ import logging
 import random
 from types import SimpleNamespace
 
-import pytest
 import test_spec_rows as T
 import torch
 
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection
@@ -66,9 +64,13 @@ def _loop(extra_input: str, streaming: bool) -> Loop:
     return Loop(name=T.LOOP, section=node, max_iters=1 << 20, outputs=[])
 
 
-def _worker(kind: str, section: Loop):
-    def runtime(kind, *_a, **_k):
-        common = dict(
+def _worker(section: Loop):
+    def runtime(*_a, **_k):
+        from mstar.communication.tensor_store import RustTensorBookkeeping
+        from mstar.graph.runtime import rust as rust_runtime
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(
+            bookkeeping=book,
             my_worker_id=T.ME,
             my_worker_graphs=[WorkerGraph(
                 section=section, graph_walks={T.WALK}, ranks=[0], worker_graph_id=T.WG,
@@ -77,17 +79,11 @@ def _worker(kind: str, section: Loop):
             all_wg_ids_to_nodes={T.WG: {T.NODE}}, node_to_partition={T.NODE: T.PART},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         )
-        if kind == "python":
-            tm = _TM(T.PythonTensorBookkeeping())
-            return PythonGraphRuntime(**common, tensor_manager=tm, communicator=None), tm
-        from mstar.communication.tensor_store import RustTensorBookkeeping
-        from mstar.graph.runtime import rust as rust_runtime
-        book = RustTensorBookkeeping()
-        return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), _TM(book)
+        return rt, _TM(book)
 
     shared, T._runtime = T._runtime, runtime
     try:
-        w = T._worker(kind)
+        w = T._worker()
     finally:
         T._runtime = shared
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
@@ -106,13 +102,13 @@ def _values(w, edge) -> list[int]:
     ]
 
 
-def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
+def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
     """Drive the loop until every row's stream ends. Returns, per row, the
     items sent, the items executed steps consumed, the items still held by
     its buffer, and how often a step reported its stream final."""
     rng = random.Random(seed)
     section = _loop(CODES, streaming=True)
-    w = _worker(kind, section)
+    w = _worker(section)
     w.streams = StreamBufferManager(
         w.request_state, w.tensor_manager,
         [Connection(
@@ -224,11 +220,10 @@ def _run_stream(kind: str, seed: int, n_rids=3, n_items=9, chunk=2):
     return rids, sent, seen, left, finals, alive
 
 
-@pytest.mark.parametrize("kind", T.KINDS)
-def test_a_stream_reaches_executed_steps_once_and_in_order(kind, caplog):
+def test_a_stream_reaches_executed_steps_once_and_in_order(caplog):
     caplog.set_level(logging.ERROR)
     for seed in range(40):
-        rids, sent, seen, left, finals, alive = _run_stream(kind, seed)
+        rids, sent, seen, left, finals, alive = _run_stream(seed)
         for r in rids:
             assert seen[r] + left[r] == list(range(sent[r])), (
                 f"seed {seed}: rid {r} consumed {seen[r]}, its buffer holds {left[r]}"
@@ -253,9 +248,8 @@ class _NoCalls:
         raise AssertionError(f"the GPU thread called the graph runtime: {name}")
 
 
-@pytest.mark.parametrize("kind", T.KINDS)
-def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(kind, monkeypatch):
-    w = T._worker(kind, mixed=True)
+def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(monkeypatch):
+    w = T._worker(mixed=True)
     w.scheduler.label_for = lambda node, request_walks: (
         (T.MIXED, request_walks) if len(set(request_walks.values())) > 1
         else (next(iter(request_walks.values())), {})
@@ -297,9 +291,8 @@ def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(kind, monkeypatch):
 
 # --- a loop-external input -------------------------------------------------------
 
-@pytest.mark.parametrize("kind", T.KINDS)
-def test_a_loop_external_input_falls_back_to_rows_and_persists(kind, monkeypatch):
-    w = _worker(kind, _loop(CTX, streaming=False))
+def test_a_loop_external_input_falls_back_to_rows_and_persists(monkeypatch):
+    w = _worker(_loop(CTX, streaming=False))
     rids = T._admit(w, 3)
     block = ColumnarEdgeSpecs.empty()
     for r in rids:

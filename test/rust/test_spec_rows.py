@@ -2,7 +2,7 @@
 must build exactly the speculative step the per-row path builds.
 
 A real worker (``Worker.__new__`` plus the attributes these methods read) over
-a real graph runtime, Python and Rust, is driven through a decode loop. Each
+the real graph runtime is driven through a decode loop. Each
 step the next one is speculated twice from the same state, once per path --
 prepping is side-effect free when nothing streams -- and everything the engine,
 the model and the rest of the loop read off the two is compared, before and
@@ -18,13 +18,12 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
+from mstar.communication.tensor_store import TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput
@@ -43,21 +42,11 @@ NODE_B, SIG_B = "head", "hidden"
 # a prefill walk on NODE (``mixed=True``), for a step whose rows mix walks
 WG_PRE, PRE, MIXED = 1, "prefill", "mixed"
 
-def _have_rust() -> bool:
-    try:
-        import mstar_rust  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-KINDS = ["python", pytest.param("rust", marks=pytest.mark.skipif(
-    not _have_rust(), reason="mstar_rust not built",
-))]
+pytest.importorskip("mstar_rust", reason="mstar_rust not built")
 
 
 class _StubTM:
-    """The tensor manager surface both runtimes and the worker touch here."""
+    """The tensor manager surface the worker touches here."""
 
     set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
     set_persist = TensorCommunicationManager.set_persist
@@ -116,7 +105,7 @@ class _Scheduler:
         return batch
 
 
-def _runtime(kind: str, max_iters: int, pair: bool = False, mixed: bool = False):
+def _runtime(max_iters: int, pair: bool = False, mixed: bool = False):
     body = GraphNode(
         name=NODE, input_names=[SIG],
         outputs=[GraphEdge(next_node=NODE, name=SIG)],
@@ -146,19 +135,14 @@ def _runtime(kind: str, max_iters: int, pair: bool = False, mixed: bool = False)
         all_wg_ids_to_nodes=wg_nodes, node_to_partition=dict.fromkeys(nodes, PART),
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
     )
-    if kind == "python":
-        tm = _StubTM(PythonTensorBookkeeping())
-        return PythonGraphRuntime(**common, tensor_manager=tm, communicator=None), tm
     from mstar.communication.tensor_store import RustTensorBookkeeping
     from mstar.graph.runtime import rust as rust_runtime
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), _StubTM(book)
 
 
-def _worker(
-    kind: str, max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False,
-) -> Worker:
-    rt, tm = _runtime(kind, max_iters, pair, mixed)
+def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -> Worker:
+    rt, tm = _runtime(max_iters, pair, mixed)
     w = Worker.__new__(Worker)
     w._graph_runtime = rt
     w.tensor_manager = tm
@@ -361,9 +345,8 @@ def _step_both(w, pending, monkeypatch, outputs=None, check_unread=True):
     return rows
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_decode_loop_builds_the_same_steps(kind, monkeypatch):
-    w = _worker(kind)
+def test_a_decode_loop_builds_the_same_steps(monkeypatch):
+    w = _worker()
     rids = _admit(w, 6)
     pending = _first_step(w, rids)
     for k in range(5):
@@ -379,11 +362,10 @@ def test_a_decode_loop_builds_the_same_steps(kind, monkeypatch):
         assert dict(spec.node_batch.per_request_info_wrapped[rids[0]].dynamic_loop_iter_counts)[LOOP] == k + 1
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_two_node_loop_builds_the_same_steps(kind, monkeypatch):
+def test_a_two_node_loop_builds_the_same_steps(monkeypatch):
     # every step hops to the other node: NODE -> NODE_B within an iteration,
     # NODE_B -> NODE into the next one
-    w = _worker(kind, pair=True)
+    w = _worker(pair=True)
     rids = _admit(w, 5)
     pending = _first_step(w, rids)
     hops = []
@@ -396,11 +378,10 @@ def test_a_two_node_loop_builds_the_same_steps(kind, monkeypatch):
 
 
 @pytest.mark.parametrize("outputs", ["rows_only", "loopback", "routed"])
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_step_that_mixes_walks_continues_its_loop_the_same(kind, outputs, monkeypatch):
+def test_a_step_that_mixes_walks_continues_its_loop_the_same(outputs, monkeypatch):
     # N mixes decode rows with prefill rows; the speculation continues the
     # decode rows, which take N's outputs however N kept them
-    w = _worker(kind, mixed=True)
+    w = _worker(mixed=True)
     decode = _admit(w, 4)
     prefill = _admit(w, 3, start=4, walk=PRE)
     pending = _mixed_first_step(w, decode, prefill)
@@ -419,19 +400,17 @@ def test_a_step_that_mixes_walks_continues_its_loop_the_same(kind, outputs, monk
         pending = _advance(w, pending, _step_both(w, pending, monkeypatch))
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_reading_rows_before_threading_changes_nothing(kind, monkeypatch):
-    w = _worker(kind)
+def test_reading_rows_before_threading_changes_nothing(monkeypatch):
+    w = _worker()
     pending = _first_step(w, _admit(w, 4))
     for _ in range(2):
         pending = _advance(w, pending, _step_both(w, pending, monkeypatch, check_unread=False))
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_rows_at_their_last_iteration_leave_on_both_paths(kind, monkeypatch):
+def test_rows_at_their_last_iteration_leave_on_both_paths(monkeypatch):
     # staggered: the second group starts two iterations later, so the first
     # group reaches max_iters while the second still runs
-    w = _worker(kind, max_iters=4)
+    w = _worker(max_iters=4)
     first = _admit(w, 3)
     pending = _first_step(w, first)
     pending = _advance(w, pending, _step_both(w, pending, monkeypatch))
@@ -454,9 +433,8 @@ def test_rows_at_their_last_iteration_leave_on_both_paths(kind, monkeypatch):
     assert seen[0] == first + late and seen[-1] == late
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_teardown_and_room_filter_the_same_rows(kind, monkeypatch):
-    w = _worker(kind)
+def test_teardown_and_room_filter_the_same_rows(monkeypatch):
+    w = _worker()
     rids = _admit(w, 6)
     pending = _first_step(w, rids)
     w._pending_removes = {rids[1]: object()}
@@ -465,9 +443,8 @@ def test_teardown_and_room_filter_the_same_rows(kind, monkeypatch):
     assert list(spec.node_batch.request_ids) == [rids[0], rids[2], rids[3]]
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_a_row_without_its_loop_back_drops_on_both_paths(kind, monkeypatch):
-    w = _worker(kind)
+def test_a_row_without_its_loop_back_drops_on_both_paths(monkeypatch):
+    w = _worker()
     rids = _admit(w, 4)
     pending = _first_step(w, rids)
     spec = _step_both(w, pending, monkeypatch, outputs=_rows_only(pending, missing={rids[2]}))
@@ -478,11 +455,10 @@ def test_a_row_without_its_loop_back_drops_on_both_paths(kind, monkeypatch):
 
 
 @pytest.mark.parametrize("pair", [False, True])
-@pytest.mark.parametrize("kind", KINDS)
-def test_routed_outputs_are_threaded_row_by_row(kind, pair, monkeypatch):
+def test_routed_outputs_are_threaded_row_by_row(pair, monkeypatch):
     # N kept its outputs per request (not rows-only): the rows path hands over
     # to the per-row splice, which takes N's tensor lists
-    w = _worker(kind, pair=pair)
+    w = _worker(pair=pair)
     rids = _admit(w, 3)
     pending = _first_step(w, rids)
     sig = SIG_B if pair else SIG
@@ -514,9 +490,8 @@ def _engine_facing_types(spec) -> dict:
     )
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_what_the_engine_reads_has_the_same_types_on_both_paths(kind, monkeypatch):
-    w = _worker(kind)
+def test_what_the_engine_reads_has_the_same_types_on_both_paths(monkeypatch):
+    w = _worker()
     pending = _first_step(w, _admit(w, 4))
     general = _speculate(w, pending, rows=False, monkeypatch=monkeypatch)
     rows = _speculate(w, pending, rows=True, monkeypatch=monkeypatch)
