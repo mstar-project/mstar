@@ -1,7 +1,12 @@
 """The Qwen3.5 graph-bucket ladders come from the environment."""
+import ast
 import importlib
+from pathlib import Path
 
+import pytest
 import torch
+
+from mstar.utils import knobs
 
 
 def _reload(monkeypatch, name, value):
@@ -38,9 +43,49 @@ def test_prefill_buckets_hold_a_mixed_step_and_near_power_of_two_batches(monkeyp
     assert 16 * 512 + 8 <= buckets[-1]
 
 
-def test_text_walks_compile_deterministically(monkeypatch):
-    m = _reload(monkeypatch, "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", None)
+def _compile_modes(m):
     submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
     configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
-    assert {c.capture_graph_walk for c in configs} >= {"decode", "prefill_text", "mixed"}
-    assert {c.compile_mode for c in configs} == {"deterministic"}
+    return {c.capture_graph_walk: c.compile_mode for c in configs}
+
+
+@pytest.fixture
+def clean_knobs(monkeypatch):
+    monkeypatch.delenv("MSTAR_COMPILE_DETERMINISTIC", raising=False)
+    knobs.configure(None)
+    yield
+    knobs.configure(None)
+
+
+def test_decode_compiles_tuned_and_prefill_deterministically_by_default(monkeypatch, clean_knobs):
+    modes = _compile_modes(_reload(monkeypatch, "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", None))
+    assert modes == {
+        "decode": None, "prefill_text": "deterministic", "mixed": "deterministic", "prefill_vision": "deterministic",
+    }
+
+
+def test_the_switch_makes_every_text_walk_deterministic(monkeypatch, clean_knobs):
+    m = _reload(monkeypatch, "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", None)
+    knobs.configure({"compile_deterministic": True})
+    assert set(_compile_modes(m).values()) == {"deterministic"}
+    # the environment variable wins over the config, as for every knob
+    monkeypatch.setenv("MSTAR_COMPILE_DETERMINISTIC", "0")
+    assert _compile_modes(m)["decode"] is None
+
+
+def test_only_qwen3_5_text_walks_read_the_switch():
+    root = Path(__file__).resolve().parents[2]
+    readers = sorted(
+        str(p.relative_to(root)) for p in (root / "mstar").rglob("*.py")
+        if "compile_deterministic" in p.read_text() and p.parts[-2:] != ("utils", "knobs.py")
+    )
+    assert readers == ["mstar/model/qwen3_5/submodules.py"]
+
+    tree = ast.parse((root / readers[0]).read_text())
+    methods = [
+        f"{cls.name}.{fn.name}"
+        for cls in tree.body if isinstance(cls, ast.ClassDef)
+        for fn in cls.body if isinstance(fn, ast.FunctionDef)
+        and any(isinstance(n, ast.Name) and n.id == "compile_deterministic" for n in ast.walk(fn))
+    ]
+    assert methods == ["LLMSubmodule.get_accelerator_graph_configs"]

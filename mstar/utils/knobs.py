@@ -20,6 +20,7 @@ KNOBS: dict[str, str] = {
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
+    "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -115,6 +116,15 @@ def ingraph_decode_rope() -> bool:
     position resource's planned positions instead of staging them before the
     replay."""
     return _setting("ingraph_decode_rope", "0") == "1"
+
+
+def compile_deterministic() -> bool:
+    """``compile_deterministic`` / ``MSTAR_COMPILE_DETERMINISTIC`` (default
+    off): Qwen3.5's decode capture compiles in Inductor's deterministic mode,
+    as its prefill captures always do, so greedy output reproduces across
+    server processes and the cold start shrinks, at the cost of one-row decode
+    speed. Qwen3.5's text walks are the only reader."""
+    return _setting("compile_deterministic", "0") == "1"
 
 
 def kv_chain_lazy_steps() -> int:

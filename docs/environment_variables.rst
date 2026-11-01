@@ -706,6 +706,13 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``MSTAR_COMPILE_DETERMINISTIC``
+     - config's ``knobs: compile_deterministic``, else ``0``
+     - ``1``: Qwen3.5's decode capture compiles in Inductor's deterministic
+       mode, as its prefill, mixed and vision captures always do, so greedy
+       output reproduces across server processes and the cold start shrinks,
+       at the cost of one-row decode speed. Only Qwen3.5's text walks read it
+       (``knobs.compile_deterministic``).
    * - ``TRITON_PTXAS_BLACKWELL_PATH``
      - torch's ptxas, when needed
      - Triton's own variable: the ptxas it runs for sm_100 and up. ptxas

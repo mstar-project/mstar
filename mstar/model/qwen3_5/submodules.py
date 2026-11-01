@@ -77,7 +77,7 @@ from mstar.model.submodule_base import (
     TokenStop,
     device_loopback_enabled,
 )
-from mstar.utils.knobs import ingraph_decode_rope
+from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 logger = logging.getLogger(__name__)
@@ -183,12 +183,18 @@ class LLMSubmodule(ARNodeSubmodule):
                 },
             )
 
+        # Prefill loses nothing to deterministic mode and starts much faster.
+        # Decode keeps its tuned kernels, which win at one row, unless the
+        # deployment asks for output that reproduces across processes: both
+        # the cost and that guarantee sit on this graph.
+        decode_compile_mode = DETERMINISTIC_COMPILE_MODE if compile_deterministic() else None
+
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=dummy(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-                compile_mode=DETERMINISTIC_COMPILE_MODE,
+                compile_mode=decode_compile_mode,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
