@@ -18,10 +18,6 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.model.multimodal import TEXT, PromptPart
-
-VIDEO = "video"
-
 
 class SampledVideo(NamedTuple):
     """What ``load_video`` hands ``process_prompt``: the sampled frames only."""
@@ -132,8 +128,8 @@ def expand_video_pads(
 ) -> str:
     """Replace the nth ``pad`` in ``text`` with the nth video's groups.
 
-    One pad per group: `find_media_spans` reads each group back as a span and
-    the vision walk inserts its embeddings, as for an image.
+    One pad per group, expanded to the group's tokens afterwards
+    (`expand_media_pads`), as an image's pad is.
     """
     pieces = text.split(pad)
     if len(pieces) != len(timestamps) + 1:
@@ -146,34 +142,3 @@ def expand_video_pads(
         out += [f"<{t:.1f} seconds>{start}{pad}{end}" for t in times]
         out.append(after)
     return "".join(out)
-
-
-def expand_video_parts(
-    parts: list[PromptPart], groups: Sequence[int],
-) -> list[PromptPart]:
-    """``parts`` with each video as text, group, text, ..., group, text.
-
-    The prefill plan's view of `expand_video_pads`: the text around each group
-    is the outer sentinel and the timestamps, so a video always has text on
-    both sides, and `prefill_plan` merges it with the user's text next to it.
-    Video parts are renumbered per group, as `find_media_spans` numbers spans.
-    A video with no entry in ``groups`` expands to nothing.
-    """
-    out: list[PromptPart] = []
-    group = 0
-    for part in parts:
-        if part.modality != VIDEO:
-            out.append(part)
-            continue
-        n = groups[part.index] if part.index < len(groups) else 0
-        for g in range(n):
-            out.append(PromptPart(modality=TEXT))
-            out.append(PromptPart(modality=VIDEO, index=group + g))
-        out.append(PromptPart(modality=TEXT))
-        group += n
-    return out
-
-
-def group_owners(groups: Sequence[int]) -> list[int]:
-    """The video each group (numbered across all videos) belongs to."""
-    return [v for v, n in enumerate(groups) for _ in range(n)]

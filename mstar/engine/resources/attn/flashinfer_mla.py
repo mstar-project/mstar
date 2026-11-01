@@ -248,7 +248,7 @@ class FlashInferMLAManager(AttentionManager):
             num_qo_heads=kv_config.num_qo_heads,
             kv_lora_rank=kv_config.kv_lora_rank,
             qk_rope_head_dim=kv_config.qk_rope_head_dim,
-            page_size=kv_config.page_size,
+            page_size=kv_config.tokens_per_page,
             max_num_pages=kv_config.max_num_pages,
             sm_scale=sm_scale,
             device=device,
@@ -328,8 +328,8 @@ class FlashInferMLAManager(AttentionManager):
                 # the rows' query counts come from this step's own segments, the kv from the
                 # stored context (the cache's segments describe what the step appends)
                 spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
-                views = context_only_views(kv_out.views, spans, self._kv_config.page_size)
-                indptrs = build_paged_indptrs(views, self._kv_config.page_size)
+                views = context_only_views(kv_out.views, spans, self._kv_config.tokens_per_page)
+                indptrs = build_paged_indptrs(views, self._kv_config.tokens_per_page)
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1)
             else:

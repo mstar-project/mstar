@@ -1,6 +1,4 @@
 import logging
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -8,11 +6,6 @@ from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
-from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -26,38 +19,20 @@ from mstar.engine.resources.linear_attn.config import (
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
-from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
-from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceReqConfig
-from mstar.graph.base import (
-    GraphEdge,
-    GraphNode,
-    GraphSection,
-    Loop,
-    Sequential,
-    TensorPointerInfo,
-)
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import (
-    ForwardPassArgs,
-    KVLabel,
-    LabelLayout,
-    Model,
-    PrefixKeys,
-    ProcessPromptOutput,
-    Span,
-    TensorAndMetadata,
-    prompt_spans,
-)
+from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.multimodal import (
-    TEXT,
+    VIDEO,
     PromptPart,
-    check_attachments,
-    check_plan,
-    find_media_spans,
+    as_uint8_chw,
     messages_from_parts,
-    parts_from_modalities,
-    prefill_plan,
-    split_around_spans,
+    vision_encoder,
+)
+from mstar.model.multimodal_decoder import (
+    MIXED_SPLIT,
+    MediaIntake,
+    MultimodalDecoderModel,
+    PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import vision_position_advance
@@ -66,105 +41,34 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
-    LLM_MIXED,
     ROPE,
-    SAMPLER,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
 from mstar.model.qwen3_5.video import (
-    VIDEO,
     ProcessedVideo,
     expand_video_pads,
-    expand_video_parts,
-    group_owners,
     group_timestamps,
     sample_video,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
 
-# a mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
-# the prefill kernels, its decode rows the decode ones
-_MIXED_SPLIT = CombinedSplit(LLM_MIXED, prefill_walks=("prefill_text",))
-
-
-def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
-    """Resolve only the files needed to construct config and tokenize input.
-
-    The API and conductor processes never download the checkpoint; workers
-    fetch the full snapshot lazily from ``get_submodule``.
-    """
-    local_path = Path(repo_id)
-    if local_path.is_dir():
-        return str(local_path)
-
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(
-        repo_id=repo_id,
-        cache_dir=cache_dir,
-        allow_patterns=[
-            "config.json",
-            "preprocessor_config.json",
-            "video_preprocessor_config.json",
-            "tokenizer_config.json",
-            "vocab.json",
-            "tokenizer.json",
-            "merges.txt",
-        ],
-    )
-
-
-def _as_hwc_uint8(image: torch.Tensor):
-    """What the HF image processor expects, from what the data worker sends.
-
-    Images arrive ``(C, H, W)`` float32 in [0, 1] on the GPU. The processor
-    defaults to ``do_rescale=True``, so floats would be rescaled twice and the
-    model would silently see a near-black image.
-    """
-    if image.dtype.is_floating_point:
-        image = (image * 255.0).clamp(0, 255).to(torch.uint8)
-    if image.dim() == 3 and image.shape[0] == 4:
-        # the processor refuses a 4-channel (RGBA) tensor, so drop alpha
-        image = image[:3]
-    if image.dim() == 3 and image.shape[0] in (1, 3):
-        image = image.permute(1, 2, 0)
-    return image.cpu().contiguous().numpy()
-
-
-@dataclass(frozen=True)
-class WalkInput:
-    node: str
-    inputs: tuple[str, ...]
-
-
-# `prefill_order` tags, in prompt order. The nth tag of a kind addresses the
-# nth tensor of that kind, except that a video's tags, one per temporal group,
-# all address its one tensor.
-TEXT_PART, IMAGE_PART, VIDEO_PART = 0, 1, 2
-
-
-@dataclass(frozen=True)
-class PrefillStep:
-    walk: str
-    # one list per name: a `prefill_vision` step carries every span and image
-    input_tensors: dict[str, list[TensorPointerInfo]]
-    order: tuple[int, ...] = ()
-
-
 # TODO: implement MoE variants
-class Qwen3_5DenseModel(Model):
-    # Image preprocessing is a few small ops per request, and a thread per
-    # core only slows them: each op waits on whichever thread a co-tenant
-    # descheduled. At 64 threads c=1 TTFT p95 was 152 ms (some preprocesses
-    # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
-    # thread is steadier but slower (13 ms).
-    PREPROCESS_TORCH_THREADS = 4
+class Qwen3_5DenseModel(MultimodalDecoderModel):
+    NAME = "Qwen3.5"
+    METADATA_FILES = (
+        "config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "tokenizer.json",
+        "merges.txt",
+    )
 
     def __init__(
         self,
@@ -172,10 +76,7 @@ class Qwen3_5DenseModel(Model):
         cache_dir: str | None = None,
         **kwargs: Any,
     ):
-        self.model_path_hf = model_path_hf
-        self.cache_dir = cache_dir
-
-        self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
+        super().__init__(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
@@ -189,9 +90,16 @@ class Qwen3_5DenseModel(Model):
         # which only the tokenizer knows. See `Qwen3_5Config.stop_token_ids`.
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
-
-        # so weights are materialized at most once per node
-        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        # the vision tower, whose output fills images' and videos' pads in
+        # prompt order
+        pad = self._pad_ids()
+        tower = vision_encoder(tuple(pad.values())) if pad else None
+        self.media = tuple(
+            MediaIntake(m, tower, p, self._image_intake) if m == "image"
+            # a video fills one pad per temporal group
+            else MediaIntake(m, tower, p, self._video_intake, runs=self._video_runs)
+            for m, p in pad.items()
+        )
         self._image_processor = None
         self._video_processor = None
 
@@ -234,7 +142,7 @@ class Qwen3_5DenseModel(Model):
                 resource_key=ATTN, nodes={"LLM"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
-                    splits=(_MIXED_SPLIT,),
+                    splits=(MIXED_SPLIT,),
                 ),
             ),
             PositionSpec(
@@ -260,14 +168,10 @@ class Qwen3_5DenseModel(Model):
                 config=LinearAttnConfig(
                     recurrent_state=GDN_STATE,
                     variant=LinearAttnVariant.GDN,
-                    splits=(_MIXED_SPLIT,),
+                    splits=(MIXED_SPLIT,),
                 ),
             ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
-            ),
+            self._sampler_spec(self.config.vocab_size),
             *self._vision_resources(),
         ]
 
@@ -298,105 +202,26 @@ class Qwen3_5DenseModel(Model):
             ),
         ]
 
-    # -----------------------------------------------------------------------
-    # Model ABC: walk graph declaration
-    # -----------------------------------------------------------------------
-    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
-
-    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        prefill_text = GraphNode(
-            name="LLM",
-            input_names=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="new_token",
-                    persist=True,
-                    output_modality="text"
-                ),
-            ],
-        )
-
-        decode =  Loop(
-            name="decode_loop",
-            section=GraphNode(
-                name="LLM",
-                input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(
-                        next_node="LLM",
-                        name="text_inputs",
-                    ),
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="text_inputs",
-                        output_modality="text",
-                    ),
-                ],
-            ),
-            # A safety bound, not the per-request budget
-            max_iters=self.config.max_position_embeddings,
-            outputs=[],
-        )
-
-        # One walk for a whole multimodal prompt: the encoder embeds every
-        # image, then the LLM prefills text spans and embeddings as one row,
-        # spliced in prompt order off `prefill_order`.
-        prefill_vision = Sequential([
-            GraphNode(
-                name="vision_encoder",
-                # each image's (t, h, w) patch grid: token count and 3D ids
-                input_names=["pixel_values", "image_grid_thw"],
-                outputs=[
-                    GraphEdge(next_node="LLM", name="vision_embeds"),
-                ],
-            ),
-            GraphNode(
-                name="LLM",
-                input_names=["vision_embeds", "image_grid_thw", "text_inputs"],
-                outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        persist=True,
-                        output_modality="text",
-                    ),
-                ],
-            ),
-        ])
-
-        return dict(
-            prefill_text=prefill_text,
-            prefill_vision=prefill_vision,
-            decode=decode,
-        )
-
     # ------------------------------------------------------------------
     # Model ABC: I/O
     # ------------------------------------------------------------------
-    # The chat template writes each image as this triple with one pad; the
-    # interior is dropped and `prefill_vision` re-emits the sentinels. A
-    # video's triple is expanded first (`expand_video_pads`) into one inner
-    # triple per temporal group, and those are the spans.
-    _PLACEHOLDER_TOKENS: dict[str, tuple[str, str, str]] = {
-        "image": ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
-        VIDEO: ("<|vision_start|>", "<|video_pad|>", "<|vision_end|>"),
-    }
+    # The chat template writes each image as `<|vision_start|><|image_pad|>
+    # <|vision_end|>`; a video's triple is first written out per temporal
+    # group (`expand_video_pads`). Each pad then expands to its tokens.
+    _PAD_TOKENS: dict[str, str] = {"image": "<|image_pad|>", VIDEO: "<|video_pad|>"}
 
-    def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
-        """``(start, pad, end)`` sentinel ids, read off the tokenizer.
+    def _pad_ids(self) -> dict[str, int]:
+        """Pad ids, read off the tokenizer.
 
         Not off `config.json`: Qwen3-Omni's disagrees with its tokenizer, and
-        wrong ids silently find no spans.
+        wrong ids silently find no pads.
         """
-        specs: dict[str, tuple[int, int, int]] = {}
-        for modality, tokens in self._PLACEHOLDER_TOKENS.items():
-            ids = tuple(self.tokenizer.convert_tokens_to_ids(t) for t in tokens)
-            if any(i is None or i == self.tokenizer.unk_token_id for i in ids):
-                continue
-            specs[modality] = ids
-        return specs
+        ids: dict[str, int] = {}
+        for modality, token in self._PAD_TOKENS.items():
+            i = self.tokenizer.convert_tokens_to_ids(token)
+            if i is not None and i != self.tokenizer.unk_token_id:
+                ids[modality] = i
+        return ids
 
     @property
     def image_processor(self):
@@ -425,6 +250,10 @@ class Qwen3_5DenseModel(Model):
         ``device`` is (see `sample_video`)."""
         video = sample_video(filepath, self.video_processor)
         return TensorAndMetadata(data=video.frames, metadata=video.metadata)
+
+    def _video_runs(self, metadata: dict) -> int:
+        """A video's pad runs: one per temporal group."""
+        return len(self._video_timestamps(metadata))
 
     def _video_timestamps(self, metadata: dict) -> list[float]:
         """Seconds per temporal group, from the sampling metadata alone."""
@@ -457,58 +286,18 @@ class Qwen3_5DenseModel(Model):
             )
         return ProcessedVideo(out["pixel_values_videos"], grid, timestamps)
 
-    def process_prompt(
-        self,
-        prompt: str | None,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        tensors: NameToTensorList | None = None,
-        prompt_parts: list[PromptPart] | None = None,
-        **kwargs,
-    ) -> ProcessPromptOutput:
-        """Render the request once, tokenize once, split at the attachments.
-
-        ``text_inputs`` comes back as one span per text step of the prefill
-        plan, since attachments sit inside the user turn. `_prefill_schedule`
-        walks the same plan, so the nth span is the nth text step. Each
-        video's temporal group count goes back as ``video_groups`` metadata:
-        the schedule needs it to lay out the plan, and only tokenizing knows it.
-        """
-        if prompt is None:
-            # An image-only message renders with an empty text span. With no
-            # attachments either, fail here, where it reaches the client as a
-            # 400, not in the conductor, where the request would hang.
-            if not any(m != TEXT for m in input_modalities):
-                raise ValueError(
-                    "Qwen3.5 got a request with no text and no attachments; "
-                    "send a prompt, an image, a video, or a mix"
-                )
-            prompt = ""
-
-        parts = parts_from_modalities(
-            input_modalities,
-            [p.text or "" for p in prompt_parts if p.modality == TEXT]
-            if prompt_parts is not None else prompt,
-            [p.role for p in prompt_parts or ()],
-        )
-        unsupported = {p.modality for p in parts} - {TEXT, "image", VIDEO}
-        if unsupported:
-            raise ValueError(
-                f"Qwen3.5 here has no {', '.join(sorted(unsupported))} path; "
-                "text, image and video attachments only"
-            )
-        tensors = tensors or {}
-        raw_images = tensors.get("image_inputs", [])
-        raw_videos = tensors.get("video_inputs", [])
-        # always, or a named but unsent attachment is quietly dropped
-        check_attachments(parts, {"image": len(raw_images), VIDEO: len(raw_videos)})
+    def _prompt_ids(
+        self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
+    ) -> torch.Tensor:
+        """The chat template's prompt, each video's pad written out as one
+        ``<t seconds>``-stamped pad per temporal group (`expand_video_pads`)."""
+        raw_videos = raw.get(VIDEO, [])
         video_metadata = (kwargs.get("input_metadata") or {}).get("video_inputs", [])
         if len(video_metadata) != len(raw_videos):
             raise ValueError(
                 f"Qwen3.5 got {len(raw_videos)} videos but sampling metadata "
                 f"for {len(video_metadata)}; videos must come through `load_video`"
             )
-
         # From the metadata alone, so a bad layout 400s before the processors
         # spend seconds resizing a long video
         timestamps = [self._video_timestamps(metadata) for metadata in video_metadata]
@@ -528,331 +317,69 @@ class Qwen3_5DenseModel(Model):
             # no user turn) is the client's to fix: a 400, not a 500
             raise ValueError(f"Qwen3.5's chat template refused the chat: {exc}") from exc
         if timestamps:
-            start, pad, end = self._PLACEHOLDER_TOKENS[VIDEO]
-            text = expand_video_pads(text, pad, start, end, timestamps)
+            text = expand_video_pads(
+                text, self._PAD_TOKENS[VIDEO], "<|vision_start|>", "<|vision_end|>", timestamps,
+            )
         # a long prompt is encoded as parallel chunks, identical ids
-        input_ids = torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
+        return torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
 
-        groups = [len(times) for times in timestamps]
-        spans = find_media_spans(input_ids, self._placeholder_specs())
-        segments = split_around_spans(input_ids, spans)
-        check_plan(prefill_plan(expand_video_parts(parts, groups)), spans, len(segments))
+    def _merge(self) -> int:
+        if self.vision_config is None:
+            raise ValueError("this Qwen3.5 checkpoint has no vision tower; send text only")
+        return self.vision_config.spatial_merge_size
 
-        images = [
-            self.image_processor(images=[_as_hwc_uint8(image)], return_tensors="pt")
-            for image in raw_images
-        ]
-        videos = [
-            self._preprocess_video(frames, metadata, times)
-            for frames, metadata, times in zip(raw_videos, video_metadata, timestamps, strict=True)
-        ]
-
-        result: NameToTensorList = {"text_inputs": segments}
-        if images:
-            result["pixel_values"] = [out["pixel_values"] for out in images]
-            result["image_grid_thw"] = [g for out in images for g in out["image_grid_thw"]]
-        if videos:
-            result["pixel_values_videos"] = [video.pixel_values for video in videos]
-            result["video_grid_thw"] = [video.grid for video in videos]
-            # the decoded frames are spent; don't hold them for the request's life
-            result["video_inputs"] = []
-        walk = "prefill_vision" if images or videos else "prefill_text"
-        merge = self.vision_config.spatial_merge_size
-        owners = group_owners(groups)
-
-        def media(step: PromptPart) -> tuple[Span]:
-            # A span is the merged tokens and two sentinels, and each temporal group of a video
-            # is placed like a one-frame image.
-            video = step.modality == VIDEO
-            grid = result["video_grid_thw"][owners[step.index]] if video else result["image_grid_thw"][step.index]
-            grid = grid[0] if grid.dim() == 2 else grid
-            t, h, w = (int(v) for v in grid.tolist())
-            grid = torch.tensor((1 if video else t, h, w))
-            rows = int(grid.prod()) // merge**2 + 2
-            source = (VIDEO, owners[step.index]) if video else ("image", step.index)
-            return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
-
-        plan = prefill_plan(expand_video_parts(parts, groups))
-        layout = LabelLayout(
-            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
-            # The keys name `prefill_text` alone, and the preprocess worker refuses
-            # a keyed span in any other walk.
-            keyed_spans=0 if walk == "prefill_vision" else None,
+    def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
+        merge = self._merge()
+        # uint8, HWC: the processor rescales by default, so floats would be
+        # rescaled twice and the model would see a near-black image
+        out = self.image_processor(
+            images=[as_uint8_chw(image).permute(1, 2, 0).numpy()], return_tensors="pt",
         )
-        # always set, so a `video_groups` the client sent never reaches the schedule
-        return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
+        grid = out["image_grid_thw"][0]
+        return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
 
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
-
-    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {"main": KVLabel(
-            growth=(("decode", "decode_loop"),),
-            keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
-        )}}
-
-    def checkpoint_path(self) -> str:
-        return self._resolve_weights()
-
-
-    def text_output(self) -> TextOutput:
-        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
-
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        modality: str,
-        request_kwargs: dict | None = None,
-    ) -> bytes:
-        if modality == "text":
-            return super().postprocess(output, modality, request_kwargs)
-        raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
-
-    # ------------------------------------------------------------------
-    # Model ABC: forward pass args
-    # ------------------------------------------------------------------
-
-    # Which node reads which of a walk's signals. Both `prefill_vision` nodes
-    # need the grid, so it appears twice; the conductor dedupes the unpersist.
-    _WALK_INPUTS: dict[str, list[WalkInput]] = {
-        "prefill_text": [WalkInput("LLM", ("text_inputs",))],
-        "prefill_vision": [
-            WalkInput("vision_encoder", ("pixel_values", "image_grid_thw")),
-            WalkInput("LLM", ("text_inputs", "image_grid_thw")),
-        ]
-    }
-
-    def _prefill_schedule(
-        self,
-        input_modalities: list[str],
-        signals: dict[str, list[TensorPointerInfo]],
-        video_groups: list[int] | None = None,
-    ) -> list[PrefillStep]:
-        """The prefill walks a request runs.
-
-        With images or videos, one `prefill_vision` walk carries the whole
-        interleaving as `order`; without, one `prefill_text` walk per span.
-        `process_prompt` split `text_inputs` against the same plan, laid out
-        from the same ``video_groups``. A video rides the walk as one tensor
-        and grid, but one tag per temporal group, since timestamp text sits
-        between its groups.
-        """
-        video_groups = video_groups or []
-        pools = {
-            TEXT: signals.get("text_inputs", []),
-            "image": signals.get("pixel_values", []),
-            VIDEO: signals.get("pixel_values_videos", []),
-        }
-        grid_pools = {
-            "image": signals.get("image_grid_thw", []),
-            VIDEO: signals.get("video_grid_thw", []),
-        }
-        owners = group_owners(video_groups)
-        if len(video_groups) != input_modalities.count(VIDEO):
-            logger.warning(
-                "Qwen3.5 has temporal group counts for %d videos but the "
-                "layout names %d; the rest are skipped",
-                len(video_groups), input_modalities.count(VIDEO),
-            )
-
-        order: list[int] = []
-        picked: dict[str, list[TensorPointerInfo]] = {
-            "text_inputs": [], "pixel_values": [], "image_grid_thw": [],
-        }
-        plan = prefill_plan(
-            expand_video_parts(parts_from_modalities(input_modalities), video_groups)
+    def _video_intake(self, frames: torch.Tensor, metadata: dict) -> PreparedMedia:
+        """Each temporal group is placed like a one-frame image."""
+        merge = self._merge()
+        video = self._preprocess_video(frames, metadata, self._video_timestamps(metadata))
+        t, h, w = (int(n) for n in video.grid)
+        group = torch.tensor([1, h, w])
+        return PreparedMedia(
+            {"pixel_values": video.pixel_values}, [int(group.prod()) // merge ** 2] * t, [group] * t,
         )
-        for step in plan:
-            pool = pools.get(step.modality, [])
-            # a video's tensors are indexed by video, its steps by group
-            index = owners[step.index] if step.modality == VIDEO else step.index
-            # an image or video needs its grid too
-            short = index >= len(pool) or (
-                step.modality != TEXT
-                and index >= len(grid_pools.get(step.modality, []))
-            )
-            if short:
-                # `check_plan` already 400s a mismatch at intake. This runs in
-                # the conductor, where raising orphans the request and hangs the
-                # client. Same choice as Qwen3-Omni and BAGEL.
-                logger.warning(
-                    "Qwen3.5 prefill plan wants a %s span at index %d but the "
-                    "prompt produced %d; skipping it",
-                    step.modality, index, len(pool),
-                )
-                continue
-            if step.modality == TEXT:
-                order.append(TEXT_PART)
-                picked["text_inputs"].append(pool[index])
-                continue
-            order.append(VIDEO_PART if step.modality == VIDEO else IMAGE_PART)
-            first_group = step.modality != VIDEO or (
-                step.index == 0 or owners[step.index - 1] != index
-            )
-            if first_group:
-                picked["pixel_values"].append(pool[index])
-                picked["image_grid_thw"].append(grid_pools[step.modality][index])
 
-        if not order:
-            return []
-        if not picked["pixel_values"]:
-            # no encoder to run: the text walk, one step per span
-            return [
-                PrefillStep("prefill_text", {"text_inputs": [t]}, (TEXT_PART,))
-                for t in picked["text_inputs"]
-            ]
-        # TODO: one walk holds every image and video, so a many-image prompt
-        # makes one very wide step. Cap images per walk here and emit several
-        # steps, each with its share of `order`.
-        return [PrefillStep("prefill_vision", picked, tuple(order))]
-
-    def get_initial_forward_pass_args(
+    def process_prompt(
         self,
-        partition_name: str,
+        prompt: str | None,
         input_modalities: list[str],
         output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        schedule = self._prefill_schedule(
-            input_modalities, input_signals,
-            (model_kwargs or {}).get("video_groups"),
+        tensors: NameToTensorList | None = None,
+        prompt_parts: list[PromptPart] | None = None,
+        **kwargs,
+    ) -> ProcessPromptOutput:
+        """The shared intake: ``text_inputs`` is the whole prompt, one pad per
+        merged vision token, and ``pixel_values`` the images and videos in
+        prompt order; ``MEDIA_LAYOUT`` gives each image and video frame
+        group's offset, tokens and grid, for the tower's grid maths and the
+        LLM's MRoPE positions."""
+        out = super().process_prompt(prompt, input_modalities, output_modalities, tensors, prompt_parts, **kwargs)
+        if (tensors or {}).get("video_inputs"):
+            # the decoded frames are spent; don't hold them for the request's life
+            out.new_input_tensors["video_inputs"] = []
+        return out
+
+    def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
+        # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
+        merge = self.vision_config.spatial_merge_size
+        advance = length + sum(
+            vision_position_advance(torch.tensor(grid), merge) - tokens
+            for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
         )
-        if not schedule:
-            # every step was skipped for want of a tensor
-            raise ValueError(
-                f"Qwen3.5 has nothing to prefill for modalities "
-                f"{input_modalities}: the request carries no "
-                f"{sorted(input_signals) or 'inputs'}. An empty prompt cannot "
-                "be served."
-            )
-        step = schedule[0]
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=step.walk,
-            is_prefill=True,
-        )
-        # The remaining walks; `get_partition_forward_pass_args` pops them.
-        metadata.kwargs["prefill_schedule"] = schedule[1:]
-
-        inputs = self._walk_inputs(step)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-            step_metadata={
-                "is_prefill": True,
-                "last_prefill": len(schedule) == 1,
-                "prefill_order": step.order,
-            },
-        )
-
-    @classmethod
-    def _walk_inputs(cls, step: PrefillStep) -> list[GraphEdge]:
-        """One edge per (node, input) this walk reads, off `_WALK_INPUTS`."""
-        edges = []
-        for inp in cls._WALK_INPUTS[step.walk]:
-            for name in inp.inputs:
-                tensors = step.input_tensors.get(name, [])
-                if not tensors:
-                    # An image-only prompt has no text span to hand over.
-                    continue
-                edge = GraphEdge(next_node=inp.node, name=name)
-                edge.tensor_info = list(tensors)
-                edges.append(edge)
-        return edges
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Walk the prefill schedule, then loop in decode until stopped."""
-        metadata = partition_metadata
-        remaining: list[PrefillStep] = metadata.kwargs.get("prefill_schedule", [])
-        # Before the pop: the step about to run is the last one when it is the
-        # only one left.
-        last_prefill = len(remaining) == 1
-
-        order: tuple[int, ...] = ()
-        if metadata.is_prefill and remaining:
-            # each prefill step carries its own tensors; only decode reads
-            # back what the previous step emitted
-            step = remaining.pop(0)
-            metadata.graph_walk = step.walk
-            inputs = self._walk_inputs(step)
-            order = step.order
-        elif metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
-            edge.tensor_info = persist_signals.get("new_token", [])
-            inputs = [edge]
-        else:
-            # decode stops via `LLMSubmodule.check_stop`; reaching here again
-            # after it fires means the request is finished
-            metadata.kwargs["decode_finished"] = True
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-            step_metadata={
-                "is_prefill": metadata.is_prefill,
-                "last_prefill": last_prefill,
-                "prefill_order": order,
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Model ABC: per-request resource configs
-    # ------------------------------------------------------------------
-
-    def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
-        model_kwargs = model_kwargs or {}
-        keys = [
-            "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos", "return_logprobs", "logprobs_mode",
-        ]
-        return {
-            SAMPLER: SamplingReqConfig(
-                **{k: model_kwargs[k] for k in keys if k in model_kwargs}
-            )
-        }
+        return super().kv_layout(layout, length, advance)
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
-
-    def get_default_sharding_config(self) -> ShardingConfig:
-        return ShardingConfig(
-            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
-        )
-
-    def get_submodule(
-        self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None,
-    ) -> NodeSubmodule | None:
-        if node_name in self._submodule_cache:
-            return self._submodule_cache[node_name]
-        submodule = self._create_submodule(
-            node_name, device, autocast_dtype, tp_group,
-        )
-        self._submodule_cache[node_name] = submodule
-        return submodule
 
     def _create_submodule(
         self, node_name: str, device: str,
@@ -888,7 +415,9 @@ class Qwen3_5DenseModel(Model):
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
             logger.info("Loaded Qwen3.5 vision tower onto %s", device)
-            return VisionEncoderSubmodule(tower, self.vision_config)
+            return VisionEncoderSubmodule(
+                tower, self.vision_config, self.encoder(node_name),
+            )
 
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 
@@ -901,25 +430,4 @@ class Qwen3_5DenseModel(Model):
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(model, self.config, self.vision_config)
-
-    @staticmethod
-    def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
-        """Construct under `dtype` so no fp32 copy of the weights is
-        allocated. fp32-only parameters restore themselves in `_apply`."""
-        torch.set_default_dtype(dtype)
-        try:
-            return make().to(device)
-        finally:
-            torch.set_default_dtype(torch.float32)
-
-    def _resolve_weights(self) -> str:
-        """The full snapshot; only workers call this."""
-        local_path = Path(self.model_path_hf)
-        if local_path.is_dir():
-            return str(local_path)
-        from huggingface_hub import snapshot_download
-
-        return snapshot_download(
-            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
-        )
+        return LLMSubmodule(model, self.config, self.vision_config, self.encoders)

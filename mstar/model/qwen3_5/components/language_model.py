@@ -309,11 +309,21 @@ class Qwen3_5ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
+    # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
+
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.model.embed_tokens.weight.dtype
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
     def forward(
-        self, input_ids: torch.Tensor, *, label: str,
+        self, input_embeds: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden = self.model(
-            self.model.embed_tokens(input_ids), label=label, cos_sin=cos_sin,
-        )
+        """``(tokens, hidden)`` in, the stack's normed output out."""
+        return self.model(input_embeds, label=label, cos_sin=cos_sin)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

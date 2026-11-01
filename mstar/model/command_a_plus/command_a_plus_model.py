@@ -125,6 +125,7 @@ class CommandAPlusModel(Model):
 
     def get_node_resources(self):
         config = self.config
+        local = tuple(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
         return [
             KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
                 num_layers=config.num_hidden_layers, num_qo_heads=config.num_attention_heads,
@@ -132,7 +133,7 @@ class CommandAPlusModel(Model):
                 max_seq_len=self.max_seq_len,
             )),
             AttentionSpec(resource_key=LOCAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE, sliding_window=config.sliding_window,
+                kv_cache=KV_CACHE, sliding_window=config.sliding_window, layers=local,
             )),
             AttentionSpec(resource_key=GLOBAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
                 kv_cache=KV_CACHE,

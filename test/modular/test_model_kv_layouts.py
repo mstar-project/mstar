@@ -491,15 +491,13 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
-    llm = SimpleNamespace(config=SimpleNamespace(stop_token_ids=()), _token_is_real=LLMSubmodule._token_is_real)
-
-    def check_stop(request_id, request_info, outputs):
-        return LLMSubmodule.check_stop(llm, request_id, request_info, outputs)
+    llm = LLMSubmodule.__new__(LLMSubmodule)
+    llm.stop_token_ids = frozenset()
 
     cap = Qwen3_5DenseModel.get_loop_caps(object.__new__(Qwen3_5DenseModel), max_output_tokens=max_tokens)
 
     assert cap["decode_loop"] == _stops_after(
-        check_stop, "decode_loop", "decode", 2048,
+        llm.check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
 

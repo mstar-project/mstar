@@ -21,10 +21,10 @@ class TokenStepNode:
 
     DECODE_WALK = "decode"
     DECODE_LOOP = "decode_loop"
-    # The walk that samples the first token, before DECODE_LOOP exists. A stop
-    # there ends the partition (END_PARTITION); a stop id on any other walk
-    # outside the loop stops nothing, since the model's transition may still
-    # have a walk to run.
+    # The walk that samples the first token, before DECODE_LOOP exists (see
+    # `_is_prefill_walk`). A stop there ends the partition (END_PARTITION); a
+    # stop id on any other walk outside the loop stops nothing, since the
+    # model's transition may still have a walk to run.
     PREFILL_WALK = "prefill"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
@@ -65,21 +65,29 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """A stop id, or the token budget, on a PREFILL_WALK or decode row.
-        The budget counts the token PREFILL_WALK samples."""
+        """A stop id, or the token budget, on a prefill or decode row.
+        The budget counts the token the prefill samples."""
         walk = request_info.graph_walk
         if walk == self.DECODE_WALK:
             generated = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 2
-        elif walk == self.PREFILL_WALK:
+        elif self._is_prefill_walk(walk):
             generated = 1
         else:
             return False
-        ignore_eos = request_info.resource_configs[self.SAMPLER].ignore_eos
-        return (not ignore_eos and token in self.stop_token_ids) or generated >= request_info.max_tokens
+        # the set test first: a stop id is rare, and the config read behind it
+        # goes through the wrapper
+        return (
+            token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos
+        ) or generated >= request_info.max_tokens
+
+    def _is_prefill_walk(self, walk: str) -> bool:
+        """Whether ``walk`` samples the request's first token. Override for a
+        node with several prefill walks."""
+        return walk == self.PREFILL_WALK
 
     def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
         """``check_stop``'s answer for one row: a decode row stops the loop,
-        and a PREFILL_WALK row, which runs before the loop exists, ends the
+        and a prefill row, which runs before the loop exists, ends the
         partition. A batched decode step answers from ``_stops`` without
         calling this, so an override changes only the other rows."""
         if not self._stops(token, request_info):

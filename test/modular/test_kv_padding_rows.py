@@ -133,7 +133,7 @@ def test_an_eager_write_under_a_lease_keeps_its_own_addressing_and_skips_padding
     sink_before = mgr.kv_cache.tensor[:, SINK_PAGE].clone()
     assert mgr.admit(step, ctx).ok
     mgr.plan(step, ctx)
-    state = mgr._current_plan_states["ctx"]
+    state = mgr._current_plan_states["ctx", 0]
     assert state.total_tokens == 60 and state.ready is None
     k = torch.arange(40 * 4, dtype=torch.float32, device="cuda").view(40, 1, 4)
     mgr.write_kv(k, -k, layer_idx=0, label="ctx")

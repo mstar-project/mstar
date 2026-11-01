@@ -12,10 +12,9 @@ from mstar.model.submodule_base import END_PARTITION, HostRows
 EOS = 7
 
 
-def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=False):
+def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode"):
     return SimpleNamespace(
         graph_walk=walk,
-        step_metadata={"last_prefill": last_prefill},
         resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": done},
         max_tokens=max_tokens,
@@ -23,10 +22,10 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=
 
 
 def _sub():
-    return SimpleNamespace(
-        config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})),
-        _token_is_real=LLMSubmodule._token_is_real,
-    )
+    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub.stop_token_ids = frozenset({EOS, 9})
+    sub._media_walks = frozenset({"prefill_vision"})
+    return sub
 
 
 @pytest.mark.parametrize("shape", ["flat", "column"])
@@ -59,44 +58,48 @@ def test_batched_agrees_with_per_request(shape):
 
 
 @pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
-def test_a_last_prefill_stop_token_ends_the_partition(step_walk):
-    """The last prefill's token comes before decode_loop exists, so its stop
-    ends the partition; an earlier chunk's token is not the request's."""
+def test_a_prefill_stop_token_ends_the_partition(step_walk):
+    """A prefill's token comes before decode_loop exists, so its stop ends the
+    partition, on the text walk and on a media walk alike."""
     tokens = torch.tensor([EOS, EOS, EOS, EOS])
     infos = {
-        "early": _info(walk="prefill_text"),                   # not the last prefill
-        "last": _info(walk="prefill_text", last_prefill=True),
-        "ignored": _info(walk="prefill_text", last_prefill=True, ignore_eos=True),
+        "text": _info(walk="prefill_text"),
+        "media": _info(walk="prefill_vision"),
+        "ignored": _info(walk="prefill_text", ignore_eos=True),
     }
     if step_walk is None:
         infos["dec"] = _info()
+    sub = _sub()
     got = LLMSubmodule.check_stop_batched(
-        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
+        sub, list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
     )
-    assert got == {"last": {END_PARTITION}, **({"dec": {"decode_loop"}} if step_walk is None else {})}
+    assert got == {
+        "text": {END_PARTITION}, "media": {END_PARTITION},
+        **({"dec": {"decode_loop"}} if step_walk is None else {}),
+    }
     for rid, info in infos.items():
-        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+        per_request = LLMSubmodule.check_stop(sub, rid, info, {"new_token": [tokens[:1]]})
         assert per_request == got.get(rid, set())
 
 
 @pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
-def test_the_budget_counts_the_last_prefills_token(step_walk):
-    """max_output_tokens=N gives N tokens, the first of them the last prefill's."""
+def test_the_budget_counts_the_prefills_token(step_walk):
+    """max_output_tokens=N gives N tokens, the first of them the prefill's."""
     infos = {
-        "one": _info(walk="prefill_text", last_prefill=True, max_tokens=1),
-        "early": _info(walk="prefill_text", max_tokens=1),  # not the request's token
-        "two": _info(walk="prefill_text", last_prefill=True, max_tokens=2),
+        "one": _info(walk="prefill_text", max_tokens=1),
+        "two": _info(walk="prefill_text", max_tokens=2),
     }
     if step_walk is None:
         infos["tenth"] = _info(done=8, max_tokens=10)  # the prefill's and 9 decoded
         infos["ninth"] = _info(done=7, max_tokens=10)
     tokens = torch.full((len(infos),), 3)
+    sub = _sub()
     got = LLMSubmodule.check_stop_batched(
-        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
+        sub, list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
     )
     assert got == {"one": {END_PARTITION}, **({"tenth": {"decode_loop"}} if step_walk is None else {})}
     for rid, info in infos.items():
-        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+        per_request = LLMSubmodule.check_stop(sub, rid, info, {"new_token": [tokens[:1]]})
         assert per_request == got.get(rid, set())
 
 
@@ -147,7 +150,7 @@ def test_rows_out_of_batch_order_still_map_by_request():
     from mstar.model.submodule_base import HostRows
 
     sub = LLMSubmodule.__new__(LLMSubmodule)
-    sub.config = SimpleNamespace(stop_token_ids={7})
+    sub.stop_token_ids = frozenset({7})
     rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
 
     def info(max_tokens, iters=0):

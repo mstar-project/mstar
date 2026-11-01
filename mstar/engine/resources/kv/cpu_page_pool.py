@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.kv.cache import KVCache, PagedKVConfig
+from mstar.engine.resources.kv.cache import GroupPages, KVCache, PagedKVConfig, held_pages, on_pages
 from mstar.engine.resources.kv.page_copier import make_page_copier
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
@@ -34,13 +34,17 @@ _EXHAUSTED_LOG_INTERVAL = 5.0
 @dataclass
 class OffloadedStream:
     """One (request, label) stream living on the host."""
-    # the first len(keys) pages are filed under ``keys`` in the host index
-    cpu_page_indices: list[int]
-    stored_len: int
+    # its pages and lengths in each group (`CacheStream.groups`), on host pages; the first
+    # group's first len(keys) pages are filed under ``keys`` in the host index
+    groups: tuple[GroupPages, ...]
     position: int
-    released: int = 0
     protected_prefix: int = 0
     keys: list[bytes] = field(default_factory=list)
+
+    @property
+    def host_pages(self) -> list[int]:
+        """Every host page the record holds, group by group."""
+        return held_pages(self.groups) if len(self.groups) > 1 else self.groups[0].page_indices
 
 
 class PageCopies(NamedTuple):
@@ -68,7 +72,7 @@ class CPUPagePool:
         # same layout as the device cache, on pinned memory so the copies can
         # be async
         self.cpu_kv_cache = torch.empty(
-            config.num_layers,
+            kv_cache.tensor.shape[0],
             arena.allocator.max_num_pages,
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
@@ -115,36 +119,34 @@ class CPUPagePool:
         self,
         rid: str,
         label: str,
-        gpu_page_indices: list[int],
+        groups: tuple[GroupPages, ...],
         keys: list[bytes],
-        stored_len: int,
         position: int,
-        released: int = 0,
         protected_prefix: int = 0,
     ) -> PageCopies | None:
-        """None when the host can't hold the stream even after evicting cached pages."""
+        """None when the host can't hold the stream even after evicting cached pages. ``groups``
+        are a copy of the stream's (`CacheStream.groups`), on its device pages."""
         # retained before evicting, so the eviction passes over them
         found = self.retain_run(keys)
-        n_pages = len(gpu_page_indices) - len(found)
+        gpu_pages = held_pages(groups)
+        n_pages = len(gpu_pages) - len(found)
         cpu_pages = self.take(n_pages)
         if len(cpu_pages) < n_pages:
             self.arena.release(cpu_pages + found)
             self._log_refusal(rid, label, n_pages)
             return None
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
-            cpu_page_indices=found + cpu_pages,
-            stored_len=stored_len,
+            groups=on_pages(groups, found + cpu_pages),
             position=position,
-            released=released,
             protected_prefix=protected_prefix,
             keys=list(keys),
         )
-        return PageCopies(gpu=gpu_page_indices[len(found):], cpu=cpu_pages)
+        return PageCopies(gpu=gpu_pages[len(found):], cpu=cpu_pages)
 
     def insert_keys(self, rid: str, label: str) -> None:
         """Call this only after the placed stream's copies are queued."""
         state = self.offloaded[rid][label]
-        self.index.insert_run(state.keys, state.cpu_page_indices[:len(state.keys)], None)
+        self.index.insert_run(state.keys, state.groups[0].page_indices[:len(state.keys)], None)
 
     def _log_refusal(self, rid: str, label: str, n_pages: int) -> None:
         now = time.monotonic()
@@ -256,7 +258,7 @@ class CPUPagePool:
         """
         state = self.pop(rid, label)
         if state is not None:
-            self.arena.release(state.cpu_page_indices)
+            self.arena.release(state.host_pages)
 
     def sync(self) -> None:
         """Order the current stream behind the pending copies.
@@ -270,7 +272,7 @@ class CPUPagePool:
 
     def remove_request(self, rid: str) -> None:
         for state in self.offloaded.pop(rid, {}).values():
-            self.arena.release(state.cpu_page_indices)
+            self.arena.release(state.host_pages)
 
     @property
     def num_free_pages(self) -> int:

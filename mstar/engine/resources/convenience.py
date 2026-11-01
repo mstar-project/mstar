@@ -130,7 +130,7 @@ class LinearAttnCallable:
 
 class RaggedAttentionCallable:
     """`AttentionCallable` for a cacheless attention: ``(q, k, v) -> out`` over
-    one declared span of a `RaggedAttnManager`.
+    one declared span of a `RaggedAttnManager` (``label=None``: its default).
 
     No ``kv`` and no layer cursor, because there is neither to carry: a ragged
     plan is keyed by the segment label, and the wrapper behind it is per
@@ -144,16 +144,16 @@ class RaggedAttentionCallable:
     tokens, packed in the same request order as ``q``. A
     ``RaggedBlockCausalAttentionSpec`` resource binds like a self-attention one.
 
-    One instance per label, held for the life of the resource binding: a
-    compiled transformer region guards on the identity of the callables it is
-    handed, so handing it a fresh one per step retraces that frame every step
-    until Dynamo gives up.
+    One instance per label or per layer, held for the life of the resource
+    binding, never a fresh one per step: a compiled transformer region guards
+    on the identity of the callables it is handed, so a fresh one per step
+    retraces that frame every step until Dynamo gives up.
     """
 
     def __init__(
         self,
         attn: RaggedAttnManager | RaggedCrossAttnManager | RaggedBlockCausalAttnManager,
-        label: str,
+        label: str | None,
     ):
         self.attn = attn
         self.label = label

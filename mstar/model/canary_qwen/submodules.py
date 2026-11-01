@@ -16,6 +16,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.canary_qwen.config import ATTN, DECODE_LOOP, DECODE_WALK, KV_CACHE, ROPE, SAMPLER
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.components.token_step import TokenStepNode
+from mstar.model.multimodal import splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -57,8 +58,7 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         slots = input_ids == self.audio_token_id
         # the placeholder id is past the trained vocabulary; embed 0 there
         embeds = self.model.embed(torch.where(slots, torch.zeros_like(input_ids), input_ids))
-        frame = (torch.cumsum(slots, 0) - 1).clamp(0, audio_embeds.shape[0] - 1)
-        return torch.where(slots[:, None], audio_embeds.to(embeds.dtype)[frame], embeds)
+        return splice_media(embeds, slots, audio_embeds)
 
     def prepare_inputs(
         self,

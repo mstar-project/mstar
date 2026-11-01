@@ -20,11 +20,12 @@ Modes:
 
 Input kinds:
   data    -- the values do not change the step (``vision_embeds``).
-  shape   -- the step's length is derived from the values (``image_grid_thw``):
-             zeros give the follower a different step than the leader's.
-  prepare -- ``prepare_inputs`` issues a collective for the row (a text part's
-             vocab-parallel embedding in Qwen3.5's ``prefill_vision``), so a
-             rank that puts another row in its place skips that collective.
+  shape   -- the step's length is derived from the values (a patch-grid
+             tensor): zeros give the follower a different step than the
+             leader's.
+  prepare -- ``prepare_inputs`` issues a collective for the row (a
+             vocab-parallel embedding run there), so a rank that puts another
+             row in its place skips that collective.
 
 Checked at every terminal state:
   live     -- no reachable state is stuck short of done (the instance hang).
