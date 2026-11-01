@@ -18,12 +18,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.model.components.mrope import layout_position_ids
 from mstar.model.cosmos3.components.reasoner import (
     MediaGrid,
     patchify,
     preprocess_image,
     preprocess_video,
-    prompt_position_ids,
     sample_frame_indices,
     smart_resize,
     vision_layout,
@@ -407,7 +407,7 @@ def test_sample_frame_indices() -> None:
 def _positions(ids, cfg, image_grids, video_grids):
     """The served path: the intake's layout, then the reasoner's positions from it."""
     layout = vision_layout(ids, cfg, image_grids, video_grids, "vision_embeds")
-    return prompt_position_ids(layout, cfg.vision.spatial_merge_size, len(ids))
+    return layout_position_ids(layout, cfg.vision.spatial_merge_size, len(ids))
 
 
 def test_mrope_positions_image_then_text() -> None:
@@ -584,7 +584,7 @@ def test_edge_reasoner_video_prompt() -> None:
     assert int((ids == r.video_token_id).sum()) == 6 * per_frame
     assert int((ids == r.vision_start_token_id).sum()) == 6
     assert out["pixel_values"][0].shape[0] == int(grid[0].prod())
-    pos, _ = prompt_position_ids(prompt.metadata[MEDIA_LAYOUT], r.vision.spatial_merge_size, len(ids))
+    pos, _ = layout_position_ids(prompt.metadata[MEDIA_LAYOUT], r.vision.spatial_merge_size, len(ids))
     starts = (ids == r.vision_start_token_id).nonzero().flatten().tolist()
     # Frame k's tokens sit at one temporal position; successive frames are
     # separated by the timestamp text plus the merged grid's longer side.

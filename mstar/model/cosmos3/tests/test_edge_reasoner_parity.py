@@ -98,10 +98,10 @@ def test_reasoner_prompt_and_vision_match_reference() -> None:
     import torchvision
     from transformers import AutoTokenizer
 
+    from mstar.model.components.mrope import layout_position_ids
     from mstar.model.cosmos3.components.reasoner import (
         expand_placeholders,
         preprocess_image,
-        prompt_position_ids,
         render_chat,
         vision_layout,
     )
@@ -130,7 +130,7 @@ def test_reasoner_prompt_and_vision_match_reference() -> None:
     ids = torch.tensor(tok(text, add_special_tokens=False)["input_ids"])
     assert ids.tolist() == rec["input_ids"].tolist()
     layout = vision_layout(ids, cfg.reasoner, [grid], [], "vision_embeds")
-    pos, next_pos = prompt_position_ids(layout, cfg.reasoner.vision.spatial_merge_size, len(ids))
+    pos, next_pos = layout_position_ids(layout, cfg.reasoner.vision.spatial_merge_size, len(ids))
     assert torch.equal(pos, rec["position_ids"])
     assert next_pos == int(rec["position_ids"].max()) + 1
     assert next_pos == len(ids) + int(rec["rope_delta"])

@@ -91,6 +91,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.components.mrope import layout_extent
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -847,8 +848,10 @@ class Cosmos3Model(Model):
             section=GraphNode(
                 name=REASONER_NODE,
                 input_names=["text_inputs"],
+                # every output is the token the node reads back off the
+                # sampler, so it stays on the device
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                     GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
                 ],
             ),
@@ -995,7 +998,6 @@ class Cosmos3Model(Model):
             IMAGE,
             VIDEO,
             expand_placeholders,
-            frame_advance,
             preprocess_image,
             preprocess_video,
             render_chat,
@@ -1071,11 +1073,8 @@ class Cosmos3Model(Model):
             out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
             out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
-        merge = reasoner.vision.spatial_merge_size
         # a vision run spans its merged grid's longer side in positions, not its tokens
-        advance = ids.numel() + sum(
-            frame_advance(grid, merge) - tokens for tokens, grid in zip(layout["tokens"], layout["grid"], strict=True)
-        )
+        advance = layout_extent(layout, reasoner.vision.spatial_merge_size, ids.numel())
         main = LabelLayout(
             # media rows fill the expanded placeholders, so the span is rows, not ids
             spans=(Span("rows", walk, ids.numel(), advance, "text_inputs"),),

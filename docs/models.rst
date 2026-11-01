@@ -1124,11 +1124,11 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The reasoner is a ``SampledTokenDecoder``: its decode steps, text prefills (alone
-or packed beside decode rows) and vision prefills are captured into CUDA graphs
-per bucket, each compiled first: the eager decode step is over a thousand tiny
-kernels, and the fused step runs at the weight-streaming floor (about twice the
-uncompiled rate at batch size 1 on an H100). Concurrent chat requests share
+The reasoner is a ``SampledTokenDecoder``: its decode steps are captured into
+CUDA graphs per batch bucket, each compiled first: the eager decode step is over
+a thousand tiny kernels, and the fused step runs at the weight-streaming floor
+(about twice the uncompiled rate at batch size 1 on an H100). Its prefills, text
+and vision (one vision prompt a step), run eagerly and uncompiled. Concurrent chat requests share
 decode steps (continuous batching over the captured decode graphs, padded to the
 next batch bucket). Requests never see each other's data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run

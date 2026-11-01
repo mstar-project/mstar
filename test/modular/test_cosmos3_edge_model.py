@@ -93,7 +93,10 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     assert isinstance(decode, Loop) and decode.name == REASONER_DECODE_LOOP
     body = decode.section
     assert body.name == REASONER_NODE and set(body.input_names) == {"text_inputs"}
-    assert {e.name for e in body.outputs} == {"new_token", "text_inputs"}
+    # one signal, so the decode step stays on the device
+    assert {(e.next_node, e.name) for e in body.outputs} == {
+        (EMIT_TO_CLIENT, "text_inputs"), (REASONER_NODE, "text_inputs"),
+    }
 
 
 def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
@@ -318,7 +321,8 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
 
     from mstar.engine.resources.position.config import PositionConfig
     from mstar.engine.resources.position.manager import RopeManager
-    from mstar.model.cosmos3.components.reasoner import MediaGrid, prompt_position_ids, vision_layout
+    from mstar.model.components.mrope import layout_position_ids
+    from mstar.model.cosmos3.components.reasoner import MediaGrid, vision_layout
     from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
     from mstar.model.keys import ROPE
     from mstar.model.submodule_base import END_PARTITION
@@ -334,7 +338,7 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={MEDIA_LAYOUT: layout})
     walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
     inp = sub.prepare_inputs(walk, fwd, {"text_inputs": [ids], "vision_embeds": [torch.zeros(8, 4)]})
-    pos, advance = prompt_position_ids(layout, r.vision.spatial_merge_size, len(ids))
+    pos, advance = layout_position_ids(layout, r.vision.spatial_merge_size, len(ids))
     assert torch.equal(inp.custom_pos_ids, pos) and inp.resource_step_info == advance == int(pos.max()) + 1
     step = sub.declare_step(walk, ["r"], [inp])
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 13)]

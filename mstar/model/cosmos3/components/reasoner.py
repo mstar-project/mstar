@@ -17,10 +17,8 @@ byte-for-byte:
   span per frame.
 * ``vision_layout``: the rendered prompt's ``MEDIA_LAYOUT``, one run per image
   and per video frame, checked against the media.
-* ``prompt_position_ids``: the 3D mRoPE ids of that prompt. Text tokens
-  advance all three axes together; a vision run puts the cursor on the
-  temporal axis and the cursor plus the merged ``(h, w)`` grid on the spatial
-  ones, and advances the cursor by ``max(h, w)`` merged patches.
+  The worker places the prompt's 3D mRoPE ids from that layout
+  (``components/mrope.layout_position_ids``).
 """
 
 from __future__ import annotations
@@ -274,47 +272,6 @@ def vision_layout(
     if any(seen[tok] != len(f) for tok, f in frames.items()):
         raise ValueError("prompt has fewer media placeholder runs than media frames")
     return layout
-
-
-def frame_advance(grid: list[int], merge_size: int) -> int:
-    """How far one image or video frame moves the position cursor: the
-    longer side of its merged grid, not its token count."""
-    return max(grid[1], grid[2]) // merge_size
-
-
-def prompt_position_ids(
-    layout: dict, merge_size: int, num_tokens: int, start: int = 0,
-    device: torch.device | None = None,
-) -> tuple[torch.Tensor, int]:
-    """3D mRoPE ids ``[3, num_tokens]`` (temporal, height, width) of a prompt
-    whose vision runs ``layout`` places, counted from ``start``, and how far
-    the prompt moves the cursor (decoding continues there, at
-    ``max(position) + 1``).
-
-    Text runs put the same increasing ids on all three axes. A vision run puts
-    the cursor on the temporal axis and the cursor plus the merged-grid
-    coordinates on the spatial ones. Built on ``device`` from host values, so
-    no host-to-device copy."""
-    pieces: list[torch.Tensor] = []
-    pos, cursor = start, 0
-
-    def text(n: int) -> torch.Tensor:
-        return torch.arange(pos, pos + n, device=device).expand(3, -1)
-
-    for offset, tokens, grid in zip(layout["offset"], layout["tokens"], layout["grid"], strict=True):
-        if offset > cursor:
-            pieces.append(text(offset - cursor))
-            pos += offset - cursor
-        h, w = grid[1] // merge_size, grid[2] // merge_size
-        hh = torch.arange(h, device=device).repeat_interleave(w)
-        ww = torch.arange(w, device=device).repeat(h)
-        pieces.append(torch.stack([torch.full_like(hh, pos), hh + pos, ww + pos]))
-        pos += frame_advance(grid, merge_size)
-        cursor = offset + tokens
-    if num_tokens > cursor:
-        pieces.append(text(num_tokens - cursor))
-        pos += num_tokens - cursor
-    return torch.cat(pieces, dim=1), pos - start
 
 
 def render_chat(

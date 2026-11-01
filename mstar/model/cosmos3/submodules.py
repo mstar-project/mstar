@@ -61,7 +61,7 @@ from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, Su
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.step import ResourceStep
 from mstar.engine.windowing import WindowSchedule
-from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
@@ -3218,8 +3218,12 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     ATTN_KEY = ATTN
     # max-autotune until the default compile level (mstar serve -O) is measured on this model
     COMPILE_MODE = "max-autotune-no-cudagraphs"
-    # a step past the capture buckets runs eagerly, uncompiled
+    # the prefills, which capture nothing, run eagerly and uncompiled (and every
+    # step does with accelerator graphs off)
     disable_torch_compile = True
+    # one vision prefill a step, as before: a video prompt can run to tens of
+    # thousands of tokens, and nothing caps a step's tokens
+    PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1]
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
@@ -3228,10 +3232,8 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
     def prompt_positions(self, fwd_info, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
-        from mstar.model.cosmos3.components.reasoner import prompt_position_ids
-
         start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label=REASONER_LABEL)
-        return prompt_position_ids(
+        return layout_position_ids(
             layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
         )
 
@@ -3254,7 +3256,3 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
             config for config in super().get_accelerator_graph_configs(device, tp_world_size)
             if config.capture_graph_walk == self.DECODE_WALK
         ]
-
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        # the decode loop's client edge is named new_token
-        return {"new_token": "new_token"} if graph_walk == self.DECODE_WALK else {}
