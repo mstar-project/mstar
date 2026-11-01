@@ -65,6 +65,12 @@ def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
     return model
 
 
+def _make_model_k(k: int) -> Glm52Model:
+    cfg = Glm52ModelConfig()
+    cfg.mtp_num_draft_tokens = k
+    return _make_model(cfg)
+
+
 def test_glm52_registered():
     # The registry is lazy (module path, class name) so importing it pulls
     # no model code; resolve the entry and check it is the class.
@@ -119,6 +125,14 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
     assert attn.config.sm_scale == cfg.qk_head_dim ** -0.5  # 256**-0.5, no mscale
     assert attn.depends_on() == {KV_RESOURCE}
     assert sampler.vocab_size == cfg.vocab_size
+
+
+def test_glm52_resources_mtp_adds_the_plane_layer():
+    # the draft module's KV is one more layer plane on the trunk's page table
+    kv, _, _ = _specs(_make_model_k(2).config)
+    assert kv.config.num_layers == 79
+    kv0, _, _ = _specs(_make_model_k(0).config)
+    assert kv0.config.num_layers == 78
 
 
 def test_glm52_resources_flag_off_is_naive():
@@ -251,10 +265,15 @@ def test_glm52_request_config_is_the_sampler_config():
     assert over.temperature == cfg.temperature
 
 
-def test_glm52_mtp_is_refused_until_it_lands():
-    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
-        Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=2)
-    Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=0)
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(mtp_num_draft_tokens=2, num_hidden_layers=10), "num_hidden_layers"),
+    (dict(mtp_num_draft_tokens=-1), "mtp_num_draft_tokens"),
+], ids=["shallower-trunk", "negative-k"])
+def test_glm52_refuses_an_mtp_config_it_cannot_serve(kwargs, match):
+    """Every checkpoint layer past a shallower trunk would load as the MTP layer, and a
+    negative draft count reads as off to some checks and on to others."""
+    with pytest.raises(ValueError, match=match):
+        Glm52Model(model_path_hf="", **kwargs)
 
 
 # ── config ──
@@ -543,6 +562,13 @@ def test_indexer_exists_only_on_the_dsa_path():
     assert on.model.layers[0].self_attn.indexer is not None  # FULL
     assert on.model.layers[1].self_attn.indexer is None      # SHARED
     assert all(n.startswith("model.layers.0.") for n in _indexer_params(on))
+
+    # the MTP layer's indexer follows the same flag (drafting is flag-off
+    # only, so it never carries one in practice)
+    cfg = Glm52ModelConfig.reduced()
+    cfg.num_hidden_layers = 4  # MTP position lands FULL
+    cfg.mtp_num_draft_tokens = 2
+    assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
 
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():

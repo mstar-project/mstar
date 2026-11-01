@@ -57,7 +57,10 @@ class ParallelGatedMLP(nn.Module):
         comm_group: CommGroup | None = None,
         activation: str | Callable = "silu",
         bias: bool = False,
+        reduce_results: bool = True,
     ):
+        """``reduce_results=False`` returns this rank's partial down_proj output, for a
+        caller that adds it to another partial and reduces once."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -78,7 +81,7 @@ class ParallelGatedMLP(nn.Module):
             output_size=hidden_size,
             bias=bias,
             input_is_parallel=True,
-            reduce_results=True,
+            reduce_results=reduce_results,
         )
 
         self.intermediate_size_per_partition = (

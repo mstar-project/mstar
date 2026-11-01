@@ -114,6 +114,9 @@ class Glm52MLAAttention(MLAAttention):
         mask = dsa_selection_to_mask(dsa_selection, q.shape[0], dtype=q.dtype, device=q.device)
         return masked_reference_attention(q, k, v, mask)
 
+    def _selects(self, dsa_selection=None) -> bool:
+        return self._dsa is not None
+
     def _select(self, hidden_states, q_c, position_ids, dsa_selection=None):
         # None-guarded here (not just inside _dsa_select) so the default
         # flag-off path never crosses the compiler.disable boundary — dynamo
@@ -144,12 +147,11 @@ class Glm52MLAAttention(MLAAttention):
         selection: torch.Tensor,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        kv_c: torch.Tensor,
-        k_pe: torch.Tensor,
+        latent: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write this step's latents, then sparse absorbed MLA over the picked ones."""
         layer_idx = self.cache_layer_idx
-        self._kv.write_kv(torch.cat([kv_c, k_pe], dim=-1).squeeze(1), None, layer_idx=layer_idx)
+        self._kv.write_kv(latent, None, layer_idx=layer_idx)
         return self._dsa.attend(
             selection, q_nope, q_pe, self._kv.layer_view(layer_idx), self.softmax_scale)

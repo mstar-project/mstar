@@ -51,7 +51,7 @@ def launches(monkeypatch):
 
 def _use(monkeypatch, table):
     tuning = getattr(decode, table)
-    monkeypatch.setattr(decode, "_tuning", lambda device: tuning)
+    monkeypatch.setattr(decode, "_tuning", lambda device, experts=None: tuning)
     return tuning
 
 
@@ -72,9 +72,14 @@ def test_tuning_follows_the_gpu_name(monkeypatch):
     pick = decode._tuning.__wrapped__
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H100 80GB HBM3")
     assert pick(torch.device("cuda", 0)) is decode._H100
+    assert pick(torch.device("cuda", 0), (6144, 256, 256)) is decode._H100
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: "NVIDIA H200")
     assert pick(torch.device("cuda", 0)) is decode._H200
     assert pick(torch.device("cpu")) is decode._H200
+    # GLM-5.2's experts get their own table; any other shape keeps the H200 one
+    assert pick(torch.device("cuda", 0), (6144, 256, 256)) is decode._H200_GLM52
+    assert pick(torch.device("cuda", 0), (4096, 288, 256)) is decode._H200
+    assert pick(torch.device("cuda", 0), (6144, 128, 256)) is decode._H200
 
 
 def test_tile_tables():

@@ -81,9 +81,9 @@ def _fp8_pair(sd, base, weight):
 
 
 def _hf_checkpoint(model, cfg):
-    """Emit HF-style keys: routed experts as fp8 pairs (mandatory for the
-    fp8-resident containers), o_proj/kv_b_proj as fp8 pairs (dense
-    dequant-on-load coverage), everything else bf16 passthrough."""
+    """Emit HF-style keys as the fp8 checkpoint stores them: the routed experts, the
+    attention projections, the shared expert and the dense MLPs as fp8 pairs (kv_b_proj
+    dequantizes on load), the norms, router, embedding and head bf16."""
     inter = cfg.intermediate_size
     moe_inter = cfg.moe_intermediate_size
     shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
@@ -92,10 +92,10 @@ def _hf_checkpoint(model, cfg):
     for i, layer in enumerate(m.layers):
         p = f"model.layers.{i}."
         a = layer.self_attn
-        sd[p + "self_attn.q_a_proj.weight"] = a.q_a_proj.weight
+        _fp8_pair(sd, p + "self_attn.q_a_proj", a.q_a_proj.weight)
         sd[p + "self_attn.q_a_layernorm.weight"] = a.q_a_layernorm.weight
-        sd[p + "self_attn.q_b_proj.weight"] = a.q_b_proj.weight
-        sd[p + "self_attn.kv_a_proj_with_mqa.weight"] = a.kv_a_proj_with_mqa.weight
+        _fp8_pair(sd, p + "self_attn.q_b_proj", a.q_b_proj.weight)
+        _fp8_pair(sd, p + "self_attn.kv_a_proj_with_mqa", a.kv_a_proj_with_mqa.weight)
         sd[p + "self_attn.kv_a_layernorm.weight"] = a.kv_a_layernorm.weight
         _fp8_pair(sd, p + "self_attn.kv_b_proj", a.kv_b_proj.weight)
         _fp8_pair(sd, p + "self_attn.o_proj", a.o_proj.weight)
@@ -118,13 +118,13 @@ def _hf_checkpoint(model, cfg):
                 _fp8_pair(sd, p + f"mlp.experts.{e}.up_proj", gup[e, moe_inter:, :])
                 _fp8_pair(sd, p + f"mlp.experts.{e}.down_proj", dwn[e])
             sh = mlp.shared_expert
-            sd[p + "mlp.shared_experts.gate_proj.weight"] = sh.gate_up_proj.weight[:shared_inter]
-            sd[p + "mlp.shared_experts.up_proj.weight"] = sh.gate_up_proj.weight[shared_inter:]
-            sd[p + "mlp.shared_experts.down_proj.weight"] = sh.down_proj.weight
+            _fp8_pair(sd, p + "mlp.shared_experts.gate_proj", sh.gate_up_proj.weight[:shared_inter])
+            _fp8_pair(sd, p + "mlp.shared_experts.up_proj", sh.gate_up_proj.weight[shared_inter:])
+            _fp8_pair(sd, p + "mlp.shared_experts.down_proj", sh.down_proj.weight)
         else:
-            sd[p + "mlp.gate_proj.weight"] = mlp.gate_up_proj.weight[:inter]
-            sd[p + "mlp.up_proj.weight"] = mlp.gate_up_proj.weight[inter:]
-            sd[p + "mlp.down_proj.weight"] = mlp.down_proj.weight
+            _fp8_pair(sd, p + "mlp.gate_proj", mlp.gate_up_proj.weight[:inter])
+            _fp8_pair(sd, p + "mlp.up_proj", mlp.gate_up_proj.weight[inter:])
+            _fp8_pair(sd, p + "mlp.down_proj", mlp.down_proj.weight)
     sd["model.norm.weight"] = m.norm.weight
     sd["lm_head.weight"] = model.lm_head.weight
     return {k: v.detach().cpu().clone().contiguous() for k, v in sd.items()}
