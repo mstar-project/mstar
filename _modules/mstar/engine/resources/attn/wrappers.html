@@ -990,12 +990,46 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">(VoxServe uses [n_pages, 2, page_size, n_heads, head_dim] without layer dim.)</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+
+<span class="c1"># A captured wrapper's later plans call FlashInfer's planner module directly</span>
+<span class="c1"># (``_plan_direct``): most of FlashInfer's ``plan()`` is Python that gives the</span>
+<span class="c1"># same answer every step of a captured bucket. vLLM and SGLang do the same</span>
+<span class="c1"># (vLLM's fast_plan_decode over FlashInfer's fast_decode_plan, SGLang's</span>
+<span class="c1"># fast_prefill_plan) with FlashInfer pinned to one version, because the</span>
+<span class="c1"># direct call restates FlashInfer's planner arguments and per-plan state.</span>
+<span class="c1"># So it runs only on the versions here, which test_flashinfer_direct_plan.py</span>
+<span class="c1"># and test_attn_mixed_split.py have compared with ``plan()`` on a GPU; on any</span>
+<span class="c1"># other, a captured wrapper plans with ``plan()``. pyproject.toml pins the</span>
+<span class="c1"># same version.</span>
+<span class="n">DIRECT_PLAN_FLASHINFER_VERSIONS</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"0.7.2"</span><span class="p">})</span>
+
+
+<span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_direct_plan_supported</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
+
+    <span class="c1"># a stand-in module (CPU tests) has no version: not a checked one</span>
+    <span class="n">version</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">flashinfer</span><span class="p">,</span> <span class="s2">"__version__"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">version</span> <span class="ow">in</span> <span class="n">DIRECT_PLAN_FLASHINFER_VERSIONS</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="n">checked</span> <span class="o">=</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">DIRECT_PLAN_FLASHINFER_VERSIONS</span><span class="p">))</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+        <span class="s2">"FlashInfer </span><span class="si">%s</span><span class="s2"> is not a version the attention wrappers' direct planner calls were "</span>
+        <span class="s2">"checked against (</span><span class="si">%s</span><span class="s2">), so captured wrappers plan with FlashInfer's plan(), which is "</span>
+        <span class="s2">"slower. Install the pinned version (pip install flashinfer-python==</span><span class="si">%s</span><span class="s2">) to use them."</span><span class="p">,</span>
+        <span class="n">version</span><span class="p">,</span> <span class="n">checked</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span>
+            <span class="n">DIRECT_PLAN_FLASHINFER_VERSIONS</span><span class="p">,</span>
+            <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">v</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">v</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)</span> <span class="k">if</span> <span class="n">p</span><span class="o">.</span><span class="n">isdigit</span><span class="p">()),</span>
+        <span class="p">),</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="kc">False</span>
 
 
 <span class="c1"># The head dims FlashInfer instantiates its paged prefill/decode kernels (and</span>
@@ -1025,6 +1059,34 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"dims are zeros to drop) and declare that size as the KV cache's head_dim."</span>
         <span class="p">)</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_prefill_plan_is_direct</span><span class="p">(</span><span class="n">w</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Whether FlashInfer prefill wrapper ``w``'s plan resolved to the one</span>
+<span class="sd">    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2 or</span>
+<span class="sd">    fa3 under a graph, no custom mask, prefix items, window, soft cap or</span>
+<span class="sd">    position encoding, a 16-bit KV."""</span>
+    <span class="k">return</span> <span class="p">(</span>
+        <span class="n">_direct_plan_supported</span><span class="p">()</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_backend</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"fa2"</span><span class="p">,</span> <span class="s2">"fa3"</span><span class="p">)</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">is_cuda_graph_enabled</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_jit_module</span> <span class="ow">is</span> <span class="kc">None</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_cached_module</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_custom_mask_buf</span> <span class="ow">is</span> <span class="kc">None</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_prefix_len_ptr</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_logits_soft_cap</span> <span class="o">==</span> <span class="mf">0.0</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_pos_encoding_mode</span> <span class="o">==</span> <span class="s2">"NONE"</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_cached_kv_data_type</span> <span class="ow">in</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_max_total_num_rows</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_decode_plan_is_direct</span><span class="p">(</span><span class="n">w</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Whether FlashInfer decode wrapper ``w``'s plan resolved to the one</span>
+<span class="sd">    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2</span>
+<span class="sd">    tensor-core decode under a graph, one query token per row, no window."""</span>
+    <span class="k">return</span> <span class="p">(</span>
+        <span class="n">_direct_plan_supported</span><span class="p">()</span>
+        <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_backend</span> <span class="o">==</span> <span class="s2">"fa2"</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">use_tensor_cores</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">is_cuda_graph_enabled</span>
+        <span class="ow">and</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="s2">"_uses_cudnn"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_jit_module</span> <span class="ow">is</span> <span class="kc">None</span>
+        <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="s2">"_q_len_per_req"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">and</span> <span class="n">w</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span>
+    <span class="p">)</span>
 
 
 <div class="viewcode-block" id="FlashInferPrefillWrapper">
@@ -1126,6 +1188,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># page-locked staging for an inline plan's host arrays (`_stage_pinned`)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_done</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># set by the first staged plan when ``_plan_direct`` may take the later</span>
+        <span class="c1"># ones, for the (dtype, causal) it was built for</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span><span class="p">:</span> <span class="nb">list</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planner_key</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_stage_pinned</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">kv_indptr</span><span class="p">,</span> <span class="n">last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">,</span> <span class="n">indices</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Copy the plan's host arrays into this wrapper's page-locked buffers,</span>
@@ -1190,7 +1256,6 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        consume them as CPU and async-H2D copy to the device for our own</span>
 <span class="sd">        per-token bookkeeping below.</span>
 <span class="sd">        """</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
             <span class="c1"># planned inline behind the step in flight, which a pageable copy</span>
             <span class="c1"># would wait for: stage page-locked, copy the indices in ourselves</span>
@@ -1200,10 +1265,16 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">kv_lens</span><span class="p">,</span> <span class="n">paged_kv_indices</span><span class="p">,</span>
                 <span class="p">)</span>
             <span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">[</span><span class="s2">"indices"</span><span class="p">][:</span><span class="n">n</span><span class="p">],</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="p">)</span>
-            <span class="n">paged_kv_indices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_plan_staged</span><span class="p">(</span>
+                    <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">paged_kv_indptr</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">[</span><span class="s2">"indices"</span><span class="p">][:</span><span class="n">n</span><span class="p">],</span>
+                    <span class="n">paged_kv_last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">,</span> <span class="n">causal</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">finally</span><span class="p">:</span>
+                <span class="c1"># also on a raise: copies already issued still read the pinned buffers</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_done</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
             <span class="n">qo_indptr</span><span class="o">=</span><span class="n">qo_indptr</span><span class="p">,</span>
             <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">paged_kv_indptr</span><span class="p">,</span>
@@ -1219,10 +1290,6 @@ window.runMermaid = runMermaid;</script>
             <span class="n">seq_lens</span><span class="o">=</span><span class="n">kv_lens</span><span class="p">,</span>
             <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
         <span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_done</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># every copy out of the staging buffers is issued: the next</span>
-            <span class="c1"># restage waits for them</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_done</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
 
         <span class="c1"># Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,</span>
         <span class="c1"># even if we're not in a cuda graph</span>
@@ -1232,6 +1299,93 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">qo_indptr</span> <span class="o">=</span> <span class="n">qo_indptr</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span> <span class="o">=</span> <span class="n">qo_indptr</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_staged</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">paged_kv_indptr</span><span class="p">,</span> <span class="n">paged_kv_indices</span><span class="p">,</span> <span class="n">paged_kv_last_page_len</span><span class="p">,</span>
+        <span class="n">kv_lens</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Plan a captured wrapper from page-locked int32 host arrays, which</span>
+<span class="sd">        the caller keeps unchanged until this plan's copies have landed."""</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="n">causal</span><span class="p">,</span> <span class="n">window_left</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planner_key</span> <span class="o">==</span> <span class="n">key</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_plan_direct</span><span class="p">(</span>
+                <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">paged_kv_indptr</span><span class="p">,</span> <span class="n">paged_kv_indices</span><span class="p">,</span> <span class="n">paged_kv_last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">paged_kv_indices</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+            <span class="n">qo_indptr</span><span class="o">=</span><span class="n">qo_indptr</span><span class="p">,</span>
+            <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">paged_kv_indptr</span><span class="p">,</span>
+            <span class="n">paged_kv_indices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">],</span>
+            <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">paged_kv_last_page_len</span><span class="p">,</span>
+            <span class="n">num_qo_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+            <span class="n">head_dim_qk</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">page_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
+            <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span>
+            <span class="n">q_data_type</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">seq_lens</span><span class="o">=</span><span class="n">kv_lens</span><span class="p">,</span>
+            <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_direct_planner_args</span><span class="p">(</span><span class="n">causal</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planner_key</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">key</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_direct_planner_args</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""FlashInfer's planner arguments for this wrapper, fixed but for the</span>
+<span class="sd">        host indptrs and lengths, when its plan resolved to the one path</span>
+<span class="sd">        ``_plan_direct`` reproduces (``_prefill_plan_is_direct``); else None.</span>
+<span class="sd">        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer</span>
+<span class="sd">        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``)."""</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">_prefill_plan_is_direct</span><span class="p">(</span><span class="n">w</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">args</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">w</span><span class="o">.</span><span class="n">_float_workspace_buffer</span><span class="p">,</span> <span class="n">w</span><span class="o">.</span><span class="n">_int_workspace_buffer</span><span class="p">,</span> <span class="n">w</span><span class="o">.</span><span class="n">_pin_memory_int_workspace_buffer</span><span class="p">,</span>
+            <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">w</span><span class="o">.</span><span class="n">_max_total_num_rows</span><span class="p">,</span> <span class="n">w</span><span class="o">.</span><span class="n">_fixed_batch_size</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span> <span class="kc">True</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">causal</span><span class="p">,</span>
+            <span class="o">-</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># window_left</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="n">w</span><span class="o">.</span><span class="n">_backend</span> <span class="o">==</span> <span class="s2">"fa2"</span><span class="p">:</span>
+            <span class="n">args</span> <span class="o">+=</span> <span class="p">[</span>
+                <span class="o">-</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># fixed_split_size</span>
+                <span class="kc">False</span><span class="p">,</span>  <span class="c1"># disable_split_kv (FlashInfer sets it for an NVFP4 KV only)</span>
+                <span class="mi">0</span><span class="p">,</span>  <span class="c1"># num_colocated_ctas</span>
+                <span class="mi">0</span><span class="p">,</span>  <span class="c1"># uniform_q_len</span>
+            <span class="p">]</span>
+        <span class="k">return</span> <span class="n">args</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_direct</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">kv_indptr</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""What FlashInfer's ``plan`` does per step on the path</span>
+<span class="sd">        ``_direct_planner_args`` checked: its checks, the four index copies</span>
+<span class="sd">        into the captured buffers, the per-step lengths it keeps, then its</span>
+<span class="sd">        planner. Not its ``_kv_lens_buffer`` copy, which fa2/fa3 do not read."""</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="n">indices</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">qo</span> <span class="o">=</span> <span class="n">qo_indptr</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+        <span class="n">total</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">qo</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;</span> <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"more page indices than the captured buffer holds"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">total</span> <span class="o">&gt;</span> <span class="n">w</span><span class="o">.</span><span class="n">_max_total_num_rows</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">total</span><span class="si">}</span><span class="s2"> query rows in a wrapper captured for </span><span class="si">{</span><span class="n">w</span><span class="o">.</span><span class="n">_max_total_num_rows</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_qo_indptr_buf</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">qo_indptr</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_indptr_buf</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">kv_indptr</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_last_page_len_buf</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">last_page_len</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">indices</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_qo_indptr_last</span> <span class="o">=</span> <span class="n">total</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_max_q_len</span> <span class="o">=</span> <span class="nb">int</span><span class="p">((</span><span class="n">qo</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">-</span> <span class="n">qo</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">max</span><span class="p">())</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_max_kv_len</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">kv_lens</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">())</span>
+        <span class="n">args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span>
+        <span class="n">args</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">=</span> <span class="n">qo_indptr</span>
+        <span class="n">args</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="n">kv_indptr</span>
+        <span class="n">args</span><span class="p">[</span><span class="mi">5</span><span class="p">]</span> <span class="o">=</span> <span class="n">kv_lens</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_plan_info</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">_cached_module</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
 
 <div class="viewcode-block" id="FlashInferPrefillWrapper.run">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper.run">[docs]</a>
@@ -1296,6 +1450,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="n">head_dim</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span> <span class="o">=</span> <span class="n">page_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># set by the first plan when ``_plan_direct`` may take the later ones</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span><span class="p">:</span> <span class="nb">list</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
 
@@ -1367,6 +1523,15 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">paged_kv_indices</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="n">paged_kv_indices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span>
 
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">and</span> <span class="n">kv_lens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="ow">and</span> <span class="n">window_left</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span>
+            <span class="c1"># the planner reads host int32 by raw pointer; plan() converts anything else</span>
+            <span class="ow">and</span> <span class="n">kv_lens</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span> <span class="ow">and</span> <span class="n">kv_lens</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cpu"</span>
+        <span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_plan_direct</span><span class="p">(</span><span class="n">paged_kv_indptr</span><span class="p">,</span> <span class="n">paged_kv_indices</span><span class="p">,</span> <span class="n">paged_kv_last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">)</span>
+            <span class="k">return</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span><span class="p">:</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">range_pop</span><span class="p">,</span> <span class="n">range_push</span>
 
@@ -1390,8 +1555,54 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">range_pop</span><span class="p">(</span><span class="n">synchronize</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_n_req</span> <span class="o">=</span> <span class="n">n_req</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="ow">and</span> <span class="n">kv_lens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_direct_planner_args</span><span class="p">(</span><span class="n">n_req</span><span class="p">)</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_direct_planner_args</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n_req</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""FlashInfer's planner arguments for this wrapper, fixed but for the</span>
+<span class="sd">        indptr and lengths, when its plan resolved to the one path</span>
+<span class="sd">        ``_plan_direct`` reproduces (``_decode_plan_is_direct``); else None.</span>
+<span class="sd">        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer</span>
+<span class="sd">        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own</span>
+<span class="sd">        ``fast_decode_plan``, the direct path sets no per-step state but the</span>
+<span class="sd">        plan."""</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">_decode_plan_is_direct</span><span class="p">(</span><span class="n">w</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">flashinfer.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">_get_range_buf</span>
+
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="n">w</span><span class="o">.</span><span class="n">_float_workspace_buffer</span><span class="p">,</span> <span class="n">w</span><span class="o">.</span><span class="n">_int_workspace_buffer</span><span class="p">,</span> <span class="n">w</span><span class="o">.</span><span class="n">_pin_memory_int_workspace_buffer</span><span class="p">,</span>
+            <span class="n">_get_range_buf</span><span class="p">(</span><span class="n">n_req</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">"cpu"</span><span class="p">),</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">n_req</span><span class="p">,</span> <span class="n">n_req</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span> <span class="kc">True</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="kc">False</span><span class="p">,</span>  <span class="c1"># causal</span>
+            <span class="o">-</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># window_left</span>
+            <span class="o">-</span><span class="mi">1</span><span class="p">,</span>  <span class="c1"># fixed_split_size</span>
+            <span class="kc">False</span><span class="p">,</span>  <span class="c1"># disable_split_kv</span>
+            <span class="mi">0</span><span class="p">,</span>  <span class="c1"># num_colocated_ctas</span>
+            <span class="mi">0</span><span class="p">,</span>  <span class="c1"># uniform_q_len</span>
+        <span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_direct</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">indptr</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">last_page_len</span><span class="p">,</span> <span class="n">kv_lens</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""What FlashInfer's ``plan`` does per step on the path</span>
+<span class="sd">        ``_direct_planner_args`` checked: the three index copies into the</span>
+<span class="sd">        captured buffers, then its planner."""</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="n">indices</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;</span> <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"more page indices than the captured buffer holds"</span><span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_indptr_buf</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">indptr</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_last_page_len_buf</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">last_page_len</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">dst</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">indices</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span> <span class="o">!=</span> <span class="n">dst</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">():</span>
+            <span class="n">dst</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">indices</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="n">indices</span><span class="o">.</span><span class="n">device</span> <span class="o">==</span> <span class="n">dst</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planner_args</span>
+        <span class="n">args</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span> <span class="o">=</span> <span class="n">indptr</span>
+        <span class="n">args</span><span class="p">[</span><span class="mi">5</span><span class="p">]</span> <span class="o">=</span> <span class="n">kv_lens</span>
+        <span class="n">w</span><span class="o">.</span><span class="n">_plan_info</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">_cached_module</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
 
 <div class="viewcode-block" id="FlashInferDecodeWrapper.run">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FlashInferDecodeWrapper.run">[docs]</a>
@@ -1595,44 +1806,47 @@ window.runMermaid = runMermaid;</script>
         <span class="n">p_last</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([[</span><span class="n">lead_last</span><span class="p">],</span> <span class="n">last</span><span class="p">[</span><span class="n">prompt</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">pad</span><span class="p">),</span> <span class="p">[</span><span class="n">tail_last</span><span class="p">]])</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
         <span class="n">p_lens</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([[</span><span class="n">lead_kv</span><span class="p">],</span> <span class="n">lens</span><span class="p">[</span><span class="n">prompt</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">pad</span><span class="p">),</span> <span class="p">[</span><span class="n">tail_kv</span><span class="p">]])</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_dec_mask</span><span class="p">[:</span><span class="n">rows</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"dec_mask"</span><span class="p">,</span> <span class="n">dec</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">),</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span><span class="p">[:</span> <span class="n">rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"qo"</span><span class="p">,</span> <span class="n">qo</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-        <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_num_rows</span> <span class="o">=</span> <span class="n">rows</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_dec_mask</span><span class="p">[:</span><span class="n">rows</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"dec_mask"</span><span class="p">,</span> <span class="n">dec</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">),</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span><span class="p">[:</span> <span class="n">rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"qo"</span><span class="p">,</span> <span class="n">qo</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_num_rows</span> <span class="o">=</span> <span class="n">rows</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_cores</span><span class="p">:</span>
-            <span class="c1"># the run's rows one token each, and the last row the rest, so</span>
-            <span class="c1"># qo_indptr ends at the row count FlashInfer checks</span>
-            <span class="n">d_qo</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
-            <span class="n">d_qo</span><span class="p">[</span><span class="mi">1</span> <span class="p">:</span> <span class="n">run</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">run</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
-            <span class="n">d_qo</span><span class="p">[</span><span class="n">run</span> <span class="o">+</span> <span class="mi">1</span> <span class="p">:]</span> <span class="o">=</span> <span class="n">run</span>
-            <span class="n">d_qo</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
-                <span class="n">qo_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_qo</span><span class="p">),</span>
-                <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_indptr</span><span class="p">),</span>
-                <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_indices</span><span class="p">),</span>
-                <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_last</span><span class="p">),</span>
-                <span class="n">kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_lens</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
-                <span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_cores</span><span class="p">:</span>
+                <span class="c1"># the run's rows one token each, and the last row the rest, so</span>
+                <span class="c1"># qo_indptr ends at the row count FlashInfer checks</span>
+                <span class="n">d_qo</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+                <span class="n">d_qo</span><span class="p">[</span><span class="mi">1</span> <span class="p">:</span> <span class="n">run</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">run</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+                <span class="n">d_qo</span><span class="p">[</span><span class="n">run</span> <span class="o">+</span> <span class="mi">1</span> <span class="p">:]</span> <span class="o">=</span> <span class="n">run</span>
+                <span class="n">d_qo</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+                    <span class="n">qo_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_qo</span><span class="p">),</span>
+                    <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_indptr</span><span class="p">),</span>
+                    <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_indices</span><span class="p">),</span>
+                    <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_last</span><span class="p">),</span>
+                    <span class="n">kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">d_lens</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
+                    <span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+                    <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_indptr"</span><span class="p">,</span> <span class="n">d_indptr</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                    <span class="n">paged_kv_indices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_indices"</span><span class="p">,</span> <span class="n">d_indices</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                    <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_last"</span><span class="p">,</span> <span class="n">d_last</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                    <span class="n">kv_lens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_lens"</span><span class="p">,</span> <span class="n">d_lens</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_prefill</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+                <span class="n">qo_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_qo</span><span class="p">),</span>
+                <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_kvp</span><span class="p">),</span>
+                <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_idx</span><span class="p">),</span>
+                <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_last</span><span class="p">),</span>
+                <span class="n">kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_lens</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
+                <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
             <span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
-                <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_indptr"</span><span class="p">,</span> <span class="n">d_indptr</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
-                <span class="n">paged_kv_indices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_indices"</span><span class="p">,</span> <span class="n">d_indices</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
-                <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_last"</span><span class="p">,</span> <span class="n">d_last</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
-                <span class="n">kv_lens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_lens"</span><span class="p">,</span> <span class="n">d_lens</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_prefill</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
-            <span class="n">qo_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_qo</span><span class="p">),</span>
-            <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_kvp</span><span class="p">),</span>
-            <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_idx</span><span class="p">),</span>
-            <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_last</span><span class="p">),</span>
-            <span class="n">kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_lens</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
-            <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
-        <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="o">.</span><span class="n">record</span><span class="p">()</span></div>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="c1"># also on a raise: copies already issued still read the pinned buffers</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="o">.</span><span class="n">record</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="FlashInferMixedWrapper.run">

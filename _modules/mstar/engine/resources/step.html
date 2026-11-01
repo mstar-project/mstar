@@ -1048,6 +1048,9 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Preplan</span>
     <span class="n">is_preplan</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># the prefix a resource's own plan laps record under, as the runner times</span>
+    <span class="c1"># the plan: res.pre_plan, res.plan (promoting a pre-plan) or res.plan_fresh</span>
+    <span class="n">plan_phase</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"res.plan"</span>
     <span class="c1"># will get populated with the output of plan as previous steps</span>
     <span class="c1"># complete their plan stages</span>
     <span class="n">plan_results</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>

@@ -962,7 +962,10 @@ transport for disaggregated deployments.</p>
 <p>The GPU model families depend on:</p>
 <ul class="simple">
 <li><p><strong>FlashInfer</strong> (<code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>) — paged attention and continuous batching for the
-autoregressive backbones (every model with a <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> node runs attention through it).</p></li>
+autoregressive backbones (every model with a <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> node runs attention through it).
+Pinned to the version the attention wrappers’ direct planner calls were checked against
+(<code class="docutils literal notranslate"><span class="pre">DIRECT_PLAN_FLASHINFER_VERSIONS</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/attn/wrappers.py</span></code>); on any
+other version they fall back to FlashInfer’s own <code class="docutils literal notranslate"><span class="pre">plan()</span></code>.</p></li>
 <li><p><strong>flash-attn</strong> — used by LingBot-World’s <code class="docutils literal notranslate"><span class="pre">reference_numerics</span></code> mode. <strong>Not installed by any extra</strong>; install it separately
 (see <a class="reference internal" href="#flash-attn-lingbot-world">flash-attn (LingBot-World)</a>).</p></li>
 <li><p><strong>flash-attn-4</strong> — Waypoint’s flex-attention <code class="docutils literal notranslate"><span class="pre">FLASH</span></code> backend. <strong>Not installed by any

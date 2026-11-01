@@ -1232,8 +1232,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    plan thread every decode step). Iterating the numpy view costs 0.1 us a</span>
 <span class="sd">    row and the numpy scalar has ``.item()`` too. Everything else FlashInfer</span>
 <span class="sd">    does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its</span>
-<span class="sd">    device buffer) is plain tensor behaviour.</span>
+<span class="sd">    device buffer) is plain tensor behaviour, so torch ops skip the subclass</span>
+<span class="sd">    dispatch (about 6 us a call) and treat it as a plain tensor.</span>
 <span class="sd">    """</span>
+
+    <span class="n">__torch_function__</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_disabled_torch_function_impl</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">iter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">numpy</span><span class="p">())</span></div>

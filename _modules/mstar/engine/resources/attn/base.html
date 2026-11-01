@@ -1236,8 +1236,9 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged</span>
 <span class="sd">    between steps the re-plan is skippable."""</span>
     <span class="n">q_seq_lens</span><span class="p">:</span> <span class="nb">tuple</span>
-    <span class="n">page_indices</span><span class="p">:</span> <span class="nb">tuple</span>
-    <span class="n">last_page_lens</span><span class="p">:</span> <span class="nb">tuple</span></div>
+    <span class="c1"># the int32 arrays' bytes</span>
+    <span class="n">page_indices</span><span class="p">:</span> <span class="nb">bytes</span>
+    <span class="n">last_page_lens</span><span class="p">:</span> <span class="nb">bytes</span></div>
 
 
 

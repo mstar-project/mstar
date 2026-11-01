@@ -1457,9 +1457,11 @@ master write. <code class="docutils literal notranslate"><span class="pre">0</sp
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">ingraph_decode_rope</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>A captured decode step builds its rotary tables inside the graph from
-the position resource’s planned positions instead of staging them.
-Experiment knob, measured and gated on its own.</p></td>
+<td><p>A captured step of a text walk (Qwen3.5 decode, text prefill and
+mixed) builds its rotary tables inside the graph from the position
+resource’s planned positions instead of building them before the
+replay (<code class="docutils literal notranslate"><span class="pre">LLMSubmodule._rope_in_graph</span></code>). Experiment knob, measured
+and gated on its own.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
