@@ -48,13 +48,12 @@ from mstar.model.canary_qwen.config import (
     DECODE_LOOP,
     DECODE_WALK,
     KV_CACHE,
-    PREFILL_WALK,
     ROPE,
     SAMPLER,
     CanaryQwenModelConfig,
 )
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, expand_media_pads, media_layout
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, expand_media_pads, media_layout, media_walk_name
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -92,6 +91,10 @@ def audio_encoder(pad_id: int) -> MediaEncoder:
     """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
     audio placeholder out."""
     return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", (pad_id,))
+
+
+# the media walk the LLM node knows its prompts by, named from the encoder
+PREFILL_WALK = media_walk_name([audio_encoder(0)])
 
 
 class CanaryQwenModel(Model):

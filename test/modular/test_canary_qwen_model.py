@@ -13,8 +13,8 @@ import torch
 
 from mstar.api_server.openai.adapters import CanaryQwenAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
-from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel, audio_encoder, merge_lora
-from mstar.model.canary_qwen.config import PREFILL_WALK, CanaryQwenModelConfig
+from mstar.model.canary_qwen.canary_qwen_model import PREFILL_WALK, CanaryQwenModel, audio_encoder, merge_lora
+from mstar.model.canary_qwen.config import CanaryQwenModelConfig
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder, nemo_to_hf_name
 from mstar.model.multimodal import MEDIA_LAYOUT
 

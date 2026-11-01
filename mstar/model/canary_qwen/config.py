@@ -19,8 +19,6 @@ KV_CACHE = "kv_cache"
 ATTN = "attn"
 ROPE = "rope"
 SAMPLER = "sampler"
-# the media walk `SampledTokenDecoder` names after the audio encoder (`media_walk_name`)
-PREFILL_WALK = "prefill_audio"
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
 
