@@ -61,9 +61,8 @@ def test_colliding_timesteps_resolve_first_for_x0_and_second_for_noise():
     assert schedule.noise_sigma(t).item() == schedule.sigmas[matches[1]].item()
 
 
-def _store(cfg, max_request_tokens: int, dtype=torch.float32) -> RollingKVManager:
-    config = RollingKVConfig(num_layers=cfg.num_layers, num_heads=1, head_dim=1, max_request_tokens=max_request_tokens,
-                             dtype=dtype)
+def _store(cfg, pool_tokens: int, dtype=torch.float32) -> RollingKVManager:
+    config = RollingKVConfig(num_layers=cfg.num_layers, num_heads=1, head_dim=1, pool_tokens=pool_tokens, dtype=dtype)
     return RollingKVManager(config, torch.device("cpu"))
 
 
@@ -504,7 +503,7 @@ def test_the_dit_declares_the_rolling_kv_and_a_ragged_cross_attention(model):
     kv, attn = model.get_node_resources()
     assert isinstance(kv, RollingKVSpec) and kv.resource_key == DIT_KV and kv.nodes == {"dit"}
     assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim) == (30, 12, 128)
-    assert kv.config.dtype == torch.bfloat16 and kv.config.max_slots == 1
+    assert kv.config.dtype == torch.bfloat16 and kv.config.pool_tokens == model.max_window_tokens()
     assert isinstance(attn, RaggedCrossAttentionSpec)
     assert attn.resource_key == DIT_ATTN and attn.nodes == {"dit"}
     assert (attn.config.num_qo_heads, attn.config.num_kv_heads, attn.config.head_dim) == (12, 12, 128)
@@ -514,20 +513,21 @@ def test_the_dit_declares_the_rolling_kv_and_a_ragged_cross_attention(model):
     assert isinstance(ref_kv, RollingKVSpec) and ref_kv.resource_key == DIT_KV
 
 
-def test_the_bound_holds_the_window_of_the_largest_area_at_any_aspect(model):
-    """18 latent frames of at most max_area / 256 tokens: 11.1 GiB of bf16 K/V at
-    720x1280, 4.7 GiB at the default 464x832, each rollout holding its own."""
+def test_the_default_pool_holds_the_window_of_the_largest_area_at_any_aspect(model):
+    """18 latent frames of at most max_area / 256 tokens: an 11.1 GiB bf16 pool, which
+    holds one rollout at 720x1280 or two at the default 464x832 (4.7 GiB each)."""
     cfg = model.config
-    assert model.max_request_tokens() == 18 * (720 * 1280 // 256)
+    assert model.max_window_tokens() == 18 * (720 * 1280 // 256)
     (kv, _) = model.get_node_resources()
-    assert round(kv.config.request_bytes(model.max_request_tokens(), torch.bfloat16) / 2**30, 1) == 11.1
+    assert round(kv.config.token_bytes(kv.config.pool_tokens, torch.bfloat16) / 2**30, 1) == 11.1
     default = _bare_dit_submodule(model, {}).chunk_spans(0, (464, 832)).position
-    assert round(kv.config.request_bytes(default.sink + default.window, torch.bfloat16) / 2**30, 1) == 4.7
+    assert round(kv.config.token_bytes(default.sink + default.window, torch.bfloat16) / 2**30, 1) == 4.7
+    assert kv.config.pool_tokens // (default.sink + default.window) == 2
     sub = _bare_dit_submodule(model, {})
     for image_hw in [(720, 1280), (1280, 720), (960, 960), (408, 2256), (2256, 408), (480, 832)]:
         lat = model.geometry(image_hw, 720, 1280)
         last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
-        assert last.sink + last.window <= model.max_request_tokens(), image_hw
+        assert last.sink + last.window <= model.max_window_tokens(), image_hw
 
 
 SWITCHES = ("reference_numerics", "dit_compile_autotune")
@@ -624,17 +624,18 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
     assert fast == base
 
 
-def test_the_shipped_config_sizes_the_rolling_kv_pool_and_no_longer_caps_requests(model):
-    """Concurrency is the store's slots now: a rollout past them waits at admit."""
+def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_largest(model):
+    """Concurrency is the conductor's max_concurrent_requests; the K/V memory is
+    the pool's, sized in the config to one rollout at the largest area."""
     from pathlib import Path
 
     import yaml
 
     config = yaml.safe_load((Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml").read_text())
-    assert "max_concurrent_requests" not in config
+    assert config["max_concurrent_requests"] == 1
     (kv, _) = model.get_node_resources()
     kv.apply_yaml_overrides(**config["resources"][DIT_KV])
-    assert kv.config.max_slots == 1 and kv.config.max_request_tokens == model.max_request_tokens()
+    assert kv.config.pool_tokens == model.max_window_tokens()
 
 
 def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
@@ -661,7 +662,7 @@ def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
     dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
         conditioning, ChunkOnlyStore(), attention)
     store = RollingKVManager(RollingKVConfig(num_layers=num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                                             max_request_tokens=cfg.local_attn_size * frame_seqlen,
+                                             pool_tokens=cfg.local_attn_size * frame_seqlen,
                                              dtype=torch.float32),
                              torch.device("cpu"))
     sub = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True), {DIT_KV: store})

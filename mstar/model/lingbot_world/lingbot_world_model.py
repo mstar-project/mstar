@@ -104,7 +104,7 @@ class LingBotWorldModel(Model):
             resource_key=DIT_KV, nodes={"dit"},
             config=RollingKVConfig(
                 num_layers=cfg.num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                max_request_tokens=self.max_request_tokens(), dtype=torch.bfloat16,
+                pool_tokens=self.max_window_tokens(), dtype=torch.bfloat16,
             ),
         )]
         if not cfg.reference_numerics:
@@ -117,11 +117,11 @@ class LingBotWorldModel(Model):
             ))
         return specs
 
-    def max_request_tokens(self) -> int:
+    def max_window_tokens(self) -> int:
         """Tokens of rolling K/V one rollout keeps per layer at the largest area
         a request may ask for: ``local_attn_size`` latent frames of at most
         ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``).
-        Each rollout allocates its own window's worth, so this only bounds them."""
+        The default pool: room for any one rollout, or several smaller ones."""
         cfg = self.config
         cell = cfg.vae_stride[1] * cfg.vae_stride[2] * cfg.patch_size[1] * cfg.patch_size[2]
         frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size

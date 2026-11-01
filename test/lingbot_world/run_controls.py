@@ -120,7 +120,7 @@ def main():
 
     cfg.local_attn_size = -1
     # keeping every frame takes more than the windowed bound
-    full = bind_resources(model, sub, {"dit_kv": {"max_request_tokens": lat_f * frame_seqlen}})
+    full = bind_resources(model, sub, {"dit_kv": {"pool_tokens": lat_f * frame_seqlen}})
     lat_full, _, _, _ = timed_rollout(sub, full, text, image, cond, poses, intr, md, rid=13)
     cfg.local_attn_size = 18
     report["no_window_vs_oracle"] = [stats(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat_full)]
