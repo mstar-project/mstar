@@ -411,7 +411,6 @@ class LTX25Model(Model):
         kw = metadata.kwargs["request"]
         scale = 2 if metadata.graph_walk == STAGE1_WALK else 1
         return {
-            "is_prefill": metadata.is_prefill,
             "height": kw["height"] // scale, "width": kw["width"] // scale,
             "num_frames": kw["num_frames"], "fps": kw["fps"],
         }

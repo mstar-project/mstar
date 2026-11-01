@@ -532,7 +532,6 @@ class WaypointModel(Model):
         nothing else in the shell is per-request.
         """
         return {
-            "is_prefill": metadata.is_prefill,
             "num_steps": metadata.kwargs["num_steps"],
             "seed_hw": metadata.kwargs.get("seed_hw"),
         }

@@ -2409,9 +2409,8 @@ Override these methods:
 - ``get_partition_topology()`` declares the partitions and the streaming ``Connection``
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
-- ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it. Every walk belongs to exactly one
-  partition.
+- ``get_partitions()`` declares each ``PartitionDefinition``: its name and its walks.
+  Every walk belongs to exactly one partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 

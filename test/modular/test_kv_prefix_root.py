@@ -438,7 +438,7 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
     }
     walks = ("prefill", "prefill_image")
     label = KVLabel(keys=PrefixKeys("text_inputs", walks))
-    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
+    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs))
     return SimpleNamespace(
         kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
         get_partitions=lambda: [partition],

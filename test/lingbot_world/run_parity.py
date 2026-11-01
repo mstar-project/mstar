@@ -174,7 +174,7 @@ def main():
         camera_poses=poses, intrinsics=intr, num_frames=meta["frame_num_requested"],
     )
     lat_f = int(tensors["camera_poses"][0].shape[0])
-    md = {"is_prefill": False, "guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // cs}
+    md = {"guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // cs}
     image = tensors["image_inputs"][0]
     lat_h, lat_w = image.shape[1] // 8, image.shape[2] // 8
 

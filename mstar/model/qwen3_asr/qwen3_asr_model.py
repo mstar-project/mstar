@@ -293,7 +293,6 @@ class Qwen3ASRModel(Model):
             inputs=inputs,
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
             step_metadata={
-                "is_prefill": True,
                 "audio_slot": (model_kwargs or {}).get("audio_slot"),
                 "audio_tokens": (model_kwargs or {}).get("audio_tokens"),
             },
@@ -320,7 +319,6 @@ class Qwen3ASRModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": False},
         )
 
     # -------------------------------------------------------------------

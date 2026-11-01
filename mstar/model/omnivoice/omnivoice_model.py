@@ -549,7 +549,6 @@ class OmniVoiceModel(Model):
         """Per-pass metadata the submodules read from ``request_info.step_metadata``."""
         kw = metadata.kwargs
         return {
-            "is_prefill": metadata.is_prefill,
             "num_step": kw["num_step"],
             "guidance_scale": kw["guidance_scale"],
             "t_shift": kw["t_shift"],

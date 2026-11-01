@@ -756,14 +756,10 @@ class Cosmos3Model(Model):
             PartitionDefinition(
                 name="default",
                 graph_walks=walks - {self.VIDEO_DECODE_AR_WALK},
-                initial_walk=None,
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name=constants.WINDOW_DECODER_PARTITION,
                 graph_walks={self.VIDEO_DECODE_AR_WALK},
-                initial_walk=self.VIDEO_DECODE_AR_WALK,
-                producer_partitions=["default"],
             ),
         ]
 
@@ -1574,9 +1570,7 @@ class Cosmos3Model(Model):
         params.setdefault("flow_shift", constants.V2V_DEFAULT_FLOW_SHIFT)
 
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        md = {"is_prefill": metadata.is_prefill}
-        md.update(metadata.kwargs)
-        return md
+        return dict(metadata.kwargs)
 
     def get_initial_forward_pass_args(
         self,

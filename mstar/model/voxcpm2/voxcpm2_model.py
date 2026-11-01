@@ -319,14 +319,10 @@ class VoxCPM2Model(Model):
             PartitionDefinition(
                 name="Talker",
                 graph_walks={"talker_prefill", "talker_prefill_clone", "talker_decode"},
-                initial_walk="talker_prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="VAEDecoder",
                 graph_walks={"vae_chunk"},
-                initial_walk=None,
-                producer_partitions=["Talker"],
             ),
         ]
 

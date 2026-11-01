@@ -779,7 +779,7 @@ def test_state_machine_aligns_words_after_decoding():
     assert [(e.next_node, e.name, e.tensor_info) for e in align.inputs] == [(DECODER_NODE, "encoder_states", [enc])]
     assert set(map(id, align.unpersist_tensors)) == set(map(id, [enc, rules]))
     # the forced prompt and the audio length travel on the host
-    assert align.step_metadata == {"is_prefill": False, **_align_meta(audio_frames=77)}
+    assert align.step_metadata == _align_meta(audio_frames=77)
     assert model.get_partition_forward_pass_args("default", align.full_metadata, {}).request_done
 
 
@@ -828,7 +828,7 @@ def test_state_machine_language_detection():
     # the detection step's (inactive) rule state is dropped, not routed
     assert set(map(id, second.unpersist_tensors)) == {id(lang), id(tail), id(stale_rules)}
     # the second prefill restates the settings; the language is still unknown
-    assert second.step_metadata == {"is_prefill": True, "timestamps": False, "word_timestamps": False}
+    assert second.step_metadata == {"timestamps": False, "word_timestamps": False}
 
     third = model.get_partition_forward_pass_args("default", second.full_metadata, {"new_token": [object()]})
     assert third.full_metadata.graph_walk == DECODE_WALK and not third.full_metadata.is_prefill

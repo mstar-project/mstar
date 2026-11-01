@@ -587,14 +587,10 @@ class Qwen3TTSModel(Model):
             PartitionDefinition(
                 name="Talker",
                 graph_walks=talker_walks,
-                initial_walk="talker_prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="Codec",
                 graph_walks=codec_walks,
-                initial_walk=None,
-                producer_partitions=["Talker"],
             ),
         ]
 
@@ -934,9 +930,7 @@ class Qwen3TTSModel(Model):
                 is_prefill=True,
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
-            step_metadata = self._talker_step_metadata(metadata)
-            for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY):
-                step_metadata[key] = model_kwargs[key]
+            step_metadata = {key: model_kwargs[key] for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY)}
             if clone:
                 routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
                 step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
@@ -999,7 +993,6 @@ class Qwen3TTSModel(Model):
                     full_metadata=partition_metadata,
                     inputs=[edge],
                     unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._talker_step_metadata(partition_metadata),
                 )
             if partition_metadata.graph_walk == "talker_decode":
                 return ForwardPassArgs(
@@ -1324,8 +1317,3 @@ class Qwen3TTSModel(Model):
             self.config,
         )
 
-    @staticmethod
-    def _talker_step_metadata(
-        metadata: CurrentForwardConductorMetadata,
-    ) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill}

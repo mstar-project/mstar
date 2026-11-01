@@ -1184,7 +1184,6 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
         if requires_cfg:
@@ -1224,7 +1223,6 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("requires_cfg", None)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
         hidden = self.language_model(
@@ -1256,7 +1254,6 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("requires_cfg", None)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
 
         self.language_model(
             input_embeds, mode="gen",
@@ -1286,7 +1283,6 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         kwargs.pop("temperature", None)
         kwargs.pop("top_k", None)
         kwargs.pop("top_p", None)
@@ -1343,7 +1339,6 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
 
         latents = input_embeds
 
@@ -1492,7 +1487,6 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         kwargs.pop("requires_cfg", None)
         kwargs.pop("cfg_text_scale", None)
         kwargs.pop("cfg_img_scale", None)

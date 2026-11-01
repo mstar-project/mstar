@@ -411,7 +411,6 @@ class WhisperModel(Model):
         the conductor metadata, which carries it for the request's lifetime.
         """
         return {
-            "is_prefill": True,
             "timestamps": kwargs.get("timestamps", False),
             # the stop check keeps the prompt walk's token for the align walk
             "word_timestamps": kwargs.get("word_timestamps", False),
@@ -518,7 +517,6 @@ class WhisperModel(Model):
                 inputs=inputs,
                 unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]) + list(ts_rules),
                 step_metadata={
-                    "is_prefill": False,
                     # the forced prompt the transcript is aligned under; a
                     # detected language (None here) the decoder recorded
                     "language": kwargs.get("language_token"),
@@ -544,7 +542,6 @@ class WhisperModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=list(new_token) + list(ts_rules),
-            step_metadata={"is_prefill": False},
         )
 
     # -------------------------------------------------------------------

@@ -987,8 +987,6 @@ class Model(ABC):
             PartitionDefinition(
                 name=DEFAULT_PARTITION,
                 graph_walks=walks,
-                initial_walk=None,
-                producer_partitions=[],
             )
         ]
 

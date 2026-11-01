@@ -713,16 +713,13 @@ class NemotronDuplexModel(Model):
     def get_partitions(self) -> list[PartitionDefinition]:
         return [
             PartitionDefinition(
-                name="Encoder", graph_walks={"encode"}, initial_walk="encode",
-                producer_partitions=[],
+                name="Encoder", graph_walks={"encode"},
             ),
             PartitionDefinition(
-                name="LLM", graph_walks={"decode"}, initial_walk="decode",
-                producer_partitions=["Encoder"],
+                name="LLM", graph_walks={"decode"},
             ),
             PartitionDefinition(
-                name="Talker", graph_walks={"talker_decode"}, initial_walk="talker_decode",
-                producer_partitions=["LLM"],
+                name="Talker", graph_walks={"talker_decode"},
             ),
         ]
 

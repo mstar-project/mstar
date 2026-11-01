@@ -92,7 +92,7 @@ def main():
     poses, intr = tensors["camera_poses"][0], tensors["intrinsics"][0]
     lat_f = poses.shape[0]
     _, _, lat_h, lat_w = ref_in["vae_latent"].shape
-    md = {"is_prefill": False, "guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // cs}
+    md = {"guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // cs}
     n_tok = ref_in["context"].shape[0]
     text = torch.zeros(1, cfg.text_len, cfg.text_dim, dtype=ref_in["context"].dtype)
     text[0, :n_tok] = ref_in["context"]

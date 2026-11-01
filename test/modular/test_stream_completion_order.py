@@ -237,8 +237,7 @@ def _conductor(passes=1):
         },
         partition_definitions={
             "LLM": PartitionDefinition(name="LLM", graph_walks={"decode"}),
-            "SNAC": PartitionDefinition(name="SNAC", graph_walks={"snac_chunk"},
-                                        producer_partitions=["LLM"]),
+            "SNAC": PartitionDefinition(name="SNAC", graph_walks={"snac_chunk"}),
         },
         streaming_connections={("LLM", "SNAC", EDGE): StreamingConnectionState(
             from_partition="LLM", to_partition="SNAC", edge_name=EDGE,

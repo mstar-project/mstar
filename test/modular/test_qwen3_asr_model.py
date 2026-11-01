@@ -499,7 +499,7 @@ def test_graph_resources_and_state_machine():
         model_kwargs={"audio_slot": 5, "audio_tokens": 37},
     )
     assert args.full_metadata.graph_walk == PREFILL_WALK
-    assert args.step_metadata == {"is_prefill": True, "audio_slot": 5, "audio_tokens": 37}
+    assert args.step_metadata == {"audio_slot": 5, "audio_tokens": 37}
     assert [(e.next_node, e.name) for e in args.inputs] == [(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")]
     nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
     assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill

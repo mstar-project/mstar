@@ -189,14 +189,10 @@ class OrpheusModel(Model):
             PartitionDefinition(
                 name="LLM",
                 graph_walks={"prefill", "decode"},
-                initial_walk="prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="SNAC",
                 graph_walks={"snac_chunk"},
-                initial_walk=None,
-                producer_partitions=["LLM"],
             ),
         ]
 
@@ -235,7 +231,6 @@ class OrpheusModel(Model):
             metadata.graph_walk = "decode"
         elif metadata.graph_walk == "decode":
             request_done = True
-            metadata.kwargs["decode_finished"] = True
 
         if request_done:
             return ForwardPassArgs(
@@ -249,15 +244,11 @@ class OrpheusModel(Model):
         graph_edge.tensor_info = persist_signals.get("new_token", [])
         inputs = [graph_edge]
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        step_metadata = {
-            "is_prefill": metadata.is_prefill,
-        }
 
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
         )
 
     def _get_snac_partition_forward(
@@ -352,9 +343,6 @@ class OrpheusModel(Model):
                 full_metadata=full_metadata,
                 inputs=inputs,
                 unpersist_tensors=unpersist_tensors,
-                step_metadata={
-                    "is_prefill": True,
-                },
             )
         elif partition_name == "SNAC":
             # SNAC starts with snac_chunk walk but no inputs —

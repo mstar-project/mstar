@@ -161,7 +161,7 @@ def _mstar_greedy(variant: str, snapshot: str, text_tokens: torch.Tensor, cfg_we
     info = SimpleNamespace(
         request_id="r", rid_handle="r",
         step_metadata={"cfg_weight": cfg_weight, "exaggeration": exaggeration, "min_p": 0.05,
-                       "max_new_tokens": 1000, "is_prefill": True},
+                       "max_new_tokens": 1000},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=0.0, ignore_eos=False)},
         max_tokens=4096, random_seed=0,
     )

@@ -365,14 +365,6 @@ def test_duplex_request_resource_configs():
     assert greedy.temperature == 0.0 and greedy.ignore_eos is True
 
 
-def test_duplex_partition_producer_chain():
-    parts = {p.name: p for p in _make_model().get_partitions()}
-    assert set(parts) == {"Encoder", "LLM", "Talker"}
-    assert parts["Encoder"].producer_partitions == []
-    assert parts["LLM"].producer_partitions == ["Encoder"]
-    assert parts["Talker"].producer_partitions == ["LLM"]
-
-
 def test_duplex_topology_routes():
     conns = {(c.from_partition, c.to_partition, c.edge_name)
              for c in _make_model().get_partition_topology().connections}

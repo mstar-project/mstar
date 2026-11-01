@@ -213,7 +213,6 @@ def test_graph_walks_and_partitions(model):
     assert walks["decode"].max_iters == model.config.max_speech_tokens
     partitions = {p.name: p for p in model.get_partitions()}
     assert partitions[LM_PARTITION].graph_walks == {"prefill", "prefill_voice", "decode"}
-    assert partitions[TOKEN2WAV_PARTITION].producer_partitions == [LM_PARTITION]
     (connection,) = model.get_partition_topology().connections
     assert connection.edge_name == SPEECH_TOKENS
     policy = connection.chunk_policy_factory()
@@ -844,7 +843,6 @@ def _info(rid: int, seed: int, limits=(0, 30), **knobs):
         "ras_window": 10,
         "ras_tau": 0.1,
         "ignore_eos": False,
-        "is_prefill": True,
         **knobs,
     }
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta)

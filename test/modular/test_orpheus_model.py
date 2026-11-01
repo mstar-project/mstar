@@ -30,9 +30,7 @@ def test_orpheus_prefill_transitions_to_decode():
     )
 
     assert result.full_metadata.graph_walk == "decode"
-    assert result.step_metadata["is_prefill"] is False
     assert result.request_done is False
-    assert "decode_finished" not in result.full_metadata.kwargs
 
 
 def test_orpheus_decode_eos_marks_done():
@@ -42,9 +40,6 @@ def test_orpheus_decode_eos_marks_done():
         output_modalities=["audio"],
         graph_walk="decode",
         is_prefill=False,
-        kwargs={
-            "decode_finished": False,
-        },
     )
 
     result = model.get_partition_forward_pass_args(
@@ -54,4 +49,3 @@ def test_orpheus_decode_eos_marks_done():
     )
 
     assert result.request_done is True
-    assert result.full_metadata.kwargs["decode_finished"] is True

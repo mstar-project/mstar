@@ -504,14 +504,10 @@ class ChatterboxModel(Model):
             PartitionDefinition(
                 name=T3_PARTITION,
                 graph_walks={"prefill", "prefill_voice", "decode"},
-                initial_walk="prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name=S3GEN_PARTITION,
                 graph_walks={"s3gen_chunk", "s3gen_chunk_voice"},
-                initial_walk=None,
-                producer_partitions=[T3_PARTITION],
             ),
         ]
 
@@ -714,9 +710,7 @@ class ChatterboxModel(Model):
     # -----------------------------------------------------------------------
 
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata, keys) -> dict[str, Any]:
-        step = {k: metadata.kwargs[k] for k in keys}
-        step["is_prefill"] = metadata.is_prefill
-        return step
+        return {k: metadata.kwargs[k] for k in keys}
 
     def get_initial_forward_pass_args(
         self,

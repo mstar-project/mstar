@@ -669,7 +669,7 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     )
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
-    assert talker.step_metadata == {"is_prefill": True, **prompt}
+    assert talker.step_metadata == prompt
     # Residual-group sampling rides the code predictor's own per-request
     # sampler config, not step metadata.
     assert "subtalker_sampling" not in talker.step_metadata

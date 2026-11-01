@@ -375,8 +375,8 @@ class _Talking(_ToyModel):
         super().__init__(
             {"prefill": llm(), "prefill_image": Sequential([vit, llm()]), "talk": talker}, None,
             partitions=[
-                PartitionDefinition("LLM", {"prefill", "prefill_image"}, "prefill"),
-                PartitionDefinition("Talker", {"talk"}, "talk", ["LLM"]),
+                PartitionDefinition("LLM", {"prefill", "prefill_image"}),
+                PartitionDefinition("Talker", {"talk"}),
             ],
         )
 

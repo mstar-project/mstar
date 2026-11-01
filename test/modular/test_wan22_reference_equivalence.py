@@ -161,7 +161,6 @@ def oracle_meta() -> dict:
 
 def _step_metadata(meta: dict) -> dict:
     return {
-        "is_prefill": False,
         "num_inference_steps": meta["num_inference_steps"],
         "guidance_scale": meta["guidance_scale"],
         "height": meta["height"],
@@ -598,7 +597,7 @@ def test_i2v_first_frame_injection_semantics(oracle_meta, text_embeds, dit_submo
     num_steps, height, width, num_frames = 8, 224, 384, 9
     h_lat, w_lat, t_lat = height // 16, width // 16, (num_frames - 1) // 4 + 1
     meta = {
-        "is_prefill": False, "num_inference_steps": num_steps, "guidance_scale": 5.0,
+        "num_inference_steps": num_steps, "guidance_scale": 5.0,
         "height": height, "width": width, "num_frames": num_frames,
     }
     fwd_info = _fwd_info("video_gen_i2v", meta, seed=7)

@@ -384,14 +384,10 @@ class CosyVoice3Model(Model):
             PartitionDefinition(
                 name=LM_PARTITION,
                 graph_walks={"prefill", "prefill_voice", "decode"},
-                initial_walk="prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name=TOKEN2WAV_PARTITION,
                 graph_walks={"token2wav"},
-                initial_walk=None,
-                producer_partitions=[LM_PARTITION],
             ),
         ]
 
@@ -580,9 +576,7 @@ class CosyVoice3Model(Model):
 
     @staticmethod
     def _step_metadata(metadata: CurrentForwardConductorMetadata, keys) -> dict[str, Any]:
-        step = {k: metadata.kwargs[k] for k in keys}
-        step["is_prefill"] = metadata.is_prefill
-        return step
+        return {k: metadata.kwargs[k] for k in keys}
 
     def get_initial_forward_pass_args(
         self,

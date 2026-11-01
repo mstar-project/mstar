@@ -113,7 +113,6 @@ def test_gen_params_and_step_metadata() -> None:
         model_kwargs={"size": "256x256", "num_inference_steps": 7},
     )
     sm = fpa.step_metadata
-    assert sm["is_prefill"] is True
     assert sm["height"] == 256 and sm["width"] == 256
     assert sm["num_inference_steps"] == 7
 

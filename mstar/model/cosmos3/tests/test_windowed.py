@@ -159,7 +159,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     parts = {p.name: p for p in model.get_partitions()}
     assert set(parts) == {"default", C.WINDOW_DECODER_PARTITION}
     assert parts[C.WINDOW_DECODER_PARTITION].graph_walks == {C.VIDEO_DECODE_AR_WALK}
-    assert parts[C.WINDOW_DECODER_PARTITION].initial_walk == C.VIDEO_DECODE_AR_WALK
     assert C.VIDEO_DECODE_AR_WALK not in parts["default"].graph_walks
     topo = model.get_partition_topology()
     (conn,) = topo.connections
