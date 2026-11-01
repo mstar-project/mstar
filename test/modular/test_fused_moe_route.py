@@ -27,11 +27,11 @@ def test_the_eager_router_stays_for_what_the_kernel_does_not_cover():
 
 
 @cuda
-@pytest.mark.parametrize("tokens", [1, 3, 8, 16])
-def test_the_kernels_experts_and_weights_are_the_eager_routers(tokens):
+@pytest.mark.parametrize(("tokens", "top_k"), [(1, 8), (3, 8), (8, 8), (16, 8), (1, 6), (5, 6), (16, 6)])
+def test_the_kernels_experts_and_weights_are_the_eager_routers(tokens, top_k):
     from mstar.utils.fused_moe.align import moe_align_block_size
 
-    router = _router(device="cuda")
+    router = _router(device="cuda", top_k=top_k)
     torch.manual_seed(tokens)
     # fp32 logits rounded to bf16 tie often; torch.topk orders ties arbitrarily
     x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
@@ -44,10 +44,10 @@ def test_the_kernels_experts_and_weights_are_the_eager_routers(tokens):
         values = logits[row, ids[row].long()]
         assert (values[:-1] >= values[1:]).all(), "ordered by logit"
         floor = values[-1]
-        assert (logits[row] > floor).sum() <= 7, "no expert above the kth was left out"
+        assert (logits[row] > floor).sum() <= top_k - 1, "no expert above the kth was left out"
     # where no tie crosses the kth, the two agree
-    kth = logits.topk(9, dim=-1).values
-    clean = kth[:, 7] > kth[:, 8]
+    kth = logits.topk(top_k + 1, dim=-1).values
+    clean = kth[:, top_k - 1] > kth[:, top_k]
     assert torch.equal(ids[clean].sort(dim=-1).values.long(), ref_ids[clean].sort(dim=-1).values)
     assert torch.allclose(
         weights[clean].sort(dim=-1).values.float(), ref_weights[clean].sort(dim=-1).values.float(), atol=1e-2,

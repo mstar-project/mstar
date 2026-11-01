@@ -14,7 +14,7 @@ from mstar.utils.fused_moe.runner import MoeAlignment
 def _route_align_kernel(
     logits_ptr, weights_ptr, ids_ptr, sorted_ptr, expert_ids_ptr, post_pad_ptr,
     T, stride_l,
-    E: tl.constexpr, BLOCK_E: tl.constexpr, K: tl.constexpr, BLOCK_M: tl.constexpr,
+    E: tl.constexpr, BLOCK_E: tl.constexpr, K: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr,
     BLOCK_T: tl.constexpr, PAD_LEN: tl.constexpr, BLOCK_PAD: tl.constexpr, SOFTMAX: tl.constexpr,
 ):
     rows = tl.arange(0, BLOCK_T)
@@ -23,9 +23,10 @@ def _route_align_kernel(
         logits_ptr + rows[:, None] * stride_l + experts[None, :],
         mask=(rows[:, None] < T) & (experts[None, :] < E), other=-float("inf"),
     ).to(tl.float32)
-    kk = tl.arange(0, K)
-    top_vals = tl.zeros((BLOCK_T, K), dtype=tl.float32)
-    top_ids = tl.zeros((BLOCK_T, K), dtype=tl.int32)
+    kk = tl.arange(0, BLOCK_K)
+    # past K these stay at -inf, whose softmax and sigmoid terms are 0
+    top_vals = tl.full((BLOCK_T, BLOCK_K), -float("inf"), tl.float32)
+    top_ids = tl.zeros((BLOCK_T, BLOCK_K), dtype=tl.int32)
     for i in tl.static_range(K):
         best = tl.max(logits, axis=1)
         idx = tl.min(tl.where(logits == best[:, None], experts[None, :], BLOCK_E), axis=1)
@@ -40,16 +41,16 @@ def _route_align_kernel(
     else:
         s = tl.sigmoid(top_vals).to(dtype).to(tl.float32)
         total = tl.sum(s, axis=1).to(dtype).to(tl.float32)
-    row_ok = rows[:, None] < T
-    tl.store(weights_ptr + rows[:, None] * K + kk[None, :], (s / total[:, None]).to(dtype), mask=row_ok)
-    tl.store(ids_ptr + rows[:, None] * K + kk[None, :], top_ids, mask=row_ok)
+    in_row = (rows[:, None] < T) & (kk[None, :] < K)
+    tl.store(weights_ptr + rows[:, None] * K + kk[None, :], (s / total[:, None]).to(dtype), mask=in_row)
+    tl.store(ids_ptr + rows[:, None] * K + kk[None, :], top_ids, mask=in_row)
 
     # Block alignment, matching moe_align_block_size: each expert's slots are
     # padded to a multiple of BLOCK_M, experts laid out in index order.
     num_slots = T * K
-    slot = tl.arange(0, BLOCK_T * K)
-    slot_expert = tl.reshape(top_ids, (BLOCK_T * K,))
-    valid = slot < num_slots
+    slot = tl.reshape(rows[:, None] * K + kk[None, :], (BLOCK_T * BLOCK_K,))
+    slot_expert = tl.reshape(top_ids, (BLOCK_T * BLOCK_K,))
+    valid = tl.reshape(in_row, (BLOCK_T * BLOCK_K,))
     onehot = (slot_expert[:, None] == experts[None, :]) & valid[:, None]
     counts = tl.sum(onehot.to(tl.int32), axis=0)
     padded = (counts + BLOCK_M - 1) // BLOCK_M * BLOCK_M
@@ -94,7 +95,8 @@ def route_align(
     post_pad = torch.empty((1,), dtype=torch.int32, device=device)
     _route_align_kernel[(1,)](
         logits, weights, ids, sorted_ids, expert_ids, post_pad, tokens, logits.stride(0),
-        E=experts, BLOCK_E=triton.next_power_of_2(experts), K=k, BLOCK_M=block_m,
+        E=experts, BLOCK_E=triton.next_power_of_2(experts), K=k,
+        BLOCK_K=triton.next_power_of_2(k), BLOCK_M=block_m,
         BLOCK_T=triton.next_power_of_2(tokens), PAD_LEN=pad_len,
         BLOCK_PAD=triton.next_power_of_2(pad_len), SOFTMAX=softmax, num_warps=4,
     )

@@ -145,9 +145,10 @@ def test_the_rope_from_the_plan_is_the_rope_custom_positions_gave():
     """The tables a captured step builds from planned positions, against the old custom ids."""
     inv_freq = compute_rope_freqs(128, rope_theta=1e6)
     planned = torch.tensor([3.0, 40.0, 500.0])
-    from_plan = compute_3d_cos_sin(planned.unsqueeze(0).expand(3, -1), inv_freq, (24, 20, 20), target_dtype=torch.bfloat16)
+    tables = dict(mrope_section=(24, 20, 20), target_dtype=torch.bfloat16)
+    from_plan = compute_3d_cos_sin(planned.unsqueeze(0).expand(3, -1), inv_freq, **tables)
     custom = [ARNodeInputs(input_seq_len=1, custom_pos_ids=torch.full((3, 1), float(p))) for p in planned]
-    from_rows = compute_3d_cos_sin(mrope_position_ids(None, custom), inv_freq, (24, 20, 20), target_dtype=torch.bfloat16)
+    from_rows = compute_3d_cos_sin(mrope_position_ids(None, custom), inv_freq, **tables)
     assert torch.equal(from_plan[0], from_rows[0]) and torch.equal(from_plan[1], from_rows[1])
 
 
