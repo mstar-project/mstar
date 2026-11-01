@@ -223,13 +223,14 @@ class RecurrentStatePool(Resource):
 
         # Snapshots:
         # `_kv` is the KV cache whose page keys name them, None while they are off.
-        # `_snap_meta` maps a filed slot to its key, least recently filed or restored first.
+        # `_snap_meta` maps a filed slot to its key and whether it is a decode snapshot (a reply's),
+        # least recently filed or restored first. Eviction takes a reply's first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
         self._kv: KVManager | None = None
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
-        self._snap_meta: OrderedDict[int, bytes] = OrderedDict()
+        self._snap_meta: OrderedDict[int, tuple[bytes, bool]] = OrderedDict()
         self._snap_refs: dict[int, int] = {}
         # Handle-keyed, purged by `remove_request`.
         # `_keyed` holds the (rid, label) streams the KV cache keys.
@@ -861,27 +862,37 @@ class RecurrentStatePool(Resource):
                     slot.has_state = True
                     slot.tokens = restore.tokens
                     self._version += 1
-                    self._snap_meta.move_to_end(restore.slot)
+                    # last to evict now, and a reply's snapshot that served a hit is kept like a prompt's
+                    key, _ = self._snap_meta.pop(restore.slot)
+                    self._snap_meta[restore.slot] = (key, False)
                 self._unref(restore.slot)
 
     def _reserve_snapshot(self) -> int | None:
         """A free snapshot slot, else the least recently used one nothing
-        holds. Caller holds the lock."""
+        holds, a decode snapshot before a prompt's.
+
+        A prompt's snapshot serves every resend and later turn of its chat; a
+        decode snapshot only a prompt that repeats the reply token for token.
+        Every request files one of each, so one LRU over both would hold half
+        as many prompts as slots. Caller holds the lock."""
         if self._snap_free:
             return self._snap_free.pop()
-        snap = next((snap for snap in self._snap_meta if snap not in self._snap_refs), None)
+        refs = self._snap_refs
+        snap = next((snap for snap, (_, reply) in self._snap_meta.items() if reply and snap not in refs), None)
+        if snap is None:
+            snap = next((snap for snap in self._snap_meta if snap not in refs), None)
         if snap is not None:
-            del self._snap_by_key[self._snap_meta.pop(snap)]
+            del self._snap_by_key[self._snap_meta.pop(snap)[0]]
         return snap
 
-    def _index(self, snap: int, key: bytes) -> bool:
+    def _index(self, snap: int, key: bytes, reply: bool = False) -> bool:
         """File ``snap`` under ``key`` and return True, or free it and return
         False if an earlier copy stands. Caller holds the lock."""
         if key in self._snap_by_key:
             self._snap_free.append(snap)
             return False
         self._snap_by_key[key] = snap
-        self._snap_meta[snap] = key
+        self._snap_meta[snap] = (key, reply)
         return True
 
     def _save_decode(self, rid: str, label: str, slot: SlotState) -> None:
@@ -930,7 +941,7 @@ class RecurrentStatePool(Resource):
             self._unkeyed.discard(key)
             if decode.replaces is not None:
                 self._drop_decode(key, decode.replaces)
-            if self._index(decode.slot, name):
+            if self._index(decode.slot, name, reply=True):
                 self._decode[key] = DecodeSnapshot(decode.slot, decode.tokens, name)
             else:
                 del self._decode[key]
