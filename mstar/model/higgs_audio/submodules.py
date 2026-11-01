@@ -88,6 +88,8 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
 
 class HiggsAudioLLMSubmodule(SampledTokenDecoder):
     ATTN_KEY = ATTN
+    # max-autotune until the default compile level (mstar serve -O) is measured on this model
+    COMPILE_MODE = "max-autotune-no-cudagraphs"
     # ~12.5 tokens per second of audio: eight 30 s clips and their
     # instructions fill the top media bucket
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]

@@ -2510,8 +2510,9 @@ which also caps their batches), device loop-back of the sampled token, the splic
 the encoders' outputs into the prompt's embeddings inside the forward
 (``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
 sampler and the position resource, the forward through the sampler and both stop
-checks, ``TokenStepNode``'s (EOS, or the request's token count, where the loop's cap
-also ends it) on decode rows only. A media row's tensor holds exactly the pads in its
+checks, ``TokenStepNode``'s: a stop id ends decode, and on a prefill row a stop id or
+a one-token budget ends the partition. The model's loop cap, ``max_output_tokens - 1``,
+is the decode budget. A media row's tensor holds exactly the pads in its
 ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:

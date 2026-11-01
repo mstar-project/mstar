@@ -6,9 +6,9 @@ walk per subset of the model's `MediaEncoder` s, which prefills a whole
 multimodal prompt as one row). It owns the engine contract: the capture
 configs, device loop-back of the sampled token, the step declaration around
 the sampler and the position resource, the forward through the sampler, and
-the stop checks, which are `TokenStepNode`'s (EOS, or the request's token
-budget, which counts the prefill's token; a prefill row's stop ends the
-partition). A model subclasses it with its resource steps
+the stop checks, which are `TokenStepNode`'s (a stop id; a prefill row's
+stop, or a one-token budget, ends the partition, and the model's loop cap
+is the decode budget). A model subclasses it with its resource steps
 and its attention key, and an MRoPE model adds its own positions.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
