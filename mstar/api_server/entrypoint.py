@@ -1035,20 +1035,22 @@ class APIServer:
                         with self.request_lock:
                             pending = self.pending_requests
                             if all(rid in pending for rid in body.request_ids):
-                                rids, values = body.request_ids, body.values
+                                rids, values, logprobs = body.request_ids, body.values, body.logprobs
                             else:
-                                rids, values = [], []
-                                for rid, value in zip(body.request_ids, body.values, strict=True):
+                                rids, values, logprobs = [], [], []
+                                for i, (rid, value) in enumerate(zip(body.request_ids, body.values, strict=True)):
                                     if rid in pending:
                                         rids.append(rid)
                                         values.append(value)
+                                        if body.logprobs:
+                                            logprobs.append(body.logprobs[i])
                                     elif rid not in self.recently_completed:
                                         logger.warning(
                                             "Token for unknown request %s dropped", rid,
                                         )
                             if rids:
                                 self.preprocess_worker.new_result_tokens(
-                                    rids, values, body.signal, body.modality,
+                                    rids, values, body.signal, body.modality, logprobs or None,
                                 )
                         continue
 

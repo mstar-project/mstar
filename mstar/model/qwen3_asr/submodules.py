@@ -2,10 +2,11 @@
 # NodeSubmodule wrappers for Qwen3-ASR
 # ---------------------------------------------------------------------------
 #
-# The audio encoder node is the shared AuTEncoderSubmodule
-# (mstar/model/components/aut_encoder_submodule.py). This module holds the
-# LLM node, Qwen3ASRLLMSubmodule (KV/attention/positions/sampler): dense Qwen3
-# with the audio embeddings spliced into the prompt at prefill.
+# Two submodules:
+#   1. Qwen3ASREncoderSubmodule  (ragged attention) — packed AuT encoder over
+#      every request's audio, windows declared as segments
+#   2. Qwen3ASRLLMSubmodule      (KV/attention/positions/sampler) — dense Qwen3
+#      with the audio embeddings spliced into the prompt at prefill
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -25,10 +26,14 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.components.audio_features import LogMelSpectrogram
+from mstar.model.components.aut_encoder import AuTEncoder
+from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.qwen3_asr.config import (
     ATTN,
+    AUT_ATTN,
     DECODE_LOOP,
     DECODE_WALK,
     KV_CACHE,
@@ -43,6 +48,7 @@ from mstar.model.submodule_base import (
     BatchedModelOutput,
     DeviceLoopback,
     ModelInputsFromEngine,
+    NodeInputs,
     TokenStop,
 )
 
@@ -50,7 +56,50 @@ logger = logging.getLogger(__name__)
 
 
 # ===================================================================
-# Qwen3ASRLLMSubmodule
+# 1. Qwen3ASREncoderSubmodule
+# ===================================================================
+
+
+class Qwen3ASREncoderSubmodule(AuTEncoderSubmodule):
+    """Packed AuT encoder (see ``AuTEncoderSubmodule``).
+
+    Consumes one clip of samples per request (from ``process_prompt``) and
+    turns it into unpadded log-mel features on the GPU (``prepare_inputs``).
+    """
+
+    def __init__(self, encoder: AuTEncoder, config: Qwen3ASRModelConfig):
+        super().__init__(encoder, attn_key=AUT_ATTN)
+        self.config = config
+        # built here, after the encoder was materialized, so its filter bank
+        # and window are real tensors on the encoder's device
+        self.log_mel = LogMelSpectrogram(
+            num_mel_bins=config.num_mel_bins,
+            sampling_rate=config.sampling_rate,
+            n_fft=config.n_fft,
+            hop_length=config.hop_length,
+        ).to(device=encoder.conv2d1.weight.device, dtype=torch.float32)  # float32 even under a bf16 default dtype
+
+    def _mel(self, audio: torch.Tensor) -> torch.Tensor:
+        """The spectrogram in float32 whatever dtype the engine cast this
+        module to (it casts submodules to the compute dtype after they are
+        built; a bf16 STFT would not match the reference features)."""
+        if self.log_mel.window.dtype != torch.float32:
+            self.log_mel.float()
+        return self.log_mel(audio)
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs,
+    ) -> NodeInputs:
+        audio = inputs["audio"][0].reshape(-1).to(device=self.get_device(), dtype=torch.float32)
+        return self.feature_inputs(self._mel(audio).to(self._param_dtype()))  # (num_mel_bins, T)
+
+
+# ===================================================================
+# 2. Qwen3ASRLLMSubmodule
 # ===================================================================
 
 

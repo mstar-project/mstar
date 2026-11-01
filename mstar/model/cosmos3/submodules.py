@@ -87,6 +87,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StepOrder,
 )
 
 logger = logging.getLogger(__name__)
@@ -2058,6 +2059,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return self.max_gen_batch_size
         return None
 
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Chained windows stream to the decoder as they finish, so a
+        session's stream keeps moving while others run. Every other walk's
+        output comes at the end of its loop."""
+        return StepOrder.TURNS if graph_walk == VIDEO_GEN_AR_WALK else StepOrder.ARRIVAL
+
     # Native bf16, not the engine autocast — see the note on forward(). The
     # cross-request batched denoise must match the per-request path exactly.
     @torch.autocast(device_type="cuda", enabled=False)
@@ -2983,6 +2990,12 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             self._stream = _wan_vae().FastDecoder(
                 vae, channels_last=self._channels_last, compile=self._decode_compiled, deterministic=False,
             )
+
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """The decoder feeds the DiT's chained windows to the client, so a
+        session's stream keeps moving while others run."""
+        del graph_walk
+        return StepOrder.TURNS
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         chunks = (inputs or {}).get("window_latents") or []
