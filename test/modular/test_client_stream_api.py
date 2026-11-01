@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import threading
 import time
@@ -1631,3 +1632,11 @@ def test_websocket_deflate_is_a_serving_setting():
     assert entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {}).ws_per_message_deflate is True
     off = entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {"ws_per_message_deflate": False})
     assert off.ws_per_message_deflate is False
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_uvicorn_h11_fallback_is_logged(monkeypatch, caplog, installed):
+    monkeypatch.setattr(entrypoint.importlib.util, "find_spec", lambda name: object() if installed else None)
+    with caplog.at_level(logging.INFO, logger=entrypoint.logger.name):
+        entrypoint._uvicorn_config(object(), "127.0.0.1", 8000, {})
+    assert ("h11" in caplog.text) is not installed

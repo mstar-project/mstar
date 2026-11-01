@@ -41,9 +41,6 @@ dependencies = [
     "torchvision>=0.25.0",
     "torchaudio>=2.10.0",
     "uvicorn",
-    # uvicorn's HTTP parser in C: without it uvicorn takes h11, whose Python send
-    # is a quarter of the API process's GIL time when it streams tokens
-    "httptools",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
     "gdown",
@@ -97,6 +94,13 @@ audio = [
 # Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
 metrics = [
     "prometheus-client>=0.20",
+]
+
+# Optional: uvicorn's standard extra, for its HTTP parser in C (httptools). Without
+# it uvicorn takes h11, whose Python send is a quarter of the API process's GIL time
+# when it streams tokens. The server runs either way and logs the fallback.
+server = [
+    "uvicorn[standard]",
 ]
 
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
