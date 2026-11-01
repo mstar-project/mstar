@@ -2779,15 +2779,14 @@ def _set_preprocess_threads(model, config: dict) -> None:
     torch.set_num_threads(int(threads))
 
 
-def _set_switch_interval(model: type, config: dict) -> None:
-    """``api_switch_interval_s`` from the config, else the model's
-    ``API_SWITCH_INTERVAL_S``: the GIL switch interval of this process only
-    (the conductor and workers are spawned fresh). With neither set,
-    Python's 5 ms stays. Streaming many small chunks keeps three of this
+def _set_switch_interval(config: dict) -> None:
+    """``api_switch_interval_s`` from the config: the GIL switch interval of
+    this process only (the conductor and workers are spawned fresh). Unset
+    keeps Python's 5 ms. Streaming many small chunks keeps three of this
     process's threads busy (event loop, message thread, data worker); a
     shorter interval hands the GIL between them sooner, which also preempts a
     model's preprocessing on the data-worker thread more often."""
-    interval = config.get("api_switch_interval_s", model.API_SWITCH_INTERVAL_S)
+    interval = config.get("api_switch_interval_s")
     if interval is None:
         return
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not interval > 0:
@@ -2902,10 +2901,8 @@ def main(argv: list[str] | None = None):
      # Create a lightweight model instance for prompt processing
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
-    model_cls = get_model_class(model_name)
-    # the class's default: checked before the model is built
-    _set_switch_interval(model_cls, config)
-    model = model_cls(
+    _set_switch_interval(config)
+    model = get_model_class(model_name)(
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )

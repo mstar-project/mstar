@@ -272,20 +272,13 @@ def test_a_failing_copy_lets_its_siblings_finish(caplog) -> None:
 
 
 def test_api_switch_interval_must_be_a_positive_number(monkeypatch) -> None:
-    """``api_switch_interval_s`` (else the model class's default) is refused
-    unless a positive number of seconds: yaml's ``true`` is not 1 s."""
-    class _Model:
-        API_SWITCH_INTERVAL_S = None
-
-    class _Fast:
-        API_SWITCH_INTERVAL_S = 0.002
-
+    """``api_switch_interval_s`` is refused unless a positive number of seconds:
+    yaml's ``true`` is not 1 s."""
     set_to = []
     monkeypatch.setattr(entrypoint.sys, "setswitchinterval", set_to.append)
     for bad in (True, 0, -0.001, "1ms"):
         with pytest.raises(ValueError, match="api_switch_interval_s"):
-            entrypoint._set_switch_interval(_Model, {"api_switch_interval_s": bad})
-    entrypoint._set_switch_interval(_Model, {"api_switch_interval_s": 0.001})
-    entrypoint._set_switch_interval(_Model, {})
-    entrypoint._set_switch_interval(_Fast, {})
-    assert set_to == [0.001, 0.002]
+            entrypoint._set_switch_interval({"api_switch_interval_s": bad})
+    entrypoint._set_switch_interval({"api_switch_interval_s": 0.001})
+    entrypoint._set_switch_interval({})
+    assert set_to == [0.001]
