@@ -15,8 +15,7 @@ Graph walks (4):
     video_gen_i2v - I2V: same topology; dit additionally consumes the
                     persisted image_latent for first-frame injection
 
-The walk sequence is fixed up front from the input modalities and stepped through
-``metadata.kwargs["walk_step"]``:
+The walk plan (``walk_plan``) is fixed up front from the input modalities:
 
     T2V: encode_text -> video_gen
     I2V: encode_text -> encode_image -> video_gen_i2v
@@ -35,10 +34,6 @@ from fractions import Fraction
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -49,7 +44,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import Model, WalkStep
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -371,10 +366,8 @@ class Wan22Model(Model):
         I2V image rides through as ``image_inputs`` for the vae_encoder to
         preprocess, but its size is checked here.
 
-        Every malformed-request check lives here rather than in
-        ``get_initial_forward_pass_args``, even where that also guards: a
-        ValueError here becomes a 400, while the same raise at the conductor is
-        swallowed and the client hangs.
+        Every malformed-request check lives here, so a malformed request is a
+        400 before it reaches the conductor; ``walk_plan`` only backstops some.
         """
         self._validate_request(prompt, input_modalities, output_modalities, tensors)
         self._validate_generation_size(kwargs)
@@ -486,18 +479,6 @@ class Wan22Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
-    def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        """Per-pass metadata the submodules read from ``request_info.step_metadata``."""
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            "num_inference_steps": kw["num_inference_steps"],
-            "guidance_scale": kw["guidance_scale"],
-            "height": kw["height"],
-            "width": kw["width"],
-            "num_frames": kw["num_frames"],
-        }
-
     def _log_config_echo(self, model_kwargs: dict, resolved: dict) -> None:
         """Emit one ``key=value`` log line per request at generation start, echoing every
         resolved setting so an operator can read back exactly what ran instead of
@@ -525,21 +506,16 @@ class Wan22Model(Model):
             "on" if self.config.compile_dit else "off",
         )
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
-        # These are backstops, not the primary guard. ``process_prompt`` already
-        # rejected every one of these on the data worker, where a ValueError
-        # becomes a 400; a raise HERE runs at the conductor, whose main loop
-        # swallows it, so the client would hang instead. They remain because a
-        # malformed request must never reach the graph, but they should be
-        # unreachable in practice.
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # These are backstops, not the primary guard: ``process_prompt`` already
+        # rejected every one of these on the data worker.
         target_output = output_modalities[0] if output_modalities else "video"
         if target_output != "video":
             raise ValueError(
@@ -556,10 +532,10 @@ class Wan22Model(Model):
                 "Request declared an image input but no image_inputs tensor "
                 "arrived; image-to-video requires the conditioning image."
             )
-        schedule = [self.ENCODE_TEXT_WALK]
+        walks = [self.ENCODE_TEXT_WALK]
         if is_i2v:
-            schedule.append(self.ENCODE_IMAGE_WALK)
-        schedule.append(self.VIDEO_GEN_I2V_WALK if is_i2v else self.VIDEO_GEN_WALK)
+            walks.append(self.ENCODE_IMAGE_WALK)
+        walks.append(self.VIDEO_GEN_I2V_WALK if is_i2v else self.VIDEO_GEN_WALK)
 
         requested_steps = int(
             model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
@@ -571,100 +547,16 @@ class Wan22Model(Model):
                 requested_steps, num_inference_steps, self.config.max_denoise_steps,
             )
 
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
+        # what the submodules read from ``request_info.step_metadata``
+        request = {
             "num_inference_steps": num_inference_steps,
             "guidance_scale": float(model_kwargs.get("guidance_scale", self.config.guidance_scale)),
             "height": int(model_kwargs.get("height", self.config.default_height)),
             "width": int(model_kwargs.get("width", self.config.default_width)),
             "num_frames": int(model_kwargs.get("num_frames", self.config.default_num_frames)),
         }
-        self._log_config_echo(model_kwargs, kwargs)
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=schedule[0],
-            is_prefill=True,
-            kwargs=kwargs,
-        )
-
-        text_edge = GraphEdge(next_node="text_encoder", name="text_inputs")
-        text_edge.tensor_info = input_signals["text_inputs"]
-        inputs = [text_edge]
-
-        # text_inputs is consumed only by encode_text; image_inputs stays
-        # persisted for the encode_image pass (I2V).
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(full_metadata),
-        )
-
-    def _video_gen_inputs(
-        self, walk: str, persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """External inputs seeding the denoise walk.
-
-        The loop-back edges are sent empty; the dit submodule seeds them at
-        iteration 0.
-        """
-        inputs: list[GraphEdge] = []
-        persisted = ["text_embeds_pos", "text_embeds_neg"]
-        if walk == self.VIDEO_GEN_I2V_WALK:
-            persisted.append("image_latent")
-        for name in persisted:
-            edge = GraphEdge(next_node="dit", name=name)
-            edge.tensor_info = persist_signals.get(name, [])
-            inputs.append(edge)
-        inputs += [
-            GraphEdge(next_node="dit", name="latents"),
-            GraphEdge(next_node="dit", name="unipc_model_outputs"),
-            GraphEdge(next_node="dit", name="unipc_last_sample"),
-        ]
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Step through the request's fixed walk schedule; done after video_gen."""
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        if step < len(schedule):
-            metadata.kwargs["walk_step"] = step
-            walk = schedule[step]
-            metadata.graph_walk = walk
-            metadata.is_prefill = walk in (self.ENCODE_TEXT_WALK, self.ENCODE_IMAGE_WALK)
-            if walk == self.ENCODE_IMAGE_WALK:
-                edge = GraphEdge(next_node="vae_encoder", name="image_inputs")
-                edge.tensor_info = persist_signals.get("image_inputs", [])
-                inputs.append(edge)
-            else:
-                inputs = self._video_gen_inputs(walk, persist_signals)
-        else:
-            # video_gen(_i2v) completed — one video per request.
-            request_done = True
-
-        # Each input is consumed for the last time in its pass; the denoise loop
-        # re-injects its own worker-side.
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(metadata),
-            request_done=request_done,
-        )
+        self._log_config_echo(model_kwargs, request)
+        return [WalkStep(walk, step_metadata=request) for walk in walks]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

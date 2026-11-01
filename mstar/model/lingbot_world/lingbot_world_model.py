@@ -31,11 +31,10 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -58,7 +57,6 @@ _CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune")
 REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
-_SCHEDULE = (ENCODE_TEXT_WALK, ROLLOUT_WALK)
 _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
 
 
@@ -307,69 +305,16 @@ class LingBotWorldModel(Model):
     # Forward pass orchestration
     # ------------------------------------------------------------------
 
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            "guidance_scale": 1.0,
-            "num_latent_frames": kw["num_latent_frames"],
-            "num_chunks": kw["num_latent_frames"] // self.config.chunk_size,
-        }
-
-    def _walk_inputs(self, walk: str, signals: dict[str, list[TensorPointerInfo]]) -> list[GraphEdge]:
-        if walk == ENCODE_TEXT_WALK:
-            edges = [GraphEdge(next_node="text_encoder", name="text_inputs")]
-        else:
-            edges = [GraphEdge(next_node="dit", name=name) for name in _DIT_INPUTS]
-        for edge in edges:
-            edge.tensor_info = signals.get(edge.name, [])
-        return edges
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
         for name in ("text_inputs", "image_inputs", "camera_poses", "intrinsics"):
             if not input_signals.get(name):
                 raise ValueError(f"LingBot-World is missing its {name!r} input; process_prompt emits it.")
         lat_f = int(input_signals["camera_poses"][0].dims[0])
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=_SCHEDULE[0],
-            is_prefill=True,
-            kwargs={"walk_step": 0, "num_latent_frames": lat_f},
-        )
-        inputs = self._walk_inputs(_SCHEDULE[0], input_signals)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata),
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        step = metadata.kwargs["walk_step"] + 1
-        if step >= len(_SCHEDULE):
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[],
-                step_metadata=self._step_metadata(metadata), request_done=True,
-            )
-        metadata.kwargs["walk_step"] = step
-        metadata.graph_walk = _SCHEDULE[step]
-        metadata.is_prefill = _SCHEDULE[step] != ROLLOUT_WALK
-        inputs = self._walk_inputs(_SCHEDULE[step], persist_signals)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata),
-        )
+        request = {"guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // self.config.chunk_size}
+        return [WalkStep(walk, step_metadata=request) for walk in (ENCODE_TEXT_WALK, ROLLOUT_WALK)]
 
     # ------------------------------------------------------------------
     # Submodule loading

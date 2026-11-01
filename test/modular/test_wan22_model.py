@@ -253,69 +253,40 @@ def test_wan22_worker_graphs_from_yaml():
 
 
 # ----------------------------------------------------------------------
-# Forward pass transitions (schedule-driven state machine)
+# Walk plan
 # ----------------------------------------------------------------------
 
 
-def test_wan22_initial_schedule_t2v():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text"],
-        output_modalities=["video"],
-        input_signals={"text_inputs": [_tensor_info("text")]},
-    )
-    assert args.full_metadata.graph_walk == Wan22Model.ENCODE_TEXT_WALK
-    assert args.full_metadata.is_prefill is True
-    assert args.full_metadata.kwargs["walk_schedule"] == [
-        Wan22Model.ENCODE_TEXT_WALK,
-        Wan22Model.VIDEO_GEN_WALK,
-    ]
-    edge_targets = {(e.next_node, e.name) for e in args.inputs}
-    assert edge_targets == {("text_encoder", "text_inputs")}
-    assert args.step_metadata["num_inference_steps"] == \
-        model.config.default_num_inference_steps
-    assert args.step_metadata["guidance_scale"] == model.config.guidance_scale
+def _plan(model, input_modalities, output_modalities, input_signals, model_kwargs=None):
+    return model.walk_plan("default", input_modalities, output_modalities, input_signals, model_kwargs or {})
 
 
-def test_wan22_initial_schedule_i2v_inserts_encode_image():
+@pytest.mark.parametrize("input_modalities, walks", [
+    (["text"], [Wan22Model.ENCODE_TEXT_WALK, Wan22Model.VIDEO_GEN_WALK]),
+    (["text", "image"], [Wan22Model.ENCODE_TEXT_WALK, Wan22Model.ENCODE_IMAGE_WALK, Wan22Model.VIDEO_GEN_I2V_WALK]),
+], ids=["t2v", "i2v"])
+def test_wan22_plan_walks_and_request_metadata(input_modalities, walks):
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text", "image"],
-        output_modalities=["video"],
-        input_signals={
-            "text_inputs": [_tensor_info("text")],
-            "image_inputs": [_tensor_info("image")],
-        },
-    )
-    assert args.full_metadata.kwargs["walk_schedule"] == [
-        Wan22Model.ENCODE_TEXT_WALK,
-        Wan22Model.ENCODE_IMAGE_WALK,
-        Wan22Model.VIDEO_GEN_I2V_WALK,
-    ]
+    signals = {"text_inputs": [_tensor_info("text")], "image_inputs": [_tensor_info("image")]}
+    plan = _plan(model, input_modalities, ["video"], signals)
+    assert [step.walk for step in plan] == walks and not any(step.bind for step in plan)
+    cfg = model.config
+    assert all(step.step_metadata == {
+        "num_inference_steps": cfg.default_num_inference_steps, "guidance_scale": cfg.guidance_scale,
+        "height": cfg.default_height, "width": cfg.default_width, "num_frames": cfg.default_num_frames,
+    } for step in plan)
 
 
 def test_wan22_rejects_non_video_output():
     model = _make_model()
     with pytest.raises(ValueError, match="video"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["text"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text"], ["text"], {"text_inputs": [_tensor_info("text")]})
 
 
 def test_wan22_rejects_promptless_request():
     model = _make_model()
     with pytest.raises(ValueError, match="text prompt"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["image"],
-            output_modalities=["video"],
-            input_signals={"image_inputs": [_tensor_info("image")]},
-        )
+        _plan(model, ["image"], ["video"], {"image_inputs": [_tensor_info("image")]})
 
 
 @pytest.mark.parametrize("requested,expected", [
@@ -328,97 +299,9 @@ def test_wan22_rejects_promptless_request():
 def test_wan22_num_inference_steps_clamped(requested, expected):
     model = _make_model()
     assert model.config.max_denoise_steps == 100
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text"],
-        output_modalities=["video"],
-        input_signals={"text_inputs": [_tensor_info("text")]},
-        model_kwargs={"num_inference_steps": requested},
-    )
-    assert args.step_metadata["num_inference_steps"] == expected
-
-
-def _step(model, metadata, persist_signals):
-    return model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals=persist_signals,
-    )
-
-
-def test_wan22_t2v_transitions_encode_text_to_video_gen_to_done():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text"],
-        output_modalities=["video"],
-        input_signals={"text_inputs": [_tensor_info("text")]},
-    )
-    metadata = args.full_metadata
-
-    persist = {
-        "text_embeds_pos": [_tensor_info("pos")],
-        "text_embeds_neg": [_tensor_info("neg")],
-    }
-    result = _step(model, metadata, persist)
-    assert result.full_metadata.graph_walk == Wan22Model.VIDEO_GEN_WALK
-    assert result.full_metadata.is_prefill is False
-    assert result.request_done is False
-    edge_targets = {(e.next_node, e.name) for e in result.inputs}
-    assert edge_targets == {("dit", name) for name in (
-        {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
-    )}
-    # Persisted embeddings carry tensor_info; loop-seeding edges arrive empty.
-    by_name = {e.name: e for e in result.inputs}
-    assert by_name["text_embeds_pos"].tensor_info == persist["text_embeds_pos"]
-    assert by_name["text_embeds_neg"].tensor_info == persist["text_embeds_neg"]
-    for name in LOOP_BACK_NAMES:
-        assert by_name[name].tensor_info == []
-    # The embeddings see their last use here and must be unpersisted.
-    unpersisted = {info.uuid for info in result.unpersist_tensors}
-    assert {persist["text_embeds_pos"][0].uuid, persist["text_embeds_neg"][0].uuid} \
-        <= unpersisted
-
-    result = _step(model, result.full_metadata, {})
-    assert result.request_done is True
-    assert result.inputs == []
-
-
-def test_wan22_i2v_transitions_include_encode_image_and_image_latent():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["text", "image"],
-        output_modalities=["video"],
-        input_signals={
-            "text_inputs": [_tensor_info("text")],
-            "image_inputs": [_tensor_info("image")],
-        },
-    )
-    metadata = args.full_metadata
-
-    # encode_text -> encode_image: the persisted raw image feeds vae_encoder.
-    persist = {"image_inputs": [_tensor_info("image")]}
-    result = _step(model, metadata, persist)
-    assert result.full_metadata.graph_walk == Wan22Model.ENCODE_IMAGE_WALK
-    assert result.full_metadata.is_prefill is True
-    edge_targets = {(e.next_node, e.name) for e in result.inputs}
-    assert edge_targets == {("vae_encoder", "image_inputs")}
-
-    # encode_image -> video_gen_i2v: dit also consumes the persisted latent.
-    persist = {
-        "text_embeds_pos": [_tensor_info("pos")],
-        "text_embeds_neg": [_tensor_info("neg")],
-        "image_latent": [_tensor_info("latent")],
-    }
-    result = _step(model, result.full_metadata, persist)
-    assert result.full_metadata.graph_walk == Wan22Model.VIDEO_GEN_I2V_WALK
-    assert result.full_metadata.is_prefill is False
-    by_name = {e.name: e for e in result.inputs}
-    assert by_name["image_latent"].tensor_info == persist["image_latent"]
-
-    result = _step(model, result.full_metadata, {})
-    assert result.request_done is True
+    plan = _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]},
+                 {"num_inference_steps": requested})
+    assert plan[0].step_metadata["num_inference_steps"] == expected
 
 
 # ----------------------------------------------------------------------
@@ -750,12 +633,7 @@ def test_wan22_get_submodule_dummy_mode_returns_none():
 def test_wan22_i2v_declared_without_image_tensor_raises():
     model = _make_model()
     with pytest.raises(ValueError, match="image_inputs"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text", "image"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text", "image"], ["video"], {"text_inputs": [_tensor_info("text")]})
 
 
 def _uint8_video(frames=4, height=64, width=96):
@@ -808,24 +686,18 @@ def test_wan22_postprocess_rejects_non_video_modality():
 
 # ----------------------------------------------------------------------
 # Feature 3: config echo — one resolved-settings line per request at generation
-# start. No weights/GPU needed; the line is emitted from get_initial_forward_pass_args.
+# start. No weights/GPU needed; the line is emitted from walk_plan.
 # ----------------------------------------------------------------------
 
 
 def test_wan22_config_echo_logs_resolved_settings(caplog):
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-            model_kwargs={
-                "height": 480, "width": 832, "num_frames": 33,
-                "num_inference_steps": 20, "guidance_scale": 5.0, "seed": 7,
-                "negative_prompt": "blurry", "fps": 30,
-            },
-        )
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {
+            "height": 480, "width": 832, "num_frames": 33,
+            "num_inference_steps": 20, "guidance_scale": 5.0, "seed": 7,
+            "negative_prompt": "blurry", "fps": 30,
+        })
     echoes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:")]
     assert len(echoes) == 1, f"expected exactly one config echo, got {echoes}"
     line = echoes[0]
@@ -842,13 +714,8 @@ def test_wan22_config_echo_marks_absent_negative_and_auto_seed(caplog):
     # and steps reflect the clamped/defaulted value.
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-            model_kwargs={"num_inference_steps": 10_000},  # clamps to max_denoise_steps
-        )
+        # clamps to max_denoise_steps
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]}, {"num_inference_steps": 10_000})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "seed=auto" in line
     assert "negative_prompt=absent" in line
@@ -860,12 +727,7 @@ def test_wan22_config_echo_reflects_compile_off(caplog):
     model = _make_model()
     model.config.compile_dit = False
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "compile=off" in line
 
@@ -957,12 +819,7 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
     monkeypatch.setenv(_DECODE_TILING_ENV, "banana")
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
-        model.get_initial_forward_pass_args(
-            partition_name="default",
-            input_modalities=["text"],
-            output_modalities=["video"],
-            input_signals={"text_inputs": [_tensor_info("text")]},
-        )
+        _plan(model, ["text"], ["video"], {"text_inputs": [_tensor_info("text")]})
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "decode=auto" in line
     assert "banana" not in line
