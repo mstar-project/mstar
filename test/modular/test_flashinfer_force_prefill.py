@@ -1,6 +1,7 @@
 """A packed capture whose rows are all one token long (bs == num_tokens) still
 plans prefill attention: its forward reads per-row token offsets (qo_indptr),
-which the decode wrapper does not have."""
+which the decode wrapper does not have. An eager step of such rows plans the
+decode wrapper, and each row is then its own last token."""
 import types
 
 import pytest
@@ -8,11 +9,16 @@ import torch
 
 from mstar.engine.resources import BucketKey, SlotLease
 from mstar.engine.resources.attn import flashinfer
+from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.plan import SequenceView, build_paged_indptrs
 
 
 class _Decode:
     def __init__(self, **kwargs):
+        pass
+
+    def plan(self, **kwargs):
         pass
 
 
@@ -48,3 +54,17 @@ def test_a_one_token_per_row_bucket_plans_decode(manager):
 def test_a_packed_bucket_of_one_token_rows_plans_prefill(manager):
     wrapper = manager._cg_wrapper(_lease("prefill", 4, 4), "main", 4, force_prefill=True)
     assert isinstance(wrapper, _Prefill)
+
+
+def test_an_eager_step_of_one_token_prompts_samples_every_row(manager):
+    indptrs = build_paged_indptrs(
+        [SequenceView(rid, "main", [1 + i], 1, 1) for i, rid in enumerate("abc")], page_size=16,
+    )
+    ctx = types.SimpleNamespace(
+        slot_lease=None, is_preplan=False, force_prefill=False, slot=0,
+        plan_results={"kv": {"main": types.SimpleNamespace(cpu_indptrs=indptrs)}},
+    )
+    manager.plan(AttentionStep(causal=True), ctx)
+    assert isinstance(manager._current_plan_states["main"], _Decode)
+    hidden = torch.randn(3, 8)
+    assert torch.equal(manager.select_last_hidden(hidden), hidden)

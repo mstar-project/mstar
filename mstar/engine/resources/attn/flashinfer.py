@@ -288,6 +288,10 @@ class FlashInferManager(AttentionManager):
         from prefill.
         """
         qo_indptr_buf = self.qo_indptr_buf(label)
+        if qo_indptr_buf is None:
+            # an eager step of one-token rows plans the decode wrapper, which
+            # keeps no qo_indptr: each row is its own last token
+            return hidden
         last_token_indices = (qo_indptr_buf[1:] - 1).long()
         return hidden.index_select(0, last_token_indices)
 
