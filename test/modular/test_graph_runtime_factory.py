@@ -133,8 +133,8 @@ def test_importing_the_worker_does_not_need_the_extension():
     """Tooling imports mstar.worker on machines that never built it."""
     import subprocess
 
-    probe = (
+    script = (
         "import sys; sys.modules['mstar_rust'] = None; import mstar.worker.worker; "
         "assert 'mstar.graph.runtime.rust' not in sys.modules"
     )
-    subprocess.run([sys.executable, "-c", probe], check=True)
+    subprocess.run([sys.executable, "-c", script], check=True)

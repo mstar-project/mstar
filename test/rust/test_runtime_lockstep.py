@@ -4,7 +4,8 @@
 after each operation and assert what a worker acts on at that point: ready
 nodes, what pop_rids hands back, the uuids routing asks to register, and which
 uuids the bookkeeper still holds. A wrong reference shows up at the step that
-caused it.
+caused it. Where a script used to diff two runtimes, the expected values are
+the ones the Rust runtime gives today.
 """
 import sys
 

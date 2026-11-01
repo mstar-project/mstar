@@ -2,8 +2,7 @@
 
 A wrong answer here is silent in production -- a request that is never
 scheduled, or a refcount off by one -- so each sequence asserts the concrete
-state a worker would act on. These started as two-runtime comparisons, which
-is why the graphs are shaped after real models' worker graphs.
+state a worker would act on.
 """
 import sys
 

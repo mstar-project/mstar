@@ -621,7 +621,7 @@ class _LoopWorker:
 
 
 def test_accumulated_outputs_feed_the_successor_once_after_the_loop(tmp_path):
-    """The shape the refusal points to passes startup, and runs ``step`` ITERS
+    """The graph the refusal points to passes startup, and runs ``step`` ITERS
     times, then ``post`` once, reporting done once."""
     w = _LoopWorker(tmp_path)
     trace = []

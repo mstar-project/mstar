@@ -379,8 +379,8 @@ def _runtime_kwargs(communicator, bookkeeping):
 
 
 def test_the_setting_holds_under_the_graph_runtime(monkeypatch):
-    """The setting lives on the submodule and is applied by the engine; the
-    graph runtime never sees it."""
+    """The setting is on the submodule and the engine applies it; the graph
+    runtime never sees it."""
     from mstar.communication.codec import WireCodec
     from mstar.communication.rust_communicator import RustZMQCommunicator
     from mstar.communication.tensor_store import RustTensorBookkeeping

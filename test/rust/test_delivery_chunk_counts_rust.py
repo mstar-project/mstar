@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, ".")
-# the shared scenario lives beside the modular test; "test" itself can resolve
-# to the standard library's package, so import it by directory
+# the shared scenario is in the modular test; "test" itself can resolve to the
+# standard library's package, so import it by directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modular"))
 
 import pytest
