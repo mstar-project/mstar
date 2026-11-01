@@ -960,12 +960,11 @@ class Conductor:
         """
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            replica_idx = replicas[wg._group_id]
             # Route to a whole instance (the lockstep unit): every rank of a
             # tp*sp instance runs the request together, so its TP all-reduce
             # and SP all-to-all collectives stay in sync. Picking a single TP
             # row here would desync the SP all-to-all across rows.
-            result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replica_idx]]
+            result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replicas[wg._group_id]]]
         return result
 
     def _build_request_sharding_config(
