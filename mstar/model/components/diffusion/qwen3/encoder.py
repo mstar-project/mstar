@@ -17,6 +17,7 @@ reference's own kernel.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components import DecoderLayer, GatedMLP
+from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
 from mstar.model.components.linear import FusedColumnLinear
 
 
@@ -238,6 +240,11 @@ class Qwen3HiddenStateEncoder(nn.Module):
         # No padding anywhere in the batch: HF's create_causal_mask returns None and attention
         # runs its is_causal path; mirror that rather than passing an all-True mask.
         mask = None if bool(attention_mask.all()) else padded_causal_mask(attention_mask)
+        return self.run_layers(input_ids, rotary, mask)
+
+    def run_layers(
+        self, input_ids: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor], mask: torch.Tensor | None,
+    ) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         taps = []
         for layer_idx, layer in enumerate(self.layers, start=1):
@@ -248,3 +255,29 @@ class Qwen3HiddenStateEncoder(nn.Module):
                 taps.append(hidden)
         # stack(dim=1).permute(0, 2, 1, 3).reshape(...) == concatenation along the feature dim
         return torch.cat(taps, dim=-1)
+
+
+def compiled_encoder_forward(encoder: Qwen3HiddenStateEncoder) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """``encoder(input_ids, attention_mask)`` compiled once for every prompt width and batch size.
+
+    Sizes stay symbolic, so dynamo builds one graph for a single row and one for several and nothing
+    compiles inside a request. Fusion is what pays: the eager forward is about 2080 kernels and
+    launch-bound at any width (MI325X: 14.9 ms at 64 tokens, 20.6 at 512), compiled it is about 460
+    (5.0 and 12.7 ms). It always takes the masked attention path, since choosing the mask-free one is
+    a host sync, so an unpadded batch differs from ``encoder`` in rounding only."""
+
+    def masked(input_ids: torch.Tensor, attention_mask: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor]):
+        return encoder.run_layers(input_ids, rotary, padded_causal_mask(attention_mask))
+
+    compiled = with_inductor_rounding(torch.compile(masked, fullgraph=False, dynamic=True), eager_rounding=True)
+    tables: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def forward(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        seq = input_ids.shape[1]
+        rotary = tables.get(seq)
+        if rotary is None:
+            positions = torch.arange(seq, device=input_ids.device)
+            rotary = tables[seq] = qwen3_rotary_tables(positions, encoder.head_dim, encoder.rope_theta)
+        return compiled(input_ids, attention_mask, rotary)
+
+    return forward
