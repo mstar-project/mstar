@@ -123,6 +123,31 @@ class TestACRolloutForwardBatched:
                 assert tensors[0].shape == (1, window, d)
                 assert torch.equal(tensors[0], step_out[i : i + 1])
 
+    def test_replays_the_block_loop_exactly_when_leased(self):
+        """The rollout step gets the block loop's runner only when its step
+        leased the region, whatever the runner's buckets allow."""
+        from mstar.model.vjepa2.submodules import BLOCK_LOOP_REGION
+
+        submodule, cfg = _make_submodule()
+        window, d = cfg.grid_size * cfg.grid_size, cfg.hidden_size
+        runner, handed = object(), []
+
+        def rollout_step(*args, runner=None, **kwargs):
+            handed.append(runner)
+            return torch.zeros(1, window, d)
+
+        submodule._rollout_step = rollout_step
+        for leases in ({}, {BLOCK_LOOP_REGION: object()}):
+            engine_inputs = ModelInputsFromEngine(
+                request_ids=["r"], per_request_info={"r": _request_info("r")},
+                piecewise_runners={BLOCK_LOOP_REGION: runner}, piecewise_leases=leases,
+            )
+            submodule.forward_batched(
+                graph_walk="prefill_video_rollout", engine_inputs=engine_inputs,
+                encoder_hidden=torch.randn(1, window, d), actions=torch.randn(1, 1, 7), states=torch.randn(1, 1, 7),
+            )
+        assert handed == [None, runner]
+
     def test_pair_matches_singles(self):
         """A 2-request batch produces the same per-request outputs as two
         single-request batches over the same inputs."""

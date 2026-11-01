@@ -550,7 +550,8 @@ class RecurrentStatePool(Resource):
     def _fork_rids(step: RecurrentStep) -> set[str]:
         if not (step.pre_forks or step.post_forks):
             return set()
-        return {seg.request_id for seg in step.segments or ()}
+        rids = {seg.request_id for seg in step.segments or ()}
+        return rids if step.fork_rids is None else rids & step.fork_rids
 
     @property
     def supports_preplan(self):
@@ -768,6 +769,12 @@ class RecurrentStatePool(Resource):
                 return
             if prefix is None:
                 self._drop_lease(rid)
+                return
+            if prefix.tokens == 0 and lease.slot is not None:
+                # a declined hit runs from token 0: give the snapshot back, and
+                # keep the hit, which admit still snapshots the boundary of
+                self._unref(lease.slot)
+                self._leases[rid] = lease._replace(slot=None, tokens=0)
                 return
             if prefix.tokens != lease.tokens:
                 raise RuntimeError(

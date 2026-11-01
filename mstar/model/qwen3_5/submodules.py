@@ -70,6 +70,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -80,6 +81,15 @@ from mstar.utils.knobs import ingraph_decode_rope
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 logger = logging.getLogger(__name__)
+
+
+def token_stop(stop_token_ids) -> TokenStop:
+    """The LLM's stop: a decode row's stop id, checked by the graph runtime."""
+    return TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset(stop_token_ids),
+        sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+        last_prefill_flag="last_prefill", runtime_check=True,
+    )
 
 
 class LLMSubmodule(ARNodeSubmodule):
@@ -139,11 +149,7 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
-        self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
-            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
-            last_prefill_flag="last_prefill",
-        )
+        self.token_stop = token_stop(config.stop_token_ids)
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ------------------------------------------------------------------
@@ -316,6 +322,23 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             },
         )
+
+    # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
+    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
+    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
+    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        # a vision row's length depends on its image grids; it is admitted whole
+        if graph_walk == "decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        return None
 
     def prepare_inputs(
         self,
@@ -661,6 +684,11 @@ class LLMSubmodule(ARNodeSubmodule):
         # feed `prefill_tokens` from the inputs
         return graph_walk == "decode"
 
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
+
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop
         # check already has on the host; prefill's new_token edge is persisted
@@ -833,20 +861,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         sin: torch.Tensor,
         seq_lengths: tuple[int, ...],
     ) -> torch.Tensor | None:
-        """The block loop replayed once per prompt, or None if not leased.
-
-        A leased step declares nothing of its own (`declare_step`), so
-        ``engine_inputs.step`` is None; a bucket that fits is not enough, as
-        ``can_lease`` may have refused the batch. The bucket check keeps a
-        forward driven outside the engine (no declaration either) eager.
-        """
-        runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
-        if runner is None or engine_inputs.step is not None or not runner.can_run(
-            len(engine_inputs.request_ids), int(hidden.shape[0]),
-        ):
+        """The block loop replayed once per prompt, or None if not leased."""
+        if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
         # one replay for every image, not one each: a second plan overwrites the schedule a queued replay still reads
-        return runner.run(
+        return engine_inputs.piecewise_runners[VISION_BLOCK_LOOP].run(
             static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
             request_ids=[engine_inputs.request_ids[0]],
             seq_lens=list(seq_lengths),

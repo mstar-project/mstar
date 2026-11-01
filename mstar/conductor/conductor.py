@@ -37,6 +37,7 @@ from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_l
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.submodule_base import chunk_tick_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
@@ -748,6 +749,13 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # graph walk -> the chunkable (node, walk) pairs whose Loop needs its
+        # loop-back seeded for the first chunk
+        self._chunk_ticks: dict[str, tuple[tuple[str, str], ...]] = {}
+        for (node, walk), policy in self.model.chunking_policy_of().items():
+            if policy.chunkable:
+                self._chunk_ticks.setdefault(walk, ())
+                self._chunk_ticks[walk] += ((node, walk),)
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
@@ -1390,20 +1398,20 @@ class Conductor:
                 pstate = partition_states[partition_name]
                 inputs_per_worker = self._split_inputs_to_workers(
                     sharding_config=request_data.sharding_config,
-                    inputs=fwd_args.inputs,
+                    inputs=self._with_chunk_ticks(
+                        fwd_args.inputs, fwd_args.full_metadata.graph_walk,
+                    ),
                     graph_walk=fwd_args.full_metadata.graph_walk,
                 )
 
-                self._update_persist_ref_counts(
-                    body.request_id,
-                    inputs_per_worker.get(worker_id, [])
-                )
+                initial_inputs = inputs_per_worker.get(worker_id, [])
+                self._update_persist_ref_counts(body.request_id, initial_inputs)
 
                 message = NewRequest(
                     request_id=body.request_id,
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
-                    initial_inputs=inputs_per_worker.get(worker_id, []),
+                    initial_inputs=initial_inputs,
                     loop_caps=loop_caps,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
@@ -1976,13 +1984,32 @@ class Conductor:
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
 
+    def _with_chunk_ticks(self, inputs: list, graph_walk: str) -> list:
+        """``inputs`` plus a seed for each chunk Loop this walk enters.
+
+        Every entry into the walk needs one, re-entry included: the seed makes
+        the node ready for the walk's FIRST chunk, and later chunks get the
+        signal from their own routing. Carries no tensor, so the worker ingests
+        it straight away (see ``chunk_tick_name``). Added before the split, so
+        as signal-only edges the seeds reach exactly the chunked node's ranks,
+        which need not be the ranks the walk's other inputs go to.
+        """
+        ticks = self._chunk_ticks.get(graph_walk)
+        if not ticks:
+            return inputs
+        return inputs + [
+            GraphEdge(next_node=node, name=chunk_tick_name(node, walk))
+            for node, walk in ticks
+        ]
+
     def _send_partition_inputs(
         self, request_id: str, partition_name: str, fwd_args: ForwardPassArgs,
     ):
         """Send InputSignals for a specific partition's next forward pass."""
+        walk = fwd_args.full_metadata.graph_walk
         self._send_inputs(
-            request_id, partition_name, fwd_args.inputs,
-            fwd_args.full_metadata.graph_walk, fwd_args.step_metadata,
+            request_id, partition_name, self._with_chunk_ticks(fwd_args.inputs, walk),
+            walk, fwd_args.step_metadata,
         )
 
     def _send_inputs(
