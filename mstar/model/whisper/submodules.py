@@ -77,7 +77,7 @@ class _PromptPackedConfig(PackedAcceleratorGraphConfig):
 # Walks that run the encoder and hand the decoder its output.
 ENCODER_WALKS = (PREFILL_WALK, DETECT_LANGUAGE_WALK)
 # Walks whose sampled token is the first transcript token, subject to the
-# begin-suppression rules.
+# begin-suppression rules; a stop id there ends the request.
 FIRST_TOKEN_WALKS = (PREFILL_WALK, PREFILL_PROMPT_WALK)
 
 
@@ -752,13 +752,23 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             rows["ts_rules"] = next_rules
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
+    def _is_prefill_walk(self, walk: str) -> bool:
+        return walk in FIRST_TOKEN_WALKS
+
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """The shared stop condition (a stop id; the loop cap ends decode at the
-        budget) on a decode step's token; a prompt walk's token never stops the loop. Either way the token
-        is kept for the align walk first."""
-        if request_info.graph_walk != DECODE_WALK:
+        """A stop id, on a decode step's token or on the first transcript
+        token, where it ends the request (an empty transcript has no words to
+        align). No budget check: the loop cap ends decode, and the model's
+        transition skips decode for a one-token budget, so a word-timestamp
+        request still aligns that token. Either way the token is kept for the
+        align walk first."""
+        walk = request_info.graph_walk
+        if walk != DECODE_WALK:
             self._record_prompt_token(request_info, token)
-            return False
+            return (
+                self._is_prefill_walk(walk) and token in self.stop_token_ids
+                and not request_info.resource_configs[SAMPLER].ignore_eos
+            )
         self._record(request_info, token)
         if super()._stops(token, request_info):
             self.request_state(request_info.rid_handle).add("stopped", True)
@@ -803,13 +813,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != DECODE_WALK:
-            # as check_stop: a prompt walk's token never stops the loop, and
-            # only a word-timestamp request keeps it
-            request_ids = [rid for rid in request_ids if request_infos[rid].step_metadata.get("word_timestamps")]
-            if not request_ids:
-                return {}
+        if step_walk != DECODE_WALK:
+            # a prompt walk's rows (a stop ends the partition), or a mixed step
+            return super().check_stop_batched(request_ids, request_infos, host_rows, step_walk)
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
+        # not the base's decode path, which skips `_stops`: each token is kept for the align walk
         return {rid: {DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}
