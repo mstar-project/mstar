@@ -25,7 +25,7 @@ model_kwargs: &model_kwargs
   # (see compile_exact_ops in docs/models.rst)
   # On AMD GPUs the bf16 config does not apply this (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M
   # kernel choice keeps the output off the reference bit for bit either way. MI325X: 0.406 -> 0.384 s at B=1, 2.97 -> 3.32
-  # images/s at c=16. This file's AMD default is fp8, which needs it, so the override below turns the knob on.
+  # images/s at c=16. This file's AMD default runs fp8 steps, which need it, so the override below turns the knob on.
   compile_exact_ops: [norms]
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
@@ -43,12 +43,13 @@ model_kwargs: &model_kwargs
   # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.19x images/s at
-  # c=1 and 1.21x at c=16 on MI325X; median 22.6 vs 23.9 dB from diffusers (docs/models.rst). Default bf16, fp8 on
-  # AMD GPUs (platform_overrides below)
+  # c=1 and 1.21x at c=16 on MI325X; median 22.6 vs 23.9 dB from diffusers (docs/models.rst). Default bf16,
+  # flux2_klein_fp8.yaml serves it
   # On AMD GPUs fp8 needs `knobs: dit_exact_ops: true` (top level). MI325X: 22.6 dB with the knob on, 22.5-22.7
   # with it off (floor 22.4). The knob costs 7% of fp8 images/s at c=1, leaving 1.13x bf16
   # linear_dtype_steps picks the dtype per denoise step (docs/models.rst): [bf16, bf16, fp8, fp8] loses 0.1 dB on the
-  # typical image against bf16 on MI325X, 1.0 dB with fp8 on every step, and keeps about half of the speedup
+  # typical image against bf16 on MI325X, 1.0 dB with fp8 on every step, and keeps about half of the speedup.
+  # Unset, except on AMD GPUs (platform_overrides below)
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
   # linear_dtype: bf16 (default), mxfp8 or nvfp4 runs the block linears through a block-scaled GEMM, faster and
@@ -67,14 +68,10 @@ node_groups:
   - node_names: [dit]
     ranks: [0]
 
-# On AMD GPUs all 60 of the DiT's declared linears run fp8, with the norms on the eager kernels. An entry replaces a
-# top-level key whole, so model_kwargs repeats the block above through the merge key. MI325X at c=1/4/8/16: 3.157 / 3.586 /
-# 3.494 / 3.647 images/s against 2.775 / 3.107 / 3.181 / 3.313 on bf16, median 22.59 dB from diffusers (floor 22.43).
-# The typical image loses 1.0 dB against bf16 and the worst 11.4 dB, accepted by eye on the 40 image_v1 images.
-# flux2_klein_bf16.yaml keeps bf16 on every platform. flux2_klein_fp8_bpff.yaml loses at most 1.65 dB for about
-# 40% of the gain.
-# Each prompt encodes alone, the DiT and VAE keep batching. MI325X, shared node: a c=16 image reads 30-34 dB from its c=1 twin
-# against 25-26 batched (41 against 26 on bf16). c=16 images/s stay level, c=4 loses 4%, and the distance from diffusers does not move.
+# On AMD GPUs the DiT runs the step schedule [bf16, bf16, fp8, fp8] with the norms on the eager kernels, and each prompt encodes
+# alone while the DiT and VAE keep batching. An entry replaces a top-level key whole, so model_kwargs repeats the block above
+# through the merge key. fp8 on every step, flux2_klein_fp8.yaml, sits on the 22.43 dB floor from diffusers once batched (6 of 12
+# cells under it at c=16 on MI325X), and the solo encoder does not move that. flux2_klein_bf16.yaml keeps bf16 on every platform.
 platform_overrides:
   rocm:
     model_kwargs:
@@ -86,5 +83,7 @@ platform_overrides:
       linear_dtype: fp8
       # the text stream's linears (512 rows) are no faster in fp8
       linear_keep_bf16: ["double_blocks.*.attn.txt_*", "double_blocks.*.txt_ff.*"]
+      # two bf16 steps, then fp8 (measured above: 0.1 dB from bf16 on the typical image for about half of the fp8 speedup)
+      linear_dtype_steps: [bf16, bf16, fp8, fp8]
     knobs:
       dit_exact_ops: true
