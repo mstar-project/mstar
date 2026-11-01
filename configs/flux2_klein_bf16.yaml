@@ -1,6 +1,6 @@
 model: "flux2_klein"
 
-# bf16 on every platform: flux2_klein.yaml without its AMD fp8 override. Its comments explain the settings.
+# bf16 on every platform: flux2_klein.yaml without its AMD fp8 override. Its comments explain the settings, the solo text encoder too.
 max_seq_len: 512
 
 model_kwargs: &model_kwargs

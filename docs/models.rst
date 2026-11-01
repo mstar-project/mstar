@@ -1578,8 +1578,12 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the DiT and VAE keep batching. A prompt encoded in a batch gives another image than the
    same prompt alone, because a GEMM's rounding depends on its row count there and the
    reference feeds all 512 positions, padding included, to the DiT. Run alone, a prompt
-   takes the path a single request takes, so images at one request do not change. NVIDIA
-   keeps the batched encoder, and whether it has the same dependence is unmeasured.
+   takes the path a single request takes, so images at one request do not change. On one
+   MI325X at 16 requests a klein-4B image lands a median 41 dB from its single-request twin
+   on bf16 and 30 to 34 dB on fp8, against 26 dB batched, for up to 2% of images per second
+   (4% at 4 requests on fp8). klein-9B reads 33 to 34 and 31 to 32 dB against 27 to 28. The
+   distance from diffusers does not improve, as that comes from the DiT. NVIDIA keeps the
+   batched encoder, and whether it has the same dependence is unmeasured.
    ``z_image_turbo`` takes the same key and stays batched.
 
 ``vae_compile``
