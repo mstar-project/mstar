@@ -720,6 +720,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         on ``ModelInputsFromEngine``), e.g. for a bucket that follows a stream chunk.
 
         None (the default) means the walk has a single capture.
+
+        On a node whose only capture is a piecewise region, no forward
+        replays by this key: it only groups the scheduler's rows
+        (``split_batches_by_capture_key``) and need not name a bucket.
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
@@ -731,7 +735,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         runs worse than two captured ones, e.g. per-request eager; leave it off
         when a batched eager forward handles the mix well. On a node whose only
         capture is a piecewise region, the key only groups the scheduler's
-        rows (e.g. the requests that can replay a region together).
+        rows (e.g. Qwen3.5's vision node puts a request too large for one
+        replay in a group of its own).
         """
         del graph_walk
         return False

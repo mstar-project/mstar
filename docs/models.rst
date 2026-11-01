@@ -422,10 +422,10 @@ default, which lowers the token count of short clips. Notes:
   ordinary resolution exceeds the patches, and one over ~64 s with frames
   resized below ~256x256 pixels exceeds the segments.
 - An encoder step packs the images and videos of up to 8 requests into one
-  replay; requests that would overflow it together run one at a time, and a
-  request too large for a replay alone (a long video) gets a step of its own,
-  so no request's prefill waits for another's long encode. The
-  packed GEMMs' shapes follow the step's total patches, so an image's
+  replay. Requests that fit alone but would overflow it together run one
+  after another in that step. While the block loop is captured, a request too
+  large for a replay alone (a long video) gets a step of its own. The packed
+  GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
   beyond the largest captured ``prefill_vision`` bucket (4096), so it runs
@@ -1504,8 +1504,9 @@ Requests are therefore independent and the loop is resumable across ranks.
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
 resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
-6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured
-before #963's one-pass adaLN and fused q/k norm+RoPE
+6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
+an earlier version of the DiT block, before the adaLN was computed in one pass
+and the q/k norm and RoPE were fused
 (``model_kwargs: attention_backend: sdpa`` restores the reference kernel; the
 cross-attention over the 512 text tokens stays on SDPA, which is faster at that
 shape). The untiled VAE decode runs the shared Wan VAE decoder,
@@ -1531,12 +1532,12 @@ the sequence) that splits the classifier-free guidance batch: each rank runs one
 branch at batch 1 and the two noise predictions are all-gathered
 every step, so a guided step costs one branch's forward (502 vs 1000 ms at
 1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps;
-measured before #963). The
+measured on that earlier version). The
 text encoder and VAE run on rank 0. Without guidance both ranks compute the same
 step, correct but no faster. For throughput under concurrency,
 ``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
 at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
-decode; measured before #963), while one request takes the 1-GPU time.
+decode; measured on that earlier version), while one request takes the 1-GPU time.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

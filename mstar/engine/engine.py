@@ -2337,7 +2337,8 @@ class Engine:
     ) -> Any | None:
         """The capture bucket this one request would replay, by
         ``cg_key_info``; None when the walk has no capture or the submodule
-        does not split by it.
+        does not split by it. On a node whose only capture is a piecewise
+        region it is a scheduler group, not a bucket.
 
         A batch spanning two groups matches no capture and runs eager, so the
         scheduler batches each group on its own when the submodule opts in
