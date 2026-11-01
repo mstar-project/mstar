@@ -321,7 +321,8 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
     def build_layout(self, bucket_key: H3Layout, device) -> H3StepLayout:
         # the positions travel to the device in fp64 and round to fp32 there, as the reference's do
         pos = position_ids(bucket_key).to(device)
-        rope = rope_table(pos, rope_inv_freq(self.config.transformer), self.transformer.dtype)
+        cfg = self.config.transformer
+        rope = rope_table(pos, rope_inv_freq(cfg), self.transformer.dtype, cfg.attention_head_dim)
         classes, tags = timestep_classes(bucket_key), modality_tags(bucket_key)
         return H3StepLayout(
             rope=rope, row_index=(classes * NUM_MODALITIES + tags).to(device), row_class=classes.to(device),

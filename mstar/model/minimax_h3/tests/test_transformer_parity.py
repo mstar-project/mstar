@@ -33,6 +33,7 @@ from mstar.model.minimax_h3.components.layout import (  # noqa: E402
 from mstar.model.minimax_h3.components.transformer import (  # noqa: E402
     H3Inputs,
     H3StepLayout,
+    apply_rope,
     rope_inv_freq,
     rope_table,
 )
@@ -111,7 +112,7 @@ def test_velocity_matches_diffusers(models, anchors):
         text = conditioner(hidden, sdpa_attention)
         classes, tags = timestep_classes(layout), modality_tags(layout)
         step_layout = H3StepLayout(
-            rope=rope_table(position_ids(layout), rope_inv_freq(CFG), torch.float32),
+            rope=rope_table(position_ids(layout), rope_inv_freq(CFG), torch.float32, CFG.attention_head_dim),
             row_index=classes * NUM_MODALITIES + tags, row_class=classes, no_class=torch.zeros_like(classes),
             tags=tags,
             text_len=layout.text_len, num_condition_rows=layout.num_condition_rows,
@@ -131,3 +132,17 @@ def test_velocity_matches_diffusers(models, anchors):
         )
     torch.testing.assert_close(exact_video, want_video, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(exact_audio, want_audio, rtol=1e-4, atol=1e-5)
+
+
+def test_rope_rounds_as_diffusers_in_bf16():
+    """The rope is one product over the whole head; in bf16 every channel must still round
+    as diffusers' rotate-half does."""
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3RotaryPosEmbed, _apply_rotary_emb
+
+    cfg = H3TransformerConfig()
+    pos = position_ids(H3Layout(text_len=7, latent_frames=3, latent_height=4, latent_width=6, audio_latents=4))
+    g = torch.Generator().manual_seed(0)
+    x = (3 * torch.randn(1, pos.shape[0], 4, cfg.attention_head_dim, generator=g)).to(torch.bfloat16)
+    want = _apply_rotary_emb(x, *MiniMaxH3RotaryPosEmbed(cfg.rope_inv_freq_len, cfg.rope_theta)(pos))
+    got = apply_rope(x, rope_table(pos, rope_inv_freq(cfg), torch.bfloat16, cfg.attention_head_dim))
+    assert torch.equal(got, want)

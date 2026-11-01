@@ -40,13 +40,16 @@ Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class RopeTable(NamedTuple):
-    """``cos`` / ``sin`` ``[S, rotary_dim]`` of the packed rows, in the activation dtype."""
+    """``cos`` / ``sin`` ``[S, head_dim]`` of the packed rows, in the activation dtype, over
+    the whole head: the pass-through channels at cos 1, sin 0, and rotate-half's sign
+    folded into ``sin``."""
 
     cos: torch.Tensor
     sin: torch.Tensor
+    rotary_dim: int
 
     def rows(self, start: int, count: int) -> "RopeTable":
-        return RopeTable(self.cos.narrow(0, start, count), self.sin.narrow(0, start, count))
+        return RopeTable(self.cos.narrow(0, start, count), self.sin.narrow(0, start, count), self.rotary_dim)
 
 
 def rope_inv_freq(cfg: H3TransformerConfig) -> torch.Tensor:
@@ -56,25 +59,33 @@ def rope_inv_freq(cfg: H3TransformerConfig) -> torch.Tensor:
     return 1.0 / (cfg.rope_theta ** (torch.arange(0, 2 * n, 2, dtype=torch.float32) / (2 * n)))
 
 
-def rope_table(position_ids: torch.Tensor, inv_freq: torch.Tensor, dtype: torch.dtype) -> RopeTable:
+def rope_table(position_ids: torch.Tensor, inv_freq: torch.Tensor, dtype: torch.dtype, head_dim: int) -> RopeTable:
     """``MiniMaxH3RotaryPosEmbed.forward``: ``[S, 3]`` positions (rounded to fp32) times one
     frequency table per axis, concatenated ``(t, h, w)`` and doubled, then cos/sin in fp32
     on the positions' device, cast to ``dtype`` where the reference casts them."""
     freqs = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq.to(position_ids.device).view(1, 1, -1)
     freqs = torch.cat(freqs.unbind(dim=1), dim=-1)
     freqs = torch.cat((freqs, freqs), dim=-1)
-    return RopeTable(freqs.cos().to(dtype), freqs.sin().to(dtype))
+    cos, sin = freqs.cos().to(dtype), freqs.sin().to(dtype)
+    rot, half = cos.shape[-1], cos.shape[-1] // 2
+    rest = (cos.shape[0], head_dim - rot)
+    return RopeTable(
+        torch.cat((cos, cos.new_ones(rest)), dim=-1),
+        torch.cat((-sin[:, :half], sin[:, half:], sin.new_zeros(rest)), dim=-1),
+        rot,
+    )
 
 
 def apply_rope(x: torch.Tensor, rope: RopeTable) -> torch.Tensor:
     """``_apply_rotary_emb`` on ``[B, S, H, D]``: rotate-half over the leading
-    ``rotary_dim`` channels in the activation dtype, the rest passed through."""
-    rot = rope.cos.shape[-1]
-    x_rot, x_pass = x[..., :rot], x[..., rot:]
-    cos, sin = rope.cos[None, :, None, :], rope.sin[None, :, None, :]
-    x1, x2 = x_rot.chunk(2, dim=-1)
-    rotated = torch.cat((-x2, x1), dim=-1)
-    return torch.cat((x_rot * cos + rotated * sin, x_pass), dim=-1).contiguous()
+    ``rotary_dim`` channels in the activation dtype, the rest passed through. Written
+    as one product over the whole head (``x * cos + partner * sin``, each channel's
+    partner the one rotate-half moves into it), which rounds every channel as the
+    reference does and lets a compiled block fuse it with the q/k norm before it."""
+    rot = rope.rotary_dim
+    half = rot // 2
+    partner = torch.cat((x[..., half:rot], x[..., :half], x[..., rot:]), dim=-1)
+    return x * rope.cos[None, :, None, :] + partner * rope.sin[None, :, None, :]
 
 
 def timestep_sinusoid(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
@@ -264,7 +275,7 @@ class H3Inputs(NamedTuple):
 class H3StepLayout(NamedTuple):
     """One bucket's per-row tensors on the device, built once per layout."""
 
-    rope: RopeTable           # [S, rotary_dim]
+    rope: RopeTable           # [S, head_dim]
     row_index: torch.Tensor   # [S] AdaLN table row: timestep class * 3 + modality tag
     row_class: torch.Tensor   # [S] timestep class
     no_class: torch.Tensor    # [S] zeros: every row on the one timestep of a single-timestep step
