@@ -69,7 +69,6 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
-    w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
@@ -86,7 +85,7 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
@@ -124,7 +123,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
         ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
-            final_stream_rids={7}, stream_partition_done_rids={7},
+            final_stream_rids={7}, partition_done_rids={7},
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
@@ -151,7 +150,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert pending.node_batch.request_ids == []
     assert pending.node_batch.per_request_info == {}
     assert pending.node_batch.final_stream_rids == set()
-    assert pending.node_batch.stream_partition_done_rids == set()
+    assert pending.node_batch.partition_done_rids == set()
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
@@ -175,7 +174,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
         ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
-            final_stream_rids=set(), stream_partition_done_rids=set(),
+            final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
@@ -457,6 +456,7 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
     w.tensor_manager.register_request = lambda rid, cfg: None
     w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
+    w.scheduler.note_arrival = lambda rid: None
 
     Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
     assert not _reads_done(w)
@@ -483,7 +483,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._draining_rids = set()
     w._reads_done_sent = set()
     w._unprocessed_messages = {}
-    w._last_active = {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
     w._graph_runtime = SimpleNamespace(
@@ -504,7 +503,6 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     )
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        evictable_nodes=lambda: ["n"],
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
     w.tensor_manager = SimpleNamespace(
@@ -513,6 +511,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.scheduler = SimpleNamespace(note_arrival=lambda rid: seen.setdefault("scheduler", rid))
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
@@ -522,8 +521,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     handle = w._graph_runtime.get_rid_handle("X")
     assert handle == 1
     assert info.rid_handle == handle
-    assert seen == {"state": handle, "engine": handle, "tensors": handle}
-    assert set(w._last_active) == {(handle, "n")}
+    assert seen == {"state": handle, "scheduler": handle, "engine": handle, "tensors": handle}
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────

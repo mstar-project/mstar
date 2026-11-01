@@ -1,4 +1,5 @@
-"""Ragged attention head-dimension padding checks that need no GPU."""
+"""Ragged attention checks that need no GPU: head-dimension padding and the
+custom op's manager registry."""
 
 import sys
 from types import SimpleNamespace
@@ -120,3 +121,26 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch, tensor_core
     assert decode.call_count == (0 if tensor_cores else 1)
     if tensor_cores:
         assert prefill.call_args_list[0].kwargs["backend"] == "fa2"
+
+
+def test_a_dropped_manager_leaves_the_op_registry():
+    """The custom op finds a manager by key; the registry must not keep one
+    alive past the engine that built it, nor hand one engine's key to
+    another's manager over the same resource key."""
+    import gc
+
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.attn.ragged.base import _MANAGERS
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    spec = RaggedAttentionSpec(
+        resource_key="dropped", nodes={"encoder"},
+        config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
+    )
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16)
+    mgr, other = build_resource(spec, info), build_resource(spec, info)
+    assert _MANAGERS[mgr._key] is mgr and _MANAGERS[other._key] is other
+    key = mgr._key
+    del mgr
+    gc.collect()
+    assert key not in _MANAGERS

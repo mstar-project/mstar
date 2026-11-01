@@ -73,6 +73,17 @@ class EngineResourceInfo:
     max_rows_in_combined: "Mapping[str, int | None]" = field(
         default_factory=dict
     )
+    # the prefix caches this engine opens (`opening_prefix_caches`), decided
+    # before any resource is built, for one that sizes itself by its own
+    prefix_caches: frozenset[str] = frozenset()
+
+    @property
+    def head_shards(self) -> int:
+        """How many ways the node's ranks split its attention heads, which each
+        builder sizes head counts by: all its TP × SP ranks. A ragged resource
+        declaring ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
+        group = self.joint_comm_group
+        return 1 if group is None else group.world_size
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -119,13 +130,14 @@ class Resource(ABC):
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened."""
-        return False
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
+        """Open whatever this resource keeps across requests, under ``root``. The
+        engine calls it, before any request, on the caches `opening_prefix_caches` opens."""
+        return
 
     def close_prefix_cache(self) -> None:
-        """Undo `enable_prefix_cache`. Called before any request."""
+        """Keep nothing across requests. The engine calls it, before any
+        request, on every other resource."""
         return
 
     def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:

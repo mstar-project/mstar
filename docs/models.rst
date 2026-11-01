@@ -425,7 +425,8 @@ The ~437 GB of BF16 weights are never downloaded automatically: download the
 checkpoint and set ``model_kwargs.checkpoint_dir`` in
 ``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
 ``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
-H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. It keeps only the
+sliding layers' window per request, and no prefix cache yet. Tokenizer and config
 metadata are pinned to one checkpoint revision.
 ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
 all-reduce until FlashInfer's is measured there.
@@ -440,10 +441,10 @@ give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
 On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
 Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
-64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+64 (``benchmark/command_a_plus/bench_http.py``, measured before the sliding layers
+kept only their window); ``validate_checkpoint.py``
 there checks parity against Hugging Face, with ``--images`` for image prompts.
-Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
-outside the sliding window.
+Not supported yet: FP8 weights and prefill CUDA graphs.
 
 Kokoro notes
 ------------
@@ -493,6 +494,13 @@ Kokoro notes
 Qwen3-Omni notes
 ----------------
 
+- The audio and vision encoders attend through ragged attention resources
+  (``audio_attn`` within each 8 s window, ``vision_attn`` within each image or
+  video frame group), FlashInfer by default, so no ``flash-attn`` install is
+  needed. A deployment can pick the kernel under ``resources:`` in its YAML,
+  e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
+  is captured as a CUDA graph per token-count bucket; a request past the
+  largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
 - Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
   25-frame chunks behind 25 frames of left context. Playback stays gapless
   while the Talker produces frames at about 1.5x real time over the first 50
