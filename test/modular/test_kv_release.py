@@ -12,17 +12,24 @@ exactly the freed token count — because the planner indexes pages as
 
 from __future__ import annotations
 
+import dataclasses
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.engine.resources.kv.cache import PageAllocator
-from mstar.engine.resources.kv.config import KVStep, PagedKVConfig, RetentionPolicy
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.base import KeyedWalks
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, RetentionPolicy
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.manager import KVManager, PageArena
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.engine.windowing import WindowSchedule
 
@@ -368,3 +375,197 @@ def test_window_schedule_drives_the_manager() -> None:
         _assert_pages_conserved(m)
     st = _stream(m, "r")
     assert st.released == (schedule.total_units - 16) * tpu
+
+
+# --- sliding layers: the group with the window keeps the last tokens --------
+
+# Layer 0 is full and layers 1 and 2 slide, so a sliding page holds PS/2 tokens
+# of two layers: the same bytes as a full page.
+WINDOW = 10
+SLIDING = (1, 2)
+
+
+def _specs(cfg: PagedKVConfig, sliding=SLIDING, window: int = WINDOW) -> dict:
+    """``cfg``, an attention over it that keeps ``window`` of the ``sliding`` layers, and one
+    that runs the rest."""
+    return {
+        "kv": KVSpec(resource_key="kv", nodes={"LLM"}, config=cfg),
+        "local": AttentionSpec(resource_key="local", nodes={"LLM"},
+                               config=AttentionConfig("kv", sliding_window=window, layers=sliding)),
+        "full": AttentionSpec(resource_key="full", nodes={"LLM"}, config=AttentionConfig("kv")),
+    }
+
+
+def _windowed(cfg: PagedKVConfig, sliding=SLIDING, window: int = WINDOW) -> PagedKVConfig:
+    resolve_spec_dependencies(list(_specs(cfg, sliding, window).values()))
+    return cfg
+
+
+def _window_manager(max_num_pages: int = 32, joint_comm_group=None, config: dict | None = None, **kw) -> KVManager:
+    cfg = _windowed(PagedKVConfig(
+        num_layers=3, num_kv_heads=1, head_dim=4, max_seq_len=4096,
+        max_num_pages=max_num_pages, page_size=PS, **(config or {}),
+    ))
+    return KVManager(
+        cfg=cfg, name="kv", joint_comm_group=joint_comm_group,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
+        device=torch.device("cpu"), dtype=torch.float32, **kw,
+    )
+
+
+def _grow_writing(m: KVManager, rid: str, start: int, span: int) -> None:
+    """One step of ``span`` tokens whose K, in every layer, is the token's position."""
+    step = KVStep(segments=(Segment(rid, "main", span),))
+    ctx = _ctx(rid)
+    assert m.admit(step, ctx).ok
+    m.plan(step, ctx)
+    k = torch.arange(start, start + span, dtype=torch.float32)[:, None, None].expand(span, 1, 4)
+    for layer in range(3):
+        m.write_kv(k, -k, layer_idx=layer, label="main")
+    m.commit(step, ctx)
+
+
+def _held_positions(m: KVManager, stream, layer: int, page_size: int) -> list[int]:
+    view = m.layer_view(layer)
+    return [
+        int(view[stream.page_indices[i // page_size], 0, i % page_size, 0, 0])
+        for i in range(stream.stored_len)
+    ]
+
+
+def test_sliding_layers_keep_a_window() -> None:
+    """A long request's sliding layers hold about the window, its newest tokens, while its
+    full layer holds every token; what the window drops goes back to the pool."""
+    m = _window_manager()
+    kept = m.config.groups[1]
+    budget, page_size = kept.retention.context_budget, kept.page_size
+    free = m._arena.num_free
+    m.ingest_request("r")
+    total = 50
+    _grow_writing(m, "r", 0, total)
+    for _ in range(30):
+        _grow_writing(m, "r", total, 1)
+        total += 1
+        st = _stream(m, "r")
+        window = st.groups[1]
+        assert budget <= window.stored_len < budget + page_size
+        assert window.released + window.stored_len == total
+        assert len(window.page_indices) == -(-window.stored_len // page_size)
+        m.assert_pages_conserved()
+    # in pages of every layer, as max_num_pages counts them
+    assert m.page_counts().total == m.config.max_num_pages - 1
+    assert st.stored_len == total and st.released == 0
+    assert _held_positions(m, st, 0, PS) == list(range(total))
+    for layer in SLIDING:
+        assert _held_positions(m, window, layer, page_size) == list(range(window.released, total))
+    m.remove_request("r")
+    assert m._arena.num_free == free
+
+
+def test_a_window_pool_holds_the_bytes_of_max_num_pages() -> None:
+    """max_num_pages counts 128-token pages of every layer where the page size is derived, so
+    a pool that keeps a window, at the page its window derives, holds the bytes it would
+    keeping every token."""
+    geometry = dict(num_layers=4, num_kv_heads=1, head_dim=4, max_seq_len=4096, max_num_pages=3)
+    whole, windowed = PagedKVConfig(**geometry), _windowed(PagedKVConfig(**geometry), (1, 2, 3))
+    assert (whole.tokens_per_page, windowed.tokens_per_page) == (128, 192)
+    # a copy declares what the original did, so it derives the same page and bytes again
+    copied = _windowed(dataclasses.replace(windowed), (1, 2, 3))
+    cpu = torch.device("cpu")
+    for pool in (windowed, copied):
+        assert KVCache(pool, cpu, torch.float32).tensor.nbytes == KVCache(whole, cpu, torch.float32).tensor.nbytes
+
+
+class _CopyingPool(_FakePool):
+    """Moves each page's bytes, so a round trip can be checked."""
+
+    def __init__(self):
+        super().__init__()
+        self.host: dict[int, torch.Tensor] = {}
+
+    def copy_out(self, gpu_kv_cache, copies):
+        for gpu, cpu in zip(copies.gpu, copies.cpu, strict=True):
+            self.host[cpu] = gpu_kv_cache[:, gpu].clone()
+
+    def copy_in(self, gpu_kv_cache, copies):
+        for gpu, cpu in zip(copies.gpu, copies.cpu, strict=True):
+            gpu_kv_cache[:, gpu] = self.host[cpu]
+
+
+def test_window_survives_offload_and_reload() -> None:
+    """Both groups' pages go to the host and come back, bytes and window intact."""
+    m = _window_manager()
+    m._cpu_pool = _CopyingPool()
+    m.ingest_request("r")
+    _grow_writing(m, "r", 0, 50)
+    st = _stream(m, "r")
+    window = st.groups[1]
+    held = len(st.pages())
+    kept = (window.stored_len, window.released)
+    expected = [_held_positions(m, st, 0, PS)] + [_held_positions(m, window, i, PS // 2) for i in SLIDING]
+    assert m.offload("r") == held
+    assert not window.page_indices and m._cpu_pool.arena.num_free == 64 - held
+    m.kv_cache.tensor.fill_(-1)
+    assert m.reload("r")
+    assert (window.stored_len, window.released) == kept
+    assert [_held_positions(m, st, 0, PS)] + [_held_positions(m, window, i, PS // 2) for i in SLIDING] == expected
+    assert m._cpu_pool.arena.num_free == 64
+    m.assert_pages_conserved()
+
+
+def test_a_pool_derives_its_groups_wherever_it_is_resolved() -> None:
+    """The pool's groups come from its attentions each time the specs are resolved, after a
+    deployment's overrides, so its page_size is checked against them, and resolving again
+    changes nothing."""
+    geometry = dict(num_layers=3, num_kv_heads=1, head_dim=4, max_seq_len=64)
+    unresolved = PagedKVConfig(**geometry, page_size=PS)
+    unresolved.apply_yaml_overrides(page_size=7)
+    with pytest.raises(ValueError):
+        _windowed(unresolved)
+    specs = _specs(PagedKVConfig(**geometry))
+    apply_yaml_overrides(list(specs.values()), {"resources": {"kv": {"page_size": 2 * PS}}})
+    resolve_spec_dependencies(list(specs.values()))
+    assert [g.page_size for g in specs["kv"].config.groups] == [2 * PS, PS]
+    # a deployment's page size rescues a declared one the layers can't split, as validation
+    # accepts it: the overrides apply before the derivation checks them
+    four = {**geometry, "num_layers": 4, "page_size": 128}
+    with pytest.raises(ValueError):
+        _windowed(PagedKVConfig(**four), (1, 2, 3))
+    specs = _specs(PagedKVConfig(**four), (1, 2, 3))
+    apply_yaml_overrides(list(specs.values()), {"resources": {"kv": {"page_size": 192}}})
+    assert [g.page_size for g in specs["kv"].config.groups] == [192, 64]
+
+
+@pytest.mark.parametrize(("layers", "sliding", "pages"), [
+    (52, tuple(i for i in range(52) if i % 4 != 3), (192, 64)),   # 13 full, 39 sliding
+    (62, tuple(i for i in range(62) if i % 4 != 1), (184, 64)),   # 16 full, 46 sliding
+    (11, tuple(range(3, 11)), (176, 66)),                         # 3 full, 8 sliding
+    (11, tuple(range(8, 11)), (66, 176)),                         # 8 full, 3 sliding
+    (32, (31,), (64, 1984)),                                      # 31 full, 1 sliding: pages past a short window
+])
+def test_an_unset_page_size_is_whole_for_both_groups(layers, sliding, pages) -> None:
+    cfg = _windowed(PagedKVConfig(num_layers=layers, num_kv_heads=1, head_dim=4, max_seq_len=64), sliding, 4)
+    assert tuple(group.page_size for group in cfg.groups) == pages
+
+
+def test_window_pool_refusals_and_tp_offload(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="reads this pool"):
+        _window_manager(needs_remote_transfer=True)
+    # a model that keys labels still starts, without a prefix cache (a limitation for now)
+    m = _window_manager()
+    assert not m.config.prefix_cache
+    assert not m.enable_prefix_cache(b"root", {"main": KeyedWalks(("prefill",))}) and m._index is None
+    m.ingest_request("r")
+    free = m._arena.num_free
+    step = KVStep(segments=(Segment("r", "main", 4),), pre_forks=(("main", "other"),))
+    outcome = m.admit(step, _ctx("r"))
+    assert not outcome.ok and outcome.reason.terminal
+    assert m._arena.num_free == free
+    with pytest.raises(ValueError):
+        m.write_slots()
+    # no prefix cache, so prefix_cache_tp has no hit order for an offload to break
+    monkeypatch.setattr(manager_mod, "CPUPagePool", lambda **kw: _FakePool())
+    _window_manager(
+        joint_comm_group=SimpleNamespace(rank=0, world_size=2),
+        config=dict(num_qo_heads=2, prefix_cache_tp=True, cpu_offload_pages=4),
+    )

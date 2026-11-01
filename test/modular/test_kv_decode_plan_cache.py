@@ -4,6 +4,7 @@ and padding rows included, and anything else that touches a stream makes the
 next plan start from the streams again."""
 from __future__ import annotations
 
+import gc
 import importlib.util
 import pathlib
 import sys
@@ -13,8 +14,11 @@ import torch
 
 sys.path.insert(0, ".")
 
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
-from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
+from mstar.engine.resources.kv.manager import CacheStream, KVManager  # noqa: E402
+from mstar.engine.resources.kv.plan import KVPlanOutputs  # noqa: E402
+from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
@@ -32,12 +36,20 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(H.manager_mod, "KVTransferManager", H._StubTransfer)
 
 
-def _manager(mode: int) -> KVManager:
+def _manager(mode: int, sliding: tuple[int, ...] = ()) -> KVManager:
+    # with layer 0 full and layers 1 and 2 sliding, those slide in PAGE-token pages
+    geometry = dict(num_layers=3, page_size=2 * PAGE) if sliding else dict(num_layers=1, page_size=PAGE)
+    cfg = PagedKVConfig(num_kv_heads=1, head_dim=8, max_seq_len=512, max_num_pages=256, **geometry)
+    if sliding:
+        # a window of 6 for them, as the attention over them declares it
+        resolve_spec_dependencies([
+            KVSpec(resource_key="kv", nodes={"n"}, config=cfg),
+            AttentionSpec(resource_key="local", nodes={"n"},
+                          config=AttentionConfig("kv", sliding_window=6, layers=sliding)),
+            AttentionSpec(resource_key="full", nodes={"n"}, config=AttentionConfig("kv")),
+        ])
     kv = KVManager(
-        cfg=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
-            max_num_pages=256, page_size=PAGE,
-        ),
+        cfg=cfg,
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
@@ -72,33 +84,35 @@ def _decode(kv: KVManager, rids: tuple[str, ...], slot: int, pad: int = 0, commi
     return res, step, ctx
 
 
-def _flat(res):
+def _flat(res, page_sizes: tuple[int, ...] = (PAGE,)):
+    """Each (label, group)'s plan, as lists."""
     out = {}
-    for label, o in res.items():
-        ind = o.cpu_indptrs
-        out[label] = (
-            [tuple(v[:5]) for v in o.views],
-            ind.qo_indptr.tolist(), ind.paged_kv_indptr.tolist(), ind.paged_kv_indices.tolist(),
-            ind.paged_kv_last_page_len.tolist(), ind.kv_lens.tolist(),
-            [v.page_idxs[-1] for v in o.views],
-            [(v.last_page_len(PAGE) or PAGE) - 1 for v in o.views],
-        )
+    for g, (outputs, page) in enumerate(zip(res.groups, page_sizes, strict=True)):
+        for label, o in outputs.items():
+            ind = o.cpu_indptrs
+            out[label, g] = (
+                [tuple(v[:5]) for v in o.views],
+                ind.qo_indptr.tolist(), ind.paged_kv_indptr.tolist(), ind.paged_kv_indices.tolist(),
+                ind.paged_kv_last_page_len.tolist(), ind.kv_lens.tolist(),
+                [v.page_idxs[-1] for v in o.views],
+                [(v.last_page_len(page) or page) - 1 for v in o.views],
+            )
     return out
 
 
-def _run(mode: int, steps: int, pad: int):
-    kv = _manager(mode)
+def _run(mode: int, steps: int, pad: int, sliding: tuple[int, ...] = ()):
+    kv = _manager(mode, sliding)
     _prefill(kv, "a", 5)
     _prefill(kv, "b", 7)
     _prefill(kv, "c", 4)
     plans = []
     for t in range(steps):
         res, _, _ = _decode(kv, ("a", "b", "c"), slot=t % 2, pad=pad)
-        plans.append(_flat(res))
+        plans.append(_flat(res, tuple(g.page_size for g in kv.config.groups)))
         for o in res.values():
             if o.decode_pages is not None:
-                assert o.decode_pages.tolist() == plans[-1]["main"][6]
-                assert o.decode_offsets.tolist() == plans[-1]["main"][7]
+                assert o.decode_pages.tolist() == plans[-1]["main", 0][6]
+                assert o.decode_offsets.tolist() == plans[-1]["main", 0][7]
                 assert o.is_decode
     return kv, plans
 
@@ -110,6 +124,15 @@ def test_cached_decode_plans_match_the_full_ones(pad):
     assert fast == full
     # the first decode step plans from the streams, every later one off it
     assert kv.plan_cache_stats == {"hit": 11, "miss": 0, "mismatch": 0}
+
+
+def test_cached_decode_plans_follow_a_window():
+    """The sliding layers' plans off the cached one match the full ones while each
+    window releases a page every few steps, and a release costs no miss."""
+    _, full = _run(0, 20, 1, (1, 2))
+    kv, fast = _run(1, 20, 1, (1, 2))
+    assert fast == full
+    assert kv.plan_cache_stats == {"hit": 19, "miss": 0, "mismatch": 0}
 
 
 def test_verify_mode_sees_no_difference():
@@ -287,3 +310,25 @@ def test_views_built_after_the_next_preplan_keep_their_step():
     got.append([tuple(v) for v in late.views])
     assert got == want
     assert kv.plan_cache_stats["hit"] == 11
+
+
+def test_plans_and_streams_are_freed_by_refcount():
+    """A step's plan, with its pinned and device indptrs, and a removed request's streams go
+    when the last reference does, not at the cyclic GC's next pass."""
+    kv = _manager(0)
+    gc.collect()
+    # another test's module may keep its managers, and their streams, for the session
+    before = {id(o) for o in gc.get_objects() if isinstance(o, (KVPlanOutputs, CacheStream))}
+    gc.disable()
+    try:
+        _prefill(kv, "a", 5)
+        for t in range(4):
+            _decode(kv, ("a",), slot=t % 2)
+        kv.remove_request("a")
+        alive = [
+            type(o).__name__ for o in gc.get_objects()
+            if isinstance(o, (KVPlanOutputs, CacheStream)) and id(o) not in before
+        ]
+    finally:
+        gc.enable()
+    assert alive == []
