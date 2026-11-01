@@ -1,6 +1,7 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -26,6 +27,9 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import CapturedResidentStep
 
 
 class FlashInferManager(AttentionManager):
@@ -98,6 +102,13 @@ class FlashInferManager(AttentionManager):
         if self._window_left >= 0:
             return "a sliding window reads pages a resident row no longer holds"
         return None
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.label))
+        if isinstance(wrapper, FmhaDecodeWrapper):
+            table = step.block_table
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len, table.stride, table.col)
+            step.host_plan_free = True
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
@@ -234,6 +245,8 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
+            return
         refuse_context_only(step, type(self).__name__)
         if self._window_left >= 0 and not step.causal:
             raise ValueError("sliding_window requires causal attention")

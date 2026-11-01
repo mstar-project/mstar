@@ -2830,6 +2830,9 @@ class KVManager(AttentionResource):
         )
         laps = PhaseLaps(f"{ctx.plan_phase}.kv_cache.")
         self.reset_default_cursors()
+        if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
+            # nothing reads a plan of this step, and its graph fills the addressing
+            return KVPlanOutputs({})
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states

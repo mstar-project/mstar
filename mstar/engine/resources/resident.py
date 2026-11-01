@@ -182,6 +182,11 @@ class CapturedResidentStep:
     label: str
     slots: torch.Tensor
     buffers: ResidentBuffers
+    # the store and the block table, for attention that reads a row's pages itself
+    store: torch.Tensor | None = None
+    block_table: ResidentTable | None = None
+    # set by an owner whose kernel runs off the tables alone: nothing plans this bucket
+    host_plan_free: bool = False
 
 
 class ResidentPlanner:
@@ -203,6 +208,8 @@ class ResidentPlanner:
         self.narrow_cols = 0
         self._stager = PinnedStager(torch.long, numel=1 << 16)
         self._buffers: dict[tuple[BucketKey, int], ResidentBuffers] = {}
+        # buckets whose steps need no host plan at all
+        self.host_plan_free: set[BucketKey] = set()
 
         self._lock = threading.Lock()
         # rid -> slot. Handle-keyed: `release` purges it.
@@ -495,6 +502,8 @@ class ResidentPlanner:
     def gather(self, step: CapturedResidentStep) -> None:
         for resource in self._owners:
             resource.resident_gather(step)
+        if step.host_plan_free:
+            self.host_plan_free.add(step.bucket)
 
     def commit_in_graph(self, step: CapturedResidentStep) -> None:
         for resource in self._owners:

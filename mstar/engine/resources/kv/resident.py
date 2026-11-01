@@ -90,6 +90,7 @@ class KVResidentTables:
     def gather(self, step: CapturedResidentStep, token_to_page: torch.Tensor, token_to_cache: torch.Tensor) -> None:
         store, table = self.planner.store, self.block_table
         stride, page_size = table.stride, self.page_size
+        step.store, step.block_table = store, table
         # before the reads: a row that crossed writes into its new page
         scatter_cells(store, step.buffers.cells)
         kv_len = step.buffers.kv_len
