@@ -422,7 +422,9 @@ default, which lowers the token count of short clips. Notes:
   ordinary resolution exceeds the patches, and one over ~64 s with frames
   resized below ~256x256 pixels exceeds the segments.
 - An encoder step packs the images and videos of up to 8 requests into one
-  replay; requests that would overflow it together run one at a time. The
+  replay; requests that would overflow it together run one at a time, and a
+  request too large for a replay alone (a long video) gets a step of its own,
+  so no request's prefill waits for another's long encode. The
   packed GEMMs' shapes follow the step's total patches, so an image's
   embeddings can differ at the last bit with what it is batched beside.
 - On two GPUs, ``configs/qwen3_5_9b_dp2.yaml`` (a whole replica per GPU)
@@ -518,7 +520,8 @@ The ~437 GB of BF16 weights are never downloaded automatically: download the
 checkpoint and set ``model_kwargs.checkpoint_dir`` in
 ``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
 ``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
-H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. It keeps only the
+sliding layers' window per request, and no prefix cache yet. Tokenizer and config
 metadata are pinned to one checkpoint revision.
 ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
 all-reduce until FlashInfer's is measured there.
@@ -533,10 +536,10 @@ give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
 On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
 Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
-64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+64 (``benchmark/command_a_plus/bench_http.py``, measured before the sliding layers
+kept only their window); ``validate_checkpoint.py``
 there checks parity against Hugging Face, with ``--images`` for image prompts.
-Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
-outside the sliding window.
+Not supported yet: FP8 weights and prefill CUDA graphs.
 
 Kokoro notes
 ------------

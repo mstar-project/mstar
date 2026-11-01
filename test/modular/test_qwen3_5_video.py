@@ -605,6 +605,34 @@ def test_vision_batch_that_overflows_one_replay_runs_request_by_request():
     assert not encoder.can_batch(None, [request(64, 2), request(64, 3)])
 
 
+def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
+    """The scheduler groups vision requests by `cg_key_info`: requests that fit
+    a replay alone share steps, and one past the top patch bucket or the
+    segment ceiling is a group of its own, so a long video's embeddings are
+    not held back for its batch's others. The engine splits a node whose only
+    capture is a piecewise region."""
+    from mstar.engine.engine import Engine
+    from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY
+
+    encoder = _encoder(max_segments=4)
+
+    def info(*grid):
+        return SimpleNamespace(step_metadata={STEP_GRIDS_KEY: list(grid)})
+
+    image, video, frames = info((1, 16, 16)), info((2, 128, 128)), info((5, 16, 16))
+    assert encoder.cg_key_info("prefill_vision", {1: image}) is None
+    assert encoder.cg_key_info("prefill_vision", {2: video}) == (2,)
+    assert encoder.cg_key_info("prefill_vision", {3: frames}) == (3,)
+
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"vision_encoder": SimpleNamespace(
+        submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
+    )}
+    assert engine.splits_by_capture_key("vision_encoder", "prefill_vision")
+    assert engine.capture_group("vision_encoder", "prefill_vision", 2, video) == (2,)
+    assert engine.capture_group("vision_encoder", "prefill_vision", 1, image) is None
+
+
 def test_vision_encoder_refuses_patches_it_would_not_normalize():
     with pytest.raises(ValueError, match="uint8"):
         _encoder(max_segments=4)._normalize(torch.zeros(2, 3))

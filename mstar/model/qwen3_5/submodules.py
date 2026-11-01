@@ -134,10 +134,10 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
-        # only a decode row's token ends decode_loop; a prefill is not in it yet
         self.token_stop = TokenStop(
             loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
-            sampler=SAMPLER, walk="decode",
+            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+            last_prefill_flag="last_prefill",
         )
         # the decode walk reads its input ids off the sampler's slot masters
         self.device_loopback = DeviceLoopback(
@@ -617,12 +617,13 @@ class VisionEncoderSubmodule(NodeSubmodule):
     A replay's attention plan holds at most the vision attention resource's
     ``max_segments_per_step`` segments. A batch that would overflow it or
     the top patch bucket runs its requests one at a time instead, each
-    replaying if it fits alone; a request too large alone runs the block loop
-    eagerly.
+    replaying if it fits alone. A request too large alone (a long video)
+    runs the block loop without the graph, in a step of its own
+    (`cg_key_info`).
     """
 
     # Patch-count buckets of one replay. 16384 patches merge to the LLM's
-    # 4096 `prefill_vision` bucket; a larger step runs eagerly.
+    # 4096 `prefill_vision` bucket; a larger step runs uncaptured.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
     # Requests per encoder step. They share one replay, so a burst of image
     # requests pays the per-step host cost once per this many, not per image.
@@ -633,9 +634,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
     # guards on the batch size: every new size recompiled (~0.6 s, on a live
     # request). The tensor stages are compiled on their own instead
     # (`compile_regions`), dynamic in the patch count, so one graph serves
-    # every capture bucket and the eager steps past the top one. Uncompiled,
-    # the blocks' fp32 rope, norms and activations were over half the tower's
-    # GPU time on long videos.
+    # every capture bucket and the uncaptured steps past the top one.
+    # Uncompiled, the blocks' fp32 rope, norms and activations were over half
+    # the tower's GPU time on long videos.
     disable_torch_compile = True
 
     def __init__(
@@ -710,8 +711,27 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # packed, the requests must fit one replay together. Applied with the
         # block loop uncaptured too (capture off, or a node without the
         # runner), where it only splits a large step into per-request runs.
-        patches = sum(inp.input_seq_len for inp in model_inputs)
-        return patches <= self.BLOCK_LOOP_PATCH_BUCKETS[-1] and self._fits_capture(model_inputs)
+        return self._fits_capture(model_inputs)
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        return True
+
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict, **kwargs: Any,
+    ) -> Any:
+        """The scheduler's group (``split_batches_by_capture_key``): requests
+        that each fit a replay alone pack together (None); one too large for
+        a replay (a long video) is a group of its own, so it gets a step of
+        its own. Beside others it would run back to back with them in one
+        step (`can_batch`), which holds every request's embeddings, and so
+        their prefills, until the last one is encoded."""
+        return tuple(
+            rid for rid, info in per_request_info.items()
+            if not self._fits_replay(
+                sum(t * h * w for t, h, w in info.step_metadata[STEP_GRIDS_KEY]),
+                sum(t for t, _, _ in info.step_metadata[STEP_GRIDS_KEY]),
+            )
+        ) or None
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         return self.MAX_BATCH_SIZE
@@ -772,8 +792,16 @@ class VisionEncoderSubmodule(NodeSubmodule):
         }
 
     def _fits_capture(self, inputs: list[NodeInputs]) -> bool:
-        """Whether the batch's segments fit a replay's attention plan: the
-        resource's per-step ceiling, read from it so a YAML override holds.
+        """Whether the batch fits one replay (`_fits_replay`)."""
+        return self._fits_replay(
+            sum(inp.input_seq_len for inp in inputs),
+            sum(len(inp.tensor_inputs["seq_lengths"]) for inp in inputs),
+        )
+
+    def _fits_replay(self, patches: int, segments: int) -> bool:
+        """Whether a step of this many patches and attention segments fits one
+        replay: the top patch bucket, and the attention plan's per-step
+        segment ceiling, read from the resource so a YAML override holds.
 
         TODO: capture more than 64 segments, so long low-res videos replay
         too. The ceiling is sized for images (16384 patches / 256-patch
@@ -782,9 +810,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         2x2 merge block) would hold any prompt that fits, at small buckets'
         cost unchanged; that is a ragged-resource change.
         """
-        segments = sum(len(inp.tensor_inputs["seq_lengths"]) for inp in inputs)
         # the whole step replays as one row (`one_row_per_step`)
-        return segments <= self.node_resources[VISION_ATTN].max_segments_per_step
+        return (
+            patches <= self.BLOCK_LOOP_PATCH_BUCKETS[-1]
+            and segments <= self.node_resources[VISION_ATTN].max_segments_per_step
+        )
 
     def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         """The captured region: reads the runner's buffers, never rebinds."""
