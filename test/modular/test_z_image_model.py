@@ -116,6 +116,31 @@ def test_capture_shapes_cover_sizes_times_caption_buckets():
     assert _make_model(accelerator_graph=False).capture_buckets() == []
 
 
+@pytest.mark.parametrize(("capture_sizes", "batch_sizes", "limit"), [
+    ([[1024, 1024]], [1, 2, 4, 8], None),  # 2 x 4 x 4 graphs fit the process-wide limit
+    ([[1024, 1024], [768, 1344]], list(range(1, 9)), 128),
+])
+def test_the_transformers_recompile_limit_covers_the_capture_plan(monkeypatch, capture_sizes, batch_sizes, limit):
+    from mstar.engine import recompile_limit
+    from mstar.model.components.diffusion import compile_utils
+    from mstar.model.z_image.submodules import ZImageDenoiseSubmodule
+
+    seen = {}
+
+    def fake_compile(fn, **kwargs):
+        seen.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(compile_utils.torch, "compile", fake_compile)
+    model = _make_model(capture_sizes=capture_sizes, capture_caption_lengths=[32, 64, 96, 128],
+                        capture_batch_sizes=batch_sizes)
+    ZImageDenoiseSubmodule(
+        torch.nn.Linear(2, 2), ZImageConfig(), loop_name=DENOISE_LOOP, attn_resource_key=None,
+        capture_buckets=model.capture_buckets(), capture_batch_sizes=model.capture_batch_sizes,
+    )
+    assert seen["recompile_limit"] == (limit or recompile_limit())
+
+
 def test_postprocess_png_and_adapter():
     model = _make_model()
     assert model.postprocess(torch.zeros(1, 3, 16, 16, dtype=torch.uint8), "image")[:4] == b"\x89PNG"
