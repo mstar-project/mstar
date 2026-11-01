@@ -47,6 +47,8 @@ model_kwargs:
     - single_blocks.18.out
     - single_blocks.0.qkv_mlp
     - single_blocks.3.qkv_mlp
+  # linear_dtype_steps picks the dtype per denoise step (docs/models.rst): with this list, [bf16, bf16, fp8, fp8] loses
+  # 0.2 dB on the typical image against bf16 on MI325X, 1.3 dB with fp8 on every step, at about half of the speedup
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 

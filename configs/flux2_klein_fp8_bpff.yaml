@@ -1,0 +1,64 @@
+model: "flux2_klein"
+
+# MI325X: median 23.61 dB from diffusers (floor 22.43), +4% images/s at c=1 and +11.5% at c=16 over bf16 (shared node)
+max_seq_len: 512
+
+model_kwargs:
+  linear_dtype: fp8
+  linear_dtype_steps: [bf16, fp8_partial, fp8, fp8]
+  fp8_partial_keep_bf16:
+    - double_blocks.0.attn.img_out
+    - double_blocks.4.attn.img_out
+    - double_blocks.0.attn.img_qkv
+    - double_blocks.2.attn.img_out
+    - double_blocks.3.attn.img_out
+    - double_blocks.1.attn.img_out
+    - double_blocks.4.attn.img_qkv
+    - single_blocks.0.out
+    - single_blocks.1.out
+    - single_blocks.6.out
+    - single_blocks.3.out
+    - double_blocks.2.attn.img_qkv
+    - single_blocks.2.out
+    - double_blocks.3.attn.img_qkv
+    - double_blocks.0.img_ff.linear_out
+    - double_blocks.3.img_ff.linear_out
+    - single_blocks.7.out
+    - double_blocks.4.img_ff.linear_out
+    - double_blocks.0.img_ff.linear_in
+    - double_blocks.1.img_ff.linear_out
+    - single_blocks.4.out
+    - single_blocks.5.out
+    - single_blocks.12.out
+    - double_blocks.2.img_ff.linear_out
+    - single_blocks.9.out
+    - double_blocks.1.attn.img_qkv
+    - single_blocks.11.out
+    - single_blocks.8.out
+    - single_blocks.10.out
+    - single_blocks.13.out
+    - double_blocks.3.img_ff.linear_in
+    - double_blocks.1.img_ff.linear_in
+    - single_blocks.16.out
+    - single_blocks.0.qkv_mlp
+  attention_backend: auto
+  compile: true
+  compile_eager_rounding: true
+  compile_exact_ops: [norms]
+  accelerator_graph: true
+  capture_sizes: [[1024, 1024], [768, 1344]]
+  capture_edit_sizes: [[1024, 1024]]
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+  max_batch_size: 8
+  vae_compile: true
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]
+
+knobs:
+  dit_exact_ops: true

@@ -23,7 +23,11 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    STEP_POLICY_RECOMPILE_LIMIT,
+    ExactOps,
+    compile_transformer_forward,
+)
 from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
     compile_vae_decode,
@@ -42,6 +46,7 @@ from mstar.model.components.diffusion.image_io import (
     unpatchify_latents,
 )
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
+from mstar.model.components.fp8_linear import StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
@@ -194,10 +199,11 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
         self.config = config
@@ -209,6 +215,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
             compile_transformer_forward(
                 transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                recompile_limit=None if step_dtypes is None else STEP_POLICY_RECOMPILE_LIMIT,
             )
 
     # hooks -----------------------------------------------------------------

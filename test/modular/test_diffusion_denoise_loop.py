@@ -22,6 +22,7 @@ from mstar.engine.resources.convenience import RaggedAttentionCallable  # noqa: 
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
+    StepBucket,
     StepScalar,
 )
 from mstar.model.components.diffusion.flow_match import (  # noqa: E402
@@ -29,6 +30,7 @@ from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     FlowMatchSchedule,
     euler_step,
 )
+from mstar.model.components.fp8_linear import StepDtypes  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
 LOOP = "denoise_loop"
@@ -503,6 +505,80 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
     assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
     assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
+
+
+def _policy(*steps: str) -> StepDtypes:
+    return StepDtypes(steps or ("bf16", "fp8", "fp8", "fp8"))
+
+
+def test_a_steps_key_carries_its_dtype_under_a_policy():
+    sub = ToyDenoise(step_dtypes=_policy())
+    key = sub.bucket_key_for(_info("r", 0))
+    latents = torch.zeros(8, 3)
+    assert sub.prepare_inputs(WALK, _info("r", 0), _inputs()).resource_step_info == StepBucket(key, "bf16")
+    for k in (1, 3):
+        info = _info("r", k)
+        assert sub.prepare_inputs(WALK, info, _inputs(latents)).resource_step_info == StepBucket(key, "fp8")
+
+
+def test_without_a_policy_a_steps_key_is_the_models():
+    sub = ToyDenoise()
+    assert sub.prepare_inputs(WALK, _info("r", 0), _inputs()).resource_step_info == sub.bucket_key_for(_info("r", 0))
+    assert not sub.split_batches_by_capture_key(WALK)
+
+
+def test_two_dtypes_never_share_a_batch():
+    sub = ToyDenoise(step_dtypes=_policy())
+    latents = torch.zeros(8, 3)
+    first = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
+    second = sub.prepare_inputs(WALK, _info("b", 1), _inputs(latents))
+    third = sub.prepare_inputs(WALK, _info("c", 2), _inputs(latents))
+    assert not sub.can_batch(None, [first, second])
+    assert sub.can_batch(None, [second, third])
+    assert sub.split_batches_by_capture_key(WALK)
+
+
+def test_cg_key_info_and_declare_step_agree_under_a_policy():
+    sub = ToyDenoise(attn_resource_key=None, step_dtypes=_policy())
+    sub.attn_resource_key = "dit_attn"
+    latents = torch.zeros(8, 3)
+    infos = {_handle(r): _info(r, k) for r, k in (("a", 2), ("b", 1))}
+    inputs = [sub.prepare_inputs(WALK, info, _inputs(latents)) for info in infos.values()]
+    key = sub.cg_key_info(WALK, infos)
+    assert key == StepBucket(sub.bucket_key_for(infos[_handle("a")]), "fp8")
+    assert sub.declare_step(WALK, list(infos), inputs).cg_key_info == key
+    mixed = {_handle("a"): _info("a", 0), _handle("b"): _info("b", 1)}
+    assert sub.cg_key_info(WALK, mixed) is None  # a mix matches no capture
+
+
+def test_each_captured_bucket_gets_one_graph_per_dtype():
+    bucket = (8, 3)
+    sub = ToyDenoise(
+        capture_buckets=[(WALK, bucket)], capture_batch_sizes=(1, 2), step_dtypes=_policy("bf16", "bf16", "fp8"),
+    )
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    assert [c.additional_key_info for c in configs] == [StepBucket(bucket, "bf16"), StepBucket(bucket, "fp8")]
+    for config in configs:
+        assert config.single_request_inputs.resource_step_info == config.additional_key_info
+
+
+def test_a_step_runs_in_its_rows_dtype_and_the_model_sees_its_own_key():
+    policy = _policy()
+    seen = []
+
+    class Recording(ToyDenoise):
+        def denoise(self, engine_inputs, bucket_key, latents, timestep, sigma, sigma_next, **cond):
+            seen.append((bucket_key, policy.active))
+            return latents
+
+    sub = Recording(step_dtypes=policy)
+    latents = torch.zeros(8, 3)
+    key = sub.bucket_key_for(_info("r", 0))
+    for k, dtype in ((0, "bf16"), (1, "fp8")):
+        inputs = [sub.prepare_inputs(WALK, _info("r", k), _inputs(latents if k else None))]
+        engine_inputs = ModelInputsFromEngine(request_ids=["r"], per_request_info={})
+        sub.forward(WALK, engine_inputs, **sub.preprocess(WALK, engine_inputs, inputs))
+        assert seen[-1] == (key, dtype)
 
 
 def dataclasses_replace(info, **changes):

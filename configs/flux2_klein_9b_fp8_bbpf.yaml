@@ -1,0 +1,82 @@
+model: "flux2_klein_9b"
+
+# MI325X: median 26.37 dB from diffusers (floor 25.46), +1% images/s at c=1 and +7% at c=16 over bf16 (shared node)
+max_seq_len: 512
+
+model_kwargs:
+  linear_dtype: fp8
+  linear_dtype_steps: [bf16, bf16, fp8_partial, fp8]
+  fp8_partial_keep_bf16:
+    - double_blocks.0.attn.img_out
+    - double_blocks.2.attn.img_out
+    - double_blocks.4.attn.img_out
+    - double_blocks.5.attn.img_out
+    - double_blocks.7.attn.img_out
+    - double_blocks.3.attn.img_out
+    - double_blocks.1.attn.img_out
+    - double_blocks.6.attn.img_out
+    - double_blocks.0.attn.img_qkv
+    - double_blocks.2.attn.img_qkv
+    - double_blocks.3.attn.img_qkv
+    - double_blocks.6.attn.img_qkv
+    - double_blocks.0.img_ff.linear_out
+    - double_blocks.1.attn.img_qkv
+    - double_blocks.4.attn.img_qkv
+    - single_blocks.0.out
+    - double_blocks.5.attn.img_qkv
+    - double_blocks.7.attn.img_qkv
+    - single_blocks.2.out
+    - double_blocks.2.img_ff.linear_out
+    - double_blocks.1.img_ff.linear_out
+    - double_blocks.3.img_ff.linear_out
+    - double_blocks.6.img_ff.linear_out
+    - single_blocks.1.out
+    - single_blocks.5.out
+    - double_blocks.4.img_ff.linear_out
+    - double_blocks.7.img_ff.linear_out
+    - double_blocks.4.img_ff.linear_in
+    - double_blocks.3.img_ff.linear_in
+    - double_blocks.5.img_ff.linear_out
+    - single_blocks.3.out
+    - double_blocks.1.img_ff.linear_in
+    - single_blocks.4.out
+    - double_blocks.2.img_ff.linear_in
+    - double_blocks.7.img_ff.linear_in
+    - single_blocks.6.out
+    - single_blocks.12.out
+    - single_blocks.7.out
+    - single_blocks.8.out
+    - single_blocks.10.out
+    - double_blocks.0.img_ff.linear_in
+    - single_blocks.3.qkv_mlp
+    - double_blocks.5.img_ff.linear_in
+    - double_blocks.6.img_ff.linear_in
+    - single_blocks.0.qkv_mlp
+    - single_blocks.16.out
+    - single_blocks.18.out
+    - single_blocks.11.out
+    - single_blocks.9.out
+    - single_blocks.13.out
+    - single_blocks.15.out
+  fp8_keep_bf16: []
+  attention_backend: auto
+  compile: true
+  compile_eager_rounding: true
+  compile_exact_ops: [norms]
+  accelerator_graph: true
+  capture_sizes: [[1024, 1024], [768, 1344]]
+  capture_edit_sizes: [[1024, 1024]]
+  capture_batch_sizes: [1, 2, 3, 4]
+  max_batch_size: 4
+  vae_compile: true
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]
+
+knobs:
+  dit_exact_ops: true
