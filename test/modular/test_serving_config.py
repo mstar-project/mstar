@@ -81,6 +81,7 @@ def test_the_gentle_ramp_configs_are_their_base_with_a_chunk_schedule(ramp, base
 
 @pytest.mark.parametrize("name, bf16", [
     ("flux2_klein.yaml", "flux2_klein_bf16.yaml"),
+    ("flux2_klein_9b.yaml", "flux2_klein_9b_bf16.yaml"),
 ])
 def test_the_klein_configs_serve_bf16_on_cuda_and_fp8_on_rocm(monkeypatch, name, bf16):
     """On AMD GPUs the override adds fp8 and the knob it needs to the file's
