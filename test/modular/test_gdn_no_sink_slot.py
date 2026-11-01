@@ -34,6 +34,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
 )
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.platforms import current_platform
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 POOL, BACKEND = "gdn_state", "linear_attn"
@@ -86,7 +87,8 @@ def test_backend_takes_the_sink_setting_off_the_pool():
 # --- the gather/scatter itself --------------------------------------------
 
 requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlashInfer's chunked kernel needs a GPU"
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="FlashInfer's chunked kernel needs an NVIDIA GPU",
 )
 
 

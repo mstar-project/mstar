@@ -453,7 +453,9 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
 
 Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
 cache, or when that cache's ``prefix_cache`` is off; in those three cases the pool allocates
-no snapshot slots. Every cache on the node then stays shut, and the engine logs which
+no snapshot slots. They also stay off when a resource over the pool can't write them, as
+AITER's GDN kernels on AMD GPUs can't (they keep no state checkpoints), though the slots are
+allocated by then. Every cache on the node then stays shut, and the engine logs which
 resource kept it shut.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:
@@ -624,6 +626,15 @@ The spec types are:
        a cos/sin table built once (GLM-5.2 uses float32). A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+   * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
+     - The linear-attention layers' kernels, planned against the named pool:
+       ``LinearAttnVariant.GDN`` or ``MAMBA2``. ``backend`` selects the GDN kernels:
+       ``LinearAttnBackend.AUTO`` (the default: AITER's on an AMD GPU, FlashInfer's
+       elsewhere), ``FLASHINFER`` or ``AITER``. Mamba-2 runs M*'s own Triton kernels
+       under every backend. AITER's chunked prefill builds its schedule on the host,
+       so a prefill capture bucket larger than ``max_captured_prefill_tokens`` (512
+       by default) runs eagerly; smaller ones capture a sequential kernel whose cost
+       grows with the longest row.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
@@ -1812,6 +1823,10 @@ that a misspelled setting is never silently ignored:
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
        ``max_tokens_per_request``. The two ceilings size CUDA-graph buckets, which is a
        memory-against-coverage trade the deployment makes, not the model.
+   * - ``LinearAttnSpec``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``; ``auto`` is the platform's
+       default), ``max_captured_prefill_tokens`` (AITER only: the largest prefill
+       capture bucket; larger buckets run eagerly)
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,

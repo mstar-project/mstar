@@ -13,10 +13,12 @@ import torch
 
 from mstar.engine.resources.linear_attn.wrappers import GDNMixedWrapper, GDNPrefillWrapper
 from mstar.engine.resources.recurrent.pool import SINK_SLOT
+from mstar.platforms import current_platform
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlashInfer's GDN kernels need a GPU"
+    not torch.cuda.is_available() or current_platform.is_rocm(),
+    reason="FlashInfer's GDN kernels need an NVIDIA GPU (test/rocm/test_gdn_aiter.py covers AMD)",
 )
 
 HEADS, DIM, CONV_DIM, WIDTH, SLOTS = 4, 128, 256, 4, 16
