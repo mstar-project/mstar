@@ -70,6 +70,7 @@ from mstar.model.qwen3_tts.components.speaker_encoder import (
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
+    blackwell_path_measured,
 )
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
@@ -101,7 +102,7 @@ from mstar.utils.h2d import PinnedStager
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
-# what the first depth pass feeds: the Talker hidden state and the group-0 embedding
+# what a two-token first depth pass feeds: the Talker hidden state and the group-0 embedding
 FIRST_PASS_TOKENS = 2
 
 
@@ -109,7 +110,7 @@ class DepthAddressing(NamedTuple):
     """Each depth token's position and batch row, for one batch size. The tensors
     outlive a capture, so a replay spends no launches rebuilding them."""
 
-    first_positions: torch.Tensor  # [batch * FIRST_PASS_TOKENS], the first pass
+    first_positions: torch.Tensor  # [batch * FIRST_PASS_TOKENS], a two-token first pass
     first_rows: torch.Tensor  # [batch * FIRST_PASS_TOKENS]
     positions: torch.Tensor  # [groups, batch], the single-token passes
     rows: torch.Tensor  # [batch]
@@ -185,6 +186,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Lazy frame-local CodePredictor KV scratch, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
         self._depth_addressing: DepthAddressing | None = None
+        # Decided once, on the device the weights loaded to.
+        self.two_token_first_pass = blackwell_path_measured(self.get_device())
+        talker_model.model.fused_add_norm = self.two_token_first_pass
+        code_predictor.fused_add_norm = self.two_token_first_pass
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -675,16 +680,21 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         cp_cache = self._get_cp_kv_cache(batch_size)
         addressing = self._get_depth_addressing(batch_size)
-        # The first pass runs positions 0 and 1 as two tokens of one pass: the
-        # Talker hidden state conditions the decoder, and the group-0 embedding
-        # predicts group 1. Each later position consumes the previous group's
-        # embedding.
-        cp_hidden = self.code_predictor.forward_depth_unrolled(
-            torch.stack((last_hidden, codec_embed), dim=1),
-            addressing.first_positions, addressing.first_rows, cp_cache, cache_pos=0,
-        )
+        # Position 0 conditions the depth decoder on the Talker hidden state,
+        # and each following position consumes the previous group's embedding.
+        # Positions 0 and 1 can run as two tokens of one pass, which predicts
+        # group 1.
+        if self.two_token_first_pass:
+            cp_hidden = self.code_predictor.forward_depth_unrolled(
+                torch.stack((last_hidden, codec_embed), dim=1),
+                addressing.first_positions, addressing.first_rows, cp_cache, cache_pos=0,
+            )
+        else:
+            self.code_predictor.forward_depth_unrolled(
+                last_hidden.unsqueeze(1), addressing.positions[0], addressing.rows, cp_cache, cache_pos=0,
+            )
         for group_idx in range(1, self.num_codes):
-            if group_idx > 1:
+            if group_idx > 1 or not self.two_token_first_pass:
                 cp_hidden = self.code_predictor.forward_depth_unrolled(
                     codec_embed.unsqueeze(1),
                     addressing.positions[group_idx], addressing.rows, cp_cache, cache_pos=group_idx,

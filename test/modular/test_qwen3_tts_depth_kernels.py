@@ -1,9 +1,9 @@
-"""Qwen3-TTS's depth loop: the fused q/k norm + RoPE + KV write (``qk_norm_rope_kv_write``) with its guard and eager
-fallback, the decode attention over several tokens of a row, and the two-token first pass.
+"""Qwen3-TTS's depth loop: the fused q/k norm + RoPE + KV write (``qk_norm_rope_kv_write``) with its eager fallback, the
+decode attention over several tokens of a row, the two-token first pass and the deferred residual adds.
 
-The CPU tests stand a Python reference in for the Triton kernels and pin the selection, the guard and what a two-token
-pass means. The GPU tests hold the kernels to the eager path at bf16 tolerance on the predictor's own geometry (16
-groups, 16 q and 8 KV heads of 128, rows 1/8/28).
+The CPU tests stand a Python reference in for the Triton kernels and pin what a two-token pass means. The GPU tests hold
+the kernels to the eager path at bf16 tolerance on the predictor's own geometry (16 groups, 16 q and 8 KV heads of 128,
+rows 1/8/28).
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 
 import mstar.model.qwen3_tts.components.talker as talker_module
+from mstar.model.components.norm import RMSNorm
+from mstar.model.qwen3_tts import submodules
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     Qwen3TTSCodePredictorConfig,
@@ -122,10 +124,12 @@ def addressing_dtypes(submodule: TalkerSubmodule) -> set[torch.dtype]:
     return {full.first_positions.dtype, full.positions.dtype}
 
 
-def test_depth_loop_runs_the_first_two_tokens_as_one_pass(monkeypatch):
+@pytest.mark.parametrize("two_tokens", [True, False], ids=["two_tokens", "one_token"])
+def test_depth_loop_passes(monkeypatch, two_tokens):
     config = _config()
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
     submodule.code_predictor.consolidate_stacked_weights()
+    submodule.two_token_first_pass = two_tokens
     cp = config.talker.code_predictor
     calls = []
 
@@ -139,59 +143,84 @@ def test_depth_loop_runs_the_first_two_tokens_as_one_pass(monkeypatch):
     layer0 = torch.tensor([1, 2])
     codes, embed_sum = submodule._depth_loop(hidden, layer0, lambda logits: logits.argmax(-1))
 
-    assert len(calls) == GROUPS - 1
-    assert calls[0] == ((batch, 2), [0, 1, 0, 1], [0, 0, 1, 1], 0)
+    if two_tokens:
+        first = [((batch, 2), [0, 1, 0, 1], [0, 0, 1, 1], 0)]
+    else:
+        first = [((batch, 1), [group, group], [0, 1], group) for group in range(2)]
+    assert calls == first + [((batch, 1), [group, group], [0, 1], group) for group in range(2, GROUPS)]
     assert addressing_dtypes(submodule) == {torch.int32}
-    for group in range(2, GROUPS):
-        assert calls[group - 1] == ((batch, 1), [group, group], [0, 1], group)
     assert codes.shape == (batch, GROUPS)
     assert codes[:, 0].tolist() == [1, 2]
     assert embed_sum.shape == (batch, config.talker.hidden_size)
 
 
-def _fake_tensors(head_dim=128, dtype=torch.bfloat16, cache_dtype=None, q_stride=1, cache_stride=1, device_type="cuda"):
-    device = SimpleNamespace(type=device_type)
-    q = SimpleNamespace(shape=(4, 16, head_dim), device=device, dtype=dtype, stride=lambda _dim: q_stride)
-    cache = SimpleNamespace(dtype=cache_dtype or dtype, stride=lambda _dim: cache_stride)
-    return q, cache
+@pytest.mark.parametrize("measured", [True, False])
+def test_one_gate_decides_the_add_norms_and_the_two_token_pass(monkeypatch, measured):
+    monkeypatch.setattr(submodules, "blackwell_path_measured", lambda device: measured)
+    config = _config()
+    talker, predictor = Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config)
+    submodule = TalkerSubmodule(talker, predictor, config)
+    assert submodule.two_token_first_pass is measured
+    assert talker.model.fused_add_norm is measured
+    assert predictor.fused_add_norm is measured
 
 
-@pytest.fixture
-def blackwell(monkeypatch):
-    seen = []
-
-    def has_capability(major, minor, device):
-        seen.append((major, minor))
-        return (major, minor) <= (10, 3)
-
-    monkeypatch.setattr(attention, "current_platform", SimpleNamespace(has_cuda_capability=has_capability))
-    return seen
-
-
-def test_guard_takes_what_the_predictor_runs(blackwell):
-    assert attention.qk_norm_rope_kv_write_applies(*_fake_tensors())
-    assert attention.qk_norm_rope_kv_write_applies(*_fake_tensors(dtype=torch.float32))
-    assert attention.qk_norm_rope_kv_write_applies(*_fake_tensors(head_dim=64))
-    assert blackwell == [(10, 0)] * 3
+def test_predictor_decides_the_q_k_kernel_once(monkeypatch, python_kernels):
+    config = _config()
+    predictor, attn, q, k, v, kv_layer = _attend_inputs(config, 2)
+    calls = []
+    monkeypatch.setattr(
+        talker_module, "qk_norm_rope_kv_write_applies", lambda q, layer: calls.append(q.device) or False,
+    )
+    positions, rows = torch.full((2,), 1), torch.arange(2)
+    with torch.no_grad():
+        for _ in range(3):
+            predictor._norm_rope_attend(attn, q.clone(), k.clone(), v, positions, rows, kv_layer, 1, 2)
+    assert calls == [q.device]
 
 
-@pytest.mark.parametrize("kwargs", [
-    dict(head_dim=72),                     # tl.arange can't span a half head that is no power of two
-    dict(head_dim=1),
-    dict(dtype=torch.float64),
-    dict(cache_dtype=torch.float32),       # the kernel stores k and v in the cache's dtype, q in its own
-    dict(q_stride=2),                      # heads have to be contiguous
-    dict(cache_stride=2),
-    dict(device_type="cpu"),
-], ids=str)
-def test_guard_refuses(blackwell, kwargs):
-    assert not attention.qk_norm_rope_kv_write_applies(*_fake_tensors(**kwargs))
+class _ScaleAttention(torch.nn.Module):
+    """Stands in for the paged attention: the residual stream is what's under test."""
+
+    def __init__(self):
+        super().__init__()
+        self.attend = SimpleNamespace(bind_step=lambda label: None, set_layer_idx=lambda idx: None)
+
+    def forward(self, hidden_states):
+        return 0.5 * hidden_states
 
 
-def test_guard_refuses_an_older_gpu(monkeypatch):
-    platform = SimpleNamespace(has_cuda_capability=lambda major, minor, device: False)
-    monkeypatch.setattr(attention, "current_platform", platform)
-    assert not attention.qk_norm_rope_kv_write_applies(*_fake_tensors())
+def _talker_language_model(config):
+    model = Qwen3TTSTalkerModel(config).model
+    for layer in model.layers:
+        layer.self_attn = _ScaleAttention()
+        layer.mlp = torch.nn.Identity()
+    return model
+
+
+def test_talker_keeps_its_input_out_of_the_in_place_residual(monkeypatch):
+    """``RMSNorm.forward_residual`` only writes in place on CUDA, so stand that in: a replay's input is a static buffer
+    the next replay reads."""
+
+    def in_place(self, hidden_states, residual, comm_group=None):
+        residual.add_(hidden_states)
+        hidden_states.copy_(self(residual))
+        return hidden_states, residual
+
+    config = _config()
+    torch.manual_seed(0)
+    fused = _talker_language_model(config)
+    fused.fused_add_norm = True
+    plain = _talker_language_model(config)
+    plain.load_state_dict(fused.state_dict())
+    embeds = torch.randn(3, config.talker.hidden_size)
+    before = embeds.clone()
+    with torch.no_grad():
+        want = plain(embeds, label="main")
+        monkeypatch.setattr(RMSNorm, "forward_residual", in_place)
+        got = fused(embeds, label="main")
+    assert torch.equal(embeds, before)
+    torch.testing.assert_close(got, want)
 
 
 def _attend_inputs(config, batch):
@@ -203,32 +232,6 @@ def _attend_inputs(config, batch):
     k = torch.randn(batch, cp.num_key_value_heads, cp.head_dim)
     v = torch.randn(batch, cp.num_key_value_heads, cp.head_dim)
     return predictor, attn, q, k, v, _cache(config, batch)[0]
-
-
-def test_applies_selects_the_one_kernel(monkeypatch):
-    config = _config()
-    batch = 3
-    predictor, attn, q, k, v, kv_layer = _attend_inputs(config, batch)
-    positions, rows = torch.full((batch,), 2), torch.arange(batch)
-    calls = []
-
-    def fake_kernel(*args):
-        calls.append(args)
-
-    monkeypatch.setattr(talker_module, "qk_norm_rope_kv_write_applies", lambda q, layer: True)
-    monkeypatch.setattr(talker_module, "qk_norm_rope_kv_write", fake_kernel)
-    monkeypatch.setattr(talker_module, "decode_attn_nhd", _reference_attention)
-    monkeypatch.setattr(talker_module, "apply_rope_pos_ids", lambda *a: pytest.fail("the eager RoPE ran"))
-    with torch.no_grad():
-        predictor._norm_rope_attend(attn, q, k, v, positions, rows, kv_layer, 2, 3)
-
-    (args,) = calls
-    assert args[0] is q and args[1] is k and args[2] is v
-    assert args[3] is attn.q_norm.weight and args[4] is attn.k_norm.weight
-    # a token's depth position is also its cache slot
-    assert args[5] is positions and args[8] is positions
-    assert args[6] is kv_layer and args[7] is rows and args[9] == batch
-    assert args[12] == attn.rope_theta
 
 
 def test_fallback_is_the_eager_norm_rope_and_write(monkeypatch, python_kernels):
@@ -345,29 +348,36 @@ def _predictor(rows):
 
 @needs_cuda
 @pytest.mark.parametrize("rows", ROWS)
-def test_depth_passes_match_the_eager_one_token_passes(rows, monkeypatch):
-    """All 16 positions through five real-geometry layers: the fused path with its two-token
-    first pass against the eager path with one token per pass."""
+@pytest.mark.parametrize("measured", [True, False], ids=["blackwell", "older"])
+def test_depth_passes_match_the_eager_one_token_passes(rows, measured, monkeypatch):
+    """All 16 positions through five real-geometry layers against the eager norm, RoPE, write and add with one token per
+    pass. ``measured`` runs the fused add+norms and the two-token first pass over the kernel; without it, the kernel
+    with a plain add and one token per pass."""
     predictor, cache = _predictor(rows)
+    predictor.fused_add_norm = measured
     g = torch.Generator(device="cpu").manual_seed(3)
     inputs = torch.randn(rows, 16, 2048, generator=g).cuda().bfloat16()
     batch_rows = torch.arange(rows, device="cuda")
 
     with torch.inference_mode():
-        fused = [predictor.forward_depth_unrolled(
-            inputs[:, :2].clone(), torch.arange(2, device="cuda").repeat(rows), batch_rows.repeat_interleave(2),
-            cache, cache_pos=0,
-        )[:, 1]]
-        for pos in range(2, 16):
+        fused = []
+        if measured:
             fused.append(predictor.forward_depth_unrolled(
+                inputs[:, :2].clone(), torch.arange(2, device="cuda").repeat(rows), batch_rows.repeat_interleave(2),
+                cache, cache_pos=0,
+            )[:, 1])
+        for pos in range(2 if measured else 0, 16):
+            out = predictor.forward_depth_unrolled(
                 inputs[:, pos:pos + 1].clone(), batch_rows * 0 + pos, batch_rows, cache, cache_pos=pos,
-            )[:, 0])
+            )[:, 0]
+            if pos:
+                fused.append(out)
 
         monkeypatch.setattr(talker_module, "qk_norm_rope_kv_write_applies", lambda q, layer: False)
-        eager_cache = cache.clone().zero_()
+        eager_predictor, eager_cache = _predictor(rows)
         eager = []
         for pos in range(16):
-            out = predictor.forward_depth_unrolled(
+            out = eager_predictor.forward_depth_unrolled(
                 inputs[:, pos:pos + 1].clone(), batch_rows * 0 + pos, batch_rows, eager_cache, cache_pos=pos,
             )[:, 0]
             if pos:

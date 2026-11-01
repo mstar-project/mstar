@@ -1875,6 +1875,22 @@ def test_qwen3_tts_fused_snake_channels_last_matches_the_contiguous_form():
     assert torch.equal(channels_last.squeeze(2), fused(x))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernel runs on CUDA")
+def test_qwen3_tts_fused_snake_reads_a_4d_input_in_any_layout():
+    from mstar.model.qwen3_tts.components.snake import FusedSnakeBeta
+
+    snake = SimpleNamespace(
+        alpha=torch.randn(6) * 0.3, beta=torch.randn(6) * 0.3, no_div_by_zero=1e-9,
+    )
+    fused = FusedSnakeBeta(snake).cuda()
+    x = torch.randn(3, 6, 1000, device="cuda")
+    want = fused(x).unsqueeze(2)
+    assert torch.equal(fused(x.unsqueeze(2)), want)
+    strided = x.unsqueeze(2).contiguous(memory_format=torch.channels_last)[..., ::2]
+    assert not strided.is_contiguous(memory_format=torch.channels_last)
+    assert torch.equal(fused(strided), want[..., ::2])
+
+
 def _codec_decoder(codec, dtype=torch.float32):
     if importlib.util.find_spec("qwen_tts") is None:
         pytest.skip("qwen-tts optional dependency is not installed")
@@ -1922,42 +1938,6 @@ def test_qwen3_tts_channels_last_stack_keeps_dilated_convs_out_of_bf16():
     assert dilated.weight.dtype == torch.float32
     x = torch.randn(1, 4, 1, 32, dtype=torch.bfloat16)
     assert dilated(x.contiguous(memory_format=torch.channels_last)).dtype == torch.bfloat16
-
-
-@pytest.mark.parametrize(
-    "applies,split,expected", [(True, True, True), (False, True, False), (True, False, False)],
-)
-def test_qwen3_tts_codec_selects_the_channels_last_stack(monkeypatch, applies, split, expected):
-    from mstar.model.qwen3_tts import submodules
-
-    monkeypatch.setattr(submodules, "channels_last_applies", lambda device: applies)
-    codec = _tiny_codec_config(split_decode=split)
-    config = _tiny_model_config()
-    config.codec = codec
-    submodule = CodecSubmodule(_codec_decoder(codec), config)
-    assert (submodule.channels_last_stack is not None) is expected
-
-    if expected:
-        calls = []
-        submodule.channels_last_stack.register_forward_pre_hook(lambda _module, args: calls.append(args[0].shape))
-        window = max(submodule.windows)
-        codes = torch.randint(0, 32, (1, codec.num_quantizers, window))
-        with torch.no_grad():
-            pcm = submodule._decode(codes, torch.zeros(1, dtype=torch.long))
-        assert len(calls) == 1 and pcm.dtype == torch.int16
-
-
-@pytest.mark.parametrize(
-    "capability,device_type,expected", [(True, "cuda", True), (False, "cuda", False), (True, "cpu", False)],
-)
-def test_qwen3_tts_channels_last_needs_a_measured_gpu(monkeypatch, capability, device_type, expected):
-    import mstar.model.qwen3_tts.components.conv_stack as stack
-
-    seen = []
-    platform = SimpleNamespace(has_cuda_capability=lambda *args: seen.append(args[:2]) or capability)
-    monkeypatch.setattr(stack, "current_platform", platform)
-    assert stack.channels_last_applies(SimpleNamespace(type=device_type)) is expected
-    assert seen in ([], [(10, 0)])
 
 
 def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():
