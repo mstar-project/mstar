@@ -19,8 +19,6 @@ model_kwargs:
   # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
   # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
-  # the device's tuned GEMM solutions where it has a table (mstar/platforms/rocm_dit_gemm.py); elsewhere nothing changes
-  tuned_linears: true
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles per
   # batch size inside its first requests and decodes on the eager VAE.
@@ -35,7 +33,8 @@ model_kwargs:
   # so all 16 lengths would be 128 graphs. Spend it on batch sizes before caption lengths: a
   # captured bucket serves a shorter batch by padding it with dummy rows (CudaGraphRunner.DummyRowPool),
   # and at 16 concurrent requests steps average 5.7 rows, so with only 1/2/4/8 captured about 30% of a
-  # step's rows would be dummies. The 64 graphs of the two sizes cost 5.3 GiB of VRAM on MI325X.
+  # step's rows would be dummies. The 64 graphs of the two sizes cost 5.3 GiB of VRAM and take a warm start from
+  # about 96 s to about 220 s on MI325X.
   capture_caption_lengths: [32, 64, 96, 128]
   # every batch size up to max_batch_size
   capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
