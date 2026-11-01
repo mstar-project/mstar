@@ -5,7 +5,7 @@ from itertools import chain
 
 import torch
 
-from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
+from mstar.conductor.request_info import DEFAULT_PARTITION
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -19,13 +19,12 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
     KV_CACHE,
     LOCAL_ATTN,
-    PREFILL_WALKS,
     ROPE,
     SAMPLER,
     CommandAPlusConfig,
@@ -89,39 +88,14 @@ class CommandAPlusModel(Model):
         if partition_name != DEFAULT_PARTITION:
             raise ValueError(f"Unknown Command A+ partition: {partition_name!r}")
 
-    def get_initial_forward_pass_args(
-        self, partition_name, input_modalities, output_modalities, input_signals,
-        model_kwargs=None,
-    ):
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
         self._check_partition(partition_name)
         if not input_signals.get("text_inputs"):
             raise ValueError("Command A+ prefill requires text_inputs")
-        pixels = input_signals.get("pixel_values", [])
-        inputs = [GraphEdge(next_node="LLM", name="text_inputs", tensor_info=input_signals["text_inputs"])]
-        if pixels:
-            inputs.append(GraphEdge(next_node="vision_encoder", name="pixel_values", tensor_info=pixels))
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                graph_walk="prefill_image" if pixels else "prefill", is_prefill=True,
-                input_modalities=input_modalities, output_modalities=output_modalities,
-            ),
-            inputs=inputs, unpersist_tensors=[info for edge in inputs for info in edge.tensor_info],
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name, partition_metadata, persist_signals, incoming_connections=None,
-    ):
-        self._check_partition(partition_name)
-        metadata = partition_metadata
-        seeds = persist_signals.get("decode_input", [])
-        if metadata.graph_walk == "decode" or not seeds:
-            return ForwardPassArgs(metadata, [], list(seeds), request_done=True)
-        if metadata.graph_walk not in PREFILL_WALKS:
-            raise ValueError(f"Unexpected graph walk: {metadata.graph_walk!r}")
-        metadata.graph_walk = "decode"
-        metadata.is_prefill = False
-        edge = GraphEdge(next_node="LLM", name="text_inputs", tensor_info=seeds)
-        return ForwardPassArgs(metadata, [edge], list(seeds))
+        # A prefill that ends the reply (max_tokens 1) persists no decode_input, and
+        # the conductor's token count ends the request there.
+        prefill = "prefill_image" if input_signals.get("pixel_values") else "prefill"
+        return [WalkStep(prefill), WalkStep("decode", bind={"text_inputs": "decode_input"})]
 
     def get_node_resources(self):
         config = self.config

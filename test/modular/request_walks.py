@@ -1,4 +1,4 @@
-"""A request through an AR model's walks: the graph runtime takes its stops, the model its walks."""
+"""A request through an AR model's walk plan: the graph runtime takes its stops."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -47,22 +47,24 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
         sharding_config=_sharding_config(),
         tensor_manager=StubTensorManager(),
     )
-    args = model.get_initial_forward_pass_args(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]})
-    metadata = args.full_metadata
+    plan = model.walk_plan(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]}, {})
     caps = model.get_loop_caps(max_output_tokens=max_tokens)
     rid = runtime.add_request(
-        request_id="r", partition=PARTITION, graph_walk=metadata.graph_walk,
+        request_id="r", partition=PARTITION, graph_walk=plan[0].walk,
         partition_worker_graph_ids=ids, worker_graph_to_workers=ParallelList(ids, [["w0"]] * len(ids)),
         loop_caps=caps,
     )
     emitted: list[int] = []
     counted = 0  # the conductor's count: tokens on conductor_new_token edges
     steps = 0
-    while True:
-        walk = metadata.graph_walk
+    held: dict[str, list[torch.Tensor]] = {"text_inputs": [prompt]}  # the persisted signals
+    for planned in plan:
+        walk = planned.walk
         runtime.set_walk(rid, PARTITION, walk)
         edges = _edges(walks[walk])
-        inputs = {edge.name: list(edge.tensor_info) for edge in args.inputs}
+        # as the conductor sends a step's inputs: the signal its bind names, or its own name's
+        io = walks[walk].get_inputs_outputs()
+        inputs = {name: held.get(planned.bind.get(name, name), []) for name, _ in io.ext_inputs | io.loop_back}
         persisted: dict[str, list[torch.Tensor]] = {}
         iteration = 0
         while True:
@@ -93,7 +95,7 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
                 break
             inputs = {edge.name: out[edge.name] for edge in edges if edge.next_node == "LLM"}
             iteration += 1
-        args = model.get_partition_forward_pass_args(PARTITION, metadata, persisted)
-        metadata = args.full_metadata
-        if args.request_done or counted >= max_tokens:
+        held.update(persisted)
+        if counted >= max_tokens:
             return emitted
+    return emitted
