@@ -716,6 +716,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.dependencies"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependencies</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.dependency"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependency()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.device"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.device</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.head_shards"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.head_shards</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.joint_comm_group"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.joint_comm_group</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.kv_dtype"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.kv_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.max_rows_in_combined</span></code></a></li>
@@ -1054,6 +1055,14 @@ TypeError rather than something silently swallowed by a <code class="docutils li
 <dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.device">
 <span class="sig-name descname"><span class="pre">device</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><span class="pre">torch.device</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.device" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.head_shards">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.head_shards" title="Link to this definition">#</a></dt>
+<dd><p>How many ways the node’s ranks split its attention heads, which each
+builder sizes head counts by: all its TP × SP ranks. A ragged resource
+declaring <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.shard_over_sp=False</span></code> splits over TP only.</p>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.joint_comm_group">
@@ -2052,6 +2061,7 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.dependencies"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependencies</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.dependency"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependency()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.device"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.device</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.head_shards"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.head_shards</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.joint_comm_group"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.joint_comm_group</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.kv_dtype"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.kv_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.EngineResourceInfo.max_rows_in_combined"><code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.max_rows_in_combined</span></code></a></li>

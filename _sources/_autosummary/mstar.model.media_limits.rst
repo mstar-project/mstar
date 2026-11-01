@@ -28,6 +28,7 @@ mstar.model.media\_limits
       read_image
       read_sound_file
       sound_file_seconds
+      video_decode_threads
    
    
 

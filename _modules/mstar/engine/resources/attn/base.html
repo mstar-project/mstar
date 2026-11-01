@@ -1117,8 +1117,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER_MLA</span><span class="o">.</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> reads it"</span>
             <span class="p">)</span>
         <span class="c1"># `shard` lives on the KVConfig base, so this is unchanged for both.</span>
-        <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">kv_config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+        <span class="n">kv_config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">head_shards</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">DENSE</span><span class="p">:</span>
             <span class="c1"># A dense backend runs on FlashAttention-3 (AITER on ROCm). Where</span>
             <span class="c1"># that has no kernel for the GPU or does not import, the same pass</span>

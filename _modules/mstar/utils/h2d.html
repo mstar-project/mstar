@@ -1074,17 +1074,6 @@ window.runMermaid = runMermaid;</script>
         <span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="o">=</span> <span class="p">[</span><span class="n">b</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bufs</span><span class="p">]</span>
 
-<div class="viewcode-block" id="PinnedStager.to_device">
-<a class="viewcode-back" href="../../../_autosummary/mstar.utils.h2d.html#mstar.utils.h2d.PinnedStager.to_device">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_device</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">values</span><span class="p">:</span> <span class="n">Sequence</span> <span class="o">|</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span> <span class="o">|</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""A new ``device`` tensor holding ``values`` (a sequence, an array or a CPU tensor, any</span>
-<span class="sd">        shape) in this stager's dtype, through ``copy_``: one non-blocking H2D, no stream drain."""</span>
-        <span class="n">host</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_np_dtype</span><span class="p">)</span>
-        <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">host</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">host</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
-        <span class="k">return</span> <span class="n">out</span></div>
-
-
 <div class="viewcode-block" id="PinnedStager.copy_">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.h2d.html#mstar.utils.h2d.PinnedStager.copy_">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">copy_</span><span class="p">(</span>
@@ -1146,30 +1135,46 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="to_device_nonblocking">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.h2d.html#mstar.utils.h2d.to_device_nonblocking">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">to_device_nonblocking</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">|</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``tensor`` on ``device`` without a host stall.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">to_device_nonblocking</span><span class="p">(</span>
+    <span class="n">data</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="n">Sequence</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">|</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``data`` on ``device`` without a host stall.</span>
 
 <span class="sd">    A copy from pageable memory blocks the calling thread until it retires, so on</span>
-<span class="sd">    the GPU thread it waits out the step still running there. This writes a CPU</span>
-<span class="sd">    tensor into a pinned buffer with one memcpy on the calling thread (``copy_``</span>
-<span class="sd">    would split it over the intra-op pool, where a descheduled thread holds up the</span>
-<span class="sd">    GPU thread) and queues one non-blocking copy from it on the current stream.</span>
-<span class="sd">    torch's caching host allocator keeps the pinned buffer until that copy has</span>
-<span class="sd">    retired, so nothing is written over an in-flight source.</span>
+<span class="sd">    the GPU thread it waits out the step still running there. Host values go</span>
+<span class="sd">    through a fresh pinned buffer instead, and one non-blocking copy from it is</span>
+<span class="sd">    queued on the current stream. torch's caching host allocator keeps that</span>
+<span class="sd">    buffer until the copy has retired, so the caller may reuse its source at once.</span>
 
-<span class="sd">    The result is valid on the stream the copy was issued on; another stream has</span>
-<span class="sd">    to wait on it, as for any async copy. The host tensor is read as it is, so the</span>
-<span class="sd">    device tensor is bit-identical to a pageable copy; a model that packs a draw</span>
-<span class="sd">    does so before this.</span>
+<span class="sd">    A sequence is built straight into pinned memory as ``torch.tensor(data,</span>
+<span class="sd">    dtype=dtype)`` would build it. A pageable CPU tensor is written into the</span>
+<span class="sd">    pinned buffer with one memcpy on the calling thread (``copy_`` would split it</span>
+<span class="sd">    over the intra-op pool, where a descheduled thread holds up the GPU thread),</span>
+<span class="sd">    so the device tensor is bit-identical to a pageable copy. An already-pinned</span>
+<span class="sd">    contiguous tensor is copied from in place, so don't write to it until the copy lands;</span>
+<span class="sd">    stage a reused buffer through :class:`PinnedStager` instead. The result is valid on the</span>
+<span class="sd">    stream the copy was issued on; another stream has to wait on it, as for any</span>
+<span class="sd">    async copy. Where the device takes no pinned memory (a CPU device), the result</span>
+<span class="sd">    is a plain ``.to(device)``.</span>
 <span class="sd">    """</span>
     <span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cpu"</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">is_accelerator</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">tensor</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-    <span class="n">source</span> <span class="o">=</span> <span class="n">tensor</span> <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span> <span class="k">else</span> <span class="n">tensor</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-    <span class="n">pinned</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">source</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">source</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">pin</span> <span class="o">=</span> <span class="n">DeviceCapability</span><span class="o">.</span><span class="n">of</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">pin_memory</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">pin</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">host</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="n">pin</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"dtype is for a sequence; convert the tensor before staging it"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">pin</span> <span class="ow">or</span> <span class="n">data</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cpu"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">data</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">is_pinned</span><span class="p">()</span> <span class="ow">and</span> <span class="n">data</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">():</span>
+        <span class="k">return</span> <span class="n">data</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">source</span> <span class="o">=</span> <span class="n">data</span> <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span> <span class="k">else</span> <span class="n">data</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+    <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">source</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">source</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">source</span><span class="o">.</span><span class="n">numel</span><span class="p">():</span>
-        <span class="n">pinned</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()[:]</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
-    <span class="k">return</span> <span class="n">pinned</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
+        <span class="n">host</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()[:]</span> <span class="o">=</span> <span class="n">source</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">host</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
 
 </pre></div>
 

@@ -984,6 +984,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">and nothing to carry between steps: the resource holds only planned wrappers.</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">itertools</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1019,8 +1021,10 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">manager_cls</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
     <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
     <span class="n">joint</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span>
-    <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">joint</span><span class="o">.</span><span class="n">world_size</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">shard_over_sp</span> <span class="k">else</span> <span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">shard_over_sp</span> <span class="ow">or</span> <span class="n">joint</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">head_shards</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
     <span class="n">dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span>
     <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -1028,7 +1032,9 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"RaggedAttentionConfig.dtype on a node without a KV-backed attention "</span>
             <span class="s2">"(the engine has no KV dtype to fall back on)."</span>
         <span class="p">)</span>
-    <span class="k">return</span> <span class="n">manager_cls</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">manager_cls</span><span class="p">(</span>
+        <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">)</span>
 
 
 <div class="viewcode-block" id="dense_or_flashinfer">
@@ -1155,6 +1161,34 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># Live managers by op key, which is how the custom op below names one: an op</span>
+<span class="c1"># takes tensors and scalars, not objects. The op key is the resource key plus a</span>
+<span class="c1"># number unique in the process, so two engines in one process (tests,</span>
+<span class="c1"># harnesses) never reach each other's plans. Weak, so an entry goes with the</span>
+<span class="c1"># engine's last reference to it.</span>
+<span class="n">_MANAGERS</span><span class="p">:</span> <span class="n">weakref</span><span class="o">.</span><span class="n">WeakValueDictionary</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"_RaggedManagerBase"</span><span class="p">]</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">WeakValueDictionary</span><span class="p">()</span>
+<span class="n">_MANAGER_NUMBERS</span> <span class="o">=</span> <span class="n">itertools</span><span class="o">.</span><span class="n">count</span><span class="p">()</span>
+
+
+<span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">"mstar::ragged_attention"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">ragged_attention</span><span class="p">(</span>
+    <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``_MANAGERS[key].run(q, k, v, label)`` as one node of a compiled graph.</span>
+
+<span class="sd">    Contract: returns a fresh tensor shaped like ``q`` in the manager's dtype,</span>
+<span class="sd">    and mutates no argument. Every backend's wrapper output is a new allocation,</span>
+<span class="sd">    or a clone of the graph-mode buffer the next call overwrites, so it aliases</span>
+<span class="sd">    neither an input nor anything a later call writes.</span>
+<span class="sd">    """</span>
+    <span class="k">return</span> <span class="n">_MANAGERS</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+
+
+<span class="nd">@ragged_attention</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">label</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">q</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">_MANAGERS</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">_RaggedManagerBase</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""What the self- and cross-attention managers share: persistent wrappers per</span>
 <span class="sd">    (bucket, slot, label) and per (label, slot), the preplan protocol, and ``run``.</span>
@@ -1168,7 +1202,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
         <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
         <span class="n">config</span><span class="p">:</span> <span class="n">RaggedAttentionConfig</span><span class="p">,</span>
+        <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
     <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">#</span><span class="si">{</span><span class="nb">next</span><span class="p">(</span><span class="n">_MANAGER_NUMBERS</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+        <span class="n">_MANAGERS</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
@@ -1344,7 +1381,6 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">wrapper</span>
 
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
         <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">return_lse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
@@ -1353,11 +1389,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        also the log-sum-exp ``[total_tokens, H]`` (fp32, natural log), for merging</span>
 <span class="sd">        attentions over disjoint key sets. The plan is the same either way.</span>
 
-<span class="sd">        Not behind a custom op, unlike the paged backend's ``run``: the ragged</span>
-<span class="sd">        caller (an encoder tower) has no per-layer KV write to keep in the same</span>
-<span class="sd">        graph, so the break this costs is one per layer of a region that is</span>
-<span class="sd">        CUDA-graph captured rather than compiled.</span>
+<span class="sd">        Traced by ``torch.compile`` with ``config.compile_op``, this is the</span>
+<span class="sd">        ``mstar::ragged_attention`` op: the region keeps one graph, and Inductor</span>
+<span class="sd">        fuses the pointwise work on either side of the attention. Otherwise, and</span>
+<span class="sd">        with ``return_lse`` (the op returns only the output), a compiled caller</span>
+<span class="sd">        breaks here, and an eager one calls the kernel directly.</span>
 <span class="sd">        """</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">compile_op</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">return_lse</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">is_compiling</span><span class="p">():</span>
+            <span class="k">return</span> <span class="n">ragged_attention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_key</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">return_lse</span><span class="p">)</span>
+
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">return_lse</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">return_lse</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">return_lse</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>

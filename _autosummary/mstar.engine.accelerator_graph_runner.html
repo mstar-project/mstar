@@ -1813,6 +1813,8 @@ then commits and returns the padded buffers behind a real-length view.</p>
 <p>Only the static buffers carry data into a replay: the region’s Python
 ran once, at capture, so whatever it read off <code class="docutils literal notranslate"><span class="pre">PiecewiseCallInputs</span></code>
 is baked into the graph.</p>
+<p>A <code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code> region replays the step as one row named by its
+first request, however many requests or segments it is passed.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

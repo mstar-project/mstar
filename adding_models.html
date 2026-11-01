@@ -1394,17 +1394,21 @@ forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> (all pre-sharding, as in <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code>), an <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code> that
 defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code>, the
 default, <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>, or <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code>),
-<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, and the
+<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, the
 two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
-<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm)
-and falls back to FlashInfer if that kernel is missing. By default the heads are split
-across all TP × SP ranks of the node; <code class="docutils literal notranslate"><span class="pre">shard_over_sp=False</span></code> splits them across the
-TP ranks only, for an attention each sequence-parallel rank runs whole over its own
-tokens (one over a replicated stream, or a cross-attention from the rank’s query
-shard). <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> sizes each label’s FlashInfer workspace per slot (default
-<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512); a node with many labels can declare less, since a
-ragged prefill only uses it for split-KV partials. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder
-towers)</a>.</p></td>
+<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>, <code class="docutils literal notranslate"><span class="pre">shard_over_sp</span></code> and
+<code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3
+<code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm) and falls back to FlashInfer if that kernel is
+missing. By default the heads are split across all TP × SP ranks of the node;
+<code class="docutils literal notranslate"><span class="pre">shard_over_sp=False</span></code> splits them across the TP ranks only, for an attention
+each sequence-parallel rank runs whole over its own tokens (one over a
+replicated stream, or a cross-attention from the rank’s query shard).
+<code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> sizes each label’s FlashInfer workspace per slot (default
+<code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512); a node with many labels can declare less,
+since a ragged prefill only uses it for split-KV partials. <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>,
+<code class="docutils literal notranslate"><span class="pre">shard_over_sp</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> are the model’s declaration; the serving
+config’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> overrides take only the backends and the two ceilings.
+See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a> for <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>The cross-attention counterpart: one span of each request attends another
@@ -1651,7 +1655,11 @@ encoder node only, and names no cache:</p>
 </div>
 <p>A layer binds the key as it binds any other resource, then attends through the resource’s
 <code class="docutils literal notranslate"><span class="pre">run(q,</span> <span class="pre">k,</span> <span class="pre">v,</span> <span class="pre">label=None)</span></code>. There is no KV write to pair it with, so no
-<code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code> is involved.</p>
+<code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code> is involved. A compiled caller breaks at <code class="docutils literal notranslate"><span class="pre">run</span></code>; with
+<code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig(compile_op=True)</span></code>, <code class="docutils literal notranslate"><span class="pre">run</span></code> traces as the <code class="docutils literal notranslate"><span class="pre">mstar::ragged_attention</span></code>
+custom op instead, so the region keeps one graph across the attention (worth it for a
+compiled, uncaptured region; it costs startup time and capture memory where the region
+is also captured). An eager call goes straight to the kernel.</p>
 <p>The step is an ordinary <code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code>, and its <code class="docutils literal notranslate"><span class="pre">segments</span></code> are the entire layout.
 There is no cache to read the layout off, so a label that carries no segment in the
 declaration cannot be attended: the forward raises, rather than silently reusing the
@@ -1674,13 +1682,14 @@ step names the <code class="docutils literal notranslate"><span class="pre">(q_l
 </div>
 <p>Each pair is planned as its own layout, pairing each request’s <code class="docutils literal notranslate"><span class="pre">q_label</span></code> span with that
 request’s <code class="docutils literal notranslate"><span class="pre">kv_label</span></code> span; cross-attention is never causal. A layer attends through
-<code class="docutils literal notranslate"><span class="pre">RaggedAttentionCallable(resource,</span> <span class="pre">cross_label(q_label,</span> <span class="pre">kv_label))</span></code>, passing the key
+<code class="docutils literal notranslate"><span class="pre">resource.run(q,</span> <span class="pre">k,</span> <span class="pre">v,</span> <span class="pre">label=cross_label(q_label,</span> <span class="pre">kv_label))</span></code>, passing the key
 span’s tokens as <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code>. One resource has one head geometry, so a model whose
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (<code class="docutils literal notranslate"><span class="pre">mstar/model/ltx2_5/submodules.py</span></code>).</p>
-<p>Called with <code class="docutils literal notranslate"><span class="pre">return_lse=True</span></code>, a ragged or ragged cross-attention callable on the FlashInfer
-backend also returns each query row’s log-sum-exp (<code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">H]</span></code>, fp32, natural log)
-from the same plan, which is what merging attentions over disjoint key sets needs. Under sequence parallelism
+<p>Called with <code class="docutils literal notranslate"><span class="pre">return_lse=True</span></code>, a ragged or ragged cross-attention resource’s <code class="docutils literal notranslate"><span class="pre">run</span></code> on the
+FlashInfer backend also returns each query row’s log-sum-exp (<code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">H]</span></code>, fp32,
+natural log) from the same plan, which is what merging attentions over disjoint key sets
+needs; a compiled caller breaks there even with <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>. Under sequence parallelism
 LTX-2.5’s audio queries attend each rank’s share of the video tokens, and
 <code class="docutils literal notranslate"><span class="pre">attention_over_sharded_keys</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed/sequence_parallel.py</span></code>)
 merges them.</p>
@@ -1862,15 +1871,22 @@ that depend on tensor values in <code class="docutils literal notranslate"><span
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">check_stop(...)</span> <span class="pre">-&gt;</span> <span class="pre">set[str]</span> <span class="pre">|</span> <span class="pre">StopCheck</span></code> (optional)</dt><dd><p>Runs off the GPU thread, and may read tensor values. Return the names of the <code class="docutils literal notranslate"><span class="pre">Loop</span></code>
 objects to stop, for example after seeing the EOS token. This is how a decode loop
-terminates. A prefill samples the first token before its decode loop exists, so a stop
-there is returned as <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code> (from <code class="docutils literal notranslate"><span class="pre">mstar.model.submodule_base</span></code>) instead:
-the worker reports the partition done with that pass, and the conductor ends it rather
-than start decode. Return it only from a row outside any loop; from inside one the
-request fails. <code class="docutils literal notranslate"><span class="pre">TokenStepNode</span></code> does this for its <code class="docutils literal notranslate"><span class="pre">PREFILL_WALK</span></code>. It suits a partition
-with nothing left to run once generation stops: a model that runs another walk after its
-loop (an <code class="docutils literal notranslate"><span class="pre">align</span></code> walk, or image generation after thinking) or publishes final-only
-state at the loop’s stop needs its own transition instead. Keep <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>,
-if you write one, in agreement.
+terminates. An AR submodule whose loop ends on a stop token sets
+<code class="docutils literal notranslate"><span class="pre">self.token_stop</span> <span class="pre">=</span> <span class="pre">TokenStop(...)</span></code> in <code class="docutils literal notranslate"><span class="pre">__init__</span></code> instead of writing one; that also
+gives it <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>, which checks a whole step off one host copy of its
+tokens. The token budget is the loop’s cap from <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>, not a stop check.
+A prefill samples the first token before its decode loop exists, so a stop there is
+returned as <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code> (from <code class="docutils literal notranslate"><span class="pre">mstar.model.submodule_base</span></code>) instead: the worker
+reports the partition done with that pass, and the conductor ends it rather than start
+decode. Return it only from a row outside any loop; from inside one the request fails.
+<code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> does this for the walks in its <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>, whose token counts toward
+the budget, so <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code> gives the loop <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>. A
+model that prefills a prompt over several passes sets <code class="docutils literal notranslate"><span class="pre">last_prefill_flag</span></code> to the
+<code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> flag of its last pass (Qwen3.5: <code class="docutils literal notranslate"><span class="pre">&quot;last_prefill&quot;</span></code>), or a stop id
+sampled on its first pass ends the request. It suits a partition with nothing left to run once generation stops: a model that runs
+another walk after its loop (an <code class="docutils literal notranslate"><span class="pre">align</span></code> walk, or image generation after thinking) or
+publishes final-only state at the loop’s stop needs its own transition instead. Keep
+<code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>, if you write one, in agreement.
 To also keep some of this step’s outputs from being routed, return
 <code class="docutils literal notranslate"><span class="pre">StopCheck(stops,</span> <span class="pre">withheld=(names...))</span></code>, for example a frame streamed alongside the
 EOS token: its consumer then never receives it, instead of finding and dropping it with
@@ -2387,6 +2403,14 @@ engine then gives the region no lease for that step. Your forward must replay on
 when the region was leased, for example when the outer step is <code class="docutils literal notranslate"><span class="pre">None</span></code>, and not
 whenever <code class="docutils literal notranslate"><span class="pre">runner.can_run</span></code> is true: a refused batch can still fit a bucket, and
 replaying it would declare the region’s resources twice.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code> makes the runner lease, check (<code class="docutils literal notranslate"><span class="pre">can_run</span></code>) and replay the region as
+one row, whatever the step’s batch size, under the step’s first request. It is for a
+packed region that runs every request’s segments as one ragged batch, such as a vision
+tower, and needs <code class="docutils literal notranslate"><span class="pre">lease_before_step</span></code> and <code class="docutils literal notranslate"><span class="pre">capture_batch_sizes=[1]</span></code>. The region’s
+<code class="docutils literal notranslate"><span class="pre">declare_step</span></code> then receives <code class="docutils literal notranslate"><span class="pre">[first_rid]</span></code> with every request’s <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code>, so the
+whole step’s segments count against that one request’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
+which for this region is a per-step ceiling. Pair it with a <code class="docutils literal notranslate"><span class="pre">can_lease</span></code> that refuses a
+step with more.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> lists the batch sizes to record. <code class="docutils literal notranslate"><span class="pre">None</span></code> uses the runner
 default.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture. The default is
@@ -2614,7 +2638,9 @@ default:</p>
 </pre></div>
 </div>
 <p>The setting applies only to the API server process. The conductor and workers keep
-torch’s default.</p>
+torch’s default. It does not size video decoding: each torchcodec decode that asks
+<code class="docutils literal notranslate"><span class="pre">media_limits.video_decode_threads</span></code> (<code class="docutils literal notranslate"><span class="pre">Model.load_video</span></code> does) runs FFmpeg with up to 8
+threads, no more than the CPUs the process’s CPU plan leaves unpinned (<code class="docutils literal notranslate"><span class="pre">CpuPlan.left</span></code>).</p>
 <p>A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> hands the tensor it reads straight to the

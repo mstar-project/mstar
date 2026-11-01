@@ -1076,8 +1076,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"KVSpec dispatches on the config, so this means the spec was "</span>
                 <span class="s2">"built by hand with the wrong one."</span>
             <span class="p">)</span>
-        <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">head_shards</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
             <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
             <span class="n">name</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span>

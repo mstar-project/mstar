@@ -1342,6 +1342,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># (`ModelInputsFromEngine.step` is the declaration that tells it so).</span>
     <span class="c1"># None: every batch that fits a bucket.</span>
     <span class="n">can_lease</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The region replays a whole step as ONE row, however many requests the</span>
+    <span class="c1"># step carries (a vision tower packing every request's images as segments</span>
+    <span class="c1"># of one ragged batch), so the runner leases, checks and replays it at batch</span>
+    <span class="c1"># size 1, under the step's first request. Only for a packed</span>
+    <span class="c1"># `lease_before_step` region captured at batch size 1 alone.</span>
+    <span class="n">one_row_per_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)</span>
     <span class="n">forward_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="c1"># None =&gt; defer to the runner's default batch-size buckets</span>
@@ -1355,6 +1361,15 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">check_compile_mode</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">compile_mode</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">one_row_per_step</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">PACKED</span>
+            <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">lease_before_step</span>
+            <span class="ow">or</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">capture_batch_sizes</span> <span class="ow">or</span> <span class="p">())</span> <span class="o">!=</span> <span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"one_row_per_step needs a packed lease_before_step region "</span>
+                <span class="s2">"with capture_batch_sizes=[1]"</span>
+            <span class="p">)</span>
 
 <div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig.get_config_type">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.get_config_type">[docs]</a>

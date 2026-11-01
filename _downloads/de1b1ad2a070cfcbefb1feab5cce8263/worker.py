@@ -225,10 +225,10 @@ def _env_number(name: str, default, parse, minimum):
     """A numeric tuning knob from the environment.
 
     A malformed value falls back to *default* and one below *minimum* is
-    raised to it, each with a warning, as ``MSTAR_PY_SWITCH_INTERVAL_SEC``
-    and ``MSTAR_RECOMPILE_LIMIT`` already do. The worker reads these when it
-    is built: raising from ``run()`` would come after weight load, warmup and
-    capture, and after the conductor has counted the worker ready.
+    raised to it, each with a warning, as ``MSTAR_RECOMPILE_LIMIT`` already
+    does. The worker reads these when it is built: raising from ``run()``
+    would come after weight load, warmup and capture, and after the conductor
+    has counted the worker ready.
     """
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -3589,7 +3589,9 @@ class Worker:
 
         Qualifies only where ``_store_and_route`` would take its device-loopback
         branch and ``_stream_and_send`` would add nothing Python-side before
-        the send. Returns False, having done nothing, otherwise.
+        the send. Returns False, having done nothing, otherwise. A step whose
+        stop check withheld an output (``StopCheck.withheld``) does not, as
+        this path routes every output.
         """
         rt = self._graph_runtime
         batch = batch_N.batch
@@ -3599,6 +3601,7 @@ class Worker:
             host_rows is None or SAMPLED_LOGPROB in host_rows.buffers
             or batch.request_walks or self.enable_prof
             or batch_N.node_batch.partition_done_rids
+            or batch_N.node_batch.withheld_outputs
             or not getattr(rt, "supports_route_and_send_inline", False)
             or not self._all_on_device(
                 engine, batch_N.node_name, batch_N.graph_walk, signals,

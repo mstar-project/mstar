@@ -3303,9 +3303,10 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""The captured bucket serving this call, or None for eager.</span>
 
 <span class="sd">        BATCHED buckets are fixed by the padded batch size; PACKED ones take</span>
-<span class="sd">        the smallest captured token bucket that fits.</span>
+<span class="sd">        the smallest captured token bucket that fits. A ``one_row_per_step``</span>
+<span class="sd">        region resolves every batch as one row.</span>
 <span class="sd">        """</span>
-        <span class="n">padded_bs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_padded_bs</span><span class="p">(</span><span class="n">batch_size</span><span class="p">)</span>
+        <span class="n">padded_bs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_padded_bs</span><span class="p">(</span><span class="mi">1</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">one_row_per_step</span> <span class="k">else</span> <span class="n">batch_size</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">padded_bs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">BATCHED</span><span class="p">:</span>
@@ -3377,7 +3378,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Only the static buffers carry data into a replay: the region's Python</span>
 <span class="sd">        ran once, at capture, so whatever it read off ``PiecewiseCallInputs``</span>
 <span class="sd">        is baked into the graph.</span>
+
+<span class="sd">        A ``one_row_per_step`` region replays the step as one row named by its</span>
+<span class="sd">        first request, however many requests or segments it is passed.</span>
 <span class="sd">        """</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">one_row_per_step</span><span class="p">:</span>
+            <span class="n">real_bs</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="n">request_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">request_ids</span> <span class="o">=</span> <span class="n">request_ids</span><span class="p">[:</span><span class="mi">1</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">real_bs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">request_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">real_bs</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)</span>

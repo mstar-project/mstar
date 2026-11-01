@@ -544,7 +544,8 @@ Worker scheduling
        last core of the mask. A number outside the mask, or too near its top
        for every worker, stops the server at startup. Threads and pools a
        pinned thread starts keep the process mask (``mstar.utils.threads``),
-       and the API server's intra-op and encode pools are sized from the
+       and the API server's intra-op and encode pools and FFmpeg's per-decode
+       threads (``media_limits.video_decode_threads``) are sized from the
        CPUs the pins leave (``CpuPlan`` in ``mstar.utils.cpus``). Each worker
        and the API server log their CPUs and why. Read by
        ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``

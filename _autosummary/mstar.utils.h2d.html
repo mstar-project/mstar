@@ -692,7 +692,6 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager"><code class="docutils literal notranslate"><span class="pre">PinnedStager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.to_device"><code class="docutils literal notranslate"><span class="pre">PinnedStager.to_device()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.to_device_nonblocking"><code class="docutils literal notranslate"><span class="pre">to_device_nonblocking()</span></code></a></li>
@@ -719,8 +718,8 @@ values a destination already holds, as in a steady decode batch.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.h2d.to_device_nonblocking" title="mstar.utils.h2d.to_device_nonblocking"><code class="xref py py-obj docutils literal notranslate"><span class="pre">to_device_nonblocking</span></code></a>(tensor, device)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without a host stall.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.h2d.to_device_nonblocking" title="mstar.utils.h2d.to_device_nonblocking"><code class="xref py py-obj docutils literal notranslate"><span class="pre">to_device_nonblocking</span></code></a>(data, device[, dtype])</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">data</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without a host stall.</p></td>
 </tr>
 </tbody>
 </table>
@@ -836,46 +835,33 @@ ahead of anything that reads <code class="docutils literal notranslate"><span cl
 </dl>
 </dd></dl>
 
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.h2d.PinnedStager.to_device">
-<span class="sig-name descname"><span class="pre">to_device</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#PinnedStager.to_device"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.PinnedStager.to_device" title="Link to this definition">#</a></dt>
-<dd><p>A new <code class="docutils literal notranslate"><span class="pre">device</span></code> tensor holding <code class="docutils literal notranslate"><span class="pre">values</span></code> (a sequence, an array or a CPU tensor, any
-shape) in this stager’s dtype, through <code class="docutils literal notranslate"><span class="pre">copy_</span></code>: one non-blocking H2D, no stream drain.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>values</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em> | </em><em>ndarray</em><em> | </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
 </dd></dl>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.h2d.to_device_nonblocking">
-<span class="sig-prename descclassname"><span class="pre">mstar.utils.h2d.</span></span><span class="sig-name descname"><span class="pre">to_device_nonblocking</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#to_device_nonblocking"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.to_device_nonblocking" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without a host stall.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.h2d.</span></span><span class="sig-name descname"><span class="pre">to_device_nonblocking</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#to_device_nonblocking"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.to_device_nonblocking" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">data</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without a host stall.</p>
 <p>A copy from pageable memory blocks the calling thread until it retires, so on
-the GPU thread it waits out the step still running there. This writes a CPU
-tensor into a pinned buffer with one memcpy on the calling thread (<code class="docutils literal notranslate"><span class="pre">copy_</span></code>
-would split it over the intra-op pool, where a descheduled thread holds up the
-GPU thread) and queues one non-blocking copy from it on the current stream.
-torch’s caching host allocator keeps the pinned buffer until that copy has
-retired, so nothing is written over an in-flight source.</p>
-<p>The result is valid on the stream the copy was issued on; another stream has
-to wait on it, as for any async copy. The host tensor is read as it is, so the
-device tensor is bit-identical to a pageable copy; a model that packs a draw
-does so before this.</p>
+the GPU thread it waits out the step still running there. Host values go
+through a fresh pinned buffer instead, and one non-blocking copy from it is
+queued on the current stream. torch’s caching host allocator keeps that
+buffer until the copy has retired, so the caller may reuse its source at once.</p>
+<p>A sequence is built straight into pinned memory as <code class="docutils literal notranslate"><span class="pre">torch.tensor(data,</span>
+<span class="pre">dtype=dtype)</span></code> would build it. A pageable CPU tensor is written into the
+pinned buffer with one memcpy on the calling thread (<code class="docutils literal notranslate"><span class="pre">copy_</span></code> would split it
+over the intra-op pool, where a descheduled thread holds up the GPU thread),
+so the device tensor is bit-identical to a pageable copy. An already-pinned
+contiguous tensor is copied from in place, so don’t write to it until the copy lands;
+stage a reused buffer through <a class="reference internal" href="#mstar.utils.h2d.PinnedStager" title="mstar.utils.h2d.PinnedStager"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedStager</span></code></a> instead. The result is valid on the
+stream the copy was issued on; another stream has to wait on it, as for any
+async copy. Where the device takes no pinned memory (a CPU device), the result
+is a plain <code class="docutils literal notranslate"><span class="pre">.to(device)</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>tensor</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>data</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a>)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -941,7 +927,6 @@ does so before this.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager"><code class="docutils literal notranslate"><span class="pre">PinnedStager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.to_device"><code class="docutils literal notranslate"><span class="pre">PinnedStager.to_device()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.to_device_nonblocking"><code class="docutils literal notranslate"><span class="pre">to_device_nonblocking()</span></code></a></li>

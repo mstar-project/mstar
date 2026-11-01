@@ -1022,19 +1022,41 @@ window.runMermaid = runMermaid;</script>
         <span class="n">buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">buffer</span><span class="p">)</span> <span class="ow">or</span> <span class="n">buffer</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
-        <span class="n">values</span> <span class="o">=</span> <span class="n">buffer</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">buffer</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
-        <span class="n">rows</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_ids</span>
-        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">rows</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span>
-            <span class="n">a</span> <span class="o">==</span> <span class="n">b</span> <span class="k">for</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">rows</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="p">):</span>
-            <span class="c1"># the common case: the batch in forward order, no row map needed</span>
-            <span class="k">return</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">values</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="n">row_of</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">rows</span><span class="p">)}</span>
-        <span class="k">return</span> <span class="p">(</span>
-            <span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">values</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span>
-            <span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">:=</span> <span class="n">row_of</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">values</span><span class="p">)</span>
-        <span class="p">)</span></div>
+        <span class="c1"># padded rows past the real ones fall off the zip</span>
+        <span class="n">value_of</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">buffer</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">buffer</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">False</span><span class="p">))</span>
+        <span class="k">return</span> <span class="p">((</span><span class="n">rid</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span> <span class="k">if</span> <span class="p">(</span><span class="n">value</span> <span class="o">:=</span> <span class="n">value_of</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="TokenStop">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.TokenStop">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">TokenStop</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""When an AR submodule's sampled token ends its decode loop: on a stop</span>
+<span class="sd">    id, unless the request's sampler config sets ``ignore_eos``. The token</span>
+<span class="sd">    budget is the loop's cap (``Model.get_loop_caps``), which the runtime</span>
+<span class="sd">    enforces.</span>
+
+<span class="sd">    Declared as ``ARNodeSubmodule.token_stop``; ``check_stop`` and</span>
+<span class="sd">    ``check_stop_batched`` follow from it.</span>
+<span class="sd">    """</span>
+
+    <span class="n">loop</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># the output (and ``check_stop_buffers`` entry) holding the step's token</span>
+    <span class="n">buffer</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">stop_ids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="c1"># resource key of the sampler whose request config carries ``ignore_eos``</span>
+    <span class="n">sampler</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># the only walk whose rows can stop the loop; None for every walk</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># walks that sample the reply's first token before the loop exists. That</span>
+    <span class="c1"># token counts toward the budget, so ``get_loop_caps`` gives the loop</span>
+    <span class="c1"># ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one</span>
+    <span class="c1"># token, ends the partition (``END_PARTITION``)</span>
+    <span class="n">prefill_walks</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="c1"># for a prompt prefilled over several passes: the ``step_metadata`` flag of</span>
+    <span class="c1"># the pass whose token is the reply's (earlier passes' tokens are not)</span>
+    <span class="n">last_prefill_flag</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -2275,7 +2297,6 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
         <span class="n">request_infos</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
         <span class="n">host_rows</span><span class="p">:</span> <span class="n">HostRows</span><span class="p">,</span>
-        <span class="n">step_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="n">BatchedStopCheck</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``check_stop`` for the whole batch at once, off the host rows.</span>
 
@@ -2283,8 +2304,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        names or ``END_PARTITION``; rids with nothing left out), or a</span>
 <span class="sd">        ``BatchedStopCheck`` for a submodule whose ``check_stop`` withholds,</span>
 <span class="sd">        and must agree with ``check_stop`` for every rid. None, or a raise,</span>
-<span class="sd">        falls back to the per-request path. ``step_walk`` is the walk every row</span>
-<span class="sd">        ran, or None when the step mixes walks (each row's is on its info).</span>
+<span class="sd">        falls back to the per-request path.</span>
 <span class="sd">        """</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 
@@ -2318,6 +2338,77 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.</span>
     <span class="c1"># The engine probes the prefix cache for a walk that carries them only then.</span>
     <span class="n">cuts_tensor_inputs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="c1"># Set (in ``__init__``, where the stop ids are known) by a submodule whose</span>
+    <span class="c1"># sampled token ends a dynamic loop; the stop checks below follow from it.</span>
+    <span class="n">token_stop</span><span class="p">:</span> <span class="n">TokenStop</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="ARNodeSubmodule.check_stop">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.check_stop">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_stop</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="n">StopCheck</span><span class="p">:</span>
+        <span class="n">stop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span>
+        <span class="k">if</span> <span class="n">stop</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">check_stop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">request_info</span><span class="p">,</span> <span class="n">outputs</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">stop</span><span class="o">.</span><span class="n">buffer</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="c1"># a row's first element, as ``HostRows.first_values`` reads it</span>
+        <span class="n">token</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="n">stop</span><span class="o">.</span><span class="n">buffer</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_token_stops</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">request_info</span><span class="p">):</span>
+            <span class="k">return</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_names</span><span class="p">(</span><span class="n">request_info</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ARNodeSubmodule.check_stop_batched">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.check_stop_batched">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_stop_batched</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">request_infos</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+        <span class="n">host_rows</span><span class="p">:</span> <span class="n">HostRows</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="n">BatchedStopCheck</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">stop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span>
+        <span class="k">if</span> <span class="n">stop</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">check_stop_batched</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">request_infos</span><span class="p">,</span> <span class="n">host_rows</span><span class="p">)</span>
+        <span class="n">pairs</span> <span class="o">=</span> <span class="n">host_rows</span><span class="o">.</span><span class="n">first_values</span><span class="p">(</span><span class="n">stop</span><span class="o">.</span><span class="n">buffer</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">pairs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">verdict</span><span class="p">,</span> <span class="n">names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_token_stops</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_names</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">rid</span><span class="p">:</span> <span class="n">names</span><span class="p">(</span><span class="n">info</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">pairs</span>
+            <span class="k">if</span> <span class="n">verdict</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">info</span> <span class="o">:=</span> <span class="n">request_infos</span><span class="p">[</span><span class="n">rid</span><span class="p">])</span>
+        <span class="p">}</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_token_stops</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">token</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Both stop checks' verdict on one row: whether its sampled</span>
+<span class="sd">        ``token`` ends the reply."""</span>
+        <span class="n">stop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span>
+        <span class="n">prefill_walks</span> <span class="o">=</span> <span class="n">stop</span><span class="o">.</span><span class="n">prefill_walks</span>
+        <span class="c1"># the set test first: a stop id is rare, and the reads behind it go</span>
+        <span class="c1"># through the info wrapper</span>
+        <span class="k">if</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">stop_ids</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">info</span><span class="o">.</span><span class="n">resource_configs</span><span class="p">[</span><span class="n">stop</span><span class="o">.</span><span class="n">sampler</span><span class="p">]</span><span class="o">.</span><span class="n">ignore_eos</span><span class="p">:</span>
+            <span class="n">walk</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">graph_walk</span>
+            <span class="k">if</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">prefill_walks</span><span class="p">:</span>
+                <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_reply_token</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+            <span class="c1"># only a row of ``walk`` ends the loop</span>
+            <span class="k">return</span> <span class="n">stop</span><span class="o">.</span><span class="n">walk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">walk</span> <span class="o">==</span> <span class="n">stop</span><span class="o">.</span><span class="n">walk</span>
+        <span class="c1"># the loop's cap is at least 1, so a one-token budget ends at the prefill</span>
+        <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="n">prefill_walks</span><span class="p">)</span> <span class="ow">and</span> <span class="n">info</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&lt;=</span> <span class="mi">1</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="n">info</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">prefill_walks</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_reply_token</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_is_reply_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="n">flag</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span><span class="o">.</span><span class="n">last_prefill_flag</span>
+        <span class="k">return</span> <span class="n">flag</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">bool</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">step_metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">flag</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_stop_names</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""What a row whose token stops returns: a ``prefill_walks`` row has</span>
+<span class="sd">        no loop yet, so it ends the partition."""</span>
+        <span class="n">stop</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_stop</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">END_PARTITION</span><span class="p">}</span> <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">prefill_walks</span> <span class="k">else</span> <span class="p">{</span><span class="n">stop</span><span class="o">.</span><span class="n">loop</span><span class="p">}</span>
 
 <div class="viewcode-block" id="ARNodeSubmodule.split_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.split_inputs">[docs]</a>

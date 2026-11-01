@@ -1063,6 +1063,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">backend</span><span class="p">:</span> <span class="n">RaggedAttnBackend</span> <span class="o">=</span> <span class="n">RaggedAttnBackend</span><span class="o">.</span><span class="n">AUTO</span>
     <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
 
+    <span class="c1"># Whether a compiled caller keeps the attention in its graph, as the</span>
+    <span class="c1"># ``mstar::ragged_attention`` op, rather than breaking there per layer. For</span>
+    <span class="c1"># a compiled, uncaptured region whose fusions around attention pay; off by</span>
+    <span class="c1"># default, since tracing a whole transformer as one graph per capture</span>
+    <span class="c1"># bucket costs startup time and capture memory (Z-Image: +2.6 GiB).</span>
+    <span class="n">compile_op</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
     <span class="c1"># Activation dtype of the q / k / v the node hands the kernel (and of its</span>
     <span class="c1"># output). A cacheless attention doesn't need to adhere to the dtype of its</span>
     <span class="c1"># KV cache, so it is free to declare a separate dtype here; when None, the</span>
@@ -1167,7 +1174,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">RaggedCrossAttentionSpec</span><span class="p">(</span><span class="n">_RaggedSpecBase</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Cacheless cross-attention between two spans of each request: a forward's</span>
 <span class="sd">    ``(q_label, kv_label)`` pairs (``RaggedCrossAttentionStep``), each run through</span>
-<span class="sd">    ``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``.</span>
+<span class="sd">    ``resource.run(q, k, v, label=cross_label(q_label, kv_label))``.</span>
 
 <span class="sd">    Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:</span>
 <span class="sd">    a model with both declares one of each per head geometry.</span>
