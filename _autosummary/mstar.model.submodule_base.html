@@ -856,7 +856,7 @@
 <td><p>A step's outputs, split by how they are addressed.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.BatchedStopCheck" title="mstar.model.submodule_base.BatchedStopCheck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchedStopCheck</span></code></a>(stops, withheld)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> for <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>: rid -&gt; loops to stop and rid -&gt; withheld outputs, rids with none left out of each.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> for <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>: rid -&gt; what <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> returns for it (loop names or <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code>) and rid -&gt; withheld outputs, rids with none left out of each.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostRows</span></code></a>(request_ids, buffers)</p></td>
 <td><p>A step's row-addressed outputs (<code class="docutils literal notranslate"><span class="pre">check_stop_buffers</span></code>) on the host.</p></td>
@@ -1191,8 +1191,9 @@ alone, and the caller takes the request out of the batch instead.</p>
 <dt class="sig sig-object py" id="mstar.model.submodule_base.BatchedStopCheck">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">BatchedStopCheck</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stops</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">withheld</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#BatchedStopCheck"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.BatchedStopCheck" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
-<p><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> for <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>: rid -&gt; loops to stop and
-rid -&gt; withheld outputs, rids with none left out of each.</p>
+<p><code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> for <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>: rid -&gt; what <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>
+returns for it (loop names or <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code>) and rid -&gt; withheld
+outputs, rids with none left out of each.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1594,6 +1595,13 @@ worker’s <em>next</em> iter’s fast postprocess. The current in-flight step
 (already submitted under the assumption that the rid continues)
 will run for that rid and its output discarded — the standard
 1-wasted-step cost for any stop signal.</p>
+<p><code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code> ends the request’s partition after this pass, so
+the conductor starts no further walk: e.g. a prefill whose sampled
+token is a stop token, before its decode loop exists. Return it only
+from a row outside any loop: from inside one, the request fails with
+an internal error. Use it only when nothing else must run for the
+partition (a later walk, a loop’s final-only publication); the
+model’s transition still decides those.</p>
 <p>A <code class="docutils literal notranslate"><span class="pre">StopCheck</span></code> also names outputs of this step that are not routed
 (<code class="docutils literal notranslate"><span class="pre">StopCheck.withheld</span></code>), decided off the same read; it may withhold
 without stopping.</p>
@@ -1616,7 +1624,8 @@ without stopping.</p>
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.check_stop_batched">
 <span class="sig-name descname"><span class="pre">check_stop_batched</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_infos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.check_stop_batched"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">check_stop</span></code> for the whole batch at once, off the host rows.</p>
-<p>Optional. Returns rid -&gt; loops to stop (rids with none left out), or a
+<p>Optional. Returns rid -&gt; what <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> returns for it (loop
+names or <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code>; rids with nothing left out), or a
 <code class="docutils literal notranslate"><span class="pre">BatchedStopCheck</span></code> for a submodule whose <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> withholds,
 and must agree with <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> for every rid. None, or a raise,
 falls back to the per-request path. <code class="docutils literal notranslate"><span class="pre">step_walk</span></code> is the walk every row

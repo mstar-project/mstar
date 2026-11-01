@@ -1127,6 +1127,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">current_worker_graph_ids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
     <span class="c1"># wg_id -&gt; count of distinct TP ranks that have reported completion</span>
     <span class="n">wg_rank_completions</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># a report since the last advance set `partition_done` (it can be the</span>
+    <span class="c1"># next pass's; see `Conductor._process_done_forward`)</span>
+    <span class="n">worker_reported_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">num_output_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># resource label -&gt; PublishedInfo, accumulated across all TP ranks and</span>
     <span class="c1"># handed back out on the next forward</span>

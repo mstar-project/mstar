@@ -992,6 +992,12 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.knobs</span><span class="w"> </span><span class="kn">import</span> <span class="n">device_loopback_enabled</span>  <span class="c1"># noqa: F401  (re-export)</span>
 
+<span class="c1"># What ``check_stop`` returns, besides loop names, for a stop no loop can carry:</span>
+<span class="c1"># a prefill that sampled a stop token, before its decode loop exists. The</span>
+<span class="c1"># request's partition ends when this pass completes, and the conductor starts</span>
+<span class="c1"># no further walk.</span>
+<span class="n">END_PARTITION</span> <span class="o">=</span> <span class="s2">"__end_partition__"</span>
+
 
 <div class="viewcode-block" id="HostRows">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.HostRows">[docs]</a>
@@ -1051,8 +1057,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="BatchedStopCheck">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedStopCheck">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">BatchedStopCheck</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""``StopCheck`` for ``check_stop_batched``: rid -&gt; loops to stop and</span>
-<span class="sd">    rid -&gt; withheld outputs, rids with none left out of each."""</span>
+<span class="w">    </span><span class="sd">"""``StopCheck`` for ``check_stop_batched``: rid -&gt; what ``check_stop``</span>
+<span class="sd">    returns for it (loop names or ``END_PARTITION``) and rid -&gt; withheld</span>
+<span class="sd">    outputs, rids with none left out of each."""</span>
 
     <span class="n">stops</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span>
     <span class="n">withheld</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span></div>
@@ -2245,6 +2252,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        will run for that rid and its output discarded — the standard</span>
 <span class="sd">        1-wasted-step cost for any stop signal.</span>
 
+<span class="sd">        ``END_PARTITION`` ends the request's partition after this pass, so</span>
+<span class="sd">        the conductor starts no further walk: e.g. a prefill whose sampled</span>
+<span class="sd">        token is a stop token, before its decode loop exists. Return it only</span>
+<span class="sd">        from a row outside any loop: from inside one, the request fails with</span>
+<span class="sd">        an internal error. Use it only when nothing else must run for the</span>
+<span class="sd">        partition (a later walk, a loop's final-only publication); the</span>
+<span class="sd">        model's transition still decides those.</span>
+
 <span class="sd">        A ``StopCheck`` also names outputs of this step that are not routed</span>
 <span class="sd">        (``StopCheck.withheld``), decided off the same read; it may withhold</span>
 <span class="sd">        without stopping.</span>
@@ -2264,7 +2279,8 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="n">BatchedStopCheck</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``check_stop`` for the whole batch at once, off the host rows.</span>
 
-<span class="sd">        Optional. Returns rid -&gt; loops to stop (rids with none left out), or a</span>
+<span class="sd">        Optional. Returns rid -&gt; what ``check_stop`` returns for it (loop</span>
+<span class="sd">        names or ``END_PARTITION``; rids with nothing left out), or a</span>
 <span class="sd">        ``BatchedStopCheck`` for a submodule whose ``check_stop`` withholds,</span>
 <span class="sd">        and must agree with ``check_stop`` for every rid. None, or a raise,</span>
 <span class="sd">        falls back to the per-request path. ``step_walk`` is the walk every row</span>
