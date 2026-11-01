@@ -1879,9 +1879,10 @@ class PreprocessWorkerThread:
         # Releases queued before this request was submitted belong
         # to an earlier request under its id: apply them first.
         self._process_releases()
-        if self._client_edges:
-            # Routes too, so a call's held items go out before this input,
-            # which may be a multi-second media preprocess.
+        if self._client_edges and prepared is None:
+            # Routes too, so a call's held items go out before this input's
+            # preprocess, which may take seconds. One prepared on the pool
+            # only stores and sends here, and the pass drains routes first.
             try:
                 self._process_messages()
             except Exception:  # noqa: BLE001 — the pass's inputs still go
