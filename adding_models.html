@@ -1200,7 +1200,9 @@ reply restores it. It replaces the request’s previous decode snapshot once the
 keys its page; a step whose token never reaches the chain, such as the one speculated
 past the reply’s end, leaves the previous one in place.</p></li>
 <li><p>A snapshot is keyed by the KV chain’s key at its page. A full set of slots evicts the
-least recently used snapshot that no request holds.</p></li>
+least recently used snapshot that no request holds, a decode snapshot before a prompt’s,
+so the slots hold about one prompt each. A decode snapshot that a later prompt restores
+is kept like a prompt’s from then on.</p></li>
 </ul>
 <p>Snapshots stay off without <code class="docutils literal notranslate"><span class="pre">prefix_slots</span></code>, and also above one rank, without a named KV
 cache, when that cache isn’t on every node of the pool, or when its <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> is
