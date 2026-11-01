@@ -16,7 +16,7 @@ import yaml
 torch = pytest.importorskip("torch")
 
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
-from mstar.conductor.conductor import Conductor, ForwardPassArgs, _growth_walks, _walk_io  # noqa: E402
+from mstar.conductor.conductor import Conductor, ForwardPassArgs, _walk_io  # noqa: E402
 from mstar.conductor.request_info import (  # noqa: E402
     FINAL_PREFILL,
     PartitionDefinition,
@@ -26,7 +26,8 @@ from mstar.conductor.request_info import (  # noqa: E402
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig  # noqa: E402
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
-from mstar.model.base import KVLabel, LabelLayout, Model, Span  # noqa: E402
+from mstar.model.base import KVLabel, LabelLayout, Model, Span, growth_walks  # noqa: E402
+from mstar.model.components.token_step import TokenStepNode  # noqa: E402
 from mstar.model.submodule_base import ChunkingPolicy, chunk_tick_name  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge  # noqa: E402
@@ -37,6 +38,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     SetupDone,
     WorkerGraphsDone,
 )
+from mstar.worker.engine_manager import _refuse_ungrown_decode_walks  # noqa: E402
 
 PREPROCESS = "api_server_preprocess_worker"
 
@@ -167,7 +169,7 @@ def plan_step(model, plan, k, signals) -> ForwardPassArgs:
     step metadata, by the conductor's own `_plan_step`."""
     c = Conductor.__new__(Conductor)
     c._walk_inputs, _, _ = _walk_io(model)
-    c._growth_walks = _growth_walks(model)
+    c._growth_walks = growth_walks(model)
     return c._plan_step(SimpleNamespace(persist_signals=signals), PartitionState("p", plan=list(plan)), k)
 
 
@@ -378,8 +380,34 @@ def _every_partitions_reads():
     ]
 
 
+def _another_partitions_persist():
+    """A's walk persists ``x`` afresh and B's second step reads it. B may enter
+    that step before A's walk writes ``x``, so what is held now is kept for B."""
+    walks = {
+        "a": GraphNode(name="na", input_names=["x"], outputs=[
+            GraphEdge(next_node=EMPTY_DESTINATION, name="x", persist=True),
+        ]),
+        "b0": GraphNode(name="nb", input_names=["y"], outputs=[]),
+        "b1": GraphNode(name="nb", input_names=["x"], outputs=[]),
+    }
+    model = _ToyModel(walks, {"A": [WalkStep("a")], "B": [WalkStep("b0"), WalkStep("b1")]},
+                      {"A": ["a"], "B": ["b0", "b1"]})
+    return model, {"x": [REF], "y": [TAIL]}, {}, [
+        ("B", "b0", {}, False), ("A", "a", {"x": EMB}, False), ("B", "b1", {}, False),
+    ], [
+        ("NEW_REQUEST", "A", "a", {("na", "x"): [REF]}, False),
+        ("NEW_REQUEST", "B", "b0", {("nb", "y"): [TAIL]}, False),
+        ("UNPERSIST_TENSORS", PREPROCESS, {TAIL: 1}),
+        ("INPUT_SIGNALS", "B", "b1", {("nb", "x"): [REF]}, False),
+        ("UNPERSIST_TENSORS", PREPROCESS, {REF: 2}),
+        # nothing reads what A persisted; the request's end lets go of it
+        ("UNPERSIST_TENSORS", "worker_0", {}),
+    ]
+
+
 _PLANS = {
     "every partition's reads": _every_partitions_reads,
+    "another partition's persist keeps it": _another_partitions_persist,
     "prefill then decode": _p2,
     "chunked prefill seeds its tick": _chunked_prefill,
     "a re-persisted name": _rebound_name,
@@ -432,13 +460,36 @@ def test_a_walk_plan_sends_each_steps_inputs_and_releases_their_last_read(tmp_pa
         "the plan's last step did not end the request"
 
 
-def test_a_request_no_partition_has_a_walk_for_is_refused(tmp_path, monkeypatch):
-    """No worker would ever report on it, so nothing would end it: a 400."""
-    model = _ToyModel({"a": GraphNode(name="na", input_names=["x"], outputs=[])}, {"default": []})
-    c = _conductor(model, [{"node_names": ["na"], "ranks": [0]}], tmp_path, monkeypatch)
+_REFUSED = {
+    # no worker would ever report on it, so nothing would end it
+    "no partition has a walk": ({"default": []}, None, "no walk to run"),
+    # a walk the model doesn't have fails the same check
+    "a walk of another partition": ({"A": [WalkStep("b")], "B": []}, {"A": ["a"], "B": ["b"]},
+                                    "not one of its walks"),
+    "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None,
+                                         "not inputs of that walk"),
+}
+
+
+@pytest.mark.parametrize("case", list(_REFUSED))
+def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, case):
+    """A 400, before any worker hears of the request."""
+    plans, groups, message = _REFUSED[case]
+    walks = {name: GraphNode(name=f"n{name}", input_names=["x"], outputs=[]) for name in ("a", "b")}
+    c = _conductor(_ToyModel(walks, plans, groups), [{"node_names": ["na", "nb"], "ranks": [0]}], tmp_path,
+                   monkeypatch)
     _run(c, [[_new_request("r", {"x": [_info(PROMPT)]})]])
 
     failed = [m.body for _, m in c.comm.sent if getattr(m, "message_type", None) == "request_failed"]
     assert [(f.request_id, f.status) for f in failed] == [("r", 400)]
-    assert "no walk to run" in failed[0].error_message
+    assert message in failed[0].error_message
     assert not _sends(c, ("NEW_REQUEST",)) and "r" not in c.requests
+
+
+def test_a_token_decoder_whose_decode_walk_grows_no_kv_is_refused_at_load():
+    """The conductor marks no step `FINAL_PREFILL` before a walk that grows no
+    KV label, so a stop on the prefill would end nothing."""
+    walks, plans = _decoder_walks([("prefill", ())]), {"default": [WalkStep("prefill"), DECODE]}
+    _refuse_ungrown_decode_walks({"llm": TokenStepNode()}, _ToyModel(walks, plans, growth=True))
+    with pytest.raises(ValueError, match="'llm' decodes in 'decode'"):
+        _refuse_ungrown_decode_walks({"llm": TokenStepNode()}, _ToyModel(walks, plans))

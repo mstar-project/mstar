@@ -37,7 +37,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import Model, WorkerGraph, streamed_inputs
+from mstar.model.base import Model, WorkerGraph, growth_walks, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
@@ -100,13 +100,6 @@ def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict
         if streamed and set(loops) <= {chunk_loop_name(node, walk) for node in graph.get_nodes()}:
             repeating.add(walk)
     return inputs, persists, frozenset(repeating)
-
-
-def _growth_walks(model: Model) -> frozenset[str]:
-    """The walks that grow a KV label: the step before one is `FINAL_PREFILL`."""
-    return frozenset(
-        walk for labels in model.kv_labels().values() for label in labels.values() for walk, _ in label.growth
-    )
 
 
 @dataclass
@@ -782,7 +775,7 @@ class Conductor:
         }
         # what the walk plans need of each walk (`_plan_step`, `_next_plan_args`, `_consumed`)
         self._walk_inputs, self._walk_persists, self._repeating_walks = _walk_io(self.model)
-        self._growth_walks = _growth_walks(self.model)
+        self._growth_walks = growth_walks(self.model)
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
@@ -1357,6 +1350,7 @@ class Conductor:
                 p.name, body.initial_input_modalities, body.initial_output_modalities,
                 body.initial_signals, model_kwargs,
             )
+            self._check_plan(p, pstate.plan)
             pstate.is_done = not pstate.plan
             first_steps[p.name] = self._plan_step(request_data, pstate, 0) if pstate.plan else ForwardPassArgs()
             self._set_partition_worker_graph_ids(body.request_id, p.name, pstate.graph_walk)
@@ -1961,6 +1955,25 @@ class Conductor:
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
 
+    def _check_plan(self, partition: PartitionDefinition, plan: list[WalkStep]) -> None:
+        """Refuse a plan the conductor can't run: a step whose walk isn't one
+        of the partition's (which startup checked are the model's), or a
+        ``bind`` key that isn't an input of the step's walk."""
+        model = type(self.model).__name__
+        for step in plan:
+            if step.walk not in partition.graph_walks:
+                raise ValueError(
+                    f"{model}'s plan for partition {partition.name!r} runs {step.walk!r}, which is not "
+                    f"one of its walks {sorted(partition.graph_walks)}"
+                )
+            if step.bind:
+                inputs = {name for name, _ in self._walk_inputs[step.walk]}
+                if unknown := sorted(set(step.bind) - inputs):
+                    raise ValueError(
+                        f"{model}'s plan binds {unknown} on {step.walk!r}, which are not inputs of that "
+                        f"walk; its inputs are {sorted(inputs)}"
+                    )
+
     def _plan_step(self, request_data: RequestData, pstate: PartitionState, k: int) -> ForwardPassArgs:
         """Enter step ``k`` of the partition's plan: each input of its walk gets
         the persisted signal its ``bind`` names, or its own name's, or an
@@ -2022,35 +2035,27 @@ class Conductor:
         partitions go out.
 
         A name one of them reads is released unless a later step of some
-        partition's plan reads it with no walk persisting the name in between,
-        where the sending steps' own walks count: what a step persists replaces
-        what it read. A held name whose next reader comes only after such a
-        walk is released too, so the reader doesn't get both (though one no
-        worker was ever sent has no reader count, and `_un_persist_tensors`
-        leaves it held). Anything else is held, at most to the request's end.
+        partition's plan reads it with no walk of that partition persisting the
+        name in between, the partition's current step included: what a step
+        persists replaces what it read. Another partition's walk is no such
+        guarantee, since the partitions run concurrently. Anything else is
+        held, at most to the request's end.
         """
         states = request_data.partition_states
-        sending = [states[name].plan[states[name].cursor] for name in sent]
-        read_now = set().union(*(self._reads(step) for step in sending))
-        rewritten = set().union(*(self._walk_persists[step.walk] for step in sending))
-        # a name a later step reads -> whether to release it: only if no
-        # reader would get what is held now
-        release: dict[str, bool] = {}
+        read_now = set().union(*(self._reads(states[name].plan[states[name].cursor]) for name in sent))
+        # the names a later step reads as they are held now
+        still_read: set[str] = set()
         for pstate in states.values():
             if pstate.is_done or not pstate.plan:
                 continue
             plan = pstate.plan
-            fresh = rewritten | self._walk_persists[plan[pstate.cursor].walk]
+            fresh = self._walk_persists[plan[pstate.cursor].walk]
             for step in plan[pstate.cursor + 1:]:
-                for name in self._reads(step):
-                    if name in fresh:
-                        release.setdefault(name, True)
-                    else:
-                        release[name] = False
+                still_read |= self._reads(step) - fresh
                 fresh = fresh | self._walk_persists[step.walk]
         return [
             info for name, infos in request_data.persist_signals.items()
-            if release.get(name, name in read_now) for info in infos
+            if name in read_now and name not in still_read for info in infos
         ]
 
     def _send_inputs(
