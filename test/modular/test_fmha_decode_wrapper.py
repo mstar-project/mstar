@@ -153,6 +153,8 @@ def test_captured_decode_takes_fmha_when_asked(monkeypatch):
     wrapper = manager._cg_wrapper(_decode_lease(), "main", 16, False)
     assert isinstance(wrapper, _Recorder)
     assert wrapper.kwargs["batch_size"] == 16 and wrapper.kwargs["max_seq_len"] == 1024
+    # a config that leaves page_size to the pool still hands the wrapper the pool's page
+    assert wrapper.kwargs["page_size"] == manager._kv_config.tokens_per_page
     assert not built
 
 

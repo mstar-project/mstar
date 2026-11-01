@@ -185,7 +185,7 @@ class FlashInferManager(AttentionManager):
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim,
-            page_size=config.page_size,
+            page_size=self._group.page_size,
             batch_size=num_rows,
             max_seq_len=config.max_seq_len,
             device=self._device,
