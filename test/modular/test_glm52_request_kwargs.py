@@ -76,6 +76,13 @@ def test_strings_that_are_not_the_knobs_type_are_refused(kwargs):
         _intake(_model(), kwargs)
 
 
+def test_return_logprobs_is_refused_where_the_sampler_never_sees_it():
+    # GLM-5.2 builds its sampler config from its own keys, which leave it out
+    with pytest.raises(ValueError, match="does not report logprobs"):
+        _intake(_model(), {"return_logprobs": True})
+    _intake(_model(), {"return_logprobs": False})
+
+
 def test_min_p_is_refused_at_intake():
     m = _model()
     # the sampler that would read it is built without it

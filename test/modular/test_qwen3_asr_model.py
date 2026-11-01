@@ -19,10 +19,10 @@ sys.path.insert(0, ".")
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
-from mstar.model.components.aut_encoder_submodule import AUT_ATTN, AuTEncoderSubmodule  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
+    AUT_ATTN,
     DECODE_WALK,
     ENCODER_NODE,
     KV_CACHE,
@@ -31,7 +31,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
     Qwen3ASRModelConfig,
 )
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
-from mstar.model.qwen3_asr.submodules import Qwen3ASRLLMSubmodule  # noqa: E402
+from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
 from mstar.model.submodule_base import HostRows, ModelInputsFromEngine, NodeInputs, StopCheck  # noqa: E402
 
@@ -262,10 +262,7 @@ def _encoder_submodule(cfg):
     # attention unbound -> SDPA per window (the CPU path)
     for layer in encoder.layers:
         layer.self_attn.ragged = None
-    log_mel = LogMelSpectrogram(
-        num_mel_bins=cfg.num_mel_bins, sampling_rate=cfg.sampling_rate, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-    )
-    return AuTEncoderSubmodule(encoder, log_mel).eval()
+    return Qwen3ASREncoderSubmodule(encoder, cfg).eval()
 
 
 def test_encoder_submodule_declares_windows_and_packs_requests():
@@ -451,7 +448,7 @@ def test_graph_resources_and_state_machine():
     cfg = model.config
     frames = cfg.max_audio_samples // cfg.hop_length
     expected = -(-frames // cfg.audio.n_window_infer)  # windows, rounded up
-    assert ragged.config.max_segments_per_request == expected
+    assert ragged.config.max_segments_per_request == model.max_windows_per_request == expected
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {LLM_NODE} and kv.config.num_kv_heads == 2 and kv.config.max_num_pages == model.KV_PAGES
     (attn,) = [s for s in specs if hasattr(getattr(s, "config", None), "decode_tensor_cores")]

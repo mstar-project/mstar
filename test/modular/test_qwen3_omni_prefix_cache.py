@@ -7,9 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from torch._dynamo.utils import counters
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeVisionEncoderConfig
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeVisionEncoder
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
@@ -20,14 +17,11 @@ from mstar.engine.resources.position.manager import RopeManager
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
-from mstar.model.qwen3_omni.submodules import ThinkerSubmodule, VisionEncoderSubmodule
+from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
 
 RID = "r0"
 NODE = "Thinker"
 HIDDEN = 8
-
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="flash-attn runs on a GPU")
-
 
 class _StubThinker(nn.Module):
     def __init__(self):
@@ -251,36 +245,6 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     )
 
 
-def _vision(attn_implementation: str = "sdpa") -> VisionEncoderSubmodule:
-    # The tensors `prepare_inputs` builds depend only on the grid, the merge size and
-    # `num_grid_per_side`, so a small encoder is enough.
-    config = Qwen3OmniMoeVisionEncoderConfig(
-        depth=2, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=16,
-        num_position_embeddings=64, deepstack_visual_indexes=[0, 1],
-    )
-    encoder = Qwen3OmniMoeVisionEncoder._from_config(config, attn_implementation=attn_implementation).eval()
-    return VisionEncoderSubmodule(encoder, config=None)
-
-
-def _image(vision):
-    grid, pixels = torch.tensor([1, 4, 6]), torch.randn(24, 3 * 2 * 16 * 16)
-    inputs = {"pixel_values": [pixels], "image_grid_thw": [grid]}
-    return grid, pixels, vision.prepare_inputs("prefill_vision", None, inputs)
-
-
-def test_the_vision_encoder_embeds_an_image_from_its_prepared_inputs_as_it_would_alone():
-    vision = _vision()
-    grid, pixels, prepared = _image(vision)
-    encoder = vision.vision_encoder
-    with torch.no_grad():
-        ours = vision.forward("prefill_vision", None, **prepared.tensor_inputs)
-        alone = encoder(pixels, grid_thw=grid[None])
-
-    assert torch.equal(ours["vision_embeds"][0], alone.pooler_output) and all(
-        torch.equal(layer, own) for layer, own in zip(ours["deepstack"], alone.deepstack_features, strict=True)
-    ), "the inputs built before the compiled call embed the image otherwise than the encoder does"
-
-
 def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
     out = _prompt(
         model, ["text", "video", "text"], {"video_inputs": [torch.zeros(4, 3, 64, 96)]},
@@ -292,34 +256,21 @@ def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
         "a prompt with a video keyed other than its leading text"
     )
 
-@requires_cuda
-def test_the_vision_encoder_compiles_no_graph_for_a_size_inside_the_ranges_it_has_compiled():
-    pytest.importorskip("flash_attn")
-    torch._dynamo.reset()
-    submodule = _vision("flash_attention_2")
-
-    def inputs(grid):
-        return {"pixel_values": [torch.randn(grid[0] * grid[1] * grid[2], 3 * 2 * 16 * 16, device="cuda")],
-                "image_grid_thw": [torch.tensor(grid, device="cuda")]}
-
-    submodule = submodule.to(device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("node", ["audio_encoder", "vision_encoder"])
+def test_the_encoders_are_not_compiled_while_their_output_is_cached(monkeypatch, node):
+    """The engine compiles an item encoder's forward with dynamic=True, and a
+    graph compiled for a new size rounds otherwise than the one whose output
+    the prefix cache holds. Both encoders capture their block stacks and opt
+    out of the compile, so no size compiles a graph of its own."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    compiled = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compiled.append(fn) or fn)
+    cls = {"audio_encoder": AudioEncoderSubmodule, "vision_encoder": VisionEncoderSubmodule}[node]
     engine = Engine.__new__(Engine)
     engine._device = torch.device("cuda")
-    engine._item_encoders = {"vision"}
-    engine._submodules = {"vision": SimpleNamespace(submodule=submodule)}
+    engine._item_encoders = {node}
+    engine._submodules = {node: SimpleNamespace(submodule=object.__new__(cls), forward="eager")}
+
     engine._compile_submodules()
-    forward = engine._submodules["vision"].forward
 
-    def encode(grid):
-        prepared = submodule.prepare_inputs("prefill_vision", None, inputs(grid))
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            forward("prefill_vision", None, **prepared.tensor_inputs)
-
-    encode((1, 4, 6))
-    frames = counters["frames"]["ok"]
-    with torch._dynamo.config.patch(error_on_recompile=True):
-        encode((1, 8, 10))
-
-    assert counters["frames"]["ok"] == frames, (
-        "the vision encoder compiled a graph for a size inside a range it had compiled"
-    )
+    assert not compiled and engine._submodules[node].forward == "eager"

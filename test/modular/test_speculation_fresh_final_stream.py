@@ -32,7 +32,13 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationPrepOutput,
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler, PopReadyResult, ScheduledBatch  # noqa: E402
+from mstar.worker.batch_builder import StepPick  # noqa: E402
+from mstar.worker.micro_scheduler import (  # noqa: E402
+    ChainPick,
+    MicroScheduler,
+    PopReadyResult,
+    ScheduledBatch,
+)
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
@@ -135,8 +141,11 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        room_for_continuing=lambda target: None,
-        get_next_batch=lambda *a, **k: fresh,
+        pick_chain_step=lambda state, target, continuing: ChainPick(target, StepPick(
+            taken=[*continuing, FRESH], continuing=list(continuing), room=None,
+            held_back=set(), ordered=False,
+        ), []),
+        take_chain_step=lambda state, chain: fresh,
     )
     runtime, target = _runtime()
     worker = _worker(scheduler, runtime)
