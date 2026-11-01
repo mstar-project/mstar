@@ -10,7 +10,7 @@ node_groups:
 
   - node_names: [Thinker]
     ranks: [1]
-    graph_walks: [thinker_decode]
+    graph_walks: [thinker_decode, thinker_text_decode]
   
   - node_names: [Talker]
     ranks: [2]
