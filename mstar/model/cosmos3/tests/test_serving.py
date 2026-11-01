@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+from mstar.model.cosmos3.tests.stubs import StubSampler
 
 NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
 
@@ -137,12 +138,8 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
     dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
         model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
 
-    class _Sched:
-        def __init__(self, n):
-            self.timesteps = list(range(n))
-
     n = 4
-    dit.request_state("r").add_all(scheduler=_Sched(n), raw_action_dim=2)
+    dit.request_state("r").add_all(scheduler=StubSampler(list(range(n))), raw_action_dim=2)
 
     def info(walk, it):
         return types.SimpleNamespace(
@@ -160,14 +157,12 @@ def test_dynamic_loop_check_stop_and_wasted_step() -> None:
     # A forward one past the step count returns its inputs unchanged without
     # touching the transformer or cache manager (both None here).
     lat = torch.zeros(1, 4, 1, 2, 2)
-    ti = torch.tensor([n])
-    out = dit._forward_image_gen(None, dit.request_states["r"], latents=lat, time_index=ti)
-    assert torch.equal(out["latents"][0], lat) and torch.equal(out["time_index"][0], ti)
+    solver = {"unipc_last_sample": torch.ones(1)}
+    out = dit._forward_image_gen(None, dit.request_states["r"], n, latents=lat, **solver)
+    assert torch.equal(out["latents"][0], lat) and out["unipc_last_sample"] == [solver["unipc_last_sample"]]
 
     act = torch.zeros(1, 3, 5)
-    out = dit._forward_action_gen(
-        None, dit.request_states["r"], latents=lat, action_latents=act, time_index=ti
-    )
+    out = dit._forward_action_gen(None, dit.request_states["r"], n, latents=lat, action_latents=act)
     assert torch.equal(out["latents"][0], lat)
     # The action latents (the looped self-edge the loop emits on finish) pass
     # through unchanged on the discarded extra step.
@@ -679,41 +674,33 @@ def test_postprocess_finishes_captured_step() -> None:
 
     import torch
 
-    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.submodules import IMAGE_GEN_LOOP, Cosmos3DiTSubmodule
     from mstar.model.submodule_base import ARNodeInputs
 
     dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
         model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
-
-    class _Sched:
-        step_index = None
-        timesteps = torch.tensor([900.0, 500.0, 100.0])
-
-        @staticmethod
-        def step(velocity, t, latents, return_dict=False):
-            return (latents + velocity,)
+    dit._solver_state = ()
 
     # One all-noisy latent frame of 2x2 patches (the layout the captured
     # graph's velocity mask is derived from).
     dit.request_state("r").add_all(
-        gs=2.0, scheduler=_Sched(),
+        gs=2.0, scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
         cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
     )
-    info = types.SimpleNamespace(graph_walk="image_gen")
-    lat, ti = torch.ones(1, 1, 2, 2), torch.tensor([1])
-    inp = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": ti})
+    info = types.SimpleNamespace(graph_walk="image_gen", dynamic_loop_iter_counts={IMAGE_GEN_LOOP: 1})
+    lat = torch.ones(1, 1, 2, 2)
+    inp = ARNodeInputs(tensor_inputs={"latents": lat})
 
     # Captured shape: velocity = uncond + gs*(cond - uncond) = 3, latents += 3.
     out = {"cond_v": [torch.full((1, 1, 2, 2), 2.0)], "uncond_v": [torch.ones(1, 1, 2, 2)]}
     dit.postprocess("r", info, out, inputs=inp)
-    assert set(out) == {"latents", "time_index"}
+    assert set(out) == {"latents"}
     assert torch.equal(out["latents"][0], torch.full((1, 1, 2, 2), 4.0))
-    assert torch.equal(out["time_index"][0], torch.tensor([2]))
 
     # Eager shape (already finished) and non-gen walks stay untouched.
-    eager = {"latents": [lat], "time_index": [ti]}
+    eager = {"latents": [lat]}
     dit.postprocess("r", info, eager, inputs=inp)
-    assert eager == {"latents": [lat], "time_index": [ti]}
+    assert eager == {"latents": [lat]}
     pre = {"cond_v": [lat]}
     dit.postprocess("r", types.SimpleNamespace(graph_walk="prefill"), pre, inputs=inp)
     assert pre == {"cond_v": [lat]}

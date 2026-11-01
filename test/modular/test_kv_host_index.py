@@ -11,11 +11,12 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import chain
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
@@ -130,7 +131,7 @@ def _pages(kv: KVManager, rid: str) -> list[int]:
 
 
 def _host_pages(kv: KVManager, rid: str) -> list[int]:
-    return kv._cpu_pool.offloaded[rid]["main"].cpu_page_indices
+    return kv._cpu_pool.offloaded[rid]["main"].host_pages
 
 
 def test_a_prefix_sixteen_requests_share_is_stored_once():

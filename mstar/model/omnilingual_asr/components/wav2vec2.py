@@ -41,6 +41,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from mstar.utils.h2d import to_device_nonblocking
+
 _ATTENTION_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
@@ -217,10 +219,7 @@ class Wav2Vec2CTC(nn.Module):
         frame_lens = [t] * n if seq_lens is None else self.frame_lengths(seq_lens)
         frame_mask = None
         if any(f < t for f in frame_lens):
-            lens = torch.tensor(frame_lens)
-            if x.is_cuda:
-                lens = lens.pin_memory()
-            lens = lens.to(x.device, non_blocking=True)
+            lens = to_device_nonblocking(frame_lens, x.device)
             frame_mask = torch.arange(t, device=x.device)[None, :] < lens[:, None]
         x = front.model_dim_proj(front.post_extract_layer_norm(x))
         x = front.pos_encoder(x, frame_mask)

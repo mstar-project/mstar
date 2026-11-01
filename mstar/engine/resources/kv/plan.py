@@ -221,8 +221,11 @@ class HostLens(torch.Tensor):
     plan thread every decode step). Iterating the numpy view costs 0.1 us a
     row and the numpy scalar has ``.item()`` too. Everything else FlashInfer
     does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its
-    device buffer) is plain tensor behaviour.
+    device buffer) is plain tensor behaviour, so torch ops skip the subclass
+    dispatch (about 6 us a call) and treat it as a plain tensor.
     """
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
 
     def __iter__(self):
         return iter(self.numpy())
@@ -291,7 +294,7 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
     nowhere else to ride.
     """
 
-    __slots__ = ("pre_forks", "post_forks", "fork_rids")
+    __slots__ = ("pre_forks", "post_forks", "fork_rids", "later_groups")
 
     def __init__(
         self,
@@ -299,6 +302,7 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
         pre_forks: tuple[tuple[str, str], ...] = (),
         post_forks: tuple[tuple[str, str], ...] = (),
         fork_rids: frozenset | None = None,
+        later_groups: tuple[dict[str, KVPlanOutput], ...] = (),
     ):
         super().__init__(mapping or {})
         # applied by `plan`; the consumer mirrors them at plan time
@@ -307,6 +311,15 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
         self.post_forks = post_forks
         # the rows both apply to, as `KVStep.fork_rids`; None is every row
         self.fork_rids = fork_rids
+        # the labels' plans in each group of the pool past the first (`PagedKVConfig.groups`)
+        self.later_groups = later_groups
+
+    @property
+    def groups(self) -> tuple[dict[str, KVPlanOutput], ...]:
+        """The labels' plans in each group: these, then ``later_groups``, as `CacheStream.groups`
+        holds a stream's pages. Not a field, which would make every step's plan a reference
+        cycle, held with its indptrs until the cyclic GC runs."""
+        return (self, *self.later_groups)
 
 
 # Page the padding tail of a captured step scatters into. Reserved at
