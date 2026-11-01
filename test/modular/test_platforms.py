@@ -220,3 +220,101 @@ def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, ro
     conductor.Conductor._launch_workers(spawner)
     assert seen == ["default"] * 4
     assert len(spawner._worker_processes) == 2
+
+
+# --- device selection (mstar serve --gpus) ----------------------------------
+
+
+@pytest.fixture
+def device_env(monkeypatch):
+    """Starts with no device variables set. Teardown restores what the test sets."""
+    for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+    return monkeypatch
+
+
+@pytest.mark.parametrize(
+    ("hip", "cuda", "xpu", "expected"),
+    [
+        (None, "12.8", None, {"CUDA_VISIBLE_DEVICES": "0,1"}),
+        (None, None, "20250101", {"CUDA_VISIBLE_DEVICES": "0,1"}),
+        ("7.0", None, None, {"CUDA_VISIBLE_DEVICES": "0,1", "HIP_VISIBLE_DEVICES": "0,1"}),
+    ],
+)
+def test_gpus_select_devices_without_a_device_call(device_env, hip, cuda, xpu, expected):
+    """ROCm sets both variables since HIP reads HIP_VISIBLE_DEVICES first.
+    Other builds set only CUDA_VISIBLE_DEVICES, as before."""
+
+    def device_call():
+        raise AssertionError("a device call before the devices were selected")
+
+    device_env.setattr(torch.cuda, "is_available", device_call)
+    device_env.setattr(platforms, "resolve_platform", device_call)
+    device_env.setattr(torch.version, "hip", hip)
+    device_env.setattr(torch.version, "cuda", cuda)
+    device_env.setattr(torch.version, "xpu", xpu, raising=False)
+
+    platforms.apply_visible_devices("0,1")
+    selected = {
+        key: os.environ[key]
+        for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+        if key in os.environ
+    }
+    assert selected == expected
+
+
+def test_gpus_replace_a_leftover_hip_selection_on_rocm(device_env):
+    device_env.setattr(torch.version, "hip", "7.0")
+    device_env.setenv("HIP_VISIBLE_DEVICES", "3")
+    platforms.apply_visible_devices("0")
+    assert os.environ["HIP_VISIBLE_DEVICES"] == os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("hip_env", "cuda_env"), [(None, None), ("1", None), (None, "1"), ("0,1", "0,1")],
+)
+def test_without_gpus_a_consistent_environment_stands(device_env, hip_env, cuda_env):
+    device_env.setattr(torch.version, "hip", "7.0")
+    if hip_env is not None:
+        device_env.setenv("HIP_VISIBLE_DEVICES", hip_env)
+    if cuda_env is not None:
+        device_env.setenv("CUDA_VISIBLE_DEVICES", cuda_env)
+    platforms.apply_visible_devices(None)
+    assert os.environ.get("HIP_VISIBLE_DEVICES") == hip_env
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == cuda_env
+
+
+def test_without_gpus_conflicting_selections_fail_on_rocm(device_env):
+    device_env.setattr(torch.version, "hip", "7.0")
+    device_env.setenv("HIP_VISIBLE_DEVICES", "1")
+    device_env.setenv("CUDA_VISIBLE_DEVICES", "0")
+    with pytest.raises(ValueError, match="HIP_VISIBLE_DEVICES='1'"):
+        platforms.apply_visible_devices(None)
+
+
+def test_without_gpus_cuda_ignores_hip_selection(device_env):
+    device_env.setattr(torch.version, "hip", None)
+    device_env.setattr(torch.version, "cuda", "12.8")
+    device_env.setenv("HIP_VISIBLE_DEVICES", "1")
+    device_env.setenv("CUDA_VISIBLE_DEVICES", "0")
+    platforms.apply_visible_devices(None)
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_serve_selects_gpus_through_the_platform(device_env):
+    from mstar.cli import main as cli
+
+    selected = []
+
+    class SelectedError(Exception):
+        """Raised by the stand-in, so the server never starts."""
+
+    def apply(devices):
+        selected.append(devices)
+        raise SelectedError
+
+    device_env.setattr(platforms, "apply_visible_devices", apply)
+    with pytest.raises(SelectedError):
+        cli.main(["serve", "kokoro", "--gpus", "2,3"])
+    assert selected == ["2,3"]

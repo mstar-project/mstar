@@ -158,11 +158,28 @@ def _read_gemm_backends(*args, **kwargs):
     return inductor_config.max_autotune_gemm_backends, args, kwargs
 
 
-@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
-def test_no_overrides_returns_the_callable_itself(on_platform, platform):
+@pytest.mark.parametrize(
+    ("platform", "num_tokens"),
+    [(CudaPlatform(), 16), (CudaPlatform(), None), (RocmPlatform(), 64), (RocmPlatform(), None)],
+    ids=repr,
+)
+def test_no_overrides_returns_the_callable_itself(on_platform, platform, num_tokens):
     on_platform(platform)
-    assert with_inductor_overrides(_read_gemm_backends, 16) is _read_gemm_backends
-    assert with_inductor_overrides(_read_gemm_backends) is _read_gemm_backends
+    assert with_inductor_overrides(_read_gemm_backends, num_tokens) is _read_gemm_backends
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "aten_only"), [(1, True), (32, True), (33, False), (1024, False), (None, False)],
+)
+def test_rocm_keeps_small_buckets_gemms_on_aten(num_tokens, aten_only):
+    """Small buckets autotune GEMMs over hipBLASLt only. Bigger ones, and
+    forwards compiled for any token count, keep inductor's defaults."""
+    overrides = RocmPlatform().inductor_overrides(num_tokens)
+    assert overrides == ({"max_autotune_gemm_backends": "ATEN"} if aten_only else {})
+
+
+def test_cuda_keeps_inductors_defaults():
+    assert all(CudaPlatform().inductor_overrides(n) == {} for n in (1, 32, 1024, None))
 
 
 def test_overrides_hold_inside_the_call_only(on_platform):
