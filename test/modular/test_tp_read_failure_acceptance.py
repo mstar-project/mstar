@@ -669,7 +669,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._graph_runtime = graph
     w.engine_manager = SimpleNamespace(
         get_engine=lambda node: engine, warmup_all=lambda: None,
-        remove_request=engine.remove_request, evictable_nodes=lambda: (),
+        remove_request=engine.remove_request,
     )
     w.request_state = graph
     w.parallel_nodes = {NODE}
@@ -683,7 +683,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.scheduler.runtime = graph
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
-    w._last_active = {}
     w._hold_logged = {}
     w._in_flight_rids = set()
     w._pending_removes = {}
