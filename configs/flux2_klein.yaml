@@ -9,6 +9,8 @@ max_seq_len: 512
 # transformer per shape, CUDA-graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs: &model_kwargs
+  # text_encoder_max_batch_size: prompts in one text encoder step, max_batch_size unless set. Default batched, 1 on AMD
+  # GPUs (platform_overrides below). Whether NVIDIA's text encoder depends on the batch size the same way is unmeasured
   # sdpa (cuDNN on H100) is the reference kernel; auto runs the DiT's joint attention on the
   # engine's ragged attention resource with the platform's default kernel (FlashInfer FA3 on
   # NVIDIA GPUs, AITER's asm flash attention on MI300X/MI325X, where torch's sdpa is AOTriton)
@@ -77,6 +79,8 @@ platform_overrides:
       <<: *model_kwargs
       # AITER's asm flash attention through the ragged resource; torch's sdpa is AOTriton here
       attention_backend: auto
+      # prompts encode one at a time: the batched encode's padding costs more than it saves here
+      text_encoder_max_batch_size: 1
       linear_dtype: fp8
       # the text stream's linears (512 rows) are no faster in fp8; the line's declaration left them out
       linear_keep_bf16: ["double_blocks.*.attn.txt_*", "double_blocks.*.txt_ff.*"]
