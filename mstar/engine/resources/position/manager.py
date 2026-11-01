@@ -2,10 +2,12 @@
 
 has ownership of per-(request,label) position counter"""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 
 import torch
 
+from mstar.engine.node_dtype import warn_implicit_downcast
 from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotKey,
@@ -328,7 +330,7 @@ class RopeManager(PositionManager):
         # a stream forked off another starts at the source's position, so
         # mirror the forks KV just applied before any counter is read below
         self._apply_forks(
-            plan_outputs.pre_forks, ctx.padded_request_ids,
+            plan_outputs.pre_forks, self._forking_rids(plan_outputs, ctx),
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
@@ -346,18 +348,32 @@ class RopeManager(PositionManager):
         return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
+        all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
             if advance:
-                counters = self._counters.setdefault(segment.request_id, {})
+                counters = all_counters.get(segment.request_id)
+                if counters is None:
+                    counters = all_counters[segment.request_id] = {}
                 counters[segment.label] = counters.get(segment.label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
         plan_outputs = ctx.plan_results.get(self._kv_cache_name)
         if plan_outputs is not None:
-            self._apply_forks(plan_outputs.post_forks, ctx.padded_request_ids)
+            self._apply_forks(plan_outputs.post_forks, self._forking_rids(plan_outputs, ctx))
+
+    @staticmethod
+    def _forking_rids(plan_outputs: KVPlanOutputs, ctx: StepContext) -> Sequence[int]:
+        """The rows KV forked: a step's forks may cover only some of its rows.
+        A chunked prompt forks on some of its chunks only (BAGEL's pre-forks on
+        its first), and a later chunk re-forking the target's counter would
+        restart its positions."""
+        fork_rids = plan_outputs.fork_rids
+        if fork_rids is None:
+            return ctx.padded_request_ids
+        return [rid for rid in ctx.padded_request_ids if rid in fork_rids]
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],
@@ -422,13 +438,18 @@ class RopeManager(PositionManager):
         eager path has no slot to key a buffer by, so allocates plainly.
         """
         block = self._config.scheme == PosScheme.BLOCK
+        counters = self._counters
         pos_ids: list[int] = []
+        append, extend = pos_ids.append, pos_ids.extend
         for rid, label, to_compute in rows:
-            start = self.position(rid, label)
-            if block:
-                pos_ids.extend([start] * to_compute)
+            labels = counters.get(rid)
+            start = labels.get(label, 0) if labels is not None else 0
+            if to_compute == 1:
+                append(start)  # a decode row
+            elif block:
+                extend([start] * to_compute)
             else:
-                pos_ids.extend(range(start, start + to_compute))
+                extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(
@@ -564,6 +585,7 @@ class RopeManager(PositionManager):
             dtype = torch.get_autocast_dtype(q.device.type)
             q, k = q.to(dtype), k.to(dtype)
         elif q.dtype == torch.float32:
+            warn_implicit_downcast("RoPE", q.dtype, torch.bfloat16)
             q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
 
         llama31_params = {

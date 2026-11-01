@@ -9,15 +9,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
+from typing import NamedTuple
 
 import torch
 
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.model.components.diffusion.image_io import PNG_WORKERS
 
 try:
     import torchaudio  # noqa: F401 — probes availability; real usage in callers
@@ -44,10 +43,10 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -63,9 +62,8 @@ from mstar.streaming.topology import (
     ClientStreamLimits,
     client_stream_limits,
 )
-from mstar.utils import profiler
+from mstar.utils import cpus, profiler
 from mstar.utils.client_errors import client_error_text
-from mstar.utils.cpus import usable_cpus
 from mstar.utils.ipc_format import (
     AbortRequest,
     ClientStreamRoute,
@@ -82,6 +80,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.utils.threads import Thread, ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -100,17 +99,6 @@ def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool
     return modality in ARTIFACT_MODALITIES and not streamed
 
 
-def encode_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
-    """Outputs encoded at once. A PNG deflates on ``png_workers`` threads of
-    its own (``image_io.PNG_WORKERS``), so the pool times that stays within
-    the CPUs the process may use."""
-    if cpus is None:
-        cpus = usable_cpus()
-    if png_workers is None:
-        png_workers = PNG_WORKERS
-    return max(1, min(4, cpus // png_workers))
-
-
 def _sha256(path: str) -> bytes:
     with open(path, "rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
@@ -119,6 +107,12 @@ def _sha256(path: str) -> bytes:
 def _file_state(path: str) -> tuple[int, int, int]:
     stat = os.stat(path)
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _prefix_cache(model_kwargs: dict) -> bool:
+    """A client's prefix_cache: unset or None is on, otherwise its truth."""
+    value = model_kwargs.get("prefix_cache")
+    return value is None or bool(value)
 
 
 class _FileChangedError(Exception):
@@ -165,13 +159,19 @@ def _video_frame_metadata(
         "frame_count": frame_count,
     }
 @dataclass
-class InlineToken:
-    """One request's value out of a RESULT_TOKENS frame, queued behind the
-    tensor results so sequences keep arrival order."""
-    request_id: str
-    value: int
-    loop_indices: NestedLoopIndices | None
+class InlineTokens:
+    """One RESULT_TOKENS frame's values for the requests still known here,
+    queued behind the tensor results so each request's chunks keep arrival
+    order. One item per frame, not per request, so the data worker wakes the
+    message thread once per step (``ResultQueue``). A chunk's order is its
+    arrival sequence; its loop indices only give a turn-token model's ``step``."""
+    request_ids: list[str]
+    values: list[int]
     modality: str
+    # per request, or None when no request of the frame asked
+    logprobs: list[float | None] | None = None
+    # per request, the loop context of the step that produced the value
+    loop_indices: list[NestedLoopIndices | None] | None = None
 
 
 def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> None:
@@ -197,14 +197,46 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
+    YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
+    groups = [
+        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        for group in model_config.get("node_groups") or []
+    ]
+    opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
     return {
-        spec.resource_key: spec.config.page_size
-        for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
+        spec.resource_key: spec.config.tokens_per_page for spec in specs
+        if isinstance(spec, KVSpec) and spec.resource_key in opened
     }
+
+
+class ResultQueue(queue.Queue):
+    """What the data worker hands the API message thread: output chunks, or
+    profile updates.
+
+    A put doesn't wake that thread: ``flush`` signals ``wakeup`` once for
+    everything put since the last flush. The data worker thread flushes after
+    each item it takes and after its reads. A RESULT_TOKENS frame is one item
+    whose chunks are put as it is taken, so a token step costs the message
+    thread two passes however many rows it had, one for the frame's arrival and
+    one for its chunks. A result tensor is one request's edge, and taking it
+    only starts a read, whose chunks go out with the flush after the reads."""
+
+    def __init__(self, wakeup: EventWakeup):
+        super().__init__()
+        self.wakeup = wakeup
+        self._unsignaled = False
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self._unsignaled = True
+
+    def flush(self) -> None:
+        if self._unsignaled:
+            self._unsignaled = False
+            self.wakeup.signal()
 
 
 class PreprocessWorker:
@@ -227,8 +259,12 @@ class PreprocessWorker:
         self.abort_request_queue = queue.Queue()
         self.reads_done_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
-        self.output_queue = queue.Queue()
-        self.profile_queue = queue.Queue()
+        # Ends the API message thread's poll: the flushes of these two queues,
+        # and the API server when a request handler changes what that
+        # thread's next pass reads, signal it.
+        self.results_wakeup = EventWakeup()
+        self.output_queue = ResultQueue(self.results_wakeup)
+        self.profile_queue = ResultQueue(self.results_wakeup)
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -262,9 +298,10 @@ class PreprocessWorker:
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof,
+            copy_workers=cpus.plan().copy_workers,
         )
 
-        self.thread = threading.Thread(
+        self.thread = Thread(
             target=_preprocess_loop,
             kwargs=dict(
                 in_queue=self.request_input_queue,
@@ -376,30 +413,38 @@ class PreprocessWorker:
         self.result_tensor_input_queue.put(input)
         self._signal()
 
-    def new_result_token(
-        self, request_id: str, value: int,
-        loop_indices: NestedLoopIndices | None, signal: str, modality: str,
-        wake: bool = True,
+    def new_result_tokens(
+        self, request_ids: list[str], values: list[int], signal: str, modality: str,
+        logprobs: list[float | None] | None = None,
+        loop_indices: list[NestedLoopIndices | None] | None = None,
     ):
-        """A value that rode inline: same accounting as a result tensor, no
-        transport read and nothing to ack. ``wake=False`` queues without
-        ending the thread's idle wait: a frame's caller hands over every
-        request's value first and calls ``wake`` once."""
-        if request_id not in self.received_chunk_counts:
-            logger.debug("Late token for cleaned-up request %s dropped", request_id)
-            return
-        counts = self.received_chunk_counts[request_id]
-        counts[signal] = counts.get(signal, 0) + 1
-        self.per_request_reading_tensors[request_id] += 1
-        self.result_tensor_input_queue.put(
-            InlineToken(request_id, value, loop_indices, modality)
-        )
-        if wake:
+        """A frame's values that rode inline: the same accounting per request
+        as a result tensor, no transport read and nothing to ack. A request
+        already cleaned up is dropped."""
+        counts_by_rid = self.received_chunk_counts
+        reading = self.per_request_reading_tensors
+        kept_ids: list[str] = []
+        kept_values: list[int] = []
+        kept_logprobs: list[float | None] = []
+        kept_loops: list[NestedLoopIndices | None] = []
+        for i, (rid, value) in enumerate(zip(request_ids, values, strict=True)):
+            counts = counts_by_rid.get(rid)
+            if counts is None:
+                logger.debug("Late token for cleaned-up request %s dropped", rid)
+                continue
+            counts[signal] = counts.get(signal, 0) + 1
+            reading[rid] += 1
+            kept_ids.append(rid)
+            kept_values.append(value)
+            if logprobs:
+                kept_logprobs.append(logprobs[i])
+            if loop_indices:
+                kept_loops.append(loop_indices[i])
+        if kept_ids:
+            self.result_tensor_input_queue.put(
+                InlineTokens(kept_ids, kept_values, modality, kept_logprobs or None, kept_loops or None)
+            )
             self._signal()
-
-    def wake(self):
-        """End the thread's idle wait after a batch of ``wake=False`` puts."""
-        self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
         """Ack and drop result tensors for an already-removed request.
@@ -526,6 +571,14 @@ class RequestOutputState:
     frame_index: int = 0
 
 
+class HeldItems(NamedTuple):
+    """Client stream items stored before their call's route arrived."""
+
+    signals: dict[str, list[TensorPointerInfo]]
+    # the append's late answer; None for items that came with the request
+    on_late: Callable[[str], None] | None
+
+
 @dataclass(slots=True)
 class ClientCall:
     """A call's client streams, as their producer. The data worker sends each
@@ -537,9 +590,7 @@ class ClientCall:
     route: ClientStreamRoute | None = None
     # items stored before the route arrived, each with its append's on_late,
     # sent in this order once it does
-    held: list[tuple[dict[str, list[TensorPointerInfo]], Callable[[str], None] | None]] = field(
-        default_factory=list,
-    )
+    held: list[HeldItems] = field(default_factory=list)
     # stream edge -> items sent to each of its ranks
     items_sent: dict[str, int] = field(default_factory=dict)
     # streams that take no more items: the client ended them, or their
@@ -560,7 +611,7 @@ class PreprocessWorkerThread:
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
     # None (a thread built without __init__) postprocesses every output inline
-    _encode_pool: ThreadPoolExecutor | None = None
+    _encode_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -570,8 +621,8 @@ class PreprocessWorkerThread:
         self,
         in_queue: queue.Queue, # for preprocessing
         result_tensor_queue: queue.Queue, # for output streaming
-        out_queue: queue.Queue,
-        profile_queue: queue.Queue,
+        out_queue: ResultQueue,
+        profile_queue: ResultQueue,
         cleanup_request_queue: queue.Queue,
         abort_request_queue: queue.Queue,
         reads_done_queue: queue.Queue,
@@ -663,8 +714,8 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        self._encode_pool = ThreadPoolExecutor(
-            max_workers=encode_workers(), thread_name_prefix="mstar-encode",
+        self._encode_pool = ThreadPool(
+            max_workers=cpus.plan().encode_workers, thread_name_prefix="mstar-encode",
         )
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
@@ -784,7 +835,7 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            if model_kwargs.get("prefix_cache") is not False:
+            if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
                 ))
@@ -808,7 +859,7 @@ class PreprocessWorkerThread:
             self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
-            call.held.append((self._store_held(input.request_id, stream_items), None))
+            call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_state[input.request_id] = RequestOutputState()
@@ -1017,7 +1068,7 @@ class PreprocessWorkerThread:
         their append answered as late; an append that also carried items for
         a stream already ended gets a second answer."""
         if call.route is None:
-            call.held.append((signals, on_late))
+            call.held.append(HeldItems(signals, on_late))
             return
         late = []
         for name, infos in signals.items():
@@ -1413,36 +1464,66 @@ class PreprocessWorkerThread:
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
 
-    def _emit_inline_token(self, item: InlineToken) -> None:
-        """Detokenize a value that arrived inline and queue its chunk."""
-        request_id = item.request_id
-        state = self.request_output_state.setdefault(
-            request_id, RequestOutputState()
-        )
-        sequence = state.next_sequence
-        state.next_sequence += 1
+    def _emit_inline_tokens(self, item: InlineTokens) -> None:
+        """Postprocess a frame's inline values in one model call and queue each
+        request's chunk, in arrival order with its tensor results."""
+        rids, values, logprobs, loops = item.request_ids, item.values, item.logprobs, item.loop_indices
+        if self._draining_rids:
+            keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
+            rids = [rids[i] for i in keep]
+            values = [values[i] for i in keep]
+            logprobs = logprobs and [logprobs[i] for i in keep]
+            loops = loops and [loops[i] for i in keep]
+        kwargs = self.request_model_kwargs
         try:
-            tensor = torch.tensor([item.value], dtype=torch.int64)
-            postprocessed = self.model.postprocess(
-                tensor, item.modality,
-                request_kwargs=self.request_model_kwargs.get(request_id),
+            datas = self.model.postprocess_inline(
+                values, item.modality, [kwargs.get(rid) for rid in rids],
             )
-            self._queue_completed_output(
-                request_id,
-                sequence,
-                ResultChunk(
-                    request_id=request_id,
-                    modality=item.modality,
-                    data=postprocessed,
-                    metadata=(self._turn_metadata([item.value] if item.modality == "text" else [], item.loop_indices)
-                              if self._turn_tokens else {}),
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001 — must reach the client
-            self._fail_request(
-                request_id, exc, f"{item.modality} output postprocessing",
-                sequence=sequence,
-            )
+        except Exception:  # noqa: BLE001 — retried row by row below
+            # so a failure fails only the request it belongs to
+            datas = None
+        states = self.request_output_state
+        for i, request_id in enumerate(rids):
+            state = states.get(request_id)
+            if state is None:
+                state = states[request_id] = RequestOutputState()
+            sequence = state.next_sequence
+            state.next_sequence += 1
+            try:
+                if datas is None:
+                    data = self.model.postprocess_inline(
+                        [values[i]], item.modality, [kwargs.get(request_id)],
+                    )[0]
+                else:
+                    data = datas[i]
+                metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
+                if self._wants_token_ids(request_id, item.modality):
+                    metadata["token_ids"] = [values[i]]
+                if self._turn_tokens:
+                    metadata.update(self._turn_metadata(
+                        [values[i]] if item.modality == "text" else [], loops[i] if loops else None,
+                    ))
+                self._queue_completed_output(
+                    request_id,
+                    sequence,
+                    ResultChunk(request_id=request_id, modality=item.modality, data=data, metadata=metadata),
+                )
+            except Exception as exc:  # noqa: BLE001 — must reach the client
+                self._fail_request(
+                    request_id, exc, f"{item.modality} output postprocessing",
+                    sequence=sequence,
+                )
+
+    def _wants_token_ids(self, request_id: str, modality: str) -> bool:
+        """A text chunk of a request that set ``return_token_ids``."""
+        return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
+
+    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+        """``metadata`` plus the chunk's sampled ids, stop tokens included. A
+        float text tensor (Whisper's word alignment) carries no ids."""
+        if tensor.is_floating_point() or not self._wants_token_ids(request_id, modality):
+            return metadata
+        return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
 
     def _queue_completed_output(
         self,
@@ -1511,6 +1592,7 @@ class PreprocessWorkerThread:
         if modality in ("text", "audio") and self._turn_tokens:
             ids = tensor.flatten().tolist() if modality == "text" else []
             chunk_metadata = {**chunk_metadata, **self._turn_metadata(ids, loop_indices)}
+        chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.
@@ -1870,6 +1952,8 @@ class PreprocessWorkerThread:
         if not isinstance(self.communicator, OutboxCommunicator):
             self.communicator = OutboxCommunicator(self.communicator)
         idle_wait = self._idle_wait()
+        flush_results = self.out_queue.flush
+        flush_profiles = self.profile_queue.flush
         while not self.stop_event.is_set():
             did_work = False
             sends_pending = False
@@ -1885,28 +1969,29 @@ class PreprocessWorkerThread:
                 while not self.result_tensor_queue.empty():
                     did_work = True
                     result = self.result_tensor_queue.get()
-                    if isinstance(result, InlineToken):
+                    if isinstance(result, InlineTokens):
                         # Nothing to read or ack: postprocess in place, in
                         # arrival order with the tensor results.
-                        if result.request_id not in self._draining_rids:
-                            self._emit_inline_token(result)
-                        continue
-                    # Draining for teardown: don't start new reads — ack the
-                    # tensors back so the producing worker can free its buffers.
-                    if result.request_id in self._draining_rids:
+                        self._emit_inline_tokens(result)
+                    elif result.request_id in self._draining_rids:
+                        # Draining for teardown: don't start new reads — ack
+                        # the tensors back so the producing worker can free
+                        # its buffers.
                         self._discard_result_tensor(result)
-                        continue
-                    try:
-                        self._read_result_tensor(result)
-                    except Exception as exc:  # noqa: BLE001 — must reach the client
-                        # The read never started, so none of this edge's
-                        # tensors will ever produce a chunk; answer for all of
-                        # them at once.
-                        self._fail_request(
-                            result.request_id, exc,
-                            f"{result.modality} output transfer",
-                            count=len(result.graph_edge.tensor_info),
-                        )
+                    else:
+                        try:
+                            self._read_result_tensor(result)
+                        except Exception as exc:  # noqa: BLE001 — must reach the client
+                            # The read never started, so none of this edge's
+                            # tensors will ever produce a chunk; answer for all
+                            # of them at once.
+                            self._fail_request(
+                                result.request_id, exc,
+                                f"{result.modality} output transfer",
+                                count=len(result.graph_edge.tensor_info),
+                            )
+                    # one wake per item, and so per step
+                    flush_results()
                 did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
@@ -1917,6 +2002,7 @@ class PreprocessWorkerThread:
                     self._cleanup_request_state(req_id)
                 did_work = self._process_read_tensors() or did_work
                 did_work = self._release_encoded() or did_work
+                flush_results()
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
                     self._complete_drain_if_ready(rid)
@@ -1944,6 +2030,10 @@ class PreprocessWorkerThread:
                         logger.exception("Input for request %s failed", pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
+            # a new input's profile update or error chunks, and anything a
+            # raise skipped
+            flush_results()
+            flush_profiles()
 
             # getattr: tests drive this loop with stand-in tensor managers
             transfers = getattr(self.tensor_manager, "transfer_stats", None)

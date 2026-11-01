@@ -5,12 +5,10 @@ import multiprocessing as mp
 import os
 import signal
 import socket
-import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 
-import numpy as np
 import torch
 import yaml
 
@@ -30,6 +28,8 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
     merge_publish_info,
 )
+from mstar.conductor.routing import ReplicaRouter, RoutingHandle
+from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
@@ -37,6 +37,7 @@ from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_l
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.submodule_base import chunk_tick_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
@@ -66,6 +67,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.utils.threads import Thread
 from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
@@ -222,16 +224,6 @@ def _run_worker(worker) -> None:
         raise stop
 
 
-def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
-    """The device string a worker rank runs on: its own number unless the
-    deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
-    GPU); CPU deployments ignore the mapping."""
-    if device_type == "cpu":
-        return "cpu"
-    index = (rank_devices or {}).get(rank, rank)
-    return f"{device_type}:{index}"
-
-
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
@@ -254,9 +246,12 @@ def _worker_process_target(
     tcp_transfer_device="",
     status_interval_s: float | None = None,
     env: dict[str, str] | None = None,
+    local_worker_devices: list[str] | None = None,
+    all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
-    picklability. ``status_interval_s`` turns on the worker's metrics."""
+    picklability. ``status_interval_s`` turns on the worker's metrics;
+    ``local_worker_devices`` is every worker's device, in ``worker_ids`` order."""
     # before anything in this process touches the device runtime; the MPS pipe
     # directory in ``env`` decides whether this process becomes an MPS client
     apply_process_env_defaults()
@@ -280,7 +275,7 @@ def _worker_process_target(
     )
     quiet_noisy_loggers()
     built: list = []  # the Worker, once it exists
-    threading.Thread(
+    Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
         kwargs={"before_hard_exit": lambda: [_unlink_owned_files(w.tensor_manager) for w in built]},
     ).start()
@@ -299,6 +294,7 @@ def _worker_process_target(
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            all_worker_graph_ids_to_instances=all_worker_graph_ids_to_instances,
             sharding_config=sharding_config,
             parallel_groups=parallel_groups,
             hostname=hostname,
@@ -310,6 +306,7 @@ def _worker_process_target(
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             status_interval_s=status_interval_s,
+            local_worker_devices=local_worker_devices,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -332,6 +329,8 @@ class RequestData:
     # resource label -> the config this request's resources were opened with
     resource_configs: dict[str, ResourceReqConfig]
     sharding_config: ShardingConfig | None = None
+    # what the replica pick recorded for the request; released in _drop_request
+    routing: RoutingHandle | None = None
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
     dispatched: bool = False
     # set once request_complete goes out; after that the client must never get
@@ -480,8 +479,7 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
-        accelerator = torch.accelerator.current_accelerator(check_available=True)
-        self.device_type = accelerator.type if accelerator is not None else "cpu"
+        self.device_type = accelerator_type()
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         logger.info(
@@ -491,14 +489,6 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
-        # Optional ``rank_devices: {rank: device_index}`` places a worker rank
-        # on a device other than the one its number implies, e.g. two workers
-        # sharing one GPU so a light node's steps stop interleaving with a
-        # heavy node's on the same worker loop.
-        self.rank_devices = {
-            int(rank): int(index)
-            for rank, index in (self.model_config.get("rank_devices") or {}).items()
-        }
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -607,6 +597,10 @@ class Conductor:
             wg_id: tuple(wg.section.get_nodes()) for wg_id, wg in self.worker_graphs.items()
         }
         self._components = sorted({n for nodes in self._wg_nodes.values() for n in nodes})
+        self._router = ReplicaRouter(
+            model, self.worker_graphs.values(), specs=self._node_resources(),
+            weights=self.model_config.get("routing_weights"),
+        )
         self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
         self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
         # worker id -> its latest WorkerStatus snapshots (cumulative)
@@ -715,6 +709,11 @@ class Conductor:
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        # a model that builds its sampler config from its own keys would drop it unseen
+        if model_kwargs.get("return_logprobs") and not any(
+            getattr(cfg, "return_logprobs", False) for cfg in configs.values()
+        ):
+            raise ValueError("this model does not report logprobs; leave return_logprobs unset")
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
@@ -727,7 +726,7 @@ class Conductor:
             for rank in worker_graph.ranks:
                 rank_to_worker_graphs[rank].append(worker_graph)
 
-        self._sorted_ranks = sorted(rank_to_worker_graphs.keys())
+        self._sorted_ranks, self._worker_devices = deployment_workers(self.model_config, self.device_type)
         self.worker_ids = [f"worker_{rank}" for rank in self._sorted_ranks]
 
         # Messages that arrive before all workers report SETUP_DONE; replayed
@@ -750,8 +749,24 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # graph walk -> the chunkable (node, walk) pairs whose Loop needs its
+        # loop-back seeded for the first chunk
+        self._chunk_ticks: dict[str, tuple[tuple[str, str], ...]] = {}
+        for (node, walk), policy in self.model.chunking_policy_of().items():
+            if policy.chunkable:
+                self._chunk_ticks.setdefault(walk, ())
+                self._chunk_ticks[walk] += ((node, walk),)
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
+        # each worker graph's lockstep instances, as worker ids; a request of
+        # the worker graph runs on one of them
+        self._all_worker_graph_ids_to_instances: dict[int, list[list[str]]] = {
+            worker_graph_id: [
+                [f"worker_{rank}" for rank in instance]
+                for instance in worker_graph.replica_ranks
+            ]
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
         self._loop_max_iters: dict[str, int] = {}
@@ -801,7 +816,9 @@ class Conductor:
                 raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
             self._mps = MpsDaemon()
             self._mps.start()
-        for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
+        # every worker runs on this host and builds the same CPU plan from all
+        # of their devices (see mstar.utils.cpus)
+        for worker_id, device in zip(self.worker_ids, self._worker_devices, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
                 kwargs={
@@ -812,6 +829,7 @@ class Conductor:
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
+                    "all_worker_graph_ids_to_instances": self._all_worker_graph_ids_to_instances,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
                     "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
@@ -820,7 +838,8 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": worker_device(self.device_type, rank, self.rank_devices),
+                    "device": device,
+                    "local_worker_devices": self._worker_devices,
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
@@ -935,37 +954,25 @@ class Conductor:
                 ),
             )
 
-    def _assign_worker_graphs_to_workers(self) -> dict[int, list[str]]:
+    def _assign_worker_graphs_to_workers(self, replicas: dict[int, int]) -> dict[int, list[str]]:
         """
-        For a request, assign worker graphs to workers. DP picks are
-        coordinated by ``_group_id`` so all wgs derived from the same
-        node_group land on the same (replica's) workers — without this,
-        two wgs sharing a TP group could end up on different DP replicas
-        and break model topology.
+        For a request, assign worker graphs to the workers of their group's
+        replica in ``replicas`` (``ReplicaRouter.pick``). DP picks are coordinated
+        by ``_group_id`` so all wgs derived from the same node_group land on
+        the same (replica's) workers — without this, two wgs sharing a TP
+        group could end up on different DP replicas and break model topology.
 
         TODO: smarter assignment that minimizes cross-graph-walk tensor
         transfer (e.g., bias toward keeping prefill→decode handoff local
         for the same request).
         """
-        # _group_id -> chosen DP-replica index within that group's ranks
-        group_id_to_replica_idx: dict[int, int] = {}
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            if wg._instance_ranks:
-                # Route to a whole instance (the lockstep unit): every rank of a
-                # tp*sp instance runs the request together, so its TP all-reduce
-                # and SP all-to-all collectives stay in sync. Picking a single TP
-                # row here would desync the SP all-to-all across rows.
-                replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._instance_ranks)),
-                )
-                ranks = wg._instance_ranks[replica_idx]
-                result[wg_id] = [f"worker_{r}" for r in ranks]
-            else:
-                replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg.ranks)),
-                )
-                result[wg_id] = [f"worker_{wg.ranks[replica_idx]}"]
+            # Route to a whole instance (the lockstep unit): every rank of a
+            # tp*sp instance runs the request together, so its TP all-reduce
+            # and SP all-to-all collectives stay in sync. Picking a single TP
+            # row here would desync the SP all-to-all across rows.
+            result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replicas[wg._group_id]]]
         return result
 
     def _build_request_sharding_config(
@@ -1200,7 +1207,7 @@ class Conductor:
         except Exception as exc:  # noqa: BLE001
             request_data = self.requests.get(body.request_id)
             if request_data is None or not request_data.dispatched:
-                self.requests.pop(body.request_id, None)
+                self._drop_request(body.request_id)
                 if isinstance(exc, ValueError):
                     self._reject_request(body.request_id, scrub_paths(str(exc)), status=400)
                     return
@@ -1245,8 +1252,6 @@ class Conductor:
             None if self._status_interval_s is None
             else self._queued_since.pop(body.request_id, ingest_time)
         )
-        worker_graph_to_workers = self._assign_worker_graphs_to_workers()
-
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
         loop_caps = self._loop_caps(model_kwargs)
@@ -1273,6 +1278,69 @@ class Conductor:
                 ),
                 random_seed=seed,
             )
+
+        # Kick off all partitions by calling get_initial_forward_pass_args per partition
+        partition_fwd_args: dict[str, ForwardPassArgs] = {}
+        for p in partitions:
+            fwd_args = self.model.get_initial_forward_pass_args(
+                partition_name=p.name,
+                input_modalities=body.initial_input_modalities,
+                output_modalities=body.initial_output_modalities,
+                input_signals=body.initial_signals,
+                model_kwargs=body.model_kwargs,
+            )
+            pstate = partition_states[p.name]
+            # if a partition is not active at all in the request, register that here
+            pstate.is_done = fwd_args.request_done
+
+            pstate.metadata = fwd_args.full_metadata
+            pstate.metadata.kwargs.update(fwd_args.step_metadata)
+            partition_fwd_args[p.name] = fwd_args
+
+        # after the initial fwd args: the configs are derived from them (BAGEL
+        # reads `requires_cfg` off the metadata the model just settled), and
+        # before the replica pick, which scores the request from them
+        resource_configs = self._get_resource_configs(
+            model_kwargs, partition_fwd_args
+        )
+        # keyed by resource, so each config is handed only its own chain
+        kwargs = model_kwargs or {}
+        prefix_keys = kwargs.get("prefix_keys") or {}
+        prefix_tail = kwargs.get("prefix_tail") or {}
+        prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_cache = kwargs.get("prefix_cache")
+        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
+            prefix_cache = False
+        kv_layout = kwargs.get("kv_layout") or {}
+        refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, resource_configs)
+        for key, cfg in resource_configs.items():
+            cfg.apply_conductor_config(
+                seed=seed,
+                resource_key=key,
+                prefix_keys=prefix_keys.get(key),
+                prefix_tail=prefix_tail.get(key),
+                prefix_decode=prefix_decode.get(key),
+                prefix_cache=prefix_cache,
+                kv_layout=kv_layout.get(key),
+                loop_caps=loop_caps,
+            )
+        if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
+            max_output_tokens, loop_caps = self._fit_loop_caps(
+                model_kwargs, resource_configs, max_output_tokens,
+            )
+            for key, cfg in resource_configs.items():
+                cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        for specs in self._resource_specs():
+            for key, cfg in resource_configs.items():
+                cfg.validate(specs.get(key))
+
+        # a partition done from the start runs none of its nodes, so it adds no
+        # load to their replicas
+        groups_run = self._router.groups_run(
+            name for name, fwd_args in partition_fwd_args.items() if not fwd_args.request_done
+        )
+        placement = self._router.pick(resource_configs, groups_run)
+        worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
 
         # Build per-connection streaming state. None for a client stream: the
         # data worker sends and ends it itself.
@@ -1304,69 +1372,20 @@ class Conductor:
             partition_states=partition_states,
             partition_definitions=partition_definitions,
             streaming_connections=streaming_connections,
-            resource_configs={},
+            resource_configs=resource_configs,
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
         )
-        self.requests[body.request_id] = request_data
+        self._register_request(body.request_id, request_data)
 
-        # Kick off all partitions by calling get_initial_forward_pass_args per partition
-        partition_fwd_args: dict[str, ForwardPassArgs] = {}
         for p in partitions:
-            fwd_args = self.model.get_initial_forward_pass_args(
-                partition_name=p.name,
-                input_modalities=body.initial_input_modalities,
-                output_modalities=body.initial_output_modalities,
-                input_signals=body.initial_signals,
-                model_kwargs=body.model_kwargs,
-            )
-            pstate = partition_states[p.name]
-            # if a partition is not active at all in the request, register that here
-            pstate.is_done = fwd_args.request_done
-
-            pstate.metadata = fwd_args.full_metadata
-            pstate.metadata.kwargs.update(fwd_args.step_metadata)
             self._set_partition_worker_graph_ids(
-                body.request_id, p.name, fwd_args.full_metadata.graph_walk,
+                body.request_id, p.name, partition_fwd_args[p.name].full_metadata.graph_walk,
             )
-            partition_fwd_args[p.name] = fwd_args
 
-        # after the initial fwd args: the configs are derived from them (BAGEL
-        # reads `requires_cfg` off the metadata the model just settled)
-        request_data.resource_configs = self._get_resource_configs(
-            model_kwargs, partition_fwd_args
-        )
-        # keyed by resource, so each config is handed only its own chain
-        kwargs = model_kwargs or {}
-        prefix_keys = kwargs.get("prefix_keys") or {}
-        prefix_tail = kwargs.get("prefix_tail") or {}
-        prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_cache = kwargs.get("prefix_cache")
-        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
-            prefix_cache = False
-        kv_layout = kwargs.get("kv_layout") or {}
-        refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
-        for key, cfg in request_data.resource_configs.items():
-            cfg.apply_conductor_config(
-                seed=seed,
-                resource_key=key,
-                prefix_keys=prefix_keys.get(key),
-                prefix_tail=prefix_tail.get(key),
-                prefix_decode=prefix_decode.get(key),
-                prefix_cache=prefix_cache,
-                kv_layout=kv_layout.get(key),
-                loop_caps=loop_caps,
-            )
-        if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
-            request_data.max_output_tokens, loop_caps = self._fit_loop_caps(
-                model_kwargs, request_data.resource_configs, max_output_tokens,
-            )
-            for key, cfg in request_data.resource_configs.items():
-                cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        for specs in self._resource_specs():
-            for key, cfg in request_data.resource_configs.items():
-                cfg.validate(specs.get(key))
+        # only now: a request refused before this leaves nothing in the mirrors
+        request_data.routing = self._router.add(placement, resource_configs, groups_run)
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1379,20 +1398,20 @@ class Conductor:
                 pstate = partition_states[partition_name]
                 inputs_per_worker = self._split_inputs_to_workers(
                     sharding_config=request_data.sharding_config,
-                    inputs=fwd_args.inputs,
+                    inputs=self._with_chunk_ticks(
+                        fwd_args.inputs, fwd_args.full_metadata.graph_walk,
+                    ),
                     graph_walk=fwd_args.full_metadata.graph_walk,
                 )
 
-                self._update_persist_ref_counts(
-                    body.request_id,
-                    inputs_per_worker.get(worker_id, [])
-                )
+                initial_inputs = inputs_per_worker.get(worker_id, [])
+                self._update_persist_ref_counts(body.request_id, initial_inputs)
 
                 message = NewRequest(
                     request_id=body.request_id,
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
-                    initial_inputs=inputs_per_worker.get(worker_id, []),
+                    initial_inputs=initial_inputs,
                     loop_caps=loop_caps,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
@@ -1468,6 +1487,17 @@ class Conductor:
             for worker_ids in request_data.worker_graph_to_workers.values()
             for worker_id in worker_ids
         }
+
+    def _register_request(self, request_id: str, request_data: RequestData) -> None:
+        self.requests[request_id] = request_data
+
+    def _drop_request(self, request_id: str) -> None:
+        """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
+        request_data = self.requests.pop(request_id, None)
+        if request_data is not None and request_data.routing is not None:
+            self._router.remove(request_data.routing, [
+                name for name, pstate in request_data.partition_states.items() if pstate.fwd_pass_number
+            ])
 
     def _register_draining(
         self, request_id: str, expected_acks: set[str], participants: set[str],
@@ -1549,7 +1579,7 @@ class Conductor:
                     ),
                 ),
             )
-        self.requests.pop(request_id, None)
+        self._drop_request(request_id)
         logger.info("Tore down request %s; freed worker resources", request_id)
         self._try_admit_waiting()
 
@@ -1788,6 +1818,11 @@ class Conductor:
             )
             return []
 
+        # Any report of the pass may carry it, not only the one that completes
+        # the pass: that can be another worker's (an encoder's, say).
+        if body.partition_done:
+            pstate.worker_reported_done = True
+
         # Persist signals: every rank contributes its shard (different uuid +
         # source_tp_rank); accumulate across ranks, do not dedup.
         if body.persist_signals:
@@ -1846,10 +1881,7 @@ class Conductor:
 
         return done_partitions
 
-    def _process_done_forward(
-        self, request_id: str, partition_name: str,
-        partition_done_from_worker: bool = False,
-    ) -> bool:
+    def _process_done_forward(self, request_id: str, partition_name: str) -> bool:
         """Process a completed forward pass for a specific partition.
 
         Calls get_partition_forward_pass_args for all partitions uniformly.
@@ -1860,10 +1892,16 @@ class Conductor:
         """
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
+        # A self-triggering partition's next pass can report in the same cycle,
+        # and is queued again before this pass's state is reset. When the
+        # earlier call ended the partition, on the flag the later report
+        # latched, the later call has nothing left to advance.
+        if pstate.is_done:
+            return all(ps.is_done for ps in request_data.partition_states.values())
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
         stream_fed = partition_name in self._stream_fed_partitions
-        if stream_fed and partition_done_from_worker:
+        if stream_fed and pstate.worker_reported_done:
             pstate.is_done = True
 
         prev_walk =  pstate.metadata.graph_walk
@@ -1876,17 +1914,15 @@ class Conductor:
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
-        # The worker's signal is authoritative for a stream-terminated
-        # partition: the pass that consumed the stream's final chunk has run.
-        # Treat it as the partition's own `request_done` so its downstream
-        # connections get `producer_done` and the chain closes. A model that
-        # inferred the end from the connection counters instead
-        # (`consumed_count >= token_count`) could race: `consumed_count` counts
-        # chunks popped for execution, and every worker-graphs-done report from
-        # a worker carries every buffer's count, so a colocated consumer's report
-        # could finish this partition while its last step was still running,
-        # and that step's output arrived for a request already gone.
-        if stream_fed and partition_done_from_worker:
+        # The worker's signal is authoritative, whatever walk the model chose:
+        # the pass that consumed a stream's final chunk, or whose stop check
+        # returned END_PARTITION, has run. Treat it as the partition's own
+        # `request_done` so its downstream connections get `producer_done`. A
+        # stream-fed model that inferred the end from the connection counters
+        # instead (`consumed_count >= token_count`) could race: a colocated
+        # consumer's report carries every buffer's count, so it could finish
+        # this partition while its last step was still running.
+        if pstate.worker_reported_done:
             fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
@@ -1938,6 +1974,7 @@ class Conductor:
         pstate.completed_worker_graph_ids = set()
         pstate.current_worker_graph_ids = set()
         pstate.wg_rank_completions = {}
+        pstate.worker_reported_done = False
         pstate.fwd_pass_number += 1
 
         self._set_partition_worker_graph_ids(
@@ -1947,13 +1984,32 @@ class Conductor:
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
 
+    def _with_chunk_ticks(self, inputs: list, graph_walk: str) -> list:
+        """``inputs`` plus a seed for each chunk Loop this walk enters.
+
+        Every entry into the walk needs one, re-entry included: the seed makes
+        the node ready for the walk's FIRST chunk, and later chunks get the
+        signal from their own routing. Carries no tensor, so the worker ingests
+        it straight away (see ``chunk_tick_name``). Added before the split, so
+        as signal-only edges the seeds reach exactly the chunked node's ranks,
+        which need not be the ranks the walk's other inputs go to.
+        """
+        ticks = self._chunk_ticks.get(graph_walk)
+        if not ticks:
+            return inputs
+        return inputs + [
+            GraphEdge(next_node=node, name=chunk_tick_name(node, walk))
+            for node, walk in ticks
+        ]
+
     def _send_partition_inputs(
         self, request_id: str, partition_name: str, fwd_args: ForwardPassArgs,
     ):
         """Send InputSignals for a specific partition's next forward pass."""
+        walk = fwd_args.full_metadata.graph_walk
         self._send_inputs(
-            request_id, partition_name, fwd_args.inputs,
-            fwd_args.full_metadata.graph_walk, fwd_args.step_metadata,
+            request_id, partition_name, self._with_chunk_ticks(fwd_args.inputs, walk),
+            walk, fwd_args.step_metadata,
         )
 
     def _send_inputs(
@@ -2079,7 +2135,7 @@ class Conductor:
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
 
     def _route_message(
-        self, message, done_partition_forwards: list[tuple[str, str, bool]],
+        self, message, done_partition_forwards: list[tuple[str, str]],
     ) -> None:
         """Apply one message from the api server or a worker. A WORKER_GRAPHS_DONE
         that finishes a partition's pass is queued on ``done_partition_forwards``."""
@@ -2114,9 +2170,7 @@ class Conductor:
                 range_push("conductor._process_worker_graphs_done")
             done_parts = self._process_worker_graphs_done(message.body)
             for pname in done_parts:
-                done_partition_forwards.append(
-                    (rid, pname, message.body.partition_done)
-                )
+                done_partition_forwards.append((rid, pname))
             if self.enable_nvtx:
                 range_pop()
         else:
@@ -2189,7 +2243,7 @@ class Conductor:
             for snap in snapshots:
                 by_family.setdefault(snap.name, []).append(snap)
         return ConductorStatus(metrics=[
-            states.snapshot(), self._in_flight_gauge.snapshot(),
+            states.snapshot(), self._in_flight_gauge.snapshot(), self._router.predicted_saving.snapshot(),
             *(merge(family, by_family.get(name, ()))
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])
@@ -2211,7 +2265,7 @@ class Conductor:
                 range_push("conductor.run_loop")
 
             try:
-                done_partition_forwards: list[tuple[str, str, bool]] = []
+                done_partition_forwards: list[tuple[str, str]] = []
 
                 startup_backlog = self._startup_message_backlog
                 self._startup_message_backlog = []
@@ -2228,14 +2282,11 @@ class Conductor:
 
                 completed_requests = []
 
-                for request_id, partition_name, p_done in done_partition_forwards:
+                for request_id, partition_name in done_partition_forwards:
                     if request_id not in self.requests or request_id in self.draining:
                         continue  # already completed by another partition in this cycle
                     try:
-                        all_done = self._process_done_forward(
-                            request_id, partition_name,
-                            partition_done_from_worker=p_done,
-                        )
+                        all_done = self._process_done_forward(request_id, partition_name)
                     except Exception as exc:
                         self._fail_after_error(
                             request_id, f"advancing partition {partition_name}", exc,

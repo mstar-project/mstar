@@ -33,6 +33,7 @@ from mstar.integrations.dynamo.bridges import (
     TensorBridge,
     get_tensor_spec,
 )
+from mstar.utils import cpus
 from mstar.utils.socket_prefix import per_launch_socket_prefix
 
 if TYPE_CHECKING:
@@ -80,9 +81,14 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
             "worker does not serve; serve it with `mstar serve` and use /v1/realtime or /generate/ws"
         )
     # after the refusal, which needs only the model class
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, deployment_cpu_plan
     from mstar.communication.communicator import CommProtocol
 
+    # before the workers exist: under ``auto`` this takes the GPUs' locks
+    try:
+        cpus.install(deployment_cpu_plan(config))
+    except cpus.CpuPlanError as e:
+        raise SystemExit(f"mstar: {e}") from None
     server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,

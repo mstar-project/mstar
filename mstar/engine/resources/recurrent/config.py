@@ -298,6 +298,14 @@ class RecurrentStateSpec(NodeResourceSpec):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache} if self.config.kv_cache else set()
 
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        # snapshots are keyed by `kv_cache`'s pages, and kept at one rank only
+        return bool(self.config.prefix_slots) and self.config.kv_cache is not None and world_size == 1
+
+    @property
+    def restores_prefix(self) -> bool:
+        return True
+
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
         prefix_slots: int | None = None,
@@ -346,3 +354,5 @@ class RecurrentStep(ResourceStep):
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # the rows the forks apply to; None is every row (as KVStep.fork_rids)
+    fork_rids: frozenset | None = None

@@ -85,6 +85,7 @@ class Wan22Model(Model):
         cache_dir: str | None = None,
         variant: str = WAN22_VARIANT_TI2V_5B,
         compile_dit_sizes: tuple[str, ...] | None = None,
+        dit_max_batch_size: int = Wan22Config.dit_max_batch_size,
         max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
@@ -100,6 +101,7 @@ class Wan22Model(Model):
         self.cache_dir = cache_dir
         self.config = Wan22Config(
             variant=variant, compile_dit_sizes=compile_dit_sizes,
+            dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
         )
@@ -175,11 +177,10 @@ class Wan22Model(Model):
         if i2v:
             dit_inputs.append("image_latent")
         # Loop-carried state: see Wan22DitSubmodule's docstring for the
-        # definitive shape/dtype inventory (latents, 0-based step index, the
-        # order-2 UniPC ring buffer, and the corrector's last_sample).
+        # definitive shape/dtype inventory (latents, the order-2 UniPC ring
+        # buffer, and the corrector's last_sample).
         dit_inputs += [
             "latents",
-            "time_index",
             "unipc_model_outputs",
             "unipc_last_sample",
         ]
@@ -191,7 +192,6 @@ class Wan22Model(Model):
                 input_names=dit_inputs,
                 outputs=[
                     GraphEdge(next_node="dit", name="latents"),
-                    GraphEdge(next_node="dit", name="time_index"),
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
@@ -445,7 +445,7 @@ class Wan22Model(Model):
             )
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Mux the emitted uint8 ``[1, 3, F, H, W]`` video tensor to mp4 bytes.
+        """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
 
         PyAV is the encoder because it bundles its own FFmpeg; torchcodec needs
         system FFmpeg libraries. ``fps`` is a PLAYBACK rate, not a generation knob:
@@ -467,7 +467,7 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output[0].permute(1, 2, 3, 0).cpu().numpy()
+        frames = output.cpu().numpy()
         buffer = io.BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
         # PyAV rejects float rates, so the rate is handed over as an exact
@@ -623,7 +623,6 @@ class Wan22Model(Model):
             inputs.append(edge)
         inputs += [
             GraphEdge(next_node="dit", name="latents"),
-            GraphEdge(next_node="dit", name="time_index"),
             GraphEdge(next_node="dit", name="unipc_model_outputs"),
             GraphEdge(next_node="dit", name="unipc_last_sample"),
         ]
@@ -758,7 +757,7 @@ class Wan22Model(Model):
         """
         from diffusers import UniPCMultistepScheduler
 
-        from mstar.model.wan22.components.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
+        from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
 
         scheduler_config = UniPCMultistepScheduler.load_config(
             self.model_path_hf, subfolder="scheduler", cache_dir=self.cache_dir,

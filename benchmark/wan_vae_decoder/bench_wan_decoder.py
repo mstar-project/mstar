@@ -277,12 +277,14 @@ def mstar_warm_node(raw, device, compiled, n_steady, overrides=None):
         per_request_info={"bench": SimpleNamespace(step_metadata=md)},
     )
 
+    # the node emits [T, C, H, W] frames; the bench reads them as [1, C, T, H, W] pixels
     def start():
         sub.cleanup_request("bench")
-        return sub.forward(C.VIDEO_DECODE_AR_WALK, infos, norm[:, :, :1])["video_output"][0]
+        return sub.forward(C.VIDEO_DECODE_AR_WALK, infos, norm[:, :, :1])["video_output"][0].transpose(0, 1)[None]
 
     def chunk(c):
-        return sub.forward(C.VIDEO_DECODE_AR_WALK, infos, norm[:, :, 1 + 3 * c: 4 + 3 * c])["video_output"][0]
+        frames = sub.forward(C.VIDEO_DECODE_AR_WALK, infos, norm[:, :, 1 + 3 * c: 4 + 3 * c])["video_output"][0]
+        return frames.transpose(0, 1)[None]
 
     return sub, start, chunk
 

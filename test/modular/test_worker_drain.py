@@ -15,7 +15,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -30,9 +30,16 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
+
+class _StubRuntime(SimpleNamespace, PhasedPostprocess):
+    """Stubbed phase methods under the reference begin / resume."""
+
+    supports_inline_emit = False
+
 
 def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
@@ -43,6 +50,7 @@ def _worker(
     w._walk_driven_edges = {}
     w.worker_id = "w0"
     w._phase_period = 0
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.is_tp_follower = is_follower
     w.sent = []
     w.cleared = []
@@ -58,8 +66,9 @@ def _worker(
     w._pending_removes = {}
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
-    w._graph_runtime = SimpleNamespace(
+    w._graph_runtime = _StubRuntime(
         get_rid_handle=lambda r: r if r in known_rids else None,
+        register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
         remove_request=lambda h: None,
         # The TP fan-out reads the sharding config off the runtime now; no
@@ -68,7 +77,6 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
-    w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
@@ -85,13 +93,14 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
         force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
     )
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     return w
 
 
@@ -122,7 +131,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
         ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
-            final_stream_rids={7}, stream_partition_done_rids={7},
+            final_stream_rids={7}, partition_done_rids={7},
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
@@ -149,7 +158,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert pending.node_batch.request_ids == []
     assert pending.node_batch.per_request_info == {}
     assert pending.node_batch.final_stream_rids == set()
-    assert pending.node_batch.stream_partition_done_rids == set()
+    assert pending.node_batch.partition_done_rids == set()
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
@@ -173,7 +182,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
         ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
-            final_stream_rids=set(), stream_partition_done_rids=set(),
+            final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
@@ -210,7 +219,8 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     )
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
-        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+        after_output_copy=lambda batch: None,
+        step_finished=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     )
     w.request_state.get_fwd_info = lambda rid, partition: None
@@ -444,15 +454,17 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     step can run; refused, the step's head would wait for the handle for ever."""
     known = []
     w = _worker(known_rids=known, is_follower=True, tp_follow=("X",))
-    w._my_consumer_connections = []
+    w._all_wg_nodes = {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w._graph_runtime.add_request = lambda request_id, **kw: known.append(request_id) or request_id
     w.request_state.add_request = lambda rid, info: w.request_state.per_request_info.update(
         {rid: SimpleNamespace(stream_buffers={})}
     )
-    w.engine_manager.add_request = lambda rid, cfgs: None
+    w.engine_manager.add_request = lambda rid, cfgs, info: None
+    w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
     w.tensor_manager.register_request = lambda rid, cfg: None
     w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
+    w.scheduler.note_arrival = lambda rid: None
 
     Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
     assert not _reads_done(w)
@@ -461,7 +473,9 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
     ))
+    # failed by the drain check, not by an ingest error
     assert known == ["X"] and w.failed == {"X"}
+    assert not [m for _e, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
 
     # the step runs, and READS_DONE goes once
     w.scheduler.pending_tp_follow_count.pop("X")
@@ -477,14 +491,13 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._draining_rids = set()
     w._reads_done_sent = set()
     w._unprocessed_messages = {}
-    w._my_consumer_connections = []
-    w._last_active = {}
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
     w._graph_runtime = SimpleNamespace(
         add_request=lambda request_id, **kw: rids.intern(request_id),
         get_rid_handle=rids.handle, get_rid_string=rids.name,
         get_sharding_config=lambda h: None,
+        register_stop_limits=lambda rid, info: None,
     )
     seen = {}
 
@@ -498,7 +511,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         per_request_info={}, add_request=_state_add,
     )
     w.engine_manager = SimpleNamespace(
-        evictable_nodes=lambda: ["n"],
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
     w.tensor_manager = SimpleNamespace(
@@ -506,6 +519,8 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.scheduler = SimpleNamespace(note_arrival=lambda rid: seen.setdefault("scheduler", rid))
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
@@ -515,8 +530,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     handle = w._graph_runtime.get_rid_handle("X")
     assert handle == 1
     assert info.rid_handle == handle
-    assert seen == {"state": handle, "engine": handle, "tensors": handle}
-    assert set(w._last_active) == {(handle, "n")}
+    assert seen == {"state": handle, "scheduler": handle, "engine": handle, "tensors": handle}
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────

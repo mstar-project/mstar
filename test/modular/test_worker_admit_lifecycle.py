@@ -24,6 +24,7 @@ from mstar.model.base import WorkerGraph
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -80,24 +81,24 @@ def _worker():
     )
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
-        evictable_nodes=lambda: [NODE],
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfgs, info: None,
         remove_request=lambda rid: None,
     )
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=lambda rid_str: None,
+        note_arrival=lambda rid: None,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._my_consumer_connections = []
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._draining_rids = set()
     w._pending_drains = set()
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = {}
-    w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

@@ -12,8 +12,9 @@ import queue
 import threading
 from types import SimpleNamespace
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication.event import EventWakeup
 
 
 def _worker_with(received_chunk_counts):
@@ -46,7 +47,8 @@ def test_preprocess_failure_emits_error_chunk():
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.in_queue = queue.Queue()
     wt._is_pending = lambda key: True
-    wt.out_queue = queue.Queue()
+    wt.out_queue = ResultQueue(EventWakeup())
+    wt.profile_queue = ResultQueue(EventWakeup())
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
     wt.abort_request_queue = queue.Queue()

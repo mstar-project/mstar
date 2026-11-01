@@ -26,6 +26,7 @@ from test_startup_graph_validation import (
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -347,17 +348,74 @@ def test_worker_graph_and_sharding_group_tp_mismatch_is_refused():
     ]
 
 
-def test_two_lockstep_nodes_on_one_worker_are_refused(tmp_path):
-    """Worker.__init__ raised this on every rank, after the engine was built."""
-    cfg = _cfg(tmp_path, [
-        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
-        {"node_names": ["b"], "ranks": [0, 1], "tp_size": 2},
-    ])
-    assert _problems(_Model(_a_then_b, tp_enabled_nodes=["a", "b"]), cfg) == [
-        f"Multiple parallel nodes ['a', 'b'] found in worker worker_{rank}; current "
-        "implementation requires at most one lockstep-parallel node per worker."
-        for rank in (0, 1)
-    ]
+_TP2 = {"ranks": [0, 1], "tp_size": 2}
+
+
+def _kv(key, nodes):
+    return KVSpec(resource_key=key, nodes=set(nodes), config=PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64,
+    ))
+
+
+@pytest.mark.parametrize("groups", [
+    [{"node_names": ["a", "b"], **_TP2}],
+    [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **_TP2}],
+    # two replicas each: every worker is in the same block for both nodes
+    [{"node_names": ["a"], "ranks": [0, 1, 2, 3], "tp_size": 2},
+     {"node_names": ["b"], "ranks": [0, 1, 2, 3], "tp_size": 2}],
+], ids=["one_group", "two_groups", "replicas"])
+def test_lockstep_nodes_sharing_one_instance_are_accepted(groups, tmp_path, monkeypatch):
+    """One leader and one step stream. Each node has a KV pool of its own."""
+    model = _Model(
+        _a_then_b, specs=[_kv("kv_a", ["a"]), _kv("kv_b", ["b"])],
+        kv_labels={"kv_a": {"main": KVLabel()}, "kv_b": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
+    )
+    _start_conductor(model, _cfg(tmp_path, groups), tmp_path, monkeypatch)
+
+
+class _Trail(_Stub):
+    """Keeps a page trail the followers check against rank 0's, and nothing else."""
+
+    def page_trail(self):
+        return (0, 0)
+
+
+class _TrailSpec(_Spec):
+    @property
+    def resource_class(self):
+        return _Trail
+
+
+@pytest.mark.parametrize("spec, resources", [
+    (_kv("kv", ["a", "b"]), {"kv": {"cpu_offload_pages": 0}}),  # no host pool: can't evict
+    (_TrailSpec("kv", {"a", "b"}), {}),
+], ids=["kv_offload_off", "page_trail_only"])
+def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources, tmp_path):
+    """Rank 0's decisions on a resource (page moves, prefix leases, page
+    trails) reach the followers per node, riding on one node's next step, so
+    two lockstep nodes over one resource could admit out of step. Refused until
+    rank 0 journals a shared resource in one stream."""
+    labels = {"kv": {"main": KVLabel()}} if isinstance(spec, KVSpec) else None
+    model = _Model(_a_then_b, specs=[spec], kv_labels=labels, tp_enabled_nodes=["a", "b"])
+    cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources=resources)
+    [problem] = _problems(model, cfg)
+    assert problem.startswith("Resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_0, worker_1;")
+
+
+@pytest.mark.parametrize("b, placed", [
+    ({"ranks": [1, 0], "tp_size": 2}, "TP ranks [1, 0]"),  # the same ranks, led by the other one
+    ({"ranks": [0, 1, 2, 3], "tp_size": 4}, "TP ranks [0, 1, 2, 3]"),
+    ({"ranks": [0, 1], "sp_size": 2}, "SP ranks [0, 1]"),  # the same ranks, the other axis
+], ids=["other_leader", "other_size", "other_axis"])
+def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, placed, tmp_path):
+    """Two instances on a worker are two leaders' step streams with no order
+    between them."""
+    cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
+    model = _Model(_a_then_b, tp_enabled_nodes=["a", "b"], sp_enabled_nodes=["b"] if "sp_size" in b else ())
+    problems = _problems(model, cfg)
+    assert len(problems) == 2
+    for rank, problem in enumerate(problems):
+        assert f"on worker_{rank}" in problem and f"a on TP ranks [0, 1]; b on {placed}" in problem
 
 
 def test_parallel_ranks_off_their_position_are_refused(tmp_path):
@@ -423,8 +481,22 @@ def test_resource_over_local_nodes_in_different_parallel_groups_is_refused(tmp_p
     ([_Spec("kv", {"llm"}, deps={"kv"})], {}, r"resource 'kv' depends on itself"),
     ([_Spec("a", {"llm"}, deps={"b"}), _Spec("b", {"llm"}, deps={"a"})], {},
      r"dependency cycle among resources \['a', 'b'\]"),
+    # NaN would make every replica's cost NaN, and every DP ingest fail
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"prefix": float("nan")}},
+     r"routing_weights.prefix must be a number from 0 to 1e\+06; got nan"),
+    # finite, but a busy replica's cost overflows to inf, and inf - inf is NaN
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"load": 1e308, "prefix": 1e308}},
+     r"routing_weights.load must be a number from 0 to 1e\+06; got 1e\+308"),
+    # a weight is per term of the cost, not per resource
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"kv": 2.0}},
+     r"routing_weights names \['kv'\]; it takes \['load', 'prefix'\]"),
+    # named on its own, not as a config the resource checks could not read, empty too
+    ([_Spec("kv", {"llm"})], {"routing_weights": []}, r"routing_weights must be a mapping"),
+    # nothing would spread a hot prefix
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"load": 0}}, r"routing_weights.load must be above 0"),
 ], ids=["top_level_kv_cache", "unknown_resource", "bad_override", "duplicate_key", "missing_dependency",
-        "self_dependency", "cycle"])
+        "self_dependency", "cycle", "routing_weight_not_finite", "routing_weights_overflow",
+        "routing_weight_per_resource", "routing_weights_not_a_mapping", "routing_load_0"])
 def test_resource_problem_is_refused_in_the_conductor(specs, extra, pattern, tmp_path, monkeypatch):
     """EngineManager.build and Engine.load_model raised these on every worker."""
     with pytest.raises(DeploymentError, match=pattern):

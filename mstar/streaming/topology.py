@@ -88,6 +88,15 @@ class Connection:
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
     limits: ClientStreamLimits | None = None
+    # Dim to join a chunked producer's pieces on, or None to keep them apart.
+    # A node whose prefill is chunked emits one piece per chunk, but its
+    # consumer's ChunkPolicy counts ITEMS -- so to a FixedChunkPolicy(1) the
+    # pieces look like separate items and it reads only the first. Joining them
+    # here, on the consumer, keeps the item the consumer already expects. Done
+    # on arrival rather than at the producer deliberately: the consumer owns
+    # these tensors outright, so there is no cross-stream ordering to get
+    # wrong, which is where the producer-side join went wrong before.
+    join_dim: int | None = None
     # Set on the connections into a producer-triggered partition. The
     # producer worker calls it for each pass that emits on the edge, and the
     # pass's items run under the consumer walk it returns: the producer, which
@@ -207,7 +216,7 @@ def find_client_stream(
     conn: Connection, walks: Mapping[str, GraphSection], partitions: Mapping[str, PartitionDefinition],
 ) -> ClientStream:
     """``conn``'s consumer: the one node, over every walk, that takes the edge
-    (as ``Worker._build_consumer_node_cache`` resolves it), in a walk of the
+    (as ``mstar.worker.stream_buffers.consumer_nodes`` resolves it), in a walk of the
     partition it flows into; ``ValueError`` for a stream without one."""
     name, partition = conn.edge_name, partitions.get(conn.to_partition)
     if partition is None:

@@ -15,6 +15,20 @@ from contextvars import ContextVar
 
 import torch
 
+from mstar.utils import cpus
+
+
+def video_decode_threads() -> int:
+    """FFmpeg threads for one video decode. torchcodec decodes single-threaded
+    by default, which dominates a long clip's request latency; frame threading
+    is bit-identical. Bounded by 8 and by the CPUs the process's plan leaves
+    unpinned, as ``CpuPlan.png_threads`` is. The bound is per decode:
+    concurrent decodes each start this many threads. Not tied to torch's
+    intra-op pool: FFmpeg's threads are its own, and that pool is kept small
+    for fork-join ops a decode doesn't run."""
+    return min(8, cpus.plan().left)
+
+
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)
 DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
 # about 39 s of 720p30, or 2.6 min of 640x360 at 30 fps, decoded at once: a

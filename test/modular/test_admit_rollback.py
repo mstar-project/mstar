@@ -20,10 +20,11 @@ import torch
 from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -73,7 +74,7 @@ class _HostPoolStub(CPUPagePool):
         self.offloaded = {}
         self._refused_logged_at = None
         self._refused_unlogged = 0
-        self.dropped = 0
+        self.dropped = self.written = self.cancelled = 0
         self._dropped_logged_at = None
 
     def copy_out(self, gpu_kv_cache, copies):

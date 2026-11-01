@@ -60,7 +60,7 @@ def main():
     from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
 
     codec = frames_from_mp4(LTX25Model(skip_weight_loading=True).postprocess(
-        torch.from_numpy(ref).permute(3, 0, 1, 2), "video", {"fps": 24}))
+        torch.from_numpy(ref), "video", {"fps": 24}))
     print(f"codec floor (oracle frames through H.264)   PSNR {psnr(codec, ref):6.2f} dB")
     if args.second_oracle:
         second = torch.load(Path(args.second_oracle) / "video.pt").numpy()
