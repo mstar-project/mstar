@@ -12,19 +12,19 @@ layout into buffers that stay put under capture.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn import kda_torch, kda_triton
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
-from mstar.engine.resources.recurrent.pool import RecurrentAddressing
+from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.platforms import current_platform
 from mstar.utils.h2d import PinnedStager
@@ -85,6 +85,12 @@ class KDAPlan:
     # every row is a verify block of `block` tokens (LinearAttnStep.speculative)
     is_verify: bool = False
     block: int = 1
+    # (row, offset into the row, slot): the states this prefill keeps for prefix reuse, and
+    # whether `layout` carries their section (a captured step's always does, on a keyed walk)
+    snapshots: tuple[tuple[int, int, int], ...] = ()
+    snapshot_section: bool = False
+    # a window's first tokens, run on their own first (`KDAManager.token_window`)
+    head: KDAPlan | None = None
     _cache: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -138,6 +144,8 @@ class KDAManager(LinearAttnManager):
         # k of the pool's speculative blocks: a verify block spans up to k + 1 tokens
         self.speculative_tokens = speculative_tokens
 
+        # the pool, whose snapshot slots a prefill fills (`bind_dependencies`)
+        self._pool: RecurrentStatePool | None = None
         # per (bucket, slot, label): a captured graph reads its layout here
         self._cg_layout: dict[CGSlotKey, torch.Tensor] = {}
         self._layout_stager = PinnedStager(torch.int32)
@@ -156,6 +164,12 @@ class KDAManager(LinearAttnManager):
     def depends_on(self) -> set[str]:
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
+
+    def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        self._pool = resources.get(self._pool_key)
+        if self._pool is not None:
+            # the kernels store each snapshot themselves, through no checkpoint buffer
+            self._pool.bind_snapshot_writer(buffered=False)
 
     # Step lifecycle
 
@@ -226,10 +240,34 @@ class KDAManager(LinearAttnManager):
             assert num_tokens == rows * block, (num_tokens, rows, block)
             plan.is_verify, plan.block = True, block
         elif not is_decode and self.kernels is not None:
-            host = self.kernels.layout(spans, num_tokens, lease is not None)
+            targets = self._snapshot_targets(label, addressing, ctx, spans)
+            plan.snapshots = targets or ()
+            # an eager step without targets runs the kernels that keep none
+            plan.snapshot_section = targets is not None and (lease is not None or bool(targets))
+            host = self.kernels.layout(
+                spans, num_tokens, lease is not None, plan.snapshots if plan.snapshot_section else None,
+            )
             if host is not None:
                 plan.layout = self._stage_layout(host, label, ctx)
         return plan
+
+    def _snapshot_targets(
+        self, label: str, addressing: RecurrentAddressing, ctx: StepContext, spans: tuple[int, ...],
+    ) -> tuple[tuple[int, int, int], ...] | None:
+        """The pool's snapshot targets for this prefill, or None on a walk the KV cache doesn't
+        key, where the pool keeps none."""
+        walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
+        if not addressing.snapshot_every or self._pool is None or walk not in self._pool.keyed_walks(label):
+            assert not addressing.snapshots, f"kda: a {walk!r} step keeps snapshots its KV cache doesn't key"
+            return None
+        chunk = self.kernels.chunk
+        for row, offset, _ in addressing.snapshots:
+            if offset % chunk and offset != spans[row]:
+                raise ValueError(
+                    f"kda: a snapshot {offset} tokens into a row falls inside a {chunk}-token "
+                    "chunk; the KV cache's page size must be a multiple of the chunk"
+                )
+        return tuple((t.row, t.offset, t.slot) for t in addressing.snapshots)
 
     def _stage_layout(self, host: list[int], label: str, ctx: StepContext) -> torch.Tensor:
         """A fresh device copy eager; under a lease, the static buffer of that
@@ -272,27 +310,60 @@ class KDAManager(LinearAttnManager):
     def token_window(self, pieces: list[tuple[int, int]], label: str | None = None) -> Iterator[None]:
         """Run this step's KDA over a window of its prefill tokens: ``pieces`` are (row, tokens)
         in packed order, each the next run of that row's tokens. A row's state carries over in
-        its slot, so windows run in order compute what the whole step would."""
+        its slot, so windows run in order compute what the whole step would.
+
+        A piece that starts inside one of its row's chunks (the row a window boundary cut) runs
+        its tokens up to the chunk's end first, on their own, so the rest of the row chunks as
+        the whole row would and each snapshot lands on a chunk end."""
         if label is None:
             label = self._default_label
         full = self.current_plan(label)
         assert not (full.is_decode or full.is_verify), "kda: a token window splits a prefill"
-        rows = self._rows_stager.to_device([row for row, _ in pieces], self._device)
-        spans = tuple(n for _, n in pieces)
-        plan = KDAPlan(
-            slot_ids=full.slot_ids.index_select(0, rows),
-            has_state=full.has_state.index_select(0, rows),
-            spans=spans, num_tokens=sum(spans), is_decode=False,
-        )
-        if self.kernels is not None:
-            host = self.kernels.layout(spans, plan.num_tokens, False)
-            if host is not None:
-                plan.layout = self._layout_stager.to_device(host, self._device)
+        done = full.cached("window_done", lambda: [0] * full.num_rows)
+        chunk = getattr(self.kernels, "chunk", 1)
+        heads, rest = [], []
+        for row, n in pieces:
+            first = min(-done[row] % chunk, n)
+            if first:
+                heads.append((row, done[row], first))
+            if n > first:
+                rest.append((row, done[row] + first, n - first))
+            done[row] += n
+        if heads and (len(heads) > 1 or heads[0][0] != pieces[0][0]):
+            raise NotImplementedError(
+                f"kda: a window's pieces {pieces} start inside a chunk past its first; "
+                "only the row the window boundary cut can"
+            )
+        plan = self._window_plan(full, rest or heads)
+        if heads and rest:
+            plan.head = self._window_plan(full, heads)
         self._current[label] = plan
         try:
             yield
         finally:
             self._current[label] = full
+
+    def _window_plan(self, full: KDAPlan, pieces: list[tuple[int, int, int]]) -> KDAPlan:
+        """``full`` cut to ``pieces``, (row, first token, tokens) in packed order, with the
+        snapshots that fall in them."""
+        rows = self._rows_stager.to_device([row for row, _, _ in pieces], self._device)
+        spans = tuple(n for _, _, n in pieces)
+        snapshots = tuple(
+            (i, offset - at, slot)
+            for i, (row, at, n) in enumerate(pieces)
+            for kept, offset, slot in full.snapshots if kept == row and at < offset <= at + n
+        )
+        plan = KDAPlan(
+            slot_ids=full.slot_ids.index_select(0, rows),
+            has_state=full.has_state.index_select(0, rows),
+            spans=spans, num_tokens=sum(spans), is_decode=False,
+            snapshots=snapshots, snapshot_section=bool(snapshots),
+        )
+        if self.kernels is not None:
+            host = self.kernels.layout(spans, plan.num_tokens, False, snapshots or None)
+            if host is not None:
+                plan.layout = self._layout_stager.to_device(host, self._device)
+        return plan
 
     # Submodule-level functionality
 
@@ -326,6 +397,18 @@ class KDAManager(LinearAttnManager):
             return self.kernels.run_verify(
                 qkv, g, beta, plan, conv_layer, state_layer, spec, params, gate=gate,
             )
+        if plan.head is not None:
+            # a window's head runs first, on its own (`token_window`)
+            n = plan.head.num_tokens
+            first = self.kernels.run_paged(
+                qkv[:n], g[:n], beta[:n], plan.head, conv_layer, state_layer, params,
+                gate=None if gate is None else gate[:n],
+            )
+            rest = self.kernels.run_paged(
+                qkv[n:], g[n:], beta[n:], plan, conv_layer, state_layer, params,
+                gate=None if gate is None else gate[n:],
+            )
+            return torch.cat([first, rest])
         return self.kernels.run_paged(
             qkv, g, beta, plan, conv_layer, state_layer, params, gate=gate,
         )

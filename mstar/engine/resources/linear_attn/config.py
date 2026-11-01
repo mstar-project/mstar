@@ -74,8 +74,9 @@ class LinearAttnSpec(NodeResourceSpec):
 
     @property
     def writes_prefix_snapshots(self) -> bool:
-        # only the GDN wrapper writes state checkpoints into the pool's snapshot slots
-        return self.config.variant is LinearAttnVariant.GDN
+        # GDN's wrapper and KDA's kernels write the state at page boundaries into the pool's
+        # snapshot slots; Mamba-2 doesn't yet
+        return self.config.variant in (LinearAttnVariant.GDN, LinearAttnVariant.KDA)
 
     @property
     def resource_class(self) -> "type[Resource]":

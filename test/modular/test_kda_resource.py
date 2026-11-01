@@ -48,7 +48,7 @@ class _Recorder:
         self.runs: list[tuple] = []
         self.verifies: list[tuple] = []
 
-    def layout(self, spans, num_tokens, fixed):
+    def layout(self, spans, num_tokens, fixed, snapshots=None):
         self.layouts.append((spans, num_tokens, fixed))
         return [num_tokens, *spans]
 

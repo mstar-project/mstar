@@ -471,18 +471,20 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
 - A prefill keeps the state at its last page boundary before its end, since a resend's KV
   hit always leaves the last page to recompute, and at its KV hit's last page
   boundary when that is past what it restored. A shared prefix is then served from the third request
-  that shares it. A step longer than the largest captured bucket checkpoints less often, so that
-  its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
-- A decode step that ends a page keeps the state there, so a later turn that re-sends the
-  reply restores it. It replaces the request's previous decode snapshot once the KV chain
+  that shares it. Under GDN, a step longer than the largest captured bucket checkpoints less often,
+  so that its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval;
+  KDA's kernels store each snapshot themselves and keep every page.
+- A decode step that ends a page keeps the state there, where the KV cache keys the decode walk,
+  so a later turn that re-sends the reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
   past the reply's end, leaves the previous one in place.
 - A snapshot is keyed by the KV chain's key at its page. A full set of slots evicts the
   least recently used snapshot that no request holds.
 
-Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, or when that cache's ``prefix_cache`` is off; in those three cases the pool allocates
-no snapshot slots. Every cache on the node then stays shut, and the engine logs which
+Snapshots stay off without ``prefix_slots``, without a named KV cache, when that cache's
+``prefix_cache`` is off, and above one rank unless it sets ``prefix_cache_tp``; in those
+cases the pool allocates no snapshot slots. Above one rank rank 0 leases a request's snapshot
+as it sends the step, as it does the KV pages, and the other ranks restore the same slot. Every cache on the node then stays shut, and the engine logs which
 resource kept it shut.
 
 A model with a keyed label is checked at load time. Loading fails in two more cases:

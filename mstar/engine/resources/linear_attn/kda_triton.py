@@ -18,7 +18,8 @@ and S the ``[K, V]`` fp32 state:
 ``_kda_conv_kernel`` (conv, gate cumsum, beta) and ``_kda_intra_kernel`` (l2norm factors, A,
 Aqk, the solve, W, U) run per chunk, ``_kda_scan_kernel`` serially over each span's chunks with
 the state in place in its slot, and ``_kda_out_norm_kernel`` applies the output gate and norm.
-The bf16 rounding points follow ``kda_torch``.
+The bf16 rounding points follow ``kda_torch``. For prefix reuse the scan also stores the state
+and conv tail at up to two chunk ends per span (or the span's end) into the pool's snapshot slots.
 """
 from __future__ import annotations
 
@@ -184,6 +185,9 @@ class KdaVarlen:
     slots: torch.Tensor  # int32 [N]
     chunk_offsets: torch.Tensor  # int32 [N]: index of each span's first chunk
     chunks: torch.Tensor  # int32 [num_chunks, 2]: (span, chunk within the span)
+    # int32 [N, 2]: per span the offsets (0: none) of the states to keep, and their slots
+    snap_off: torch.Tensor | None = None
+    snap_slot: torch.Tensor | None = None
 
 
 def static_rows(num_spans: int, num_tokens: int, chunk: int | None = None) -> int:
@@ -191,12 +195,15 @@ def static_rows(num_spans: int, num_tokens: int, chunk: int | None = None) -> in
     return num_tokens // (chunk or CONFIG.chunk) + num_spans
 
 
-def varlen_layout(lens, num_tokens: int | None = None, chunk: int | None = None) -> list[int]:
+def varlen_layout(lens, num_tokens: int | None = None, chunk: int | None = None,
+                  snapshots=None) -> list[int]:
     """The spans' starts, lengths and first chunks, then the (span, chunk) table, as host ints.
 
     With ``num_tokens`` (a capture bucket's) the table is filled out to ``static_rows`` with a
     chunk past span 0's end, which every kernel masks out, so a captured graph reads any split
-    of those tokens at the same offsets."""
+    of those tokens at the same offsets. With ``snapshots``, ``(span, offset, slot)`` for each
+    state to keep (at most two a span, each at a chunk end or the span's end), a section of the
+    spans' two offsets (0: none) and then their slots sits before the table."""
     chunk = chunk or CONFIG.chunk
     starts, offsets, table, start = [], [], [], 0
     for n, length in enumerate(lens):
@@ -209,17 +216,29 @@ def varlen_layout(lens, num_tokens: int | None = None, chunk: int | None = None)
         rows = static_rows(len(lens), num_tokens, chunk)
         assert len(table) // 2 <= rows and start <= num_tokens, (len(table), rows, num_tokens)
         table += (0, -(-lens[0] // chunk)) * (rows - len(table) // 2)
-    return [*starts, *lens, *offsets, *table]
+    snap = []
+    if snapshots is not None:
+        snap = [0] * (4 * len(lens))
+        for span, offset, slot in snapshots:
+            at = 2 * span + (snap[2 * span] != 0)
+            assert snap[at] == 0 and 0 < offset <= lens[span], (span, offset, lens[span])
+            assert offset % chunk == 0 or offset == lens[span], (offset, chunk, lens[span])
+            snap[at], snap[2 * len(lens) + at] = offset, slot
+    return [*starts, *lens, *offsets, *snap, *table]
 
 
 def varlen_view(layout: torch.Tensor, slots: torch.Tensor, num_spans: int, num_tokens: int,
-                chunk: int | None = None) -> KdaVarlen:
-    """A ``varlen_layout`` on device, with each span's slot, as the kernels' ``KdaVarlen``."""
+                chunk: int | None = None, snapshots: bool = False) -> KdaVarlen:
+    """A ``varlen_layout`` on device, with each span's slot, as the kernels' ``KdaVarlen``;
+    ``snapshots``: the layout carries the snapshot section."""
     n = num_spans
+    s = 4 * n if snapshots else 0
     return KdaVarlen(
-        num_spans=n, num_tokens=num_tokens, num_chunks=(layout.numel() - 3 * n) // 2,
+        num_spans=n, num_tokens=num_tokens, num_chunks=(layout.numel() - 3 * n - s) // 2,
         chunk=chunk or CONFIG.chunk, starts=layout[:n], lens=layout[n:2 * n], slots=slots[:n],
-        chunk_offsets=layout[2 * n:3 * n], chunks=layout[3 * n:],
+        chunk_offsets=layout[2 * n:3 * n], chunks=layout[3 * n + s:],
+        snap_off=layout[3 * n:5 * n] if snapshots else None,
+        snap_slot=layout[5 * n:7 * n] if snapshots else None,
     )
 
 
@@ -434,12 +453,14 @@ if _HAS_TRITON:
     def _kda_scan_kernel(
         w_s, u_s, qg_s, kg_s, aqk_s, glast_s, state_pool, stride_state,
         proj, stride_proj, conv_pool, stride_conv, o_out,
-        starts, lens, slots, chunk_offsets, T,
+        starts, lens, slots, chunk_offsets, snap_off, snap_slot, T,
         H: tl.constexpr, D: tl.constexpr, C: tl.constexpr, BV: tl.constexpr,
-        PREC: tl.constexpr, STAGES: tl.constexpr,
+        PREC: tl.constexpr, STAGES: tl.constexpr, SNAP: tl.constexpr,
     ):
         """One program per (V block, span, head), serial over the span's chunks. The fp32
-        state ``[K, V]`` is read from the span's slot, stored V-first, and written back."""
+        state ``[K, V]`` is read from the span's slot, stored V-first, and written back.
+        With ``SNAP`` the state after the chunk ending at each of the span's two snapshot
+        offsets (0: none) is stored into that snapshot's slot too, and its conv tail."""
         iv = tl.program_id(0)
         n = tl.program_id(1)
         h = tl.program_id(2)
@@ -451,7 +472,13 @@ if _HAS_TRITON:
         k = tl.arange(0, D)
         v = iv * BV + tl.arange(0, BV)
         r = tl.arange(0, C)
-        sp = state_pool + slot * stride_state + h * D * D + k[:, None] + v[None, :] * D
+        head = h * D * D + k[:, None] + v[None, :] * D
+        sp = state_pool + slot * stride_state + head
+        if SNAP:
+            off0 = tl.load(snap_off + 2 * n)
+            off1 = tl.load(snap_off + 2 * n + 1)
+            snap0 = tl.load(snap_slot + 2 * n).to(tl.int64)
+            snap1 = tl.load(snap_slot + 2 * n + 1).to(tl.int64)
         s = tl.load(sp)
         for c in tl.range(0, tl.cdiv(L, C), num_stages=STAGES):
             pos = c * C + r
@@ -468,6 +495,10 @@ if _HAS_TRITON:
             tl.store(o_out + (bos + pos)[:, None] * P + h * D + v[None, :],
                      o.to(o_out.dtype.element_ty), mask=valid)
             s = s * decay[:, None] + _mm(tl.trans(kg), v_new, PREC)
+            if SNAP:
+                end = tl.minimum((c + 1) * C, L)
+                tl.store(state_pool + snap0 * stride_state + head, s, mask=end == off0)
+                tl.store(state_pool + snap1 * stride_state + head, s, mask=end == off1)
         tl.store(sp, s)
 
         if iv == 0:
@@ -478,11 +509,30 @@ if _HAS_TRITON:
             tq = _new_tail(proj, stride_proj, cstate, h * D + k, bos, L, m)
             tk = _new_tail(proj, stride_proj, cstate, P + h * D + k, bos, L, m)
             tv = _new_tail(proj, stride_proj, cstate, 2 * P + h * D + k, bos, L, m)
+            if SNAP:
+                # each snapshot's tail, as a span ending at its offset leaves it
+                q0 = _new_tail(proj, stride_proj, cstate, h * D + k, bos, off0, m)
+                k0 = _new_tail(proj, stride_proj, cstate, P + h * D + k, bos, off0, m)
+                v0 = _new_tail(proj, stride_proj, cstate, 2 * P + h * D + k, bos, off0, m)
+                q1 = _new_tail(proj, stride_proj, cstate, h * D + k, bos, off1, m)
+                k1 = _new_tail(proj, stride_proj, cstate, P + h * D + k, bos, off1, m)
+                v1 = _new_tail(proj, stride_proj, cstate, 2 * P + h * D + k, bos, off1, m)
             tl.debug_barrier()
             live = (m < 3)[None, :]
             tl.store(cstate + (h * D + k)[:, None] * 3 + m[None, :], tq, mask=live)
             tl.store(cstate + (P + h * D + k)[:, None] * 3 + m[None, :], tk, mask=live)
             tl.store(cstate + (2 * P + h * D + k)[:, None] * 3 + m[None, :], tv, mask=live)
+            if SNAP:
+                at0 = conv_pool + snap0 * stride_conv + m[None, :]
+                at1 = conv_pool + snap1 * stride_conv + m[None, :]
+                keep0 = live & (off0 > 0)
+                keep1 = live & (off1 > 0)
+                tl.store(at0 + (h * D + k)[:, None] * 3, q0, mask=keep0)
+                tl.store(at0 + (P + h * D + k)[:, None] * 3, k0, mask=keep0)
+                tl.store(at0 + (2 * P + h * D + k)[:, None] * 3, v0, mask=keep0)
+                tl.store(at1 + (h * D + k)[:, None] * 3, q1, mask=keep1)
+                tl.store(at1 + (P + h * D + k)[:, None] * 3, k1, mask=keep1)
+                tl.store(at1 + (2 * P + h * D + k)[:, None] * 3, v1, mask=keep1)
 
     @triton.jit(do_not_specialize=["T"])
     def _kda_out_norm_kernel(o_in, proj, stride_proj, g_b, norm_w, out, T, norm_eps,
@@ -507,7 +557,8 @@ def kda_prefill(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state
                 *, num_heads, head_dim, lower_bound, scale, norm_eps, cfg: PrefillConfig | None = None):
     """Fused KDA prefill for ``proj (T, 3P + H + 2D)`` over ``varlen``'s spans; returns the
     gated-normed ``(T, P)``. The spans' slots in ``conv_pool (S, 3P, 3)`` and
-    ``state_pool (S, H, V, K)`` fp32 are updated in place."""
+    ``state_pool (S, H, V, K)`` fp32 are updated in place, and ``varlen``'s snapshot slots
+    written."""
     cfg = cfg or CONFIG
     H, D, C = num_heads, head_dim, varlen.chunk
     T, P = proj.shape[0], num_heads * head_dim
@@ -543,11 +594,13 @@ def kda_prefill(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state
     o = torch.empty(T, P, dtype=proj.dtype, device=dev)
     bv = cfg.scan_bv or (32 if varlen.num_spans * H * D // 32 <= _num_sms(dev) else 64)
     bv = min(bv, D)
+    snap = varlen.snap_off is not None
     _kda_scan_kernel[(D // bv, varlen.num_spans, H)](
         w_s, u_s, qg_s, kg_s, aqk_s, glast_s, state_pool, state_pool.stride(0),
         proj, proj.stride(0), conv_pool, conv_pool.stride(0), o,
-        varlen.starts, varlen.lens, varlen.slots, varlen.chunk_offsets, T,
-        H=H, D=D, C=C, BV=bv, PREC=cfg.scan_prec, STAGES=cfg.scan_stages,
+        varlen.starts, varlen.lens, varlen.slots, varlen.chunk_offsets,
+        varlen.snap_off if snap else varlen.lens, varlen.snap_slot if snap else varlen.lens, T,
+        H=H, D=D, C=C, BV=bv, PREC=cfg.scan_prec, STAGES=cfg.scan_stages, SNAP=snap,
         num_warps=cfg.scan_warps,
     )
     _kda_out_norm_kernel[(triton.cdiv(T, 64), H)](
@@ -769,9 +822,15 @@ class TritonKDAKernels:
     def __init__(self, config: PrefillConfig | None = None):
         self.config = config or CONFIG
 
-    def layout(self, spans, num_tokens: int, fixed: bool) -> list[int]:
-        """The prefill's span layout; ``fixed`` sizes it by ``num_tokens`` for a capture."""
-        return varlen_layout(spans, num_tokens if fixed else None, self.config.chunk)
+    @property
+    def chunk(self) -> int:
+        """Prefill chunk length: a span's snapshots sit on its chunk ends."""
+        return self.config.chunk
+
+    def layout(self, spans, num_tokens: int, fixed: bool, snapshots=None) -> list[int]:
+        """The prefill's span layout; ``fixed`` sizes it by ``num_tokens`` for a capture, and
+        ``snapshots`` (``(row, offset, slot)``s, or None for no section) are the states it keeps."""
+        return varlen_layout(spans, num_tokens if fixed else None, self.config.chunk, snapshots)
 
     @torch.compiler.disable
     def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None):
@@ -785,7 +844,8 @@ class TritonKDAKernels:
             return kda_decode(proj, conv_state, p.conv_weight, p.f_b, p.g_b, p.dt_bias, p.A_log,
                               p.norm_weight, rec_state, plan.slot_ids, **kwargs)
         varlen = plan.cached("kda_triton", lambda: varlen_view(
-            plan.layout, plan.slot_ids, plan.num_rows, plan.num_tokens, self.config.chunk))
+            plan.layout, plan.slot_ids, plan.num_rows, plan.num_tokens, self.config.chunk,
+            snapshots=plan.snapshot_section))
         return kda_prefill(proj, conv_state, p.conv_weight, p.f_b, p.g_b, p.dt_bias, p.A_log,
                            p.norm_weight, rec_state, varlen, cfg=self.config, **kwargs)
 
