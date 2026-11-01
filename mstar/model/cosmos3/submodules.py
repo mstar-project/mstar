@@ -3229,6 +3229,8 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
     reads_device_loopback = False
+    # prefills stay eager, as before: their captures are unmeasured here
+    CAPTURE_PREFILL = False
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
@@ -3255,16 +3257,11 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
         # the deployment switch every Cosmos3 node's captures follow
         if not self.config.accelerator_graph or os.environ.get("COSMOS3_DISABLE_ACCELERATOR_GRAPH"):
             return []
-        # Prefills stay eager, as before: their captures are unmeasured here, and
-        # the reasoner has no combined walk. A decode step past the top bucket
-        # runs eagerly rather than being capped, as before.
-        decode = [
-            config for config in super().get_accelerator_graph_configs(device, tp_world_size)
-            if config.capture_graph_walk == self.DECODE_WALK
-        ]
-        for config in decode:
+        # a decode step past the top bucket runs eagerly rather than being capped, as before
+        configs = super().get_accelerator_graph_configs(device, tp_world_size)
+        for config in configs:
             config.caps_eager_batch_size = False
-        return decode
+        return configs
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         return {}
