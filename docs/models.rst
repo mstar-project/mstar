@@ -1626,22 +1626,27 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the cross-seed bar), and Z-Image-Turbo moves too far (two of 40 images half-way or more
    to another seed), so ``fp8`` is not recommended there.
 
-   On AMD GPUs ``configs/flux2_klein.yaml`` serves fp8 on every declared linear and
-   ``configs/flux2_klein_9b.yaml`` fp8 with its ``fp8_keep_bf16`` list, both with
-   ``knobs: dit_exact_ops: true``, through a
-   :ref:`platform_overrides <platform-overrides>` entry. NVIDIA stays on bf16, and
-   ``flux2_klein_bf16.yaml`` and ``flux2_klein_9b_bf16.yaml`` serve bf16 everywhere. On one
-   quiet MI325X at 1, 4, 8 and 16 requests:
+   On AMD GPUs ``configs/flux2_klein.yaml`` serves the step schedule
+   ``[bf16, fp8_partial, fp8, fp8]`` and ``configs/flux2_klein_9b.yaml``
+   ``[bf16, bf16, fp8_partial, fp8]`` (see ``linear_dtype_steps``), both with
+   ``knobs: dit_exact_ops: true`` and ``text_encoder_max_batch_size: 1``, through a
+   :ref:`platform_overrides <platform-overrides>` entry. NVIDIA stays on bf16 with a batched
+   text encoder, and ``flux2_klein_bf16.yaml`` and ``flux2_klein_9b_bf16.yaml`` serve bf16
+   everywhere. On one MI325X (shared node) at 1, 4, 8 and 16 requests:
 
-   * klein-4B: 3.157, 3.586, 3.494 and 3.647 images per second against 2.775, 3.107, 3.181
-     and 3.313 on bf16, at a median 22.59 dB from diffusers (floor 22.43).
-   * klein-9B: 1.737, 1.820, 1.769 and 1.819 images per second against 1.569, 1.620, 1.680
-     and 1.670 on bf16, at a median 26.48 dB from diffusers (floor 25.46).
+   * klein-4B: 2.984, 3.518, 3.513 and 3.460 images per second, 6, 19, 12 and 8% over bf16.
+     No cell at 4 requests or more falls under the 22.43 dB floor from diffusers (lowest
+     23.16).
+   * klein-9B: 1.627, 1.788, 1.744 and 1.757 images per second, 3, 16, 6 and 6% over bf16.
+     No cell falls under the 25.46 dB floor (lowest 26.24).
 
-   The median hides a tail. Against its bf16 twin the typical image loses 1.0 dB on klein-4B
-   and 1.3 dB on klein-9B, and the worst 11.4 and 6.5 dB. Those 40 images were checked by eye
-   and accepted. The per-step schedules ``flux2_klein_fp8_bpff.yaml`` and
-   ``flux2_klein_9b_fp8_bbpf.yaml`` lose at most 1.65 dB for about 40% and 80% of the gain.
+   Both schedules were checked by eye on the 40 ``image_v1`` images and accepted. fp8 on
+   every step and the 9B keep-list stay by name, as ``flux2_klein_fp8.yaml`` and
+   ``flux2_klein_9b_fp8_keep.yaml``. They serve 6 and 8% more images per second at one
+   request and 4 and 3% more at 16, and they clear the floor at one request (22.59 and
+   26.48 dB), but not once batched: at 16 requests 6 of 12 klein-4B cells read under
+   22.43 dB and 1 of 10 klein-9B cells under 25.46. That distance comes from fp8 in the DiT,
+   and encoding each prompt alone does not move it.
 
 ``fp8_keep_bf16``
    Linears that stay bf16 under ``linear_dtype: fp8``, as module-name patterns matched
@@ -1650,8 +1655,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    four single blocks), ``double_blocks.0-2.img_ff.linear_out``. An entry that names none
    of the model's fp8 linears is an error at load. Each kept linear gives back its share of
    the fp8 speedup, and which ones buy the most quality per millisecond is a per-model
-   measurement. ``configs/flux2_klein_9b.yaml`` keeps the 51 of klein-9B's 80 fp8 linears
-   with the most image error per millisecond saved (every double block's, most single
+   measurement. ``configs/flux2_klein_9b_fp8_keep.yaml`` keeps the 51 of klein-9B's 80 fp8
+   linears with the most image error per millisecond saved (every double block's, most single
    blocks' output projections and two early fused projections): in a one-GPU MI325X A/B it
    serves at a median 26.5 dB from the diffusers reference, over the ROCm floor, at about
    1.18 times the bf16 images per second (1.39 times with every linear in fp8). Lists
