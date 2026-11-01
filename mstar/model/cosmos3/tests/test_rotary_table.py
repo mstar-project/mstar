@@ -37,9 +37,9 @@ def stand_in_rotary(cfg):
     return functools.partial(Cosmos3OmniTransformer._rotary, holder)
 
 
-def _tiny(dtype=torch.float32):
+def _tiny(dtype=torch.float32, compile_denoise=False, **overrides):
     cfg = _tiny_edge_config(
-        compile_denoise=False, action_gen=True, max_action_dim=12, num_embodiment_domains=6,
+        compile_denoise=compile_denoise, action_gen=True, max_action_dim=12, num_embodiment_domains=6, **overrides,
     )
     model = Cosmos3OmniTransformer(cfg).eval()
     _init_all(model)
@@ -189,12 +189,7 @@ def test_denoise_steps_take_the_table(monkeypatch) -> None:
             latent, ts, cond["rotary"], uncond["rotary"], cond["vision_token_shapes"],
             cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
         ))
-        req = {
-            "latents": latent, "vision_timesteps": ts, "rotary_cond": cond["rotary"],
-            "rotary_uncond": uncond["rotary"], "vision_token_shapes": cond["vision_token_shapes"],
-            "vision_noisy_frame_indexes": cond["vision_noisy_frame_indexes"],
-            "vision_mse_loss_indexes": cond["mse_gen_indexes"],
-        }
+        req = Cosmos3OmniTransformer.denoise_step_row(cond, latent, ts, cond["rotary"], uncond["rotary"])
         ((x_c, x_u),) = _run(
             res, CFG_BATCHED_LABEL, both, lambda: model.denoise_step_batched([req], CFG_BATCHED_LABEL, attn),
         )
@@ -232,6 +227,70 @@ def test_denoise_steps_take_the_table(monkeypatch) -> None:
         res.plan(CFG_BATCHED_LABEL, both, causal=False)
         model.commit_window(latent, [cond["rotary"], uncond["rotary"]], CFG_BATCHED_LABEL, attn)
         assert {label for label, _ in res.kv.pending} == {COND_LABEL, UNCOND_LABEL}
+
+
+def test_served_batched_paths_run_the_real_step() -> None:
+    """``forward_batched``, the sound path and a captured batch hand the real
+    cross-request step rows it can read, and an eager batch and a captured one
+    are the same compute."""
+    sub, model, cfg, res = _tiny(sound_gen=True, sound_dim=6)
+    torch.manual_seed(0)
+    gs, rids = 6.0, ["a", "b"]
+    sched = SimpleNamespace(
+        timesteps=torch.tensor([900.0, 500.0]), step=lambda v, t, x, return_dict=False: (x + v,),
+    )
+
+    def statics(ids, **kwargs):
+        return sub._build_static(ids, 64, 64, 9, 24.0, False, "cpu", **kwargs)
+
+    cond_ids, unc_ids = [3, 5, 7, 11, 13], [2, 4, 6, 8, 10, 12, 14]
+    cond, uncond = statics(cond_ids), statics(unc_ids)
+    cond_s, uncond_s = statics(cond_ids, sound_latent_frames=4), statics(unc_ids, sound_latent_frames=4)
+    with torch.no_grad():
+        _prefill(model, res, {COND_LABEL: cond, UNCOND_LABEL: uncond})
+    sub._slim_statics(cond, uncond)
+    sub._slim_statics(cond_s, uncond_s)
+
+    def state(rid_cond, rid_uncond, **kwargs):
+        for rid in rids:
+            sub.request_state(rid).add_all(cond=rid_cond, uncond=rid_uncond, gs=gs, scheduler=sched, **kwargs)
+
+    latents = {rid: torch.randn(sub._latent_shape(64, 64, 9)) for rid in rids}
+    sound = {rid: torch.randn(1, cfg.sound_dim, 4) for rid in rids}
+    time_index = {"a": torch.tensor([0]), "b": torch.tensor([1])}
+    ei = SimpleNamespace(request_ids=rids, step=None, resources=res.as_dict(), per_request_states=None)
+
+    def groups(span):
+        return [(COND_LABEL, span)] * 2 + [(UNCOND_LABEL, span)] * 2
+
+    n = cond["num_vision_tokens"]
+    with torch.no_grad():
+        state(cond_s, uncond_s, num_sound=4)
+        joint = _run(res, CFG_BATCHED_LABEL, groups(n + 4), lambda: sub.forward_batched(
+            C.VIDEO_SOUND_GEN_WALK, ei, latents=latents, sound_latents=sound, time_index=time_index,
+        ))
+        state(cond, uncond)
+        eager = _run(res, CFG_BATCHED_LABEL, groups(n), lambda: sub.forward_batched(
+            C.VIDEO_GEN_WALK, ei, latents=latents, time_index=time_index,
+        ))
+        sub._capture_layout = {tuple(latents["a"].shape): cond}
+        captured = _run(res, CFG_BATCHED_LABEL, groups(n), lambda: sub.forward_captured(
+            C.VIDEO_GEN_WALK, ei,
+            latents=torch.stack([latents[rid] for rid in rids]),
+            vision_timesteps=torch.stack([torch.full((n,), t) for t in sched.timesteps.tolist()]),
+            cos_cond=torch.stack([cond["rotary"][0]] * 2),
+            sin_cond=torch.stack([cond["rotary"][1]] * 2),
+            cos_uncond=torch.stack([uncond["rotary"][0]] * 2),
+            sin_uncond=torch.stack([uncond["rotary"][1]] * 2),
+            noisy_token_mask=torch.ones(2, n),
+        ))
+    for rid in rids:
+        uncond_v = captured[rid]["uncond_v"][0]
+        velocity = uncond_v + gs * (captured[rid]["cond_v"][0] - uncond_v)
+        assert torch.allclose(eager[rid]["latents"][0], latents[rid] + velocity, atol=1e-4)
+        assert joint[rid]["latents"][0].shape == latents[rid].shape
+        assert joint[rid]["sound_latents"][0].shape == sound[rid].shape
+        assert not torch.equal(joint[rid]["sound_latents"][0], sound[rid])
 
 
 def test_captured_inputs_stack_the_tables(monkeypatch) -> None:

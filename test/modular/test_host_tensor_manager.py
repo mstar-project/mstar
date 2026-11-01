@@ -44,6 +44,10 @@ class _StubCommunicator(BaseCommunicator):
         pass
     def get_all_new_messages(self):
         return []
+    def register_event_for_poll(self, event):
+        pass
+    def poll_for_messages(self, timeout_ms=20):
+        return False
 
 def primary_context_active():
     cuda = ctypes.CDLL("libcuda.so.1")
@@ -100,6 +104,12 @@ class _StubCommunicator(BaseCommunicator):
 
     def get_all_new_messages(self):
         return []
+
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
 
 
 class _StubTransferEngine:

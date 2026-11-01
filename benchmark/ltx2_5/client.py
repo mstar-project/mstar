@@ -45,6 +45,7 @@ def main():
     p.add_argument("--height", type=int, default=544)
     p.add_argument("--width", type=int, default=960)
     p.add_argument("--num-frames", type=int, default=121)
+    p.add_argument("--recipe", default="single", choices=("single", "two_stage"))
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -52,7 +53,7 @@ def main():
     t0 = time.perf_counter()
     res = client.generate(
         text=args.prompt, output_modalities=("video", "audio"), seed=args.seed,
-        height=args.height, width=args.width, num_frames=args.num_frames,
+        height=args.height, width=args.width, num_frames=args.num_frames, recipe=args.recipe,
     )
     elapsed = time.perf_counter() - t0
     videos = [c["bytes"] for c in res.raw if c.get("modality") == "video"]

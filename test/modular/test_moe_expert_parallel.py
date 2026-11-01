@@ -33,20 +33,22 @@ _DEVICES = [
 class _FakeCommGroup(CommGroup):
     """One rank of a P-rank group, run in one process with its peers.
 
-    A forward makes two all-reduces. The first syncs the routing; rank 0
+    An EP forward makes two all-reduces. The first syncs the routing; rank 0
     runs first and posts its tensor to ``bus``, which the other ranks
     take, as the real zero-padded all-reduce would. The second is the
-    identity; the test sums the rank outputs itself.
+    identity; the test sums the rank outputs itself. A TP forward makes
+    only the second (``syncs_routing=False``).
     """
 
-    def __init__(self, rank: int, world_size: int, bus: dict | None = None):
+    def __init__(self, rank: int, world_size: int, bus: dict | None = None, syncs_routing: bool = True):
         super().__init__(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
         self.all_reduce_calls = 0
         self.bus = bus if bus is not None else {}
+        self.syncs_routing = syncs_routing
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         self.all_reduce_calls += 1
-        if self.all_reduce_calls % 2 == 1:
+        if self.syncs_routing and self.all_reduce_calls % 2 == 1:
             if self.rank == 0:
                 self.bus["routing"] = input_.clone()
             else:
@@ -308,7 +310,8 @@ def test_ep_expert_load_off_by_default():
 def _rank_blocks(cls, world_size, ckpt, router_w, device, dtype, **kwargs):
     blocks, bus = [], {}
     for rank in range(world_size):
-        block = cls(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size, bus), **kwargs)
+        group = _FakeCommGroup(rank, world_size, bus, syncs_routing=cls is ExpertParallelSparseMoeBlock)
+        block = cls(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=group, **kwargs)
         with torch.no_grad():
             block.gate.weight.copy_(router_w)
         block = block.to(device, dtype)

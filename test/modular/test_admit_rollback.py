@@ -73,7 +73,7 @@ class _HostPoolStub(CPUPagePool):
         self.offloaded = {}
         self._refused_logged_at = None
         self._refused_unlogged = 0
-        self.dropped = 0
+        self.dropped = self.written = self.cancelled = 0
         self._dropped_logged_at = None
 
     def copy_out(self, gpu_kv_cache, copies):

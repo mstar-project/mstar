@@ -34,6 +34,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -84,7 +85,6 @@ def _worker(is_tp_follower=False) -> Worker:
     )
     w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w.engine_manager = SimpleNamespace(
-        evictable_nodes=lambda: [NODE],
         add_request=lambda rid, cfgs: None,
         remove_request=lambda rid: None,
     )
@@ -93,20 +93,20 @@ def _worker(is_tp_follower=False) -> Worker:
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=w.wire_rids_cleared.append,
         fail_rids=lambda rids: None,
+        note_arrival=lambda rid: None,
         pending_tp_follow_count={},
         last_consumed_tp_seq=-1,
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._my_consumer_connections = []
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._draining_rids = set()
     w._pending_drains = set()
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._removes_awaiting_step = {}
-    w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

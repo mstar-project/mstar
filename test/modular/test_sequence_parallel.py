@@ -4,7 +4,9 @@
 splits, and of several tensors at once against one at a time; and
 ``ulysses_attention`` over sharded tokens against one rank attending the whole
 sequence (with fewer key/value heads than query heads too), for the
-``[S, H, D]`` and ``[B, S, H, D]`` layouts.
+``[S, H, D]`` and ``[B, S, H, D]`` layouts; and ``attention_over_sharded_keys``, a
+replicated query over sharded keys merged by log-sum-exp, against one rank attending
+all the keys.
 """
 
 from __future__ import annotations
@@ -16,7 +18,12 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.distributed.sequence_parallel import sp_seq_split, ulysses_attention
+from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.model.components.distributed.sequence_parallel import (
+    attention_over_sharded_keys,
+    sp_seq_split,
+    ulysses_attention,
+)
 
 HEADS = 6
 
@@ -118,3 +125,21 @@ def _several_at_once(rank, world, total, batched):
 @pytest.mark.parametrize("world,total", [(2, 6), (3, 11)], ids=["2-even", "3-uneven"])
 def test_all_to_all_of_several_tensors_matches_one_at_a_time(tmp_path, world, total, batched):
     _run(_several_at_once, world, tmp_path / "store", total, batched)
+
+
+def _sharded_keys(rank, world, total):
+    group = _group(rank, world)
+    sizes = sp_seq_split(total, world)
+    q = _full(5, batched=True, seed=0)               # the same short query on every rank
+    k, v = (_full(total, batched=True, seed=seed) for seed in (1, 2))
+    want = _sdpa(batched=True)(q, k, v)
+    start = sum(sizes[:rank])
+    out = attention_over_sharded_keys(
+        group, q, k.narrow(1, start, sizes[rank]), v.narrow(1, start, sizes[rank]), sdpa_attention,
+    )
+    torch.testing.assert_close(out, want)
+
+
+@pytest.mark.parametrize("world,total", [(1, 7), (2, 7), (3, 11)], ids=["1", "2-uneven", "3-uneven"])
+def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
+    _run(_sharded_keys, world, tmp_path / "store", total)

@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from mstar.model.wan22.config import Wan22Config
-from mstar.model.wan22.submodules import Wan22DitSubmodule
+from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
 from mstar.model.wan22.wan22_model import Wan22Model
 
 CHANNELS = 4
@@ -55,9 +55,10 @@ def _step(node: Wan22DitSubmodule, width: int, height: int, frames: int, guidanc
     meta = {"num_inference_steps": 4, "guidance_scale": guidance}
     out = node.forward(
         "video_gen",
-        engine_inputs=SimpleNamespace(single_request_info=SimpleNamespace(step_metadata=meta)),
+        engine_inputs=SimpleNamespace(single_request_info=SimpleNamespace(
+            step_metadata=meta, dynamic_loop_iter_counts={DENOISE_LOOP_NAME: 1},
+        )),
         latents=torch.randn(shape, generator=gen),
-        time_index=torch.tensor([1]),
         unipc_model_outputs=torch.randn((2, *shape), generator=gen),
         unipc_last_sample=torch.randn(shape, generator=gen),
         text_embeds_pos=torch.randn(1, TEXT_LEN, TEXT_DIM, generator=gen),

@@ -160,7 +160,7 @@ def check_decode(device="cuda:1"):
     video_dec = model.get_submodule("vae_decoder", device)
     audio_dec = model.get_submodule("audio_decoder", device)
     frames = video_dec.run_batch(latents=load("latents_007").to(device), shape=shape)["video_output"][0]
-    ref = load("video").permute(3, 0, 1, 2)  # [F, H, W, 3] -> [3, F, H, W]
+    ref = load("video")  # [F, H, W, 3], the node's layout
     diff = (frames.cpu().float() - ref.float())
     mse = diff.pow(2).mean()
     print(f"video frames  max_abs={diff.abs().max():.0f} psnr={10 * torch.log10(255 ** 2 / mse):.2f} dB "
@@ -213,6 +213,41 @@ def check_forced(device="cuda:0", attention="flashinfer", compile_transformer=Tr
         report(f"forced step {k} audio", va, ra)
 
 
+
+
+
+@torch.inference_mode()
+def check_two_stage_seed(device="cuda:0"):
+    """The two-stage recipe's hand-offs against the two-stage oracle: the latent upsampler
+    node on stage 1's final latents (denormalize, upsample, re-normalize, pack), then stage
+    2's starting latents from its output (generator replay, sigma-0 noise blend)."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.ltx2_5.config import UPSAMPLER_NODE
+    from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
+    from mstar.model.ltx2_5.submodules import REFINE_AUDIO, REFINE_LATENTS, LTXDenoiseSubmodule, shape_from_metadata
+
+    two = Path(str(ORACLE).replace("t2av", "two_stage"))
+    model = LTX25Model()
+    config = model.config
+    meta = {"height": 1088, "width": 1920, "num_frames": 121, "fps": 24.0}
+    up = model.get_submodule(UPSAMPLER_NODE, device).run_batch(
+        latents=torch.load(two / "s1_final_video.pt").to(device),
+        audio_latents=torch.load(two / "s1_final_audio.pt").to(device),
+        shape=shape_from_metadata(config, {**meta, "height": 544, "width": 960}),   # stage 1 runs at half size
+    )
+    report("latent upsampler video", up[REFINE_LATENTS], torch.load(two / "s2_seed_video.pt"))
+    report("latent upsampler audio", up[REFINE_AUDIO], torch.load(two / "s2_seed_audio.pt"))
+
+    sub = LTXDenoiseSubmodule(torch.nn.Linear(1, 1).to(device), config, loop_name="denoise_loop",
+                              use_ragged_attention=False, refine_walks=frozenset({"refine_av"}))
+    info = CurrentForwardPassInfo(request_id="r", graph_walk="refine_av", fwd_index=0, random_seed=0, max_tokens=0,
+                                  step_metadata=meta)
+    seeds = sub.initial_loop_back(info, {REFINE_LATENTS: [up[REFINE_LATENTS][0]], REFINE_AUDIO: [up[REFINE_AUDIO][0]]},
+                                  shape_from_metadata(config, meta), torch.Generator().manual_seed(0))
+    report("stage-2 starting video", seeds["latents"], torch.load(two / "s2_latents_init.pt")[0])
+    report("stage-2 starting audio", seeds["audio_latents"], torch.load(two / "s2_audio_init.pt")[0])
+
+
 if __name__ == "__main__":
     {"dit": check_dit, "text": check_text, "loop": check_loop, "decode": check_decode,
-     "forced": check_forced}[sys.argv[1]]()
+     "forced": check_forced, "two_stage_seed": check_two_stage_seed}[sys.argv[1]]()

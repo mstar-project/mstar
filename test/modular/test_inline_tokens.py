@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import queue
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
 
-from mstar.api_server.data_worker import InlineToken, PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import APIServerMessage, ResultChunk, ResultTokens
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
+from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.model.base import Model
 from mstar.model.submodule_base import HostRows
 from mstar.worker.worker import Worker
 
@@ -29,7 +33,7 @@ def test_result_tokens_round_trips_through_the_codec():
         body=ResultTokens(
             request_ids=["r1", "r2", "r3"], values=[5, 151645, 7],
             loop_indices=[_loop(3), None, _loop(9)],
-            signal="text_inputs", modality="text",
+            signal="text_inputs", modality="text", logprobs=[-0.25, None, -1.0],
         ),
     )
     back = wire.decode(wire.encode(msg))
@@ -41,6 +45,9 @@ def test_result_tokens_round_trips_through_the_codec():
     assert back.body.loop_indices[0].loop_indices == {"decode_loop": 3}
     assert back.body.loop_indices[2].wg_fwd_pass_idx == 10
     assert back.body.signal == "text_inputs" and back.body.modality == "text"
+    assert back.body.logprobs == [-0.25, None, -1.0]
+    plain = replace(msg, body=replace(msg.body, logprobs=None))
+    assert wire.decode(wire.encode(plain)).body.logprobs is None
 
 
 # -- api server --------------------------------------------------------------
@@ -50,6 +57,9 @@ class _Model:
     def get_partition_topology(self):
         from mstar.streaming.topology import PartitionTopology
         return PartitionTopology(partitions=["default"])
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
+    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
@@ -99,8 +109,8 @@ class _TM:
 def _thread():
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
-        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
+        profile_queue=ResultQueue(EventWakeup()), cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop, communicator=_Comm(),
         tensor_manager=_TM(), model=_Model(),
@@ -108,21 +118,34 @@ def _thread():
     return worker, stop
 
 
-def test_inline_tokens_are_detokenized_in_order_without_a_read():
-    worker, stop = _thread()
-    for i, v in enumerate((11, 12, 13)):
-        worker.result_tensor_queue.put(InlineToken("req", v, _loop(i), "text"))
-    worker.result_tensor_queue.put(InlineToken("other", 99, None, "text"))
+class _FailsOn(_Model):
+    def __init__(self, bad):
+        self.bad = bad
+
+    def postprocess(self, output, modality, request_kwargs=None):
+        if int(output[0]) == self.bad:
+            raise ValueError("bad token")
+        return super().postprocess(output, modality, request_kwargs)
+
+
+def _run_until(worker, stop, n):
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
-        chunks = [worker.out_queue.get(timeout=5) for _ in range(4)]
+        return [worker.out_queue.get(timeout=5) for _ in range(n)]
     finally:
         stop.set()
         thread.join(timeout=5)
+
+
+def test_inline_tokens_are_detokenized_in_order_without_a_read():
+    worker, stop = _thread()
+    for v in (11, 12, 13):
+        worker.result_tensor_queue.put(InlineTokens(["req", "other"], [v, v + 80], "text"))
+    chunks = _run_until(worker, stop, 6)
     assert all(isinstance(c, ResultChunk) for c in chunks)
     assert [c.data for c in chunks if c.request_id == "req"] == [b"<11>", b"<12>", b"<13>"]
-    assert [c.data for c in chunks if c.request_id == "other"] == [b"<99>"]
+    assert [c.data for c in chunks if c.request_id == "other"] == [b"<91>", b"<92>", b"<93>"]
     state = worker.request_output_state["req"]
     assert state.next_sequence == 3 and state.next_emit == 3 and not state.pending
 
@@ -130,31 +153,63 @@ def test_inline_tokens_are_detokenized_in_order_without_a_read():
 def test_a_draining_request_drops_its_inline_tokens():
     worker, stop = _thread()
     worker._draining_rids.add("gone")
-    worker.result_tensor_queue.put(InlineToken("gone", 1, None, "text"))
-    worker.result_tensor_queue.put(InlineToken("live", 2, None, "text"))
-    thread = threading.Thread(target=worker.run)
-    thread.start()
-    try:
-        chunk = worker.out_queue.get(timeout=5)
-    finally:
-        stop.set()
-        thread.join(timeout=5)
+    worker.result_tensor_queue.put(InlineTokens(["gone", "live"], [1, 2], "text"))
+    [chunk] = _run_until(worker, stop, 1)
     assert chunk.request_id == "live" and chunk.data == b"<2>"
     assert worker.out_queue.empty()
+    assert "gone" not in worker.request_output_state
+
+
+def test_a_row_that_fails_postprocessing_fails_only_its_request():
+    worker, stop = _thread()
+    worker.model = _FailsOn(13)
+    worker.result_tensor_queue.put(InlineTokens(["bad", "good"], [13, 2], "text"))
+    chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
+    assert chunks["good"].modality == "text" and chunks["good"].data == b"<2>"
+    assert chunks["bad"].modality == "error" and b"bad token" in chunks["bad"].data
+    assert chunks["bad"].metadata["status"] == 400
+
+
+def test_inline_logprobs_land_in_their_chunks_metadata():
+    worker, stop = _thread()
+    worker._draining_rids.add("gone")
+    worker.result_tensor_queue.put(InlineTokens(["gone", "req", "quiet"], [1, 11, 12], "text", [-0.1, -0.5, None]))
+    chunks = {c.request_id: c.metadata for c in _run_until(worker, stop, 2)}
+    assert chunks == {"req": {"logprobs": [-0.5]}, "quiet": {}}
+
+
+def test_a_request_that_asks_gets_each_text_chunks_token_ids():
+    worker, stop = _thread()
+    worker.request_model_kwargs = {"req": {"return_token_ids": True}}
+    worker.result_tensor_queue.put(InlineTokens(["req", "other"], [11, 12], "text", [-0.5, None]))
+    chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
+    assert chunks["req"].metadata == {"logprobs": [-0.5], "token_ids": [11]}
+    assert chunks["other"].metadata == {}
+    # a tensor chunk's ids too, and nothing on another modality or a float text tensor (Whisper's alignment)
+    ids = torch.tensor([[5, 151645]])
+    assert worker._with_token_ids("req", "text", ids, {}) == {"token_ids": [5, 151645]}
+    assert worker._with_token_ids("req", "audio", ids, {"sample_rate": 1}) == {"sample_rate": 1}
+    assert worker._with_token_ids("req", "text", torch.rand(2, 3), {}) == {}
 
 
 def test_the_facade_accounts_an_inline_token_like_a_tensor():
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.result_tensor_input_queue = queue.Queue()
-    facade.per_request_reading_tensors = {"r1": 0}
-    facade.received_chunk_counts = {"r1": {}}
-    facade.new_result_token("r1", 42, _loop(4), "text_inputs", "text")
-    facade.new_result_token("r1", 43, _loop(5), "text_inputs", "text")
-    facade.new_result_token("unknown", 1, _loop(0), "text_inputs", "text")  # dropped, no raise
-    assert facade.per_request_reading_tensors["r1"] == 2
-    assert facade.received_chunk_counts["r1"] == {"text_inputs": 2}
+    facade.per_request_reading_tensors = {"r1": 0, "r2": 0}
+    facade.received_chunk_counts = {"r1": {}, "r2": {}}
+    wakes = []
+    facade._signal = lambda: wakes.append(1)
+    facade.new_result_tokens(["r1", "r2"], [42, 52], "text_inputs", "text")
+    # a request already cleaned up is dropped from its frame, without raising
+    facade.new_result_tokens(["r1", "unknown"], [43, 1], "text_inputs", "text", [-0.5, -1.0])
+    # a frame with nothing known queues nothing and wakes no one
+    facade.new_result_tokens(["gone"], [7], "text_inputs", "text")
+    assert len(wakes) == 2, "one wake per frame that queued an item"
+    assert facade.per_request_reading_tensors == {"r1": 2, "r2": 1}
+    assert facade.received_chunk_counts == {"r1": {"text_inputs": 2}, "r2": {"text_inputs": 1}}
     items = [facade.result_tensor_input_queue.get_nowait() for _ in range(2)]
-    assert [i.value for i in items] == [42, 43]
+    assert [(i.request_ids, i.values) for i in items] == [(["r1", "r2"], [42, 52]), (["r1"], [43])]
+    assert [i.logprobs for i in items] == [None, [-0.5]]
     assert facade.result_tensor_input_queue.empty()
 
 
@@ -252,3 +307,26 @@ def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
     assert _worker()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
     ) == ("text_inputs", [70, 0])
+
+
+def test_row_logprobs_follow_the_batch_order():
+    nan = float("nan")
+    # a padded replay's rows: three real, one padding
+    rows = HostRows((7, 8, 9), {
+        "new_token": torch.tensor([70, 80, 90, 0]),
+        SAMPLED_LOGPROB: torch.tensor([-0.5, nan, -0.25, nan]),
+    })
+    assert Worker._row_logprobs(rows, [9, 7, 8]) == [-0.25, -0.5, None]
+    assert Worker._row_logprobs(rows, [7, 6]) == [-0.5, None], "a rid with no row has none"
+    # empty when no row has one
+    assert Worker._row_logprobs(None, [7]) == []
+    assert Worker._row_logprobs(HostRows((7,), {"new_token": torch.tensor([70])}), [7]) == []
+    assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
+
+
+def test_a_step_with_logprobs_skips_the_fused_route():
+    # the fused route builds no route input, which is where log-probs ride
+    worker = _worker(SimpleNamespace(supports_route_and_send_inline=True))
+    rows = HostRows((7,), {"new_token": torch.tensor([70]), SAMPLED_LOGPROB: torch.tensor([-0.5])})
+    batch_N = SimpleNamespace(batch=SimpleNamespace(output_signals=["text_inputs"]))
+    assert worker._route_and_send_fast(batch_N, rows, None, [7], set()) is False

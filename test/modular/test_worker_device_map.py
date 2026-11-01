@@ -1,6 +1,6 @@
 """Deployment ``rank_devices``: which device string each worker rank gets."""
 
-from mstar.conductor.conductor import worker_device
+from mstar.conductor.workers import worker_device
 
 
 def test_rank_is_the_device_by_default():

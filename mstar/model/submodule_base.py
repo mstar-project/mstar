@@ -84,6 +84,17 @@ if TYPE_CHECKING:
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
+class StepOrder(Enum):
+    """Who runs first when more rows of a node are ready than its step takes
+    (``NodeSubmodule.max_batch_size``)."""
+    # First come, first served to completion: the rows that ran the node's last
+    # step keep it, then the request that arrived first. The default.
+    ARRIVAL = "arrival"
+    # Longest-waiting first: a row that just ran gives way to one that waited.
+    # For a session whose stream has to keep moving while others run.
+    TURNS = "turns"
+
+
 class InputMetadata(NamedTuple):
     """What the worker knows about one request's inputs to this step.
 
@@ -916,16 +927,21 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return None
 
-    def get_autocast_dtype(self) -> torch.dtype | None:
-        """Per-submodule autocast dtype override for the engine's forward
-        wrap. The engine consults this on each ``execute_batch`` and uses
-        the returned dtype instead of its own when non-``None``.
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Which rows go first when more are ready than ``max_batch_size``
+        allows. Override it for a walk whose sessions have to keep moving
+        while others run."""
+        del graph_walk
+        return StepOrder.ARRIVAL
 
-        Default: ``None`` (inherit the engine's autocast dtype). To turn
-        autocast off for one specific submodule whose engine otherwise has
-        it enabled, wrap the submodule's forward with
-        ``torch.amp.autocast(enabled=False)`` — that path is engine-agnostic
-        and doesn't need this surface.
+    def get_autocast_dtype(self) -> torch.dtype | None:
+        """This node's dtype in place of the model's: the engine manager casts
+        the node's params to it, and every forward, warm-up and capture runs
+        under autocast in it. Read once at load (``resolve_node_dtype``).
+
+        Default: ``None`` (inherit the model's dtype). Ignored when
+        ``disable_autocast`` is set; to run a node without autocast, in the
+        dtype it was built in, set that instead.
         """
         return None
 
@@ -940,9 +956,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
-        ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
-        ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
-        the captured region runs under (avoids a copy-time upcast at replay).
+        ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
+        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
+        allocate the hidden-state buffer in the dtype the captured region runs
+        under (avoids a copy-time upcast at replay).
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

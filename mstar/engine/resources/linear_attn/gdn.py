@@ -202,7 +202,10 @@ class GDNManager(LinearAttnManager):
         else:
             key = CGSlotKey(lease.bucket, lease.slot, label)
             store = self._cg_wrappers
-            bs = max(self._cg_max_bs, lease.bucket.bs)
+            # A split's decode half runs on as many rows as it is sized for,
+            # so it takes the bucket's; the floor is for the other wrappers,
+            # whose kernels run on the step's rows whatever their buffers hold.
+            bs = lease.bucket.bs if split is not None else max(self._cg_max_bs, lease.bucket.bs)
             tok = lease.bucket.num_tokens
 
         if key not in store:

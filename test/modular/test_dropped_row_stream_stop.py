@@ -125,7 +125,6 @@ def _worker(eng, runtime, in_loop=True):
     w.enable_nvtx = False
     w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(
