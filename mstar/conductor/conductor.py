@@ -708,6 +708,11 @@ class Conductor:
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        # a model that builds its sampler config from its own keys would drop it unseen
+        if model_kwargs.get("return_logprobs") and not any(
+            getattr(cfg, "return_logprobs", False) for cfg in configs.values()
+        ):
+            raise ValueError("this model does not report logprobs; leave return_logprobs unset")
         for key, labels in self._kv_labels.items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
@@ -2279,15 +2284,9 @@ class Conductor:
                 self._sweep_expiry()
                 if self._status_interval_s is not None:
                     self._maybe_send_status()
-                # Wait for the next message rather than sleeping a fixed tick: a
-                # message that lands mid-sleep waited out the rest of it, on every
-                # hop of a request (walk transitions, completions), and a 1 ms
-                # sleep on a busy host often lasts several.
-                self.communicator.poll_for_messages(timeout_ms=1)
 
             except Exception:
                 logger.exception("Conductor error in main loop")
-                time.sleep(0.01)  # a failing pass skipped the wait above
             finally:
                 if self.enable_nvtx:
                     range_pop()
@@ -2295,3 +2294,4 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
+            time.sleep(0.001)

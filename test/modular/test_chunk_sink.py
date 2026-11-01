@@ -59,7 +59,7 @@ class _Comm:
     def register_event_for_poll(self, event):
         pass
 
-    def poll_for_messages(self, timeout_ms=1):
+    def poll_for_messages(self, timeout_ms=20):
         self.server.running = False
         return False
 

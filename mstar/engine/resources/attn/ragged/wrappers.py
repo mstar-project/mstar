@@ -54,6 +54,8 @@ class _RaggedPrefillBase(ABC):
             max_total_kv_tokens if max_total_kv_tokens is not None else max_total_tokens
         )
         self._num_segments = 0
+        # the host layout of the last plan; see `_plan`
+        self._planned_layout: tuple | None = None
 
         if accelerator_graph:
             assert max_num_segments is not None, "max_num_segments required for accelerator graph mode"
@@ -117,6 +119,17 @@ class _RaggedPrefillBase(ABC):
         return cu, total_tokens
 
     def _plan(self, cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> None:
+        # A wrapper keeps its last plan's schedule until it is planned again
+        # (``run`` only reads it), and a denoising request keeps its layout
+        # from step to step, so an unchanged layout is not replanned:
+        # FlashInfer's plan is a device kernel plus a stream sync. Compared
+        # only on host layouts, since reading a device one would sync.
+        layout = None
+        if cu_seqlens.device.type == "cpu" and kv_cu_seqlens.device.type == "cpu":
+            kv = None if kv_cu_seqlens is cu_seqlens else tuple(kv_cu_seqlens.tolist())
+            layout = (tuple(cu_seqlens.tolist()), kv, causal)
+            if layout == self._planned_layout:
+                return
         cu, total_tokens = self._prepare_cu_seqlens(cu_seqlens, self.max_total_tokens)
         if kv_cu_seqlens is cu_seqlens:
             kv_cu = cu
@@ -124,6 +137,7 @@ class _RaggedPrefillBase(ABC):
             kv_cu, _ = self._prepare_cu_seqlens(kv_cu_seqlens, self.max_total_kv_tokens, "key ")
         self._num_segments = int(cu_seqlens.numel()) - 1
         self._plan_kernel(cu, kv_cu, total_tokens, causal)
+        self._planned_layout = layout
 
     @abstractmethod
     def _plan_kernel(

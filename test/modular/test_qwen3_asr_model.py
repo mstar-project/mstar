@@ -19,10 +19,11 @@ sys.path.insert(0, ".")
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
-from mstar.model.components.aut_encoder_submodule import AUT_ATTN, AUT_ENCODE, AuTEncoderSubmodule  # noqa: E402
+from mstar.model.components.aut_submodule import AUT_ENCODE  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
+    AUT_ATTN,
     DECODE_WALK,
     ENCODER_NODE,
     KV_CACHE,
@@ -31,7 +32,9 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
     Qwen3ASRModelConfig,
 )
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
-from mstar.model.qwen3_asr.submodules import Qwen3ASRLLMSubmodule  # noqa: E402
+from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
+from mstar.model.qwen3_omni.config import AUDIO_ATTN  # noqa: E402
+from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
 from mstar.model.submodule_base import HostRows, ModelInputsFromEngine, NodeInputs, StopCheck  # noqa: E402
 
@@ -262,10 +265,7 @@ def _encoder_submodule(cfg):
     # attention unbound -> SDPA per window (the CPU path)
     for layer in encoder.layers:
         layer.self_attn.ragged = None
-    log_mel = LogMelSpectrogram(
-        num_mel_bins=cfg.num_mel_bins, sampling_rate=cfg.sampling_rate, n_fft=cfg.n_fft, hop_length=cfg.hop_length,
-    )
-    return AuTEncoderSubmodule(encoder, log_mel).eval()
+    return Qwen3ASREncoderSubmodule(encoder, cfg).eval()
 
 
 def test_encoder_submodule_declares_windows_and_packs_requests():
@@ -310,12 +310,12 @@ class _WindowedAttention:
 class _Replay:
     """The captured stack's answer: the layers over the windows the replay was handed."""
 
-    def __init__(self, sub: AuTEncoderSubmodule):
+    def __init__(self, sub):
         self.sub = sub
 
     def run(self, static_inputs, request_ids, seq_lens, real_bs):
         self.seq_lens = seq_lens
-        self.sub.bind_node_resources({AUT_ATTN: _WindowedAttention(seq_lens)})
+        self.sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(seq_lens)})
         return {"embeds": self.sub.encoder.encode(static_inputs["hidden"], None)}
 
 
@@ -333,16 +333,16 @@ def test_packed_clips_split_by_the_encoder_s_own_window(leased):
         downsample_hidden_size=8, n_window=52,
     )
     hf = hf_modeling.Qwen3OmniMoeAudioEncoder._from_config(config, attn_implementation="sdpa").eval()
-    encoder = AuTEncoder(AuTEncoderConfig.from_hf(config.to_dict()), attn_key=AUT_ATTN).eval()
+    encoder = AuTEncoder(AuTEncoderConfig.from_hf(config.to_dict()), attn_key=AUDIO_ATTN).eval()
     encoder.load_weights(list(hf.state_dict().items()))
-    sub = AuTEncoderSubmodule(encoder)  # fed log-mel features, as Qwen3-Omni's node is
+    sub = AudioEncoderSubmodule(encoder, config=None)  # Qwen3-Omni's node, fed log-mel features
 
     rids = ["a", "b", "c"]
     # one chunk; under one chunk; ten chunks over two attention windows
     clips = (torch.randn(128, 104), torch.randn(128, 60), torch.randn(128, 1000))
     rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio_features": [clip]}) for clip in clips]
     windows = [segment.span for segment in sub.declare_step(PREFILL_WALK, rids, rows).segments]
-    sub.bind_node_resources({AUT_ATTN: _WindowedAttention(windows)})
+    sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(windows)})
     runner = _Replay(sub)
     # the engine hands a forward the runner only on a step that leased it
     engine_inputs = _engine_inputs(rids)
@@ -518,7 +518,7 @@ def test_graph_resources_and_state_machine():
     cfg = model.config
     frames = cfg.max_audio_samples // cfg.hop_length
     expected = -(-frames // cfg.audio.n_window_infer)  # windows, rounded up
-    assert ragged.config.max_segments_per_request == expected
+    assert ragged.config.max_segments_per_request == model.max_windows_per_request == expected
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {LLM_NODE} and kv.config.num_kv_heads == 2 and kv.config.max_num_pages == model.KV_PAGES
     (attn,) = [s for s in specs if hasattr(getattr(s, "config", None), "decode_tensor_cores")]

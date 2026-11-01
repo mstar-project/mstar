@@ -924,7 +924,9 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
     w.wakeup_event = SimpleNamespace(register_future=stub)
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub)
+    w.scheduler = SimpleNamespace(
+        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
+    )
     for name in ("_verify_tp_async_sched_agrees", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
                  "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
