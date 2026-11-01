@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.graph.base import TensorPointerInfo
-from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 
 NameToTensorList = dict[str, list[torch.Tensor]]
 
@@ -546,23 +545,21 @@ class RustTensorBookkeeping(TensorBookkeeping):
 
 
 def _build_tensor_bookkeeping() -> TensorBookkeeping:
-    """Gated on ``MSTAR_RUST_GRAPH``, which is what actually needs it: the
-    Rust graph runtime holds a SHARE of this object, so the two have to be the
-    same implementation.
+    """The Rust bookkeeper wherever the extension imports: the graph runtime
+    holds a SHARE of this object, so the two have to be the same
+    implementation. The Python one is for the api server's data worker, which
+    may run without the extension.
 
-    Not worth taking on its own. A descriptor is copied into Rust on the way
-    in and rebuilt on the way out, which the Python runtime pays for and gets
-    nothing back -- the saving is in the crossings the Rust runtime avoids.
-
-    Deliberately NOT gated on being in a worker, so the api server's data
-    worker takes it too and pays that copy with no Rust runtime behind it.
-    Small next to its per-request work, and the api server is a candidate for
-    Rust itself; ``TensorStore(bookkeeping=...)`` is the override if that
-    stops being true.
+    Deliberately NOT gated on being in a worker, so the data worker takes the
+    Rust one too where it can, and pays the copy of each descriptor into Rust
+    with no graph runtime behind it. Small next to its per-request work, and
+    the api server is a candidate for Rust itself;
+    ``TensorStore(bookkeeping=...)`` is the override if that stops being true.
     """
-    if resolve_graph_runtime_type(log=False) == GraphRuntimeType.RUST:
+    try:
         return RustTensorBookkeeping()
-    return PythonTensorBookkeeping()
+    except ImportError:
+        return PythonTensorBookkeeping()
 
 
 class TensorStore:
