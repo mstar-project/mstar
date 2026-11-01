@@ -187,6 +187,29 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
+class ResultQueue(queue.Queue):
+    """The data worker's output chunks, for the API message thread.
+
+    A put doesn't wake that thread: ``flush`` signals ``wakeup`` once for
+    everything put since the last flush, and the data worker thread flushes
+    after each batch of outputs, so one step's chunks cost the message thread
+    one wake and one pass, however many rows the step had."""
+
+    def __init__(self, wakeup: EventWakeup):
+        super().__init__()
+        self.wakeup = wakeup
+        self._unsignaled = False
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self._unsignaled = True
+
+    def flush(self) -> None:
+        if self._unsignaled:
+            self._unsignaled = False
+            self.wakeup.signal()
+
+
 class PreprocessWorker:
     def __init__(
         self,
@@ -207,7 +230,9 @@ class PreprocessWorker:
         self.abort_request_queue = queue.Queue()
         self.reads_done_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
-        self.output_queue = queue.Queue()
+        # The API message thread polls this with its socket (``ResultQueue``).
+        self.results_wakeup = EventWakeup()
+        self.output_queue = ResultQueue(self.results_wakeup)
         self.profile_queue = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
@@ -686,6 +711,7 @@ class PreprocessWorkerThread:
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
     ):
+        profiler.hop_stamp(input.request_id, "dw.start")
         file_states: dict[str, list[tuple[int, int, int]]] = {}
         self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
@@ -722,6 +748,7 @@ class PreprocessWorkerThread:
                 prompt_parts=input.prompt_parts,
                 **model_kwargs,
             )
+            profiler.hop_stamp(input.request_id, "dw.prompt")
             if isinstance(prompt_tensors, ProcessPromptOutput):
                 model_kwargs.update(prompt_tensors.metadata)
                 prompt_tensors = prompt_tensors.new_input_tensors
@@ -747,6 +774,7 @@ class PreprocessWorkerThread:
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
 
+        profiler.hop_stamp(input.request_id, "dw.tokenized")
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
         # conductor, so a failure here still finds no remote reader.
@@ -777,6 +805,7 @@ class PreprocessWorkerThread:
             ),
         )
         self.communicator.send("conductor", msg)
+        profiler.hop_stamp(input.request_id, "dw.sent")
 
         # Record preprocess-side profiling: the moment the fully preprocessed
         # request was handed off to the conductor, plus the per-modality sizes of
@@ -1411,6 +1440,8 @@ class PreprocessWorkerThread:
                             request_id,
                             loop_indices,
                         )
+                        if sequence == 0:
+                            profiler.hop_stamp(request_id, "dw.read")
                         if self.enable_nvtx:
                             profiler.range_push(f"dataworker.get_tensor.{modality}")
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
@@ -1634,6 +1665,8 @@ class PreprocessWorkerThread:
         if not isinstance(self.communicator, OutboxCommunicator):
             self.communicator = OutboxCommunicator(self.communicator)
         idle_wait = self._idle_wait()
+        # a plain queue in tests that build the thread around their own
+        flush_results = getattr(self.out_queue, "flush", lambda: None)
         while not self.stop_event.is_set():
             did_work = False
             sends_pending = False
@@ -1646,7 +1679,14 @@ class PreprocessWorkerThread:
                 # queued read-starts / acks / cleanups must never wait behind a
                 # multi-second media preprocess. Drain them fully every pass
                 # before taking new input below.
+                batch = self.result_tensor_queue.qsize()
                 while not self.result_tensor_queue.empty():
+                    if batch == 0:
+                        # what came in meanwhile is the next batch: one wake
+                        # each, also when the queue refills faster than it drains
+                        flush_results()
+                        batch = self.result_tensor_queue.qsize()
+                    batch -= 1
                     did_work = True
                     result = self.result_tensor_queue.get()
                     if isinstance(result, InlineToken):
@@ -1671,6 +1711,7 @@ class PreprocessWorkerThread:
                             f"{result.modality} output transfer",
                             count=len(result.graph_edge.tensor_info),
                         )
+                flush_results()
                 did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
@@ -1681,6 +1722,7 @@ class PreprocessWorkerThread:
                     self._cleanup_request_state(req_id)
                 did_work = self._process_read_tensors() or did_work
                 did_work = self._release_encoded() or did_work
+                flush_results()
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
                     self._complete_drain_if_ready(rid)
@@ -1701,6 +1743,8 @@ class PreprocessWorkerThread:
                         logger.exception("Input for request %s failed", pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
+            # the error chunks of a failed input, and anything a raise skipped
+            flush_results()
 
             # getattr: tests drive this loop with stand-in tensor managers
             transfers = getattr(self.tensor_manager, "transfer_stats", None)

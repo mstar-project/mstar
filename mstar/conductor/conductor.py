@@ -66,7 +66,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
-from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.utils.profiler import hop_stamp, nvtx_enabled, range_pop, range_push
 from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
@@ -255,9 +255,11 @@ def _worker_process_target(
     tcp_transfer_device="",
     status_interval_s: float | None = None,
     env: dict[str, str] | None = None,
+    local_worker_devices: list[str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
-    picklability. ``status_interval_s`` turns on the worker's metrics."""
+    picklability. ``status_interval_s`` turns on the worker's metrics;
+    ``local_worker_devices`` is every worker's device, in ``worker_ids`` order."""
     # before anything in this process touches the device runtime; the MPS pipe
     # directory in ``env`` decides whether this process becomes an MPS client
     apply_process_env_defaults()
@@ -311,6 +313,7 @@ def _worker_process_target(
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             status_interval_s=status_interval_s,
+            local_worker_devices=local_worker_devices,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -803,6 +806,9 @@ class Conductor:
             # a host check, not a config one: shipped configs validate on any machine
             self._colocation = current_platform.colocated_workers()
             self._colocation.start()
+        # every worker runs on this host; each picks its step-thread CPU knowing
+        # the others' devices (see mstar.utils.step_threads)
+        devices = [worker_device(self.device_type, rank, self.rank_devices) for rank in self._sorted_ranks]
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
@@ -823,6 +829,7 @@ class Conductor:
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
                     "device": worker_device(self.device_type, rank, self.rank_devices),
+                    "local_worker_devices": devices,
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
@@ -1168,6 +1175,7 @@ class Conductor:
         When a new request comes in from the API server, assign workers,
         initialize partition states, and kick off all partitions.
         """
+        hop_stamp(body.request_id, "cond.arrival")
 
         if body.request_id in self._early_abort_requests:
             # The abort outran this NEW_REQUEST. The preprocess worker's input
@@ -1436,6 +1444,7 @@ class Conductor:
                         body=message,
                     ),
                 )
+                hop_stamp(body.request_id, "cond.dispatch")
 
         request_data.resource_configs = without_layouts(request_data.resource_configs)
 
@@ -2315,4 +2324,16 @@ class Conductor:
             # Outside the try above so DeadWorkerError leaves the loop instead of
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
-            time.sleep(0.001)
+            self._pass_wait()
+
+    def _pass_wait(self) -> bool:
+        """Wait between passes of the main loop. A message ends the wait, so a
+        new request or a finished pass is handled when it lands rather than on
+        the next tick of a 1 ms grid; 1 ms stays as the backstop for the timed
+        checks (expiry, status, worker liveness). True when a message is
+        waiting. getattr: tests drive the loop with stand-in communicators."""
+        poll = getattr(self.communicator, "poll_for_messages", None)
+        if callable(poll):
+            return poll(timeout_ms=1)
+        time.sleep(0.001)
+        return False

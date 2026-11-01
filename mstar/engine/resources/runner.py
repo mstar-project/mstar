@@ -509,6 +509,9 @@ class StepRunner:
         place plan in `step.ctx.plan_results` before next plan runs
         again could possibly move that into `plan` itself"""
         self._drop_stale_preplan(step)
+        # a step nothing was staged for plans from scratch (a prefill, say):
+        # timed apart from the promotions it would otherwise be averaged into
+        span = "res.plan." if step.ctx.is_preplan or self._staged is not None else "res.plan_fresh."
         if not step.ctx.is_preplan:
             # the resources promote their staged share below (or plan afresh
             # if nothing was staged): either way nothing stays staged
@@ -524,7 +527,7 @@ class StepRunner:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
                 if t0 is not None:
-                    phase_end(f"res.plan.{key}", t0)
+                    phase_end(span + key, t0)
                 if self._nvtx:
                     range_pop()
         return results

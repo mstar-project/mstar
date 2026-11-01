@@ -240,7 +240,9 @@ IN_GRAPH_KNOBS = ("ingraph_decode_rope", "sampler_ingraph_scatter")
 
 
 def test_only_rocm_builds_decode_rope_and_sampler_scatter_in_the_graph():
-    assert RocmPlatform().knob_defaults() == {knob: "1" for knob in IN_GRAPH_KNOBS}
+    assert RocmPlatform().knob_defaults() == {
+        **{knob: "1" for knob in IN_GRAPH_KNOBS}, "step_thread_core": "off",
+    }
     for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
         assert platform.knob_defaults() == {}
 

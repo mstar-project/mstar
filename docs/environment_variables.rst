@@ -478,7 +478,12 @@ Worker scheduling
        completes. Removes the per-step serial build/plan from the group's
        critical path. Voids (allocation failure, per-rid failure, a
        continuing request without loop-back output) are derived by each
-       rank from replicated state, never signalled. A comma-separated
+       rank, never signalled, from N's verdict as the ranks agree on it in
+       one host-side vote per step (``Worker._agree_on_step``): a request
+       that failed after the forward on one rank fails on every rank, and a
+       step that raised, was admitted, or ran different rows on some ranks
+       only stops every worker of the instance with the reason rather than
+       leave them waiting in a collective. A comma-separated
        list of node names (``thinker,talker``) enables it for those
        parallel nodes only. ``0`` (or ``false``): the serial path — leader schedules
        after N, followers rebuild after the broadcast. Set it identically
@@ -493,6 +498,31 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_STEP_THREAD_CORE``
+     - config's ``knobs: step_thread_core``, else ``auto`` (``off`` on AMD GPUs,
+       ``RocmPlatform.knob_defaults``)
+     - The CPU a worker's main, GPU and plan threads share. A step passes
+       between them several times, and a thread woken on another core waits
+       for it to leave a deep idle state; on one shared CPU it starts at once.
+       ``auto`` pins only when the process mask is narrower than the host,
+       i.e. the server runs under ``taskset`` or a cpuset (separate servers
+       on one bare host would otherwise all pick the same CPUs); it then
+       gives each worker of the deployment its own CPU: the first one local
+       to its GPU (sysfs ``local_cpulist``) that the process may run on and
+       no earlier worker took, else the first free CPU of the mask. When the
+       mask has fewer than one CPU per worker plus one, nothing is pinned.
+       ``off`` leaves the threads on the process mask; a number pins on any
+       mask: it is the first worker's CPU, and the next workers take the
+       allowed CPUs above it. The API
+       server's message thread and the Rust frontend's bridge, which every
+       step's tokens pass through next, share the last CPU of the mask, and
+       the workers leave that one out (unless ``off``, or the mask has fewer
+       than three CPUs). Everything else (intra-op pools, transport threads,
+       the API server's data worker) keeps the process mask, the pools a
+       pinned thread starts later included. Each worker and
+       the API server log their CPU and how it was chosen. Read by
+       ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
+       is missing (macOS, Windows).
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
