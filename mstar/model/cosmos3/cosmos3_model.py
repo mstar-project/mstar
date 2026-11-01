@@ -1603,23 +1603,21 @@ class Cosmos3Model(Model):
             prefill = self.PREFILL_COND_WALK
         else:
             prefill = self.PREFILL_WALK
-        return [WalkStep(prefill, step_metadata=params),
-                WalkStep(self._denoise_walk(params, output_modalities), step_metadata=params)]
-
-    def _denoise_walk(self, params: dict, output_modalities: list[str]) -> str:
-        """Forward-dynamics runs the joint denoise but decodes the predicted
-        video; inverse-dynamics / policy emit the action; image and video share
-        the loop but differ in what the VAE node emits."""
+        # The denoise walk: forward-dynamics runs the joint denoise but decodes
+        # the predicted video; inverse-dynamics / policy emit the action; image
+        # and video share the loop but differ in what the VAE node emits.
         is_video = "video" in output_modalities
         if params.get("action_mode") == "forward_dynamics":
-            return self.ACTION_VIDEO_GEN_WALK
-        if "action" in output_modalities:
-            return self.ACTION_GEN_WALK
-        if is_video and params.get("window_mode"):
-            return self.VIDEO_GEN_AR_WALK
-        if is_video and params.get("generate_sound"):
-            return self.VIDEO_SOUND_GEN_WALK
-        return self.VIDEO_GEN_WALK if is_video else self.IMAGE_GEN_WALK
+            denoise = self.ACTION_VIDEO_GEN_WALK
+        elif "action" in output_modalities:
+            denoise = self.ACTION_GEN_WALK
+        elif is_video and params.get("window_mode"):
+            denoise = self.VIDEO_GEN_AR_WALK
+        elif is_video and params.get("generate_sound"):
+            denoise = self.VIDEO_SOUND_GEN_WALK
+        else:
+            denoise = self.VIDEO_GEN_WALK if is_video else self.IMAGE_GEN_WALK
+        return [WalkStep(prefill, step_metadata=params), WalkStep(denoise, step_metadata=params)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

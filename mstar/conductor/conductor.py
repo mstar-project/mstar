@@ -1343,7 +1343,21 @@ class Conductor:
                 p.name, body.initial_input_modalities, body.initial_output_modalities,
                 body.initial_signals, model_kwargs,
             )
-            self._check_plan(p, pstate.plan)
+            # refuse a plan the conductor can't run: a step whose walk isn't one of the
+            # partition's (which startup checked are the model's), or a ``bind`` key
+            # that isn't an input of the step's walk
+            for step in pstate.plan:
+                if step.walk not in p.graph_walks:
+                    raise ValueError(
+                        f"{type(self.model).__name__}'s plan for partition {p.name!r} runs {step.walk!r}, "
+                        f"which is not one of its walks {sorted(p.graph_walks)}"
+                    )
+                inputs = {name for name, _ in self._walk_inputs[step.walk]}
+                if unknown := sorted(set(step.bind) - inputs):
+                    raise ValueError(
+                        f"{type(self.model).__name__}'s plan binds {unknown} on {step.walk!r}, which are not "
+                        f"inputs of that walk; its inputs are {sorted(inputs)}"
+                    )
             pstate.is_done = not pstate.plan
             first_steps[p.name] = self._plan_step(request_data, pstate, 0) if pstate.plan else ForwardPassArgs()
             self._set_partition_worker_graph_ids(body.request_id, p.name, pstate.graph_walk)
@@ -1935,25 +1949,6 @@ class Conductor:
 
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
-
-    def _check_plan(self, partition: PartitionDefinition, plan: list[WalkStep]) -> None:
-        """Refuse a plan the conductor can't run: a step whose walk isn't one
-        of the partition's (which startup checked are the model's), or a
-        ``bind`` key that isn't an input of the step's walk."""
-        model = type(self.model).__name__
-        for step in plan:
-            if step.walk not in partition.graph_walks:
-                raise ValueError(
-                    f"{model}'s plan for partition {partition.name!r} runs {step.walk!r}, which is not "
-                    f"one of its walks {sorted(partition.graph_walks)}"
-                )
-            if step.bind:
-                inputs = {name for name, _ in self._walk_inputs[step.walk]}
-                if unknown := sorted(set(step.bind) - inputs):
-                    raise ValueError(
-                        f"{model}'s plan binds {unknown} on {step.walk!r}, which are not inputs of that "
-                        f"walk; its inputs are {sorted(inputs)}"
-                    )
 
     def _plan_step(self, request_data: RequestData, pstate: PartitionState, k: int) -> ForwardPassArgs:
         """Enter step ``k`` of the partition's plan: each input of its walk gets
