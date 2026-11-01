@@ -564,6 +564,13 @@ Qwen3-TTS notes
   On its own it lowers first-audio latency at high concurrency; with
   ``mps: true`` in the YAML (see :doc:`serving`) the two workers' kernels also
   overlap, which raised c=32 throughput by about a fifth on an H100.
+- ``configs/qwen3tts_1p7b_split_bf16.yaml`` is the same split with the codec in
+  bf16, the recommended deployment on AMD GPUs (HIP runs the two workers'
+  kernels side by side without MPS). On an MI300X with the rest of the node idle, in
+  audio s/s with TTFA p50: 10.0 / 50.3 / 113.7 / 126.2 at c=1 / 8 / 32 / 64
+  (24 / 41 / 144 / 333 ms), against 9.0 / 39.6 / 74.6 / 75.8 (23 / 65 / 148 / 188 ms)
+  for ``configs/qwen3tts_1p7b.yaml``; Whisper WER 1.1-1.5% against the
+  reference's 0.9%.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a

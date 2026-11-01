@@ -9,10 +9,10 @@ from mstar.platforms import current_platform
 
 
 def with_inductor_overrides(
-    fn: Callable[..., Any], num_tokens: int | None = None,
+    fn: Callable[..., Any], num_tokens: int | None = None, rows: int | None = None,
 ) -> Callable[..., Any]:
     """Wrap ``fn``, a ``torch.compile``'d callable, so it runs under the
-    platform's ``inductor_overrides(num_tokens)``.
+    platform's ``inductor_overrides(num_tokens, rows)``.
 
     torch.compile compiles on call, not when wrapped, so the config is patched
     around every call. With no overrides ``fn`` is returned as is and costs
@@ -21,7 +21,7 @@ def with_inductor_overrides(
     This resolves ``current_platform``, so call it once the process has its
     device, not at import time.
     """
-    overrides = current_platform.inductor_overrides(num_tokens)
+    overrides = current_platform.inductor_overrides(num_tokens, rows)
     if not overrides:
         return fn
 

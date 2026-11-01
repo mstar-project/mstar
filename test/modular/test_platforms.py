@@ -236,6 +236,15 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
         assert solver not in platform.process_env_defaults()
 
 
+IN_GRAPH_KNOBS = ("ingraph_decode_rope", "sampler_ingraph_scatter")
+
+
+def test_only_rocm_builds_decode_rope_and_sampler_scatter_in_the_graph():
+    assert RocmPlatform().knob_defaults() == {knob: "1" for knob in IN_GRAPH_KNOBS}
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert platform.knob_defaults() == {}
+
+
 @pytest.mark.parametrize("solver", MIOPEN_SPLIT_K)
 @pytest.mark.parametrize(("exported", "expected"), [(None, "0"), ("1", "1")])
 def test_the_miopen_solver_default_keeps_an_exported_value(monkeypatch, solver, exported, expected):
