@@ -70,7 +70,9 @@ class ClientChunk(NamedTuple):
 
 
 class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write.
+    """One write to a KV stream. A layout lists them in the order the walks write,
+    and consecutive spans of one walk are one row of one step, as text around an
+    attachment is.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is

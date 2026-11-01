@@ -599,14 +599,15 @@ def test_qwen_schedule_walks_the_plan():
         "audio_seqlens": ["as0"],
     }
     schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, mods, signals)
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text", "prefill_audio", "prefill_text",
-    ]
+    assert [walk for walk, _ in schedule] == ["prefill_vision", "prefill_vision", "prefill_audio"]
     # Each vision walk carries its own image, in order.
     vision = [entry for walk, entry in schedule if walk == "prefill_vision"]
     assert [e["pixel_values"] for e in vision] == ["px0", "px1"]
     assert [e["image_grid_thw"] for e in vision] == ["g0", "g1"]
+    # Each attachment's walk takes the text before it, and the last one the text after it.
+    assert [(e["text_inputs"], e["text_before"]) for _, e in schedule] == [
+        (["t0"], 1), (["t1"], 1), (["t2", "t3"], 1),
+    ]
 
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():

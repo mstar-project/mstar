@@ -15,7 +15,7 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
 
@@ -63,7 +63,7 @@ def thinker():
 
 
 def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None, rid: str = RID):
-    info = SimpleNamespace(rid_handle=rid)
+    info = SimpleNamespace(rid_handle=rid, step_metadata={"text_before": 1})
     prepared = thinker.prepare_inputs(walk, info, inputs)
     if held is None:
         return prepared
@@ -106,6 +106,7 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
 
     cut = thinker.split_inputs("prefill_vision", SimpleNamespace(rid_handle=RID), whole, 3, whole.input_seq_len)
 
+    assert cut.tensor_inputs["mrope_pos_advance"] == whole.tensor_inputs["mrope_pos_advance"]
     assert torch.equal(cut.tensor_inputs["masks_for_talker"], whole.tensor_inputs["masks_for_talker"][:, 3:]) and all(
         torch.equal(layer, full[3:])
         for layer, full in zip(cut.tensor_inputs["deepstack"], whole.tensor_inputs["deepstack"], strict=True)
@@ -233,14 +234,29 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
     signals = {name: [object()] * len(value) for name, value in out.new_input_tensors.items()}
 
-    walks = [walk for walk, _ in model._build_thinker_prefill_schedule(modalities, signals)]
-    segments = iter(out.new_input_tensors["text_inputs"])
-    media = iter(items)
+    ((walk, entry),) = model._build_thinker_prefill_schedule(modalities, signals)
+    segments = out.new_input_tensors["text_inputs"]
+    assert len(entry["text_inputs"]) == len(segments)
+    media = next(iter(items))
+    # the text before the attachment, the attachment, the text after it, all in one walk
+    lead = entry["text_before"]
     expected = [
-        ("prefill_text", len(next(segments)), None) if walk == "prefill_text" else next(media) for walk in walks
+        *((walk, len(text), None) for text in segments[:lead]), media,
+        *((walk, len(text), None) for text in segments[lead:]),
     ]
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
+    )
+
+
+def test_a_step_writes_its_talker_rows_as_one_span(model):
+    tensors = {"audio_inputs": [torch.zeros(16000)]}
+    out = model.process_prompt(["Say it."], ["audio", "text"], ["audio"], tensors=tensors)
+    thinker = out.metadata["kv_layout"][THINKER_KV]["main"].spans
+    talker = out.metadata["kv_layout"][TALKER_KV]["main"].spans
+    assert {span.walk for span in thinker} == {"prefill_audio"}
+    assert [span.walk for span in talker] == ["talker_prefill", "talker_last_prefill"], (
+        "the Talker gets one item a Thinker step, so its layout has one span a step"
     )
 
 
@@ -251,7 +267,7 @@ def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
     )
     layout = out.metadata["kv_layout"][THINKER_KV]["main"]
 
-    assert [span.walk for span in layout.spans[:layout.keyed_count()]] == ["prefill_text"], (
+    assert [span.kind for span in layout.spans[:layout.keyed_count()]] == ["ids"], (
         "a prompt with a video keyed other than its leading text"
     )
 
