@@ -700,12 +700,12 @@ Qwen3-TTS notes
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
   It is the same component as Qwen3-Omni's code predictor
   (``ResidualCodePredictor`` in ``mstar.model.components.code_predictor_kernels``):
-  the depth sequence opens with the Talker hidden state and the group-0
-  embedding in one two-token pass, each layer's q/k norm, RoPE and KV write
+  the depth sequence opens with the Talker hidden state in a one-token pass
+  and takes one token per group after it, each layer's q/k norm, RoPE and KV write
   run in one launch and attention in ``cp_attention``, and the frame's 16 codec
-  embeddings are summed in fp32 and rounded once to the model dtype. Earlier
-  releases rounded the sum after every add, so greedy codes can differ at
-  near-ties.
+  embeddings are summed in one launch per group. Each Talker keeps its own
+  sum: Qwen3-TTS accumulates in the model dtype, rounding after every add, and
+  Qwen3-Omni in fp32, rounded once.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
@@ -806,12 +806,11 @@ Fish Audio S2-Pro notes
   it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
   4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
 - Each codec window carries the decoder's whole receptive field as context.
-  With ``model_kwargs: {codec_exact_fp32: true}`` the codec runs in fp32 with
-  TF32 off and the streamed audio matches the whole-utterance decode to within
-  one int16 step. The shipped ``configs/fish_s2_pro.yaml`` sets it to ``false``:
-  TF32 halves the codec's conv stack, most of the GPU time under concurrency
-  (c=32 throughput +35% on an H200), and the audio stays within ~60 dB SNR of
-  the exact decode.
+  The codec decodes with TF32 by default: TF32 halves its conv stack, most of
+  the GPU time under concurrency (c=32 throughput +35% on an H200), and the
+  audio stays within ~60 dB SNR of the exact decode. With
+  ``model_kwargs: {codec_exact_fp32: true}`` it runs in fp32 with TF32 off and
+  the streamed audio matches the whole-utterance decode to within one int16 step.
 
 VoxCPM2 notes
 -------------

@@ -430,30 +430,88 @@ def test_cudnn_benchmark_is_scoped(before, torch_flag) -> None:
     assert torch.backends.cudnn.benchmark is before
 
 
-def test_capture_cudnn_benchmark_covers_warmup_only(monkeypatch):
+def test_capture_cudnn_benchmark_covers_sizing_only(monkeypatch):
     """``capture_cudnn_benchmark`` turns cuDNN's algorithm search on around the
-    node's capture warm-up alone: another node's warm-up and every eager step
-    keep the process setting, so a new eager shape never searches."""
-    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    node's capture sizing, which runs its warm-up forwards (the capture after
+    it runs none): another node's sizing and every eager step keep the process
+    setting, so a new eager shape never searches."""
+    seen: list[tuple[str, bool]] = []
 
     class _Tuned(_Recorder):
         capture_cudnn_benchmark = True
 
         def forward(self, graph_walk, engine_inputs, x, **kwargs):
-            warmups.append(("forward", torch.backends.cudnn.benchmark))
+            seen.append(("forward", torch.backends.cudnn.benchmark))
             return super().forward(graph_walk, engine_inputs, x, **kwargs)
 
-    warmups: list[tuple[str, bool]] = []
-    monkeypatch.setattr(
-        AcceleratorGraphRunner, "warmup_and_capture",
-        lambda self, planned=None: warmups.append((self._submodule_name, torch.backends.cudnn.benchmark)),
-    )
+    class _Sizer:
+        def __init__(self, label):
+            self.label = label
+
+        def size_captures(self):
+            torch.nn.functional.conv1d(torch.ones(1, 1, 8), torch.ones(1, 1, 3))
+            seen.append((self.label, torch.backends.cudnn.benchmark))
+            return {}
+
+        def size_lent_captures(self, wanted):
+            return {}
+
     monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
     engine = _engine({"tuned": _Tuned(), "plain": _Recorder()})
-    engine.warmup()
-    _step(engine, "tuned")
-    assert warmups == [("tuned", True), ("plain", False), ("forward", False)]
+    monkeypatch.setattr(engine, "_device", torch.device("cuda"))
+    monkeypatch.setattr(engine, "_gpu_memory_fraction", None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 31))
+    engine._plan_captures(
+        {node: _Sizer(node) for node in ("tuned", "plain")},
+        {node: {"blocks": _Sizer(f"{node}/region")} for node in ("tuned", "plain")},
+    )
+    assert seen == [("tuned", True), ("tuned/region", True), ("plain", False), ("plain/region", False)]
     assert torch.backends.cudnn.benchmark is False
+    monkeypatch.setattr(engine, "_device", torch.device("cpu"))
+    _step(engine, "tuned")
+    assert seen[-1] == ("forward", False)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_a_capped_deployment_holds_the_cudnn_search_to_its_share(monkeypatch, fails):
+    """The search tries workspaces as large as the device has free: with
+    ``gpu_memory_fraction`` set, the allocator is held to it while a node that
+    searches is sized, and released afterwards, also when sizing raises.
+    Another node's sizing runs uncapped."""
+    class _Tuned(_Recorder):
+        capture_cudnn_benchmark = True
+
+    fraction = [0.9]   # a fraction the process already had is put back
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction",
+                        lambda value, device=None: fraction.__setitem__(0, value))
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda device=None: fraction[0])
+    sized: list[tuple[str, float]] = []
+
+    def sizer(name):
+        def size(*args):
+            sized.append((name, fraction[0]))
+            if fails and name == "tuned":
+                raise RuntimeError("sizing failed")
+            return {}
+        return size
+
+    engine = _engine({"tuned": _Tuned(), "plain": _Recorder()})
+    runners = {name: SimpleNamespace(size_captures=sizer(name), size_lent_captures=sizer(name))
+               for name in ("tuned", "plain")}
+    monkeypatch.setattr(engine, "_device", torch.device("cuda"))
+    monkeypatch.setattr(engine, "_gpu_memory_fraction", 0.55)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 30, 1 << 31))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 0)
+    if fails:
+        with pytest.raises(RuntimeError, match="sizing failed"):
+            engine._plan_captures(runners, {"tuned": {}, "plain": {}})
+        assert sized == [("tuned", 0.55)]
+    else:
+        engine._plan_captures(runners, {"tuned": {}, "plain": {}})
+        assert sized == [("tuned", 0.55), ("plain", 0.9)] * 2
+    assert fraction == [0.9]
 
 
 def test_compile_regions_are_compiled_and_warmed(monkeypatch):

@@ -662,9 +662,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     # Set True to let cuDNN time its conv algorithms in this node's capture
     # warm-up (once per captured shape, then cached) instead of taking its
-    # heuristic pick. The engine applies it around warm-up and capture; the
-    # capture itself turns it off (``accelerator_graph_runner``), and eager
-    # steps keep the process setting, so a new eager shape never searches.
+    # heuristic pick. The engine applies it around capture sizing, which runs
+    # the warm-up forwards; the capture itself turns it off
+    # (``accelerator_graph_runner``), and eager steps keep the process
+    # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
     def __init__(self):

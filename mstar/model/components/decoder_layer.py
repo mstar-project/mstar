@@ -88,9 +88,9 @@ def run_layers(
 ) -> torch.Tensor:
     """``layers`` then the final ``norm``, each residual add fused into the next
     norm (one add+norm kernel instead of two launches; under TP, with
-    ``comm_group``, all-reduce+add+norm). The stream starts at ``hidden_states``,
-    a full tensor, and later norms update it in place, so pass a tensor the
-    caller may overwrite.
+    ``comm_group``, all-reduce+add+norm). The stream starts from a copy of
+    ``hidden_states``, a full tensor, which later norms update in place, so
+    the caller's tensor is left as it was.
 
     Layer ``i`` moves its attention's cursor to ``i`` (``self_attn.attend``'s,
     or ``set_cursor(i, self_attn)`` in its place), then attends. The cursor
@@ -100,7 +100,7 @@ def run_layers(
     on every call, and the capture stance (``fail_on_recompile``) raises there.
     """
     first_norm = layers[0].input_layernorm if len(layers) else norm
-    h, residual = first_norm.forward_residual(hidden_states, None, comm_group)
+    h, residual = first_norm.forward_residual(hidden_states.clone(), None, comm_group)
     for i, layer in enumerate(layers):
         if set_cursor is None:
             layer.self_attn.attend.set_layer_idx(i)

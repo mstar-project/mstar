@@ -261,7 +261,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free.
+       whatever is free. A node that sets ``capture_cudnn_benchmark`` is held to the
+       share while its captures are sized, so its eager step must fit in it.
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
