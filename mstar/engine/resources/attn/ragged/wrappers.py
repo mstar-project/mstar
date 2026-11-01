@@ -127,7 +127,7 @@ class _RaggedPrefillBase(ABC):
         # own wrapper, so this compares against what this slot's schedule says,
         # never against what the previous step ran.
         layout = self._layout_key(cu_seqlens, kv_cu_seqlens, causal)
-        if layout is not None and layout == self._planned_layout:
+        if layout == self._planned_layout:
             return
         cu, total_tokens = self._prepare_cu_seqlens(cu_seqlens, self.max_total_tokens)
         if kv_cu_seqlens is cu_seqlens:
@@ -141,11 +141,7 @@ class _RaggedPrefillBase(ABC):
         self._planned_layout = layout
 
     @staticmethod
-    def _layout_key(cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> tuple | None:
-        """What identifies a planned layout, or None for one that can't be read
-        back without a device sync, which then simply always plans."""
-        if cu_seqlens.device.type != "cpu" or kv_cu_seqlens.device.type != "cpu":
-            return None
+    def _layout_key(cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> tuple:
         q = cu_seqlens.tolist()
         return q, q if kv_cu_seqlens is cu_seqlens else kv_cu_seqlens.tolist(), causal
 
@@ -198,9 +194,8 @@ class RaggedPrefillWrapper(_RaggedPrefillBase):
     def plan(self, cu_seqlens: torch.Tensor, causal: bool = False) -> None:
         """Plan one packed layout. ``cu_seqlens``: ``[num_segments + 1]``, [0] == 0.
 
-        CPU tensor preferred; a GPU one costs a sync and is never recognized as
-        the layout already planned. Safe to call before every replay — values
-        are copied through the static buffers, not rebound.
+        CPU tensor preferred; a GPU one costs a sync. Safe to call before every
+        replay — values are copied through the static buffers, not rebound.
         """
         self._plan(cu_seqlens, cu_seqlens, causal)
 

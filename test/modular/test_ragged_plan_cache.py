@@ -28,7 +28,6 @@ from mstar.engine.resources.attn.ragged.flashinfer import (
 )
 from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferPrefixedPrefillWrapper,
-    FlashInferRaggedPrefillWrapper,
     _RaggedPrefillBase,
 )
 from mstar.engine.resources.base import BucketKey
@@ -297,19 +296,3 @@ def test_a_plan_that_raises_leaves_nothing_to_reuse(plans):
     del wrapper._plan_kernel
     res.plan([8, 4])
     assert len(plans) == 2
-
-
-def test_a_device_layout_plans_without_being_read_back(monkeypatch):
-    """Comparing it would read it on the host: a stream sync per plan."""
-    kernel = []
-    monkeypatch.setattr(
-        FlashInferRaggedPrefillWrapper, "_plan_kernel",
-        lambda self, cu, kv_cu, total_tokens, causal: kernel.append(cu),
-    )
-    wrapper = FlashInferRaggedPrefillWrapper(
-        torch.empty(8, dtype=torch.uint8), HEADS, HEADS, HEAD_DIM, device=DEVICE,
-    )
-    layout = torch.tensor([0, 8], dtype=torch.int32, device="meta")  # .tolist() raises on meta
-    wrapper.plan(layout)
-    wrapper.plan(layout)
-    assert len(kernel) == 2
