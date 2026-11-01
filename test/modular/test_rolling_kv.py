@@ -11,10 +11,24 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec, RollingKVStep, RollingPosition
+from mstar.engine.resources.kv.rolling import (
+    RollingKVConfig,
+    RollingKVReqConfig,
+    RollingKVSpec,
+    RollingKVStep,
+    RollingPosition,
+)
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager, row_layout
-from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
+from mstar.engine.resources.step import (
+    ASKS,
+    FULL_ADMIT_QUEUED,
+    AdmitRuntimeError,
+    AllocationFailed,
+    Segment,
+    StepContext,
+)
 
 LAYERS, HEADS, DIM = 2, 1, 1
 
@@ -238,3 +252,113 @@ def test_yaml_overrides_size_the_pool_and_refuse_nonsense():
         spec.apply_yaml_overrides(pool_tokens=0)
     with pytest.raises(TypeError):
         spec.apply_yaml_overrides(max_slots=2)  # the store has no slots
+
+
+# Admission: a request that declares its tokens when it opens waits in the engine's queue
+
+
+def _declared(store: RollingKVManager, rid: int, tokens: int) -> None:
+    store.ingest_request(rid, RollingKVReqConfig(tokens=tokens))
+
+
+def test_ask_queues_only_a_declared_request_that_holds_nothing_yet():
+    store = _store(30)
+    assert store.ask(1, "dit", "rollout") is None  # declared nothing: placed at its first step
+    _declared(store, 2, 18)
+    assert store.ask(2, "dit", "rollout") is ASKS
+    assert store.reserve(2, "dit", "rollout", None) is None and store._kept == 18
+    assert store.ask(2, "dit", "rollout") is None  # reserved
+    list(_run(store, 2, [4], 6, 12))
+    assert store._kept == 0 and store.ask(2, "dit", "rollout") is None  # placed
+    _declared(store, 3, 31)
+    outcome = store.ask(3, "dit", "rollout")
+    assert not outcome.ok and outcome.reason.terminal and "pool_tokens" in outcome.reason.message
+
+
+def test_requests_wait_in_arrival_order_so_a_large_one_is_not_overtaken():
+    """A large request that doesn't fit holds back a later small one that would,
+    and both start once the pool frees, the large one first."""
+    store = _store(30)
+    admission = Admission({"kv": store}, ["kv"])
+    for rid, tokens in [(1, 18), (2, 18), (3, 6)]:
+        _declared(store, rid, tokens)
+    assert admission.admit(1, "dit", "rollout", None, ["kv"]) is None
+    list(_run(store, 1, [4], 6, 12))  # 12 of 30 free
+    assert admission.admit(2, "dit", "rollout", None, ["kv"]) is FULL_ADMIT_QUEUED  # 18 doesn't fit
+    assert admission.admit(3, "dit", "rollout", None, ["kv"]) is FULL_ADMIT_QUEUED  # 6 would, but 2 is first
+    assert admission.admit_waiting(lambda rid, node: None) == []
+    store.remove_request(1)
+    admission.remove_request(1)
+    assert admission.admit_waiting(lambda rid, node: None) == [("dit", 2), ("dit", 3)]
+    assert store._reserved == {2: 18, 3: 6} and store._kept == 24
+
+
+def test_room_set_aside_for_a_waiting_request_is_not_taken_by_another():
+    store = _store(30)
+    _declared(store, 1, 18)
+    assert store.reserve(1, "dit", "rollout", None) is None
+    step, ctx = _step(2, 0, 4, 6, 12)  # declared nothing, needs 18 of the 12 not set aside
+    outcome = store.admit(step, ctx)
+    assert not outcome.ok and isinstance(outcome.reason, AllocationFailed) and not outcome.reason.terminal
+    assert store.reserve(3, "dit", "rollout", None) is None  # declared nothing either: takes nothing
+    _declared(store, 4, 13)
+    assert store.reserve(4, "dit", "rollout", None) == 12  # the room it didn't fit against
+    assert not store.grew_since(12)
+    first, ctx1 = _step(1, 0, 4, 6, 12)
+    assert store.admit(first, ctx1).ok and store._kept == 0 and store.num_free_tokens() == 12
+
+
+def test_a_reserved_request_is_placed_even_when_the_free_room_is_split():
+    store = _store(30)
+    streams = {rid: _run(store, rid, [4] * 3, 2, 8, base=1000 * rid) for rid in (1, 2, 3)}
+    for stream in streams.values():
+        next(stream)
+    store.remove_request(1)
+    store.remove_request(3)
+    assert store._free == [(0, 10), (20, 10)]
+    _declared(store, 4, 20)
+    assert store.reserve(4, "dit", "rollout", None) is None
+    total, keys, _ = next(_run(store, 4, [4], 2, 18, base=4000))
+    assert keys == _expected(total, 2, 18, base=4000) and store._free == []
+    total, keys, _ = next(streams[2])
+    assert keys == _expected(total, 2, 8, base=2000)
+
+
+def test_a_refused_step_gives_back_its_region_and_keeps_its_reservation():
+    store = _store(30)
+    _declared(store, 1, 18)
+    assert store.reserve(1, "dit", "rollout", None) is None
+    step, ctx = _step(1, 0, 4, 6, 12)
+    assert store.admit(step, ctx).ok and store._kept == 0
+    store.rollback_admit(step, ctx)
+    assert store._reserved == {1: 18} and store._kept == 18 and store.num_free_tokens() == 30
+    assert store.admit(step, ctx).ok and store._kept == 0
+
+
+def test_removing_a_request_drops_what_it_declared_and_reserved():
+    store = _store(30)
+    _declared(store, 1, 18)
+    assert store.reserve(1, "dit", "rollout", None) is None
+    assert not store.grew_since(12)
+    store.remove_request(1)
+    assert store._wants == {} and store._reserved == {} and store._kept == 0
+    assert store.grew_since(12)
+
+
+def test_a_first_step_that_keeps_other_than_it_declared_fails_the_request():
+    store = _store(30)
+    _declared(store, 1, 18)
+    assert store.reserve(1, "dit", "rollout", None) is None
+    step, ctx = _step(1, 0, 4, 6, 14)
+    outcome = store.admit(step, ctx)
+    assert not outcome.ok and isinstance(outcome.reason, AdmitRuntimeError) and "declared" in outcome.reason.message
+
+
+def test_a_request_larger_than_the_pool_is_refused_before_it_reaches_a_worker():
+    spec = RollingKVSpec(resource_key="kv", nodes={"dit"},
+                         config=RollingKVConfig(num_layers=1, num_heads=1, head_dim=1, pool_tokens=30))
+    RollingKVReqConfig(tokens=30).validate(spec)
+    with pytest.raises(ValueError, match="resources: kv: pool_tokens"):
+        RollingKVReqConfig(tokens=31).validate(spec)
+    with pytest.raises(ValueError, match="at least one"):
+        RollingKVReqConfig(tokens=0).validate(spec)

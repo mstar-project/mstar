@@ -16,10 +16,15 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
-from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec, RollingKVStep  # noqa: E402
+from mstar.engine.resources.kv.rolling import (  # noqa: E402
+    RollingKVConfig,
+    RollingKVReqConfig,
+    RollingKVSpec,
+    RollingKVStep,
+)
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.graph.base import GraphNode, Loop  # noqa: E402
+from mstar.graph.base import GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     REFERENCE_ATTENTION,
@@ -528,6 +533,29 @@ def test_the_default_pool_holds_the_window_of_the_largest_area_at_any_aspect(mod
         lat = model.geometry(image_hw, 720, 1280)
         last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
         assert last.sink + last.window <= model.max_window_tokens(), image_hw
+
+
+def _signal(*dims: int) -> list[TensorPointerInfo]:
+    return [TensorPointerInfo(dims=list(dims), dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
+                              source_session_id="", source_entity="")]
+
+
+@pytest.mark.parametrize("image_hw", [(464, 832), (720, 1280)])
+def test_a_rollout_declares_its_rolling_kv_so_it_waits_in_line_for_the_pool(model, image_hw):
+    """The sink and window its steps will keep, at the output size: the engine
+    queues the request until the pool has that room, and refuses one that can
+    never fit before it reaches a worker."""
+    signals = {"text_inputs": _signal(512), "image_inputs": _signal(3, *image_hw),
+               "camera_poses": _signal(64, 4, 4), "intrinsics": _signal(64, 4)}
+    fwd = model.get_initial_forward_pass_args("main", ["image"], ["video_frame"], signals)
+    configs = model.get_request_resource_configs({"main": fwd})
+    first = _bare_dit_submodule(model, {}).chunk_spans(0, image_hw).position
+    assert configs == {DIT_KV: RollingKVReqConfig(tokens=first.sink + first.window)}
+    (kv, _) = model.get_node_resources()
+    configs[DIT_KV].validate(kv)
+    kv.apply_yaml_overrides(pool_tokens=first.sink + first.window - 1)
+    with pytest.raises(ValueError, match="pool_tokens"):
+        configs[DIT_KV].validate(kv)
 
 
 SWITCHES = ("reference_numerics", "dit_compile_autotune")

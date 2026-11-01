@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -56,6 +56,25 @@ class RollingPosition(NamedTuple):
     sink: int
     # trailing tokens kept, this step's own included
     window: int
+
+
+@dataclass
+class RollingKVReqConfig(ResourceReqConfig):
+    """The tokens a request keeps a layer, its sink plus window, declared when it
+    opens: it waits in line for that much of the pool before its first step,
+    instead of having that step refused until room frees up."""
+
+    tokens: int
+
+    def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
+        if self.tokens < 1:
+            raise ValueError(f"rolling KV request keeps {self.tokens} tokens; it must keep at least one")
+        config = getattr(spec, "config", None)
+        if isinstance(config, RollingKVConfig) and self.tokens > config.pool_tokens:
+            raise ValueError(
+                f"the request keeps {self.tokens} tokens of rolling K/V a layer; the pool holds "
+                f"{config.pool_tokens} (resources: {spec.resource_key}: pool_tokens)"
+            )
 
 
 @dataclass(frozen=True)

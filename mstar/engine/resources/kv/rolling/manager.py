@@ -1,12 +1,15 @@
 """A pool of rolling sink + window K/V, one contiguous region per request.
 
 The pool (``pool_tokens`` a layer, keys and values) is reserved at startup. A
-request takes a region of exactly its declared sink plus window at its first
-step, first fit, and gives it back when it is removed. When no free gap is
-large enough but the free tokens are, the resident regions slide left to join
-the gaps. A request that doesn't fit is refused with ``AllocationFailed``, which
-the worker answers by holding it until a region frees; one larger than the
-whole pool fails.
+request takes a region of exactly its sink plus window at its first step, first
+fit, and gives it back when it is removed. When no free gap is large enough but
+the free tokens are, the resident regions slide left to join the gaps.
+
+A request that declares its size when it opens (``RollingKVReqConfig``) waits in
+the engine's admission queue, in arrival order, until the pool has room for it
+(see ``Resource.ask``); the room is set aside then and the region placed at its
+first step. One that declares nothing is refused with ``AllocationFailed`` while
+it doesn't fit, which the worker answers by retrying it later.
 """
 
 from __future__ import annotations
@@ -17,9 +20,22 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.kv.rolling.config import RollingKVConfig, RollingKVSpec, RollingKVStep, RollingPosition
+from mstar.engine.resources.kv.rolling.config import (
+    RollingKVConfig,
+    RollingKVReqConfig,
+    RollingKVSpec,
+    RollingKVStep,
+    RollingPosition,
+)
 from mstar.engine.resources.spec import ResourceReqConfig
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, AdmitRuntimeError, AllocationFailed, StepContext
+from mstar.engine.resources.step import (
+    ADMIT_OK,
+    ASKS,
+    AdmitOutcome,
+    AdmitRuntimeError,
+    AllocationFailed,
+    StepContext,
+)
 
 
 class RollingRow(NamedTuple):
@@ -95,12 +111,24 @@ class RollingKVManager(Resource):
         # Empty: a region is only read up to what its request wrote.
         self._pool = torch.empty((c.num_layers, 2, c.pool_tokens, c.num_heads, c.head_dim), dtype=dtype,
                                  device=self._device)
+        # The pool as the widest words a row divides into, for moving regions: a strided
+        # copy of 2-byte elements runs at well below the bandwidth of 8-byte ones.
+        row_bytes = c.head_dim * self._pool.element_size()
+        word = next(t for t in (torch.int64, torch.int32, torch.int16, torch.uint8) if row_bytes % t.itemsize == 0)
+        self._words = self._pool.view(word)
         # free gaps ``(start, length)``, by start, adjacent ones merged
         self._free: list[tuple[int, int]] = [(0, c.pool_tokens)]
         self._requests: dict[int, _Request] = {}
         self._lock = threading.RLock()
-        # rids the live admit allocated for, for ``rollback_admit``
-        self._admit_taken: set[int] = set()
+        # Admission. `_wants` holds the tokens each request declared when it opened,
+        # `_reserved` the tokens set aside for an admitted request whose region isn't
+        # placed yet, and `_kept` their sum, which no other request may take.
+        self._wants: dict[int, int] = {}
+        self._reserved: dict[int, int] = {}
+        self._kept = 0
+        # rid -> the reservation its region took (0 for none), for regions the
+        # live admit placed, so ``rollback_admit`` can undo them
+        self._admit_taken: dict[int, int] = {}
         self._current: RollingPlan | None = None
 
     def can_capture(self) -> bool:
@@ -141,10 +169,15 @@ class RollingKVManager(Resource):
     # Request lifecycle
 
     def ingest_request(self, rid, overrides: ResourceReqConfig | None = None):
-        del overrides
+        if isinstance(overrides, RollingKVReqConfig):
+            with self._lock:
+                self._wants[rid] = overrides.tokens
 
     def remove_request(self, rid):
-        self.reset_request(rid, free=True)
+        with self._lock:
+            self.reset_request(rid, free=True)
+            self._wants.pop(rid, None)
+            self._kept -= self._reserved.pop(rid, 0)
 
     def reset_request(self, rid, free: bool = False):
         """Nothing to zero: K/V are only read up to what their request wrote."""
@@ -161,6 +194,42 @@ class RollingKVManager(Resource):
         with self._lock:
             return sum(n for _, n in self._free)
 
+    def _room(self) -> int:
+        """Free tokens not set aside for an admitted request."""
+        return self.num_free_tokens() - self._kept
+
+    # Admission: room for a request's declared tokens, before its first step
+
+    def ask(self, rid, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        with self._lock:
+            tokens = self._wants.get(rid)
+            if tokens is None or rid in self._requests or rid in self._reserved:
+                return None
+        if tokens > self.config.pool_tokens:
+            return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                f"the request keeps {tokens} tokens of rolling K/V a layer; the pool holds "
+                f"{self.config.pool_tokens} (resources: {self.name}: pool_tokens)", request_ids=frozenset({rid})))
+        return ASKS
+
+    def reserve(self, rid, node_name: str, graph_walk: str, published: None) -> int | None:
+        with self._lock:
+            need, room = self._wants.get(rid, 0), self._room()
+            if need > room:
+                return room
+            if not need:
+                return None
+            self._reserved[rid] = need
+            self._kept += need
+            return None
+
+    def unreserve(self, rid) -> None:
+        with self._lock:
+            self._kept -= self._reserved.pop(rid, 0)
+
+    def grew_since(self, mark: int) -> bool:
+        with self._lock:
+            return self._room() > mark
+
     # Pool regions
 
     def _take(self, capacity: int) -> int | None:
@@ -176,7 +245,7 @@ class RollingKVManager(Resource):
 
     def _release(self, rid) -> None:
         req = self._requests.pop(rid, None)
-        self._admit_taken.discard(rid)
+        self._admit_taken.pop(rid, None)
         if req is None:
             return
         gaps = sorted([*self._free, (req.offset, req.capacity)])
@@ -210,7 +279,8 @@ class RollingKVManager(Resource):
             return ADMIT_OK
         with self._lock:
             taken = self._admit_taken
-            taken -= {r for r in taken if ctx.is_real_row(r)}
+            for r in [r for r in taken if ctx.is_real_row(r)]:
+                del taken[r]
             for seg in step.segments or ():
                 rid = seg.request_id
                 if ctx.is_padding_row(rid):
@@ -228,17 +298,27 @@ class RollingKVManager(Resource):
                         request_ids=frozenset({rid})))
                 req = self._requests.get(rid)
                 if req is None:
+                    # `_kept` already counts this request's own reservation
+                    reserved = self._reserved.get(rid, 0)
+                    if reserved and reserved != capacity:
+                        return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                            f"the request declared {reserved} tokens of rolling K/V when it opened; its "
+                            f"first step keeps {capacity}", request_ids=frozenset({rid})))
+                    room = self._room() + reserved
+                    if capacity > room:
+                        return AdmitOutcome(ok=False, reason=AllocationFailed(
+                            message=f"rolling KV pool is full: {capacity} tokens wanted, {room} of "
+                                    f"{self.config.pool_tokens} free and not set aside",
+                            pages_short=capacity - room, label=seg.label, request_id=rid))
                     start = self._take(capacity)
-                    if start is None and self.num_free_tokens() >= capacity:
+                    if start is None:
                         self._rearrange()
                         start = self._take(capacity)
-                    if start is None:
-                        return AdmitOutcome(ok=False, reason=AllocationFailed(
-                            message=f"rolling KV pool is full: {capacity} tokens wanted, "
-                                    f"{self.num_free_tokens()} of {self.config.pool_tokens} free",
-                            pages_short=capacity - self.num_free_tokens(), label=seg.label, request_id=rid))
                     req = self._requests[rid] = _Request(start, capacity)
-                    taken.add(rid)
+                    if reserved:
+                        del self._reserved[rid]
+                        self._kept -= reserved
+                    taken[rid] = reserved
                 elif capacity != req.capacity:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"the request declares a {capacity}-token sink and window; its first step "
@@ -250,14 +330,18 @@ class RollingKVManager(Resource):
         return ADMIT_OK
 
     def rollback_admit(self, step: RollingKVStep, ctx: StepContext) -> None:
-        """Free the regions this step's admit took; a region a request already held
-        stays with it."""
+        """Free the regions this step's admit took, giving back the reservation each
+        took; a region a request already held stays with it."""
         del step
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
             for rid in [r for r in self._admit_taken if ctx.is_real_row(r)]:
+                reserved = self._admit_taken.pop(rid)
                 self._release(rid)
+                if reserved:
+                    self._reserved[rid] = reserved
+                    self._kept += reserved
 
     def plan(self, step: RollingKVStep, ctx: StepContext) -> RollingPlan:
         """Each row's write range, and the shift that makes room for it.
@@ -284,15 +368,15 @@ class RollingKVManager(Resource):
         """Move pool tokens ``[src, src + length)`` to ``dst < src`` in every layer.
         The ranges may overlap: copied left to right in blocks no longer than the
         distance moved, no block reads what an earlier one wrote, so no temporary
-        is needed (half the traffic of a clone)."""
+        is needed (half the traffic of a clone). Each block is one strided copy
+        across all layers, keys and values."""
         gap = src - dst
         if length <= 0 or gap <= 0:
             return
-        blocks = [(i, min(gap, length - i)) for i in range(0, length, gap)]
-        for layer in self._pool:
-            for cache in layer:
-                for i, n in blocks:
-                    cache[dst + i:dst + i + n] = cache[src + i:src + i + n]
+        pool = self._words
+        for i in range(0, length, gap):
+            n = min(gap, length - i)
+            pool[:, :, dst + i:dst + i + n] = pool[:, :, src + i:src + i + n]
 
     def commit(self, step: RollingKVStep, ctx: StepContext) -> None:
         if ctx.capture:
@@ -306,8 +390,9 @@ class RollingKVManager(Resource):
                     req.written = pos.written + seg.span
 
     def post_warmup_validate(self):
-        if self._requests:
-            raise RuntimeError(f"rolling KV still held for {len(self._requests)} requests after warmup")
+        held = len(self._requests) + len(self._wants) + len(self._reserved)
+        if held or self._kept:
+            raise RuntimeError(f"rolling KV still holds state for {held} requests after warmup")
 
     def cleanup(self):
         self._current = None
