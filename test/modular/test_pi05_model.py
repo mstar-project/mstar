@@ -15,9 +15,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.graph.base import GraphNode, Loop, Sequential
+from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
     discretize_state,
@@ -190,60 +189,21 @@ def test_pi05_worker_graphs_from_yaml():
 # ----------------------------------------------------------------------
 
 
-def test_pi05_initial_forward_pass_args_starts_in_prefill():
+def _pointer() -> TensorPointerInfo:
+    return TensorPointerInfo(dims=[1], dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
+                             source_session_id="", source_entity="")
+
+
+def test_pi05_plan_is_prefill_then_action_gen():
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        input_signals={
-            "image_inputs": [],
-            "text_inputs": [],
-        },
-    )
-    assert args.full_metadata.graph_walk == Pi05Model.PREFILL_WALK
-    assert args.full_metadata.is_prefill is True
-    edge_targets = {(e.next_node, e.name) for e in args.inputs}
-    assert ("vit_encoder", "image_inputs") in edge_targets
-    assert ("LLM", "text_inputs") in edge_targets
-    # Pi0.5 has no separate state_inputs edge — state is part of text_inputs.
-    assert not any(e.name == "state_inputs" for e in args.inputs)
-
-
-def test_pi05_prefill_transitions_to_action_gen():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        graph_walk=Pi05Model.PREFILL_WALK,
-        is_prefill=True,
-    )
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-    assert result.full_metadata.graph_walk == Pi05Model.ACTION_GEN_WALK
-    assert result.full_metadata.is_prefill is False
-    assert result.request_done is False
-    edge_names = {e.name for e in result.inputs}
-    assert edge_names == {"noisy_actions", "timestep_index"}
-
-
-def test_pi05_action_gen_marks_request_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        graph_walk=Pi05Model.ACTION_GEN_WALK,
-        is_prefill=False,
-    )
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-    assert result.request_done is True
+    signals = {"image_inputs": [_pointer()], "text_inputs": [_pointer()]}
+    plan = model.walk_plan("default", ["image", "text"], ["action"], signals, {})
+    assert [(step.walk, dict(step.bind), dict(step.step_metadata)) for step in plan] == [
+        (Pi05Model.PREFILL_WALK, {}, {}), (Pi05Model.ACTION_GEN_WALK, {}, {}),
+    ]
+    # without the images the prefill could never run
+    with pytest.raises(ValueError, match="image_inputs"):
+        model.walk_plan("default", ["text"], ["action"], {"text_inputs": [_pointer()]}, {})
 
 
 # ----------------------------------------------------------------------
