@@ -12,9 +12,7 @@ import yaml
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     DEFAULT_PARTITION,
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
-    StreamingConnectionState,
     WalkStep,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
@@ -512,24 +510,6 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
     }
 
 
-@dataclass
-class ForwardPassArgs:
-    # full_metadata is at the conductor level
-    full_metadata: CurrentForwardConductorMetadata
-    inputs: list[GraphEdge]
-
-    # de_persist_tensors are tensors that will be used for the final time and
-    # not go into future graph nodes
-    unpersist_tensors: list[TensorPointerInfo]
-
-    # e.g., saw EOS or max tokens. Is used to end the request
-    request_done: bool = False
-
-    # step_metadata is at the engine / worker level; and
-    # is passed into the fwd pass
-    step_metadata: dict = field(default_factory=dict)
-
-
 class Model(ABC):
     def __init_subclass__(cls, **kwargs):
         # A chunkable node runs inside its chunk Loop wherever the walk graphs
@@ -841,6 +821,7 @@ class Model(ABC):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
 
+    @abstractmethod
     def walk_plan(
         self,
         partition_name: str,
@@ -858,21 +839,9 @@ class Model(ABC):
         label, and ends the partition after the last step reports. A step whose
         walk a stream feeds, and that is a bare node (or its chunk loop), runs
         once per chunk until the worker reports the stream's final chunk. A
-        ``ValueError`` refuses the request with a 400.
+        ``ValueError`` refuses the request with a 400, and so does a plan of
+        ``[]`` for every partition.
         """
-        raise NotImplementedError(f"{type(self).__name__} declares no walk_plan")
-
-    # Until every model declares `walk_plan`, the conductor drives a model that
-    # doesn't through these two hooks instead.
-    def get_initial_forward_pass_args(
-        self,
-        partition_name: str,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        raise NotImplementedError(f"{type(self).__name__} declares no walk_plan")
 
     @abstractmethod
     def process_prompt(
@@ -1184,22 +1153,3 @@ class Model(ABC):
                 producer_partitions=[],
             )
         ]
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> "ForwardPassArgs":
-        """Return the next forward pass arguments for a specific partition.
-
-        Called by the conductor after each completed forward pass to determine
-        the next graph walk, inputs, and whether the request is done.
-
-        ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions, one per stream from another
-        partition; a client stream has no entry. For single-partition models,
-        this will be ``None`` or an empty list.
-        """
-        raise NotImplementedError(f"{type(self).__name__} declares no walk_plan")

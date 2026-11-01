@@ -168,12 +168,9 @@ You must implement these abstract methods:
    A step whose walk a stream feeds and that is a bare node runs once per chunk until the
    worker reports the stream's final chunk; any other step advances when its walk
    reports, and the partition is done after its last step. A ``ValueError`` here refuses
-   the request with a 400. Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus
-   and Chatterbox are references.
-
-   Models not yet moved to ``walk_plan`` still implement the two hooks it replaces,
-   ``get_initial_forward_pass_args`` and ``get_partition_forward_pass_args``, which
-   return a ``ForwardPassArgs`` per walk; write ``walk_plan`` for a new model.
+   the request with a 400, and so does a plan of ``[]`` for every partition (nothing would
+   ever run). Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus and
+   Chatterbox are references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
@@ -230,15 +227,6 @@ You must implement these abstract methods:
    leads the first window as context and is never output. Leave the key out when
    ``n`` is 0. The data worker drops a client's value, and the consumer partition's
    workers prime the stream with it (Qwen3-TTS, VoxCPM2).
-
-.. note::
-
-   For a model still on the transition hooks, the conductor merges each walk's
-   ``ForwardPassArgs.step_metadata`` into the request's ``metadata.kwargs``, so a
-   request fact stored under a key that a
-   later walk's step metadata also uses is overwritten by that walk's value. Keep
-   such facts under their own key: LTX-2.5 nests the request's geometry under
-   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
 
 The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
@@ -2728,7 +2716,8 @@ producer ``CLIENT``:
 ``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
 ``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
 chunk policy, exactly as it would a stream from another partition. Its partition
-self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+self-triggers from the stream, and the conductor sends its walk none of the streamed
+input. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
 that the model implements ``process_stream_chunk``. A partition may take several client
 streams (audio and video, say): each has its own buffer and its own end.

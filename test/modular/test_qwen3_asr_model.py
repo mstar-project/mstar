@@ -16,6 +16,7 @@ import yaml
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.request_info import FINAL_PREFILL  # noqa: E402
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
 from mstar.model.base import WalkStep  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
@@ -372,9 +373,11 @@ def test_llm_check_stop():
         ignore_eos = False
 
     def info(walk, decoded, max_tokens=4096):
+        # the conductor marks the prefill, the step before decode, FINAL_PREFILL
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": _Cfg()},
-                              "dynamic_loop_iter_counts": {"decode_loop": decoded}, "step_metadata": {}})()
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded},
+                              "step_metadata": {FINAL_PREFILL: walk == PREFILL_WALK}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
     # a stop token first ends the request: there is no decode loop yet
@@ -395,7 +398,8 @@ def test_llm_check_stop_batched_agrees_with_per_request():
     def info(walk, decoded, max_tokens=4096, ignore_eos=False):
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": type("C", (), {"ignore_eos": ignore_eos})()},
-                              "dynamic_loop_iter_counts": {"decode_loop": decoded}, "step_metadata": {}})()
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded},
+                              "step_metadata": {FINAL_PREFILL: walk == PREFILL_WALK}})()
 
     # rows in forward order, plus a padding row a replay leaves at the end
     tokens = torch.tensor([IM_END, 1234, EOT, IM_END, IM_END, 0])

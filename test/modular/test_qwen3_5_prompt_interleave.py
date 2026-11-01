@@ -145,7 +145,7 @@ def test_a_spelled_out_pad_is_a_bad_request(model):
 def test_empty_prompt_fails_legibly(model):
     """Nothing to prefill is a bad request, not an IndexError off schedule[0]."""
     with pytest.raises(ValueError, match="nothing to prefill"):
-        model.get_initial_forward_pass_args("LLM", ["text"], ["text"], {})
+        model.walk_plan("LLM", ["text"], ["text"], {}, {})
 
 
 def test_image_only_message_renders_an_empty_text_span(model):

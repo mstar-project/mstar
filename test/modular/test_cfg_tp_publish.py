@@ -10,7 +10,6 @@ sys.path.insert(0, ".")
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
     PartitionState,
     merge_publish_info,
 )
@@ -41,12 +40,7 @@ def _rank_publish(rank: int) -> PublishedKVInfo:
 
 def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     partition = PartitionState(
-        partition_name="default",
-        metadata=CurrentForwardConductorMetadata(
-            graph_walk="image_gen_cfg",
-            is_prefill=False,
-        ),
-        current_worker_graph_ids={"wg"},
+        partition_name="default", graph_walk="image_gen_cfg", current_worker_graph_ids={"wg"},
     )
     request = SimpleNamespace(
         partition_states={"default": partition},

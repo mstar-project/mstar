@@ -19,13 +19,13 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 
 PS = 16
@@ -95,15 +95,9 @@ class _Model(Model):
     def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         return {"kv": KVReqConfig(needed_labels=["main", "uncond"])}
 
-    def get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities,
-                                      input_signals, model_kwargs=None):
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(graph_walk="prefill", is_prefill=True),
-            inputs=[], unpersist_tensors=[],
-        )
-
-    def get_partition_forward_pass_args(self, *args, **kwargs):
-        raise AssertionError("the request never leaves its first walk")
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        # no worker reports in these tests, so the request never leaves prefill
+        return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
 
     def max_input_files(self):
         return {}

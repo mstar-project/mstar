@@ -5,20 +5,6 @@ from typing import Any
 
 from mstar.engine.resources import PublishedInfo, ResourceReqConfig
 
-
-@dataclass
-class CurrentForwardConductorMetadata:
-    """
-    Full-model forward pass-level metadata for running the current
-    forward pass. On the conductor/model level.
-    """
-    graph_walk: str
-    is_prefill: bool
-    input_modalities: list[str] = field(default_factory=list)
-    output_modalities: list[str] = field(default_factory=list)
-    kwargs: dict = field(default_factory=dict)
-
-
 DEFAULT_PARTITION = "default"
 
 # Step metadata the conductor sets on the step that samples a request's first
@@ -144,7 +130,8 @@ class StreamingConnectionState:
 class PartitionState:
     """Per-partition conductor-level state for a request."""
     partition_name: str
-    metadata: CurrentForwardConductorMetadata
+    # the walk running: the plan's current step, or the walk a stream moved it to
+    graph_walk: str = ""
     fwd_pass_number: int = 0
     random_seed: int = 0
     is_done: bool = False

@@ -72,10 +72,7 @@ class _ToyModel(Model):
     def get_node_resources(self):
         return []
 
-    def get_initial_forward_pass_args(self, *a, **k):
-        raise NotImplementedError
-
-    def get_partition_forward_pass_args(self, *a, **k):
+    def walk_plan(self, *a, **k):
         raise NotImplementedError
 
     def process_prompt(self, *a, **k):

@@ -37,6 +37,7 @@ class EncoderDecoderNode(TokenStepNode):
     its own, so the self-attention resource never plans over it).
     """
 
+    PREFILL_WALK = "prefill"
     KV_CACHE: str
     ATTN: str
     POS: str

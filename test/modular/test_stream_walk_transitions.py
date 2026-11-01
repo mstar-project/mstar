@@ -12,7 +12,6 @@ import torch
 
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
@@ -349,12 +348,7 @@ def test_the_conductor_follows_the_walk_the_worker_ran():
     c._set_partition_worker_graph_ids = (
         lambda rid, partition, walk: setattr(pstate, "current_worker_graph_ids", {7})
     )
-    pstate = PartitionState(
-        partition_name="Talker",
-        metadata=CurrentForwardConductorMetadata(
-            graph_walk="talker_prefill", is_prefill=True,
-        ),
-    )
+    pstate = PartitionState(partition_name="Talker", graph_walk="talker_prefill")
     c.requests = {"r": RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={7: ["w0"]}, all_worker_graph_ids={7},
@@ -368,5 +362,5 @@ def test_the_conductor_follows_the_walk_the_worker_ran():
         request_id="r", worker_graph_ids=[7], is_first_tp_rank=True,
         partition_name="Talker", graph_walk="talker_last_prefill",
     ))
-    assert pstate.metadata.graph_walk == "talker_last_prefill"
+    assert pstate.graph_walk == "talker_last_prefill"
     assert done == ["Talker"]

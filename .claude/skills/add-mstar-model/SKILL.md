@@ -128,7 +128,6 @@ Each of these is a one-line convention that a reference implementation states so
 - **Under bf16, round rotary frequencies and timesteps after the sinusoid, not before.** `module.to(bfloat16)` (which the engine applies after `get_submodule`) rounds the rotary frequency buffers, and a timestep cast to the module's dtype before the sinusoid loses its low bits in `t * freq`. Keep the frequency buffers fp32 in `_apply`, compute the sinusoid in fp32 from an fp32 timestep, and cast only its output. In CosyVoice3's flow estimator both roundings moved the audio measurably.
 - **Keep an fp32 LM head out of autocast, and load it as fp32.** The engine's bf16 autocast recasts an fp32 head unless it runs outside autocast, and loading the checkpoint into a bf16 module before making the head fp32 rounds its weights first.
 - **Key per-request submodule state by `fwd_info.rid_handle` in `prepare_inputs`**, not `request_id`: the forward and the engine's cleanup use the handle.
-- **The conductor merges each pass's `step_metadata` into the request's `metadata.kwargs`.** A model whose walks send *different* step metadata (multi-stage, multi-resolution) and also keeps request-level facts in kwargs under the same names has those facts overwritten by the previous walk's values: a stage-1 half-resolution `height` becomes the request's height for stage 2. Keep request-level facts under keys step metadata never uses (LTX-2.5 nests them under `kwargs["request"]`).
 
 ## Phase 5 — Batching and accelerator graphs
 
