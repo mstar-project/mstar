@@ -830,7 +830,7 @@ class Qwen3OmniModel(Model):
                 # requests skip it to save cross-partition bandwidth.
                 "audio_output": audio_output,
                 "is_last_prefill": is_last_prefill,
-                "text_before": schedule[0][1].get(TEXT_BEFORE, 0) if schedule else 0,
+                TEXT_BEFORE: schedule[0][1].get(TEXT_BEFORE, 0) if schedule else 0,
             },
         )
 
@@ -982,7 +982,7 @@ class Qwen3OmniModel(Model):
     ) -> ForwardPassArgs:
         """Thinker partition state machine.
 
-        1. Build prefill schedule: [prefill_text] + [modality walks] + [prefill_text]
+        1. Build prefill schedule: one step per attachment, or one text step
         2. Pop walks from schedule until done
         3. Transition to thinker_decode
         4. Each decode step: check new_token for EOS (im_end_token_id)
@@ -1039,7 +1039,7 @@ class Qwen3OmniModel(Model):
         step_metadata = {
             "is_prefill": metadata.is_prefill,
             "is_last_prefill": is_last_prefill,
-            "text_before": text_before,
+            TEXT_BEFORE: text_before,
             # Persist the audio_output flag across every Thinker step so
             # the submodule can gate thinker_states emission.  Default True
             # for backwards compatibility with callers that never set it.

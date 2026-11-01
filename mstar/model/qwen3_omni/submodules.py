@@ -69,7 +69,7 @@ from mstar.model.qwen3_omni.config import (
     VISION_ATTN,
     Qwen3OmniModelConfig,
 )
-from mstar.model.qwen3_omni.qwen3_omni_model import image_span
+from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -625,7 +625,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """The ids before and after this step's attachment (empty when it has none)."""
         device = self.get_device()
         texts = [text.to(device) for text in inputs.get("text_inputs", [])]
-        split = fwd_info.step_metadata.get("text_before", 0)
+        split = fwd_info.step_metadata.get(TEXT_BEFORE, 0)
         none = torch.zeros(0, dtype=torch.long, device=device)
         return torch.cat([none, *texts[:split]]), torch.cat([none, *texts[split:]])
 
