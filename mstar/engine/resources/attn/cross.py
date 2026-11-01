@@ -27,8 +27,8 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     EngineResourceInfo,
 )
+from mstar.engine.resources.kv.arena import PlanColumns
 from mstar.engine.resources.kv.config import PagedKVConfig
-from mstar.engine.resources.kv.page_table import PlanColumns
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,

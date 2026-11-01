@@ -1,6 +1,5 @@
-"""The KV page table: a stream's ``StreamPages`` behaves as the list it
-replaces, and a plan built from columns (``KVManager._plan_label``) equals the
-one built from per-row views, whatever the streams went through."""
+"""A plan built from columns (``KVManager._plan_label``) equals the one built
+from per-row views, whatever the streams went through, on either page arena."""
 from __future__ import annotations
 
 import random
@@ -8,73 +7,18 @@ import sys
 
 sys.path.insert(0, ".")
 
-import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+from mstar.engine.resources.kv import arena as arena_mod  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
-from mstar.engine.resources.kv.page_table import PageTable  # noqa: E402
 from mstar.engine.resources.kv.plan import group_by_plan_label  # noqa: E402
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
 
 PAGE = 4
 LABELS = ("main", "aux")
-
-
-@pytest.mark.parametrize("seed", range(20))
-def test_stream_pages_behave_as_lists(seed):
-    """Several streams on one table, so extents move, are freed and are reused."""
-    rng = random.Random(seed)
-    table = PageTable(capacity=8)
-    streams = [table.new() for _ in range(4)]
-    refs: list[list[int]] = [[] for _ in streams]
-    for _ in range(400):
-        i = rng.randrange(len(streams))
-        s, ref = streams[i], refs[i]
-        op = rng.random()
-        if op < 0.4:
-            new = [rng.randrange(1000) for _ in range(rng.randrange(1, 20))]
-            s.extend(new)
-            ref.extend(new)
-        elif op < 0.55 and ref:
-            a = rng.randrange(len(ref))
-            b = rng.randrange(a, len(ref) + 1)
-            del s[a:b]
-            del ref[a:b]
-        elif op < 0.65 and ref:
-            k = rng.randrange(1, len(ref) + 1)
-            del s[-k:]
-            del ref[-k:]
-        elif op < 0.75:
-            new = [rng.randrange(1000) for _ in range(rng.randrange(0, 40))]
-            s.assign(new)
-            ref[:] = new
-        elif op < 0.8:
-            s.clear()
-            ref.clear()
-        elif op < 0.85:
-            s.free()
-            ref.clear()
-        for got, want in zip(streams, refs, strict=True):
-            assert got == want and len(got) == len(want) and list(got) == want
-        if ref:
-            j = rng.randrange(-len(ref), len(ref))
-            assert s[j] == ref[j]
-            a, b = sorted(rng.randrange(-len(ref) - 2, len(ref) + 2) for _ in range(2))
-            assert s[a:b] == ref[a:b]
-
-
-def test_gather_reads_each_rows_prefix():
-    table = PageTable(capacity=8)
-    a, b = table.new(), table.new()
-    a.extend([1, 2, 3, 4, 5])
-    b.extend([9, 8])
-    offs = np.array([a.off, b.off, a.off], np.int64)
-    counts = np.array([3, 2, 0], np.int64)
-    indptr = np.array([0, 3, 5, 5], np.int64)
-    assert table.gather(offs, counts, indptr).tolist() == [1, 2, 3, 9, 8]
 
 
 class _StubTransfer:
@@ -138,15 +82,14 @@ def _same(a, b):
         assert [int(o) for o in a.decode_offsets] == [(v.last_page_len(PAGE) or PAGE) - 1 for v in b.views]
 
 
-@pytest.fixture(params=["rust", "numpy"])
+@pytest.fixture(params=["rust", "python"])
 def plan_backend(request, monkeypatch):
-    """Both ways `PageTable.plan_columns` computes: the Rust call and numpy."""
-    from mstar.engine.resources.kv import page_table
+    """The manager on each arena: Rust's plan call, and the Python arena's numpy."""
     if request.param == "rust":
-        if page_table._rust_plan_columns is None:
-            pytest.skip("the Rust extension has no kv_plan_columns")
+        if arena_mod.RustPageArena is None:
+            pytest.skip("needs mstar_rust")
     else:
-        monkeypatch.setattr(page_table, "_rust_plan_columns", None)
+        monkeypatch.setattr(arena_mod, "RustPageArena", None)
     return request.param
 
 

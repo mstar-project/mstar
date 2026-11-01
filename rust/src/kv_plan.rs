@@ -1,13 +1,10 @@
 //! A KV plan label's index arrays, built from per-row columns in one call
-//! (`KVManager._plan_label` / `PageTable.plan_columns` on the Python side).
+//! (`KVManager._plan_label`, through `PageArena.plan_columns`).
 //!
-//! Python collects, per row of the step, the row's extent in the page pool,
-//! the pages it holds, its length after the step and its span; this computes
-//! FlashInfer's four index arrays, the host lengths and each decode row's
-//! write location, and copies every row's pages out of the pool. The numpy
-//! fallback in `page_table.py` is the same arithmetic, op for op; a step of a
-//! few dozen rows is where the ~30 numpy calls it takes cost more than the
-//! per-row Python they replace, and one call here costs less than either.
+//! Per row of the step: the pages its stream holds, its length after the step
+//! and its span. This computes FlashInfer's four index arrays, the host
+//! lengths and each decode row's write location, and copies the pages each
+//! row reads. `PythonPageArena.plan_columns` is the same arithmetic in numpy.
 //!
 //! `packed_addressing` is a packed step's write locations, one page and offset
 //! per new token, for an eager write too large for per-token numpy to be cheap.
@@ -15,7 +12,6 @@
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyByteArray;
 
 /// The arrays of one plan label, back to back in one `Vec<i32>`:
 /// `qo_indptr (n + 1) | kv_indptr (n + 1) | last_page_len (n) | kv_lens (n) |
@@ -28,36 +24,8 @@ pub struct PlanColumns {
     pub all_have_pages: bool,
 }
 
-pub fn plan_columns(
-    pool: &[i32],
-    offs: &[i64],
-    held: &[i64],
-    lens: &[i64],
-    spans: &[i64],
-    page_size: i64,
-) -> Result<PlanColumns, String> {
-    let n = offs.len();
-    if held.len() != n {
-        return Err("plan columns of different lengths".into());
-    }
-    plan_columns_with(
-        |i| {
-            let (off, held) = (offs[i], held[i]);
-            if off < 0 || held < 0 || (off + held) as usize > pool.len() {
-                return Err(format!("row {i}: extent {off}+{held} is outside the page pool"));
-            }
-            Ok(&pool[off as usize..(off + held) as usize])
-        },
-        lens,
-        spans,
-        page_size,
-    )
-}
-
-/// `plan_columns` over any source of each row's held pages: `pages(i)` is
-/// row `i`'s page list (`PageArena`'s per-stream lists, or an extent of the
-/// pool above).
-pub fn plan_columns_with<'a>(
+/// `pages(i)` is row `i`'s page list (a `PageArena` stream's).
+pub fn plan_columns<'a>(
     pages: impl Fn(usize) -> Result<&'a [i32], String>,
     lens: &[i64],
     spans: &[i64],
@@ -113,30 +81,6 @@ pub fn plan_columns_with<'a>(
         kv_indptr[i + 1] = k as i32;
     }
     Ok(PlanColumns { out, total, all_have_pages })
-}
-
-/// ``plan_columns`` for Python: ``(bytearray, total, all_have_pages)``, the
-/// bytearray holding the arrays as native int32 in the order above.
-#[pyfunction]
-pub fn kv_plan_columns<'py>(
-    py: Python<'py>,
-    pool: PyBuffer<i32>,
-    offs: Vec<i64>,
-    held: Vec<i64>,
-    lens: Vec<i64>,
-    spans: Vec<i64>,
-    page_size: i64,
-) -> PyResult<(Bound<'py, PyByteArray>, usize, bool)> {
-    if !pool.is_c_contiguous() {
-        return Err(PyValueError::new_err("the page pool must be C-contiguous"));
-    }
-    // SAFETY: a C-contiguous int32 buffer, held by the caller for this call
-    // under the GIL (nothing can resize it while it is borrowed here)
-    let pool = unsafe { std::slice::from_raw_parts(pool.buf_ptr() as *const i32, pool.item_count()) };
-    let cols = plan_columns(pool, &offs, &held, &lens, &spans, page_size).map_err(PyValueError::new_err)?;
-    // SAFETY: plain i32 data viewed as its native-endian bytes
-    let bytes = unsafe { std::slice::from_raw_parts(cols.out.as_ptr() as *const u8, cols.out.len() * 4) };
-    Ok((PyByteArray::new(py, bytes), cols.total, cols.all_have_pages))
 }
 
 /// Each new token's page and offset, for a packed step that appends `span`
@@ -241,13 +185,16 @@ mod tests {
         parts
     }
 
+    fn rows<'a>(held: &'a [&'a [i32]]) -> impl Fn(usize) -> Result<&'a [i32], String> {
+        move |i| Ok(held[i])
+    }
+
     #[test]
-    fn rows_read_their_extent_prefix_and_clip_to_held_pages() {
-        // pages of two streams and a sink run in one pool
-        let pool = [10, 11, 12, 13, 20, 21, -1, -1];
+    fn rows_read_their_prefix_and_clip_to_held_pages() {
         // row 0: 9 tokens at page size 4 -> 3 pages; row 1: wants 2, holds 1;
         // row 2: a sink row of span 1
-        let c = plan_columns(&pool, &[0, 4, 6], &[4, 1, 2], &[9, 5, 1], &[1, 1, 1], 4).unwrap();
+        let held: [&[i32]; 3] = [&[10, 11, 12, 13], &[20], &[-1, -1]];
+        let c = plan_columns(rows(&held), &[9, 5, 1], &[1, 1, 1], 4).unwrap();
         let p = split(&c, 3);
         assert_eq!(p[0], vec![0, 1, 2, 3]); // qo
         assert_eq!(p[1], vec![0, 3, 4, 5]); // kv_indptr
@@ -261,8 +208,8 @@ mod tests {
 
     #[test]
     fn a_full_last_page_and_an_empty_row() {
-        let pool = [7, 8];
-        let c = plan_columns(&pool, &[0, 0], &[2, 2], &[8, 0], &[3, 0], 4).unwrap();
+        let held: [&[i32]; 2] = [&[7, 8], &[7, 8]];
+        let c = plan_columns(rows(&held), &[8, 0], &[3, 0], 4).unwrap();
         let p = split(&c, 2);
         assert_eq!(p[0], vec![0, 3, 3]);
         assert_eq!(p[1], vec![0, 2, 2]);
@@ -272,8 +219,9 @@ mod tests {
     }
 
     #[test]
-    fn an_extent_past_the_pool_is_refused() {
-        assert!(plan_columns(&[1, 2], &[1], &[2], &[8], &[1], 4).is_err());
+    fn a_rows_error_is_the_calls() {
+        let missing = |_: usize| -> Result<&[i32], String> { Err("no such stream".into()) };
+        assert!(plan_columns(missing, &[8], &[1], 4).is_err());
     }
 
     #[test]

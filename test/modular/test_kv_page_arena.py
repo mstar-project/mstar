@@ -8,9 +8,20 @@ import random
 import numpy as np
 import pytest
 
-from mstar.engine.resources.kv.arena import RustPageArena, new_page_arena, plan_columns
+from mstar.engine.resources.kv.arena import PageArena, RustPageArena, StreamPages, new_page_arena, plan_columns
 
 BACKENDS = ["python", pytest.param("rust", marks=pytest.mark.skipif(RustPageArena is None, reason="needs mstar_rust"))]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_both_backends_have_what_the_protocols_name(backend):
+    arena = new_page_arena(4, backend)
+    for protocol, obj in ((PageArena, arena), (StreamPages, arena.new_stream())):
+        names = set(protocol.__annotations__) | {
+            name for name in vars(protocol)
+            if not name.startswith("_") or name in ("__len__", "__iter__", "__getitem__", "__delitem__")
+        }
+        assert not [name for name in sorted(names) if not hasattr(obj, name)], protocol.__name__
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -48,7 +59,7 @@ def test_stream_pages_read_and_write_like_a_list(backend, seed):
             del want[a:b]
         assert pages.tolist() == want and len(pages) == pages.n == len(want)
         assert list(pages) == want and list(reversed(pages)) == want[::-1]
-        assert pages == want and pages == tuple(want) and not (pages != want)
+        assert pages == want and not (pages != want)
         for a, b, step in [(0, None, None), (2, 9, None), (-3, None, None), (None, None, 2), (5, 1, -1)]:
             assert pages[a:b:step] == want[a:b:step]
         if want:

@@ -180,7 +180,7 @@ impl ArenaCore {
         if sids.len() != lens.len() {
             return Err("plan columns of different lengths".into());
         }
-        crate::kv_plan::plan_columns_with(
+        crate::kv_plan::plan_columns(
             |i| self.pages(sids[i]).map(|pages| pages.as_slice()).map_err(|e| format!("row {i}: {e}")),
             lens,
             spans,
@@ -431,7 +431,7 @@ mod py {
             PyStreamPages { arena: slf.clone().unbind(), sid }
         }
 
-        /// ``kv_plan_columns`` over the page lists of the streams ``sids``,
+        /// `kv_plan::plan_columns` over the page lists of the streams ``sids``,
         /// one per row: ``(bytearray, total, all_have_pages)``.
         fn plan_columns<'py>(
             &self,

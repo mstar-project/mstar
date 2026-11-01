@@ -311,14 +311,19 @@ def test_a_step_with_sink_rows_is_planned_from_the_streams():
 def test_sink_pages_grow_under_the_managers_lock(monkeypatch):
     """The sink run is a page list the main thread changes under the lock, and
     a plan may run on the plan thread: growing it takes the lock too. Capture
-    sizes it for the longest captured step. On the Python arena, whose
-    extents are what a growth moves."""
+    sizes it for the longest captured step. On the Python arena, whose list a
+    spy can wrap."""
     monkeypatch.setattr(manager_mod, "new_page_arena", lambda n: arena_mod.new_page_arena(n, "python"))
     kv = _manager(0)
     owned = []
-    table = kv._arena._table
-    alloc = table._alloc
-    table._alloc = lambda capacity: owned.append(kv._lock._is_owned()) or alloc(capacity)
+    extend = arena_mod._ListStreamPages.extend
+
+    def spy(pages, new):
+        if pages is kv._sink_pages:
+            owned.append(kv._lock._is_owned())
+        extend(pages, new)
+
+    monkeypatch.setattr(arena_mod._ListStreamPages, "extend", spy)
     kv.ingest_request("b", KVReqConfig())
     step = KVStep(segments=(Segment("b", "main", 200),), sink=frozenset({("b", "main")}))
     ctx = StepContext(request_ids=("b",), graph_walk="prefill", slot=0, capture=False)

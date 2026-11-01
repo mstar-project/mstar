@@ -20,7 +20,7 @@ from mstar.engine.resources.base import (
     KeyedWalks,
     PublishedInfo,
 )
-from mstar.engine.resources.kv.arena import PageArena, new_page_arena, plan_columns
+from mstar.engine.resources.kv.arena import PageArena, StreamPages, new_page_arena, plan_columns
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import (
     KVLayout,
@@ -35,7 +35,6 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.host_writes import HostWrites
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
-from mstar.engine.resources.kv.page_table import StreamPages
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,

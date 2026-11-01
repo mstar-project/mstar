@@ -19,9 +19,9 @@ import torch
 
 from mstar.engine.resources.attn import cross as cross_mod
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.kv import page_table as page_table_mod
+from mstar.engine.resources.kv import arena as arena_mod
+from mstar.engine.resources.kv.arena import columns_from_raw, new_page_arena
 from mstar.engine.resources.kv.config import PagedKVConfig
-from mstar.engine.resources.kv.page_table import PageTable
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -281,18 +281,17 @@ def _unbuilt():
 
 def _columns_plan(rows, *, views: bool = False) -> KVPlanOutput:
     """The context label's plan as ``KVManager._plan_label`` builds it, off
-    ``PageTable.plan_columns``. ``rows``: (request id, held pages, written
+    the arena's ``plan_columns``. ``rows``: (request id, held pages, written
     length); a padding row holds nothing and has length 0. With ``views``
     the output has no columns and the cross manager must read the views."""
-    table = PageTable()
-    offs, held, lens = [], [], []
-    for _, pages, length in rows:
-        stream = table.new()
+    arena = new_page_arena(16)
+    # held until the plan reads them: a dropped stream is freed
+    streams = [arena.new_stream() for _ in rows]
+    for stream, (_, pages, _) in zip(streams, rows, strict=True):
         stream.extend(pages)
-        offs.append(stream.off)
-        held.append(stream.n)
-        lens.append(length)
-    cols = table.plan_columns(offs, held, lens, [0] * len(rows), 16)
+    sids = [stream.sid for stream in streams]
+    lens = [length for _, _, length in rows]
+    cols = columns_from_raw(arena.plan_columns(sids, lens, [0] * len(rows), 16), len(rows))
     bounds = cols.kv_indptr.tolist()
     built = [
         SequenceView(request_id=rid, label=CONTEXT, page_idxs=cols.indices[bounds[i]:bounds[i + 1]].tolist(),
@@ -343,11 +342,11 @@ _CONTEXT_ROWS = [
 ]
 
 
-@pytest.fixture(params=["numpy", "rust"])
+@pytest.fixture(params=["python", "rust"])
 def plan_columns_backend(request, monkeypatch):
-    if request.param == "numpy":
-        monkeypatch.setattr(page_table_mod, "_rust_plan_columns", None)
-    elif page_table_mod._rust_plan_columns is None:
+    if request.param == "python":
+        monkeypatch.setattr(arena_mod, "RustPageArena", None)
+    elif arena_mod.RustPageArena is None:
         pytest.skip("the mstar_rust extension is not built")
 
 
