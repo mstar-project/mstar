@@ -40,6 +40,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
+from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
 from mstar.model.components.mlp import MLP
@@ -258,7 +259,7 @@ class Wan22DiTBlock(nn.Module):
         hidden_states, norm_hidden = ada_layer_norm(
             hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
         )
-        ff_output = self.ffn(norm_hidden)
+        ff_output = gelu_tanh_ffn(norm_hidden, self.ffn)
         frames = timestep_proj.shape[1]
         return (
             hidden_states.unflatten(1, (frames, -1)).float()

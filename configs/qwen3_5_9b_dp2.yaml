@@ -6,8 +6,10 @@ model_kwargs:
   prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
 node_groups:
   # A whole replica per GPU (text, images and video); the conductor sends
-  # each request to the replica serving fewer. For image and video traffic
-  # this beats TP2, whose vision encoder runs on one rank and stalls both.
+  # each request to the cheaper replica, by live requests and the prompt's
+  # predicted prefix hit ("Data-parallel routing" in docs/serving.rst). For
+  # image and video traffic this beats TP2, whose vision encoder runs on one
+  # rank and stalls both.
   - node_names: [LLM, vision_encoder]
     ranks: [0, 1]
 resources:
