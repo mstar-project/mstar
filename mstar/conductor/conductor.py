@@ -1351,6 +1351,9 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
+        # process_prompt's {stream edge: context-only lead items}; each worker
+        # primes the streams its own partition consumes
+        stream_lead_items = kwargs.get("stream_lead_items") or {}
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
@@ -1403,7 +1406,7 @@ class Conductor:
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
-                        stream_lead_items=fwd_args.stream_lead_items,
+                        stream_lead_items=stream_lead_items,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,

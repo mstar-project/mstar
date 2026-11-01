@@ -793,11 +793,7 @@ class Qwen3TTSModel(Model):
             raise ValueError("Qwen3-TTS reference clip is empty")
         return ref_text, frames
 
-    # model_kwargs key: reference frames leading an in-context clone's codec stream
-    CODEC_STREAM_LEAD_KEY = "codec_stream_lead_frames"
-    INTERNAL_KWARGS = (
-        PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
-    )
+    INTERNAL_KWARGS = (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
@@ -819,9 +815,9 @@ class Qwen3TTSModel(Model):
         a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
-        request sets ``non_streaming_mode``. ``CODEC_STREAM_LEAD_KEY`` reports
-        how many reference frames lead the codec stream (context only, 0
-        without an in-context clone; see ``get_initial_forward_pass_args``).
+        request sets ``non_streaming_mode``. An in-context clone's
+        ``stream_lead_items`` reports the reference frames that lead the codec
+        stream: the first window's context, never audio of their own.
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -869,10 +865,10 @@ class Qwen3TTSModel(Model):
             PROMPT_LAYOUT_KEY: [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
             SPEAKER_ID_KEY: speaker_id,
             LANGUAGE_ID_KEY: language_id,
-            # set in every mode (0 without an in-context clone): the data worker
-            # lays this over the request's own kwargs
-            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.left_context_frames),
         }
+        lead = min(ref_frames, self.config.codec.left_context_frames)
+        if lead:
+            metadata["stream_lead_items"] = {"codec_tokens": lead}
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
@@ -962,15 +958,11 @@ class Qwen3TTSModel(Model):
                 graph_walk="codec_chunk",
                 is_prefill=False,
             )
-            # An in-context clone's stream leads with reference frames: they
-            # are the first window's context, never audio of their own.
-            lead = int((model_kwargs or {}).get(self.CODEC_STREAM_LEAD_KEY, 0))
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=[],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
-                stream_lead_items={"codec_tokens": lead} if lead else {},
             )
         raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
 

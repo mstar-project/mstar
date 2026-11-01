@@ -353,7 +353,6 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     # reference transcript or frames. Host values, for the prefill's step metadata.
     assert {key: value for key, value in result.metadata.items() if key != "kv_layout"} == {
         PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
-        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 0,
     }
 
 
@@ -457,7 +456,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
         LANGUAGE_ID_KEY: model.config.talker.codec_language_id["english"],
         REF_CLIP_KEY: clip_digest(clip),
         # All 13 reference frames lead the codec stream as context (fewer than left_context).
-        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 13,
+        "stream_lead_items": {"codec_tokens": 13},
     }
 
     xvec = model.process_prompt(
@@ -466,7 +465,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     )
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
-    assert xvec.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == 0   # no stream lead
+    assert "stream_lead_items" not in xvec.metadata   # no stream lead
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(
@@ -509,7 +508,7 @@ def test_qwen3_tts_reference_bounds_are_inclusive():
         )
         assert result.metadata[PROMPT_LAYOUT_KEY][-1] == frames
         # only the last left_context (72) frames lead the codec stream
-        assert result.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == min(frames, 72)
+        assert result.metadata["stream_lead_items"] == {"codec_tokens": min(frames, 72)}
 
 
 def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monkeypatch):
@@ -559,18 +558,11 @@ def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
     assert {key: talker.step_metadata[key] for key in prompt} == prompt
     codec = model.get_initial_forward_pass_args(
         "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
-        input_signals=pointers, model_kwargs={Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 40},
-    )
-    # The codec runs its one walk; the reference frames leading its stream are
-    # announced so the worker primes the stream with them as context.
-    assert codec.full_metadata.graph_walk == "codec_chunk"
-    assert codec.inputs == [] and codec.unpersist_tensors == []
-    assert codec.stream_lead_items == {"codec_tokens": 40}
-    xvec = model.get_initial_forward_pass_args(
-        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
         input_signals=pointers, model_kwargs={},
     )
-    assert xvec.stream_lead_items == {}
+    # The codec runs its one walk
+    assert codec.full_metadata.graph_walk == "codec_chunk"
+    assert codec.inputs == [] and codec.unpersist_tensors == []
     rearmed = model.get_partition_forward_pass_args("Codec", codec.full_metadata, persist_signals={})
     assert rearmed.full_metadata.graph_walk == "codec_chunk" and rearmed.inputs == []
 
