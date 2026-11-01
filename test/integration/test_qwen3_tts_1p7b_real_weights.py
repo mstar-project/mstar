@@ -136,7 +136,9 @@ def test_depth_loop_runs_through_projection(loaded):
         batch, model.config.talker.hidden_size, device="cuda:0", dtype=torch.bfloat16
     )
     layer0 = torch.randint(0, 2048, (batch,), device="cuda:0")
-    codes, embed_sum = talker._depth_loop(hidden, layer0, lambda logits: logits.argmax(-1))
+    codes, embed_sum = talker.code_predictor.run_depth_loop(
+        hidden, layer0, talker.model.model.codec_embedding, lambda logits: logits.argmax(-1), talker.MAX_BATCH_SIZE,
+    )
     torch.cuda.synchronize()
     assert codes.shape == (batch, model.config.num_code_groups)
     assert (codes[:, 0] == layer0).all()

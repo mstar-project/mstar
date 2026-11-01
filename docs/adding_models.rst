@@ -787,6 +787,16 @@ recompile for every new batch size.
 Each resource owns its own buffers. The two parameter sets are therefore independent,
 per-request, and safe under CUDA graphs.
 
+Both models' code predictors subclass ``DepthDecoder``
+(``mstar/model/components/depth_decoder.py``), which runs the group loop:
+``run_depth_loop(last_hidden, layer0_codes, group0_embedding, sample, max_batch_size)`` with
+the code predictor's sampler as ``sample``. A new code predictor with the same layer anatomy
+gets the loop, its frame-local KV scratch and, on AMD GPUs, the fused depth kernels of
+``mstar/platforms/depth_decoder_ops.py`` by subclassing it and keeping a per-position
+``forward_depth_unrolled`` for the other platforms. Call ``run_depth_loop`` straight from
+the forward, not through a helper method: a helper between a compiled forward and the loop
+gets compiled around the sampler and recompiles on every step, which fails graph capture.
+
 .. _Cross-attention (encoder-decoder models):
 
 Cross-attention (encoder-decoder models)
@@ -2398,10 +2408,9 @@ context is reused across calls, so a hook must not keep it.
   arrive, so send them only once the stream has moved the consumer through the walk
   before it.
 
-Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
-``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
-ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
-``talker_last_prefill`` has run.
+Qwen3-Omni's Talker (``_talker_walk``) is the reference: the Thinker's prefill pass runs
+``talker_prefill``, and its decode passes run ``talker_decode``; the conductor feeds
+``talker_decode`` its first input once ``talker_prefill`` has run.
 
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~

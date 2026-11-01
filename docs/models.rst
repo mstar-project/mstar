@@ -506,6 +506,55 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+- ``configs/qwen3omni_colocated_early_audio.yaml`` starts audio after 8 frames
+  and ramps up in smaller steps, ``codec_chunk_schedule: [8, 10, 13, 16, 20]``.
+  No chunk is more than 1.3x the one before, so each one arrives before the
+  previous one has played while the Talker gives a request about 16 frames/s.
+  The default's 13 to 25 frame step needs about 24, which one MI300X serving
+  32 requests doesn't always give a request over its first chunks. Measured on
+  one MI300X (a VM slice, one run per cell), text prompts: TTFA p50 192 / 436 / 542 ms at c=1 / 16 / 32
+  against 250 / 529 / 684 ms with the default; at c=32 the harness counts
+  every chunk in time for text and image prompts (0.99 and 0.97 with the
+  default) at the same text throughput, with image throughput 3% lower in its
+  one pair of runs. Spoken questions at c=32 keep one GPU too busy for either
+  ramp (0.90 of chunks in time, 0.87 with the default).
+- On AMD GPUs ``configs/qwen3omni_2gpu.yaml`` gives Code2Wav a worker of its own on
+  the Talker's GPU (a ``platform_overrides`` entry, see :ref:`platform-overrides`),
+  the layout of ``configs/qwen3omni_2gpu_split.yaml``, so Talker steps no longer
+  take turns with Code2Wav steps on one worker loop, and starts audio on the
+  ``ramp4g`` schedule below. On MI325X, at 32 text requests: 168 audio-s/s against
+  135, the same at one request. Other platforms serve one worker and the default
+  schedule, and ``configs/qwen3omni_2gpu_stock.yaml`` keeps those everywhere.
+- On AMD GPUs ``configs/qwen3omni_colocated.yaml`` runs the Thinker with the encoders,
+  the Talker and Code2Wav as three workers on one GPU, the layout of
+  ``configs/qwen3omni_colocated_split3.yaml``. On one MI325X (a quiet node, one run per
+  cell): 133 audio-s/s against 85 at 32 text requests, 13.1 against 10.8 and time to
+  first audio 146 against 184 ms at one request, first text 40 against 27 ms. Other
+  platforms serve one worker, and ``configs/qwen3omni_colocated_stock.yaml`` keeps it
+  everywhere.
+- ``configs/qwen3omni_2gpu_ramp4g.yaml``, the AMD default above, and
+  ``configs/qwen3omni_colocated_split3_ramp4g.yaml`` start audio after 4 frames,
+  ``codec_chunk_schedule: [4, 5, 6, 8, 10, 13, 16, 20]``. On MI325X time to first
+  audio at one text request is 78 ms on two GPUs (127 without the ramp) on a quiet
+  node, and 96 ms on one (147) on a shared one, and at 32 requests 263 ms on two
+  GPUs (413) and 349 ms on one (560). The ramp needs about 17
+  frames/s per request, while ``(4, 8, 16)`` needs 27: at 32 requests on two GPUs the
+  slowest 5% of requests get 21-27, so 4-14% of them paused against 1-6% with this
+  ramp, and on one worker on one GPU they get 15-16, so 24-68% paused.
+- A request prefills in one Thinker step. Its walk runs the encoders its
+  attachments need (``prefill_audio``, ``prefill_vision`` or
+  ``prefill_audio_vision``; ``prefill_text`` for a text-only prompt), then the
+  whole prompt as one row, each attachment spliced in where it was written.
+  That step also sends the first text token's embedding to the Talker, which
+  prefills the prompt and its assistant prefix and samples its first frame in
+  one step, without waiting for the Thinker's first decode step. A config that
+  pins walks to ranks (``configs/qwen3omni_pd_disaggregated.yaml``) lists all
+  four prefill walks.
+- On AMD GPUs the audio and vision encoders run eager. Compiled, they
+  recompiled for most new clip lengths and for each new image grid in a
+  three-grid sweep (dynamo guards the chunk lengths and the image grid the HF
+  code reads with ``.tolist()``), up to 9 s a request on an MI300X. Eager
+  costs about 13 ms an image and 8 ms a clip.
 
 Qwen3-TTS notes
 ---------------

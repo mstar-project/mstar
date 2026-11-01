@@ -19,23 +19,20 @@ _FWD = CurrentForwardPassInfo(
 )
 
 
-def test_the_first_decode_iteration_closes_the_talker_prefill():
+def test_each_prefill_walk_runs_the_talker_prefill_and_decode_runs_its_decode():
     walks = [
         _talker_walk(ProducerWalkCtx(walk, "Thinker", iters, _FWD))
         for walk, iters in [
-            ("prefill_text", {}), ("prefill_audio", {}), ("prefill_text", {}),
+            ("prefill_text", {}), ("prefill_audio", {}), ("prefill_vision", {}), ("prefill_audio_vision", {}),
+            # the first decode iteration streams nothing, so the hook's answer for it only names where the next run
             ("thinker_decode", {"thinker_decode_loop": 0}),
             ("thinker_decode", {"thinker_decode_loop": 1}),
-            ("thinker_decode", {"thinker_decode_loop": 2}),
         ]
     ]
-    assert walks == ["talker_prefill"] * 3 + [
-        "talker_last_prefill", "talker_decode", "talker_decode",
-    ]
+    assert walks == ["talker_prefill"] * 4 + ["talker_decode"] * 2
 
 
 def test_only_the_decode_loop_runs_past_the_thinkers_end():
     policy = _thinker_to_talker_policy()
     assert policy.continues_in("talker_decode")
     assert not policy.continues_in("talker_prefill")
-    assert not policy.continues_in("talker_last_prefill")
