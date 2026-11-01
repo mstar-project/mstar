@@ -437,6 +437,9 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
     assert (span.kind, span.walk, span.length) == ("rows", "prefill_audio", ids.numel())
     assert span.walk in model.get_graph_walk_graphs()
+    # every prompt carries the clip: no text walk, mixed step or prefix keys
+    assert "prefill_text" not in model.get_graph_walk_graphs() and model.get_combined_graph_walks() == {}
+    assert model.kv_labels()[KV_CACHE]["main"].keys is None
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])

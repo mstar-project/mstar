@@ -232,6 +232,24 @@ def test_every_media_walk_replays_one_capture_that_caps_it():
     assert llm.max_batch_size("decode") is None
 
 
+def test_a_media_only_model_has_no_text_walk_mixed_step_or_prefix_keys():
+    """TEXT_PROMPTS = False (an audio-only STT model) drops the text prefill
+    walk, the mixed step and the prefix keys from the model, and the text and
+    mixed captures from its LLM node."""
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    walks = media_walks(8, [AUDIO], text=False)
+    assert set(walks) == {"prefill_audio", "decode"}
+    llm = object.__new__(LLMSubmodule)
+    SampledTokenDecoder.__init__(
+        llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=()),
+        (AUDIO,), text_prompts=False,
+    )
+    captured = {w for c in llm.get_accelerator_graph_configs(torch.device("cpu")) for w in c.replay_graph_walks}
+    assert captured == {"prefill_audio", "decode"}
+
+
 def test_qwen_media_capture_stages_every_media_buffer():
     """The captured media step's static inputs are `preprocess`'s outputs:
     the ids, a row per token for every encoder's media, and the cos/sin built

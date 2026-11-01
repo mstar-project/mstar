@@ -90,9 +90,16 @@ class HiggsAudioLLMSubmodule(SampledTokenDecoder):
     ATTN_KEY = ATTN
     # max-autotune until the default compile level (mstar serve -O) is measured on this model
     COMPILE_MODE = "max-autotune-no-cudagraphs"
-    # ~12.5 tokens per second of audio: eight 30 s clips and their
-    # instructions fill the top media bucket
+    # the ladders higgs captured before moving onto the scaffold
+    PREFILL_MEDIA_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # decode reads its ids back from the routed token and emits a tensor a
+    # request, as before the scaffold; the device path is a measured change
+    reads_device_loopback = False
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        return {}
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}

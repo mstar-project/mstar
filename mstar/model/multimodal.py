@@ -473,20 +473,21 @@ def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[Me
 
 
 def media_walks(
-    max_iters: int, encoders: Sequence[MediaEncoder] = (),
+    max_iters: int, encoders: Sequence[MediaEncoder] = (), text: bool = True,
 ) -> dict[str, GraphSection]:
-    """``prefill_text``, one media walk per subset of ``encoders``, and
-    ``decode``, over the ``LLM`` node and the encoders. ``max_iters`` bounds
-    the decode loop; it is a safety bound, not the per-request budget."""
+    """``prefill_text`` (unless ``text`` is False), one media walk per subset
+    of ``encoders``, and ``decode``, over the ``LLM`` node and the encoders.
+    ``max_iters`` bounds the decode loop; it is a safety bound, not the
+    per-request budget."""
 
     def emit_first_token() -> GraphEdge:
         return GraphEdge(
             next_node=EMIT_TO_CLIENT, name="new_token", persist=True, output_modality="text",
         )
 
-    walks: dict[str, GraphSection] = {
-        "prefill_text": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()]),
-    }
+    walks: dict[str, GraphSection] = {}
+    if text:
+        walks["prefill_text"] = GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()])
     for mask in range(1, 1 << len(encoders)):
         present = [e for i, e in enumerate(encoders) if mask >> i & 1]
         nodes = [

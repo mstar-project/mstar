@@ -128,6 +128,11 @@ class MultimodalDecoderModel(Model):
 
     # one per attachment modality the model takes, set by its `__init__`
     media: tuple[MediaIntake, ...] = ()
+    # False for a model every prompt of which carries media (an audio-only
+    # STT checkpoint): no text-only prefill walk, no mixed step, no prefix keys
+    # (only a text span is keyed), and its LLM node captures neither. The
+    # model's intake must refuse a text-only request itself.
+    TEXT_PROMPTS = True
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
@@ -176,11 +181,11 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return text_combined_walks()
+        return text_combined_walks() if self.TEXT_PROMPTS else {}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
-        return media_walks(self.config.max_position_embeddings, self.encoders)
+        return media_walks(self.config.max_position_embeddings, self.encoders, text=self.TEXT_PROMPTS)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the prefill emits the first of max_output_tokens, so the loop runs one fewer
@@ -194,6 +199,8 @@ class MultimodalDecoderModel(Model):
         # A text prompt's one `ids` span is keyed for the prefix cache, and its replies extend the
         # keys; a media prompt's one `rows` span is not (`LabelLayout.keyed_count`), so nothing of
         # it is.
+        if not self.TEXT_PROMPTS:
+            return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
             keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),

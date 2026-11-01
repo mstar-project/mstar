@@ -39,6 +39,11 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     # A prompt is a voice and its text, so the ladder stops at 1024: a longer
     # step runs eagerly rather than every capture being sized for 8192.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    # the batch ladders orpheus captured before moving onto the scaffold
+    # (decode the runner's default; prompt and mixed steps up to 64 rows)
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
     # No split kernel and no recurrent state to size for prompt rows, so a
     # mixed step takes any number of them.
     MIXED_MAX_PREFILL_ROWS = None

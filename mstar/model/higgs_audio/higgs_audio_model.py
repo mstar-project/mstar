@@ -37,8 +37,11 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
 )
+from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.model.base import ForwardPassArgs
 from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
-from mstar.model.keys import KV_CACHE, ROPE
+from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
 from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
 from mstar.model.submodule_base import NodeSubmodule
@@ -66,6 +69,8 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # The reference pipeline extracts mel features with the
     # whisper-large-v3 processor (not from the higgs checkpoint).
     WHISPER_PROCESSOR_ID = "openai/whisper-large-v3"
+    # every request carries its one clip
+    TEXT_PROMPTS = False
 
     def __init__(
         self,
@@ -85,9 +90,6 @@ class HiggsAudioModel(MultimodalDecoderModel):
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         pad = self.config.audio_in_token_idx
         self.media = (MediaIntake("audio", audio_encoder(pad), pad, self._audio_intake),)
-        # the reference transcribe.py decodes greedily, and the checkpoint's
-        # generation_config.json sets no sampling knob
-        self.sampling_defaults = {"temperature": 0.0, **self.sampling_defaults}
 
     # -------------------------------------------------------------------
     # Resources
@@ -134,7 +136,28 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
 
     def max_input_files(self) -> dict[str, int]:
-        return {**super().max_input_files(), "audio": 1}
+        return {"audio": 1}
+
+    def intake(self, prompt, input_modalities, tensors=None, prompt_parts=None, **kwargs):
+        # the reference prompt has a place for the one clip only: other
+        # attachments are ignored, as they always were
+        keep = {TEXT, "audio"}
+        return super().intake(
+            prompt, [m for m in input_modalities if m in keep], tensors,
+            None if prompt_parts is None else [p for p in prompt_parts if p.modality in keep], **kwargs,
+        )
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        # the request knobs higgs has always read; the rest are ignored, as before
+        model_kwargs = model_kwargs or {}
+        return {SAMPLER: SamplingReqConfig(
+            # Reference eval decodes greedily (do_sample=False).
+            temperature=model_kwargs.get("temperature", 0.0),
+            top_p=model_kwargs.get("top_p", 1.0),
+            ignore_eos=model_kwargs.get("ignore_eos", False),
+        )}
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
@@ -268,4 +291,4 @@ class HiggsAudioModel(MultimodalDecoderModel):
             (mapped, v) for k, v in weights if (mapped := self._llm_remap(k)) is not None
         )
         llm.eval()
-        return HiggsAudioLLMSubmodule(llm, self.config, self.encoders)
+        return HiggsAudioLLMSubmodule(llm, self.config, self.encoders, text_prompts=self.TEXT_PROMPTS)

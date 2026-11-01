@@ -125,10 +125,15 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         model: torch.nn.Module,
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
+        text_prompts: bool = True,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
-        them; a text-only node passes none."""
+        them; a text-only node passes none. ``text_prompts`` is the model's
+        `MultimodalDecoderModel.TEXT_PROMPTS`: without it there is no text-only
+        prefill walk, so nothing captures one or a mixed step."""
         super().__init__()
+        if not text_prompts:
+            self.PREFILL_WALK = None
         self.model = model
         self.config = config
         # read once: a config may build the set on every access
@@ -191,14 +196,16 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 },
             )
 
-        configs = [
+        configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk=self.DECODE_WALK,
                 single_request_inputs=ids(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile_mode=self.COMPILE_MODE,
             ),
-            PackedAcceleratorGraphConfig(
+        ]
+        if self.PREFILL_WALK is not None:
+            configs += [PackedAcceleratorGraphConfig(
                 capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
@@ -213,8 +220,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.COMPILE_MODE,
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
-            ),
-        ]
+            )]
         if self._encoders:
             walks = media_walk_names(self._encoders)
             # one capture every media walk replays
