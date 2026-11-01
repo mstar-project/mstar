@@ -27,11 +27,10 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import Model, WalkStep
 from mstar.model.kokoro.config import (
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
@@ -190,45 +189,19 @@ class KokoroModel(Model):
             SPEED: [torch.tensor([speed], dtype=torch.float32)],
         }
 
-    # -- conductor state machine -------------------------------------------
+    # -- walk plan ---------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        del partition_name, model_kwargs
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=SYNTH_WALK,
-            is_prefill=True,
-        )
-        inputs = []
-        for name in (PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED):
-            edge = GraphEdge(next_node=SYNTH_NODE, name=name)
-            edge.tensor_info = input_signals.get(name, [])
-            inputs.append(edge)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
-            request_done="audio" not in output_modalities,
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """The single walk synthesizes every chunk; when it returns, the request is done."""
-        del partition_name, persist_signals, incoming_connections
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The single walk synthesizes every chunk (``process_prompt`` refuses a
+        request that asks for no audio)."""
+        return [WalkStep(SYNTH_WALK)]
 
     # -- output ------------------------------------------------------------
 
