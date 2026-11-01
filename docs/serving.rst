@@ -383,7 +383,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
        ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold`` and
        ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto``, ``always`` or a CPU number, and ``idle_hold``
+       ``auto``, the default, ``off``, ``always`` or a CPU number, and ``idle_hold``
        ``off``, the default, or ``qos``; see :ref:`host-idle`). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see

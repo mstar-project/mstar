@@ -497,7 +497,7 @@ Worker scheduling
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
    * - ``MSTAR_STEP_THREAD_CORE``
-     - config's ``knobs: step_thread_core``, else ``off``
+     - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads together, and the API
        server's message thread and Rust frontend bridge on a CPU of their own.
        A step hands work between the three worker threads several times and

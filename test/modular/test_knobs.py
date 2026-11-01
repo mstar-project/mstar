@@ -47,7 +47,7 @@ def test_the_in_graph_sampler_scatter_is_on_by_default(monkeypatch):
 
 
 def test_step_thread_core_from_the_config_and_the_environment(monkeypatch):
-    assert knobs.step_thread_core() == "off"
+    assert knobs.step_thread_core() == "auto"
     # yaml reads a bare off as False
     for value, expected in ((False, "off"), (True, "auto"), ("auto", "auto"), ("always", "always"), ("OFF", "off"),
                             (12, 12)):

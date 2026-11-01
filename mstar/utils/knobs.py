@@ -203,13 +203,13 @@ def pre_plan_enabled() -> bool:
 
 
 def step_thread_core() -> str | int:
-    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``off``):
+    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``auto``):
     pin each worker's main, GPU and plan threads, and the API server's result
     threads, to CPUs of their own. ``auto`` pins where the host's idle states
     are deep enough to pay for it and places them by the GPU's rank on its
     NUMA node, ``always`` places them the same way on any host, a number is
     the first worker's CPU (see ``mstar.utils.cpus``)."""
-    value = _setting("step_thread_core", "off").strip().lower()
+    value = _setting("step_thread_core", "auto").strip().lower()
     if value in ("auto", "always", "off"):
         return value
     if value.isdigit():
