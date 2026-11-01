@@ -1,0 +1,41 @@
+model: "personaplex"
+
+# One temporal forward per 80 ms frame: voice embeddings + 12 silence frames +
+# persona tokens + user frames. NVIDIA's 3000-slot ring KV equals dense causal
+# attention for at most 2999 forwards, so requests beyond that are rejected.
+max_seq_len: 2999
+
+# A full-length request holds ceil(2999 / 128) = 24 KV pages, so 5 of them and
+# the pool's reserved sink page take 121 of the 128 pages below (checked at
+# startup). Requests over the cap wait in the conductor rather than failing.
+max_concurrent_requests: 5
+
+resources:
+  lm_kv:
+    # 32 layers x 32 heads x 128 dims x K+V x bf16 = 512 KiB per token, so
+    # 128 pages x 128 tokens = 8 GiB of KV next to the ~17 GB of weights.
+    page_size: 128
+    max_num_pages: 128
+
+model_kwargs:
+  # Directory of extracted .pt voice presets. null fetches the gated repo's
+  # voices.tgz into the Hugging Face cache and extracts it beside the archive,
+  # as NVIDIA's offline.py does. Requests name a preset with
+  # model_kwargs["voice"] (for example "NATF2").
+  voice_dir: null
+  # Requests the LM runs together in one step (bounded above by
+  # max_concurrent_requests). 1 runs each request alone.
+  max_batch_size: 8
+
+# Single GPU: every node on rank 0.
+node_groups:
+  - node_names:
+      - MimiEncoder
+      - MimiDecoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LM
+    ranks:
+      - 0
