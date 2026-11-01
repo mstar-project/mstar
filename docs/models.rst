@@ -184,8 +184,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        store, a pool reserved at startup (``resources: dit_kv: pool_tokens``, 64800 tokens =
        11.1 GiB by default) in which each rollout takes exactly its own size: 4.7 GiB at 464x832,
        11.1 GiB at 720x1280. ``max_concurrent_requests`` (1 in the shipped configs) sets how many
-       rollouts run at once; one that doesn't fit in the pool waits for room, which counts
-       against the request timeout. Each resident rollout takes its turn on the GPU: on one H100 a 400x976 chunk (16 frames)
+       rollouts run at once; one that doesn't fit in the pool waits for room, in arrival order,
+       which counts against the request timeout, and one larger than the pool is refused. Each resident rollout takes its turn on the GPU: on one H100 a 400x976 chunk (16 frames)
        takes about 0.95 s, so a second rollout there halves each one's rate below 16 fps
        playback. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's

@@ -87,6 +87,21 @@ class ChunkSpans(NamedTuple):
     position: RollingPosition
 
 
+def rolling_extent(
+    cfg: LingBotWorldConfig, image_hw: tuple[int, int], num_latent_frames: int | None = None,
+) -> tuple[int, int]:
+    """A rollout's rolling K/V per layer, ``(sink, window)`` in tokens, at the
+    output size ``image_hw``. ``num_latent_frames`` is needed only without a
+    window, where the K/V keep the whole rollout."""
+    lat_h, lat_w = image_hw[0] // cfg.vae_stride[1], image_hw[1] // cfg.vae_stride[2]
+    frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
+    if cfg.local_attn_size > -1:
+        return cfg.sink_size * frame_seqlen, (cfg.local_attn_size - cfg.sink_size) * frame_seqlen
+    if num_latent_frames is None:
+        raise ValueError("without a window, the rolling K/V extent needs the rollout's num_latent_frames")
+    return 0, num_latent_frames * frame_seqlen
+
+
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
     """The reference's ``[4, lat_f, lat_h, lat_w]`` I2V mask: the first video
     frame is known, repeated over the first latent's four temporal slots."""
@@ -279,14 +294,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
         chunk_tokens = cfg.chunk_size * frame_seqlen
         written = chunk * chunk_tokens
-        if cfg.local_attn_size > -1:
-            sink = cfg.sink_size * frame_seqlen
-            trailing = (cfg.local_attn_size - cfg.sink_size) * frame_seqlen
-        else:
-            # keep every frame: the window is the whole rollout
-            if num_latent_frames is None:
-                raise ValueError("without a window, chunk_spans needs the rollout's num_latent_frames")
-            sink, trailing = 0, num_latent_frames * frame_seqlen
+        sink, trailing = rolling_extent(cfg, image_hw, num_latent_frames)
         return ChunkSpans(
             chunk=chunk_tokens,
             window=attended_frames(cfg, chunk) * frame_seqlen,

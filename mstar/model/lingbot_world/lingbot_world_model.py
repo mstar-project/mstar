@@ -32,8 +32,8 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
-from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec, ResourceReqConfig
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
@@ -45,7 +45,14 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import DIT_ATTN, DIT_KV, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.lingbot_world.submodules import (
+    DIT_ATTN,
+    DIT_KV,
+    ROLLOUT_LOOP_NAME,
+    ROLLOUT_WALK,
+    LingBotDitSubmodule,
+    rolling_extent,
+)
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -321,12 +328,16 @@ class LingBotWorldModel(Model):
             if not input_signals.get(name):
                 raise ValueError(f"LingBot-World is missing its {name!r} input; process_prompt emits it.")
         lat_f = int(input_signals["camera_poses"][0].dims[0])
+        height, width = input_signals["image_inputs"][0].dims[1:]
         metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=_SCHEDULE[0],
             is_prefill=True,
-            kwargs={"walk_step": 0, "num_latent_frames": lat_f},
+            kwargs={
+                "walk_step": 0, "num_latent_frames": lat_f,
+                "dit_kv_tokens": sum(rolling_extent(self.config, (int(height), int(width)), lat_f)),
+            },
         )
         inputs = self._walk_inputs(_SCHEDULE[0], input_signals)
         return ForwardPassArgs(
@@ -335,6 +346,18 @@ class LingBotWorldModel(Model):
             unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
             step_metadata=self._step_metadata(metadata),
         )
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """The rollout's rolling K/V, declared up front so it waits in the engine's
+        queue for room in the pool, and a size the pool can never hold is a 400."""
+        del model_kwargs
+        for fwd in partition_fwd_args.values():
+            tokens = fwd.full_metadata.kwargs.get("dit_kv_tokens")
+            if tokens is not None:
+                return {DIT_KV: RollingKVReqConfig(tokens=int(tokens))}
+        return {}
 
     def get_partition_forward_pass_args(
         self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,

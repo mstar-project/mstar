@@ -17,7 +17,7 @@ and StreamBufferManager._rids (purged by remove_request), the engine's and
 tensor manager's per-request state (including ChunkingManagement.prepared),
 RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,
 _unkeyed, _admit_restores, _admit_snaps} and RollingKVManager.{_requests,
-_admit_taken} (purged by remove_request), and
+_admit_taken, _wants, _reserved} (purged by remove_request), and
 WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a

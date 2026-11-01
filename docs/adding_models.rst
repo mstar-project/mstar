@@ -1099,9 +1099,12 @@ The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. A request
 contiguous region of exactly its sink plus window at its first step (first fit) and gives it
 back when it ends, so requests of different sizes share the pool instead of each holding
 the largest. When no free gap holds a new request but the free tokens do, the resident
-regions slide left to join the gaps, a copy of what they hold, between steps. A request that
-doesn't fit is refused with ``AllocationFailed`` and the worker holds it until a region
-frees; one larger than the whole pool fails. How many requests run at once is the
+regions slide left to join the gaps, a copy of what they hold, between steps. A model that
+returns a ``RollingKVReqConfig(tokens=sink + window)`` from ``get_request_resource_configs``
+gets the engine's admission queue: a request waits, in arrival order, until the pool has
+its room, which is then set aside for it, and one larger than the whole pool is a 400 at
+the conductor. Without one, a request that doesn't fit is refused with ``AllocationFailed``
+and retried until a region frees. How many requests run at once is the
 deployment's ``max_concurrent_requests``, not the store's. A step that declares this store
 runs eager (no capture yet), and it does not shard across ranks yet.
 
