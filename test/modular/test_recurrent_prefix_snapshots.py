@@ -179,7 +179,7 @@ def test_a_full_set_evicts_the_oldest_snapshot_nothing_holds():
     # b leases a@8, the oldest, so the next save takes c@8
     assert _probe(pool, "b", A[:12], hit=8).tokens == 8
     assert pool._reserve_snapshot() != held
-    assert pool._snap_meta[held] in pool._snap_by_key
+    assert pool._snap_meta[held][0] in pool._snap_by_key
     assert len(pool._snap_by_key) == 1
 
 
@@ -707,7 +707,8 @@ def test_a_decode_never_evicts_the_snapshot_a_prompt_restored_in_the_same_step()
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
     pool.commit(step, ctx)
-    assert pool._snap_meta.get(restored) == pool._kv.chain_key("a", "main", 2), "r's decode evicted b's restore"
+    filed = (pool._kv.chain_key("a", "main", 2), False)
+    assert pool._snap_meta.get(restored) == filed, "r's decode evicted b's restore"
 
 
 def _answered(pool: RecurrentStatePool, rid: str, prompt: list[int], reply: list[int]) -> None:
@@ -729,6 +730,17 @@ def test_a_full_pool_keeps_a_prompt_per_slot_though_every_reply_files_a_snapshot
         _answered(pool, f"p{i}", prompt, [100 * i + 50 + j for j in range(4)])
     for i, prompt in enumerate(prompts):
         assert _probe(pool, f"again{i}", prompt, hit=8).tokens == 8, f"prompt {i}'s snapshot was evicted for a reply's"
+
+
+def test_a_prompt_filed_where_a_replaced_reply_snapshot_was_is_evicted_after_the_newer_reply():
+    """A reply's snapshot that a newer one replaced leaves nothing marking its
+    slot a reply's for a prompt's snapshot filed there next."""
+    pool = _pool(prefix_slots=2)
+    _reply(pool, "r")
+    _decode(pool, "r", 5)  # files a snapshot at 4, then one at 8 that replaces it
+    newer = pool._decode[("r", "main")].slot
+    _snapshot(pool, "a", [5] * 20, 8, 1.0)
+    assert pool._reserve_snapshot() == newer, "eviction took a prompt's snapshot for a reply's"
 
 
 def test_a_reply_snapshot_that_served_a_prompt_is_kept_like_a_prompts():
