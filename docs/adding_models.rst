@@ -1948,7 +1948,9 @@ that a misspelled setting is never silently ignored:
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
+     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
+       ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
+       slot for a request is refused at startup.
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
