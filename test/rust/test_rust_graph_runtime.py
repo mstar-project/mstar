@@ -539,7 +539,7 @@ def test_pop_with_check_ready_is_all_or_nothing(runtime):
 def test_pop_of_an_unknown_node_raises(runtime):
     """Not None: nothing in the deployment runs this pair, and returning None
     would have the scheduler read a structural error as "not ready yet" and
-    retry the row forever. PythonGraphRuntime has always raised here."""
+    retry the row forever."""
     with pytest.raises(RuntimeError):
         runtime.pop_rids("nope", WALK, [])
 

@@ -1,10 +1,9 @@
-"""The Rust and Python runtimes must answer identically.
+"""What the graph runtime answers, through whole sequences of calls.
 
-The strongest check available: drive both through the same sequence and
-compare every answer. A divergence here is silent in production -- a request
-scheduled on one and not the other, or a refcount that differs by one -- so
-the value is in running the SAME script against both rather than asserting
-hand-written expectations twice.
+A wrong answer here is silent in production -- a request that is never
+scheduled, or a refcount off by one -- so each sequence asserts the concrete
+state a worker would act on. These started as two-runtime comparisons, which
+is why the graphs are shaped after real models' worker graphs.
 """
 import sys
 
@@ -13,13 +12,11 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
-from mstar.communication.tensors import TensorCommunicationManager
+from mstar.communication.tensor_store import TensorStore
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RequestWalks, RouteInput, SpeculationPrepInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph, _divide_into_worker_graphs
 from mstar.utils.containers import ParallelList
@@ -80,63 +77,8 @@ def _graph():
     ])
 
 
-class _StubTensorManager:
-    """Just enough of TensorCommunicationManager, with its own refcount
-    methods: the Python runtime settles and tears down through the manager,
-    so the harness must do what production does -- a hand-rolled copy would
-    only test itself."""
-
-    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
-    set_persist = TensorCommunicationManager.set_persist
-    dereference = TensorCommunicationManager.dereference
-    dereference_batch = TensorCommunicationManager.dereference_batch
-    dereference_batch_uniform = (
-        TensorCommunicationManager.dereference_batch_uniform
-    )
-    cleanup_collectable = TensorCommunicationManager.cleanup_collectable
-
-    def __init__(self, bookkeeping):
-        self.tensor_store = TensorStore(bookkeeping=bookkeeping)
-
-    def increment_ref(self, uuid, n=1):
-        self.tensor_store.increment_ref(uuid, n=n)
-
-    def get_tensor(self, uuid):
-        return self.tensor_store.get_tensor(uuid)
-
-    def _cleanup_by_uuid(self, uuid, registered=None):
-        # The transport half is shm files and registered memory, which this
-        # harness has none of; what is left is dropping the record, as
-        # remove_tensor does. A tensor put into the bookkeeper alone is not in
-        # the store, so it is forgotten directly -- unless a batched
-        # dereference (``registered`` given) already forgot it.
-        if self.tensor_store.check_uuid_presence(uuid):
-            self.tensor_store.remove_tensor(uuid)
-        elif registered is None:
-            self.tensor_store.bookkeeping.forget_tensor(uuid)
-
-
 def _sharding():
     return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
-
-
-def _python():
-    book = PythonTensorBookkeeping()
-    tm = _StubTensorManager(book)
-    wg = WorkerGraph(
-        section=_graph(), graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
-    )
-    rt = PythonGraphRuntime(
-        my_worker_id=WORKER, my_worker_graphs=[wg],
-        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
-        all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
-        all_wg_ids_to_nodes={WG_ID: NODES},
-        node_to_partition=dict.fromkeys(NODES, "default"),
-        sharding_config=_sharding(),
-        tensor_manager=tm,
-        communicator=None,
-    )
-    return rt, book, tm.tensor_store
 
 
 def _rust():
@@ -156,12 +98,11 @@ def _rust():
     return rt, book, None
 
 
-@pytest.fixture(params=["python", "rust"])
-def pair(request):
-    """(runtime, bookkeeping, store). The store is only read by the Python
-    runtime -- Rust holds a share of the bookkeeper and ignores the
-    argument -- but both are handed it so the sequences stay identical."""
-    return _python() if request.param == "python" else _rust()
+@pytest.fixture
+def pair():
+    """(runtime, bookkeeping, store). The runtime holds a share of the
+    bookkeeper and needs no store, so that slot is None."""
+    return _rust()
 
 
 def _info(uuid):
@@ -188,19 +129,14 @@ def _spec(signal, node, uuids=()):
 
 
 def _released(book, uuid) -> bool:
-    """The reference is gone, however the runtime got there.
-
-    Python dereferences through the tensor manager, which tears the tensor
-    down as it goes and leaves a collectable record. Rust hands the uuid back
-    for the caller to tear down and drops the record in the same pass, and an
-    untracked uuid is never "collectable" -- so can_gc alone reads as a leak
-    on one side and a release on the other.
-    """
+    """The reference is gone. The runtime hands the uuid back for the caller
+    to tear down and drops the record in the same pass, and an untracked uuid
+    is never "collectable", so can_gc alone reads as a leak."""
     return book.get_info(uuid) is None or book.can_gc(uuid)
 
 
 def _ready(rt):
-    """Normalised so the two orderings compare."""
+    """Normalised to compare against a sorted expectation."""
     return sorted(
         (r.node_name, r.graph_walk, sorted(r.rids))
         for r in rt.get_ready_nodes(set())
@@ -231,7 +167,7 @@ def test_admit_ingest_schedule(pair):
     assert _ready(rt) == []
 
 
-def test_structural_lookups_agree(pair):
+def test_structural_lookups(pair):
     rt, _book, _store = pair
     assert rt.get_worker_graph_id_for_node("prefill", WALK) == WG_ID
     assert rt.get_output_signals("prefill", WALK) == ["kv_cache", "token"]
@@ -246,13 +182,12 @@ def test_structural_lookups_agree(pair):
     [("no_such_node", WALK), ("prefill", "no_such_walk")],
     ids=["unknown_node", "unknown_walk"],
 )
-def test_popping_a_pair_no_worker_graph_runs_raises_in_both(pair, node, walk):
+def test_popping_a_pair_no_worker_graph_runs_raises(pair, node, walk):
     """A (node, walk) nothing in the deployment runs is a structural error.
 
-    Rust used to fold it into the same None that means "not ready yet", so the
+    It used to fold into the same None that means "not ready yet", so the
     scheduler read a bad pair as a row to retry and came back forever instead
-    of failing. Python raised here all along; AUTO prefers Rust, so the silent
-    side was the one that actually ran.
+    of failing.
     """
     rt, _book, _store = pair
     with pytest.raises(RuntimeError):
@@ -267,7 +202,7 @@ def test_popping_an_unready_rid_is_still_not_an_error(pair):
     assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is None
 
 
-def test_refusals_agree(pair):
+def test_refusals(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
     # unknown node, an input the node does not take, unknown rid
@@ -316,7 +251,7 @@ def test_one_handle_per_request_across_partitions(pair):
     ) == handles[0]
 
 
-def test_handle_recycling_agrees(pair):
+def test_handle_recycling(pair):
     rt, _book, _store = pair
     rid = _admit(rt, "r1")
     rt.remove_request(rid)
@@ -326,7 +261,7 @@ def test_handle_recycling_agrees(pair):
     assert rt.get_rid_string(rid) == "r2"
 
 
-def test_speculation_agrees(pair):
+def test_speculation_targets(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
     out = _spec_targets(rt, "prefill", WALK, rid)
@@ -341,7 +276,7 @@ def test_speculation_agrees(pair):
     assert _ready(rt) == []
 
 
-def test_loop_iters_agree(pair):
+def test_loop_iters(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
     got = rt.get_dynamic_loop_iters([rid], "default")
@@ -367,28 +302,23 @@ def _decode_graph():
     ])
 
 
-@pytest.fixture(params=["python", "rust"])
-def decode(request):
+@pytest.fixture
+def decode():
     wg = WorkerGraph(
         section=_decode_graph(), graph_walks={WALK}, ranks=[0],
         worker_graph_id=WG_ID,
     )
-    common = dict(
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
         all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
         all_wg_ids_to_nodes={WG_ID: NODES},
         node_to_partition=dict.fromkeys(NODES, "default"),
         sharding_config=_sharding(),
+        bookkeeping=book,
     )
-    if request.param == "python":
-        book = PythonTensorBookkeeping()
-        rt = PythonGraphRuntime(
-            tensor_manager=_StubTensorManager(book), communicator=None, **common,
-        )
-        return rt, book
-    book = RustTensorBookkeeping()
-    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book
+    return rt, book
 
 
 def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
@@ -456,7 +386,7 @@ def test_speculation_stops_at_the_cap(decode):
     assert speculated == [True, False]
 
 
-def test_routing_agrees(pair):
+def test_routing(pair):
     rt, book, store = pair
     rid = _admit(rt)
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
@@ -482,9 +412,8 @@ def test_routing_agrees(pair):
     assert not book.can_gc(2)
 
 
-def test_partition_idle_agrees(pair):
-    """A producer-triggered partition changes walk only when idle, so both
-    runtimes must agree on what idle is."""
+def test_partition_idle(pair):
+    """A producer-triggered partition changes walk only when idle."""
     rt, book, _store = pair
     rid = _admit(rt)
     assert rt.is_partition_idle(rid, "default")
@@ -511,7 +440,7 @@ def test_partition_idle_agrees(pair):
     assert not rt.is_partition_idle(rid, "default")
 
 
-def test_prep_agrees(pair):
+def test_prep(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
@@ -562,7 +491,7 @@ def test_a_loop_a_peer_stopped_is_not_speculated(pair):
     assert out.ready_rids == [], "the runtime would speculate an iteration of a loop a peer stopped"
 
 
-def test_cleanup_agrees(pair):
+def test_cleanup(pair):
     rt, book, store = pair
     rid = _admit(rt)
     book.put_tensor(5, _info(5))
@@ -581,9 +510,9 @@ def test_cleanup_agrees(pair):
 # --- who reclaims a freed input ----------------------------------------------
 #
 # Dropping the last reference is half of it. The shm file, the arena slot and
-# the registered memory belong to the tensor manager, and the two runtimes
-# reach it differently -- so the contract is "tell the caller what it still
-# has to tear down", and only one of them has anything to say.
+# the registered memory belong to the tensor manager, which the runtime never
+# touches -- so the contract is "tell the caller what it still has to tear
+# down".
 
 def _consume_one_input(rt, book, uuid=7):
     rid = _admit(rt)
@@ -607,16 +536,6 @@ def test_rust_names_the_inputs_it_freed():
     assert freed.uuids == [7]
     assert freed.registered == [True], "the teardown has to know to unregister"
     assert book.get_info(7) is None, "forgotten in the same pass, not a second one"
-
-
-def test_python_tears_a_freed_input_down_in_place():
-    """It was built with the tensor manager and dereferences through it, so
-    the teardown already ran and the caller is owed nothing."""
-    rt, book, _store = _python()
-    freed = _consume_one_input(rt, book)
-
-    assert freed == ([], [])
-    assert book.get_info(7) is None, "still released, just by the other route"
 
 
 def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
@@ -707,10 +626,10 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
 ])
 def test_a_stale_handle_never_panics(pair, call):
     """A handle can outlive its request: a message for a rid this rank already
-    removed is a benign race the Python side has always tolerated.
+    removed is a benign race.
 
-    On the Rust side an unchecked index panics ACROSS the FFI boundary, which
-    is far worse than an exception -- so every entry point is checked.
+    An unchecked index panics ACROSS the FFI boundary, which is far worse than
+    an exception -- so every entry point is checked.
     """
     rt, _book, _store = pair
     _admit(rt)  # so the tables are non-empty and a bad index is really out of range
@@ -791,9 +710,7 @@ def test_whoever_frees_a_consumed_input_names_it(pair, cleanup_first):
 
     named = cleanup() + route() if cleanup_first else route() + cleanup()
 
-    # Python tears it down in place through the tensor manager and names
-    # nothing; Rust cannot, so it must.
-    assert named == ([] if hasattr(rt, "_queues") else [100])
+    assert named == [100]
 
 
 def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
@@ -820,10 +737,7 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
         )
         rt.remove_request(rid)  # aborted before the send
 
-    parked = (
-        len(rt._completions) if hasattr(rt, "_completions")
-        else rt._rust.num_parked_completions()
-    )
+    parked = rt._rust.num_parked_completions()
     assert parked == 0, f"{parked} completions left parked"
 
 
@@ -859,38 +773,30 @@ def _graph_opts_out(node_name: str):
     ])
 
 
-def _opted_out(runtime_type: str, node_name: str):
+def _opted_out(node_name: str):
     wg = WorkerGraph(
         section=_graph_opts_out(node_name), graph_walks={WALK}, ranks=[0],
         worker_graph_id=WG_ID,
     )
-    common = dict(
+    return rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
         all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
         all_wg_ids_to_nodes={WG_ID: NODES},
         node_to_partition=dict.fromkeys(NODES, "default"),
         sharding_config=_sharding(),
-    )
-    if runtime_type == "python":
-        book = PythonTensorBookkeeping()
-        return PythonGraphRuntime(
-            tensor_manager=_StubTensorManager(book), communicator=None,
-            **common,
-        )
-    return rust_runtime.RustGraphRuntime(
-        bookkeeping=RustTensorBookkeeping(), **common,
+        bookkeeping=RustTensorBookkeeping(),
     )
 
 
-@pytest.fixture(params=["python", "rust"])
-def opted_out(request):
-    return _opted_out(request.param, "ar_decode")
+@pytest.fixture
+def opted_out():
+    return _opted_out("ar_decode")
 
 
-@pytest.fixture(params=["python", "rust"])
-def source_opted_out(request):
-    return _opted_out(request.param, "prefill")
+@pytest.fixture
+def source_opted_out():
+    return _opted_out("prefill")
 
 
 def test_a_source_that_refuses_async_speculates_nothing(source_opted_out):
@@ -903,21 +809,21 @@ def test_a_source_that_refuses_async_speculates_nothing(source_opted_out):
 def test_a_target_that_refuses_async_is_never_speculated(opted_out):
     """``enable_async_scheduling=False`` on the DESTINATION.
 
-    Rust only consulted the source's flag, and the source is already filtered
-    by the caller -- so the real check was missing and a node that opted out
-    got speculated into, to be dropped again per rid.
+    Only the source's flag used to be consulted, and the source is already
+    filtered by the caller -- so the real check was missing and a node that
+    opted out got speculated into, to be dropped again per rid.
     """
     rid = _admit(opted_out)
     assert _spec_targets(opted_out, "prefill", WALK, rid) == []
 
 
-def test_the_per_request_sharding_config_agrees(pair):
+def test_the_per_request_sharding_config(pair):
     """``register_request`` and the TP fan-out paths need the Python object.
 
     Rust derives its own copy for routing, but that one cannot come back out,
     so the shim derives a second from the same input by the same rule. This
-    pins them together -- and that the config is dropped on removal, since
-    handles are recycled.
+    pins that the config exists -- and is dropped on removal, since handles
+    are recycled.
     """
     rt, _book, _store = pair
     rid = _admit(rt)
@@ -931,16 +837,16 @@ def test_the_per_request_sharding_config_agrees(pair):
 
 
 def test_an_unknown_rid_has_no_sharding_config(pair):
-    # Teardown and TP fan-out can race a removal; both runtimes answer None
-    # rather than raising.
+    # Teardown and TP fan-out can race a removal, so this is None rather than
+    # a raise.
     rt, _book, _store = pair
     assert rt.get_sharding_config(9999) is None
 
 
 # --- a worker graph completes many times over one request --------------------
 
-@pytest.fixture(params=["python", "rust"])
-def one_node(request):
+@pytest.fixture
+def one_node():
     """A worker graph whose single node finishes it in one completion.
 
     The main fixture runs each request through exactly one pass, so it cannot
@@ -961,13 +867,6 @@ def one_node(request):
         node_to_partition={"only": "default"},
         sharding_config=_sharding(),
     )
-    if request.param == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        rt = PythonGraphRuntime(
-            tensor_manager=tm, communicator=None, **common,
-        )
-        return rt, book, tm.tensor_store
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
@@ -1016,8 +915,8 @@ def test_a_worker_graph_completes_on_every_pass_not_just_the_first(one_node):
 
 # --- a tensor read by N workers needs N references ---------------------------
 
-@pytest.fixture(params=["python", "rust"])
-def two_consumers(request):
+@pytest.fixture
+def two_consumers():
     """One local node whose output goes to a node owned by TWO workers.
 
     Every other fixture puts a single worker on each node, so an edge and a
@@ -1044,23 +943,16 @@ def two_consumers(request):
             tp_enabled_nodes=set(), shard_dim={},
         ),
     )
-    if request.param == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        return (
-            PythonGraphRuntime(tensor_manager=tm, communicator=None, **common),
-            book, tm.tensor_store,
-        )
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
 
 def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
-    """Rust counted one reference per EDGE, Python one per destination WORKER.
+    """One reference per destination WORKER, not per edge.
 
     The per-worker expansion happens later, in take_send_plan, so the count
-    was settled before the fanout existed. With two readers the hold drops to
-    1 and the first release frees a tensor the other is still reading.
+    has to be settled for the fanout up front. With two readers a hold of 1
+    means the first release frees a tensor the other is still reading.
     """
     rt, book, store = two_consumers
     # "remote" runs on two workers for this request.
@@ -1096,10 +988,8 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
 # --- a loop split across workers ---------------------------------------------
 
 @pytest.fixture(params=[
-    pytest.param(("python", ["worker_1"]), id="python-peer"),
-    pytest.param(("rust", ["worker_1"]), id="rust-peer"),
-    pytest.param(("python", [WORKER]), id="python-sibling"),
-    pytest.param(("rust", [WORKER]), id="rust-sibling"),
+    pytest.param(["worker_1"], id="peer"),
+    pytest.param([WORKER], id="sibling"),
 ])
 def split_loop(request):
     """One loop whose body spans two worker graphs, as BAGEL's CFG-parallel
@@ -1108,7 +998,7 @@ def split_loop(request):
     branches get their first ``latents``, and runs on a peer (over the wire)
     or in a sibling worker graph on this worker.
     The runtime under test is this worker's."""
-    kind, step_workers = request.param
+    step_workers = request.param
     loop = Loop(
         name="L", max_iters=3, outputs=[],
         section=Sequential(sections=[
@@ -1134,11 +1024,6 @@ def split_loop(request):
         node_to_partition={"combine": "default", "step": "default"},
         sharding_config=_sharding(),
     )
-    if kind == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
-                                   **common), book, step_workers)
     book = RustTensorBookkeeping()
     return (rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book,
             step_workers)
@@ -1197,8 +1082,8 @@ def test_the_last_iteration_sends_no_loop_back_to_another_worker_graph(split_loo
 def test_a_batch_of_three_routes_and_stays_schedulable(pair):
     """Every other case admits one rid, so nothing exercises a real batch.
 
-    Drives three requests through prefill together, then checks both runtimes
-    agree on what became ready and that each request can run again.
+    Drives three requests through prefill together, then checks what became
+    ready and that each request can run again.
     """
     rt, book, store = pair
     rids = [_admit(rt, f"r{i}") for i in range(3)]
@@ -1275,20 +1160,19 @@ def test_a_batch_completes_every_request_not_just_the_first(pair):
 
 # --- a walk transition, which is the whole of a text-to-text request ----------
 
-@pytest.fixture(params=["python", "rust"])
-def two_walks(request):
-    return _two_walks(request.param)
+@pytest.fixture
+def two_walks():
+    return _two_walks()
 
 
-@pytest.fixture(params=["python", "rust"])
-def combined_two_walks(request):
+@pytest.fixture
+def combined_two_walks():
     return _two_walks(
-        request.param,
         combined_walk_of={("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"},
     )
 
 
-def _two_walks(kind, **extra):
+def _two_walks(**extra):
     """Two worker graphs, one per walk, both holding the same node.
 
     This is the t2t shape: prefill runs, the conductor advances the partition
@@ -1314,11 +1198,6 @@ def _two_walks(kind, **extra):
         sharding_config=_sharding(),
         **extra,
     )
-    if kind == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
-                                   **common), book, tm.tensor_store)
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
@@ -1480,8 +1359,8 @@ def test_a_batch_transitions_together(two_walks):
 
 # --- one walk spanning two LOCAL worker graphs (the i2t shape) ----------------
 
-@pytest.fixture(params=["python", "rust"])
-def two_local_graphs(request):
+@pytest.fixture
+def two_local_graphs():
     """``encoder`` and ``LLM`` in SEPARATE worker graphs on the SAME worker.
 
     BAGEL's prefill_vit is exactly this: vit_encoder is one graph, LLM is
@@ -1513,11 +1392,6 @@ def two_local_graphs(request):
         node_to_partition={"encoder": "default", "LLM": "default"},
         sharding_config=_sharding(),
     )
-    if request.param == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
-                                   **common), book, tm.tensor_store)
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
@@ -1559,8 +1433,8 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
     assert not book.can_gc(1), "freed while LLM's ready slot still names it"
 
 
-@pytest.fixture(params=["python", "rust"])
-def streams_to_sibling(request):
+@pytest.fixture
+def streams_to_sibling():
     """``LLM`` streams new_token into ``snac_decoder``, a SEPARATE local graph.
 
     Orpheus exactly: the producer and the streaming consumer are different
@@ -1592,11 +1466,6 @@ def streams_to_sibling(request):
         node_to_partition={"LLM": "default", "snac_decoder": "SNAC"},
         sharding_config=_sharding(),
     )
-    if request.param == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
-                                   **common), book, tm.tensor_store)
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
@@ -1730,10 +1599,9 @@ def test_the_follower_target_reports_the_same_signals(pair):
 
 
 def test_marking_in_flight_does_not_unready_the_node(pair):
-    """Python sets a flag that gates FUTURE ingests; it never withdraws a node
-    that is already ready. Rust folded `scheduled` into the readiness
-    predicate, so marking a node pulled it out of the ready set -- and
-    unmarking put it back."""
+    """The flag gates FUTURE ingests; it never withdraws a node that is already
+    ready. Folding `scheduled` into the readiness predicate pulled a marked
+    node out of the ready set -- and unmarking put it back."""
     rt, _book, _store = pair
     rid = _admit(rt)
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
@@ -1749,10 +1617,10 @@ def test_marking_in_flight_does_not_unready_the_node(pair):
 def test_push_back_re_readies_a_node_whose_inputs_were_consumed(pair):
     """``push_back_node`` puts a popped node back after an OOM hold.
 
-    Python adds the name back unconditionally. Rust recomputed readiness from
-    the current input slots, so a node whose inputs had already been cleared
-    -- which is the normal order, cleanup runs before the push back -- stayed
-    silently unready and the batch was lost.
+    The name goes back unconditionally. Recomputing readiness from the current
+    input slots left a node whose inputs had already been cleared -- which is
+    the normal order, cleanup runs before the push back -- silently unready,
+    and the batch was lost.
     """
     rt, _book, _store = pair
     rid = _admit(rt)
@@ -1802,8 +1670,6 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
     this flag skip nothing at all on Orpheus.)
     """
     rt, book, store = streams_to_sibling
-    if not hasattr(rt, "_rust"):
-        pytest.skip("flag is only computed by the rust runtime")
     rid = rt.add_request(
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
@@ -1828,13 +1694,12 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
 def test_a_node_missing_a_non_streaming_input_is_not_streaming_ready():
     """"Streaming-ready" means every MISSING input is a streaming one.
 
-    Python expressed this as ``input_names.issuperset(ready_names |
-    streaming_inputs)``, which is a tautology -- ready_names is asserted a
-    subset of input_names and streaming_inputs is one by construction, so the
-    union always is too. Every node with any input at all therefore read as
-    streaming-ready, and Rust mirrored it deliberately. This pins the fix on
-    both: ``ar_decode`` takes token and kv_cache, neither streaming, so one
-    arriving must NOT make it streaming-ready.
+    ``ReadySignals`` used to express this as ``input_names.issuperset(
+    ready_names | streaming_inputs)``, which is a tautology -- ready_names is
+    asserted a subset of input_names and streaming_inputs is one by
+    construction, so the union always is too. Every node with any input at all
+    therefore read as streaming-ready. ``ar_decode`` takes token and kv_cache,
+    neither streaming, so one arriving must NOT make it streaming-ready.
     """
     from mstar.graph.base import ReadySignals
 
@@ -1887,8 +1752,7 @@ NESTED_LOOPS = {"refine_loop", "denoise_loop"}
 
 
 def _nested_graph():
-    """``test/modular/test_graph.py::test_nested_loops``, which pins the
-    Python semantics."""
+    """``test/modular/test_graph.py::test_nested_loops``."""
     return Sequential(sections=[
         Loop(
             name="refine_loop", max_iters=2,
@@ -1917,8 +1781,8 @@ def _nested_graph():
     ])
 
 
-@pytest.fixture(params=["python", "rust"])
-def nested(request):
+@pytest.fixture
+def nested():
     wg = WorkerGraph(
         section=_nested_graph(), graph_walks={WALK}, ranks=[0],
         worker_graph_id=WG_ID,
@@ -1931,13 +1795,6 @@ def nested(request):
         node_to_partition=dict.fromkeys(NESTED_NODES, "default"),
         sharding_config=_sharding(),
     )
-    if request.param == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        rt = PythonGraphRuntime(
-            tensor_manager=tm, communicator=None, **common,
-        )
-        return rt, book, tm.tensor_store
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
@@ -2023,8 +1880,8 @@ def test_speculation_names_the_innermost_enclosing_loop(nested):
 # --- pop_rids honours the batch the caller committed to -----------------------
 
 def test_an_unchecked_pop_returns_every_rid_it_was_given(pair):
-    """``check_ready=False`` means readiness is already established. Rust
-    re-checked it and silently shortened the batch."""
+    """``check_ready=False`` means readiness is already established; re-checking
+    it silently shortened the batch."""
     rt, _book, _store = pair
     rid = _admit(rt)
     # Nothing ingested, so the node is not in the ready set.
@@ -2117,28 +1974,15 @@ _TP_COMMON = dict(
 )
 
 
-def _tp_pair(kind):
-    book = PythonTensorBookkeeping() if kind == "python" \
-        else RustTensorBookkeeping()
-    tm = _StubTensorManager(book)
-    if kind == "python":
-        rt = PythonGraphRuntime(
-            my_worker_id=WORKER, my_worker_graphs=_tp_graphs(),
-            sharding_config=_tp_sharding(), tensor_manager=tm,
-            communicator=None, **_TP_COMMON,
-        )
-    else:
-        rt = rust_runtime.RustGraphRuntime(
-            my_worker_id=WORKER, my_worker_graphs=_tp_graphs(),
-            sharding_config=_tp_sharding(), bookkeeping=book, **_TP_COMMON,
-        )
+@pytest.fixture
+def tp_pair():
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=_tp_graphs(),
+        sharding_config=_tp_sharding(), bookkeeping=book, **_TP_COMMON,
+    )
     rt.set_node_metadata({"dit"}, {"dit"}, set())
-    return rt, book, tm.tensor_store
-
-
-@pytest.fixture(params=["python", "rust"])
-def tp_pair(request):
-    return _tp_pair(request.param)
+    return rt, book, TensorStore(bookkeeping=book)
 
 
 def _drive_tp(rt, book, store, steps=8):
@@ -2196,9 +2040,9 @@ def test_a_peers_copy_does_not_feed_this_ranks_node(tp_pair):
 # --- a loop edge carries tensors earlier batches produced --------------------
 #
 # The batch that finishes a loop is not the batch that produced everything the
-# loop emits: ``accumulated_outputs`` gathers one tensor per iteration. Both
-# runtimes used to report the staging set as indices into the completing
-# batch's tensors, which dropped every earlier iteration -- nothing staged
+# loop emits: ``accumulated_outputs`` gathers one tensor per iteration. The
+# staging set used to be reported as indices into the completing batch's
+# tensors, which dropped every earlier iteration -- nothing staged
 # them, and the reader got a missing tensor for a request that then hung
 # (vjepa2 prefill_video_rollout with rollout_horizon > 1).
 
@@ -2224,16 +2068,14 @@ def _rollout_graph(accumulated_edge, max_iters=2):
     ])
 
 
-# Staging splits on `persist` -- the Rust runtime takes persist edges off the
-# node's own outputs BEFORE the fanout and stages them in their own pass, so
-# the two paths have to be covered separately or one of them keeps the bug.
-@pytest.fixture(params=[
-    ("python", True), ("python", False), ("rust", True), ("rust", False),
-], ids=["python-persist", "python-emit", "rust-persist", "rust-emit"])
+# Staging splits on `persist` -- persist edges come off the node's own outputs
+# BEFORE the fanout and are staged in their own pass, so the two paths have to
+# be covered separately or one of them keeps the bug.
+@pytest.fixture(params=[True, False], ids=["persist", "emit"])
 def rollout(request):
     """encode -> loop(step), with ``pred`` accumulated across iterations and
     emitted to the client all at once when the loop finishes."""
-    which, persist = request.param
+    persist = request.param
     wg = WorkerGraph(
         section=_rollout_graph(
             GraphEdge(name="pred", next_node=EMIT_TO_CLIENT, persist=persist),
@@ -2248,11 +2090,6 @@ def rollout(request):
         node_to_partition=dict.fromkeys(ROLL_NODES, "default"),
         sharding_config=_sharding(),
     )
-    if which == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTensorManager(book)
-        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
-                                   **common), book, tm.tensor_store)
     book = RustTensorBookkeeping()
     return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
 
@@ -2304,7 +2141,7 @@ def _admit_with_remote(rt, remote):
     )
 
 
-def _persisting_rollout(which, next_node, remote=False):
+def _persisting_rollout(next_node, remote=False):
     """``rollout`` with the accumulated edge persisted, as Whisper's decode
     loop persists its transcript for the alignment walk."""
     wg = WorkerGraph(
@@ -2319,14 +2156,8 @@ def _persisting_rollout(which, next_node, remote=False):
         node_to_partition={**dict.fromkeys(ROLL_NODES, "default"), "remote": "default"},
         sharding_config=_sharding(),
     )
-    if which == "python":
-        book = PythonTensorBookkeeping()
-        rt = PythonGraphRuntime(
-            tensor_manager=_StubTensorManager(book), communicator=None, **common,
-        )
-    else:
-        book = RustTensorBookkeeping()
-        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
     return rt, book, _admit_with_remote(rt, remote)
 
 
@@ -2351,12 +2182,11 @@ def _roll(rt, book, rid):
     return out
 
 
-@pytest.mark.parametrize("which", ["python", "rust"])
-def test_persisted_accumulated_outputs_outlive_the_client_read(which):
+def test_persisted_accumulated_outputs_outlive_the_client_read():
     """A later walk reads them through the conductor, so once the client has
     read the emitted copies, every iteration's tensor is still held by its
     persist mark, not only the last batch's."""
-    rt, book, rid = _persisting_rollout(which, EMIT_TO_CLIENT)
+    rt, book, rid = _persisting_rollout(EMIT_TO_CLIENT)
     _roll(rt, book, rid)
     for uuid in (2, 3):
         book.dereference(uuid, 1)  # the client's read
@@ -2365,19 +2195,17 @@ def test_persisted_accumulated_outputs_outlive_the_client_read(which):
     assert not _released(book, 3)
 
 
-@pytest.mark.parametrize("which", ["python", "rust"])
 @pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
-def test_persisted_accumulated_outputs_are_staged_for_a_remote_reader(which, remote):
+def test_persisted_accumulated_outputs_are_staged_for_a_remote_reader(remote):
     """Only the persist pass stages an EMPTY_DESTINATION edge: every
     iteration's tensor for a remote reader, none without one."""
-    rt, book, rid = _persisting_rollout(which, EMPTY_DESTINATION, remote)
+    rt, book, rid = _persisting_rollout(EMPTY_DESTINATION, remote)
     out = _roll(rt, book, rid)
     assert sorted(out.register_uuids) == ([2, 3] if remote else [])
 
 
-@pytest.mark.parametrize("which", ["python", "rust"])
 @pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
-def test_a_persisted_output_is_staged_only_for_a_remote_reader(which, remote):
+def test_a_persisted_output_is_staged_only_for_a_remote_reader(remote):
     """With every node on this worker, a later walk reads the state from this
     worker's own store, so staging it writes a file nobody opens."""
     section = GraphNode(
@@ -2398,14 +2226,8 @@ def test_a_persisted_output_is_staged_only_for_a_remote_reader(which, remote):
         node_to_partition={"only": "default", "remote": "default"},
         sharding_config=_sharding(),
     )
-    if which == "python":
-        book = PythonTensorBookkeeping()
-        rt = PythonGraphRuntime(
-            tensor_manager=_StubTensorManager(book), communicator=None, **common,
-        )
-    else:
-        book = RustTensorBookkeeping()
-        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
     rid = _admit_with_remote(rt, remote)
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
     rt.pop_rids("only", WALK, [rid])
