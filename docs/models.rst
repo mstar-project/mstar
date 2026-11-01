@@ -1916,7 +1916,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      distilled sampler amplifies the last bit of inductor's own reductions and
      activation decompositions.
    * On AMD GPUs the setting is not applied unless the deployment asks for it
-     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`). hipBLASLt picks
+     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`), as the fp8 default
+     of ``configs/flux2_klein.yaml`` does (see ``linear_dtype``). hipBLASLt picks
      GEMM kernels per M, so the eager norms do not make the output match the reference
      there either, and the bar is the reference's own cross-seed spread. On MI325X the
      compiled norms take klein-4B from 0.406 to 0.384 s at B=1 and 2.97 to 3.32 images/s
@@ -2018,6 +2019,14 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the knob on they repeat across launches at 26.5 and 22.6 dB. At one request the knob
    costs 8% and 7% of the fp8 images per second, which leaves 1.1 times bf16 with the knob
    off (one MI325X, shared node).
+   On AMD GPUs ``configs/flux2_klein.yaml`` serves fp8 on the declared linears (the text stream
+   kept bf16) with ``knobs: dit_exact_ops: true``, through its
+   :ref:`platform_overrides <platform-overrides>` entry. NVIDIA stays on bf16, and
+   ``flux2_klein_bf16.yaml`` serves bf16 everywhere. On one quiet MI325X at 1, 4, 8 and 16
+   requests klein-4B serves 3.157, 3.586, 3.494 and 3.647 images per second against 2.775,
+   3.107, 3.181 and 3.313 on bf16, at a median 22.59 dB from diffusers (floor 22.43). The
+   median hides a tail: against its bf16 twin the typical image loses 1.0 dB on klein-4B and
+   the worst 11.4 dB; those 40 images were checked by eye and accepted.
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one
