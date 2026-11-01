@@ -1710,8 +1710,13 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
+            # promoted and inline plans per resource, apart
+            plan_phase = "res.plan" if batch.preplan_event is not None else "res.plan_fresh"
             if ctx.resident is not None:
+                ctx.plan_phase = plan_phase
+                t0 = phase_start()
                 ctx.resident.plan(step, ctx)
+                phase_end(f"{plan_phase}.resident", t0)
 
             # Admit was already done, can move on straight to plan
             if nvtx:
@@ -1722,10 +1727,7 @@ class Engine:
                 )
             t0 = phase_start()
             try:
-                # promoted and inline plans per resource, apart
-                self._runner.plan(
-                    step, "res.plan" if batch.preplan_event is not None else "res.plan_fresh",
-                )
+                self._runner.plan(step, plan_phase)
             finally:
                 phase_end(
                     "engine.plan.promoted" if batch.preplan_event is not None
@@ -2596,6 +2598,7 @@ class Engine:
             ctx = batch.step_context
             with stream if stream is not None else nullcontext():
                 if ctx.resident is not None:
+                    ctx.plan_phase = "res.pre_plan"
                     t0 = phase_start()
                     ctx.resident.plan(step, ctx)
                     phase_end("res.pre_plan.resident", t0)

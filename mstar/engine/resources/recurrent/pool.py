@@ -584,7 +584,8 @@ class RecurrentStatePool(Resource):
             "planning a different step ahead"
         )
         if ctx.resident is not None:
-            # the replay's kernels read the buffers its graph fills from the table
+            # the replay's kernels read the buffers its graph fills from the
+            # table; the addressing memo is left to host-planned steps
             return self._current
         if self._preplanned:
             # Promotion: apply the fork copies staging left undone; see

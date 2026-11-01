@@ -354,7 +354,7 @@ class ResidentPlanner:
 
     def _build(self, rids: tuple[int, ...], key: tuple, label: str, ctx) -> ResidentPlan:
         lease = ctx.slot_lease
-        laps = PhaseLaps("res.pre_plan.resident." if ctx.is_preplan else "res.plan.resident.")
+        laps = PhaseLaps(f"{ctx.plan_phase}.resident.")
         with self._lock:
             if rids == self._last_rids:
                 slots = self._last_slots
