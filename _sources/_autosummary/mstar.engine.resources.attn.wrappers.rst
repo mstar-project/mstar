@@ -14,6 +14,7 @@ mstar.engine.resources.attn.wrappers
    .. autosummary::
    
       check_flashinfer_head_dim
+      fmha_decode_applies
    
    
 
@@ -26,6 +27,7 @@ mstar.engine.resources.attn.wrappers
       FlashInferDecodeWrapper
       FlashInferMixedWrapper
       FlashInferPrefillWrapper
+      FmhaDecodeWrapper
    
    
 

@@ -1149,6 +1149,14 @@ not the 256-slot default. The state defaults to the checkpoint’s
 <code class="docutils literal notranslate"><span class="pre">mamba_ssm_dtype</span></code> (fp32 for the released checkpoints);
 <code class="docutils literal notranslate"><span class="pre">gdn_state.state_dtype:</span> <span class="pre">bfloat16</span></code> halves state traffic at some precision and
 needs FlashInfer’s fused bf16 decode kernel (K = V = 128).</p>
+<p>The prefill, mixed and vision captures compile in Inductor’s deterministic mode
+whatever <code class="docutils literal notranslate"><span class="pre">-O</span></code> says: autotuning them bought no GPU time and took about a fifth of
+the cold start. The decode capture keeps the <code class="docutils literal notranslate"><span class="pre">-O</span></code> level’s tuned kernels. <code class="docutils literal notranslate"><span class="pre">knobs:</span>
+<span class="pre">{compile_deterministic:</span> <span class="pre">true}</span></code> compiles it deterministically too: greedy output then
+reproduces across server processes and the cold start more than halves. One-row
+decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
+at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
+c=4 up it makes no difference.</p>
 <p><code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">seed</span></code> are the standard fields.
 <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> and <code class="docutils literal notranslate"><span class="pre">enable_thinking</span></code> (default true; the template opens
 a <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> block) are read by the model but are not OpenAI fields — pass them

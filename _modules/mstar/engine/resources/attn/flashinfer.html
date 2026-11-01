@@ -994,7 +994,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FlashInferDecodeWrapper</span><span class="p">,</span>
     <span class="n">FlashInferMixedWrapper</span><span class="p">,</span>
     <span class="n">FlashInferPrefillWrapper</span><span class="p">,</span>
+    <span class="n">FmhaDecodeWrapper</span><span class="p">,</span>
     <span class="n">check_flashinfer_head_dim</span><span class="p">,</span>
+    <span class="n">fmha_decode_applies</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PagedKVConfig</span>
@@ -1018,6 +1020,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">max_rows_in_combined</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">decode_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">sliding_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">decode_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
@@ -1061,6 +1064,10 @@ window.runMermaid = runMermaid;</script>
             <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_decode_tensor_cores</span> <span class="o">=</span> <span class="n">decode_tensor_cores</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_decode_fmha</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">decode_fmha</span> <span class="ow">and</span> <span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span> <span class="ow">and</span> <span class="n">sliding_window</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">and</span> <span class="n">fmha_decode_applies</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+        <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span> <span class="o">=</span> <span class="n">WorkspacePool</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
 
@@ -1121,8 +1128,9 @@ window.runMermaid = runMermaid;</script>
         <span class="n">split</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_splits</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">bucket</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">split</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># its own workspaces: both wrappers are planned for the one step</span>
+            <span class="n">decode_workspace</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">.split_decode"</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
             <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferMixedWrapper</span><span class="p">(</span>
-                <span class="n">decode_workspace</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">.split_decode"</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">),</span>
+                <span class="n">decode_workspace</span><span class="o">=</span><span class="n">decode_workspace</span><span class="p">,</span>
                 <span class="n">prefill_workspace</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">.split_prefill"</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">),</span>
                 <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
                 <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
@@ -1130,10 +1138,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_max_rows_in_combined</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">,</span>
                 <span class="p">),</span>
                 <span class="n">use_tensor_cores</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_decode_tensor_cores</span><span class="p">,</span>
+                <span class="n">decode_wrapper</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_fmha_wrapper</span><span class="p">(</span><span class="n">decode_workspace</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">),</span>
                 <span class="o">**</span><span class="n">kv_kwargs</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">elif</span> <span class="n">bucket</span><span class="o">.</span><span class="n">bs</span> <span class="o">==</span> <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">force_prefill</span><span class="p">:</span>
-            <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">(</span>
+            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_fmha_wrapper</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">)</span> <span class="ow">or</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">(</span>
                 <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">buffer</span><span class="p">,</span>
                 <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
                 <span class="n">accelerator_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
@@ -1150,6 +1159,24 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
         <span class="k">return</span> <span class="n">wrapper</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_fmha_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">workspace</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FmhaDecodeWrapper</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The fmha decode wrapper for a capture at ``num_rows``, or None to</span>
+<span class="sd">        stay on the paged decode kernel (not asked for, or none for this geometry)."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_fmha</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span>
+        <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FmhaDecodeWrapper</span><span class="p">(</span>
+            <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">workspace</span><span class="p">,</span>
+            <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
+            <span class="n">head_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">page_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_group</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
+            <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
+            <span class="n">max_seq_len</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="n">wrapper</span> <span class="k">if</span> <span class="n">wrapper</span><span class="o">.</span><span class="n">has_kernel</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_eager_wrapper</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span>

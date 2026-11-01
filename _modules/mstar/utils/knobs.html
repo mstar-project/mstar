@@ -998,6 +998,7 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"gc_gen0_threshold"</span><span class="p">:</span> <span class="s2">"MSTAR_GC_GEN0_THRESHOLD"</span><span class="p">,</span>
     <span class="s2">"pre_plan"</span><span class="p">:</span> <span class="s2">"MSTAR_PRE_PLAN_SPEC"</span><span class="p">,</span>
     <span class="s2">"step_thread_core"</span><span class="p">:</span> <span class="s2">"MSTAR_STEP_THREAD_CORE"</span><span class="p">,</span>
+    <span class="s2">"compile_deterministic"</span><span class="p">:</span> <span class="s2">"MSTAR_COMPILE_DETERMINISTIC"</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="c1"># this process's ``knobs:`` block, as strings in the env vars' format</span>
@@ -1112,6 +1113,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    rotary tables inside the graph from the position resource's planned</span>
 <span class="sd">    positions instead of building them before the replay."""</span>
     <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"ingraph_decode_rope"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+
+
+
+<div class="viewcode-block" id="compile_deterministic">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.compile_deterministic">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">compile_deterministic</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``compile_deterministic`` / ``MSTAR_COMPILE_DETERMINISTIC`` (default</span>
+<span class="sd">    off): Qwen3.5's decode capture compiles in Inductor's deterministic mode,</span>
+<span class="sd">    as its prefill captures always do, so greedy output reproduces across</span>
+<span class="sd">    server processes and the cold start shrinks, at the cost of one-row decode</span>
+<span class="sd">    speed. Qwen3.5's text walks are the only reader."""</span>
+    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"compile_deterministic"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 
 

@@ -998,6 +998,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
+
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="c1"># A captured wrapper's later plans call FlashInfer's planner module directly</span>
@@ -1623,6 +1625,162 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="FmhaDecodeWrapper">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">FmhaDecodeWrapper</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Captured decode attention on FlashInfer's trtllm-gen fmha kernel.</span>
+
+<span class="sd">    Runs the paged pages as they are (NHD, through strided views) from a block</span>
+<span class="sd">    table this wrapper owns, so a replay reads whatever the last plan staged:</span>
+<span class="sd">    a capture holds the table's and the lengths' addresses, and its batch size</span>
+<span class="sd">    and ``max_seq_len`` pick the kernel. There is no per-step FlashInfer plan.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">flashinfer.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+            <span class="n">_get_trtllm_gen_multi_ctas_kv_counter_buffer</span><span class="p">,</span>
+            <span class="n">get_device_sm_count</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="n">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">=</span> <span class="n">batch_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="n">workspace_buffer</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_kv_heads</span> <span class="o">=</span> <span class="n">num_kv_heads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_page_size</span> <span class="o">=</span> <span class="n">page_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_scale</span> <span class="o">=</span> <span class="n">head_dim</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+        <span class="c1"># a row's pages sit at [row, 0..], stride the widest row a request can reach</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_max_seq_len</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">max_seq_len</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">page_size</span>
+        <span class="n">width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_seq_len</span> <span class="o">//</span> <span class="n">page_size</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_table</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">width</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+        <span class="c1"># the kernel resets these itself at the end of every launch</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span> <span class="o">=</span> <span class="n">_get_trtllm_gen_multi_ctas_kv_counter_buffer</span><span class="p">(</span>
+            <span class="n">batch_size</span><span class="p">,</span> <span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">get_device_sm_count</span><span class="p">(</span><span class="n">device</span><span class="p">),</span> <span class="n">device</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">on_gpu</span> <span class="o">=</span> <span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_table</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_table</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">on_gpu</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_lens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_lens</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">on_gpu</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_table_np</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_table</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lens_np</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_lens</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+        <span class="c1"># set once the previous plan's copies out of the staging buffers are issued</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span> <span class="k">if</span> <span class="n">on_gpu</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned</span> <span class="o">=</span> <span class="kc">False</span>
+
+<div class="viewcode-block" id="FmhaDecodeWrapper.plan">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.plan">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">paged_kv_indptr</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">paged_kv_indices</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">paged_kv_last_page_len</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+        <span class="n">kv_lens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">window_left</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="n">n_req</span> <span class="o">=</span> <span class="n">paged_kv_indptr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
+        <span class="k">if</span> <span class="n">n_req</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"FmhaDecodeWrapper: </span><span class="si">{</span><span class="n">n_req</span><span class="si">}</span><span class="s2"> rows planned, captured for </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_planned</span><span class="p">:</span>
+            <span class="c1"># this wrapper's previous plan, a step or more back: long since done</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+        <span class="n">indptr</span> <span class="o">=</span> <span class="n">paged_kv_indptr</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+        <span class="n">pages</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">diff</span><span class="p">(</span><span class="n">indptr</span><span class="p">)</span>
+        <span class="n">row</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rows</span><span class="p">,</span> <span class="n">pages</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_table_np</span><span class="p">[</span><span class="n">row</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">row</span><span class="p">))</span> <span class="o">-</span> <span class="n">indptr</span><span class="p">[</span><span class="n">row</span><span class="p">]]</span> <span class="o">=</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lens_np</span><span class="p">[:]</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">)</span> <span class="k">if</span> <span class="n">kv_lens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="k">else</span> <span class="n">np</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="n">pages</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_page_size</span> <span class="o">+</span> <span class="n">paged_kv_last_page_len</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_table</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_pinned_table</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_lens</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_pinned_lens</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="o">.</span><span class="n">record</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_planned</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">=</span> <span class="n">window_left</span></div>
+
+
+<div class="viewcode-block" id="FmhaDecodeWrapper.run">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.run">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``q`` is ``[batch, num_qo_heads, head_dim]``, ``kv_cache_layer``</span>
+<span class="sd">        ``[max_pages, 2, page_size, num_kv_heads, head_dim]``."""</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">flashinfer.decode</span><span class="w"> </span><span class="kn">import</span> <span class="n">trtllm_batch_decode_with_kv_cache</span>
+
+        <span class="k">return</span> <span class="n">trtllm_batch_decode_with_kv_cache</span><span class="p">(</span>
+            <span class="n">query</span><span class="o">=</span><span class="n">q</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
+            <span class="n">kv_cache</span><span class="o">=</span><span class="p">(</span>
+                <span class="n">kv_cache_layer</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+                <span class="n">kv_cache_layer</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+            <span class="p">),</span>
+            <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="p">,</span>
+            <span class="n">block_tables</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_table</span><span class="p">,</span>
+            <span class="n">seq_lens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_lens</span><span class="p">,</span>
+            <span class="n">max_seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_max_seq_len</span><span class="p">,</span>
+            <span class="n">bmm1_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_scale</span><span class="p">,</span>
+            <span class="n">bmm2_scale</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
+            <span class="n">window_left</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span><span class="p">,</span>
+            <span class="n">out_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">multi_ctas_kv_counter_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="FmhaDecodeWrapper.has_kernel">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.has_kernel">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">has_kernel</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One launch over one sink-sized page, on this wrapper's own settings:</span>
+<span class="sd">        trtllm-gen ships a kernel per geometry and fetches it at first use, so</span>
+<span class="sd">        a missing or unreachable one surfaces here rather than mid-capture."""</span>
+        <span class="n">device</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_table</span><span class="o">.</span><span class="n">device</span>
+        <span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+            <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">page</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
+            <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_page_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">),</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">page</span><span class="p">)</span>
+        <span class="k">except</span> <span class="p">(</span><span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">,</span> <span class="ne">AssertionError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"no trtllm-gen fmha decode kernel for head_dim </span><span class="si">%d</span><span class="s2">, </span><span class="si">%d</span><span class="s2"> q heads, </span><span class="si">%d</span><span class="s2"> kv "</span>
+                <span class="s2">"heads, page </span><span class="si">%d</span><span class="s2">, batch </span><span class="si">%d</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">); this bucket keeps the paged decode kernel"</span><span class="p">,</span>
+                <span class="n">head_dim</span><span class="p">,</span> <span class="n">num_qo_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_kv_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_page_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)[:</span><span class="mi">200</span><span class="p">],</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="fmha_decode_applies">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.fmha_decode_applies">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">fmha_decode_applies</span><span class="p">(</span><span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""trtllm-gen's fmha kernels are built for Blackwell's compute capability</span>
+<span class="sd">    10.x; everything else keeps the paged decode kernel."""</span>
+    <span class="n">capability</span> <span class="o">=</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">cuda_capability</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="k">if</span> <span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="n">capability</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">capability</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">10</span></div>
+
+
+
 <div class="viewcode-block" id="FlashInferMixedWrapper">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FlashInferMixedWrapper">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">FlashInferMixedWrapper</span><span class="p">:</span>
@@ -1660,6 +1818,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
         <span class="n">use_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">decode_wrapper</span><span class="p">:</span> <span class="s2">"FmhaDecodeWrapper | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">SINK_PAGE</span>
 
@@ -1673,8 +1832,12 @@ window.runMermaid = runMermaid;</script>
             <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="n">head_dim</span><span class="o">=</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">page_size</span><span class="o">=</span><span class="n">page_size</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
         <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_cores</span> <span class="o">=</span> <span class="n">use_tensor_cores</span>
-        <span class="k">if</span> <span class="n">use_tensor_cores</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_cores</span> <span class="o">=</span> <span class="n">use_tensor_cores</span> <span class="ow">and</span> <span class="n">decode_wrapper</span> <span class="ow">is</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">decode_wrapper</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># every row of the bucket gets a query, the ones outside the run on</span>
+            <span class="c1"># the sink page</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span> <span class="o">=</span> <span class="n">decode_wrapper</span>
+        <span class="k">elif</span> <span class="n">use_tensor_cores</span><span class="p">:</span>
             <span class="c1"># The kernel FlashInfer's tensor-core decode runs (FA2 paged</span>
             <span class="c1"># prefill), planned with this step's qo_indptr: its KV split budget</span>
             <span class="c1"># (2 CTAs per SM over the KV heads) charges each row with a query,</span>

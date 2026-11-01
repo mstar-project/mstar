@@ -700,7 +700,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper.run"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.run()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.has_kernel"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper.has_kernel()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.plan"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.run"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper.run()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim"><code class="docutils literal notranslate"><span class="pre">check_flashinfer_head_dim()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.fmha_decode_applies"><code class="docutils literal notranslate"><span class="pre">fmha_decode_applies()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -733,6 +740,9 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim" title="mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_flashinfer_head_dim</span></code></a>(head_dim[, device])</p></td>
 <td><p>Raise unless FlashInfer's paged attention computes <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> exactly.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.wrappers.fmha_decode_applies" title="mstar.engine.resources.attn.wrappers.fmha_decode_applies"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fmha_decode_applies</span></code></a>(device)</p></td>
+<td><p>trtllm-gen's fmha kernels are built for Blackwell's compute capability 10.x; everything else keeps the paged decode kernel.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -747,6 +757,9 @@
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper" title="mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper</span></code></a>(workspace_buffer, ...)</p></td>
 <td><p>Batched prefill attention with paged KV cache.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper" title="mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FmhaDecodeWrapper</span></code></a>(workspace_buffer, ...)</p></td>
+<td><p>Captured decode attention on FlashInfer's trtllm-gen fmha kernel.</p></td>
 </tr>
 </tbody>
 </table>
@@ -823,7 +836,7 @@ the append; after append it becomes last_page_len).
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FlashInferMixedWrapper">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferMixedWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">decode_workspace</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefill_workspace</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_prefill_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_tensor_cores</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FlashInferMixedWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FlashInferMixedWrapper" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferMixedWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">decode_workspace</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefill_workspace</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_prefill_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_tensor_cores</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode_wrapper</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FlashInferMixedWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FlashInferMixedWrapper" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>A step mixing one-token rows (decode) with prompt rows, on two plans.</p>
 <p>The engine orders a split walk’s rows decode first (<code class="docutils literal notranslate"><span class="pre">CombinedSplit</span></code>),
@@ -856,6 +869,7 @@ tensor-core half’s in theirs (<code class="docutils literal notranslate"><span
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
 <li><p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>use_tensor_cores</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>decode_wrapper</strong> (<a class="reference internal" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper" title="mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper"><em>FmhaDecodeWrapper</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -975,6 +989,85 @@ per-token bookkeeping below.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">FmhaDecodeWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seq_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FmhaDecodeWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Captured decode attention on FlashInfer’s trtllm-gen fmha kernel.</p>
+<p>Runs the paged pages as they are (NHD, through strided views) from a block
+table this wrapper owns, so a replay reads whatever the last plan staged:
+a capture holds the table’s and the lengths’ addresses, and its batch size
+and <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> pick the kernel. There is no per-step FlashInfer plan.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>max_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.has_kernel">
+<span class="sig-name descname"><span class="pre">has_kernel</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FmhaDecodeWrapper.has_kernel"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.has_kernel" title="Link to this definition">#</a></dt>
+<dd><p>One launch over one sink-sized page, on this wrapper’s own settings:
+trtllm-gen ships a kernel per geometry and fetches it at first use, so
+a missing or unreachable one surfaces here rather than mid-capture.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.plan">
+<span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">paged_kv_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_last_page_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_lens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">window_left</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FmhaDecodeWrapper.plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.plan" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>paged_kv_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>paged_kv_indices</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>paged_kv_last_page_len</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a>)</p></li>
+<li><p><strong>kv_lens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>window_left</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.run">
+<span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_layer</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FmhaDecodeWrapper.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.run" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">q</span></code> is <code class="docutils literal notranslate"><span class="pre">[batch,</span> <span class="pre">num_qo_heads,</span> <span class="pre">head_dim]</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_cache_layer</span></code>
+<code class="docutils literal notranslate"><span class="pre">[max_pages,</span> <span class="pre">2,</span> <span class="pre">page_size,</span> <span class="pre">num_kv_heads,</span> <span class="pre">head_dim]</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>kv_cache_layer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">check_flashinfer_head_dim</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#check_flashinfer_head_dim"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim" title="Link to this definition">#</a></dt>
@@ -990,6 +1083,21 @@ wrappers with a stand-in module and toy head dims) is not checked.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.fmha_decode_applies">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">fmha_decode_applies</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#fmha_decode_applies"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.fmha_decode_applies" title="Link to this definition">#</a></dt>
+<dd><p>trtllm-gen’s fmha kernels are built for Blackwell’s compute capability
+10.x; everything else keeps the paged decode kernel.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1058,7 +1166,14 @@ wrappers with a stand-in module and toy head dims) is not checked.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper.run"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.run()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.has_kernel"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper.has_kernel()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.plan"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.FmhaDecodeWrapper.run"><code class="docutils literal notranslate"><span class="pre">FmhaDecodeWrapper.run()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim"><code class="docutils literal notranslate"><span class="pre">check_flashinfer_head_dim()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.wrappers.fmha_decode_applies"><code class="docutils literal notranslate"><span class="pre">fmha_decode_applies()</span></code></a></li>
 </ul>
   </nav></div>
 

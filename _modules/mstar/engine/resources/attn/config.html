@@ -1034,6 +1034,11 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># narrow GQA, where the tensor-core kernel pads few query heads per KV</span>
     <span class="c1"># head out to a tile.</span>
     <span class="n">decode_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># FlashInfer only: run captured one-token decode rows on trtllm-gen's fmha</span>
+    <span class="c1"># kernel where one exists for this GPU and geometry (`FmhaDecodeWrapper`),</span>
+    <span class="c1"># which also drops the paged kernel's per-step plan. Eager steps and prompt</span>
+    <span class="c1"># rows stay on the paged kernels.</span>
+    <span class="n">decode_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Each query attends to the last ``sliding_window`` positions, its own included, and the</span>
     <span class="c1"># pool keeps about that window of K/V per request for this attention's layers and frees</span>
     <span class="c1"># the rest (`derive_kv_groups`).</span>
@@ -1089,6 +1094,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">AttnBackend</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">decode_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">decode_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Which kernel to run is the deployment's call as much as the</span>
 <span class="sd">        model's — an image that cannot build FA3 pins FA2 here.</span>
@@ -1101,7 +1107,9 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">flashinfer_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span> <span class="o">=</span> <span class="n">flashinfer_backend</span>
         <span class="k">if</span> <span class="n">decode_tensor_cores</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_tensor_cores</span> <span class="o">=</span> <span class="n">_yaml_bool</span><span class="p">(</span><span class="s2">"decode_tensor_cores"</span><span class="p">,</span> <span class="n">decode_tensor_cores</span><span class="p">)</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_tensor_cores</span> <span class="o">=</span> <span class="n">_yaml_bool</span><span class="p">(</span><span class="s2">"decode_tensor_cores"</span><span class="p">,</span> <span class="n">decode_tensor_cores</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">decode_fmha</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_fmha</span> <span class="o">=</span> <span class="n">_yaml_bool</span><span class="p">(</span><span class="s2">"decode_fmha"</span><span class="p">,</span> <span class="n">decode_fmha</span><span class="p">)</span></div>
 </div>
 
 

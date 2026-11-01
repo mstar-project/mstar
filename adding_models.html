@@ -1345,7 +1345,11 @@ workspace, taken at build.
 (default <code class="docutils literal notranslate"><span class="pre">True</span></code>) runs one-token decode rows on FlashInfer’s tensor-core
 kernel; <code class="docutils literal notranslate"><span class="pre">False</span></code> picks the CUDA-core decode kernel, which can be faster for
 MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-Whisper and Qwen3-ASR declare <code class="docutils literal notranslate"><span class="pre">False</span></code>. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
+Whisper and Qwen3-ASR declare <code class="docutils literal notranslate"><span class="pre">False</span></code>. <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> (default <code class="docutils literal notranslate"><span class="pre">False</span></code>) runs
+captured one-token decode rows on FlashInfer’s trtllm-gen fmha kernel on Blackwell,
+with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
+the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
+kernels. Qwen3.5 declares <code class="docutils literal notranslate"><span class="pre">True</span></code>. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
 Multi-head Latent Attention over a <code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code> cache. It needs <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code>,
 the softmax scale of the model’s original qk head dim, which the other backends
 refuse. Its <code class="docutils literal notranslate"><span class="pre">run</span></code> takes the absorbed query (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">heads,</span> <span class="pre">kv_lora_rank]</span></code>)
@@ -2690,7 +2694,7 @@ that a misspelled setting is never silently ignored:</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code> / <code class="docutils literal notranslate"><span class="pre">xpu_paged</span></code>),
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code>
-(<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
+(<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> (<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
