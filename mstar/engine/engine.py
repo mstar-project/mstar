@@ -328,6 +328,9 @@ class ExecutingBatch:
 
     # rid -> the part of a chunked row's input this step runs
     chunk_ranges: Mapping[int, ChunkRange] = field(default_factory=dict)
+    # rows whose whole input this step prepared (`_prepare_chunk`), on their
+    # first chunk: a refused admit drops it, so the retry checks it again
+    first_chunk_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -1223,6 +1226,7 @@ class Engine:
                 # a declined or uncuttable walk writes over the lease (prefix None)
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
             self._chunking.prepared[key] = full
+            batch.first_chunk_rids.add(rid)
         part = submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], full, start, end,
         )
@@ -1767,6 +1771,10 @@ class Engine:
             batch.register_admit_error(
                 admit_outcome.reason, admit_outcome.failed_resource,
             )
+            # A retry prepares the row again, so its length and cached prefix
+            # are checked against the pages it then finds, not the ones before.
+            for rid in batch.first_chunk_rids:
+                self._chunking.release(rid, batch.node_name)
         return admit_outcome, step
 
     def _maybe_lease_piecewise_regions(
