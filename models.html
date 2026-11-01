@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 31, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1261,6 +1261,13 @@ voices for a picker: the bundled voices whose G2P extra is installed on the serv
 <section id="qwen3-omni-notes">
 <h2>Qwen3-Omni notes<a class="headerlink" href="#qwen3-omni-notes" title="Link to this heading">#</a></h2>
 <ul class="simple">
+<li><p>The audio and vision encoders attend through ragged attention resources
+(<code class="docutils literal notranslate"><span class="pre">audio_attn</span></code> within each 8 s window, <code class="docutils literal notranslate"><span class="pre">vision_attn</span></code> within each image or
+video frame group), FlashInfer by default, so no <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> install is
+needed. A deployment can pick the kernel under <code class="docutils literal notranslate"><span class="pre">resources:</span></code> in its YAML,
+e.g. <code class="docutils literal notranslate"><span class="pre">vision_attn:</span> <span class="pre">{flashinfer_backend:</span> <span class="pre">cutlass}</span></code>. Each encoder’s block stack
+is captured as a CUDA graph per token-count bucket; a request past the
+largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.</p></li>
 <li><p>Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
 25-frame chunks behind 25 frames of left context. Playback stays gapless
 while the Talker produces frames at about 1.5x real time over the first 50
@@ -2432,7 +2439,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 31, 2026.
+  Last updated on Nov 01, 2026.
   <br/>
 </p>
   </div>
