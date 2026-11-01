@@ -152,7 +152,7 @@ def moe_align_block_size(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort ``topk_ids`` into expert-aligned blocks.
 
-    ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly).
+    ``topk_ids`` must be int32 or int64 and contiguous (the CUDA op reads it directly).
     Ids ``>= num_experts`` mark skipped slots: they are never placed in
     ``sorted_token_ids``, so no GEMM tile reads or writes them.
 
