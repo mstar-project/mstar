@@ -39,8 +39,8 @@ The decoder module (``self.model``, e.g. ``Qwen3DenseLM``) provides:
 
 and ``config`` has ``hidden_size`` and ``stop_token_ids`` (and the model's
 ``max_position_embeddings`` bounds the decode loop, see `media_walks`).
-The node's resources are declared under ``mstar.model.keys``' ``SAMPLER`` and
-``ROPE`` keys.
+The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and
+its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
 import os
@@ -116,6 +116,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
+    # The position resource the step advances (a layer's ``pos_key``)
+    POS_KEY: str = ROPE
+    # False: only decode is captured, and every prefill (text, media, mixed)
+    # runs eagerly, for a model whose prefill captures are unmeasured
+    CAPTURE_PREFILL = True
 
     # set by `__init__`; class defaults keep a text-only node's walks working
     _encoders: tuple[MediaEncoder, ...] = ()
@@ -205,7 +210,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.COMPILE_MODE,
             ),
         ]
-        if self.PREFILL_WALK is not None:
+        if self.PREFILL_WALK is not None and self.CAPTURE_PREFILL:
             configs += [PackedAcceleratorGraphConfig(
                 capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -222,7 +227,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
             )]
-        if self._encoders:
+        if self._encoders and self.CAPTURE_PREFILL:
             walks = media_walk_names(self._encoders)
             # one capture every media walk replays
             configs.append(PackedAcceleratorGraphConfig(
@@ -411,7 +416,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                 ),
-                ROPE: PositionStep(advance=advance),
+                self.POS_KEY: PositionStep(advance=advance),
             },
         )
 

@@ -203,6 +203,30 @@ def test_every_media_walk_replays_one_capture_that_caps_it():
     assert llm.max_batch_size("decode") is None
 
 
+def test_a_node_keeps_its_walk_name_and_can_capture_decode_only():
+    """A lone encoder's declared walk names its media walk (configs and
+    metrics read walk names), and CAPTURE_PREFILL = False leaves decode as the
+    only capture."""
+    from dataclasses import replace
+
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    named = replace(AUDIO, walk="prefill")
+    assert media_walk_names([named]) == ["prefill"]
+    assert media_walk_names([VISION, named]) == ["prefill_vision", "prefill", "prefill_vision_audio"]
+
+    class DecodeOnly(LLMSubmodule):
+        CAPTURE_PREFILL = False
+
+    llm = object.__new__(DecodeOnly)
+    SampledTokenDecoder.__init__(
+        llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=()), (named,),
+    )
+    assert [c.capture_graph_walk for c in llm.get_accelerator_graph_configs(torch.device("cpu"))] == ["decode"]
+    assert llm._is_prefill_walk("prefill")
+
+
 def test_a_media_only_model_has_no_text_walk_mixed_step_or_prefix_keys():
     """TEXT_PROMPTS = False (an audio-only STT model) drops the text prefill
     walk, the mixed step and the prefix keys from the model, and the text and

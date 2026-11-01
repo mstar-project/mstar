@@ -2620,11 +2620,14 @@ writes:
 
 Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
 (the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
-``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler and
-position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
-``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS``
-caps a mixed step's prompt rows, and ``COMPILE_MODE`` names every capture's
-``compile_mode`` (``None``, the default, takes the deployment's compile level).
+``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler is declared under
+``mstar.model.keys``' ``SAMPLER``, and the positions under the node's ``POS_KEY``
+(``ROPE`` unless the model's layers name another ``pos_key``). ``MSTAR_DECODE_BUCKETS``
+sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt
+rows, ``COMPILE_MODE`` names every capture's ``compile_mode`` (``None``, the default,
+takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
+only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
+calls it something other than ``prefill_<name>``.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
 prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
