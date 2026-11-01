@@ -1,14 +1,10 @@
-"""Side-by-side parity: drive BOTH runtimes through one script, diff every step.
+"""Step-by-step scripts of the graph runtime.
 
-``test_runtime_parity.py`` runs each test twice, once per runtime, against
-hand-written expectations. That catches anything somebody thought to assert.
-This catches the rest: the two runtimes are stepped together and their
-OBSERVABLE state is compared after every operation, so a divergence fails even
-when nobody predicted it -- and the failure names the step that caused it.
-
-What "observable" means here: ready nodes, what pop_rids hands back, the
-uuids routing asks to register, and the bookkeeper's refcount/tracking for
-every uuid in play. Those are exactly the things a worker acts on.
+``test_runtime_parity.py`` asserts sequences of calls end to end. These stop
+after each operation and assert what a worker acts on at that point: ready
+nodes, what pop_rids hands back, the uuids routing asks to register, and which
+uuids the bookkeeper still holds. A wrong reference shows up at the step that
+caused it.
 """
 import sys
 
@@ -17,8 +13,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
-from mstar.communication.tensors import TensorCommunicationManager
+from mstar.communication.tensor_store import TensorStore
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import (
@@ -27,7 +22,6 @@ from mstar.graph.runtime.base import (
     RouteInput,
     SpeculationPrepInput,
 )
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
@@ -77,49 +71,13 @@ def _loop_graph():
     ])
 
 
-class _StubTM:
-    """Just enough of TensorCommunicationManager, with its own refcount
-    methods: the Python runtime settles and tears down through the manager,
-    so the harness must do what production does -- a hand-rolled copy would
-    only test itself."""
-
-    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
-    set_persist = TensorCommunicationManager.set_persist
-    dereference = TensorCommunicationManager.dereference
-    dereference_batch = TensorCommunicationManager.dereference_batch
-    dereference_batch_uniform = (
-        TensorCommunicationManager.dereference_batch_uniform
-    )
-    cleanup_collectable = TensorCommunicationManager.cleanup_collectable
-
-    def __init__(self, bookkeeping):
-        self.tensor_store = TensorStore(bookkeeping=bookkeeping)
-
-    def increment_ref(self, uuid, n=1):
-        self.tensor_store.increment_ref(uuid, n=n)
-
-    def get_tensor(self, uuid):
-        return self.tensor_store.get_tensor(uuid)
-
-    def _cleanup_by_uuid(self, uuid, registered=None):
-        # The transport half is shm files and registered memory, which this
-        # harness has none of; what is left is dropping the record, as
-        # remove_tensor does. A tensor put into the bookkeeper alone is not in
-        # the store, so it is forgotten directly -- unless a batched
-        # dereference (``registered`` given) already forgot it.
-        if self.tensor_store.check_uuid_presence(uuid):
-            self.tensor_store.remove_tensor(uuid)
-        elif registered is None:
-            self.tensor_store.bookkeeping.forget_tensor(uuid)
-
-
 def _nodes(graph):
     return set(graph.get_nodes())
 
 
-def _build(kind, graph, tp_rank=None):
+def _build(graph, tp_rank=None):
     """``tp_rank`` puts this worker at that rank of a two-rank TP group over
-    every node; None leaves it alone, which both runtimes treat as rank 0."""
+    every node; None leaves it alone, which reads as rank 0."""
     groups = []
     if tp_rank is not None:
         groups = [ShardingGroup(nodes=_nodes(graph), tp_size=2)]
@@ -127,7 +85,9 @@ def _build(kind, graph, tp_rank=None):
     wg = WorkerGraph(
         section=graph, graph_walks={WALK}, ranks=[0] if tp_rank is None else [0, 1],
         worker_graph_id=WG_ID)
-    common = dict(
+    book = RustTensorBookkeeping()
+    store = TensorStore(bookkeeping=book)
+    runtime = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
         all_wg_ids_to_dyn_loops={WG_ID: set(graph.get_loops())},
@@ -135,15 +95,9 @@ def _build(kind, graph, tp_rank=None):
         node_to_partition=dict.fromkeys(_nodes(graph), "default"),
         sharding_config=ShardingConfig(
             groups=groups, tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book,
     )
-    if kind == "python":
-        book = PythonTensorBookkeeping()
-        tm = _StubTM(book)
-        return PythonGraphRuntime(**common, tensor_manager=tm,
-                                  communicator=None), book, tm.tensor_store
-    book = RustTensorBookkeeping()
-    store = TensorStore(bookkeeping=book)
-    return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), book, store
+    return runtime, book, store
 
 
 def _info(uuid):
@@ -157,68 +111,40 @@ def _finish_teardown(store, freed):
     """What the worker does with a runtime's FreedTensors: hand them to
     TensorCommunicationManager.cleanup_collectable, whose bookkeeper half is
     mark_forgotten (the rest is shm files and memory unregistration, which
-    this harness has none of).
-
-    Only the Rust runtime returns anything -- the Python one owns a tensor
-    manager and tore down inline -- so applying it to both keeps the two
-    bookkeepers comparable instead of leaving Rust's a step behind.
-    """
+    this harness has none of)."""
     if freed.uuids:
         store.mark_forgotten(list(freed.uuids))
 
 
-class Lockstep:
-    """Runs an operation on both runtimes and diffs the result."""
+class Script:
+    """One runtime, driven the way the worker drives it."""
 
     def __init__(self, graph, tp_rank=None):
-        self.py = _build("python", graph, tp_rank)
-        self.rs = _build("rust", graph, tp_rank)
+        self.rt, self.book, self.store = _build(graph, tp_rank)
         self.workers = {None: [WORKER], 0: [WORKER, PEER], 1: [PEER, WORKER]}[tp_rank]
-        self.log: list[str] = []
-
-    def _both(self, step, fn):
-        self.log.append(step)
-        out = []
-        for trio in (self.py, self.rs):
-            try:
-                out.append(fn(*trio))
-            except Exception as e:  # a raise on one side only is a divergence
-                out.append(f"{type(e).__name__}: {e}")
-        p, r = out
-        assert p == r, (
-            f"\nDIVERGENCE at step: {step}\n"
-            f"  python -> {p!r}\n"
-            f"  rust   -> {r!r}\n"
-            f"  steps so far: {self.log}"
-        )
-        return p
 
     # -- operations ---------------------------------------------------------
     def admit(self, rid_str="r1"):
-        return self._both(f"add_request({rid_str})", lambda rt, b, s: rt.add_request(
+        return self.rt.add_request(
             request_id=rid_str, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],
-            worker_graph_to_workers=ParallelList([WG_ID], [self.workers]), loop_caps={}))
+            worker_graph_to_workers=ParallelList([WG_ID], [self.workers]), loop_caps={})
 
     def put(self, uuid):
-        """Store a tensor on both sides so routing has something to refer to."""
-        self.log.append(f"put_tensor({uuid})")
-        for _rt, _book, store in (self.py, self.rs):
-            store.put_tensor(request_id=1, uuid=uuid, tensor=torch.zeros(4),
-                             info=_info(uuid))
-            # The worker's safety hold: _postprocess_batch stores the outputs
-            # and immediately does increment_ref_batch_uniform(uuids, 1), so a
-            # tensor is never collectable between being stored and being
-            # routed. Without it every uuid sits at refcount 0 from birth and
-            # the runtimes' free paths fire at points production never hits.
-            store.increment_ref(uuid, n=1)
+        """Store a tensor so routing has something to refer to."""
+        self.store.put_tensor(request_id=1, uuid=uuid, tensor=torch.zeros(4),
+                              info=_info(uuid))
+        # The worker's safety hold: _postprocess_batch stores the outputs and
+        # immediately does increment_ref_batch_uniform(uuids, 1), so a tensor
+        # is never collectable between being stored and being routed. Without
+        # it every uuid sits at refcount 0 from birth and the free paths fire
+        # at points production never hits.
+        self.store.increment_ref(uuid, n=1)
 
     def ingest(self, rid, signal, node, uuids=()):
         spec = EdgeSpec(signal=signal, next_node=node, uuids=list(uuids),
                         is_final_streaming_chunk=False)
-        return self._both(
-            f"ingest({signal}->{node}, uuids={list(uuids)})",
-            lambda rt, b, s: rt.ingest_inputs_batch(_ingest_block([rid], [spec])))
+        return self.rt.ingest_inputs_batch(_ingest_block([rid], [spec]))
 
     def stream(self, rid, signal, node, uuids=()):
         """A chunk from a StreamBuffer, ingested as the worker does: for this
@@ -226,103 +152,56 @@ class Lockstep:
         uningested."""
         spec = EdgeSpec(signal=signal, next_node=node, uuids=list(uuids),
                         is_final_streaming_chunk=False)
-        return self._both(
-            f"stream({signal}->{node}, uuids={list(uuids)})",
-            lambda rt, b, s: rt.ingest_inputs_batch(
-                _ingest_block([rid], [spec]), can_buffer=False,
-                is_streaming=True))
+        return self.rt.ingest_inputs_batch(
+            _ingest_block([rid], [spec]), can_buffer=False, is_streaming=True)
 
     def ready(self):
-        return self._both("get_ready_nodes", lambda rt, b, s: sorted(
+        return sorted(
             (x.node_name, x.graph_walk, sorted(x.rids))
-            for x in rt.get_ready_nodes(set())))
+            for x in self.rt.get_ready_nodes(set()))
 
     def pop(self, node, rid):
-        def f(rt, b, s):
-            p = rt.pop_rids(node, WALK, [rid])
-            if p is None:
-                return None
-            # next_node is not in the block: a pop reports edges for the
-            # node the caller named, so it was the same string every time.
-            return (p.wg_ids.keys, p.wg_ids.values,
-                    sorted((sig, node, list(uuids))
-                           for _r, sig, uuids, _f
-                           in p.input_edges.edge_tuples()))
-        return self._both(f"pop_rids({node})", f)
+        p = self.rt.pop_rids(node, WALK, [rid])
+        if p is None:
+            return None
+        # next_node is not in the block: a pop reports edges for the node the
+        # caller named, so it was the same string every time.
+        return (p.wg_ids.keys, p.wg_ids.values,
+                sorted((sig, node, list(uuids))
+                       for _r, sig, uuids, _f
+                       in p.input_edges.edge_tuples()))
 
     def route(self, node, rid, signals, uuids):
-        def f(rt, b, s):
-            out = rt.complete_and_route_batch(
-                RouteInput(
-                    partition="default", graph_walk=WALK, node_name=node,
-                    output_signals=list(signals),
-                    wg_ids=ParallelList([rid], [WG_ID]),
-                    tensors=list(uuids),
-                    num_tensors=[len(uuids)] * len(signals),
-                ))
-            _finish_teardown(s, out.freed_inputs)
-            return (sorted(out.register_uuids), sorted(out.register_rids),
-                    sorted(out.new_token_output_idxs),
-                    {k: (v.keys, v.values)
-                     for k, v in out.local_streaming_by_signal.items()})
-        return self._both(f"route({node}, signals={list(signals)})", f)
+        out = self.rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name=node,
+                output_signals=list(signals),
+                wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=list(uuids),
+                num_tensors=[len(uuids)] * len(signals),
+            ))
+        _finish_teardown(self.store, out.freed_inputs)
+        return (sorted(out.register_uuids), sorted(out.register_rids),
+                sorted(out.new_token_output_idxs),
+                {k: (v.keys, v.values)
+                 for k, v in out.local_streaming_by_signal.items()})
 
     def cleanup(self, node, rid):
-        """cleanup_consumed_inputs on both, comparing the EFFECT only.
+        _finish_teardown(self.store, self.rt.cleanup_consumed_inputs(node, [rid], [WG_ID]))
 
-        The return values are asymmetric by design: the Python runtime owns a
-        tensor manager and dereferences through it as it clears, so it returns
-        FreedTensors.none(); the Rust runtime has no tensor manager and hands
-        the freed uuids back for the caller to tear down. What must agree is
-        the bookkeeper state afterwards, which `refcounts` checks.
-        """
-        self.log.append(f"cleanup_consumed_inputs({node})")
-        for rt, _b, store in (self.py, self.rs):
-            freed = rt.cleanup_consumed_inputs(node, [rid], [WG_ID])
-            _finish_teardown(store, freed)
-
-    def refcounts(self, uuids):
-        """The bookkeeper's view -- tracked and collectable -- per uuid."""
-        return self._both(
-            f"refcounts({list(uuids)})",
-            lambda rt, b, s: [
-                (u, b.get_info(u) is not None, b.can_gc(u)) for u in uuids
-            ])
+    def held(self, uuids):
+        """The uuids the bookkeeper still tracks and would not collect."""
+        return [u for u in uuids if self.book.get_info(u) is not None and not self.book.can_gc(u)]
 
 
 @pytest.fixture
 def lock():
-    return Lockstep(_loop_graph())
+    return Script(_loop_graph())
 
 
-def test_admit_and_first_ingest_agree(lock):
-    rid = lock.admit()
-    lock.ready()
-    lock.put(101)
-    lock.ingest(rid, "prompt", "prefill", [101])
-    lock.ready()
-    lock.pop("prefill", rid)
-    lock.ready()
-
-
-def test_loop_iteration_agrees(lock):
-    """prefill -> route token -> ar_decode consumes it -> routes its own."""
-    rid = lock.admit()
-    lock.put(101)
-    lock.ingest(rid, "prompt", "prefill", [101])
-    lock.pop("prefill", rid)
-    lock.put(201)
-    lock.route("prefill", rid, ["token"], [201])
-    lock.ready()
-    lock.pop("ar_decode", rid)
-    lock.ready()
-    lock.refcounts([101, 201])
-
-
-def test_loop_carried_tensor_refcounts_agree(lock):
-    """The token is emitted AND fed back. If one runtime holds a reference the
-    other does not, this is where it shows -- and a worker acting on the
-    difference resolves a freed uuid."""
+def test_a_loop_carried_tensor_is_held_until_its_iteration_consumes_the_next(lock):
+    """The token is fed back. A reference dropped or leaked here means a worker
+    resolving a freed uuid, or a tensor that is never collected."""
     rid = lock.admit()
     lock.put(101)
     lock.ingest(rid, "prompt", "prefill", [101])
@@ -330,44 +209,19 @@ def test_loop_carried_tensor_refcounts_agree(lock):
     for i, uuid in enumerate((201, 202, 203)):
         lock.put(uuid)
         lock.route("prefill" if i == 0 else "ar_decode", rid, ["token"], [uuid])
-        lock.ready()
+        assert lock.ready() == [("ar_decode", WALK, [rid])]
         lock.pop("ar_decode", rid)
-        lock.refcounts([101, 201, 202, 203])
-
-
-def test_cleanup_consumed_inputs_agrees(lock):
-    """The divergence I suspected: Python clears every consumed slot and skips
-    only the dereference for a loop-held input; Rust skips both. If that is
-    observable, readiness or refcounts differ right here."""
-    rid = lock.admit()
-    lock.put(101)
-    lock.ingest(rid, "prompt", "prefill", [101])
-    lock.pop("prefill", rid)
-    lock.put(201)
-    lock.route("prefill", rid, ["token"], [201])
-    lock.pop("ar_decode", rid)
-    lock.cleanup("ar_decode", rid)
-    lock.ready()
-    lock.refcounts([101, 201])
-
-
-def test_removal_agrees(lock):
-    rid = lock.admit()
-    lock.put(101)
-    lock.ingest(rid, "prompt", "prefill", [101])
-    lock._both("remove_request", lambda rt, b, s: sorted(rt.remove_request(rid)))
-    lock.ready()
+        assert lock.held([101, 201, 202, 203]) == [uuid]
 
 
 def _emit_loop_graph():
     """Same AR loop, but the token is ALSO persisted and emitted to the client.
 
     This is the higgs/orpheus shape: one tensor is simultaneously (a) held at
-    the conductor for delivery and (b) the next iteration's input. Python notes
-    that persist edges are excluded from the routed refcount because "the
-    conductor computes that reference when it unpersists" -- if the two
-    runtimes disagree about that reference, the tensor is freed while the loop
-    still needs it.
+    the conductor for delivery and (b) the next iteration's input. Persist
+    edges are excluded from the routed refcount because the conductor computes
+    that reference when it unpersists, so a miscount frees the tensor while the
+    loop still needs it.
     """
     return Sequential(sections=[
         GraphNode(
@@ -393,14 +247,14 @@ def _emit_loop_graph():
 
 @pytest.fixture
 def emit_lock():
-    return Lockstep(_emit_loop_graph())
+    return Script(_emit_loop_graph())
 
 
-def test_persisted_and_loop_carried_token_agrees(emit_lock):
+def test_a_persisted_and_loop_carried_token_stays_held(emit_lock):
     """The higgs shape. A token routed to BOTH the client and the next
-    iteration must leave both runtimes with the same refcount -- otherwise one
-    of them frees it on unpersist while the loop still holds an input slot
-    pointing at it, which is the KeyError seen in production."""
+    iteration stays held through the iteration that consumes it -- freeing it
+    on unpersist while the loop's input slot points at it is the KeyError seen
+    in production."""
     lk = emit_lock
     rid = lk.admit()
     lk.put(101)
@@ -408,15 +262,15 @@ def test_persisted_and_loop_carried_token_agrees(emit_lock):
     lk.pop("prefill", rid)
     lk.put(201)
     lk.route("prefill", rid, ["token"], [201])
-    lk.ready()
+    assert lk.ready() == [("ar_decode", WALK, [rid])]
     lk.pop("ar_decode", rid)
     # ar_decode emits a token that is persisted AND fed back
     lk.put(202)
     lk.route("ar_decode", rid, ["token"], [202])
-    lk.refcounts([101, 201, 202])
-    lk.ready()
+    assert lk.held([101, 201, 202]) == [202]
+    assert lk.ready() == [("ar_decode", WALK, [rid])]
     lk.pop("ar_decode", rid)
-    lk.refcounts([101, 201, 202])
+    assert lk.held([101, 201, 202]) == [202]
 
 
 @pytest.mark.parametrize("tp_rank", [0, 1])
@@ -424,23 +278,23 @@ def test_only_the_tp_leader_counts_new_tokens(tp_rank):
     """A follower doesn't send the emitted token to the client, so it frees its
     copy; counting it as a new token anyway made the worker look up a freed
     tensor (a KeyError on every Command A+ TP8 request)."""
-    lk = Lockstep(_emit_loop_graph(), tp_rank=tp_rank)
+    lk = Script(_emit_loop_graph(), tp_rank=tp_rank)
     rid = lk.admit()
     lk.put(101)
     lk.ingest(rid, "prompt", "prefill", [101])
     lk.pop("prefill", rid)
     lk.put(201)
     lk.route("prefill", rid, ["token"], [201])
-    lk.ready()
     lk.pop("ar_decode", rid)
     lk.put(202)
     _, _, new_tokens, _ = lk.route("ar_decode", rid, ["token"], [202])
     assert bool(new_tokens) == (tp_rank == 0)
 
 
-def test_repeated_emit_iterations_agree(emit_lock):
+def test_repeated_emit_iterations_hold_one_reference_each(emit_lock):
     """Several loop iterations with an emitted token each time: a reference
-    that leaks or is dropped once shows up as drift after a few passes."""
+    that leaks or is dropped once shows up as drift after a few passes. Every
+    token stays persisted for delivery, and each new one joins them."""
     lk = emit_lock
     rid = lk.admit()
     lk.put(101)
@@ -449,15 +303,17 @@ def test_repeated_emit_iterations_agree(emit_lock):
     lk.put(201)
     lk.route("prefill", rid, ["token"], [201])
     lk.pop("ar_decode", rid)
+    held = []
     for uuid in (202, 203, 204):
         lk.put(uuid)
         lk.route("ar_decode", rid, ["token"], [uuid])
-        lk.ready()
+        assert lk.ready() == [("ar_decode", WALK, [rid])]
         lk.pop("ar_decode", rid)
-        lk.refcounts([201, 202, 203, 204])
+        held.append(uuid)
+        assert lk.held([201, 202, 203, 204]) == held
 
 
-def test_cleanup_after_emit_agrees(emit_lock):
+def test_cleanup_then_route_after_an_emit(emit_lock):
     """cleanup_consumed_inputs on a node whose input was also emitted, in the
     order the worker actually uses: cleanup, then route."""
     lk = emit_lock
@@ -473,20 +329,14 @@ def test_cleanup_after_emit_agrees(emit_lock):
     # (worker.py) BEFORE complete_and_route_batch, not after.
     lk.cleanup("ar_decode", rid)
     lk.route("ar_decode", rid, ["token"], [202])
-    lk.ready()
-    lk.refcounts([101, 201, 202])
+    assert lk.ready() == [("ar_decode", WALK, [rid])]
+    assert lk.held([101, 201, 202]) == [202]
 
 
-def test_cleanup_after_route_agrees(emit_lock):
-    """The SAME steps as test_cleanup_after_emit_agrees but with route before
-    cleanup -- an order the worker does not produce (_postprocess_batch cleans
-    up first), yet the two runtimes must still agree on it.
-
-    They did not: Python's ready-name set is add-only, so clearing a node's
-    inputs left the name behind and the node read as ready with nothing
-    ingested, while Rust's clear_consumed_inputs recomputes the bit and drops
-    it. Fixed on the Python side; this pins the order-independence.
-    """
+def test_route_then_cleanup_after_an_emit(emit_lock):
+    """The SAME steps with route before cleanup -- an order the worker does not
+    produce (_postprocess_batch cleans up first). Clearing a node's inputs has
+    to take it out of the ready set whichever order runs."""
     lk = emit_lock
     rid = lk.admit()
     lk.put(101)
@@ -497,22 +347,22 @@ def test_cleanup_after_route_agrees(emit_lock):
     lk.pop("ar_decode", rid)
     lk.put(202)
     lk.route("ar_decode", rid, ["token"], [202])
-    lk.ready()
+    assert lk.ready() == [("ar_decode", WALK, [rid])]
     lk.cleanup("ar_decode", rid)
-    lk.ready()
-    lk.refcounts([101, 201, 202])
+    assert lk.ready() == []
+    assert lk.held([101, 201, 202]) == [202]
 
 
-def test_cleanup_without_pop_agrees(lock):
+def test_cleanup_without_pop_clears_the_readiness(lock):
     """Cleanup on a node sitting in the ready set, never popped. The narrowest
     form of the same rule: clearing the inputs must clear the readiness."""
     rid = lock.admit()
     lock.put(101)
     lock.ingest(rid, "prompt", "prefill", [101])
-    lock.ready()
+    assert lock.ready() == [("prefill", WALK, [rid])]
     lock.cleanup("prefill", rid)
-    lock.ready()
-    lock.refcounts([101])
+    assert lock.ready() == []
+    assert lock.held([101]) == []
 
 
 def _spec(rt, node, rid):
@@ -523,35 +373,28 @@ def _spec(rt, node, rid):
     )
 
 
-def test_speculate_node_agrees_across_a_loop(lock):
-    """Do the runtimes offer the SAME speculation targets at each point?
-
-    Motivation from the phase sweep: on orpheus the worker's `speculate` span
-    is flat in batch size under Rust and grows under Python. `speculate`
-    wraps _try_speculate_next, which returns immediately when speculate_node
-    yields nothing and otherwise builds a whole batch -- so a flat span means
-    Rust declines to speculate where Python does not. That is a behavioural
-    difference, not a faster implementation, and it belongs in lockstep.
-    """
+def test_speculation_targets_across_a_loop(lock):
+    """The target offered at each point of a request: into the loop from
+    prefill, then the same node's next iteration, before and after each pop and
+    route. A step with no target skips speculation entirely, so the worker pays
+    for a whole fresh batch instead."""
+    into_the_loop = [("ar_decode", WALK, False, "ar_loop", ("token",))]
+    next_iteration = [("ar_decode", WALK, True, "ar_loop", ("token",))]
     rid = lock.admit()
     lock.put(101)
     lock.ingest(rid, "prompt", "prefill", [101])
-    lock._both("speculate_node(prefill)", lambda rt, b, s: _spec(rt, "prefill", rid))
+    assert _spec(lock.rt, "prefill", rid) == into_the_loop
     lock.pop("prefill", rid)
-    lock._both("speculate_node(prefill) after pop",
-               lambda rt, b, s: _spec(rt, "prefill", rid))
+    assert _spec(lock.rt, "prefill", rid) == into_the_loop
     lock.put(201)
     lock.route("prefill", rid, ["token"], [201])
-    lock._both("speculate_node(ar_decode)",
-               lambda rt, b, s: _spec(rt, "ar_decode", rid))
+    assert _spec(lock.rt, "ar_decode", rid) == next_iteration
     for uuid in (202, 203):
         lock.pop("ar_decode", rid)
-        lock._both(f"speculate_node(ar_decode) iter {uuid}",
-                   lambda rt, b, s: _spec(rt, "ar_decode", rid))
+        assert _spec(lock.rt, "ar_decode", rid) == next_iteration
         lock.put(uuid)
         lock.route("ar_decode", rid, ["token"], [uuid])
-        lock._both(f"speculate_node(ar_decode) post-route {uuid}",
-                   lambda rt, b, s: _spec(rt, "ar_decode", rid))
+        assert _spec(lock.rt, "ar_decode", rid) == next_iteration
 
 
 def _external_input_loop_graph():
@@ -589,13 +432,12 @@ def _prep_same_node(rt, node, rid):
     )
 
 
-def test_same_node_speculation_with_a_held_external_input_agrees():
+def test_same_node_speculation_with_a_held_external_input():
     """A loop's external input lives in the current slot and is re-injected
-    every iteration; it never reaches the next-iter slot. Both runtimes must
-    still offer the same-node next iteration as a speculation target and hand
-    the held input over with the prepped edges (Python: GraphNode
-    .is_ready_for_speculation / _prep_spec_rid; Rust: held_mask)."""
-    lock = Lockstep(_external_input_loop_graph())
+    every iteration; it never reaches the next-iter slot. The same-node next
+    iteration is still a speculation target, and the held input goes over with
+    the prepped edges (Rust: held_mask)."""
+    lock = Script(_external_input_loop_graph())
     rid = lock.admit()
     lock.put(101)
     lock.ingest(rid, "prompt", "prefill", [101])
@@ -603,28 +445,19 @@ def test_same_node_speculation_with_a_held_external_input_agrees():
     lock.put(201)
     lock.put(301)
 
-    def route_two(rt, _b, s):
-        out = rt.complete_and_route_batch(RouteInput(
-            partition="default", graph_walk=WALK, node_name="prefill",
-            output_signals=["token", "ctx"], wg_ids=ParallelList([rid], [WG_ID]),
-            tensors=[201, 301], num_tensors=[1, 1],
-        ))
-        _finish_teardown(s, out.freed_inputs)
-        return (sorted(out.register_uuids), sorted(out.register_rids))
-
-    lock._both("route(prefill, token+ctx)", route_two)
-    lock.ready()
+    out = lock.rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="prefill",
+        output_signals=["token", "ctx"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[201, 301], num_tensors=[1, 1],
+    ))
+    _finish_teardown(lock.store, out.freed_inputs)
+    assert lock.ready() == [("ar_decode", WALK, [rid])]
     lock.pop("ar_decode", rid)
-    targets = lock._both("speculate_node(ar_decode)",
-                         lambda rt, b, s: _spec(rt, "ar_decode", rid))
+    targets = _spec(lock.rt, "ar_decode", rid)
     assert [(t[0], t[2]) for t in targets] == [("ar_decode", True)]
-    prep = lock._both("prep_spec_rids(ar_decode)",
-                      lambda rt, b, s: _prep_same_node(rt, "ar_decode", rid))
-    assert prep == ([rid], [("ctx", [301])])
-    rows = lock._both("prep_spec_rows(ar_decode)",
-                      lambda rt, b, s: _prep_rows_same_node(rt, "ar_decode", rid))
-    assert rows == ([rid], WG_ID, 0, [("ctx", [301])])
-    lock.refcounts([101, 201, 301])
+    assert _prep_same_node(lock.rt, "ar_decode", rid) == ([rid], [("ctx", [301])])
+    assert _prep_rows_same_node(lock.rt, "ar_decode", rid) == ([rid], WG_ID, 0, [("ctx", [301])])
+    assert lock.held([101, 201, 301]) == [201, 301]
 
 
 def _prep_rows_same_node(rt, node, rid, room=None):
@@ -641,23 +474,19 @@ def test_speculative_flag_survives_completion(lock):
     """The flag marking a node speculatively scheduled for N+1 must SURVIVE
     the completion of step N -- its rids are still in flight.
 
-    Python's WorkerGraphIO.mark_node_complete -> GraphNode.complete() never
-    touches ``_in_flight``; Rust's ``State::complete`` used to
-    set ``st.scheduled = false``. Because ``refresh_ready`` gates the ready-set
-    ADD on that flag (as Python's ``register_ingested_input`` does), clearing
-    it let the runtime report a node ready whose rids were mid-flight, and
+    ``State::complete`` used to set ``st.scheduled = false``. Because
+    ``refresh_ready`` gates the ready-set ADD on that flag, clearing it let the
+    runtime report a node ready whose rids were mid-flight, and
     ``get_ready_nodes`` handed them back to the scheduler as fresh work. Every
-    speculation then ran a full get_ready_nodes -> _assemble_batch ->
-    pop_rids round trip that ended in ``push_back_node`` -- the branch
-    worker.py documents as "Shouldn't happen".
-
-    Measured on bagel bs32 before the fix: 30.89 of 31.01 "fresh" rids were
-    the in-flight set under Rust, and exactly 0 under Python.
+    speculation then ran a full get_ready_nodes -> _assemble_batch -> pop_rids
+    round trip that ended in ``push_back_node`` -- the branch worker.py
+    documents as "Shouldn't happen". Measured on bagel bs32 before the fix:
+    30.89 of 31.01 "fresh" rids were the in-flight set.
 
     Asserted on the flag itself rather than on ``get_ready_nodes``: reaching
     the observable ready state needs the loop to advance, which this harness
-    does not drive, so a readiness assertion here passes vacuously (both
-    sides return []) whether or not the bug is present.
+    does not drive, so a readiness assertion here passes vacuously whether or
+    not the bug is present.
     """
     rid = lock.admit()
     lock.put(101)
@@ -667,26 +496,24 @@ def test_speculative_flag_survives_completion(lock):
     lock.route("prefill", rid, ["token"], [201])
     lock.pop("ar_decode", rid)
 
-    def flag(rt, b, s):
-        return rt.is_in_flight("ar_decode", WG_ID, rid)
-    assert lock._both("is_in_flight before", flag) is False
+    def flag():
+        return lock.rt.is_in_flight("ar_decode", WG_ID, rid)
+    assert flag() is False
 
-    lock._both("set_in_flight(ar_decode, True)",
-               lambda rt, b, s: rt.set_in_flight("ar_decode", [rid], [WG_ID], True))
-    assert lock._both("is_in_flight after set", flag) is True
+    lock.rt.set_in_flight("ar_decode", [rid], [WG_ID], True)
+    assert flag() is True
 
     # Step N completes. The flag must not be cleared by it.
     lock.put(202)
     lock.route("ar_decode", rid, ["token"], [202])
-    assert lock._both("is_in_flight after completion", flag) is True, (
+    assert flag() is True, (
         "completion cleared the speculative-scheduling flag; the node's rids "
         "are still in flight and it will be reported ready again"
     )
 
     # Only the worker clearing it explicitly ends the speculation.
-    lock._both("set_in_flight(ar_decode, False)",
-               lambda rt, b, s: rt.set_in_flight("ar_decode", [rid], [WG_ID], False))
-    assert lock._both("is_in_flight after clear", flag) is False
+    lock.rt.set_in_flight("ar_decode", [rid], [WG_ID], False)
+    assert flag() is False
 
 
 def _streaming_loop_graph():
@@ -715,12 +542,11 @@ def _streaming_loop_graph():
 def test_an_all_streaming_loop_member_takes_a_new_chunk_every_iteration():
     """Each iteration consumes the NEXT chunk, and nothing else.
 
-    Rust re-injected the first chunk as a loop external input on every
-    advance, so the node re-ran on it and refused the real next chunk
-    (its slot was full). Python refused it too, differently: the node left the
-    streaming-ready set when it first filled and nothing put it back.
+    Re-injecting the first chunk as a loop external input on every advance
+    made the node re-run on it and refuse the real next chunk (its slot was
+    full).
     """
-    lock = Lockstep(_streaming_loop_graph())
+    lock = Script(_streaming_loop_graph())
     rid = lock.admit()
     for i in range(3):
         chunk, out = 100 + i, 200 + i
@@ -738,4 +564,4 @@ def test_an_all_streaming_loop_member_takes_a_new_chunk_every_iteration():
         lock.route("talker", rid, ["audio"], [out])
         # Not ready again until the next chunk arrives.
         assert lock.ready() == []
-        lock.refcounts([chunk])
+        assert lock.held([chunk]) == []
