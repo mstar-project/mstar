@@ -284,6 +284,14 @@ class Wan22DiT(nn.Module):
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
     ``to_empty(device)`` -> checkpoint load)."""
 
+    # The linears over the video tokens, which ``linear_dtype: fp8`` runs as fp8 GEMMs. The
+    # cross-attention's k/v over the text (where fp8 is no faster), the condition embedder,
+    # modulation and output projection keep the checkpoint's weights.
+    FP8_LINEARS = (
+        "blocks.*.self_attn.*_proj", "blocks.*.cross_attn.q_proj", "blocks.*.cross_attn.o_proj",
+        "blocks.*.ffn.linear_*",
+    )
+
     def __init__(self, config: Wan22Config):
         super().__init__()
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:

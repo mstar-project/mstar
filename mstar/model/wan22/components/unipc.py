@@ -10,9 +10,14 @@ is stateless per iteration, so that state is split in two: per-request *tables*
 iteration, and *loop-carried tensors* (``UniPCState``), routed through the graph's
 loop-back edges. All solver math runs float32 on the sample's device, as the
 reference does.
+
+``unipc_coefficients`` / ``unipc_coefficient_step`` are the same update with the
+per-step branches folded into weights computed up front, for the scaffold's
+batched and captured loop; the step functions stay the bit-exact path.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -190,3 +195,115 @@ def unipc_corrector_step(
     x_t_ = sigma_t / sigma_s0 * state.last_sample - alpha_t * h_phi_1 * m0
     x_t = x_t_ - alpha_t * b_h * (corr_res + rhos_c[-1] * d1_t)
     return x_t.to(this_sample.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Coefficient form, for a batched or captured loop
+# ---------------------------------------------------------------------------
+
+
+class UniPCCoefficients(NamedTuple):
+    """The UniPC corrector and predictor of each step as weighted sums, ``[N]`` float32 each.
+
+    The step functions above branch on the step index (no corrector at step 0, the
+    order ramp) and solve for the corrector weights on the device. Every branch is
+    known per request up front, so the same update can be written with per-step
+    weights instead, which lets rows at different steps share one forward and a
+    captured graph replay any step. Over step k's converted output ``m_k``, the
+    previous two ``m_{k-1}``, ``m_{k-2}``, the sample ``x_k`` and the corrector's
+    ``last_sample``:
+
+        x_c     = corr_sample x_k + corr_last last_sample
+                  + corr_prev m_{k-1} + corr_prev2 m_{k-2} + corr_this m_k
+        x_{k+1} = pred_sample x_c + pred_this m_k + pred_prev m_{k-1}
+
+    Same algebra as the step functions; the weights are computed in float64, so the
+    result differs from them only in float32 rounding.
+    """
+
+    corr_sample: torch.Tensor
+    corr_last: torch.Tensor
+    corr_prev: torch.Tensor
+    corr_prev2: torch.Tensor
+    corr_this: torch.Tensor
+    pred_sample: torch.Tensor
+    pred_this: torch.Tensor
+    pred_prev: torch.Tensor
+
+
+def _bh2_rhos_f64(rk: float, hh: float, order: int) -> np.ndarray:
+    """``_bh2_rhos`` in float64 for one history ratio ``rk``."""
+    rks = np.array([rk, 1.0])
+    h_phi_1 = np.expm1(hh)
+    h_phi_k = h_phi_1 / hh - 1
+    b_h = np.expm1(hh)
+    rows, b = [], []
+    factorial_i = 1
+    for i in range(1, order + 1):
+        rows.append(rks ** (i - 1))
+        b.append(h_phi_k * factorial_i / b_h)
+        factorial_i *= i + 1
+        h_phi_k = h_phi_k / hh - 1 / factorial_i
+    return np.linalg.solve(np.stack(rows), np.array(b))
+
+
+def unipc_coefficients(sigmas: torch.Tensor, num_inference_steps: int) -> UniPCCoefficients:
+    """Per-step weights of the coefficient form for ``make_unipc_tables``' sigmas."""
+    s = sigmas.double().numpy()
+    with np.errstate(divide="ignore"):
+        # +inf at the terminal sigma of 0, which the expm1 below turns into -1, as in
+        # the step functions
+        lam = np.log(1 - s) - np.log(s)
+    n = num_inference_steps
+    out = {name: np.zeros(n) for name in UniPCCoefficients._fields}
+    for k in range(n):
+        if k == 0:
+            out["corr_sample"][k] = 1.0  # no corrector before the first output
+        else:
+            alpha_t = 1 - s[k]
+            h = lam[k] - lam[k - 1]
+            h_phi_1 = b_h = np.expm1(-h)
+            order = unipc_effective_order(k - 1, n)
+            out["corr_last"][k] = s[k] / s[k - 1]
+            if order == 1:
+                rho_prev2, rho_this = 0.0, 0.5
+            else:
+                rk = (lam[k - 2] - lam[k - 1]) / h
+                rho_d1, rho_this = _bh2_rhos_f64(rk, -h, order)
+                rho_prev2 = rho_d1 / rk
+            out["corr_prev"][k] = -alpha_t * h_phi_1 + alpha_t * b_h * (rho_prev2 + rho_this)
+            out["corr_prev2"][k] = -alpha_t * b_h * rho_prev2
+            out["corr_this"][k] = -alpha_t * b_h * rho_this
+        alpha_t = 1 - s[k + 1]
+        h = lam[k + 1] - lam[k]
+        h_phi_1 = b_h = np.expm1(-h)
+        out["pred_sample"][k] = s[k + 1] / s[k]
+        out["pred_this"][k] = -alpha_t * h_phi_1
+        if unipc_effective_order(k, n) == 2:
+            rk = (lam[k - 1] - lam[k]) / h
+            out["pred_this"][k] += alpha_t * b_h * 0.5 / rk
+            out["pred_prev"][k] = -alpha_t * b_h * 0.5 / rk
+    return UniPCCoefficients(**{name: torch.from_numpy(v).to(torch.float32) for name, v in out.items()})
+
+
+def unipc_coefficient_step(
+    sample: torch.Tensor,
+    this_model_output: torch.Tensor,
+    model_outputs: torch.Tensor,
+    last_sample: torch.Tensor,
+    coeffs: UniPCCoefficients,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One corrector + predictor update in the coefficient form, for a batch.
+
+    ``sample``, ``this_model_output`` (``m_k``) and ``last_sample`` are ``[B, ...]``,
+    ``model_outputs`` is the ``[B, 2, ...]`` ring (slot 1 the previous output), and
+    each weight broadcasts over a row (``[B, 1, ...]``). Returns the next sample, the
+    shifted ring and the corrected sample (the next step's ``last_sample``), float32.
+    """
+    prev, prev2 = model_outputs[:, 1], model_outputs[:, 0]
+    corrected = (
+        coeffs.corr_sample * sample + coeffs.corr_last * last_sample
+        + coeffs.corr_prev * prev + coeffs.corr_prev2 * prev2 + coeffs.corr_this * this_model_output
+    )
+    new_sample = coeffs.pred_sample * corrected + coeffs.pred_this * this_model_output + coeffs.pred_prev * prev
+    return new_sample, torch.stack([prev, this_model_output], dim=1), corrected

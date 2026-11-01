@@ -1289,10 +1289,24 @@ rotary positions (``num_frames`` up to 4,093), and height and width are at most
 16,384, the largest side the mp4 encoder (libx264) opens. Each is a 400 naming
 the limit.
 
+**The denoise loop.** The ``dit`` node runs on the DiT scaffold
+(``dit_loop: scaffold``, the default): requests at the same shape (latent grid,
+CFG on or off, T2V or I2V) batch, up to ``max_batch_size`` (default 2), at any mix
+of steps, and every shape in ``compile_dit_sizes`` is compiled and captured as an
+accelerator graph at startup for T2V and I2V with CFG, at each of
+``capture_batch_sizes`` (default ``[1, 2]``; ``accelerator_graph: false`` runs the
+same loop uncaptured). The UniPC update runs in a coefficient form, its per-step
+branches folded into per-row weights staged with the request's schedule, which
+matches the reference solver to float32 rounding. ``dit_loop: legacy`` keeps the
+one-request loop the reference-equivalence tests pin bit-exact (uncaptured,
+unbatched).
+
 **Compiled DiT shapes.** With ``compile_dit`` the DiT compiles one graph per
 input shape, so only the ``"WxHxF"`` shapes in ``compile_dit_sizes`` (default
-``1280x704x81``) use the compiled transformer; each compiles on first use, once
-with CFG and once without, so at most two compiles per listed shape. Any other
+``1280x704x81``; ``configs/wan22.yaml`` adds ``832x480x33``) use the compiled
+transformer. The scaffold loop compiles them at startup, once per captured batch
+size; the legacy loop compiles each on first use, once with CFG and once without,
+so at most two compiles per listed shape. Any other
 size or frame count runs the same transformer eager, with no compile, which is
 slower per request once warm: on an H200, about 49% more at 640x352x17 and 55%
 more at 832x480x33 than the same shape compiled. List the shapes a deployment
@@ -1309,10 +1323,12 @@ Requests are therefore independent and the loop is resumable across ranks.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
-channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
-yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
-the DiT only for the ``compile_dit_sizes`` shapes (see Compiled DiT shapes), so
-the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only
+compiled (``vae_decode_fast``; set it to ``false`` under the yaml's
+``model_kwargs`` for stock ``vae.decode``), channels-last on NVIDIA GPUs and in
+the default layout on AMD GPUs, where MIOpen's channels-last conv3d is about 2x
+slower. The DiT compiles at startup (the legacy loop: on first use) for the
+``compile_dit_sizes`` shapes (see Compiled DiT shapes). The VAE decode compiles on
+first use, once per resolution, and only
 for the sizes in ``vae_decode_fast_sizes`` (default ``1280x704``); any other
 size decodes with stock ``vae.decode``, frames identical to
 ``vae_decode_fast: false``. The compile uses Inductor's deterministic mode, so
@@ -1321,8 +1337,7 @@ has no such mode, and there two processes can differ by a few uint8 levels.
 The VAE decode
 tiles only when free VRAM at decode time is short of the untiled estimate
 (the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
-32 GiB card. No CUDA-graph capture, no continuous batching (one request per
-step) and no component offload.
+32 GiB card. No component offload.
 
 LTX-2.5 (``ltx2_5``)
 --------------------
@@ -1483,6 +1498,48 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    Pixels, default 2048². Bounds the output size a request may ask for; larger requests
    are rejected with a 400 before scheduling instead of occupying the worker for minutes
    (an 8192² request means 262k tokens of quadratic attention).
+
+``linear_dtype``
+   ``bf16`` (the default) or ``fp8``. With ``fp8`` the transformer blocks' linears over the
+   image and joint token streams run as fp8 GEMMs: weights quantised once at load with one
+   scale per output channel, activations per token inside the compiled forward (fused into
+   the modulated norm), the product on hipBLASLt or cuBLASLt. The text-stream, modulation,
+   embedding and output projections, the text encoder and the VAE stay bf16. It needs a GPU
+   with fp8 GEMMs (MI300X/MI325X, MI355X, NVIDIA Hopper and newer); elsewhere the linears
+   stay bf16 with a warning. On one MI325X (three server launches per setting) klein-9B
+   serves 1.34 times the images per second at one request and 1.39 times at 16 (0.71 to
+   0.53 s per 1024² image), klein-4B 1.19 and 1.21 times. The images move by e4m3 rounding:
+   against the diffusers reference over the 40 ``image_v1`` images, klein-9B goes from a
+   median 26.6 to 23.1 dB PSNR and klein-4B from 23.9 to 22.6 dB. Both stay far closer to
+   the reference than another seed is (normalized distance median 0.09 and 0.10, where 0 is
+   a kernel change and 1 another seed), but klein-9B falls under the ROCm floor of 3 dB
+   below the reference's own kernel spread, so it stays opt-in, a quality trade to make
+   per deployment. The same knob exists for ``z_image_turbo`` and ``wan22``, where the
+   longer samplers carry the error further: Wan2.2 (20 steps, CFG) serves 1.1 to 1.2 times
+   the clips per minute at 18 dB instead of 22 dB per frame from diffusers (still within
+   the cross-seed bar), and Z-Image-Turbo moves too far (two of 40 images half-way or more
+   to another seed), so ``fp8`` is not recommended there.
+
+``fp8_keep_bf16``
+   Linears that stay bf16 under ``linear_dtype: fp8``, as module-name patterns matched
+   segment by segment, where a segment may be an index range: ``single_blocks.*.out``
+   (every single-stream block's output projection), ``single_blocks.0-3.*`` (the first
+   four single blocks), ``double_blocks.0-2.img_ff.linear_out``. An entry that names none
+   of the model's fp8 linears is an error at load. Each kept linear gives back its share of
+   the fp8 speedup, and which ones buy the most quality per millisecond is a per-model
+   measurement. ``configs/flux2_klein_9b.yaml`` keeps the 51 of klein-9B's 80 fp8 linears
+   with the most image error per millisecond saved (every double block's, most single
+   blocks' output projections and two early fused projections): in a one-GPU MI325X A/B it
+   serves at a median 26.5 dB from the diffusers reference, over the ROCm floor, at about
+   1.18 times the bf16 images per second (1.39 times with every linear in fp8). Lists
+   giving back 20% and 30% of the saving instead of 40% measured 25.2 dB, under the floor.
+
+   On AMD GPUs, fp8 needs ``knobs: dit_exact_ops: true`` too. The numbers above were
+   measured with the norms eager. The platform default compiles them, and then the 9B
+   keep-list scores 25.4 to 25.8 dB (floor 25.5) and klein-4B 22.5 to 22.7 (floor 22.4). With
+   the knob on they repeat across launches at 26.5 and 22.6 dB. At one request the knob
+   costs 8% and 7% of the fp8 images per second, which leaves 1.1 times bf16 with the knob
+   off (one MI325X, shared node).
 
 With the klein defaults every served image is within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
