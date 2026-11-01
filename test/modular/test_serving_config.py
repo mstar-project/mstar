@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from mstar.platforms import CudaPlatform, RocmPlatform, serving_config
-from mstar.platforms.serving_config import apply_platform_overrides, load_serving_config
+from mstar.platforms.serving_config import OVERRIDES_KEY, apply_platform_overrides, load_serving_config
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -84,16 +84,25 @@ def test_the_gentle_ramp_configs_are_their_base_with_a_chunk_schedule(ramp, base
     ("flux2_klein_9b.yaml", "flux2_klein_9b_bf16.yaml"),
 ])
 def test_the_klein_configs_serve_bf16_on_cuda_and_fp8_on_rocm(monkeypatch, name, bf16):
-    """On AMD GPUs the override adds fp8 and the knob it needs to the file's
-    model_kwargs and drops none of them. CUDA serves the bf16 file unchanged."""
-    expected = _shipped(bf16)
+    """On AMD GPUs the override adds fp8, the knob it needs and the solo text encoder
+    to the file's model_kwargs and drops none of them. CUDA serves the bf16 file
+    without its override, so its encoder stays batched."""
     monkeypatch.setattr(serving_config, "_built_for", CudaPlatform)
+    expected = load_serving_config(str(CONFIGS / bf16))
+    assert OVERRIDES_KEY not in expected
+    assert "text_encoder_max_batch_size" not in expected["model_kwargs"]
     assert load_serving_config(str(CONFIGS / name)) == expected
 
     monkeypatch.setattr(serving_config, "_built_for", RocmPlatform)
     resolved = load_serving_config(str(CONFIGS / name))
-    assert resolved["model_kwargs"] == {**expected["model_kwargs"], "linear_dtype": "fp8"}
+    assert resolved["model_kwargs"] == {
+        **expected["model_kwargs"], "linear_dtype": "fp8", "text_encoder_max_batch_size": 1,
+    }
     assert resolved["knobs"] == {"dit_exact_ops": True}
     assert {k: v for k, v in resolved.items() if k not in ("model_kwargs", "knobs")} == {
         k: v for k, v in expected.items() if k != "model_kwargs"
+    }
+    # a bf16 deployment on AMD GPUs differs from the CUDA one by the solo text encoder alone
+    assert load_serving_config(str(CONFIGS / bf16)) == {
+        **expected, "model_kwargs": {**expected["model_kwargs"], "text_encoder_max_batch_size": 1},
     }

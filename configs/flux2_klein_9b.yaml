@@ -30,6 +30,8 @@ model_kwargs: &model_kwargs
   capture_edit_sizes: [[1024, 1024]]
   capture_batch_sizes: [1, 2, 3, 4]
   max_batch_size: 4
+  # text_encoder_max_batch_size: prompts in one text encoder step, max_batch_size unless set. Default batched, 1 on AMD
+  # GPUs (platform_overrides below). Whether NVIDIA's text encoder depends on the batch size the same way is unmeasured
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
@@ -73,5 +75,6 @@ platform_overrides:
     model_kwargs:
       <<: *model_kwargs
       linear_dtype: fp8
+      text_encoder_max_batch_size: 1
     knobs:
       dit_exact_ops: true

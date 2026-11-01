@@ -1,9 +1,9 @@
 model: "flux2_klein"
 
-# bf16 on every platform: flux2_klein.yaml without its AMD override. Its comments explain the settings.
+# bf16 on every platform: flux2_klein.yaml without its AMD fp8 override. Its comments explain the settings.
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
   attention_backend: auto
   compile: true
   compile_eager_rounding: true
@@ -22,3 +22,9 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      text_encoder_max_batch_size: 1

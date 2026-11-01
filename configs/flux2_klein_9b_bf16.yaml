@@ -1,10 +1,10 @@
 model: "flux2_klein_9b"
 
-# bf16 on every platform: flux2_klein_9b.yaml without its AMD override. Its comments explain the settings and the
+# bf16 on every platform: flux2_klein_9b.yaml without its AMD fp8 override. Its comments explain the settings and the
 # license. fp8_keep_bf16 does nothing under bf16, it stays so a linear_dtype: fp8 here means the same as there.
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
   attention_backend: auto
   compile: true
   compile_eager_rounding: true
@@ -31,3 +31,9 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      text_encoder_max_batch_size: 1
