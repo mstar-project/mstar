@@ -208,10 +208,19 @@ You must implement these abstract methods:
 .. note::
 
    The metadata ``process_prompt`` returns is laid over the request's own
-   ``model_kwargs``, so a key the model reads back there (a prompt layout, a
-   stream lead) must be set in every mode and listed in ``INTERNAL_KWARGS``: the
-   data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
-   lists its prompt layout, speaker, language, clip digest and codec stream lead.
+   ``model_kwargs``, so a key the model reads back there (a prompt layout) must be
+   set in every mode and listed in ``INTERNAL_KWARGS``: the data worker drops a
+   client's value for it before ``process_prompt``. Qwen3-TTS lists its prompt
+   layout, speaker, language and clip digest.
+
+.. note::
+
+   A stream that starts with context-only items (a voice clone's reference frames)
+   says so in the metadata as ``"stream_lead_items": {edge: n}``: ``edge`` names a
+   streaming ``Connection``, and ``n``, at most that edge's policy's left context,
+   leads the first window as context and is never output. Leave the key out when
+   ``n`` is 0. The data worker drops a client's value, and the consumer partition's
+   workers prime the stream with it (Qwen3-TTS, VoxCPM2).
 
 .. note::
 

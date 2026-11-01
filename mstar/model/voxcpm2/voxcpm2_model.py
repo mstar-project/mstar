@@ -83,8 +83,6 @@ from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 STREAM_EDGE = "latent_patches"
-# model_kwargs key: prompt patches leading a continuation's VAE stream
-STREAM_LEAD_KEY = "vae_stream_lead_patches"
 _CJK = re.compile(r"^[\u4e00-\u9fff]{2,}$")
 logger = logging.getLogger(__name__)
 
@@ -157,7 +155,7 @@ class VoxCPM2Model(Model):
     REF_MIN_PEAK = 1e-3
     # the reference demo offers 1 to 3; float32 overflows to inf past about 3.4e38
     MAX_CFG_VALUE = 10.0
-    INTERNAL_KWARGS = (*TALKER_STEP_METADATA, STREAM_LEAD_KEY)
+    INTERNAL_KWARGS = TALKER_STEP_METADATA
     LENGTH_KWARGS = ("max_new_tokens", "max_output_tokens", "max_len")
     # English speech measured at 1.3 to 2.9 patches per text token (24 zero-shot
     # requests of 1,300 to 1,700 tokens), so text up to max_len / 3 tokens fits in max_len patches
@@ -492,16 +490,17 @@ class VoxCPM2Model(Model):
             "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             "gen_params": [torch.tensor([cfg_value], dtype=torch.float32)],
         }
-        # every key is set in every mode: the data worker lays this over the
-        # request's own kwargs, so a key left out stays client-controlled
+        # every INTERNAL_KWARGS key is set in every mode: the data worker lays
+        # this over the request's own kwargs, so a key left out stays client-controlled
         lead = min(self.config.prompt_context_patches, ref_patches) if mode == MODE_REF_CONTINUATION else 0
         metadata = {
             PATCH_BUDGET_KEY: max_patches,
             PROMPT_MODE_KEY: mode,
             MIN_LEN_KEY: min_len,
             REF_DIGEST_KEY: digest,
-            STREAM_LEAD_KEY: lead,
         }
+        if lead:  # the data worker strips a client's stream_lead_items
+            metadata["stream_lead_items"] = {STREAM_EDGE: lead}
         # both LMs write the same rows: the prompt (``build_prompt``), then one per decode step
         walk = "talker_prefill" if mode == MODE_ZERO_SHOT else "talker_prefill_clone"
         prefill = Span("ids" if mode == MODE_ZERO_SHOT else "rows", walk, prompt_len, prompt_len, "text_inputs")
@@ -550,7 +549,6 @@ class VoxCPM2Model(Model):
                 step_metadata={key: model_kwargs[key] for key in TALKER_STEP_METADATA if key in model_kwargs},
             )
         if partition_name == "VAEDecoder":
-            lead = int(model_kwargs.get(STREAM_LEAD_KEY, 0))
             return ForwardPassArgs(
                 full_metadata=CurrentForwardConductorMetadata(
                     input_modalities=input_modalities,
@@ -561,7 +559,6 @@ class VoxCPM2Model(Model):
                 inputs=[],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
-                stream_lead_items={STREAM_EDGE: lead} if lead else {},
             )
         raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
 

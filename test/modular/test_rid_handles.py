@@ -319,7 +319,8 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
         )
         Worker._add_new_request(w, body)
 
-    new("Talker", {})
+    # the conductor stamps the lead on every partition's NEW; only the consumer primes
+    new("Talker", {"codec_tokens": 2})
     sbuf = next(iter(req.stream_buffers.values()))
     sbuf.pre_read_register("t0")
     sbuf.put("t0", torch.tensor([0]))

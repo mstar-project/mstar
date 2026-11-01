@@ -254,6 +254,23 @@ def test_only_the_new_request_carries_the_layout(tmp_path, monkeypatch):
     assert kept.kv_layout is None and kept.loop_caps is None, "the conductor's later messages would carry the layout"
 
 
+@pytest.mark.parametrize("lead", [None, {"codes": 3}])
+def test_a_stream_lead_reaches_the_new_request_and_a_clients_is_dropped(tmp_path, monkeypatch, lead):
+    """process_prompt's stream lead primes the consumer's stream; a client's
+    value past the stream's context would raise in the worker's ingest."""
+
+    class _Leading(_Model):
+        def process_prompt(self, *args, **kwargs):
+            out = super().process_prompt(*args, **kwargs)
+            if lead:
+                out.metadata["stream_lead_items"] = lead
+            return out
+
+    model = _Leading()
+    kwargs = _preprocess(model, {"max_output_tokens": 30, "stream_lead_items": {"codes": 999}})
+    assert _ingest(model, kwargs, tmp_path, monkeypatch).request_info.stream_lead_items == (lead or {})
+
+
 def test_a_layout_the_client_sent_is_dropped(tmp_path, monkeypatch):
     model = _Model()
     kwargs = _preprocess(model, {"max_output_tokens": 30, "kv_layout": {"kv": {"main": [[[1, 1, "x"]], [], 0, None]}}})
