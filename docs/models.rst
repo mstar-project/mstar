@@ -1512,8 +1512,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      distilled sampler amplifies the last bit of inductor's own reductions and activation
      decompositions.
    * On AMD GPUs the setting is not applied unless the deployment asks for it
-     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`), as the fp8 default
-     of ``configs/flux2_klein.yaml`` does (see ``linear_dtype``). hipBLASLt picks
+     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`), as the fp8 defaults
+     of the klein configs do (see ``linear_dtype``). hipBLASLt picks
      GEMM kernels per M, so the eager norms do not make the output match the reference
      there either, and the bar is the reference's own cross-seed spread. On MI325X the
      compiled norms take klein-4B from 0.406 to 0.384 s at B=1 and 2.97 to 3.32 images/s
@@ -1563,7 +1563,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    (an 8192² request means 262k tokens of quadratic attention).
 
 ``linear_dtype``
-   ``bf16`` (the default, except for the klein config noted below on AMD GPUs) or ``fp8``.
+   ``bf16`` (the default, except for the klein configs on AMD GPUs, below) or ``fp8``.
    With ``fp8`` the transformer blocks' linears over the
    image and joint token streams run as fp8 GEMMs: weights quantised once at load with one
    scale per output channel, activations per token inside the compiled forward (fused into
@@ -1577,24 +1577,30 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    median 26.6 to 23.1 dB PSNR and klein-4B from 23.9 to 22.6 dB. Both stay far closer to
    the reference than another seed is (normalized distance median 0.09 and 0.10, where 0 is
    a kernel change and 1 another seed), but klein-9B falls under the ROCm floor of 3 dB
-   below the reference's own kernel spread, so it stays opt-in, a quality trade to make
-   per deployment. The same knob exists for ``z_image_turbo`` and ``wan22``, where the
+   below the reference's own kernel spread, so every linear in fp8 stays opt-in there, a
+   quality trade to make per deployment. The same knob exists for ``z_image_turbo`` and
+   ``wan22``, where the
    longer samplers carry the error further: Wan2.2 (20 steps, CFG) serves 1.1 to 1.2 times
    the clips per minute at 18 dB instead of 22 dB per frame from diffusers (still within
    the cross-seed bar), and Z-Image-Turbo moves too far (two of 40 images half-way or more
    to another seed), so ``fp8`` is not recommended there.
 
-   On AMD GPUs ``configs/flux2_klein.yaml`` serves fp8 on every declared linear with
-   ``knobs: dit_exact_ops: true``, through its
+   On AMD GPUs ``configs/flux2_klein.yaml`` serves fp8 on every declared linear and
+   ``configs/flux2_klein_9b.yaml`` fp8 with its ``fp8_keep_bf16`` list, both with
+   ``knobs: dit_exact_ops: true``, through a
    :ref:`platform_overrides <platform-overrides>` entry. NVIDIA stays on bf16, and
-   ``flux2_klein_bf16.yaml`` serves bf16 everywhere. On one quiet MI325X at 1, 4, 8 and 16 requests:
+   ``flux2_klein_bf16.yaml`` and ``flux2_klein_9b_bf16.yaml`` serve bf16 everywhere. On one
+   quiet MI325X at 1, 4, 8 and 16 requests:
 
    * klein-4B: 3.157, 3.586, 3.494 and 3.647 images per second against 2.775, 3.107, 3.181
      and 3.313 on bf16, at a median 22.59 dB from diffusers (floor 22.43).
+   * klein-9B: 1.737, 1.820, 1.769 and 1.819 images per second against 1.569, 1.620, 1.680
+     and 1.670 on bf16, at a median 26.48 dB from diffusers (floor 25.46).
 
    The median hides a tail. Against its bf16 twin the typical image loses 1.0 dB on klein-4B
-   and the worst 11.4 dB. Those 40 images were checked by eye and accepted. The per-step
-   schedule ``flux2_klein_fp8_bpff.yaml`` loses at most 1.65 dB for about 40% of the gain.
+   and 1.3 dB on klein-9B, and the worst 11.4 and 6.5 dB. Those 40 images were checked by eye
+   and accepted. The per-step schedules ``flux2_klein_fp8_bpff.yaml`` and
+   ``flux2_klein_9b_fp8_bbpf.yaml`` lose at most 1.65 dB for about 40% and 80% of the gain.
 
 ``fp8_keep_bf16``
    Linears that stay bf16 under ``linear_dtype: fp8``, as module-name patterns matched
@@ -1652,8 +1658,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    60% of the time saving of fp8 on every step lost at least 0.7 dB on the typical image.
 
 With the bf16 klein defaults on NVIDIA every served image is within 53 dB of the eager path
-on all 100 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the
-served images of the other engines are 10 to 16 dB from the diffusers reference for the same
+on all 100 protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
+images of the other engines are 10 to 16 dB from the diffusers reference for the same
 seeds.
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the

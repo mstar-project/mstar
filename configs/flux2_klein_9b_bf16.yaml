@@ -1,0 +1,33 @@
+model: "flux2_klein_9b"
+
+# bf16 on every platform: flux2_klein_9b.yaml without its AMD override. Its comments explain the settings and the
+# license. fp8_keep_bf16 does nothing under bf16, it stays so a linear_dtype: fp8 here means the same as there.
+max_seq_len: 512
+
+model_kwargs:
+  attention_backend: auto
+  compile: true
+  compile_eager_rounding: true
+  compile_exact_ops: [norms]
+  accelerator_graph: true
+  capture_sizes: [[1024, 1024], [768, 1344]]
+  capture_edit_sizes: [[1024, 1024]]
+  capture_batch_sizes: [1, 2, 3, 4]
+  max_batch_size: 4
+  vae_compile: true
+  fp8_keep_bf16:
+    - double_blocks.*.attn.*
+    - double_blocks.*.img_ff.*
+    - single_blocks.0-13.out
+    - single_blocks.15-16.out
+    - single_blocks.18.out
+    - single_blocks.0.qkv_mlp
+    - single_blocks.3.qkv_mlp
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]
