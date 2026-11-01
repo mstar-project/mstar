@@ -16,6 +16,7 @@ from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.platforms.compile import start_compile_pool
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -269,6 +270,10 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
+        # Before the model does anything: the process's first compile builds the
+        # pool, and a submodule can compile at load (klein warms its VAE decode).
+        if (device_capability or DeviceCapability.of(device)).is_available:
+            start_compile_pool()
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
