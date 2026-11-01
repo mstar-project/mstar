@@ -569,11 +569,14 @@ mod tests {
         let mut pp = Postprocess::new(
             "p".into(), "n".into(), "w".into(), vec!["s".into()], vec![1, 2, 3], None, None,
             vec![(2, vec!["l".into()])], false, None, Vec::new(), None, vec![1, 2], false,
+            Some(vec![4, 5, 6]),
         );
         pp.stops = Some(vec![(2, vec!["l".into()]), (3, vec!["l".into()])]);
         pp.keep_rows(&[2].into_iter().collect());
         assert_eq!(pp.rids, vec![1, 3]);
         assert_eq!(pp.stops, Some(vec![(3, vec!["l".to_string()])]));
         assert_eq!(pp.partition_done, vec![1]);
+        // a dropped row's loop stride leaves with it
+        assert_eq!(pp.loop_strides, Some(vec![4, 6]));
     }
 }
