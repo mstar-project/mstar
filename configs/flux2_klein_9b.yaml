@@ -5,7 +5,7 @@ model: "flux2_klein_9b"
 # not Apache-2.0; check the license before deploying.
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
   # auto: the DiT's joint attention runs on the engine's ragged attention resource with the platform's default
   # kernel: FlashInfer FA3 on an H100 (served as fast as sdpa, 0.355 vs 0.349 s at B=1), AITER's asm flash attention
   # on MI300X/MI325X (where torch's sdpa is AOTriton, well short of it). sdpa keeps torch's kernel inline, the
@@ -18,8 +18,9 @@ model_kwargs:
   # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
   # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
   # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — true: 0.654 s at B=1 vs 0.608 plain; 0.785 without compile; [norms] pending measurement
-  # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
-  # keeps the output off the reference bit for bit either way. MI325X: 0.709 -> 0.660 s at B=1, 1.54 -> 1.68 images/s at c=16.
+  # On AMD GPUs the bf16 config does not apply this (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M
+  # kernel choice keeps the output off the reference bit for bit either way. MI325X: 0.709 -> 0.660 s at B=1, 1.54 -> 1.68
+  # images/s at c=16. This file's AMD default runs fp8 steps, which need it, so the override below turns the knob on.
   compile_exact_ops: [norms]
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
@@ -29,14 +30,17 @@ model_kwargs:
   capture_edit_sizes: [[1024, 1024]]
   capture_batch_sizes: [1, 2, 3, 4]
   max_batch_size: 4
+  # text_encoder_max_batch_size: prompts in one text encoder step, max_batch_size unless set. Default batched, 1 on AMD
+  # GPUs (platform_overrides below). Whether NVIDIA's text encoder depends on the batch size the same way is unmeasured
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.34x images/s at
-  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst)
+  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst).
+  # Default bf16, flux2_klein_9b_fp8_keep.yaml serves it with the list below
   # Under linear_dtype: fp8 these stay bf16: the linears with the most image error per ms of fp8 saving on MI325X,
-  # about 40% of the saving (ignored under bf16). One-GPU MI325X A/B: median 26.5 dB from diffusers, over the ROCm
-  # floor, at ~1.18x bf16 images/s; lists giving back 20-30% fell under the floor (25.2 dB)
+  # about 40% of the saving (ignored under bf16, emptied by the AMD default's schedule). One-GPU MI325X A/B: median 26.5 dB
+  # from diffusers, over the ROCm floor, at ~1.18x bf16 images/s; lists giving back 20-30% fell under the floor (25.2 dB)
   # On AMD GPUs fp8 needs `knobs: dit_exact_ops: true` (top level): the list was picked with the norms eager. MI325X:
   # 26.5 dB with the knob on, 25.4-25.8 with it off. The knob costs 8% of fp8 images/s at c=1, leaving 1.1x bf16
   fp8_keep_bf16:
@@ -48,7 +52,8 @@ model_kwargs:
     - single_blocks.0.qkv_mlp
     - single_blocks.3.qkv_mlp
   # linear_dtype_steps picks the dtype per denoise step (docs/models.rst): with this list, [bf16, bf16, fp8, fp8] loses
-  # 0.2 dB on the typical image against bf16 on MI325X, 1.3 dB with fp8 on every step, at about half of the speedup
+  # 0.2 dB on the typical image against bf16 on MI325X, 1.3 dB with fp8 on every step, at about half of the speedup.
+  # Unset, except on AMD GPUs (platform_overrides at the end of this file)
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 
@@ -59,3 +64,72 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+# On AMD GPUs the DiT runs [bf16, bf16, fp8_partial, fp8] with the norms on the eager kernels, and each prompt encodes alone while
+# the DiT and VAE keep batching. An entry replaces a top-level key whole, so model_kwargs repeats the block above through the merge
+# key, and the schedule's own list stands in for fp8_keep_bf16. MI325X, shared node, against bf16: +3 / +16 / +6 / +6% images/s at
+# c=1/4/8/16, no cell at c>=4 under the 25.46 dB floor from diffusers (lowest 26.24), accepted by eye on the 40 image_v1 images. The
+# keep-list, flux2_klein_9b_fp8_keep.yaml, is 8% faster at c=1 and 3% at c=16 but marginal once batched: 1 of 10 cells under the floor
+# at c=16. flux2_klein_9b_bf16.yaml keeps bf16 on every platform.
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      linear_dtype: fp8
+      linear_dtype_steps: [bf16, bf16, fp8_partial, fp8]
+      fp8_keep_bf16: []
+      fp8_partial_keep_bf16:
+        - double_blocks.0.attn.img_out
+        - double_blocks.2.attn.img_out
+        - double_blocks.4.attn.img_out
+        - double_blocks.5.attn.img_out
+        - double_blocks.7.attn.img_out
+        - double_blocks.3.attn.img_out
+        - double_blocks.1.attn.img_out
+        - double_blocks.6.attn.img_out
+        - double_blocks.0.attn.img_qkv
+        - double_blocks.2.attn.img_qkv
+        - double_blocks.3.attn.img_qkv
+        - double_blocks.6.attn.img_qkv
+        - double_blocks.0.img_ff.linear_out
+        - double_blocks.1.attn.img_qkv
+        - double_blocks.4.attn.img_qkv
+        - single_blocks.0.out
+        - double_blocks.5.attn.img_qkv
+        - double_blocks.7.attn.img_qkv
+        - single_blocks.2.out
+        - double_blocks.2.img_ff.linear_out
+        - double_blocks.1.img_ff.linear_out
+        - double_blocks.3.img_ff.linear_out
+        - double_blocks.6.img_ff.linear_out
+        - single_blocks.1.out
+        - single_blocks.5.out
+        - double_blocks.4.img_ff.linear_out
+        - double_blocks.7.img_ff.linear_out
+        - double_blocks.4.img_ff.linear_in
+        - double_blocks.3.img_ff.linear_in
+        - double_blocks.5.img_ff.linear_out
+        - single_blocks.3.out
+        - double_blocks.1.img_ff.linear_in
+        - single_blocks.4.out
+        - double_blocks.2.img_ff.linear_in
+        - double_blocks.7.img_ff.linear_in
+        - single_blocks.6.out
+        - single_blocks.12.out
+        - single_blocks.7.out
+        - single_blocks.8.out
+        - single_blocks.10.out
+        - double_blocks.0.img_ff.linear_in
+        - single_blocks.3.qkv_mlp
+        - double_blocks.5.img_ff.linear_in
+        - double_blocks.6.img_ff.linear_in
+        - single_blocks.0.qkv_mlp
+        - single_blocks.16.out
+        - single_blocks.18.out
+        - single_blocks.11.out
+        - single_blocks.9.out
+        - single_blocks.13.out
+        - single_blocks.15.out
+      text_encoder_max_batch_size: 1
+    knobs:
+      dit_exact_ops: true

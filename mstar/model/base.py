@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Type
 
 import torch
-import yaml
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -29,6 +28,7 @@ from mstar.graph.base import (
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.platforms.serving_config import load_serving_config
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -518,8 +518,7 @@ class Model(ABC):
         from mstar.validation import DeploymentError
         from mstar.validation.placement import check_placement
 
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        config = load_serving_config(config_path)
         problems = check_placement(self, config)
         if problems:
             raise DeploymentError(config_path, problems)
@@ -533,8 +532,7 @@ class Model(ABC):
         ]
 
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        config = load_serving_config(config_path)
 
         sharding_config = self.get_default_sharding_config()
 

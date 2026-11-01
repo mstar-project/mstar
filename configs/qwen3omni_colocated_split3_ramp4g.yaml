@@ -1,0 +1,22 @@
+# qwen3omni_colocated_split3.yaml with first audio after 4 codec frames, then a ramp to 25-frame
+# chunks in steps of at most 1.34x. A chunk arrives before the one ahead of it
+# has played while the Talker gives a request about 17 frames/s, the same as
+# qwen3omni_colocated_early_audio.yaml. Every window still pads to the default's
+# 50 frames, so the vocoder needs no new capture.
+model: "qwen3_omni"
+max_seq_len: 32768
+model_kwargs:
+  codec_chunk_schedule: [4, 5, 6, 8, 10, 13, 16, 20]
+resources:
+  thinker_kv:
+    max_num_pages: 256
+  talker_kv:
+    max_num_pages: 256
+node_groups:
+  - node_names: [audio_encoder, vision_encoder, Thinker]
+    ranks: [0]
+  - node_names: [Talker]
+    ranks: [1]
+  - node_names: [Code2Wav]
+    ranks: [2]
+rank_devices: {1: 0, 2: 0}

@@ -67,6 +67,7 @@ class ZImageModel(Model):
         capture_caption_lengths: list[int] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        text_encoder_max_batch_size: int | None = None,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         async_scheduling: bool = True,
@@ -90,6 +91,8 @@ class ZImageModel(Model):
         self.capture_caption_lengths = [int(n) for n in (capture_caption_lengths or [32, 64])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        # prompts in one text encoder step, max_batch_size unless set; see PromptEncoderSubmodule for why 1 exists
+        self.text_encoder_max_batch_size = int(text_encoder_max_batch_size or max_batch_size)
         # largest output (pixels) a request may ask for; larger requests are rejected before scheduling
         self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
@@ -306,7 +309,7 @@ class ZImageModel(Model):
 
         if node_name == "text_encoder":
             return ZImageTextEncoderSubmodule(build_text_encoder(self.config, self.snapshot, device), self.config,
-                                              max_batch_size=self.max_batch_size)
+                                              max_batch_size=self.text_encoder_max_batch_size)
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(
                 build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,

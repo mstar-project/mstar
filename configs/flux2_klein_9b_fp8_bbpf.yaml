@@ -1,6 +1,7 @@
 model: "flux2_klein_9b"
 
 # MI325X: median 26.37 dB from diffusers (floor 25.46), +1% images/s at c=1 and +7% at c=16 over bf16 (shared node)
+# On AMD GPUs flux2_klein_9b.yaml serves this schedule with the solo text encoder, this file keeps the encoder batched
 max_seq_len: 512
 
 model_kwargs:

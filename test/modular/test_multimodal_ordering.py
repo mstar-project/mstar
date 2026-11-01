@@ -585,8 +585,9 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
 
 
 def test_qwen_schedule_walks_the_plan():
-    """Qwen3-Omni prefills each attachment where it was written."""
+    """Qwen3-Omni prefills its whole prompt in one walk, each attachment where it was written."""
     pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
+    from mstar.model.qwen3_omni.config import AUDIO_PART, IMAGE_PART, TEXT_PART
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
@@ -598,15 +599,17 @@ def test_qwen_schedule_walks_the_plan():
         "audio_features": ["af0"],
         "audio_seqlens": ["as0"],
     }
-    schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, mods, signals)
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text", "prefill_audio", "prefill_text",
-    ]
-    # Each vision walk carries its own image, in order.
-    vision = [entry for walk, entry in schedule if walk == "prefill_vision"]
-    assert [e["pixel_values"] for e in vision] == ["px0", "px1"]
-    assert [e["image_grid_thw"] for e in vision] == ["g0", "g1"]
+    prefill = Qwen3OmniModel._thinker_prefill(model, mods, signals)
+    assert prefill.walk == "prefill_audio_vision"
+    assert prefill.order == (
+        TEXT_PART, IMAGE_PART, TEXT_PART, IMAGE_PART, TEXT_PART, AUDIO_PART, TEXT_PART,
+    )
+    sent = {(e.next_node, e.name): e.tensor_info for e in prefill.inputs}
+    # Each kind's tensors go in prompt order.
+    assert sent["Thinker", "text_inputs"] == ["t0", "t1", "t2", "t3"]
+    assert sent["vision_encoder", "pixel_values"] == ["px0", "px1"]
+    assert sent["vision_encoder", "image_grid_thw"] == ["g0", "g1"]
+    assert sent["audio_encoder", "audio_features"] == ["af0"]
 
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():
