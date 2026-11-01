@@ -9,12 +9,11 @@ from types import SimpleNamespace
 
 import torch
 import yaml
+from rust_runtime import Inboxes, build_runtime
 from test_conductor_input_merge import _config, _info
 from test_graph_runtime import (
-    StubTensorManager,
     _fwd_info,
     _ingest,
-    _RecordingCommunicator,
     _sharding_config,
     _store_outputs,
 )
@@ -25,7 +24,6 @@ from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.runtime.base import RouteInput, SendInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -71,15 +69,15 @@ def add_both_partitions(rt):
     return rid
 
 
-def test_token_counts_stay_with_their_partition():
-    rt = PythonGraphRuntime(tensor_manager=StubTensorManager(), **colocated_partitions())
-    rt._communicator = _RecordingCommunicator()
+def test_token_counts_stay_with_their_partition(tmp_path):
+    inboxes = Inboxes("worker_0", tmp_path)
+    rt = build_runtime(inboxes=inboxes, **colocated_partitions())
     rid = add_both_partitions(rt)
     minter = TensorUuidMinter("worker_0")
-    for part, walk, wg, node, inp in STEPS:
-        _ingest(rt, rid, [GraphEdge(next_node=node, name=inp)])
+
+    def run(part, walk, wg, node, tokens):
         sig = rt.get_output_signals(node, walk)
-        uuids = _store_outputs(rt._tensor_store, minter, rid, {s: [torch.ones(1)] for s in sig})
+        uuids = _store_outputs(rt.tensor_store, minter, rid, {s: [torch.ones(1)] for s in sig})
         out = rt.complete_and_route_batch(RouteInput(
             partition=part, graph_walk=walk, node_name=node, output_signals=sig,
             wg_ids=ParallelList([rid], [wg]),
@@ -87,12 +85,20 @@ def test_token_counts_stay_with_their_partition():
         rt.send_outputs(SendInput(
             completion_id=out.completion_id,
             per_request_info=ParallelList([rid], [_fwd_info(walk, part)]),
-            new_token_counts=ParallelList([rid], [{"tok": 1} if part == "P" else {}])))
-    dones = [m.body for e, m in rt._communicator.sent if e == "conductor"]
+            new_token_counts=ParallelList([rid], [tokens])))
+
+    for part, walk, wg, node, inp in STEPS:
+        _ingest(rt, rid, [GraphEdge(next_node=node, name=inp)])
+        run(part, walk, wg, node, {"tok": 1} if part == "P" else {})
+    dones = inboxes.bodies("conductor")
     assert [d.partition_name for d in dones] == ["C"]
     assert dones[0].new_token_counts == {}, f"C's WORKER_GRAPHS_DONE carries P's {dones[0].new_token_counts}"
-    # P's count is still held for P's own report
-    assert rt._request_info[rid].pending_new_token_counts == {"P": {"tok": 1}}
+
+    # P's count is still held for P's own report, when its loop ends
+    rt.stop_loops_batched("P", "produce", "p", ParallelList([rid], [["lp"]]))
+    run("P", "produce", 0, "p", {})
+    done = inboxes.bodies("conductor")[-1]
+    assert (done.partition_name, done.new_token_counts) == ("P", {"tok": 1})
 
 
 def test_split_inputs_keeps_persist_order_across_walks():

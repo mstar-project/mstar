@@ -1,100 +1,35 @@
-"""``test/modular/test_delivery_chunk_counts.py`` on the Rust runtime: the
-frames it actually sends (read off real inboxes) must let the conductor count
-every chunk, so the API server holds the request until the last one arrives.
-Includes the inline-token path, and a script run on both runtimes that must
-send the same frames.
+"""The frames ``test/modular/test_delivery_chunk_counts.py``'s runtime sends for
+a script covering every inline-token case, read off real inboxes.
 """
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
-# the shared scenario lives beside the Python-runtime test; "test" itself can
-# resolve to the standard library's package, so import it by directory
+# the shared scenario lives beside the modular test; "test" itself can resolve
+# to the standard library's package, so import it by directory
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modular"))
 
 import pytest
 
 pytest.importorskip("mstar_rust")
 
-from mstar_rust import ZmqCommunicator
 from test_delivery_chunk_counts import (  # noqa: E402
     DECODE,
+    LOOP,
     NODE,
     PREFILL,
-    RUNTIME_KWARGS,
-    SHAPES,
     WORKER,
-    assert_holds_until_last_chunk,
-    drive,
-    python_runtime,
-    tensor_info,
-    worker_graphs,
+    new_runtime,
 )
 
-import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.api_server.request_types import ResultTokens
-from mstar.communication.tensor_store import RustTensorBookkeeping
-from mstar.communication.wire import decode, encode
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge
-from mstar.graph.runtime import rust as rust_runtime
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RequestWalks, RouteInput, SendInput
 from mstar.utils.containers import ParallelList
-from mstar.utils.ipc_format import ConductorMessageType
 
 PEER = "worker_1"
-
-
-def _collect(box, first_wait_ms=1000):
-    out = []
-    first = box.recv_timeout(first_wait_ms)
-    if first is None:
-        return out
-    out.append(decode(first))
-    while (more := box.recv_timeout(50)) is not None:
-        out.append(decode(more))
-    return out
-
-
-def _rust(decode_steps, tmp_path, **overrides):
-    """The Rust runtime, its ``put``, and a read of what it sent: the chunks
-    to the API server and the WORKER_GRAPHS_DONE reports."""
-    kwargs = {**RUNTIME_KWARGS, **overrides}
-    inboxes = {peer: ZmqCommunicator(peer, str(tmp_path)) for peer in ("conductor", "api_server")}
-    book = RustTensorBookkeeping()
-    runtime = rust_runtime.RustGraphRuntime(
-        my_worker_graphs=worker_graphs(decode_steps), bookkeeping=book,
-        communicator=SimpleNamespace(_inner=ZmqCommunicator(kwargs["my_worker_id"], str(tmp_path))),
-        **kwargs,
-    )
-
-    def put(uuid):
-        book.put_tensor(uuid, tensor_info(uuid))
-        book.increment_ref(uuid, 1)  # the worker's safety hold
-
-    def sent():
-        chunks = [m.body for m in _collect(inboxes["api_server"])]
-        reports = [
-            m.body for m in _collect(inboxes["conductor"])
-            if m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
-        ]
-        return chunks, reports
-
-    return runtime, put, sent
-
-
-@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
-@pytest.mark.parametrize("shape", list(SHAPES))
-def test_request_is_held_until_its_last_chunk(shape, inline, tmp_path):
-    prefills, decode_steps = SHAPES[shape]
-    runtime, put, sent = _rust(decode_steps, tmp_path)
-    drive(runtime, put, prefills, decode_steps, inline=inline)
-    chunks, reports = sent()
-    assert len(chunks) == prefills + decode_steps
-    tokens = sum(isinstance(c, ResultTokens) for c in chunks)
-    assert tokens == (decode_steps if inline else 0)
-    assert_holds_until_last_chunk(chunks, reports)
 
 
 def _admit(runtime, request_id, workers=(WORKER,)):
@@ -204,30 +139,51 @@ def _reports(reports):
     )
 
 
-def test_both_runtimes_send_the_same_frames(tmp_path):
-    py_runtime, py_put, recorder = python_runtime(decode_steps=5)
-    py_staged = _script(py_runtime, py_put)
-    # through the wire codec, as the API server receives them
-    py_chunks = [decode(encode(m)).body for e, m in recorder.sent if e == "api_server"]
+def _prefill_step():
+    return NestedLoopIndices([], {}, 0)
 
-    rs_runtime, rs_put, sent = _rust(5, tmp_path)
-    rs_staged = _script(rs_runtime, rs_put)
-    rs_chunks, rs_reports = sent()
 
-    assert py_staged == rs_staged
-    assert _frames(py_chunks) == _frames(rs_chunks)
-    # a step's tensor chunks go out before its tokens on both
-    assert [type(c) for c in py_chunks] == [type(c) for c in rs_chunks]
-    assert _reports(recorder.reports()) == _reports(rs_reports)
-    tokens = sorted(sorted(c.values) for c in rs_chunks if isinstance(c, ResultTokens))
+def _decode_step(i):
+    return NestedLoopIndices([LOOP], {LOOP: i}, 0)
+
+
+def test_the_script_sends_these_frames(tmp_path):
+    """The staged uuids, chunks and reports are the values the runtime gives
+    today. This script used to diff them against a second runtime."""
+    runtime, put, sent = new_runtime(5, tmp_path)
+    staged = _script(runtime, put)
+    chunks, reports = sent()
+
+    assert staged == [[101, 102], [], [107], [], [112, 114], []]
+    assert _frames(chunks) == [
+        ("tensors", "r0", "new_token", "text", (101,), _prefill_step(), {"logprobs": [-1.0]}),
+        ("tensors", "r0", "new_token", "text", (112,), _decode_step(3), {"logprobs": [-3.5]}),
+        ("tensors", "r1", "new_token", "text", (102,), _prefill_step(), {}),
+        ("tensors", "r1", "new_token", "text", (114,), _decode_step(3), {}),
+        ("tensors", "r2", "new_token", "text", (107,), _prefill_step(), {"logprobs": [-2.0]}),
+        ("tokens", "new_token", "text", (("r0", 11, _decode_step(0), -1.5), ("r1", 21, _decode_step(0), None))),
+        ("tokens", "new_token", "text", (("r0", 12, _decode_step(1), -2.5), ("r1", 22, _decode_step(1), None))),
+        ("tokens", "new_token", "text", (("r0", 13, _decode_step(2), -3.0), ("r1", 23, _decode_step(2), None))),
+        ("tokens", "new_token", "text", (("r0", 15, _decode_step(4), None),)),
+    ]
+    # a step's tensor chunks go out before its tokens
+    assert [type(c).__name__ for c in chunks] == [
+        "ResultTensors", "ResultTensors", "ResultTokens", "ResultTensors", "ResultTokens",
+        "ResultTokens", "ResultTensors", "ResultTensors", "ResultTokens",
+    ]
+    assert _reports(reports) == [
+        ("r0", (0,), ("new_token",)), ("r0", (1,), ("new_token",) * 5),
+        ("r1", (0,), ("new_token",)), ("r2", (0,), ("new_token",)),
+    ]
+    tokens = sorted(sorted(c.values) for c in chunks if isinstance(c, ResultTokens))
     assert tokens == [[11, 21], [12, 22], [13, 23], [15]]
     logprobs = sorted(
-        (rid, lp) for c in rs_chunks if isinstance(c, ResultTokens) and c.logprobs
+        (rid, lp) for c in chunks if isinstance(c, ResultTokens) and c.logprobs
         for rid, lp in zip(c.request_ids, c.logprobs, strict=True) if lp is not None
     )
     assert logprobs == [("r0", -3.0), ("r0", -2.5), ("r0", -1.5)]
     metadata = sorted(
-        (c.request_id, *c.metadata["logprobs"]) for c in rs_chunks
+        (c.request_id, *c.metadata["logprobs"]) for c in chunks
         if not isinstance(c, ResultTokens) and c.metadata
     )
     # the prefills, and the step whose values missed a row
@@ -251,16 +207,13 @@ def _tp_step(runtime, put):
     _stepper(runtime, put)([(rid, DECODE)], [7])
 
 
-def test_both_runtimes_emit_from_the_tp_leader_only(tmp_path):
-    for rank in (0, 1):
-        py_runtime, py_put, recorder = python_runtime(1, **_tp_rank(rank))
-        _tp_step(py_runtime, py_put)
+def test_only_the_tp_leader_emits(tmp_path):
+    for rank, emitted in ((0, ("new_token",)), (1, ())):
         ipc_dir = tmp_path / str(rank)
         ipc_dir.mkdir()
-        rs_runtime, rs_put, sent = _rust(1, ipc_dir, **_tp_rank(rank))
-        _tp_step(rs_runtime, rs_put)
-        rs_chunks, rs_reports = sent()
+        runtime, put, sent = new_runtime(1, ipc_dir, **_tp_rank(rank))
+        _tp_step(runtime, put)
+        chunks, reports = sent()
 
-        assert _frames(recorder.chunks()) == _frames(rs_chunks)
-        assert _reports(recorder.reports()) == _reports(rs_reports)
-        assert [type(c) for c in rs_chunks] == ([ResultTokens] if rank == 0 else [])
+        assert [type(c) for c in chunks] == ([ResultTokens] if rank == 0 else [])
+        assert _reports(reports) == [("r1", (1,), emitted)]

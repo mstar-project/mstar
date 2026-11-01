@@ -7,7 +7,7 @@ forwarded one, or a peer's stream chunk or STOP_LOOPS that crossed a different
 socket. Parking those kept them, unACKed, for the life of the worker.
 
 Drives the real ``_add_new_request`` / ``_remove_request`` /
-``_process_message_list`` over the real Python graph runtime.
+``_process_message_list`` over the real graph runtime.
 """
 import sys
 from types import SimpleNamespace
@@ -15,12 +15,12 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 import torch
+from rust_runtime import build_runtime
 
 from mstar.communication.tensor_store import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -73,7 +73,8 @@ def _worker(is_tp_follower=False) -> Worker:
     w.worker_id = WORKER
     w.is_tp_follower = is_tp_follower
     w.tensor_manager = _TensorManager()
-    w._graph_runtime = PythonGraphRuntime(
+    w._graph_runtime = build_runtime(
+        bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
         my_worker_graphs=[worker_graph],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
@@ -81,7 +82,6 @@ def _worker(is_tp_follower=False) -> Worker:
         all_wg_ids_to_nodes={WG_ID: {NODE}},
         node_to_partition={NODE: "default"},
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
-        tensor_manager=w.tensor_manager,
     )
     w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w.engine_manager = SimpleNamespace(

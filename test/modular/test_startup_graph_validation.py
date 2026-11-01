@@ -20,11 +20,10 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from rust_runtime import Inboxes, build_runtime
 from test_graph_runtime import (
-    StubTensorManager,
     _fwd_info,
     _ingest,
-    _RecordingCommunicator,
     _sharding_config,
     _store_outputs,
 )
@@ -34,9 +33,8 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
@@ -294,8 +292,8 @@ def test_self_triggered_consumer_loop_sharing_its_worker_graph_is_rejected(tmp_p
 
 
 class _ChunkWalkRuntime:
-    """The Python graph runtime of worker_0, hosting the 'chunk' walk's worker
-    graphs, driven the way the worker drives it."""
+    """The graph runtime of worker_0, hosting the 'chunk' walk's worker graphs,
+    driven the way the worker drives it."""
 
     def __init__(self, node_groups, tmp_path):
         wgs = _stream_model(_gated_vocoder_then_post).get_worker_graphs(_config(tmp_path, node_groups))
@@ -304,15 +302,15 @@ class _ChunkWalkRuntime:
         self.wgs = [wg for wg in wgs if "chunk" in wg.graph_walks]
         self.wg_of = {node: wg.worker_graph_id for wg in self.wgs for node in wg.section.get_nodes()}
         ids = [wg.worker_graph_id for wg in self.wgs]
-        self.rt = PythonGraphRuntime(
+        self.inboxes = Inboxes("worker_0", tmp_path)
+        self.rt = build_runtime(
+            inboxes=self.inboxes,
             my_worker_id="worker_0", my_worker_graphs=self.wgs,
             all_wg_ids_to_graph_walks={i: {"chunk"} for i in ids},
             all_wg_ids_to_dyn_loops={i: set() for i in ids},
             all_wg_ids_to_nodes={wg.worker_graph_id: set(wg.section.get_nodes()) for wg in self.wgs},
             node_to_partition={"vocoder": "C", "post": "C"}, sharding_config=_sharding_config(),
-            tensor_manager=StubTensorManager(),
         )
-        self.rt._communicator = _RecordingCommunicator()
         self.rid = self.rt.add_request(
             request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
@@ -333,23 +331,22 @@ class _ChunkWalkRuntime:
         """Run one step of ``node``; returns the worker graphs it completed."""
         rt, rid = self.rt, self.rid
         sig = rt.get_output_signals(node, "chunk")
-        uuids = _store_outputs(rt._tensor_store, self.minter, rid, {s: [torch.ones(1)] for s in sig})
+        uuids = _store_outputs(rt.tensor_store, self.minter, rid, {s: [torch.ones(1)] for s in sig})
         assert rt.pop_rids(node, "chunk", [rid], check_ready=True) is not None, f"{node} not ready"
         out = rt.complete_and_route_batch(RouteInput(
             partition="C", graph_walk="chunk", node_name=node, output_signals=sig,
             wg_ids=ParallelList([rid], [self.wg_of[node]]),
             tensors=[u for s in sig for u in uuids[s]], num_tensors=[1] * len(sig),
         ))
-        done = rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids
+        earlier = len(self.reports())
         rt.send_outputs(SendInput(
             completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
             per_request_info=ParallelList([rid], [_fwd_info("chunk", "C")]),
         ))
-        return done
+        return [wg for wgs, _ in self.reports()[earlier:] for wg in wgs]
 
     def reports(self):
-        return [(m.body.worker_graph_ids, m.body.partition_done)
-                for e, m in self.rt._communicator.sent if e == "conductor"]
+        return [(body.worker_graph_ids, body.partition_done) for body in self.inboxes.bodies("conductor")]
 
 
 def test_gated_consumer_sharing_its_worker_graph_runs_once_per_pass(tmp_path):
@@ -588,29 +585,16 @@ def test_loop_member_feeding_a_successor_in_its_worker_graph_is_rejected(tmp_pat
 class _LoopWorker:
     """worker_0 hosting walk 'w' as one worker graph, driven as the worker drives it."""
 
-    def __init__(self, runtime, tmp_path):
+    def __init__(self, tmp_path):
         model = _ToyModel(lambda: {"w": _loop_feeding_post(accumulate=True)})
         wg, = model.get_worker_graphs(_config(tmp_path, [{"node_names": ["step", "post"], "ranks": [0]}]))
         wg.worker_graph_id = 0
-        args = dict(
+        self.rt = build_runtime(
             my_worker_id="worker_0", my_worker_graphs=[wg],
             all_wg_ids_to_graph_walks={0: {"w"}}, all_wg_ids_to_dyn_loops={0: set()},
             all_wg_ids_to_nodes={0: {"step", "post"}},
             node_to_partition={"step": "default", "post": "default"}, sharding_config=_sharding_config(),
         )
-        self.runtime = runtime
-        if runtime == "python":
-            tm = StubTensorManager()
-            # the manager's real signature: the accumulated cache holds its uuids
-            tm.increment_ref = lambda uuid, n=1: tm.tensor_store.increment_ref(uuid, n=n)
-            self.rt = PythonGraphRuntime(tensor_manager=tm, **args)
-            self.rt._communicator = _RecordingCommunicator()
-        else:
-            pytest.importorskip("mstar_rust")
-            from mstar.communication.tensor_store import RustTensorBookkeeping
-            from mstar.graph.runtime.rust import RustGraphRuntime
-            self.book = RustTensorBookkeeping()
-            self.rt = RustGraphRuntime(bookkeeping=self.book, **args)
         self.rid = self.rt.add_request(
             request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
@@ -619,19 +603,6 @@ class _LoopWorker:
         self.minter = TensorUuidMinter("worker_0")
         _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
 
-    def _put(self, sig):
-        if self.runtime == "python":
-            return _store_outputs(self.rt._tensor_store, self.minter, self.rid, {s: [torch.ones(1)] for s in sig})
-        uuids = {}
-        for s in sig:
-            u = self.minter.mint()
-            self.book.put_tensor(u, TensorPointerInfo(
-                dims=[1], dtype=torch.float32, nbytes=4, address=0, stride=(1,), uuid=u,
-                source_session_id="s", source_entity="worker_0"))
-            self.book.increment_ref(u, 1)  # the safety hold
-            uuids[s] = [u]
-        return uuids
-
     def step_once(self):
         """Run the first ready node; returns (node, reported_done) or None."""
         node = next((n for n in ("post", "step") if self.rt.pop_rids(n, "w", [self.rid], check_ready=True)), None)
@@ -639,28 +610,20 @@ class _LoopWorker:
             return None
         rt, rid = self.rt, self.rid
         sig = rt.get_output_signals(node, "w")
-        uuids = self._put(sig)
+        uuids = _store_outputs(rt.tensor_store, self.minter, rid, {s: [torch.ones(1)] for s in sig})
         out = rt.complete_and_route_batch(RouteInput(
             partition="default", graph_walk="w", node_name=node, output_signals=sig,
             wg_ids=ParallelList([rid], [0]), tensors=[u for s in sig for u in uuids[s]],
             num_tensors=[1] * len(sig),
         ))
-        if self.runtime == "rust":
-            plan = rt._rust.take_send_plan(out.completion_id)
-            return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
-        done = bool(rt._peek_completion(out.completion_id).routing[rid].completed_worker_graph_ids)
-        rt.send_outputs(SendInput(
-            completion_id=out.completion_id, new_token_counts=ParallelList([rid], [{}]),
-            per_request_info=ParallelList([rid], [_fwd_info("w")]),
-        ))
-        return node, done
+        plan = rt._rust.take_send_plan(out.completion_id)
+        return node, any(r == rid and wgs for r, wgs, *_ in plan.completed)
 
 
-@pytest.mark.parametrize("runtime", ["python", "rust"])
-def test_accumulated_outputs_feed_the_successor_once_after_the_loop(runtime, tmp_path):
-    """The shape the refusal points to passes startup, and in both runtimes
-    runs ``step`` ITERS times, then ``post`` once, reporting done once."""
-    w = _LoopWorker(runtime, tmp_path)
+def test_accumulated_outputs_feed_the_successor_once_after_the_loop(tmp_path):
+    """The shape the refusal points to passes startup, and runs ``step`` ITERS
+    times, then ``post`` once, reporting done once."""
+    w = _LoopWorker(tmp_path)
     trace = []
     while len(trace) < 4 * ITERS and (r := w.step_once()):
         trace.append(r)
