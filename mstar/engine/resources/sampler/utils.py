@@ -15,10 +15,11 @@ Usage:
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
+import heapq
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -69,7 +70,7 @@ def _xpu_generator_seed_offset(
         triton.Config({"BLOCK_SIZE": 32768}, num_warps=16, num_stages=2),
         triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=2),
     ],
-    key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
+    key=["V", "APPLY_PENALTY", "MASK_ROWS", "INCLUDE_GREEDY", "WINDOW", "NUM_STOP"],
 )
 @triton.jit
 def _fused_sampling_prep_kernel(
@@ -77,6 +78,7 @@ def _fused_sampling_prep_kernel(
     temperature_ptr,   # [B]
     penalty_ptr,       # [B] (only read when APPLY_PENALTY=True)
     seen_mask_ptr,     # [B, V] bool (only read when APPLY_PENALTY=True)
+    mask_rows_ptr,     # [B] int32: each row's mask row (only read when MASK_ROWS=True)
     hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,  # see _history_adjust
     probs_ptr,         # [B, V] float32 output
     V,
@@ -85,6 +87,7 @@ def _fused_sampling_prep_kernel(
     mask_stride_b, mask_stride_v,
     BLOCK_SIZE: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
     WINDOW: tl.constexpr,
     NUM_STOP: tl.constexpr,
@@ -110,6 +113,10 @@ def _fused_sampling_prep_kernel(
 
     if APPLY_PENALTY:
         penalty = tl.load(penalty_ptr + row)
+        if MASK_ROWS:
+            mask_row = tl.load(mask_rows_ptr + row).to(tl.int64)
+        else:
+            mask_row = row
 
     # Pass 1: scan over V, compute max of raw vals (post-penalty) + argmax.
     # argmax is only used by the greedy one-hot path; still tracked when
@@ -125,7 +132,7 @@ def _fused_sampling_prep_kernel(
         )
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
@@ -155,7 +162,7 @@ def _fused_sampling_prep_kernel(
         )
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
@@ -183,7 +190,7 @@ def _fused_sampling_prep_kernel(
         )
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
@@ -248,13 +255,14 @@ def _penalize(vals, seen, penalty):
 
 @triton.jit
 def _split_partials_kernel(
-    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr, mask_rows_ptr,
     hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
     chunk_max_ptr, chunk_sum_ptr, chunk_arg_ptr,
     V, CHUNK,
     stride_b, stride_v, mask_stride_b, mask_stride_v, part_stride_b,
     BLOCK_SIZE: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
     WINDOW: tl.constexpr,
     NUM_STOP: tl.constexpr,
@@ -268,6 +276,10 @@ def _split_partials_kernel(
         inv_temp = 1.0 / temp
     if APPLY_PENALTY:
         penalty = tl.load(penalty_ptr + row)
+        if MASK_ROWS:
+            mask_row = tl.load(mask_rows_ptr + row).to(tl.int64)
+        else:
+            mask_row = row
 
     lo = split * CHUNK
     hi = tl.minimum(lo + CHUNK, V)
@@ -285,7 +297,7 @@ def _split_partials_kernel(
         ).to(tl.float32)
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             vals = _penalize(vals, seen, penalty)
@@ -346,7 +358,7 @@ def _split_combine_kernel(
 
 @triton.jit
 def _split_write_kernel(
-    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr, mask_rows_ptr,
     hist_ptr, hist_stride, wpen_ptr, count_ptr, min_tok_ptr, stop_ptr,
     row_max_ptr, row_inv_sum_ptr, row_arg_ptr, probs_ptr,
     V, CHUNK,
@@ -354,6 +366,7 @@ def _split_write_kernel(
     mask_stride_b, mask_stride_v,
     BLOCK_SIZE: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
     WINDOW: tl.constexpr,
     NUM_STOP: tl.constexpr,
@@ -369,6 +382,10 @@ def _split_write_kernel(
         inv_temp = 1.0 / temp
     if APPLY_PENALTY:
         penalty = tl.load(penalty_ptr + row)
+        if MASK_ROWS:
+            mask_row = tl.load(mask_rows_ptr + row).to(tl.int64)
+        else:
+            mask_row = row
     gmax = tl.load(row_max_ptr + row)
     inv_sum = tl.load(row_inv_sum_ptr + row)
 
@@ -383,7 +400,7 @@ def _split_write_kernel(
         ).to(tl.float32)
         if APPLY_PENALTY:
             seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                seen_mask_ptr + mask_row * mask_stride_b + offs * mask_stride_v,
                 mask=mask, other=0,
             ).to(tl.int1)
             vals = _penalize(vals, seen, penalty)
@@ -419,8 +436,8 @@ def _split_count(batch: int, vocab: int, device: torch.device) -> int:
 
 
 def _split_v_softmax(
-    logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
-    apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
+    logits, temperature, pen_ptr, mask_ptr, rows_ptr, probs, nsplit,
+    apply_penalty, mask_rows, include_greedy, mask_stride_b, mask_stride_v, hist,
 ):
     """The three-kernel path; see the kernels above for why."""
     B, V = logits.shape
@@ -431,6 +448,7 @@ def _split_v_softmax(
     opts = dict(
         BLOCK_SIZE=block,
         APPLY_PENALTY=apply_penalty,
+        MASK_ROWS=mask_rows,
         INCLUDE_GREEDY=include_greedy,
         **hist_flags,
         num_warps=8,
@@ -445,7 +463,7 @@ def _split_v_softmax(
     rarg = torch.empty(B, device=logits.device, dtype=torch.int32)
     with torch.cuda.device(logits.device):
         _split_partials_kernel[(B, nsplit)](
-            logits, temperature, pen_ptr, mask_ptr, *hist_args, cmax, csum, carg,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, *hist_args, cmax, csum, carg,
             V, chunk,
             logits.stride(0), logits.stride(1), mask_stride_b, mask_stride_v,
             cmax.stride(0), **opts,
@@ -458,7 +476,7 @@ def _split_v_softmax(
             num_warps=4,
         )
         _split_write_kernel[(B, nsplit)](
-            logits, temperature, pen_ptr, mask_ptr, *hist_args, rmax, rinv, rarg, probs,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, *hist_args, rmax, rinv, rarg, probs,
             V, chunk,
             logits.stride(0), logits.stride(1),
             probs.stride(0), probs.stride(1),
@@ -490,11 +508,14 @@ def fused_temperature_softmax(
     logits: torch.Tensor,       # [B, V]
     temperature: torch.Tensor,  # [B]
     penalty: torch.Tensor | None = None,    # [B]
-    seen_mask: torch.Tensor | None = None,  # [B, V] bool
+    seen_mask: torch.Tensor | None = None,  # [B, V] bool, or [rows, V] with seen_rows
     include_greedy: bool = False,
     history: "HistoryRows | None" = None,
+    seen_rows: torch.Tensor | None = None,  # [B] int32
 ) -> torch.Tensor:
     """softmax(apply_penalty(logits) / temperature) fused, returns [B, V] float32.
+
+    With ``seen_rows``, row ``i`` of the logits reads mask row ``seen_rows[i]``.
 
     When include_greedy=True, rows with temperature == 0 produce a one-hot
     distribution at argmax (equivalent to argmax sampling via multinomial).
@@ -508,13 +529,15 @@ def fused_temperature_softmax(
     mask_ptr = seen_mask if apply_penalty else logits
     mask_stride_b = seen_mask.stride(0) if apply_penalty else 0
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
+    mask_rows = apply_penalty and seen_rows is not None
+    rows_ptr = seen_rows if mask_rows else logits
     hist = _history_kernel_args(history, logits)
 
     nsplit = _split_count(B, V, logits.device)
     if nsplit > 1:
         _split_v_softmax(
-            logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
-            apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, probs, nsplit,
+            apply_penalty, mask_rows, include_greedy, mask_stride_b, mask_stride_v, hist,
         )
         return probs
 
@@ -530,12 +553,13 @@ def fused_temperature_softmax(
         cache = getattr(_fused_sampling_prep_kernel, "cache", None)
         cache_size_before = len(cache) if cache is not None else 0
         _fused_sampling_prep_kernel[grid](
-            logits, temperature, pen_ptr, mask_ptr, *hist[0], probs,
+            logits, temperature, pen_ptr, mask_ptr, rows_ptr, *hist[0], probs,
             V,
             logits.stride(0), logits.stride(1),
             probs.stride(0), probs.stride(1),
             mask_stride_b, mask_stride_v,
             APPLY_PENALTY=apply_penalty,
+            MASK_ROWS=mask_rows,
             INCLUDE_GREEDY=include_greedy,
             **hist[1],
         )
@@ -1586,6 +1610,7 @@ def sample_accelerator_graphable_gpu(
     min_p: torch.Tensor | None = None,
     history: HistoryRows | None = None,
     order: FilterOrder | None = None,
+    seen_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
@@ -1613,7 +1638,8 @@ def sample_accelerator_graphable_gpu(
         top_p: ``[batch_size]`` float tensor. Use ``1.0`` to disable.
         apply_penalty: when True, ``rep_penalty`` + ``seen_tokens`` are applied.
         rep_penalty: ``[batch_size]`` float tensor (1.0 = disabled per row).
-        seen_tokens: ``[batch_size, vocab_size]`` bool mask of seen tokens.
+        seen_tokens: ``[batch_size, vocab_size]`` bool mask of seen tokens,
+            or rows of masks that ``seen_rows`` (``[batch_size]`` int32) index.
         min_p: ``[batch_size]`` float tensor (0.0 = disabled per row); None
             leaves the filter out of the captured graph entirely.
         history, order: the generation-aware processors (``HistoryRows``,
@@ -1628,6 +1654,8 @@ def sample_accelerator_graphable_gpu(
     if logits.device.type == "xpu":
         if history is not None or order is not None:
             raise ValueError("generation-aware sampling controls are CUDA-only")
+        if apply_penalty and seen_rows is not None:
+            seen_tokens = seen_tokens.index_select(0, seen_rows)
         with torch.xpu.device(logits.device):
             return _sample_xpu(
                 logits, temperature, top_k, top_p,
@@ -1649,6 +1677,7 @@ def sample_accelerator_graphable_gpu(
                 seen_mask=seen_tokens if apply_penalty else None,
                 include_greedy=True,
                 history=history,
+                seen_rows=seen_rows,
             )
             if min_p is not None:
                 probs = apply_min_p(probs, min_p)
@@ -1684,6 +1713,10 @@ class AcceleratorGraphableSampler(BaseSampler):
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
+    # Persistent rows: ``seen_tokens_buf`` is the resident masks by slot, and
+    # row i reads slot ``seen_rows[i]`` and records its token in ``seen_write_rows[i]``
+    seen_rows: torch.Tensor | None = None
+    seen_write_rows: torch.Tensor | None = None
     # ``None`` for submodules whose ``SamplerSpec`` leaves ``enable_min_p`` off.
     min_p_buf: torch.Tensor | None = None
     # Views into ``SamplerBuffers``' per-step rows; each ``None`` unless the
@@ -1749,6 +1782,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             min_p=self.min_p_buf,
             history=self.history,
             order=self.order,
+            seen_rows=self.seen_rows,
         )
         self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
@@ -1769,7 +1803,11 @@ class AcceleratorGraphableSampler(BaseSampler):
             # CUDA-graph capturable; advanced-index assignment
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
-            self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+            if self.seen_write_rows is None:
+                self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
+            else:
+                at = self.seen_write_rows.long() * self.seen_tokens_buf.shape[1] + codes
+                self.seen_tokens_buf.view(-1).scatter_(0, at, True)
         return codes
 
     @torch.compiler.disable
@@ -1787,6 +1825,8 @@ class AcceleratorGraphableSampler(BaseSampler):
         """
         if self.seen_tokens_buf is None:
             return
+        if self.seen_rows is not None:
+            raise RuntimeError("persistent rows keep their seen-token masks; there is nothing to sync")
         # One multi-tensor-apply instead of bs separate copy_ launches. The
         # masks are separately-owned tensors, so a single index_copy_ would
         # need them to be views into one buffer; _foreach_copy_ fuses the
@@ -2136,6 +2176,15 @@ class SamplerBuffers:
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
+    # masters allocated once and never grown: the in-graph scatter's captured
+    # graphs hold their addresses, and so do persistent rows' pending copies
+    fixed_masters: bool = False
+    # Master slots a persistent row holds (``hold_slots``), and those of them
+    # whose request is gone: freed when the row leaves, since the row's
+    # check-in still writes them.
+    _row_held: set[int] = field(default_factory=set, repr=False)
+    _orphaned: set[int] = field(default_factory=set, repr=False)
+    _slot_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Master row 0, never given to a request, so its config stays SamplingConfig().
     # Padding rows, unregistered rids and capture rows read it; in graph they write it.
     _trash_slot: ClassVar[int] = 0
@@ -2162,7 +2211,8 @@ class SamplerBuffers:
     )
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
-    _free_slots: list[int] = field(default_factory=list, repr=False)
+    _free_slots: list[int] = field(default_factory=list, repr=False)  # a heap
+    _top_slot: int = 0  # the highest slot handed out
     # Slots awaiting init, consumed by the next gather so the rows are written
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
@@ -2197,15 +2247,17 @@ class SamplerBuffers:
     def tracks_seen_tokens(self) -> bool:
         return self.seen_tokens is not None
 
+    def scalar_fields(self) -> dict[str, HostBuffer]:
+        """The per-request settings this sampler reads, by field name."""
+        names = (
+            "temperature", "top_k", "top_p", "seed", "rep_penalty", "min_p",
+            "window", "window_penalty", "min_tokens", "top_p_first", "top_p_min_keep",
+            "return_logprobs",
+        )
+        return {name: buf for name in names if (buf := getattr(self, name)) is not None}
+
     def _scalar_buffers(self) -> list[HostBuffer]:
-        bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
-        for opt in (
-            self.min_p, self.window, self.window_penalty, self.min_tokens,
-            self.top_p_first, self.top_p_min_keep, self.return_logprobs,
-        ):
-            if opt is not None:
-                bufs.append(opt)
-        return bufs
+        return list(self.scalar_fields().values())
 
     @classmethod
     def allocate(
@@ -2223,13 +2275,15 @@ class SamplerBuffers:
         slots: int | None = None,
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
         enable_logprobs: bool = False,
+        fixed_masters: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
         The masters hold the trash row (row 0, ``_trash_slot``) plus one row per
         request. With ``ingraph_scatter`` that is ``slots`` request rows (the
         knob's 4096 by default), allocated once: the captured graphs keep their
-        addresses, so they never grow.
+        addresses, so they never grow. ``fixed_masters`` allocates them the
+        same way without the in-graph scatter.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. ``history`` (with ``stop_ids`` and
@@ -2241,7 +2295,8 @@ class SamplerBuffers:
         """
         pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
-        if ingraph_scatter:
+        fixed_masters = fixed_masters or ingraph_scatter
+        if fixed_masters:
             cap = max(max_batch_size, slots if slots is not None else sampler_slots())
         # row 0 is the trash row; requests take rows 1..cap
         rows = cap + 1
@@ -2253,8 +2308,14 @@ class SamplerBuffers:
 
         # seen token mask is not double-buffered, as it depends on the GPU
         # value of the previous step. Same goes for offset
+        # Unless a captured graph scatters into it, the mask master starts at
+        # a step's rows and grows to the slots in use (_sync_device_capacity),
+        # fixed masters or not.
         seen_tokens = (
-            MaskBuffer.allocate(max_batch_size, rows, vocab_size, device, cg_slots=1)
+            MaskBuffer.allocate(
+                max_batch_size, rows if ingraph_scatter else max_batch_size + 1,
+                vocab_size, device, cg_slots=1,
+            )
             if vocab_size is not None else None
         )
         windowed = history is not None and history.window > 0
@@ -2290,6 +2351,7 @@ class SamplerBuffers:
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
+            fixed_masters=fixed_masters,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
@@ -2392,11 +2454,11 @@ class SamplerBuffers:
         Host rows only, under the lock ``_write_master_row`` takes, so a plan-thread
         ``_init_slot`` cannot land in the old array; device masters grow on the gpu thread.
         """
-        if self.ingraph_scatter:
+        if self.fixed_masters:
             raise RuntimeError(
-                f"more than {self._master_capacity} concurrent requests on the "
-                "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
-                "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
+                f"more than {self._master_capacity} concurrent requests on a "
+                "sampler whose masters cannot grow (the in-graph scatter, or a "
+                "walk with persistent rows); raise MSTAR_SAMPLER_SLOTS"
             )
         rows = new_capacity + 1  # plus the trash row
         with self._host_master_lock:
@@ -2410,14 +2472,19 @@ class SamplerBuffers:
 
         Swapping them on the main thread let an in-flight scatter land in the old tensor.
         """
+        seen = self.seen_tokens
+        if seen is not None and len(seen.master) <= self._top_slot:
+            # vocab-wide, so it grows to the slots in use even while the other
+            # masters are fixed (persistent rows keep their own masks)
+            seen.grow_master(max(2 * len(seen.master), self._top_slot + 1))
         cap = self._master_capacity
         if self._device_capacity >= cap:
             return
         rows = cap + 1  # plus the trash row
         self.offset.grow_master(rows)
         self.last_token.grow_master(rows)
-        if self.seen_tokens is not None:
-            self.seen_tokens.grow_master(rows)
+        if seen is not None and len(seen.master) < rows:
+            seen.grow_master(rows)
         for buf in self.loopback.values():
             buf.grow_master(rows)
         self._device_capacity = cap
@@ -2436,7 +2503,10 @@ class SamplerBuffers:
             return
         if not self._free_slots:
             self._grow_master(self._master_capacity * 2)
-        slot = self._free_slots.pop()
+        with self._slot_lock:
+            # lowest first, so a mask master that grows on demand stays small
+            slot = heapq.heappop(self._free_slots)
+        self._top_slot = max(self._top_slot, slot)
         self._rid_to_slot[rid] = slot
         # CPU-only; every GPU write for this slot is deferred to the next gather.
         self._pending_init.add(slot)
@@ -2462,7 +2532,47 @@ class SamplerBuffers:
             return
         self._cached_config.pop(rid, None)
         self._pending_init.discard(slot)
-        self._free_slots.append(slot)
+        with self._slot_lock:
+            if slot in self._row_held:
+                self._orphaned.add(slot)
+            else:
+                heapq.heappush(self._free_slots, slot)
+
+    def check_out_slots(self, request_ids: Sequence[str]) -> np.ndarray:
+        """The master slots of registered ``request_ids``, each initialized,
+        for persistent rows to check out of."""
+        get = self._rid_to_slot.get
+        pending = self._pending_init
+        slots = np.empty(len(request_ids), dtype=np.int64)
+        for i, rid in enumerate(request_ids):
+            slot = get(rid)
+            if slot is None or slot == self._trash_slot:
+                raise RuntimeError(f"request {rid!r} has no sampler slot to check out")
+            if slot in pending:
+                self._init_slot(slot, rid)
+            slots[i] = slot
+        return slots
+
+    def hold_slots(self, slots: np.ndarray) -> None:
+        """Rows now hold ``slots``: they stay reserved until ``drop_slots``."""
+        with self._slot_lock:
+            self._row_held.update(slots.tolist())
+
+    def drop_slots(self, slots: np.ndarray) -> None:
+        """The rows holding ``slots`` left; free those whose request is gone."""
+        with self._slot_lock:
+            for slot in slots.tolist():
+                self._row_held.discard(slot)
+                if slot in self._orphaned:
+                    self._orphaned.discard(slot)
+                    heapq.heappush(self._free_slots, slot)
+
+    def sync_slots(self) -> None:
+        """Grow the device masters and reset newly registered slots' offsets
+        and loop-back rows, on the gpu thread, before anything reads them."""
+        self._sync_device_capacity()
+        self._drain_offset_resets()
+        self._sync_loopback()
 
     def update_request_config(
         self, rid: str, sampling_config: SamplingConfig,
@@ -2621,16 +2731,19 @@ class SamplerBuffers:
         self._sync_device_capacity()
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        with self._offset_reset_lock:
-            resets, self._pending_offset_reset = self._pending_offset_reset, set()
-        for slot in resets:
-            self.offset.master[slot:slot + 1].zero_()
+        self._drain_offset_resets()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         if not self.ingraph_scatter:
             # with it on, the captured sample gathers off the master itself
             self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
+
+    def _drain_offset_resets(self) -> None:
+        with self._offset_reset_lock:
+            resets, self._pending_offset_reset = self._pending_offset_reset, set()
+        for slot in resets:
+            self.offset.master[slot:slot + 1].zero_()
 
     def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).

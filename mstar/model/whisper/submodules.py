@@ -27,6 +27,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.rows import RowWalk
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.submodule_base import (
@@ -702,6 +703,9 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         if next_rules is not None:
             out["ts_rules"] = [next_rules[0]]
         return out
+
+    def persistent_row_walks(self) -> Mapping[str, RowWalk]:
+        return {DECODE_WALK: RowWalk(labels={KV_CACHE: ("main",)})}
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         if graph_walk == ALIGN_WALK:

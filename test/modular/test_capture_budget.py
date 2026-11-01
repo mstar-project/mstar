@@ -77,6 +77,7 @@ class _StubMeasuredRunner:
         self._lent = set()
         self._executables = {}
         self._comm_group = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        self._forward_hooks = {}
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
 

@@ -37,6 +37,7 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.rows import RowState
 from mstar.utils.profiler import PhaseLaps
 
 
@@ -49,6 +50,13 @@ class _LastPlan(NamedTuple):
     request_ids: tuple
     qo_indptr: tuple
     plan_key: PlanCacheKey
+
+
+class _RowsPlan(NamedTuple):
+    """A persistent walk's step as committed: its rows version, and per plan
+    label the wrapper with the ``_LastPlan`` it was left planned with."""
+    version: int
+    labels: tuple[tuple[str, AttentionWrapper, Any, _LastPlan], ...]
 
 
 class QueryPacking(NamedTuple):
@@ -125,6 +133,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._preplanned = False
         # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
         self._last_plans: dict[Any, _LastPlan] = {}
+        # A held row's context is fixed while it holds the row, so a step of a
+        # persistent walk over unchanged rows (rows version) plans as the last
+        # one on its slot did, unless its wrappers were planned again since.
+        # (walk, bucket, slot) -> _RowsPlan
+        self._rows_walks: set[str] = set()
+        self._rows_plans: dict[tuple, _RowsPlan] = {}
 
         self._kv_config = kv_config
         self._wrapper_kv_kwargs = dict(
@@ -150,6 +164,11 @@ class FlashInferCrossManager(CrossAttentionManager):
     def context_cache_key(self) -> str:
         """label of kv resource holding context so x-attention can find cache to read"""
         return self._kv_cache_name
+
+    def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
+        # plans per request; only the plan is kept, by rows (`_rows_plans`)
+        self._rows_walks.add(graph_walk)
+        return RowState()
 
     @property
     def supports_preplan(self):
@@ -180,14 +199,23 @@ class FlashInferCrossManager(CrossAttentionManager):
             return
 
         laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
-        context_out = self._context_output(ctx)
-        context_views = None
-        context_rids = None
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
-
         plan_states.clear()
+        rows_key = None
+        if ctx.rows is not None and ctx.graph_walk in self._rows_walks:
+            at = (None, ctx.slot) if lease is None else (lease.bucket, lease.slot)
+            rows_key = (ctx.graph_walk, *at)
+            if self._reuse_rows_plan(rows_key, ctx, plan_states):
+                self._preplanned = ctx.is_preplan
+                laps.lap("rows_reuse")
+                return
+
+        context_out = self._context_output(ctx)
+        context_views = None
+        context_rids = None
+        planned = []
         packings = self._query_packings(step, ctx)
         laps.lap("packing")
         for plan_label, packing in packings.items():
@@ -205,6 +233,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                 and last.request_ids == request_ids and last.qo_indptr == qo_indptr
             ):
                 plan_states[plan_label] = wrapper
+                planned.append((plan_label, wrapper, state_key))
                 laps.lap("unchanged")
                 continue
             if context_rids is None and context_out.columns is not None:
@@ -241,8 +270,35 @@ class FlashInferCrossManager(CrossAttentionManager):
                 laps.lap("wrapper_plan")
             self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
             plan_states[plan_label] = wrapper
+            planned.append((plan_label, wrapper, state_key))
 
+        if rows_key is not None:
+            self._remember_rows_plan(rows_key, ctx, planned)
         self._preplanned = ctx.is_preplan
+
+    def _reuse_rows_plan(self, key: tuple, ctx: StepContext, plan_states: dict) -> bool:
+        cached = self._rows_plans.get(key)
+        diff = ctx.rows.diff
+        if cached is None or not diff.empty() or cached.version != diff.base_version:
+            return False
+        last_plans = self._last_plans
+        if any(last_plans.get(state_key) is not last for _, _, state_key, last in cached.labels):
+            return False
+        for label, wrapper, _, _ in cached.labels:
+            plan_states[label] = wrapper
+        return True
+
+    def _remember_rows_plan(self, key: tuple, ctx: StepContext, planned: list) -> None:
+        labels = tuple(
+            (label, wrapper, state_key, self._last_plans[state_key])
+            for label, wrapper, state_key in planned
+        )
+        space = ctx.rows.space
+        # at commit, the version those rows are; a step that never commits
+        # leaves no entry
+        ctx.rows.on_commit(
+            lambda _released: self._rows_plans.__setitem__(key, _RowsPlan(space.batch.version, labels)),
+        )
 
     def clear_preplan(self):
         # rebind rather than clear: a consumed preplan dict is the live one
