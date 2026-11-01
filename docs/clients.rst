@@ -526,7 +526,9 @@ stateless.
   request without ``thinking`` gets the model's default, and ``thinking.budget_tokens`` is
   checked as Anthropic checks it but not enforced. ``output_config.effort`` (Messages) and
   ``reasoning.effort`` (Responses) pick the template's level. ``context_management`` is
-  served for keeping every thinking block; other edits are a ``400``. Thinking blocks carry
+  served for keeping every thinking block; other edits are a ``400``. Claude Code's deferred
+  tools (``defer_loading``) and its tool search's ``tool_reference`` results go to the
+  template, which lists a deferred tool once a result references it. Thinking blocks carry
   an empty ``signature``; a Responses reply carries its reasoning as a ``reasoning`` item's
   text.
 - **Refused, not dropped.** On ``/v1/messages`` and ``/v1/responses``: fields the route does

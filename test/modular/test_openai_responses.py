@@ -77,6 +77,10 @@ def test_input_items_translate_onto_the_chat_template():
         "name": "shell", "parameters": SHELL["parameters"], "description": "Run a command"}}]
     assert extra["parallel_tool_calls"] is False and extra["reasoning_effort"] == "high"
     assert req.max_tokens == 900 and "prompt_cache_key" not in extra and "client_metadata" not in extra
+    levels = ("low", "high", "max")
+    assert serving_responses.to_chat_request(_codex(prefix_cache=False), levels).model_extra["prefix_cache"] is False
+    with pytest.raises(ValueError, match="prefix_cache"):
+        serving_responses.to_chat_request(_codex(prefix_cache=0), levels)
     # the GLM template takes it as it is: tool results, calls, reasoning
     mk = adapters.get_adapter("glm5_next").chat_to_request(req, "/nonexistent").model_kwargs
     assert [m["role"] for m in mk["messages"]] == ["system", "system", "user", "assistant", "tool", "assistant", "user"]

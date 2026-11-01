@@ -380,7 +380,8 @@ no longer read. It raises an error with a message describing the migration.
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
-travels with its other ``model_kwargs``. Above one rank the cache stays off unless
+travels with its other ``model_kwargs`` (a top-level field on ``/v1/chat/completions``,
+``/v1/messages`` and ``/v1/responses``). Above one rank the cache stays off unless
 ``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
 ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
 cache's nodes must run on one TP group, with no replicas and no walks placed on other

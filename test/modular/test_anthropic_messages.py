@@ -167,6 +167,71 @@ def test_claude_codes_request_translates():
     assert mk["chat_template_kwargs"] == {"enable_thinking": True, "clear_thinking": False, "reasoning_effort": "max"}
 
 
+# Claude Code 2.1.309's tool search, as recorded: a deferred tool, the search's call, and its
+# result, which references the tool instead of describing it
+_FETCH = {"name": "WebFetch", "description": "Fetches a URL.", "defer_loading": True,
+          "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}
+_SEARCH = {"name": "ToolSearch", "description": "Fetches deferred tools' schemas.",
+           "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+_LOADED = [
+    {"role": "user", "content": "read https://example.com"},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "call_6a3f", "name": "ToolSearch",
+                                       "input": {"query": "select:WebFetch", "max_results": 1}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_6a3f",
+                                  "content": [{"type": "tool_reference", "tool_name": "WebFetch"}]}]},
+]
+# the two branches of the GLM-5.2 and GLM-5.3 templates that read these: the tool list skips
+# deferred tools, and a result of tool references lists the tools it names
+_REFERENCE_TEMPLATE = (
+    "{% for t in tools %}{% set f = t['function'] %}{% if not f.defer_loading %}<tool>{{ f.name }}</tool>"
+    "{% endif %}{% endfor %}"
+    "{% for m in messages %}{% if m.role == 'tool' and m.content is not string %}<tool_response><tools>"
+    "{% for tr in m.content %}{% for t in tools %}{% if t['function'].name == tr.name %}"
+    "{{ t['function'].name }}:{{ t['function'].parameters | tojson }}{% endif %}{% endfor %}{% endfor %}"
+    "</tools></tool_response>{% endif %}{% endfor %}")
+
+
+def test_a_tool_search_result_lists_the_tool_it_loads():
+    """A deferred tool stays out of the tool list until a result references it, and the
+    reference reaches the template as the tool's name."""
+    import jinja2
+    import torch
+
+    from mstar.api_server.openai import adapters, serving_messages
+    from mstar.model.multimodal import render_chat_template
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, tools=None, **kw):
+            text = jinja2.Environment().from_string(_REFERENCE_TEMPLATE).render(messages=messages, tools=tools)
+            return torch.tensor([list(text.encode())])
+
+    adapter = adapters.get_adapter("glm5_next")
+    req, _ = serving_messages.to_chat_request(_body(messages=_LOADED, tools=[_SEARCH, _FETCH]),
+                                              efforts=adapter.reasoning_efforts)
+    assert req.messages[-1].content == [{"type": "tool_reference", "name": "WebFetch"}]
+    mk = adapter.chat_to_request(req, "/nonexistent").model_kwargs
+    text = bytes(render_chat_template(_Tokenizer(), "", None, mk).tolist()).decode()
+    listed, response = text.split("<tool_response>")
+    assert listed == "<tool>ToolSearch</tool>"
+    assert response.startswith("<tools>WebFetch:") and '"url"' in response
+
+
+def test_a_tool_result_with_text_names_the_tools_it_references():
+    from mstar.api_server.openai import serving_messages
+
+    req, _ = serving_messages.to_chat_request(_body(messages=[
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": "Found one."}, {"type": "tool_reference", "tool_name": "WebFetch"}]}]}]))
+    assert req.messages[-1].content == "Found one.\nTool loaded: WebFetch"
+
+
+def test_a_request_can_turn_its_prefix_cache_off():
+    from mstar.api_server.openai import adapters, serving_messages
+
+    req, _ = serving_messages.to_chat_request(_body(prefix_cache=False))
+    assert adapters.get_adapter("glm52").chat_to_request(req, "/nonexistent").model_kwargs["prefix_cache"] is False
+
+
 @pytest.mark.parametrize("effort, glm52, glm53", [
     ("low", "high", "low"), ("medium", "high", "high"), ("high", "max", "max"), ("max", "max", "max"),
 ])
@@ -210,6 +275,9 @@ def test_tool_choice_maps_onto_chat(choice, want):
                                            "keep": {"type": "thinking_turns", "value": 1}}]}), "keep 'all'"),
     (_body(output_config={"format": {"type": "json_schema", "schema": {}}}), "constrained decoding"),
     (_body(output_config={"effort": "extreme"}), "output_config.effort"),
+    (_body(prefix_cache="no"), "prefix_cache"),
+    (_body(messages=[{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+        {"type": "tool_reference"}]}]}]), "tool_name"),
     # a forced call opens the reply, so Anthropic refuses it with thinking on too
     (_body(tools=[WEATHER], tool_choice={"type": "any"}, thinking={"type": "enabled", "budget_tokens": 1024},
            max_tokens=4096), "enable_thinking"),

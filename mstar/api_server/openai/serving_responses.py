@@ -30,7 +30,7 @@ _FIELDS = {"model", "input", "instructions", "tools", "tool_choice", "parallel_t
            "reasoning", "temperature", "top_p", "stream", "store", "include", "text", "truncation",
            "service_tier", "top_logprobs", "metadata", "user", "prompt_cache_key", "safety_identifier",
            "stream_options", "previous_response_id", "conversation", "prompt", "background", "max_tool_calls",
-           "client_metadata"}
+           "client_metadata", "prefix_cache"}
 # set to anything but their off value, these need what a stateless server does not have
 _OFF = {"previous_response_id": (None,), "conversation": (None,), "prompt": (None,), "store": (None, False),
         "background": (None, False), "max_tool_calls": (None,), "top_logprobs": (None, 0),
@@ -68,6 +68,10 @@ def to_chat_request(body, efforts: tuple[str, ...]) -> ChatCompletionRequest:
     for key in ("temperature", "top_p", "parallel_tool_calls"):
         if body.get(key) is not None:
             chat[key] = body[key]
+    if "prefix_cache" in body:  # M*'s per-request opt-out, as on chat completions
+        if not isinstance(body["prefix_cache"], bool):
+            raise ValueError(f"prefix_cache must be a boolean; got {body['prefix_cache']!r}")
+        chat["prefix_cache"] = body["prefix_cache"]
     if body.get("tools"):
         chat["tools"] = _tools(body["tools"])
     if body.get("tool_choice") is not None:

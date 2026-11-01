@@ -14,6 +14,10 @@ Where the APIs differ:
 * ``context_management`` is served for keeping every thinking block, which the
   template is told to do; other edits are a 400.
 * A system message between turns goes to the template where it is.
+* Deferred tools (``defer_loading``) and the ``tool_reference`` blocks a tool
+  search returns go to the template, which lists a deferred tool once a result
+  references it (both GLM templates do). A result that mixes references with
+  text names each referenced tool in the text.
 * A reply's ``thinking`` block carries an empty ``signature``.
 * A call cut off by ``max_tokens`` has no ``input``: the message leaves it
   out, and the stream ends inside its ``input_json_delta`` pieces.
@@ -32,7 +36,8 @@ from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.model.base import ProcessPromptOutput
 
 _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "stream", "temperature", "top_p",
-           "top_k", "tools", "tool_choice", "thinking", "metadata", "context_management", "output_config"}
+           "top_k", "tools", "tool_choice", "thinking", "metadata", "context_management", "output_config",
+           "prefix_cache"}
 _COUNT_FIELDS = {"model", "messages", "system", "tools", "tool_choice", "thinking", "context_management",
                  "output_config"}
 _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "max": 2}
@@ -71,6 +76,10 @@ def to_chat_request(body, *, counting: bool = False,
         for key in ("temperature", "top_p", "top_k"):
             if body.get(key) is not None:
                 chat[key] = body[key]
+        if "prefix_cache" in body:  # M*'s per-request opt-out, as on chat completions
+            if not isinstance(body["prefix_cache"], bool):
+                raise ValueError(f"prefix_cache must be a boolean; got {body['prefix_cache']!r}")
+            chat["prefix_cache"] = body["prefix_cache"]
         chat["stream"] = body.get("stream") or False
     if body.get("tools"):
         chat["tools"] = _tools(body["tools"])
@@ -146,16 +155,31 @@ def _user(blocks: list) -> list[dict]:
                 texts = []
             if not isinstance(block.get("tool_use_id"), str):
                 raise ValueError("a tool_result block needs its tool_use_id")
-            result = _text(block.get("content") or "", "a tool_result's content")
-            if block.get("is_error"):
-                result = "Error: " + result  # the template has no flag for it
-            out.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": result})
+            out.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": _tool_result(block)})
         else:
             raise ValueError(f"a user message takes text and tool_result blocks; got {kind!r}"
                              + (" (the model reads text)" if kind in ("image", "document") else ""))
     if texts:
         out.append({"role": "user", "content": "\n".join(texts)})
     return out
+
+
+def _tool_result(block: dict):
+    """A tool result's content for the template: its text, or, when it is only tool
+    references (a tool search's answer), the references by name, which the template
+    expands into the tools' definitions."""
+    content = block.get("content") or ""
+    if isinstance(content, list) and content:
+        refs = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_reference"]
+        for ref in refs:
+            if not isinstance(ref.get("tool_name"), str):
+                raise ValueError(f"a tool_reference block needs its tool_name; got {ref!r}")
+        if refs and len(refs) == len(content):
+            return [{"type": "tool_reference", "name": ref["tool_name"]} for ref in refs]
+        content = [{"type": "text", "text": f"Tool loaded: {b['tool_name']}"}
+                   if isinstance(b, dict) and b.get("type") == "tool_reference" else b for b in content]
+    result = _text(content, "a tool_result's content")
+    return "Error: " + result if block.get("is_error") else result  # the template has no flag for it
 
 
 def _assistant(blocks: list) -> dict:
@@ -198,6 +222,8 @@ def _tools(tools) -> list[dict]:
         fn = {"name": tool["name"], "parameters": tool["input_schema"]}
         if tool.get("description"):
             fn["description"] = tool["description"]
+        if tool.get("defer_loading"):
+            fn["defer_loading"] = True  # listed once a tool_reference loads it
         out.append({"type": "function", "function": fn})
     return out
 
