@@ -390,7 +390,7 @@ text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label w
 
 ``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
    The iterations each named loop may run for this request. The conductor refuses a request
-   whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
+   whose cap is below 1 or past its loop's graph ``max_iters``, or whose layout at its caps holds more
    positions than its pool's ``max_seq_len``, with a 400. A request that sets no length has
    the default ``max_output_tokens`` cut to the context its prompt leaves, and a stop check
    reads that length from ``request_info.max_tokens``, which carries the cut. A model that
@@ -2336,9 +2336,13 @@ iteration. The step index is the engine's loop counter
 
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
 the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
-step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
-``bucket_key`` with the Euler update inside the graph — and asks the model for:
+batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
+``declare_step`` and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
+the graph — and asks the model for the hooks below. The loop ends on its iteration count:
+a model whose request picks its step count returns it from ``get_loop_caps``
+(``{"denoise_loop": steps}``), resolved exactly as ``schedule_for`` resolves it, and a
+stage that always runs its graph ``max_iters`` declares nothing. The scaffold refuses an
+iteration past the schedule. The hooks:
 
 .. code-block:: python
 

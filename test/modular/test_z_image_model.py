@@ -52,6 +52,9 @@ def test_graph_structure():
     assert isinstance(gen, Sequential)
     loop, decoder = gen.sections
     assert isinstance(loop, Loop) and loop.name == DENOISE_LOOP and loop.max_iters == model.config.max_denoise_steps
+    # the request's own step count ends the loop (and its speculation), clamped to the ceiling
+    assert model.get_loop_caps(num_inference_steps=3) == {DENOISE_LOOP: 3}
+    assert model.get_loop_caps(num_inference_steps=10**6) == {DENOISE_LOOP: model.config.max_denoise_steps}
     assert loop.section.input_names == {"text_embeds", "latents"}
     assert [(e.name, e.next_node) for e in loop.section.outputs] == [("latents", "dit")]
     assert decoder.outputs[0].next_node == EMIT_TO_CLIENT and decoder.outputs[0].output_modality == "image"

@@ -194,6 +194,10 @@ class ZImageModel(Model):
             raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
         return min(steps, self.config.max_denoise_steps)
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own step count, and is never speculated past it
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,

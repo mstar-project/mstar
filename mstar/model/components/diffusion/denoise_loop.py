@@ -9,15 +9,20 @@ leaves the model-specific parts to a handful of hooks:
   step index from the engine's loop counter       bucket_key_for(fwd_info)      -> hashable
   per-request schedule + seeded initial noise,    schedule_for(fwd_info, key)   -> FlowMatchSchedule
     drawn at ingest under PREFETCH_SEEDS
-  overshoot veto (async scheduling)               seed_latents(fwd_info, key, generator) -> [L, C]
-  equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
-  stacked preprocess / per-row outputs            num_tokens(key)               -> int
-  stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
-  per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
+  equal-key request batching (can_batch)          seed_latents(fwd_info, key, generator) -> [L, C]
+  stacked preprocess / per-row outputs            request_inputs(fwd_info, inputs, key) -> {name: [..]}
+  per-key CUDA-graph buckets (Euler inside)       num_tokens(key)               -> int
+                                                  denoise(engine_inputs, key, latents, timestep,
+                                                          sigma, sigma_next, **cond) -> [B, L, C]
   ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> ((label, span), ...)
 
 Conventions the base fixes:
+
+* The loop ends on its iteration count: a model whose request picks its own
+  step count declares it as the loop's cap (``Model.get_loop_caps``), so the
+  loop completes after that iteration and the async worker never speculates
+  past it.
 
 * The loop-back edges are :attr:`~DenoiseLoopSubmodule.loop_back_names`
   (``latents`` plus whatever ``SOLVER_STATE`` a multi-step scheduler carries);
@@ -46,7 +51,6 @@ Conventions the base fixes:
 from __future__ import annotations
 
 import copy
-import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from typing import Any, NamedTuple
@@ -61,8 +65,6 @@ from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.threads import ThreadPool
-
-logger = logging.getLogger(__name__)
 
 
 class StepScalar(NamedTuple):
@@ -337,7 +339,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> NodeInputs | None:
         # Keyed by the integer rid_handle, NOT by request_id. The handle is what
-        # the engine keys batches by and what it hands check_stop
+        # the engine keys batches by and what cleanup_request receives
         state = self.request_state(fwd_info.rid_handle)
         k = self.step_index(fwd_info)
         device = self.get_device()
@@ -348,18 +350,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             bucket_key = self.bucket_key_for(fwd_info)
             schedule = self.schedule_for(fwd_info, bucket_key)
             state.add_all(
-                schedule=schedule, bucket_key=bucket_key, num_steps=schedule.num_steps, schedule_walk=graph_walk,
+                schedule=schedule, bucket_key=bucket_key, schedule_walk=graph_walk,
                 **self._step_scalar_sources(schedule, device),
             )
-        bucket_key, num_steps = state["bucket_key"], state["num_steps"]
-        if k >= num_steps:
-            # Async scheduling dispatched an iteration past this request's stop; None
-            # makes the engine skip the forward (the cosmos3 / wan22 veto).
-            # debug, not info: one line per vetoed step per request (1.9k lines in a
-            # 36-minute served run), and it is the expected outcome of speculation.
-            logger.debug("%s: skipping overshoot iteration %d (request %s runs %d steps)",
-                         type(self).__name__, k, fwd_info.request_id, num_steps)
-            return None
+        bucket_key = state["bucket_key"]
+        if k >= state["schedule"].num_steps:
+            raise RuntimeError(
+                f"{type(self).__name__}: iteration {k} is past request {fwd_info.request_id}'s "
+                f"{state['schedule'].num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
+            )
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
@@ -462,27 +461,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             rid: {name: [value[i]] for name, value in outputs.items()}
             for i, rid in enumerate(engine_inputs.request_ids)
         }
-
-    def check_stop(self, request_id: int, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
-        # ``request_id`` is the engine's integer rid handle, the same key
-        # prepare_inputs stored under.
-        state = self.request_states.get(request_id)
-        if state is None or "num_steps" not in state:
-            logger.warning(
-                "%s: check_stop found no schedule for request %r (state=%s); the loop "
-                "will not be stopped by this pass",
-                type(self).__name__, request_id, "absent" if state is None else "no num_steps",
-            )
-            return set()
-        # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
-        k, num_steps = self.step_index(request_info), int(state["num_steps"])
-        stop = k + 1 >= num_steps
-        # debug, not info: one line per request per step on the GPU thread -- 19.8k of
-        # the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop
-        # counter, far too loud for a served default.
-        logger.debug("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
-                     request_id, k, num_steps, "STOP" if stop else "continue")
-        return {self.loop_name} if stop else set()
 
     # ------------------------------------------------------------ resources
     def _uniform_key(self, keys) -> Hashable | None:

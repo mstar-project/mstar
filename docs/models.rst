@@ -1500,8 +1500,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``async_scheduling``
    The engine's speculative scheduling of the image nodes: the worker assembles a batch's
    next denoise step while the current one runs and merges requests that became ready
-   meanwhile, so requests at different steps share a forward. On by default; a step a
-   request speculates past its schedule is vetoed before any forward, and ``false``
+   meanwhile, so requests at different steps share a forward. On by default; the loop's cap
+   (the request's step count) keeps speculation from running past its schedule, and ``false``
    restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
    to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
    concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the

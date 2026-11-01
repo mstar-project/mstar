@@ -1,13 +1,13 @@
 ---
 name: diffusion-scaffold
-description: Building an image/video flow or diffusion model on M*'s DiT scaffold (mstar/model/components/diffusion/, DenoiseLoopSubmodule) — bucket keys, schedules and seeding, multi-stage recipes, ragged attention spans, compile and per-bucket accelerator graphs, and the async overshoot veto. Use when porting a DiT-style model, writing a DenoiseLoopSubmodule subclass, or changing the scaffold itself.
+description: Building an image/video flow or diffusion model on M*'s DiT scaffold (mstar/model/components/diffusion/, DenoiseLoopSubmodule) — bucket keys, schedules and seeding, multi-stage recipes, ragged attention spans, compile and per-bucket accelerator graphs, and the loop cap that ends a request's denoise loop. Use when porting a DiT-style model, writing a DenoiseLoopSubmodule subclass, or changing the scaffold itself.
 ---
 
 # The DiT scaffold
 
 `mstar/model/components/diffusion/` holds what every text → flow transformer → VAE model shares: sigma schedules and the Euler step (`flow_match`), multi-axis RoPE, joint attention, compile and decode wrappers, weight streaming, and the `DenoiseLoopSubmodule` that runs as the body of a model's `Loop("denoise_loop", dit)`. `flux2_klein` and `z_image` are built on it and are the references to read. `cosmos3` and `wan22` predate it; don't copy their single-request, self-compiled, uncaptured loop.
 
-Read the module docstring of `denoise_loop.py` first. Its two-column table is the contract: on the left what the base does (step index from the engine's loop counter, per-request schedule and seeded noise, overshoot veto, equal-key batching, stop at the request's own step count, per-key graph buckets, the ragged step declaration), on the right the hooks a model implements. This skill covers the decisions behind those hooks and what has gone wrong.
+Read the module docstring of `denoise_loop.py` first. Its two-column table is the contract: on the left what the base does (step index from the engine's loop counter, per-request schedule and seeded noise, equal-key batching, per-key graph buckets, the ragged step declaration), on the right the hooks a model implements. This skill covers the decisions behind those hooks and what has gone wrong.
 
 Read the [add-mstar-model skill](../add-mstar-model/SKILL.md) for the port as a whole; this one is about the `dit` node.
 
@@ -52,13 +52,13 @@ Every attention in the DiT should go through a ragged resource, so the model get
 - `capture_buckets` lists `(graph_walk, bucket_key)` pairs to capture; `capture_request_inputs` supplies one placeholder row per bucket. A bucket is captured per batch size in `capture_batch_sizes`, and each one costs startup, so capture the shapes you serve, not every shape you accept. `replay_walks` lets another walk reuse a captured bucket.
 - The captured graph removes the gaps the per-layer attention graph breaks leave in a compiled-but-eager step; measure both before deciding a model doesn't need capture.
 
-## The overshoot veto
+## Ending the loop
 
-The async worker speculates the next iteration before the current one's stop is known. Flow models know their step count at ingestion, so `prepare_inputs` returns `None` for an iteration past the request's last step and the engine skips the forward. That is the base's job; a subclass that overrides `prepare_inputs` must keep it.
+The loop ends on its iteration count. A model whose request picks its step count declares it as the loop's cap in `get_loop_caps` (z_image, flux2_klein); the loop then completes after that iteration and neither graph runtime speculates past it. A model whose stage always runs its graph `max_iters` declares no cap (ltx2_5: caps are keyed by loop name, and its two stages share one). The conductor refuses a cap below 1 or above the loop's `max_iters`.
 
 ## State
 
-Per-request state lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key `check_stop` and cleanup receive), not by the `request_id` string; see invariant 14.
+Per-request state lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
 
 ## Validating
 

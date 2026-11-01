@@ -43,9 +43,8 @@ DIT_NODE = "dit"
 UPSAMPLER_NODE = "latent_upsampler"
 VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
-# One loop per denoising stage; the two-stage recipe runs the dit node in both.
+# One loop name for both denoising stages: each stage's walk sets its own max_iters.
 DENOISE_LOOP = "denoise_loop"
-REFINE_LOOP = "refine_loop"
 # Resource key of the dit's ragged self-attention.
 DIT_ATTN = "dit_attn"
 

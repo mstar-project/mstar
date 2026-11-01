@@ -189,10 +189,14 @@ def test_a_layout_reaches_its_streams_as_footprints(tmp_path, monkeypatch, prefi
     assert kv._ensure_label("r", "uncond").footprint == -(-(10 + 2 * 40 + 7) // PS)
 
 
-def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cap", [51, 0])
+def test_a_cap_past_its_loop_or_below_one_is_refused(tmp_path, monkeypatch, cap):
+    """Past its loop's max_iters the loop would end short; a loop ends on its
+    count only at a cap of 1 or more, so a cap of 0 would never end by count."""
     model = _Model()
+    monkeypatch.setattr(model, "get_loop_caps", lambda **kwargs: {"decode_loop": cap})
 
-    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 51}), tmp_path, monkeypatch).sent
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": 10}), tmp_path, monkeypatch).sent
 
     failed = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
     assert [body.status for body in failed] == [400], "a request the loop would end short was served"

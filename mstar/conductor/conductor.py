@@ -625,9 +625,14 @@ class Conductor:
 
     def _loop_caps(self, model_kwargs: dict) -> dict[str, int]:
         """Each named loop's cap for the request. A cap past its loop's ``max_iters``
-        would end the request short of what it asked for, so it is a ``ValueError`` (a 400)."""
+        would end the request short of what it asked for, and a loop ends on its count
+        only at a cap of 1 or more, so either is a ``ValueError`` (a 400)."""
         caps = self.model.get_loop_caps(**model_kwargs)
         for name, cap in caps.items():
+            if cap < 1:
+                raise ValueError(
+                    f"{type(self.model).__name__}.get_loop_caps gave {name!r} a cap of {cap}; a loop runs at least 1"
+                )
             max_iters = self._loop_max_iters.get(name)
             if max_iters is not None and cap > max_iters:
                 raise ValueError(
