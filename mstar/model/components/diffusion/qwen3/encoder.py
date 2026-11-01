@@ -239,13 +239,15 @@ class Qwen3HiddenStateEncoder(nn.Module):
         rms_norm_eps: float,
         rope_theta: float,
         tap_layers: tuple[int, ...],
+        max_positions: int,
         fused_qkv: bool = True,
     ):
         super().__init__()
         if min(tap_layers) < 1:
             raise ValueError("tap layers are 1-indexed decoder layers (0 would be the raw embeddings)")
         self.tap_layers = tuple(tap_layers)
-        self.head_dim, self.rope_theta = head_dim, rope_theta
+        self.head_dim, self.rope_theta, self.max_positions = head_dim, rope_theta, max_positions
+        self._rotary_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = nn.ModuleList(
             DecoderLayer(
@@ -267,6 +269,7 @@ class Qwen3HiddenStateEncoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        padded: bool | None = None,
         *,
         inputs_embeds: torch.Tensor | None = None,
         rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -278,6 +281,9 @@ class Qwen3HiddenStateEncoder(nn.Module):
         (``is_causal`` + native GQA), a padded one through a boolean causal-and-key-padding
         mask; the two pick different SDPA kernels, so the choice is part of parity.
 
+        ``padded`` is whether any row has padding, when the caller knows it on the host;
+        None reads it off ``attention_mask``, a host sync (and not graph-capturable).
+
         For a Qwen3-VL prompt with images: ``inputs_embeds`` replaces the token embeddings
         (the vision rows spliced in by the caller), ``rotary`` the 1-D tables (fp32
         ``cos, sin [S, head_dim]``, from the prompt's 3-D MRoPE positions), and
@@ -285,11 +291,22 @@ class Qwen3HiddenStateEncoder(nn.Module):
         layer ``i`` (0-indexed), as ``Qwen3VLTextModel._deepstack_process`` does.
         """
         seq = input_ids.shape[1]
+        if seq > self.max_positions:
+            raise ValueError(f"{seq} prompt tokens, past the encoder's {self.max_positions}")
         if rotary is None:
-            rotary = qwen3_rotary_tables(torch.arange(seq, device=input_ids.device), self.head_dim, self.rope_theta)
+            # one table per device at the longest length, sliced: building it copies inv_freq from
+            # the host, which a captured forward cannot do, and a table a capture read must outlive it
+            tables = self._rotary_cache.get(input_ids.device)
+            if tables is None:
+                tables = self._rotary_cache[input_ids.device] = qwen3_rotary_tables(
+                    torch.arange(self.max_positions, device=input_ids.device), self.head_dim, self.rope_theta,
+                )
+            rotary = (tables[0][:seq], tables[1][:seq])
         # No padding anywhere in the batch: HF's create_causal_mask returns None and attention
         # runs its is_causal path; mirror that rather than passing an all-True mask.
-        mask = None if bool(attention_mask.all()) else padded_causal_mask(attention_mask)
+        if padded is None:
+            padded = not bool(attention_mask.all())
+        mask = padded_causal_mask(attention_mask) if padded else None
         hidden = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         taps = []
         for layer_idx, layer in enumerate(self.layers, start=1):

@@ -11,7 +11,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -47,6 +47,54 @@ class CombinedSplit:
         return min(total, bucket_rows)
 
 
+class RoutingContext(NamedTuple):
+    """The data-parallel replicas a routing mirror is built for, and what a
+    mirror reads of the model's KV declarations, which ``ReplicaRouter`` fills."""
+    num_replicas: int
+    # the walks of the worker graphs that hold the resource's nodes on these replicas
+    walks: frozenset[str]
+    # the resource's keyed labels, each with the walks whose writes it keys
+    keyed: Mapping[str, Collection[str]]
+    # whether every replica's engine opens the resource's prefix cache (`prefix_caches_by_rank`),
+    # derived by the router rather than declared
+    prefix_cache_opens: bool
+
+
+class RoutingFacts(NamedTuple):
+    """What a mirror predicts for a new request on one replica, by name, for
+    the conductor's ``routing_cost`` to price. Every field is a count whose
+    identity is 0: a mirror leaves the fields it does not report at 0, and the
+    router adds the rows of every mirror on the replica field by field before
+    pricing them once."""
+    # the positions the request's prompt writes, every KV label's
+    work: int = 0
+    # of those, the positions a KV prefix cache is predicted to hold
+    kv_hit: int = 0
+
+
+class RoutingMirror(Protocol):
+    """A conductor-side prediction of one resource's state on each data-parallel
+    replica, for choosing a new request's replica. It holds bookkeeping only,
+    never the resource's data, follows the resource's own rules on what the
+    conductor sees, and a wrong prediction makes a request slower, never wrong.
+
+    ``config`` is the request's config for the resource, as the conductor
+    opens it with: built and validated before the pick.
+    """
+
+    def facts(self, config: "ResourceReqConfig") -> list[RoutingFacts]:
+        """The request's facts on each replica."""
+
+    def add_request(self, config: "ResourceReqConfig", replica: int) -> Any:
+        """Record the request as placed on ``replica``; the handle comes back to ``remove_request``."""
+
+    def remove_request(self, handle: Any, ran: bool) -> None:
+        """Release what ``add_request`` recorded, once the request is gone.
+        ``ran`` says whether a pass came back for one of the request's
+        partitions with a walk on the resource's node groups (not necessarily a
+        walk that uses the resource), so the resource may hold what it left."""
+
+
 @dataclass
 class NodeResourceSpec(ABC):
     resource_key: str
@@ -70,6 +118,20 @@ class NodeResourceSpec(ABC):
         """Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""
         return False
 
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        """Whether the resource keeps a prefix cache of its own on a lockstep
+        instance of ``world_size`` ranks, for a model that names its checkpoint
+        or not. False (the default) keeps nothing across requests.
+        `opening_prefix_caches` weighs it against the resources on its nodes."""
+        return False
+
+    @property
+    def restores_prefix(self) -> bool:
+        """A hit needs state the resource holds from the skipped tokens, so it
+        serves one only from a prefix cache of its own, or, keeping none, from
+        those of the resources it depends on that restore."""
+        return False
+
     @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
@@ -79,6 +141,17 @@ class NodeResourceSpec(ABC):
         The builder, not necessarily the class built: an attention spec names
         `AttentionManager`, whose `build` picks a backend subclass.
         """
+
+    def routing_mirror(self, ctx: RoutingContext) -> RoutingMirror | None:
+        """A mirror of this resource for the replicas ``ctx`` describes; None
+        (the default) leaves the resource out of the replica pick there."""
+        return None
+
+    def derive(self, specs: Mapping[str, "NodeResourceSpec"]) -> list[str]:
+        """Set what this spec takes from the specs that read it (a KV pool keeps the window its
+        attentions declare), after a deployment's overrides; return what is wrong with it.
+        Idempotent: it runs wherever the specs resolve (`resolve_spec_dependencies`)."""
+        return []
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
@@ -147,11 +220,30 @@ def spec_dependency_problems(specs: Sequence[NodeResourceSpec]) -> list[str]:
 def resolve_spec_dependencies(
     specs: Sequence[NodeResourceSpec],
 ) -> dict[str, NodeResourceSpec]:
-    """Index specs by resource key, checking uniqueness and ``depends_on``."""
+    """Index specs by resource key, checking uniqueness and ``depends_on``, and derive what each
+    takes from the others (`NodeResourceSpec.derive`)."""
+    by_key = _indexed(specs)
+    _derive(by_key)
+    return by_key
+
+
+def _indexed(specs: Sequence[NodeResourceSpec]) -> dict[str, NodeResourceSpec]:
     problems = spec_dependency_problems(specs)
     if problems:
         raise ValueError(problems[0])
     return {spec.resource_key: spec for spec in specs}
+
+
+def derive_specs(by_key: Mapping[str, NodeResourceSpec]) -> list[tuple[str, str]]:
+    """Run every spec's `NodeResourceSpec.derive`; each problem as (resource key, message)."""
+    return [(key, message) for key, spec in by_key.items() for message in spec.derive(by_key)]
+
+
+def _derive(by_key: Mapping[str, NodeResourceSpec]) -> None:
+    problems = derive_specs(by_key)
+    if problems:
+        key, message = problems[0]
+        raise ValueError(f"resource {key!r}: {message}")
 
 
 TOP_LEVEL_KV_CACHE = (
@@ -175,18 +267,26 @@ def apply_yaml_overrides(
 
     ``resources: {<resource_key>: {...}}``, one block per resource, so a model
     with two pools of the same kind (whisper's decoder cache and its encoder
-    context) can have each tuned on its own. An unknown key is an error: it
+    context) can have each tuned on its own. An unknown key is a ValueError: it
     would otherwise be a silently ineffective setting.
+
+    Then derives what the specs derive (`resolve_spec_dependencies`), with or without
+    overrides and after them, so a deployment's page size or backend is what the derivation
+    checks, as validation checks it.
     """
     if "kv_cache" in model_config:
         raise ValueError(TOP_LEVEL_KV_CACHE)
+    by_key = _indexed(specs)
     overrides = model_config.get("resources") or {}
-    if not overrides:
-        return
-    by_key = resolve_spec_dependencies(specs)
     unknown = sorted(overrides.keys() - by_key.keys())
     if unknown:
         raise ValueError(unknown_overrides_message(unknown, by_key))
     for key, kwargs in overrides.items():
-        by_key[key].apply_yaml_overrides(**kwargs)
-    logger.info("Resource specs after YAML overrides: %s", specs)
+        try:
+            by_key[key].apply_yaml_overrides(**kwargs)
+        except TypeError as e:
+            # a key the resource doesn't take: a bad config, as every other problem here is
+            raise ValueError(f"resources.{key}: {e}") from e
+    _derive(by_key)
+    if overrides:
+        logger.info("Resource specs after YAML overrides: %s", specs)

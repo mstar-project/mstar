@@ -48,6 +48,7 @@ from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
+    TokenStop,
     device_loopback_enabled,
 )
 
@@ -133,7 +134,10 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.model = llm
         self.config = config
-        self.stop_token_ids = config.stop_token_ids
+        self.token_stop = TokenStop(
+            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=config.stop_token_ids,
+            sampler=self.SAMPLER, walk=DECODE_WALK, prefill_walks=frozenset({PREFILL_WALK}),
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -296,7 +300,3 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
             row_outputs={signal: new_tokens},
             check_stop_buffers={"new_token": new_tokens},
         )
-
-    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        # only a decode step's token ends the loop: prefill runs outside it
-        return request_info.graph_walk == DECODE_WALK and super()._stops(token, request_info)

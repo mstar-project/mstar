@@ -260,7 +260,7 @@ def _submodule_class():
         def check_stop(self, request_id, request_info, outputs):
             return set()
 
-        def check_stop_batched(self, request_ids, request_infos, host_rows, step_walk=None):
+        def check_stop_batched(self, request_ids, request_infos, host_rows):
             return None
 
         def step_is_input_free(self, graph_walk):
@@ -513,7 +513,7 @@ class _Graph:
     def update_dynamic_loop_iters(self, per_request_info, partition):
         pass
 
-    def mark_stream_partition_done(self, rid, partition):
+    def mark_partition_done(self, rid, partition):
         pass
 
     def complete_and_route_batch(self, route_input):

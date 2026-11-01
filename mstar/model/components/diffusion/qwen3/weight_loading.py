@@ -70,5 +70,6 @@ def make_text_encoder(text_config: Qwen3EncoderConfig) -> Qwen3HiddenStateEncode
         rms_norm_eps=text_config.rms_norm_eps,
         rope_theta=text_config.rope_theta,
         tap_layers=text_config.hidden_state_layers,
+        max_positions=text_config.max_sequence_length,
         fused_qkv=text_config.fused_qkv,
     )
