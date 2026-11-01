@@ -102,16 +102,6 @@ _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
 
 @contextmanager
-def _capture_scope(submodule_mgmt) -> Iterator[None]:
-    """The node's fp32 precision, and ``torch.backends.cudnn.benchmark`` on
-    when it asks (``NodeSubmodule.capture_cudnn_benchmark``): the kernels a
-    capture (and the compile inside it) picks are what every replay runs."""
-    with fp32_precision_scope(submodule_mgmt.fp32_precision), \
-            cudnn_benchmark(submodule_mgmt.submodule.capture_cudnn_benchmark):
-        yield
-
-
-@contextmanager
 def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
     """Hold the caching allocator to ``gpu_memory_fraction`` while a node that
     asks for cuDNN's algorithm search (``capture_cudnn_benchmark``) is sized.
@@ -787,7 +777,10 @@ class Engine:
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
-            with self._capture_into(plan, node_name) as planned, _capture_scope(submodule_mgmt):
+            # the kernels a capture (and the compile inside it) picks are what
+            # every replay runs, so it happens under the node's precision
+            with self._capture_into(plan, node_name) as planned, \
+                    fp32_precision_scope(submodule_mgmt.fp32_precision):
                 runner.warmup_and_capture(planned)
             if plan is not None or runner.any_graphs:
                 submodule_mgmt.capture_runner = runner
@@ -797,7 +790,7 @@ class Engine:
             captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
             with self._capture_into(plan, f"{node_name} piecewise") as planned:
                 for label, pw_runner in piecewise[node_name].items():
-                    with _capture_scope(submodule_mgmt):
+                    with fp32_precision_scope(submodule_mgmt.fp32_precision):
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
@@ -850,10 +843,11 @@ class Engine:
             """A plan over what ``size`` says each runner's buckets cost."""
             pools: dict[str, dict] = {}
             for node_name, submodule_mgmt in self._submodules.items():
-                # sizing runs the forwards and captures (a sized capture runs none of its own),
-                # so under the node's precision and cuDNN search too
-                with _capture_scope(submodule_mgmt), \
-                        _search_cap(submodule_mgmt, self._gpu_memory_fraction, self._device):
+                # sizing runs the forwards and captures, so under the node's precision too,
+                # and it runs a node's only warm-up forwards, where cuDNN can time its convs
+                with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                        _search_cap(submodule_mgmt, self._gpu_memory_fraction, self._device), \
+                        cudnn_benchmark(submodule_mgmt.submodule.capture_cudnn_benchmark):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {

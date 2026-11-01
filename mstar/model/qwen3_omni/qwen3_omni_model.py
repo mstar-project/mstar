@@ -1672,8 +1672,10 @@ class Qwen3OmniModel(Model):
         with torch.device("meta"):
             # its inputs and codec embeddings are in the Talker's width, which
             # Qwen3-Omni's code predictor shares (it has no input projection)
+            # the frame's embedding sum accumulates in fp32, rounded once
             code_predictor = ResidualCodePredictor(
                 self.config.code_predictor, self.config.code_predictor.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+                embed_sum_dtype=torch.float32,
             )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
