@@ -55,9 +55,10 @@ def _build(device):
     kv = KVSpec("kv", {"llm"}, PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4 * PAGE, page_size=PAGE,
     ))
-    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=device, dependencies={"kv": kv}))
+    pool = RecurrentStatePool.build(
+        spec, EngineResourceInfo(device=device, dependencies={"kv": kv}, prefix_caches=frozenset({POOL, "kv"})),
+    )
     pool.bind_kv(_StubChains())
-    assert pool.enable_prefix_cache(b"a root")
     manager = LinearAttnManager.build(
         LinearAttnSpec(GDN, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.GDN)),
         EngineResourceInfo(device=device, dependencies={POOL: spec}),
