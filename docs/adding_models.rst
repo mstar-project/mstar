@@ -1192,7 +1192,7 @@ methods are:
 
    A node whose captured convolutions are faster with cuDNN's timed algorithm choice
    sets ``capture_cudnn_benchmark = True``: the engine turns
-   ``torch.backends.cudnn.benchmark`` on around that node's capture warm-up only, so
+   ``torch.backends.cudnn.benchmark`` on around that node's capture sizing only, so
    each captured shape is searched once, and eager steps keep the heuristic pick
    (Kokoro is an example). The search tries workspaces as large as the GPU has free,
    so on a deployment that sets ``gpu_memory_fraction`` the engine holds the
