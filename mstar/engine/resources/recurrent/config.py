@@ -30,6 +30,11 @@ class RecurrentBlockConfig:
     shape: tuple[int, ...]
     dtype: torch.dtype | None
     shard_dims: tuple[int, ...] = ()
+    # A sliding window over recent tokens along the last axis (a conv tail).
+    # Under speculative decoding a verify step appends k + 1 tokens and the
+    # next one starts after however many were accepted, so the pool keeps k
+    # more entries there (`RecurrentStateConfig.spec_tokens`).
+    speculative_window: bool = False
 
     def __post_init__(self):
         self.shape = tuple(self.shape)
@@ -47,6 +52,13 @@ class RecurrentBlockConfig:
         for dim in self.shard_dims:
             shape[dim] = divide(self._unsharded_shape[dim], num_shards)
         self.shape = tuple(shape)
+
+    def storage_shape(self, spec_tokens: int = 0) -> tuple[int, ...]:
+        """The shape a slot stores: ``shape``, with a speculative window's
+        last axis ``spec_tokens`` longer."""
+        if not (self.speculative_window and spec_tokens):
+            return self.shape
+        return (*self.shape[:-1], self.shape[-1] + spec_tokens)
 
 
 class RecurrentGeometry(ABC):
@@ -102,6 +114,7 @@ class DeltaNetGeometry(RecurrentGeometry):
                 shape=(self.conv_dim, self.conv_kernel_size - 1),
                 dtype=conv_dtype,
                 shard_dims=(0,),
+                speculative_window=True,
             ),
         }
 
@@ -262,6 +275,12 @@ class RecurrentStateConfig:
     prefix_slots: int = 0
     kv_cache: str | None = None
 
+    # Drafts per speculative verify step (k), 0 without speculation. A request
+    # then holds k + 1 slots per label, one per token of a verify row, so the
+    # step can keep the state after each token and the next one resume from the
+    # last accepted; speculative windows grow by k (`RecurrentBlockConfig`).
+    spec_tokens: int = 0
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
@@ -272,6 +291,12 @@ class RecurrentStateConfig:
                 f"max_slots={self.max_slots} leaves nothing to hand out: the "
                 "sink takes one. Raise it or set disable_sink_slot."
             )
+        if self.spec_tokens < 0:
+            raise ValueError(f"spec_tokens={self.spec_tokens} must be >= 0")
+
+    @property
+    def slots_per_request(self) -> int:
+        return self.spec_tokens + 1
 
     @property
     def usable_slots(self) -> int:

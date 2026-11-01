@@ -36,6 +36,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.unfiltered import with_unfiltered_sampling
+from mstar.engine.resources.spec_decode.config import SpecDecodeStep, SpecPhase
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
@@ -62,6 +63,7 @@ from mstar.model.qwen3_5.config import (
     MIXED_MAX_PREFILL_ROWS,
     ROPE,
     SAMPLER,
+    SPEC_DECODE,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -86,6 +88,10 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
+    # drafts a speculative decode step verifies (see `__init__`); 0 decodes one
+    # token a step
+    num_draft_tokens: int = 0
+    spec_sampling: bool = False
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -135,12 +141,32 @@ class LLMSubmodule(ARNodeSubmodule):
         model: Qwen3_5ForCausalLM,
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
+        num_draft_tokens: int = 0,
+        spec_sampling: bool = False,
     ):
         super().__init__()
         self.model = model
         self.config = config
         self.vision_config = vision_config
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Speculative decoding: a decode step verifies this many drafts of the
+        # MTP head (`model.mtp`) and drafts the next ones, each row k + 1
+        # tokens; the drafts and lengths live in the SPEC_DECODE resource.
+        self.num_draft_tokens = num_draft_tokens
+        # verify steps may sample (a second decode capture, keyed by
+        # `cg_key_info`); off, they take the target's argmax
+        self.spec_sampling = spec_sampling and num_draft_tokens > 0
+        if num_draft_tokens and model.mtp is None:
+            raise ValueError("a speculative LLM submodule needs the model's MTP head")
+
+    @property
+    def _speculative(self) -> bool:
+        return self.num_draft_tokens > 0
+
+    @property
+    def _decode_tokens(self) -> int:
+        """Tokens of one decode row: 1, or a verify row's k + 1."""
+        return self.num_draft_tokens + 1
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -175,19 +201,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 },
             )
 
-        # decode also captures once more for batches that filter nothing
-        return with_unfiltered_sampling([
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="decode",
-                single_request_inputs=dummy(1),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
-            PackedAcceleratorGraphConfig(
-                capture_graph_walk="prefill_text",
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=dummy,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
+        mixed = [] if self._speculative else [
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=LLM_MIXED,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -196,23 +210,34 @@ class LLMSubmodule(ARNodeSubmodule):
                 # the layout its GDN splits; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
             ),
+        ]
+        # a speculative node that samples captures decode twice: greedy and sampled
+        decode_keys = (False, True) if self.spec_sampling else (None,)
+        configs = [
+            *(BatchedAcceleratorGraphConfig(
+                capture_graph_walk="decode",
+                # a verify row under speculation
+                single_request_inputs=dummy(self._decode_tokens),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                additional_key_info=key,
+            ) for key in decode_keys),
+            PackedAcceleratorGraphConfig(
+                capture_graph_walk="prefill_text",
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=dummy,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+            *mixed,
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_vision",
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 make_node_input=vision_dummy,
                 capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
             ),
-        ], walks=("decode",))
-
-    def cg_key_info(
-        self, graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        per_request_input_metadata=None,
-        **kwargs: Any,
-    ) -> Any:
-        if graph_walk != "decode":
-            return None
-        return self.node_resources[SAMPLER].unfiltered_key(graph_walk, per_request_info.keys())
+        ]
+        # a plain decode also captures once more for batches that filter nothing;
+        # a verify step doesn't draw through the sampler
+        return configs if self._speculative else with_unfiltered_sampling(configs, walks=("decode",))
 
     # ------------------------------------------------------------------
     # Step declaration
@@ -335,6 +360,10 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_vision":
             return self._vision_inputs(fwd_info, inputs)
 
+        if graph_walk == "decode" and self._speculative:
+            # the verify row's tokens are the speculative resource's, on the
+            # device; the routed signal is the previous step's output, unread
+            return ARNodeInputs(input_seq_len=self._decode_tokens)
         if graph_walk == "decode" and has_loopback and self._device_loopback():
             # one token per row, read off the sampler's slot master in
             # `preprocess`; the routed signal is empty (or ignored) here
@@ -346,6 +375,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, has_loopback: bool = False,
     ) -> ARNodeInputs | None:
         # the loop-back decode row above, built once for the step's rows
+        if graph_walk == "decode" and self._speculative:
+            return ARNodeInputs(input_seq_len=self._decode_tokens)
         if graph_walk == "decode" and has_loopback and self._device_loopback():
             return ARNodeInputs(input_seq_len=1)
         return None
@@ -357,7 +388,9 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        if graph_walk == "decode" and self._device_loopback():
+        # Not under speculation: a step emits a varying number of tokens, which
+        # only the per-request tensor path carries to the client.
+        if graph_walk == "decode" and self._device_loopback() and not self._speculative:
             return frozenset({"text_inputs"})
         return frozenset()
 
@@ -398,6 +431,9 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
+        if graph_walk == "decode" and self._speculative:
+            # everything a verify step reads is on the device already
+            return out
         captured = self._captured_decode(engine_inputs, graph_walk)
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if captured and ingraph_decode_rope() and sampler.loopback_in_graph:
@@ -469,6 +505,13 @@ class LLMSubmodule(ARNodeSubmodule):
         per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
+        if graph_walk == "decode" and self._speculative:
+            lease = kwargs.get("slot_lease")
+            key = (
+                lease.bucket.cg_key_info if lease is not None
+                else self.cg_key_info(graph_walk, per_request_info or {})
+            )
+            return self._declare_verify(request_ids, key)
         prefill_tokens = {}
         if graph_walk in ("prefill_text", LLM_MIXED):
             # a mixed step's decode rows track their token through the sampler as usual
@@ -504,6 +547,20 @@ class LLMSubmodule(ARNodeSubmodule):
                 int(inp.tensor_inputs["mrope_advance"]) for inp in inputs
             )
 
+        steps = {
+            KV_CACHE: KVStep(),
+            ATTN: AttentionStep(causal=True),
+            GDN_STATE: RecurrentStep(),
+            LINEAR_ATTN: LinearAttnStep(),
+            SAMPLER: SamplerStep(
+                apply_penalty=True,
+                prefill_tracked_tokens=prefill_tokens,
+                kept_rids=kept_rids,
+            ),
+            ROPE: PositionStep(advance=advance),
+        }
+        if self._speculative:
+            self._declare_seed(steps, request_ids, per_request_info or {})
         # the leased bucket's key, which `cg_key_info` chose (or the capture's)
         lease = kwargs.get("slot_lease")
         return SubmoduleStep(
@@ -516,18 +573,86 @@ class LLMSubmodule(ARNodeSubmodule):
                 )
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
+            steps=steps,
+        )
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
+    ):
+        """Which capture a decode batch takes. Plain decode: the unfiltered
+        draw's, when no row filters. Under speculation with sampling, whether
+        the batch samples: any row at a temperature above 0 takes the sampled
+        capture (its greedy rows still take the argmax there)."""
+        del per_request_input_metadata, kwargs
+        if graph_walk != "decode":
+            return None
+        if not self._speculative:
+            return self.node_resources[SAMPLER].unfiltered_key(graph_walk, per_request_info.keys())
+        if not self.spec_sampling:
+            return None
+        return any(
+            (cfg := info.resource_configs.get(SAMPLER)) is not None and cfg.temperature > 0
+            for info in per_request_info.values()
+        )
+
+    def _declare_verify(self, request_ids: list[int], key=None) -> SubmoduleStep:
+        """A speculative decode step: k + 1 tokens a row, positions and
+        lengths settled on the device. Each row gives back the KV its earlier
+        steps over-counted, as far as the host has learned."""
+        spec = self.node_resources[SPEC_DECODE]
+        span = self._decode_tokens
+        retract = {}
+        for rid in request_ids:
+            given = spec.pending_retract(rid)
+            if given:
+                retract[rid] = given
+        return SubmoduleStep(
+            segments=[Segment(request_id=rid, label="main", span=span) for rid in request_ids],
+            cg_key_info=key,
             steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
+                KV_CACHE: KVStep(commit_adjust={
+                    (rid, "main"): -given for rid, given in retract.items()
+                }),
+                ATTN: AttentionStep(causal=True, row_queries=span),
                 GDN_STATE: RecurrentStep(),
                 LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens,
-                    kept_rids=kept_rids,
-                ),
-                ROPE: PositionStep(advance=advance),
+                SPEC_DECODE: SpecDecodeStep(phase=SpecPhase.VERIFY, retract=retract),
             },
+        )
+
+    def _declare_seed(
+        self, steps: dict, request_ids: list[int],
+        info: Mapping[int, CurrentForwardPassInfo],
+    ) -> None:
+        """A prompt step's share of speculation: seed each row's registers,
+        and on the last prefill reserve the KV a verify step writes past the
+        committed length (`SpecDecodeResource.seed_lookahead`)."""
+        spec = self.node_resources[SPEC_DECODE]
+        budgets, ignore, adjust, sampling = {}, set(), {}, {}
+        for rid in request_ids:
+            row = info.get(rid)
+            if row is None:
+                continue
+            # decode runs `max_tokens` steps after the prompt's token (`check_stop`),
+            # so a request emits that many past it
+            budgets[rid] = row.max_tokens
+            # a capture or padding row carries no sampling config
+            cfg = row.resource_configs.get(SAMPLER)
+            if cfg is not None and cfg.ignore_eos:
+                ignore.add(rid)
+            if cfg is not None and self.spec_sampling and cfg.temperature > 0:
+                sampling[rid] = (
+                    float(cfg.temperature), float(cfg.top_p), int(cfg.top_k or 0), int(cfg.seed),
+                )
+            if row.step_metadata.get("last_prefill", False) and spec.seed_lookahead:
+                adjust[(rid, "main")] = spec.seed_lookahead
+        steps[KV_CACHE] = KVStep(commit_adjust=adjust)
+        steps[SPEC_DECODE] = SpecDecodeStep(
+            phase=SpecPhase.SEED, budgets=budgets, ignore_stop=frozenset(ignore),
+            sampling=sampling,
         )
 
     # ------------------------------------------------------------------
@@ -543,6 +668,8 @@ class LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if graph_walk == "decode" and self._speculative:
+            return self._verify(engine_inputs)
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         captured = self._captured_decode(engine_inputs, graph_walk)
@@ -561,11 +688,67 @@ class LLMSubmodule(ARNodeSubmodule):
         )
         hidden = self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d))
 
-        if graph_walk != "decode":
-            # only the last token of each prefill row feeds the head
-            hidden = attn.select_last_hidden(hidden)
-        logits = self.model.lm_head(hidden)
-        return sampler.sample(logits)
+        if graph_walk == "decode":
+            return sampler.sample(self.model.lm_head(hidden))
+        # only the last token of each prefill row feeds the head
+        token = sampler.sample(self.model.lm_head(attn.select_last_hidden(hidden)))
+        if self._speculative:
+            self._seed_drafts(engine_inputs, hidden, embeds, token, (cos_3d, sin_3d))
+        return token
+
+    def _cos_sin_1d(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotary tables for text positions (the three MRoPE grids agree)."""
+        lm = self.model.model
+        return lm.build_cos_sin(
+            positions.unsqueeze(0).expand(3, -1), dtype=lm.embed_tokens.weight.dtype,
+        )
+
+    def _seed_drafts(
+        self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor,
+        embeds: torch.Tensor, token: torch.Tensor,
+        cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Run the MTP head over the prompt, which fills its KV for every
+        prompt position, and seed decode with the first token and the head's
+        draft after it. Position p reads the next token's embedding: the
+        prompt's own, and at each row's last the token just sampled."""
+        attn: AttentionManager = engine_inputs.resources[ATTN]
+        embed = self.model.model.embed_tokens
+        last = (attn.qo_indptr_buf("main")[1:] - 1).long()
+        following = embeds.roll(-1, 0).index_copy(0, last, embed(token).to(embeds.dtype))
+        drafted = self.model.mtp(hidden, following, label="main", cos_sin=cos_sin)
+        draft = self.model.lm_head(drafted.index_select(0, last)).argmax(dim=-1)
+        engine_inputs.resources[SPEC_DECODE].seed(token, draft)
+
+    def _verify(self, engine_inputs: ModelInputsFromEngine):
+        """A speculative decode step: verify each row's k drafts, then draft
+        the next k with the MTP head, every pass over the same (rows, k + 1)
+        tokens (see `SpecDecodeResource`)."""
+        spec = engine_inputs.resources[SPEC_DECODE]
+        lm, head = self.model.model, self.model.lm_head
+        k = self.num_draft_tokens
+        ids, positions = spec.verify_inputs()
+        # draft pass j sits at the verify positions plus j: one table for all
+        shifts = torch.arange(k, dtype=positions.dtype, device=positions.device)
+        cos, sin = self._cos_sin_1d((positions[None, :] + shifts[:, None]).reshape(-1))
+        cos, sin = cos.view(k, positions.shape[0], -1), sin.view(k, positions.shape[0], -1)
+        hidden = lm(lm.embed_tokens(ids), label="main", cos_sin=(cos[0], sin[0]))
+        step = engine_inputs.step
+        accepted = spec.accept(head(hidden), sample=bool(step is not None and step.cg_key_info))
+        ids = accepted.target.reshape(-1)
+        rows = positions.shape[0] // (k + 1)
+        for j in range(k):
+            spec.begin_draft_pass(j)
+            # only each row's last accepted slot is a real query: the head's
+            # work after attention, and the lm_head, run on that row alone, and
+            # the next pass reads its output in every slot
+            out = self.model.mtp(
+                hidden, lm.embed_tokens(ids), label="main", cos_sin=(cos[j], sin[j]),
+                keep=spec.draft_slots(),
+            )
+            ids = spec.record_draft(j, head(out).argmax(dim=-1))
+            hidden = out[:, None, :].expand(rows, k + 1, out.shape[-1]).reshape(rows * (k + 1), -1)
+        return accepted
 
     def forward(
         self,
@@ -577,12 +760,13 @@ class LLMSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {
-            "new_token": self._forward(
-                graph_walk, engine_inputs, cos_3d, sin_3d,
-                input_ids=input_ids, input_embeds=input_embeds,
-            )
-        }
+        out = self._forward(
+            graph_walk, engine_inputs, cos_3d, sin_3d,
+            input_ids=input_ids, input_embeds=input_embeds,
+        )
+        if graph_walk == "decode" and self._speculative:
+            out = out.tokens
+        return {"new_token": out}
 
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
@@ -612,6 +796,17 @@ class LLMSubmodule(ARNodeSubmodule):
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
         )
+        if graph_walk == "decode" and self._speculative:
+            # a row's tokens, -1 past what it emits; the stop check reads the
+            # accepted count (for the KV the host gives back) and `done`
+            return BatchedModelOutput(
+                row_outputs={"new_token": new_tokens.tokens},
+                check_stop_buffers={
+                    "new_token": new_tokens.tokens,
+                    "accepted": new_tokens.accepted,
+                    "done": new_tokens.done,
+                },
+            )
         # Row i is request i: one clone and one D2H copy per step instead of
         # one per request.
         return BatchedModelOutput(
@@ -657,6 +852,15 @@ class LLMSubmodule(ARNodeSubmodule):
         # only a decode row's stop can end decode_loop; a prefill is not in it yet
         if request_info.graph_walk != "decode" or "new_token" not in outputs:
             return set()
+        if self.num_draft_tokens:
+            # The batched check reads the step's own `done`; this fallback
+            # sees only the tokens, so it stops on a stop id and leaves the
+            # budget to the loop's cap.
+            tokens = outputs["new_token"][0].reshape(-1).tolist()
+            if request_info.resource_configs[SAMPLER].ignore_eos:
+                return set()
+            stop_ids = self.config.stop_token_ids
+            return {"decode_loop"} if any(t in stop_ids for t in tokens) else set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         hit_eos = not ignore_eos and token in self.config.stop_token_ids
@@ -673,8 +877,11 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop
-        # check already has on the host; prefill's new_token edge is persisted
-        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
+        # check already has on the host; prefill's new_token edge is persisted.
+        # Inline emission carries one token a row, so not under speculation.
+        if graph_walk == "decode" and not self._speculative:
+            return {"text_inputs": "new_token"}
+        return {}
 
     def check_stop_batched(
         self,
@@ -686,6 +893,8 @@ class LLMSubmodule(ARNodeSubmodule):
         """``check_stop`` for every request off one ``tolist``."""
         if step_walk is not None and step_walk != "decode":
             return {}  # as check_stop: only a decode row's stop ends decode_loop
+        if self.num_draft_tokens:
+            return self._check_stop_verify(request_ids, request_infos, host_rows)
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
@@ -707,6 +916,35 @@ class LLMSubmodule(ARNodeSubmodule):
                 >= info.max_tokens
             ):
                 stops[rid] = {"decode_loop"}
+        return stops
+
+
+    def _check_stop_verify(
+        self,
+        request_ids: list[int],
+        request_infos: dict[int, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[int, set[str]] | None:
+        """A verify step's stops, off the flags it computed itself; and what
+        each row accepted, which tells the speculative resource how much of
+        the KV the step reserved it can give back."""
+        accepted = host_rows.buffers.get("accepted")
+        done = host_rows.buffers.get("done")
+        if not (torch.is_tensor(accepted) and torch.is_tensor(done)):
+            return None
+        accepted, done = accepted.reshape(-1).tolist(), done.reshape(-1).tolist()
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        learned, counts = [], []
+        stops: dict[int, set[str]] = {}
+        for rid in request_ids:
+            i = row_of.get(rid)
+            if i is None or i >= len(accepted) or request_infos[rid].graph_walk != "decode":
+                continue
+            learned.append(rid)
+            counts.append(accepted[i])
+            if done[i]:
+                stops[rid] = {"decode_loop"}
+        self.node_resources[SPEC_DECODE].learn(learned, counts)
         return stops
 
 
