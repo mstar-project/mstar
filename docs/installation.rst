@@ -482,10 +482,10 @@ extension carries (see :doc:`environment_variables` for the flags):
   messages on. Each process logs it at startup (``control mesh transport:
   rust <version> from <path>``) and refuses an extension of another version
   than the one its ``mstar`` expects.
-* **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
-  transport; requires the extension, interoperates on the same descriptor
-  wire (and depends on the transport above only in the sense that both ship
-  in the same extension).
+* **SHM tensor arena**: the SHM tensor transport. Each process stages its
+  tensors in ``/dev/shm`` segments sized from ``/dev/shm`` (the
+  ``MSTAR_SHM_ARENA_*`` knobs), and a tensor that does not fit spills to a
+  per-tensor file.
 * **Message encoding** — ``MSTAR_WIRE_CODEC``: typed msgpack rather than
   pickle, which is what lets one end of an edge be Rust. On by default,
   extension or not. The legacy ``pickle`` codec is no longer supported.

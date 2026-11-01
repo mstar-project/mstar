@@ -32,10 +32,9 @@ one entity's ceiling already exceeds /dev/shm. Either way it warns when the
 ceiling exceeds current free space or when the pin budget is an outsized
 share of physical RAM.
 
-Selection: ``create_tensor_communication_manager`` picks this manager for
-the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``
-(use if the ``mstar_rust`` extension imports); default ``0`` keeps the file
-transport. See :doc:`environment_variables` for all knobs.
+Selection: ``create_tensor_communication_manager`` builds this manager for
+the SHM protocol; the file transport it extends is only its spill path. See
+:doc:`environment_variables` for the knobs.
 """
 
 from __future__ import annotations
