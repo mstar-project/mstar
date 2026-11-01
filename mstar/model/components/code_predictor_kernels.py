@@ -265,7 +265,8 @@ class ResidualCodePredictor(nn.Module):
     ``lm_head.{g - 1}`` and the projection. ``max_batch_size`` sizes the depth
     cache: the most rows a depth loop runs at once. ``embed_sum_dtype`` is the
     dtype a frame's embedding sum accumulates in (None: the embeddings' own,
-    rounding after every add), as each Talker's reference sums them.
+    rounding after every add); each Talker keeps the sum it had before the
+    two shared this predictor.
     """
 
     def __init__(
