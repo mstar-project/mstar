@@ -62,11 +62,6 @@ def _rust_communicator(codec=WireCodec):
     return comm
 
 
-@pytest.fixture(autouse=True)
-def _ambient_transport_flag_unset(monkeypatch):
-    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
-
-
 def test_the_factory_builds_the_rust_runtime():
     bookkeeping = RustTensorBookkeeping()
     runtime = _make_graph_runtime(**_kwargs(
@@ -78,25 +73,9 @@ def test_the_factory_builds_the_rust_runtime():
     assert runtime._bookkeeping is bookkeeping
 
 
-@pytest.mark.parametrize("value", ["1", "AUTO", "auto"])
-def test_a_transport_flag_that_allows_rust_builds_it(monkeypatch, value):
-    monkeypatch.setenv("MSTAR_RUST_ZMQ", value)
-    assert isinstance(_make_graph_runtime(**_kwargs(communicator=_rust_communicator())), RustGraphRuntime)
-
-
-def test_a_worker_pinned_to_pyzmq_is_refused(monkeypatch):
-    """MSTAR_RUST_ZMQ=0 contradicts the only runtime, and says so rather than
-    leaving the worker to trip over the communicator it built."""
-    monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
-    with pytest.raises(ValueError, match="MSTAR_RUST_ZMQ=0 pins the pyzmq communicator"):
-        _make_graph_runtime(**_kwargs())
-
-
-def test_the_pyzmq_communicator_is_refused():
-    """Caught on the communicator's TYPE as well as on the flag: the flag says
-    what the worker was asked to build, the type says what it actually built
-    (AUTO falls back to pyzmq on a stale extension), and only the second one
-    can be shared."""
+def test_a_communicator_other_than_the_rust_one_is_refused():
+    """The runtime sends on a share of the communicator's transport, which
+    only the Rust communicator has."""
     with pytest.raises(ValueError, match="needs the Rust communicator"):
         _make_graph_runtime(**_kwargs())
     with pytest.raises(ValueError, match="built a object"):

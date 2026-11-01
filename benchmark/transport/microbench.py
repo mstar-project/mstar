@@ -170,18 +170,11 @@ def unavailable_reason(path: str, args) -> str | None:
 # -- the control mesh ----------------------------------------------------------
 
 def make_comm(my_id: str, args):
-    """M*'s communicator (Rust or pyzmq, as ``make_communicator`` picks), with
-    each side's endpoint taken from the arguments so the two can be on
-    different machines."""
-    from mstar.communication.communicator import CommProtocol, ZMQCommunicator
-    base = ZMQCommunicator
-    if os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper() != "0":
-        try:
-            from mstar.communication.rust_communicator import RustZMQCommunicator, _RustZmq
-            if _RustZmq is not None:
-                base = RustZMQCommunicator
-        except ImportError:
-            pass
+    """M*'s communicator, with each side's endpoint taken from the arguments
+    so the two can be on different machines."""
+    from mstar.communication.communicator import CommProtocol
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+
     endpoints = {
         SENDER: f"tcp://{args.sender_host}:{args.port}",
         RECEIVER: f"tcp://{args.receiver_host}:{args.port + 1}",
@@ -189,7 +182,7 @@ def make_comm(my_id: str, args):
         "conductor": f"tcp://{args.sender_host}:{args.port + 2}",
     }
 
-    class BenchCommunicator(base):
+    class BenchCommunicator(RustZMQCommunicator):
         def _endpoint(self, entity_id: str) -> str:
             return endpoints[entity_id]
 

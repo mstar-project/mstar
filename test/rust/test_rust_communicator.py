@@ -68,25 +68,11 @@ def test_blocking_receive_waits_for_a_message(pair):
     assert b.get_all_new_messages(blocking=True) == ["late"]
 
 
-def test_make_communicator_flag(monkeypatch, tmp_path):
-    from mstar.communication.communicator import ZMQCommunicator, make_communicator
+def test_make_communicator_builds_the_rust_one(tmp_path):
+    from mstar.communication.communicator import make_communicator
 
-    def make(value):
-        monkeypatch.setenv("MSTAR_RUST_ZMQ", value)
-        return make_communicator(
-            f"m_{value}", push_ids=[], ipc_socket_path_prefix=str(tmp_path))
-
-    assert isinstance(make("0"), ZMQCommunicator)
-    assert isinstance(make("1"), RustZMQCommunicator)
-    assert isinstance(make("AUTO"), RustZMQCommunicator)  # extension installed
-    with pytest.raises(ValueError):
-        make("yes")
-    # default is AUTO: with the extension installed, unset -> Rust
-    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
-    assert isinstance(
-        make_communicator("m_default", push_ids=[],
-                          ipc_socket_path_prefix=str(tmp_path)),
-        RustZMQCommunicator)
+    comm = make_communicator("m", push_ids=[], ipc_socket_path_prefix=str(tmp_path))
+    assert isinstance(comm, RustZMQCommunicator)
 
 
 def test_blocking_receive_timeout_bounds_the_wait(pair):
