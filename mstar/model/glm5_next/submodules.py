@@ -51,6 +51,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
 )
@@ -66,7 +67,9 @@ PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
 # The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
 HOLE_KPE = -1.0e4
-_VERDICT_TIMEOUT_S = 120.0
+# a verify step's stop buffer: per row the target's argmax at each block row, then the
+# accepted count
+MTP_VERDICT = "mtp_verdict"
 
 
 def _real_row_values(last: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -109,7 +112,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self.config = config
         # MTP: a decode step verifies the last token and k drafts per request
         self.mtp_k = config.mtp_num_draft_tokens
-        self._mtp_seq = 0
         # mtp_trims: the sink page's last row, masked, that a row's spare sparse entries attend
         self._pad_slot: int | None = None
         self._pad_kpe: torch.Tensor | None = None
@@ -120,8 +122,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._long_stager = PinnedStager(torch.long)
         self._int_stager = PinnedStager(torch.int32)
         self._keep_stager = PinnedStager(torch.float32)
-        # capture slot (None: eager) -> the pinned verdict table and step number the host reads
-        self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
         # the KDA pool and resource, which settle each verify step's accepted drafts
         self._kda: KDACallable | None = None
 
@@ -331,9 +331,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         committed = state.get("context", 0)
         real = committed
         if self.mtp_k > 0 and graph_walk == "decode":
-            # holes are cache rows, not context: the model sees the prompt and the
-            # tokens emitted so far, the last of which this step takes in
-            real = state.get("prompt_len", 0) + state.get("mtp_generated", 1) - 1
+            # Holes are cache rows, not context. The tokens emitted so far are counted at the
+            # stop check, which may still be a step behind, so count one a step (the fewest a
+            # step emits): exact on the first decode step, and the stop check keeps two blocks
+            # free after that. This reads only state every rank updates in step order.
+            prompt = state.get("prompt_len", 0)
+            real = prompt + max(committed - prompt, 0) // self.mtp_block
         if real + seq_len > limit or committed + seq_len > self.config.kv_rows:
             raise RuntimeError(
                 f"request {fwd_info.request_id}: context {real + seq_len} "
@@ -344,8 +347,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             )
         if graph_walk == "prefill":
             state.add("prompt_len", committed + seq_len)
-            if self.mtp_k > 0:
-                state.add_all(mtp_generated=1, mtp_pending=None)
         return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len)
 
     def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> None:
@@ -416,8 +417,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             out["last_rows"] = self._last_rows(inputs)
         if self.mtp_k > 0 and graph_walk == "prefill":
             out["mtp_keep"] = self._mtp_keep(engine_inputs, inputs, out["input_ids"].shape[0])
-        if self.mtp_k > 0 and graph_walk == "decode":
-            out["mtp_seq"] = self._mtp_stage_seq(engine_inputs)
         if self.config.dsa_long_context:
             # the DSA resource stages its rows off the KV plan; the forward opens them
             out.update(self._dsa.step_inputs(
@@ -439,35 +438,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             start += inp.input_seq_len
         # staged in fp32 (no bf16 host view), cast on the device
         return self._keep_stager.to_device(keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
-
-    def _mailbox_key(self, engine_inputs: ModelInputsFromEngine) -> int | None:
-        """A captured step's capture slot, None eager: each has its own mailbox, which a
-        graph writes at a fixed address."""
-        lease = engine_inputs.step.ctx.slot_lease if engine_inputs.step is not None else None
-        if not engine_inputs.captured or lease is None or lease.bucket is None:
-            return None
-        return lease.slot
-
-    def _mtp_stage_seq(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        """Number this verify step and note where each real request's verdict lands."""
-        key = self._mailbox_key(engine_inputs)
-        if key not in self._mailboxes:
-            pin = self.lm_head.weight.device.type == "cuda"
-            rows = engine_inputs.resources[KDA_STATE].config.max_slots
-            self._mailboxes[key] = (
-                torch.zeros(rows, self.mtp_block + 1, dtype=torch.long, pin_memory=pin),
-                torch.full((1,), -1, dtype=torch.long, pin_memory=pin),
-            )
-        self._mtp_seq += 1
-        seq = self._mtp_seq
-        ctx = engine_inputs.step.ctx if engine_inputs.step is not None else None
-        if ctx is None or not ctx.capture:
-            # the real rows only: a padded replay's dummy rows have states too
-            real = set(ctx.request_ids if ctx is not None else engine_inputs.per_request_info)
-            for row, rid in enumerate(engine_inputs.request_ids):
-                if rid in real:
-                    self.request_state(rid).add("mtp_pending", (seq, key, row))
-        return self._long_stager.to_device([seq], self.lm_head.weight.device)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -659,13 +629,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                        ends)
 
     def _mtp_decode(
-        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, mtp_seq: torch.Tensor,
+        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         base: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One verify step: draft k tokens, verify ``[last | drafts]`` with the trunk, then run
-        the MTP layer over the block to seed the next step. The verdict (the target's argmax
-        per block row, then the accepted count) goes to the host's mailbox; returns the next
-        input token per row."""
+        the MTP layer over the block to seed the next step. Returns the next input token per
+        row and the verdict (``MTP_VERDICT``), which the stop check cuts the emitted tokens
+        from."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
         pool = engine_inputs.resources[KDA_STATE]
         rows = pool.addressing()
@@ -698,11 +668,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if base is not None:  # mtp_trims: the next block starts after the accepted rows
             pool.scatter_(MTP_LEN, (base + accepted + 1)[:, None], None)
 
-        # The host's copy: the verdict first, then its step number.
-        verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
-        verdicts[:n].copy_(verdict, non_blocking=True)
-        seq.copy_(mtp_seq, non_blocking=True)
-
         # Seed the next step: the MTP pass over the block, with the target's argmax as each
         # row's next token (up to the accepted row it equals the drafts), read at the last
         # accepted row.
@@ -714,7 +679,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if not self.config.mtp_trims:
             keep = torch.arange(block, device=accepted.device)[None, :] <= accepted[:, None]
             self._mask_holes(engine_inputs, keep)
-        return next_input
+        return next_input, verdict
 
     def _mask_holes(self, engine_inputs: ModelInputsFromEngine, keep: torch.Tensor) -> None:
         """The block's rejected rows stay in the cache, so the next step can be planned
@@ -735,12 +700,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
         mtp_keep: torch.Tensor | None = None,
-        mtp_seq: torch.Tensor | None = None,
         **kwargs,
-    ) -> NameToTensorList:
-        if mtp_seq is not None:
-            return self.forward_batched(graph_walk, engine_inputs, input_ids,
-                                        mtp_seq=mtp_seq, **kwargs)[engine_inputs.request_ids[0]]
+    ) -> NameToTensorList | BatchedModelOutput:
+        if self.mtp_k > 0 and graph_walk == "decode":
+            return self.forward_batched(graph_walk, engine_inputs, input_ids, **kwargs)
         return {"new_token": self._forward(
             graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)}
 
@@ -754,24 +717,23 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
         mtp_keep: torch.Tensor | None = None,
-        mtp_seq: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList] | BatchedModelOutput:
-        if mtp_seq is not None:
-            # the emitted tokens are cut on the host (unpack_packed_outputs); the next input
-            # is the token after the accepted drafts
+        if self.mtp_k > 0 and graph_walk == "decode":
+            # the next input is the token after the accepted drafts; the emitted tokens are
+            # cut from the verdict at the stop check (emit_from_host_rows)
             if self._dsa is not None:
                 self._dsa.ctx = self._dsa.context(kwargs)
             try:
                 base = self._trim_on_device(engine_inputs) if self.config.mtp_trims else None
-                next_input = self._mtp_decode(engine_inputs, input_ids, mtp_seq, base)
+                next_input, verdict = self._mtp_decode(engine_inputs, input_ids, base)
             finally:
                 if self._dsa is not None:
                     self._dsa.ctx = None
-            return {
-                rid: {"text_inputs": [next_input[i : i + 1]]}
-                for i, rid in enumerate(engine_inputs.request_ids)
-            }
+            return BatchedModelOutput(
+                row_outputs={"text_inputs": next_input},
+                check_stop_buffers={MTP_VERDICT: verdict},
+            )
         new_tokens = self._forward(
             graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)
         # row i is request i: one clone out of the graph and one host copy a step
@@ -780,7 +742,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             check_stop_buffers={"new_token": new_tokens},
         )
 
-    # -- MTP host side: the verdict mailbox ---------------------------------
+    # -- MTP host side: the emitted tokens, cut at the stop check ----------
 
     def _log_acceptance(self, accepted: int, every_s: float = 10.0) -> None:
         """Rank 0 logs the accepted-draft histogram at most every ``every_s`` seconds."""
@@ -797,65 +759,36 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                         self.mtp_k, mean, mean + 1, self._mtp_hist, steps)
             self._mtp_hist = [0] * (self.mtp_k + 1)
 
-    def _read_verdicts(self, request_ids: list[str]) -> list[tuple[list[int], int]]:
-        """One verify step's ``(tokens, accepted)`` per request, waiting once for the device
-        to stage them (a step's requests share its number and mailbox)."""
-        states = [self.request_state(rid) for rid in request_ids]
-        pending = [st.get("mtp_pending") for st in states]
-        seq, key, _ = pending[0]
-        assert all(p[:2] == (seq, key) for p in pending), pending
-        # read once, then kept: a later step may reuse the mailbox before a second read
-        cached = [st.get("mtp_verdict") for st in states]
-        if all(c is not None and c[0] == seq for c in cached):
-            return [c[1:] for c in cached]
-        verdicts, staged_seq = self._mailboxes[key]
-        deadline = time.monotonic() + _VERDICT_TIMEOUT_S
-        while True:
-            staged = int(staged_seq[0])
-            if staged == seq:
-                break
-            if staged > seq:
-                raise RuntimeError(
-                    f"MTP verdict of step {seq} was overwritten by step {staged} before it "
-                    "was read")
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"MTP verdict of step {seq} never arrived")
-            time.sleep(0)
-        table = verdicts[:max(p[2] for p in pending) + 1].tolist()
-        k1 = self.mtp_block
-        out = [(table[p[2]][:k1], table[p[2]][k1]) for p in pending]
-        for st, verdict in zip(states, out, strict=True):
-            st.add("mtp_verdict", (seq, *verdict))
-        return out
-
-    def unpack_packed_outputs(
+    def emit_from_host_rows(
         self,
-        static_output: dict,
         request_ids: list[str],
-        real_seq_lens: list[int],
-        inputs: list[NodeInputs],
-        per_request_info: dict[str, CurrentForwardPassInfo],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
     ) -> dict[str, NameToTensorList]:
         """A verify step's emitted tokens per request: the accepted drafts and the token
-        after them, cut at a stop token and at max_tokens. Waits for the device to stage the
-        verdict (the MTP pass that seeds the next step is still running)."""
-        if self.mtp_k == 0 or not request_ids:
+        after them, cut at a stop token and at max_tokens. The tokens sent so far are
+        ``_mtp_check_stop``'s count, which the stop check of the step before this one set."""
+        verdicts = host_rows.buffers.get(MTP_VERDICT)
+        if verdicts is None:  # a prefill: its sampled token is the output
             return {}
-        if per_request_info[request_ids[0]].graph_walk != "decode":
-            return {}
+        rows = verdicts[:len(host_rows.request_ids)].tolist()
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        k1, eos = self.mtp_block, self.config.eos_token_ids
         out = {}
-        for rid, (target, accepted) in zip(request_ids, self._read_verdicts(request_ids),
-                                           strict=True):
-            info = per_request_info[rid]
+        for rid in request_ids:
+            i = row_of.get(rid)
             state = self.request_state(rid)
-            generated = state.get("mtp_generated", 1)
-            emitted = target[:accepted + 1][:max(info.max_tokens - generated, 1)]
+            if i is None or state.get("ended_at_prefill"):
+                continue  # the reply ended at the prefill: this step only closes the loop
+            target, accepted = rows[i][:k1], rows[i][k1]
+            info = request_infos[rid]
+            emitted = target[:accepted + 1][:max(info.max_tokens - state.get("mtp_checked", 0), 1)]
             if not info.resource_configs[SAMPLER].ignore_eos:
-                for i, token in enumerate(emitted):
-                    if token in self.config.eos_token_ids:
-                        emitted = emitted[:i + 1]
+                for j, token in enumerate(emitted):
+                    if token in eos:
+                        emitted = emitted[:j + 1]
                         break
-            state.add("mtp_generated", generated + len(emitted))
             self._log_acceptance(accepted)
             out[rid] = {"new_token": [torch.tensor(emitted, dtype=torch.long)]}
         return out
@@ -925,9 +858,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         blocks fit (the next step may already be scheduled when this stop lands): in the
         context, which counts emitted tokens against context_limit, and in the cache, where
         every verify step keeps its whole block (holes, or rows the device rewrites) against
-        kv_rows. Counts the tokens emitted up to this step itself: the next step is in flight
-        when this one is checked, so the GPU thread's ``mtp_generated`` may already include
-        its tokens."""
+        kv_rows. ``mtp_checked`` counts the tokens sent up to this step, which
+        ``emit_from_host_rows`` cuts the next step's at."""
         state = self.request_state(request_id)
         before = 0 if request_info.graph_walk == "prefill" else state.get("mtp_checked", 0)
         generated = before + new_token.numel()

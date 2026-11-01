@@ -25,7 +25,7 @@ from mstar.model.glm5_next.config import (
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import HOLE_KPE, Glm5NextLLMSubmodule
 from mstar.model.glm5_next.weight_loader import restore_fp32_params
-from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
+from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputsFromEngine
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 pytestmark = pytest.mark.skipif(
@@ -98,7 +98,9 @@ class _NoTransfer:
 
 class _Engine:
     """The submodule, its real resources and a AcceleratorGraphRunner, stepped like Engine
-    (prepare -> declare -> admit -> plan -> preprocess -> run -> commit -> unpack)."""
+    (prepare -> declare -> admit -> plan -> preprocess -> run -> commit), then the emitted
+    tokens cut from the stop buffers as at the stop check. The harness runs no stop check, so
+    the cut at max_tokens never applies; it truncates instead."""
 
     def __init__(self, k, seed=0, long_context=False):
         cfg = _config(k, long_context)
@@ -174,7 +176,6 @@ class _Engine:
             assert lease is not None, "no captured bucket fits"
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=slot, capture=False,
                           slot_lease=lease)
-        real_inputs = inputs
         if lease is not None:
             inputs = self.cg.pad_inputs(lease, inputs)
             infos = self.cg.step_metadata(lease, rids, infos)
@@ -194,15 +195,14 @@ class _Engine:
         self.runner.commit(step)
         raw = BatchedModelOutput.coerce(raw)
         out_ids = self.cg.slot_for(lease).dummy_rids if lease is not None else padded
-        unpacked = self.sub.unpack_packed_outputs(
-            raw.packed_outputs, rids, [i.input_seq_len for i in real_inputs], real_inputs,
-            {rid: infos[rid] for rid in rids})
+        host = {name: t.cpu() for name, t in (raw.check_stop_buffers or {}).items()}
+        cut = self.sub.emit_from_host_rows(
+            rids, {rid: infos[rid] for rid in rids}, HostRows(tuple(rids), host))
         emitted, nxt = {}, {}
         for i, rid in enumerate(rids):
-            # a prefill step hands its tokens over as rows, an MTP step per request
             per_rid = raw.get(out_ids[i]) or {
                 name: [t[i : i + 1]] for name, t in (raw.row_outputs or {}).items()}
-            out = {**per_rid, **unpacked.get(rid, {})}
+            out = {**per_rid, **cut.get(rid, {})}
             emitted[rid] = out["new_token"][0].tolist()
             nxt[rid] = out.get("text_inputs", out["new_token"])[0].clone().to(DEV)
         if lease is not None:
