@@ -114,10 +114,7 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         # make inductor specialize on the int. The resources own the pages, so
         # module code stays clear of the allocator.
         self.layers[0].self_attn.attend.bind_step(label)
-        # The residual stream is updated in place, so it starts from a copy:
-        # ``input_embeds`` is the caller's, a packed replay's static input
-        # whose padding rows no copy refreshes.
-        return run_layers(self.layers, input_embeds.clone(), self.norm)
+        return run_layers(self.layers, input_embeds, self.norm)
 
 
 class Qwen3TTSTalkerModel(nn.Module):

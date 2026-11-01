@@ -151,9 +151,13 @@ def test_prefill_and_decode_logits_match_hf():
     prompt = torch.randint(0, TINY["vocab_size"], (7,))
     with torch.no_grad():
         expected = hf(prompt[None]).logits[0]
-        hidden = ours(ours.embed(prompt), label="main")
+        embeds = ours.embed(prompt)
+        before = embeds.clone()
+        hidden = ours(embeds, label="main")
         actual = ours.logits(hidden)
     assert torch.allclose(actual, expected, atol=1e-4), (actual - expected).abs().max()
+    # the residual stream is run_layers' own copy: a caller's static input survives
+    assert torch.equal(embeds, before)
 
     # two greedy decode steps: the fake pages carry the prompt's K/V forward
     rope.next_pos = prompt.numel()
