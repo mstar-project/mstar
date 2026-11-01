@@ -726,7 +726,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         A batch spanning two groups matches no capture. Opt in when that batch
         runs worse than two captured ones, e.g. per-request eager; leave it off
-        when a batched eager forward handles the mix well.
+        when a batched eager forward handles the mix well. On a node whose only
+        capture is a piecewise region, the key only groups the scheduler's
+        rows (e.g. the requests that can replay a region together).
         """
         del graph_walk
         return False

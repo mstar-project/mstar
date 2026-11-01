@@ -625,7 +625,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
     """
 
     # Patch-count buckets of one replay. 16384 patches merge to the LLM's
-    # 4096 `prefill_vision` bucket; a larger step runs eagerly.
+    # 4096 `prefill_vision` bucket; a larger step runs uncaptured.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
     # Requests per encoder step. They share one replay, so a burst of image
     # requests pays the per-step host cost once per this many, not per image.
@@ -636,9 +636,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
     # guards on the batch size: every new size recompiled (~0.6 s, on a live
     # request). The tensor stages are compiled on their own instead
     # (`compile_regions`), dynamic in the patch count, so one graph serves
-    # every capture bucket and the eager steps past the top one. Uncompiled,
-    # the blocks' fp32 rope, norms and activations were over half the tower's
-    # GPU time on long videos.
+    # every capture bucket and the uncaptured steps past the top one.
+    # Uncompiled, the blocks' fp32 rope, norms and activations were over half
+    # the tower's GPU time on long videos.
     disable_torch_compile = True
 
     def __init__(

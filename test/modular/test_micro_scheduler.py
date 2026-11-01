@@ -1297,10 +1297,11 @@ def _capture_group(split=True, captured=(WALK,)):
     from mstar.engine.engine import Engine
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
-    engine = SimpleNamespace(_submodules={
+    engine = Engine.__new__(Engine)
+    engine._submodules = {
         NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner, piecewise_runners={}),
-    })
-    return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
+    }
+    return engine.capture_group(NODE, WALK, 0, SimpleNamespace(guided=True))
 
 
 def test_an_opted_in_submodule_groups_by_its_capture_key():
