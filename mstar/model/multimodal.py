@@ -386,7 +386,10 @@ class MediaEncoder:
 
     ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);
     ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad
-    of ``pad_ids`` in the prompt, in prompt order.
+    of ``pad_ids`` in the prompt, in prompt order. ``walk`` names the walk a
+    prompt carrying this medium alone prefills on, for a model whose graph
+    already calls it something else (walk names are read by configs and
+    metrics).
     """
 
     name: str
@@ -394,6 +397,7 @@ class MediaEncoder:
     inputs: tuple[str, ...]
     output: str
     pad_ids: tuple[int, ...]
+    walk: str | None = None
 
     def __post_init__(self):
         if not self.pad_ids:
@@ -422,6 +426,8 @@ def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
 
 
 def media_walk_name(encoders: Sequence[MediaEncoder]) -> str:
+    if len(encoders) == 1 and encoders[0].walk is not None:
+        return encoders[0].walk
     return "prefill_" + "_".join(e.name for e in encoders)
 
 
