@@ -1572,6 +1572,16 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``max_batch_size``
    Rows batched per denoise step.
 
+``text_encoder_max_batch_size``
+   Prompts in one text encoder step, ``max_batch_size`` unless set. The klein configs set
+   it to 1 on AMD GPUs through a :ref:`platform_overrides <platform-overrides>` entry, and
+   the DiT and VAE keep batching. A prompt encoded in a batch gives another image than the
+   same prompt alone, because a GEMM's rounding depends on its row count there and the
+   reference feeds all 512 positions, padding included, to the DiT. Run alone, a prompt
+   takes the path a single request takes, so images at one request do not change. NVIDIA
+   keeps the batched encoder, and whether it has the same dependence is unmeasured.
+   ``z_image_turbo`` takes the same key and stays batched.
+
 ``vae_compile``
    ``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms at 1024² on
    an H100. Its fused reductions move the image by about 55 dB PSNR from the eager decode

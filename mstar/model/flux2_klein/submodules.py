@@ -45,6 +45,7 @@ from mstar.model.components.diffusion.image_io import (
     unpack_latents,
     unpatchify_latents,
 )
+from mstar.model.components.diffusion.prompt_encoder import PromptEncoderSubmodule
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
 from mstar.model.components.fp8_linear import StepDtypes
 from mstar.model.flux2_klein.config import Flux2KleinConfig
@@ -91,36 +92,23 @@ def shape_from_metadata(config: Flux2KleinConfig, step_metadata: dict) -> KleinS
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class KleinTextEncoderSubmodule(BatchedRows, NodeSubmodule):
+class KleinTextEncoderSubmodule(BatchedRows, PromptEncoderSubmodule):
     """Qwen3 hidden-state taps over the chat-templated, 512-token right-padded prompt.
 
-    Every request has the same token count, so the node batches unconditionally:
-    ``text_inputs`` / ``text_mask`` rows stack into ``[B, 512]`` and each request gets
-    its ``[1, 512, joint_dim]`` slice of the output. All 512 positions (pad tokens
-    included) are emitted, as the reference feeds them all to the DiT.
+    Every request has the same token count, so ``text_inputs`` / ``text_mask`` rows stack
+    into ``[B, 512]`` and each request gets its ``[1, 512, joint_dim]`` slice of the output.
+    All 512 positions (pad tokens included) are emitted, as the reference feeds them all to
+    the DiT.
     """
 
-    disable_torch_compile = True
     output_keys = (TEXT_EMBEDS,)
     keep_batch_dim = True
-
-    def __init__(self, encoder: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 16):
-        super().__init__()
-        self.encoder = encoder
-        self.config = config
-        self._max_batch_size = max_batch_size
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         return NodeInputs(
             tensor_inputs={TEXT_INPUTS: inputs[TEXT_INPUTS][0], TEXT_MASK: inputs[TEXT_MASK][0]},
             input_seq_len=self.config.text_encoder.max_sequence_length,
         )
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return len(model_inputs) > 1
-
-    def max_batch_size(self, graph_walk: str):
-        return self._max_batch_size
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         return {

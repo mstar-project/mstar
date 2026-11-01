@@ -436,6 +436,25 @@ def test_image_nodes_schedule_speculatively_unless_told_otherwise():
     assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, False)
 
 
+def test_text_encoder_batch_cap_follows_max_batch_size_unless_the_deployment_sets_it(monkeypatch):
+    """The DiT and VAE keep their cap; 1 is the path a lone request takes."""
+    from mstar.model.flux2_klein import weight_loader
+    from mstar.model.flux2_klein.flux2_klein_model import ENCODE_TEXT_WALK
+
+    def text_node(**kwargs):
+        model = _make_model(**kwargs)
+        model.skip_weight_loading = False
+        model._snapshot = Path("unused")
+        model._config = Flux2KleinConfig()
+        return model._create_submodule("text_encoder", "cpu")
+
+    monkeypatch.setattr(weight_loader, "build_text_encoder", lambda *args: torch.nn.Identity())
+    assert text_node().max_batch_size(ENCODE_TEXT_WALK) == 8
+    assert text_node(max_batch_size=4).max_batch_size(ENCODE_TEXT_WALK) == 4
+    assert text_node(text_encoder_max_batch_size=1).max_batch_size(ENCODE_TEXT_WALK) == 1
+    assert _make_model(text_encoder_max_batch_size=1).max_batch_size == 8
+
+
 def test_vae_compile_knob_reaches_the_decoder_node():
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
