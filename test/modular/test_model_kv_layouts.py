@@ -396,33 +396,47 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     assert span.length == prefill.shape[0], "the layout and the prefill disagree on its rows"
 
 
-def _higgs():
+@pytest.mark.parametrize("thinking", [False, True])
+def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
+    """The reference's prompt as one row, each piece tokenized on its own:
+    the instruction, the clip's pads where its embeddings go (one per row the
+    encoder keeps of each 4 s chunk), and the turn close. The layout's one
+    span is that row, on a walk of the graph."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.multimodal import MEDIA_LAYOUT
+    from mstar.model.multimodal_decoder import MediaIntake
 
     model = object.__new__(HiggsAudioModel)
-    model.config = HiggsAudioModelConfig()
+    model.config = cfg = HiggsAudioModelConfig()
     model.tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens=False: [ord(c) for c in text])
     model.feature_extractor = lambda chunks, **kwargs: {
         "input_features": torch.zeros(len(chunks), 128, 3000),
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
-    return model
+    pad = cfg.audio_in_token_idx
+    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    # two whole chunks of 50 rows and a 1.5 s one of 19
+    clip = torch.zeros(int(9.5 * cfg.sampling_rate))
 
+    out = model.process_prompt(
+        "say it", ["text", "audio"], ["text"], {"audio_inputs": [clip]}, enable_thinking=thinking,
+    )
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-
-    model = _higgs()
-    llm = HiggsAudioLLMSubmodule(None, model.config)
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 1024,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    enc = model.tokenizer.encode
+    before = enc("<|im_start|>user\n") + enc("say it") + enc("<|audio_bos|>")
+    after = enc("<|audio_eos|>") + enc("<|im_end|>\n<|im_start|>assistant\n")
+    if not thinking:
+        after += enc("<think>\n\n</think>\n\n")
+    [ids] = out.new_input_tensors["text_inputs"]
+    assert ids.tolist() == before + [pad] * 119 + after
+    assert out.new_input_tensors["audio_feature_lens"][0].tolist() == [400, 400, 150]
+    layout = out.metadata[MEDIA_LAYOUT]
+    assert (layout["offset"], layout["tokens"], layout["output"]) == ([len(before)], [119], ["audio_embeds"])
+    [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    assert (span.kind, span.walk, span.length) == ("rows", "prefill_audio", ids.numel())
+    assert span.walk in model.get_graph_walk_graphs()
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])

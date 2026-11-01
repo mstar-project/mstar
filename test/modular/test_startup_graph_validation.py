@@ -756,8 +756,11 @@ def _z_image(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _higgs(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig
-    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig, audio_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    config = HiggsAudioModelConfig()
+    pad = config.audio_in_token_idx
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):

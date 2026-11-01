@@ -36,7 +36,7 @@ from mstar.model.bagel.components.modeling_utils import (
 )
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
-from mstar.model.higgs_audio.config import SAMPLER
+from mstar.model.keys import SAMPLER
 from mstar.model.submodule_base import (
     END_PARTITION,
     ARNodeInputs,
