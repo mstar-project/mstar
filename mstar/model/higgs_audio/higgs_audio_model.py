@@ -62,10 +62,8 @@ class HiggsAudioModel(MultimodalDecoderModel):
     """Higgs-Audio STT: audio_tower + projector + dense Qwen3 LLM."""
 
     NAME = "Higgs-Audio"
-    METADATA_FILES = (
-        "config.json", "tokenizer_config.json", "tokenizer.json", "vocab.json",
-        "merges.txt", "added_tokens.json", "special_tokens_map.json",
-    )
+    # every process fetches the whole snapshot, as before the scaffold
+    METADATA_FILES = ("*",)
     # The reference pipeline extracts mel features with the
     # whisper-large-v3 processor (not from the higgs checkpoint).
     WHISPER_PROCESSOR_ID = "openai/whisper-large-v3"
