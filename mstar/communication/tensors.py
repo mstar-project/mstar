@@ -1534,17 +1534,20 @@ class TensorCommunicationManager(ABC):
             store.increment_ref(info.uuid, 1)
             return True
         key = (info.uuid, info.offset, info.nbytes, dims)
-        slices = self.slice_uuids.setdefault(request_id, {})
-        local = slices.get(key)
+        local = self.slice_uuids.setdefault(request_id, {}).get(key)
         if local is not None and store.check_uuid_presence(local):
             info.uuid = local
             store.increment_ref(local, 1)
             return True
+        self._repoint_slice(request_id, info, key)
+        return False
+
+    def _repoint_slice(self, request_id: Rid, info: TensorPointerInfo, key: tuple) -> None:
+        """Point ``info`` at a new uuid of this process's, which the slice ``key`` names is read into."""
         local = self._uuid_minter.mint()
-        slices[key] = local
+        self.slice_uuids[request_id][key] = local
         self.slice_origins.setdefault(request_id, {})[local] = info.uuid
         info.uuid = local
-        return False
 
     @abstractmethod
     def start_read_tensors(
@@ -1552,6 +1555,17 @@ class TensorCommunicationManager(ABC):
         graph_walk: str | None = None
     ) -> list[Future]:
         ...
+
+    def begin_read_batch(self) -> None:  # noqa: B027
+        """Open a read batch: until ``end_read_batch``, ``start_read_tensors``
+        may defer copies so that the batch's reads share them, and returns no
+        futures for what it deferred. A transport with nothing to share
+        ignores this."""
+
+    def end_read_batch(self) -> list[Future]:
+        """Issue what the batch deferred and close it. Returns futures that
+        complete when the copies land."""
+        return []
 
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         """``registered`` is the transport's ``mem_registered`` flag, passed in
