@@ -7,7 +7,7 @@ import torch
 
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import END_PARTITION, HostRows
 
 EOS = 7
 
@@ -23,7 +23,10 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=
 
 
 def _sub():
-    return SimpleNamespace(config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})))
+    return SimpleNamespace(
+        config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})),
+        _token_is_real=LLMSubmodule._token_is_real,
+    )
 
 
 @pytest.mark.parametrize("shape", ["flat", "column"])
@@ -55,18 +58,43 @@ def test_batched_agrees_with_per_request(shape):
     assert batched == {"d": {"decode_loop"}, "a": {"decode_loop"}, "b": {"decode_loop"}}
 
 
-def test_only_a_decode_rows_token_can_stop():
-    """A prefill row is not in decode_loop yet, so neither stop path checks it."""
-    tokens = torch.tensor([EOS, EOS, EOS])
+@pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
+def test_a_last_prefill_stop_token_ends_the_partition(step_walk):
+    """The last prefill's token comes before decode_loop exists, so its stop
+    ends the partition; an earlier chunk's token is not the request's."""
+    tokens = torch.tensor([EOS, EOS, EOS, EOS])
     infos = {
         "early": _info(walk="prefill_text"),                   # not the last prefill
         "last": _info(walk="prefill_text", last_prefill=True),
-        "dec": _info(),
+        "ignored": _info(walk="prefill_text", last_prefill=True, ignore_eos=True),
     }
+    if step_walk is None:
+        infos["dec"] = _info()
     got = LLMSubmodule.check_stop_batched(
-        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}),
+        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
     )
-    assert got == {"dec": {"decode_loop"}}
+    assert got == {"last": {END_PARTITION}, **({"dec": {"decode_loop"}} if step_walk is None else {})}
+    for rid, info in infos.items():
+        per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
+        assert per_request == got.get(rid, set())
+
+
+@pytest.mark.parametrize("step_walk", [None, "prefill_text"], ids=["mixed", "prefill"])
+def test_the_budget_counts_the_last_prefills_token(step_walk):
+    """max_output_tokens=N gives N tokens, the first of them the last prefill's."""
+    infos = {
+        "one": _info(walk="prefill_text", last_prefill=True, max_tokens=1),
+        "early": _info(walk="prefill_text", max_tokens=1),  # not the request's token
+        "two": _info(walk="prefill_text", last_prefill=True, max_tokens=2),
+    }
+    if step_walk is None:
+        infos["tenth"] = _info(done=8, max_tokens=10)  # the prefill's and 9 decoded
+        infos["ninth"] = _info(done=7, max_tokens=10)
+    tokens = torch.full((len(infos),), 3)
+    got = LLMSubmodule.check_stop_batched(
+        _sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}), step_walk=step_walk,
+    )
+    assert got == {"one": {END_PARTITION}, **({"tenth": {"decode_loop"}} if step_walk is None else {})}
     for rid, info in infos.items():
         per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[:1]]})
         assert per_request == got.get(rid, set())

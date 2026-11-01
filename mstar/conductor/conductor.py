@@ -1793,6 +1793,11 @@ class Conductor:
             )
             return []
 
+        # Any report of the pass may carry it, not only the one that completes
+        # the pass: that can be another worker's (an encoder's, say).
+        if body.partition_done:
+            pstate.worker_reported_done = True
+
         # Persist signals: every rank contributes its shard (different uuid +
         # source_tp_rank); accumulate across ranks, do not dedup.
         if body.persist_signals:
@@ -1851,10 +1856,7 @@ class Conductor:
 
         return done_partitions
 
-    def _process_done_forward(
-        self, request_id: str, partition_name: str,
-        partition_done_from_worker: bool = False,
-    ) -> bool:
+    def _process_done_forward(self, request_id: str, partition_name: str) -> bool:
         """Process a completed forward pass for a specific partition.
 
         Calls get_partition_forward_pass_args for all partitions uniformly.
@@ -1865,10 +1867,16 @@ class Conductor:
         """
         request_data = self.requests[request_id]
         pstate = request_data.partition_states[partition_name]
+        # A self-triggering partition's next pass can report in the same cycle,
+        # and is queued again before this pass's state is reset. When the
+        # earlier call ended the partition, on the flag the later report
+        # latched, the later call has nothing left to advance.
+        if pstate.is_done:
+            return all(ps.is_done for ps in request_data.partition_states.values())
 
         incoming_connections = request_data.get_incoming_connections(partition_name)
         stream_fed = partition_name in self._stream_fed_partitions
-        if stream_fed and partition_done_from_worker:
+        if stream_fed and pstate.worker_reported_done:
             pstate.is_done = True
 
         prev_walk =  pstate.metadata.graph_walk
@@ -1881,17 +1889,15 @@ class Conductor:
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
 
-        # The worker's signal is authoritative for a stream-terminated
-        # partition: the pass that consumed the stream's final chunk has run.
-        # Treat it as the partition's own `request_done` so its downstream
-        # connections get `producer_done` and the chain closes. A model that
-        # inferred the end from the connection counters instead
-        # (`consumed_count >= token_count`) could race: `consumed_count` counts
-        # chunks popped for execution, and every worker-graphs-done report from
-        # a worker carries every buffer's count, so a colocated consumer's report
-        # could finish this partition while its last step was still running,
-        # and that step's output arrived for a request already gone.
-        if stream_fed and partition_done_from_worker:
+        # The worker's signal is authoritative, whatever walk the model chose:
+        # the pass that consumed a stream's final chunk, or whose stop check
+        # returned END_PARTITION, has run. Treat it as the partition's own
+        # `request_done` so its downstream connections get `producer_done`. A
+        # stream-fed model that inferred the end from the connection counters
+        # instead (`consumed_count >= token_count`) could race: a colocated
+        # consumer's report carries every buffer's count, so it could finish
+        # this partition while its last step was still running.
+        if pstate.worker_reported_done:
             fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
@@ -1943,6 +1949,7 @@ class Conductor:
         pstate.completed_worker_graph_ids = set()
         pstate.current_worker_graph_ids = set()
         pstate.wg_rank_completions = {}
+        pstate.worker_reported_done = False
         pstate.fwd_pass_number += 1
 
         self._set_partition_worker_graph_ids(
@@ -2084,7 +2091,7 @@ class Conductor:
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
 
     def _route_message(
-        self, message, done_partition_forwards: list[tuple[str, str, bool]],
+        self, message, done_partition_forwards: list[tuple[str, str]],
     ) -> None:
         """Apply one message from the api server or a worker. A WORKER_GRAPHS_DONE
         that finishes a partition's pass is queued on ``done_partition_forwards``."""
@@ -2119,9 +2126,7 @@ class Conductor:
                 range_push("conductor._process_worker_graphs_done")
             done_parts = self._process_worker_graphs_done(message.body)
             for pname in done_parts:
-                done_partition_forwards.append(
-                    (rid, pname, message.body.partition_done)
-                )
+                done_partition_forwards.append((rid, pname))
             if self.enable_nvtx:
                 range_pop()
         else:
@@ -2216,7 +2221,7 @@ class Conductor:
                 range_push("conductor.run_loop")
 
             try:
-                done_partition_forwards: list[tuple[str, str, bool]] = []
+                done_partition_forwards: list[tuple[str, str]] = []
 
                 startup_backlog = self._startup_message_backlog
                 self._startup_message_backlog = []
@@ -2233,14 +2238,11 @@ class Conductor:
 
                 completed_requests = []
 
-                for request_id, partition_name, p_done in done_partition_forwards:
+                for request_id, partition_name in done_partition_forwards:
                     if request_id not in self.requests or request_id in self.draining:
                         continue  # already completed by another partition in this cycle
                     try:
-                        all_done = self._process_done_forward(
-                            request_id, partition_name,
-                            partition_done_from_worker=p_done,
-                        )
+                        all_done = self._process_done_forward(request_id, partition_name)
                     except Exception as exc:
                         self._fail_after_error(
                             request_id, f"advancing partition {partition_name}", exc,
