@@ -1930,8 +1930,34 @@ class Engine:
 
         Outputs the check withholds (``StopCheck`` / ``BatchedStopCheck``) go
         on ``batch.withheld_outputs``, for the caller to leave unrouted.
+
+        Outputs the submodule cuts from the host rows first
+        (``emit_from_host_rows``) join the step's outputs, which the caller
+        routes, and the per-request check sees them.
         """
         submodule = self._submodules[batch.node_name].submodule
+        emitted: dict[str, NameToTensorList] = {}
+        base_emit = NodeSubmodule.emit_from_host_rows
+        if (
+            host_rows is not None
+            and getattr(type(submodule), "emit_from_host_rows", base_emit) is not base_emit
+        ):
+            ctx = batch.step_context
+            try:
+                emitted = submodule.emit_from_host_rows(
+                    batch.request_ids, batch.per_request_info_wrapped, host_rows,
+                    step_walk=None if ctx.request_walks else ctx.graph_walk,
+                )
+            except Exception as error:
+                for rid in batch.request_ids:
+                    batch.register_failure(rid, error)
+                return {}
+            if emitted:
+                per_rid = batch.outputs.per_rid_outputs
+                for rid, rid_out in emitted.items():
+                    per_rid.setdefault(rid, {}).update(rid_out)
+                # the rows are no longer only views of one batch clone
+                batch.outputs.row_views = None
         if host_rows is not None:
             try:
                 ctx = batch.step_context
@@ -1955,6 +1981,8 @@ class Engine:
         withheld: dict[str, tuple[str, ...]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
+            if rid in emitted:
+                rid_outputs = {**(rid_outputs or {}), **emitted[rid]}
             if not rid_outputs:
                 continue
             try:
