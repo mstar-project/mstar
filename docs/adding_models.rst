@@ -2665,10 +2665,12 @@ Override these methods:
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
-The consuming partition's ``get_partition_forward_pass_args`` reads
-``incoming_connections``, which provides token counts and a ``producer_done`` flag for
-each stream from another partition, and uses them to decide when to run. A stream from the
-client (below) has no entry there.
+A consuming partition's plan needs nothing about the stream. A step whose walk a stream
+feeds, and that is a bare node (or its chunk loop), runs once per chunk the stream brings,
+and the partition ends when the worker reports the pass that consumed the stream's final
+chunk. For a stream from another partition, the conductor tells the consumer
+``producer_done`` once the producer partition is done; the data worker ends a stream from
+the client (below) itself.
 
 Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
 later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
@@ -2701,8 +2703,9 @@ context is reused across calls, so a hook must not keep it.
 
 Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
 ``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
-ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
-``talker_last_prefill`` has run.
+ones run ``talker_decode``. Its plan lists the three walks. The conductor follows the walk
+each pass reports and enters the next step only to send it something, so it feeds
+``talker_decode`` its first input once ``talker_last_prefill`` has run.
 
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~

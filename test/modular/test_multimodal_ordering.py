@@ -600,22 +600,19 @@ def test_qwen_schedule_walks_the_plan():
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
     mods = ["text", "image", "text", "image", "text", "audio"]
-    signals = {
-        "text_inputs": ["t0", "t1", "t2", "t3"],
-        "pixel_values": ["px0", "px1"],
-        "image_grid_thw": ["g0", "g1"],
-        "audio_features": ["af0"],
-        "audio_seqlens": ["as0"],
-    }
+    signals = {span_name(name, i): [f"{name}{i}"] for name, n in (
+        ("text_inputs", 4), ("pixel_values", 2), ("image_grid_thw", 2), ("audio_features", 1), ("audio_seqlens", 1),
+    ) for i in range(n)}
     schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, mods, signals)
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text", "prefill_audio", "prefill_text",
+    assert schedule == [
+        ("prefill_text", {"text_inputs": "text_inputs.0"}),
+        ("prefill_vision", {"pixel_values": "pixel_values.0", "image_grid_thw": "image_grid_thw.0"}),
+        ("prefill_text", {"text_inputs": "text_inputs.1"}),
+        ("prefill_vision", {"pixel_values": "pixel_values.1", "image_grid_thw": "image_grid_thw.1"}),
+        ("prefill_text", {"text_inputs": "text_inputs.2"}),
+        ("prefill_audio", {"audio_features": "audio_features.0", "audio_seqlens": "audio_seqlens.0"}),
+        ("prefill_text", {"text_inputs": "text_inputs.3"}),
     ]
-    # Each vision walk carries its own image, in order.
-    vision = [entry for walk, entry in schedule if walk == "prefill_vision"]
-    assert [e["pixel_values"] for e in vision] == ["px0", "px1"]
-    assert [e["image_grid_thw"] for e in vision] == ["g0", "g1"]
 
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():

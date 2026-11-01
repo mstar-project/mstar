@@ -34,7 +34,7 @@ from transformers.vision_utils import (
 )
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
@@ -663,7 +663,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             kept_rids = frozenset(
                 rid for rid, walk in zip(request_ids, row_walks, strict=True)
                 if walk == "thinker_decode" or (
-                    rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+                    rid in info and info[rid].step_metadata.get(FINAL_PREFILL, False)
                 )
             )
         prefill_tokens = {
@@ -870,7 +870,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         result: NameToTensorList = {}
 
         # Decode: produce logits for text token sampling
-        if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
+        if graph_walk == "thinker_decode" or request_info.step_metadata.get(FINAL_PREFILL, False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
                 engine_inputs.request_ids, logits=logits
@@ -1157,7 +1157,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         **kwargs
     ):
         return_token = request_info.graph_walk == "thinker_decode" or (
-            request_info.step_metadata.get("is_last_prefill", False)
+            request_info.step_metadata.get(FINAL_PREFILL, False)
         )
         if not return_token:
             outputs.pop("new_token", None)

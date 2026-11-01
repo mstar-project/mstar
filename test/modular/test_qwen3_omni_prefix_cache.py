@@ -245,15 +245,38 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
     signals = {name: [object()] * len(value) for name, value in out.new_input_tensors.items()}
 
-    walks = [walk for walk, _ in model._build_thinker_prefill_schedule(modalities, signals)]
-    segments = iter(out.new_input_tensors["text_inputs"])
+    schedule = model._build_thinker_prefill_schedule(modalities, signals)
     media = iter(items)
     expected = [
-        ("prefill_text", len(next(segments)), None) if walk == "prefill_text" else next(media) for walk in walks
+        ("prefill_text", len(out.new_input_tensors[bind["text_inputs"]][0]), None) if walk == "prefill_text"
+        else next(media) for walk, bind in schedule
     ]
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
     )
+    assert [span.source for span in layout if span.kind == "ids"] == [
+        bind["text_inputs"] for walk, bind in schedule if walk == "prefill_text"
+    ], "a text span's prefix keys are read off another span than the one its walk prefills"
+
+
+@pytest.mark.parametrize("audio", [False, True], ids=["text out", "audio out"])
+def test_the_plan_runs_the_thinker_and_with_audio_out_the_talker_and_the_vocoder(model, audio):
+    outputs = ["text", "audio"] if audio else ["text"]
+    kwargs = {"voice": "Chelsie", "talker_max_output_tokens": 7}
+    plans = {
+        partition: [(s.walk, dict(s.bind), dict(s.step_metadata))
+                    for s in model.walk_plan(partition, ["text"], outputs, {"text_inputs.0": [object()]}, kwargs)]
+        for partition in ("Thinker", "Talker", "Code2Wav")
+    }
+    thinker = {"audio_output": audio}
+    talker = {"voice": "Chelsie", "talker_max_tokens": 7}
+    assert plans == {
+        "Thinker": [("prefill_text", {"text_inputs": "text_inputs.0"}, thinker),
+                    ("thinker_decode", {"text_inputs": "new_token"}, thinker)],
+        "Talker": [("talker_prefill", {}, talker), ("talker_last_prefill", {}, talker),
+                   ("talker_decode", {}, {"talker_max_tokens": 7})] if audio else [],
+        "Code2Wav": [("code2wav_chunk", {}, {})] if audio else [],
+    }
 
 
 def _vision(attn_implementation: str = "sdpa") -> VisionEncoderSubmodule:
