@@ -652,6 +652,7 @@ class Worker:
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
+            eager_yield_nodes=(model_config or {}).get("eager_yield_nodes", ()),
             lockstep_first_nodes={
                 node for node in self.parallel_nodes
                 if self.parallel_groups.get_cfg_config_for_node(node).world_size > 1
@@ -4969,7 +4970,7 @@ class Worker:
             )
             other_ready = (
                 fair.peek
-                and consecutive >= 1
+                and (consecutive >= 1 or self.scheduler.yields_eagerly(pending.node_name))
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready

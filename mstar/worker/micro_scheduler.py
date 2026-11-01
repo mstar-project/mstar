@@ -230,12 +230,19 @@ class MicroScheduler:
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         speculation_mixes_walks: Mapping[str, Any] | None = None,
         lockstep_first_nodes: Collection[str] = (),
+        eager_yield_nodes: Collection[str] = (),
     ):
         self.engine_manager = engine_manager
         # Nodes whose step holds every rank of the instance, so work local to one
         # rank (a VAE decode) goes after it: the local work only waits, while the
         # other rank would sit idle in the step's collective.
         self.lockstep_first_nodes = frozenset(lockstep_first_nodes)
+        # Nodes whose speculation chains yield to other ready work from their
+        # first step, not their second; see `yields_eagerly`
+        self.eager_yield_nodes = frozenset(eager_yield_nodes)
+        lockstep = self.eager_yield_nodes & self.lockstep_first_nodes
+        if lockstep:
+            raise ValueError(f"eager_yield_nodes names lockstep nodes {sorted(lockstep)}")
         self.lockstep_first_steps = 0
         # A follower: rows of such a node are ready here, and when it gave up waiting
         # for the leader's next head for them; see `_await_lockstep_head`.
@@ -356,6 +363,13 @@ class MicroScheduler:
                 if mixes:
                     on.add((node, walk))
         return frozenset(on)
+
+    def yields_eagerly(self, node_name: str) -> bool:
+        """Whether the step just after a yield looks for other ready work too.
+        Off (the default), a chain speculates one step before it looks, so a
+        burst of prompts alternates with decode; on, the burst runs first, and
+        decode takes all of its rows at once afterwards."""
+        return node_name in self.eager_yield_nodes
 
     def speculation_mixes(self, node_name: str, graph_walk: str) -> bool:
         """Whether a speculation chain on ``(node_name, graph_walk)`` merges

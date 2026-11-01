@@ -1274,6 +1274,15 @@ def _combined_scheduler(engine: _Engine, mixes=None) -> MicroScheduler:
     )
 
 
+def test_eager_yield_is_per_node_and_refused_on_a_lockstep_node():
+    manager = SimpleNamespace(get_engine=lambda name: _Engine(max_bs=8))
+    sched = MicroScheduler(engine_manager=manager, eager_yield_nodes=[NODE])
+    assert sched.yields_eagerly(NODE) and not sched.yields_eagerly("other")
+    assert not MicroScheduler(engine_manager=manager).yields_eagerly(NODE)
+    with pytest.raises(ValueError, match="lockstep"):
+        MicroScheduler(engine_manager=manager, eager_yield_nodes=[NODE], lockstep_first_nodes={NODE})
+
+
 def test_a_combined_walk_batches_its_walks_together():
     sched = _combined_scheduler(_Engine(max_bs=8))
     manager = _Manager(["p0", "d0", "d1"], walks={"p0": "prefill"})
