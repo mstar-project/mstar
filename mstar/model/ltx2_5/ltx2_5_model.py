@@ -18,9 +18,8 @@ Graph walks:
 
 A request runs ``encode_text`` then one generate walk (recipe "single", the default),
 or ``encode_text`` -> ``stage1`` -> one refine walk ("two_stage", the card's
-better-quality recipe; ``height`` / ``width`` are the final size). Walks are stepped
-through ``metadata.kwargs["walk_step"]``. The model always denoises video and audio
-jointly; the walk only decides which decoders run.
+better-quality recipe; ``height`` / ``width`` are the final size), as its ``walk_plan``.
+The model always denoises video and audio jointly; the walk only decides which decoders run.
 
 Per-request knobs (``model_kwargs``): ``height``, ``width`` (multiples of 32),
 ``num_frames`` (8k + 1), ``fps`` (enters the video RoPE and the container),
@@ -38,7 +37,6 @@ from fractions import Fraction
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     NodeResourceSpec,
@@ -48,7 +46,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import Model, WalkStep
 from mstar.model.ltx2_5.config import (
     AUDIO_DECODER_NODE,
     DENOISE_LOOP,
@@ -403,79 +401,28 @@ class LTX25Model(Model):
                 logger.warning("LTX-2.5 %s is ignored: the distilled checkpoint runs a fixed schedule, unguided", name)
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
 
-    # --------------------------------------------------------- state machine
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        # The request's geometry lives under its own key: the conductor merges each
-        # pass's step metadata into ``metadata.kwargs``, so stage 1's half-size
-        # "height" would otherwise overwrite the request's for every later walk.
-        kw = metadata.kwargs["request"]
-        scale = 2 if metadata.graph_walk == STAGE1_WALK else 1
-        return {
-            "is_prefill": metadata.is_prefill,
-            "height": kw["height"] // scale, "width": kw["width"] // scale,
-            "num_frames": kw["num_frames"], "fps": kw["fps"],
-        }
-
-    def get_initial_forward_pass_args(
+    # ------------------------------------------------------------ walk plan
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        # Backstops: process_prompt rejected these already, where a raise is a 400; a
-        # raise here runs at the conductor.
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # a backstop: process_prompt rejected this already
         if not input_signals.get(TEXT_INPUTS):
             raise ValueError("LTX-2.5 requires a text prompt (text_inputs)")
-        model_kwargs = model_kwargs or {}
         request = self.resolve_request(model_kwargs)
         final_walk = self._generate_walk_for(output_modalities, request["recipe"])
-        middle = [STAGE1_WALK] if request["recipe"] == "two_stage" else []
-        kwargs = {"walk_schedule": [ENCODE_TEXT_WALK, *middle, final_walk], "walk_step": 0, "request": request}
         logger.info(
             "LTX-2.5 request: %dx%d frames=%d fps=%s recipe=%s outputs=%s seed=%s", request["width"],
             request["height"], request["num_frames"], request["fps"], request["recipe"], output_modalities,
             model_kwargs.get("seed", "auto"),
         )
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=ENCODE_TEXT_WALK, is_prefill=True, kwargs=kwargs,
-        )
-        edge = GraphEdge(next_node=TEXT_ENCODER_NODE, name=TEXT_INPUTS)
-        edge.tensor_info = input_signals[TEXT_INPUTS]
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info),
-            step_metadata=self._step_metadata(metadata),
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        inputs: list[GraphEdge] = []
-        request_done = step >= len(schedule)
-        unpersist: list[TensorPointerInfo] = []
-        if not request_done:
-            metadata.kwargs["walk_step"] = step
-            walk = metadata.graph_walk = schedule[step]
-            metadata.is_prefill = False
-            persisted = [TEXT_VIDEO, TEXT_AUDIO]
-            if walk in REFINE_WALKS.values():
-                persisted += [REFINE_LATENTS, REFINE_AUDIO]
-            for name in persisted:
-                edge = GraphEdge(next_node=DIT_NODE, name=name)
-                edge.tensor_info = persist_signals.get(name, [])
-                inputs.append(edge)
-                # the text embeddings outlive stage 1: the refine walk reads them too
-                if walk != STAGE1_WALK:
-                    unpersist += edge.tensor_info
-            # the loop-back edges arrive empty; the dit seeds them at iteration 0
-            inputs += [GraphEdge(next_node=DIT_NODE, name=LATENTS), GraphEdge(next_node=DIT_NODE, name=AUDIO_LATENTS)]
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs, unpersist_tensors=unpersist,
-            step_metadata=self._step_metadata(metadata), request_done=request_done,
-        )
+        geometry = {key: request[key] for key in ("height", "width", "num_frames", "fps")}
+        steps = [WalkStep(ENCODE_TEXT_WALK, step_metadata=geometry)]
+        if request["recipe"] == "two_stage":
+            # stage 1 runs at half the request's size
+            half = {**geometry, "height": geometry["height"] // 2, "width": geometry["width"] // 2}
+            steps.append(WalkStep(STAGE1_WALK, step_metadata=half))
+        return [*steps, WalkStep(final_walk, step_metadata=geometry)]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """``video``: uint8 ``[F, H, W, 3]`` frames -> H.264 mp4 at the request's fps. ``audio``:
