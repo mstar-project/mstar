@@ -25,7 +25,6 @@ Triton-specific boilerplate out of the runner.
 
 from __future__ import annotations
 
-import functools
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -630,12 +629,30 @@ def config_path(E: int, N: int, K: int, device_name: str | None = None) -> Path:
     return Path(__file__).parent / "configs" / f"E={E},N={N},K={K},device_name={device_name}.json"
 
 
-@functools.lru_cache(maxsize=None)
+_tuned_tables: dict[tuple[int, int, int], dict[int, dict] | None] = {}
+
+
 def _tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
-    path = config_path(E, N, K)
-    if not path.is_file():
-        return None
-    return {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+    # A plain dict, which dynamo reads inline: past the first read, a table it
+    # traces no further than this would be read behind a graph break.
+    if (E, N, K) not in _tuned_tables:
+        path = config_path(E, N, K)
+        _tuned_tables[E, N, K] = (
+            {int(m): cfg for m, cfg in json.loads(path.read_text()).items()} if path.is_file() else None
+        )
+    return _tuned_tables[E, N, K]
+
+
+def _nearest_tuned(tuned: dict[int, dict], M: int) -> dict:
+    """The entry for the tuned batch size nearest ``M``, the smaller on a tie.
+    By comparisons: a compile that keeps ``M`` symbolic (a prompt past the
+    capture buckets) guards on the range and gets constant tiles, which a
+    Triton launch needs."""
+    sizes = sorted(tuned)
+    for size, next_size in zip(sizes, sizes[1:], strict=False):
+        if 2 * M <= size + next_size:
+            return tuned[size]
+    return tuned[sizes[-1]]
 
 
 def get_config(M: int, E: int, N: int, K: int, top_k: int) -> tuple[Dict[str, int], Dict[str, int]]:
@@ -649,7 +666,7 @@ def get_config(M: int, E: int, N: int, K: int, top_k: int) -> tuple[Dict[str, in
     if tuned is None:
         config = get_default_config(M, E, N, K, top_k)
         return config, config
-    up = dict(tuned[min(tuned, key=lambda m: abs(m - M))])
+    up = dict(_nearest_tuned(tuned, M))
     down_overrides = up.pop("down", {})
     down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
     return up, down

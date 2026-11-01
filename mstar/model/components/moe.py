@@ -185,6 +185,9 @@ class TopKRouter(nn.Module):
         ):
             return None
         logits = F.linear(hidden_states, self.weight)
+        # int: the kernel's block sizes are constants, and a compile that keeps the
+        # token count symbolic specializes on it here, for at most these few counts
+        tokens = int(tokens)
         return route_align(
             logits, self.top_k, moe_block_m(tokens, w1, self.top_k), logits.dtype, softmax=True,
         )
