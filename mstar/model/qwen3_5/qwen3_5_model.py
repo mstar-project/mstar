@@ -583,7 +583,8 @@ class Qwen3_5DenseModel(Model):
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
@@ -792,8 +793,8 @@ class Qwen3_5DenseModel(Model):
             edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [edge]
         else:
-            # decode stops via `LLMSubmodule.check_stop`; reaching here again
-            # after it fires means the request is finished
+            # decode stops via `LLMSubmodule.check_stop` or the loop cap;
+            # reaching here again after either means the request is finished
             metadata.kwargs["decode_finished"] = True
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -823,7 +824,9 @@ class Qwen3_5DenseModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
+        keys = [
+            "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos", "return_logprobs", "logprobs_mode",
+        ]
         return {
             SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs[k] for k in keys if k in model_kwargs}

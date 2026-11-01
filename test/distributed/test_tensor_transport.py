@@ -39,6 +39,12 @@ class _MockCommunicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 _TCP_AVAILABLE = MOONCAKE_IMPORT_ERROR is None
 _PROTOCOLS = [

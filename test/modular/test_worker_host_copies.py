@@ -39,6 +39,12 @@ class _Communicator(BaseCommunicator):
     def get_all_new_messages(self):
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 class _AccumulatingRuntime:
     """Holds every iteration's output and registers all of them on the last."""
@@ -83,7 +89,6 @@ def _worker(tmp_path):
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w._graph_runtime = _AccumulatingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())

@@ -75,6 +75,13 @@ class RaggedAttentionConfig:
     backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
+    # Whether a compiled caller keeps the attention in its graph, as the
+    # ``mstar::ragged_attention`` op, rather than breaking there per layer. For
+    # a compiled, uncaptured region whose fusions around attention pay; off by
+    # default, since tracing a whole transformer as one graph per capture
+    # bucket costs startup time and capture memory (Z-Image: +2.6 GiB).
+    compile_op: bool = False
+
     # Activation dtype of the q / k / v the node hands the kernel (and of its
     # output). A cacheless attention doesn't need to adhere to the dtype of its
     # KV cache, so it is free to declare a separate dtype here; when None, the
@@ -164,7 +171,7 @@ class RaggedAttentionSpec(_RaggedSpecBase):
 class RaggedCrossAttentionSpec(_RaggedSpecBase):
     """Cacheless cross-attention between two spans of each request: a forward's
     ``(q_label, kv_label)`` pairs (``RaggedCrossAttentionStep``), each run through
-    ``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``.
+    ``resource.run(q, k, v, label=cross_label(q_label, kv_label))``.
 
     Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:
     a model with both declares one of each per head geometry.

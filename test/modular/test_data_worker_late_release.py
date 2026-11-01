@@ -20,8 +20,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication.event import EventWakeup
 from mstar.model.base import Model
 from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import (
@@ -151,8 +152,8 @@ class _Rig:
         self.worker = PreprocessWorkerThread(
             in_queue=queue.Queue(),
             result_tensor_queue=queue.Queue(),
-            out_queue=queue.Queue(),
-            profile_queue=queue.Queue(),
+            out_queue=ResultQueue(EventWakeup()),
+            profile_queue=ResultQueue(EventWakeup()),
             cleanup_request_queue=queue.Queue(),
             abort_request_queue=queue.Queue(),
             reads_done_queue=queue.Queue(),

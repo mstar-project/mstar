@@ -130,14 +130,10 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
         # the features are computed for the whole batch in preprocess; the
         # length check stays here, so a clip too short fails only its request
         audio = inputs["audio"][0]
-        frames = self.log_mel.num_frames(audio.numel())
-        if frames < 2:
-            raise ValueError(
-                f"audio of {audio.numel()} samples is shorter than two {self.log_mel.hop_length}-sample frames"
-            )
+        self.log_mel.check_length(audio.numel())
         return NodeInputs(
             tensor_inputs={"audio": audio},
-            input_seq_len=self.encoder.config.output_lengths(frames),
+            input_seq_len=self.encoder.config.output_lengths(self.log_mel.num_frames(audio.numel())),
         )
 
     def preprocess(
@@ -206,9 +202,7 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
             runner = runners.get(_region(bucket)) if bucket is not None else None
             step = max(_batch_sizes(bucket)) if bucket is not None else 1
             for part in (rows[i:i + step] for i in range(0, len(rows), step)):
-                lengths = to_device_nonblocking(
-                    torch.tensor([features[r].shape[0] for r in part]), features[part[0]].device,
-                )
+                lengths = to_device_nonblocking([features[r].shape[0] for r in part], features[part[0]].device)
                 if runner is not None and runner.can_run(len(part)):
                     padded = torch.stack([
                         torch.nn.functional.pad(features[r], (0, 0, 0, bucket - features[r].shape[0]))

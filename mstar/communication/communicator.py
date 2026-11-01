@@ -3,6 +3,7 @@ import fcntl
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from enum import Enum
 
 import zmq
@@ -51,6 +52,17 @@ class BaseCommunicator(ABC):
     @abstractmethod
     def get_all_new_messages(self) -> list:
         pass
+
+    @abstractmethod
+    def register_event_for_poll(self, event: EventWakeup) -> None:
+        """Have ``poll_for_messages`` (and ``wait_for_work``) also end when
+        ``event`` is signalled."""
+
+    @abstractmethod
+    def poll_for_messages(self, timeout_ms: int = 20) -> bool:
+        """Block until a message is readable, the registered event fires, or
+        ``timeout_ms`` elapses, whichever comes first. True when a message is
+        waiting for ``get_all_new_messages``; a fired event is drained."""
 
     # -- endpoint scheme (shared by every ZMQ-based communicator) ------------
     # Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.
@@ -329,13 +341,18 @@ class OutboxCommunicator:
         self._outbox: dict[str, collections.deque[bytes]] = {}
 
     def send(self, entity_id: str, msg) -> None:
+        self.send_each((entity_id,), msg)
+
+    def send_each(self, entity_ids: Iterable[str], msg) -> None:
+        """``send`` to each of ``entity_ids``, encoding ``msg`` once."""
         # Encoded here, queued or not: a message the codec refuses fails its
         # sender now, as a blocking send would, rather than at the head of the
         # queue where it would hold up every later message.
         data = self._inner.codec.encode(msg)
-        backlog = self._outbox.get(entity_id)
-        if backlog or not self._inner.try_send_bytes(entity_id, data):
-            self._outbox.setdefault(entity_id, collections.deque()).append(data)
+        for entity_id in entity_ids:
+            backlog = self._outbox.get(entity_id)
+            if backlog or not self._inner.try_send_bytes(entity_id, data):
+                self._outbox.setdefault(entity_id, collections.deque()).append(data)
 
     def flush(self) -> bool:
         """Send what peers can take now; True if anything is still queued.

@@ -41,7 +41,7 @@ A recipe such as LTX-2.5's two-stage distilled one (half-resolution denoise → 
 Every attention in the DiT should go through a ragged resource, so the model gets the engine's kernels and its backend can change in config.
 
 - `attention_segments(bucket_key)` declares every span a request's layers attend over, as `(label, length)`; the default is one `"main"` span of all its tokens. A layer that attends over a sub-span (a refiner over the image tokens alone, a joint model's per-modality self-attention) gets its own label, and `ragged_for(label)` gives that layer its callable.
-- `ragged_for` memoizes one callable per label for the life of a binding. The compiled transformer guards on the identity of the callables it is handed; a fresh one per step recompiles every step.
+- `ragged_for` memoizes one callable per label (the resource's `run` with the label bound) for the life of a binding, and a rebinding drops them so none attends through the old resource.
 - A model with more than one head geometry (LTX-2.5's video 32×128 and audio 32×64 heads) declares one resource per geometry.
 - Cross-attention between spans of the same request (video queries over text keys) is a separate cross-attention resource kind (`RaggedCrossAttentionSpec`, added in #372) whose step names `(q_label, kv_label)` pairs; see "Cross-attention between spans" in `docs/adding_models.rst`. Don't fall back to SDPA for it because the shapes are fixed inside a bucket.
 - `joint_attention` in `attention.py` packs per-row q/k/v into the ragged layout (or runs SDPA when no resource is bound, which is what a parity backend uses).
@@ -50,7 +50,7 @@ Every attention in the DiT should go through a ragged resource, so the model get
 
 - The engine's blanket compile is off for the node (`disable_torch_compile = True`); the model compiles its transformer region with `compile_utils.compile_transformer_forward`, which keeps the exact-op exclusions that preserve eager rounding. Compiling the DiT mostly buys the memory-bound elementwise work (modulation, fp32 norms, RoPE, gating), which on LTX-2.5 was ~45% of an eager step.
 - `capture_buckets` lists `(graph_walk, bucket_key)` pairs to capture; `capture_request_inputs` supplies one placeholder row per bucket. A bucket is captured per batch size in `capture_batch_sizes`, and each one costs startup, so capture the shapes you serve, not every shape you accept. `replay_walks` lets another walk reuse a captured bucket.
-- The captured graph removes the gaps the per-layer attention graph breaks leave in a compiled-but-eager step; measure both before deciding a model doesn't need capture.
+- The captured graph removes the launch gaps of a compiled-but-eager step. Ragged attention breaks that compiled graph per layer unless the resource sets `compile_op=True` (then `run` traces as the `mstar::ragged_attention` custom op), so measure both before deciding a model needs capture.
 
 ## The overshoot veto
 
