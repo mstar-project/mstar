@@ -62,7 +62,7 @@ def cudnn_benchmark(enabled: bool):
     """Within the block, let cuDNN time its conv algorithms per new shape
     (once, then cached) instead of taking its heuristic pick; restores the
     process-wide flag on exit. Not safe against convs on other threads, like
-    the scope below: the engine applies it around a node's capture warm-up
+    the scope below: the engine applies it around a node's capture sizing
     (``NodeSubmodule.capture_cudnn_benchmark``), and the VAE decoders around
     their forward on the worker's one GPU thread."""
     if not enabled:
