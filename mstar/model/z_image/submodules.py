@@ -33,6 +33,7 @@ from mstar.model.components.diffusion.decode_utils import (
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
+from mstar.model.components.diffusion.prompt_encoder import PromptEncoderSubmodule
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -86,7 +87,7 @@ def shape_from_metadata(config: ZImageConfig, step_metadata: dict) -> ZShape:
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class ZImageTextEncoderSubmodule(NodeSubmodule):
+class ZImageTextEncoderSubmodule(PromptEncoderSubmodule):
     """Caption features ``[1, cap_len, 2560]`` for one request: Qwen3 hidden states after
     layer 35 at the real token positions, zero elsewhere (the DiT swaps those rows for its
     learned pad token). ``text_inputs`` arrives unpadded; rows are right-padded to the
@@ -95,23 +96,9 @@ class ZImageTextEncoderSubmodule(NodeSubmodule):
     accumulation order does, so the padded length is part of bit-exactness. Requests of any
     length batch together."""
 
-    disable_torch_compile = True
-
-    def __init__(self, encoder: nn.Module, config: ZImageConfig, max_batch_size: int = 16):
-        super().__init__()
-        self.encoder = encoder
-        self.config = config
-        self._max_batch_size = max_batch_size
-
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         ids = inputs[TEXT_INPUTS][0]
         return NodeInputs(tensor_inputs={TEXT_INPUTS: ids}, input_seq_len=int(ids.shape[0]))
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return len(model_inputs) > 1
-
-    def max_batch_size(self, graph_walk: str):
-        return self._max_batch_size
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         lengths = [int(inp.tensor_inputs[TEXT_INPUTS].shape[0]) for inp in inputs]
