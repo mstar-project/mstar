@@ -583,7 +583,8 @@ def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
 
     model = _vjepa2()
     kwargs = {"rollout_horizon": horizon}
-    step_metadata = model.get_initial_forward_pass_args("p0", ["video"], ["video"], {}, kwargs).step_metadata
+    [step] = model.walk_plan("p0", ["video"], ["video"], {"video_frames": [_pointer(torch.zeros(1))]}, kwargs)
+    step_metadata = step.step_metadata
 
     assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
         VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",

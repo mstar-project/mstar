@@ -725,8 +725,8 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
     Additional required inputs vs the masked predictor: ``actions``,
     ``states``, and optionally ``extrinsics``.  Each is per-timestep, shape
     ``[T, action_embed_dim]`` (or ``[T, action_embed_dim - 1]`` for
-    extrinsics), delivered as a GraphEdge by the model's ``process_prompt``
-    / ``get_initial_forward_pass_args``.  Output is ``predicted_hidden``
+    extrinsics), emitted by the model's ``process_prompt`` and sent to this
+    node as an input edge of the walk.  Output is ``predicted_hidden``
     with the same shape as ``encoder_hidden``.
     """
 
