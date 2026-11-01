@@ -128,6 +128,17 @@ if TYPE_CHECKING:
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
+class StepOrder(Enum):
+    """Who runs first when more rows of a node are ready than its step takes
+    (``NodeSubmodule.max_batch_size``)."""
+    # First come, first served to completion: the rows that ran the node's last
+    # step keep it, then the request that arrived first. The default.
+    ARRIVAL = "arrival"
+    # Longest-waiting first: a row that just ran gives way to one that waited.
+    # For a session whose stream has to keep moving while others run.
+    TURNS = "turns"
+
+
 class InputMetadata(NamedTuple):
     """What the worker knows about one request's inputs to this step.
 
@@ -976,6 +987,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         mixed step runs the walk's rows on a path sized to a few of them."""
         del graph_walk
         return None
+
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Which rows go first when more are ready than ``max_batch_size``
+        allows. Override it for a walk whose sessions have to keep moving
+        while others run."""
+        del graph_walk
+        return StepOrder.ARRIVAL
 
     def get_autocast_dtype(self) -> torch.dtype | None:
         """This node's dtype in place of the model's: the engine manager casts

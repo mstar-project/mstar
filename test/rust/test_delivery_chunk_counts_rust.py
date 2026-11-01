@@ -117,10 +117,10 @@ def _stepper(runtime, put):
     """``step(rows, ...)`` runs NODE for ``rows``, (rid, walk) pairs, as one
     batch and sends its outputs. ``values`` ride inline as ``new_token``;
     ``stored=False`` routes no tensors, as a device loop-back step does;
-    ``failed`` rids are sent nothing."""
+    ``failed`` rids are sent nothing; ``logprobs`` are the rows' log-probs."""
     uuid = 100
 
-    def step(rows, values=None, stored=True, failed=()):
+    def step(rows, values=None, stored=True, failed=(), logprobs=()):
         nonlocal uuid
         rids = [rid for rid, _ in rows]
         walks = list(dict.fromkeys(walk for _, walk in rows))
@@ -144,7 +144,7 @@ def _stepper(runtime, put):
             wg_ids=ParallelList(rids, [0 if walk == PREFILL else 1 for _, walk in rows]),
             tensors=tensors, num_tensors=counts,
             walks=walks if mixed else None, rid_walk_idx=walk_idx if mixed else None,
-            **inline,
+            logprobs=logprobs, **inline,
         ))
         runtime.send_outputs(SendInput(
             completion_id=out.completion_id,
@@ -163,18 +163,19 @@ def _script(runtime, put) -> list[list[int]]:
     rows, a row with no inline value (None: its tensor goes instead), a step
     mixing a prefill row with decode rows, a device loop-back
     step that stores no tensors, values that miss a row, and a failed
-    request. Returns each step's staged uuids."""
+    request. ``a`` asks for log-probs, ``b`` does not, ``c`` only at its
+    prefill. Returns each step's staged uuids."""
     a, b, c = (_admit(runtime, f"r{i}") for i in range(3))
     step = _stepper(runtime, put)
     _ingest(runtime, [a, b, c])
-    outs = [step([(a, PREFILL), (b, PREFILL)], [1, 2])]
+    outs = [step([(a, PREFILL), (b, PREFILL)], [1, 2], logprobs=[-1.0, None])]
     for rid in (a, b):
         runtime.set_walk(rid, "default", DECODE)
     _ingest(runtime, [a, b])
-    outs.append(step([(a, DECODE), (b, DECODE)], [11, None]))
-    outs.append(step([(c, PREFILL), (a, DECODE), (b, DECODE)], [3, 12, 22]))
-    outs.append(step([(a, DECODE), (b, DECODE)], [13, 23], stored=False))
-    outs.append(step([(a, DECODE), (b, DECODE)], [14]))
+    outs.append(step([(a, DECODE), (b, DECODE)], [11, None], logprobs=[-1.5, None]))
+    outs.append(step([(c, PREFILL), (a, DECODE), (b, DECODE)], [3, 12, 22], logprobs=[-2.0, -2.5, None]))
+    outs.append(step([(a, DECODE), (b, DECODE)], [13, 23], stored=False, logprobs=[-3.0, None]))
+    outs.append(step([(a, DECODE), (b, DECODE)], [14], logprobs=[-3.5, None]))
     outs.append(step([(a, DECODE), (b, DECODE)], [15, 25], failed={b}))
     return [sorted(out.register_uuids) for out in outs]
 
@@ -185,13 +186,14 @@ def _frames(chunks):
     out = []
     for c in chunks:
         if isinstance(c, ResultTokens):
-            rows = zip(c.request_ids, c.values, c.loop_indices, strict=True)
+            n = len(c.request_ids)
+            rows = zip(c.request_ids, c.values, c.loop_indices, c.logprobs or [None] * n, strict=True)
             out.append(("tokens", c.signal, c.modality, tuple(sorted(rows, key=repr))))
         else:
             edge = c.graph_edge
             out.append((
                 "tensors", c.request_id, edge.name, c.modality,
-                tuple(i.uuid for i in edge.tensor_info), c.loop_indices,
+                tuple(i.uuid for i in edge.tensor_info), c.loop_indices, c.metadata,
             ))
     return sorted(out, key=repr)
 
@@ -220,6 +222,17 @@ def test_both_runtimes_send_the_same_frames(tmp_path):
     assert _reports(recorder.reports()) == _reports(rs_reports)
     tokens = sorted(sorted(c.values) for c in rs_chunks if isinstance(c, ResultTokens))
     assert tokens == [[11], [12, 22], [13, 23], [15]]
+    logprobs = sorted(
+        (rid, lp) for c in rs_chunks if isinstance(c, ResultTokens) and c.logprobs
+        for rid, lp in zip(c.request_ids, c.logprobs, strict=True) if lp is not None
+    )
+    assert logprobs == [("r0", -3.0), ("r0", -2.5), ("r0", -1.5)]
+    metadata = sorted(
+        (c.request_id, *c.metadata["logprobs"]) for c in rs_chunks
+        if not isinstance(c, ResultTokens) and c.metadata
+    )
+    # the prefills, and the step whose values missed a row
+    assert metadata == [("r0", -3.5), ("r0", -1.0), ("r2", -2.0)]
 
 
 def _tp_rank(rank):
