@@ -92,7 +92,7 @@ class _Self:
     """A ragged self-attention manager, planned from ``(span, ...)``."""
 
     def __init__(self, manager_class):
-        self.manager = manager_class(device=DEVICE, dtype=torch.float32, config=_ragged_config())
+        self.manager = manager_class(device=DEVICE, dtype=torch.float32, config=_ragged_config(), key="attn")
 
     def plan(self, spans, causal=False, **ctx):
         segments = tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans))
@@ -106,7 +106,7 @@ class _Cross:
     """A ragged cross-attention manager; each query span attends a key span twice its size."""
 
     def __init__(self, manager_class):
-        self.manager = manager_class(device=DEVICE, dtype=torch.float32, config=_ragged_config())
+        self.manager = manager_class(device=DEVICE, dtype=torch.float32, config=_ragged_config(), key="attn")
 
     def plan(self, spans, causal=False, **ctx):
         assert not causal
@@ -270,7 +270,7 @@ def test_a_dropped_block_causal_preplan_has_nothing_to_forget(monkeypatch):
     monkeypatch.setattr(RaggedBlockCausalWrapper, "__init__", lambda self, **kwargs: None)
     monkeypatch.setattr(RaggedBlockCausalWrapper, "plan", lambda self, spans: None)
     manager = FlashInferRaggedBlockCausalManager(
-        device=DEVICE, dtype=torch.float32, config=_ragged_config(), block_size=4,
+        device=DEVICE, dtype=torch.float32, config=_ragged_config(), block_size=4, key="attn",
     )
     segments = (Segment("r0", "main", 8),)
     manager.plan(
