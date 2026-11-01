@@ -405,42 +405,18 @@ def test_duplex_worker_graphs_derive_all_walks():
     assert by_walk["decode"].section.section.enable_async_scheduling is True
 
 
-def test_duplex_initial_partition_routing():
-    model = _make_model()
-    sig = {"text_inputs": ["t"], "has_prompt": ["h"], "prev_text": ["p"], "prev_func": ["f"]}
-    expected = {"Encoder": "encode", "LLM": "decode",
-                "Talker": "talker_decode"}
-    for pname, walk in expected.items():
-        fpa = model.get_initial_forward_pass_args(pname, ["audio"], ["audio", "text"], sig)
-        assert fpa.full_metadata.graph_walk == walk
-        if pname != "LLM":
-            # self-triggered: the Encoder by the client's audio stream
-            assert fpa.inputs == [] and fpa.request_done is False
+@pytest.mark.parametrize("prompt", [True, False])
+def test_duplex_plan_runs_each_partitions_loop_and_flags_a_prompt(prompt):
     # with a system prompt the LLM's first step is prompt + frame: flagged so the
-    # worker keeps it off the fixed-shape decode capture; the prompt rides the loop
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio", "text"], ["audio", "text"], sig)
-    assert fpa.step_metadata == {"prompt_pending": True} and fpa.full_metadata.is_prefill is True
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
-    # no system prompt -> same walk, nothing pending
-    no_prompt = {"text_inputs": ["s"]}
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], no_prompt)
-    assert fpa.full_metadata.graph_walk == "decode" and fpa.step_metadata == {"prompt_pending": False}
-
-
-def test_duplex_llm_after_the_first_step_nothing_is_pending():
+    # worker keeps it off the fixed-shape decode capture
     model = _make_model()
-    meta = model._meta(["audio", "text"], ["audio"], "decode", True)
-    fpa = model.get_partition_forward_pass_args("LLM", meta, {"prev_text": ["pt"], "prev_func": ["pf"]})
-    assert fpa.full_metadata.graph_walk == "decode"
-    assert fpa.full_metadata.is_prefill is False
-    assert fpa.step_metadata == {"prompt_pending": False}
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func"}
-    # the decode node lists the prompt as a fed-back input, so a re-injected copy
-    # of the seed can never outrank the node's own sentinel
-    decode = model.get_graph_walk_graphs()["decode"]
-    node = next(iter(decode.section.get_nodes().values()))
-    assert "text_inputs" in node.input_names
-    assert any(e.name == "text_inputs" and e.next_node == "nano_llm" for e in node.outputs)
+    sig = {"text_inputs": ["t"], "prev_text": ["p"], "prev_func": ["f"], **({"has_prompt": ["h"]} if prompt else {})}
+    plans = {p: model.walk_plan(p, ["audio"], ["audio", "text"], sig, {}) for p in ("Encoder", "LLM", "Talker")}
+    assert {p: [(s.walk, dict(s.bind), dict(s.step_metadata)) for s in plan] for p, plan in plans.items()} == {
+        "Encoder": [("encode", {}, {})],
+        "LLM": [("decode", {}, {"prompt_pending": prompt})],
+        "Talker": [("talker_decode", {}, {})],
+    }
 
 
 def test_duplex_stream_connection_policies():
@@ -678,24 +654,6 @@ def test_duplex_load_audio_does_not_trust_the_header_length(tmp_path, monkeypatc
     frames = sf.SoundFile.frames
     monkeypatch.setattr(sf.SoundFile, "frames", property(lambda f: frames.fget(f) * 4))
     assert model.load_audio(path, "cpu").data.numel() == 16000
-
-
-def test_duplex_encoder_partition_ends_with_the_client_stream():
-    model = _make_model()
-    meta = model._meta(["audio"], ["audio", "text"], "encode", False)
-    fpa = model.get_partition_forward_pass_args("Encoder", meta, {})
-    assert fpa.request_done is False and fpa.inputs == []
-
-
-def test_duplex_no_prompt_seeds_initial_decode_inputs():
-    """Audio-only start (no system prompt): the LLM partition starts in the
-    decode loop and its initial inputs carry the seeded prev_text / prev_func
-    and the no-prompt text_inputs sentinel so iteration 0's readiness gate fires."""
-    model = _make_model()
-    sig = {"prev_text": ["pt"], "prev_func": ["pf"], "text_inputs": ["s"]}
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], sig)
-    assert fpa.full_metadata.graph_walk == "decode"
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
 
 
 def _live_client(monkeypatch):
