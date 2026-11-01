@@ -35,7 +35,7 @@ _FIELDS = {"model", "input", "instructions", "tools", "tool_choice", "parallel_t
 _OFF = {"previous_response_id": (None,), "conversation": (None,), "prompt": (None,), "store": (None, False),
         "background": (None, False), "max_tool_calls": (None,), "top_logprobs": (None, 0),
         "truncation": (None, "disabled"), "service_tier": (None, "auto", "default")}
-_EFFORT_RANK = {"minimal": 0, "low": 0, "medium": 1, "high": 2, "xhigh": 2}
+_EFFORT_RANK = {"minimal": 0, "low": 0, "medium": 1, "high": 2, "xhigh": 3}
 
 
 def to_chat_request(body, efforts: tuple[str, ...]) -> ChatCompletionRequest:
@@ -208,10 +208,11 @@ def _reasoning(reasoning, efforts: tuple[str, ...]) -> dict:
 
 def template_level(rank: int, efforts: tuple[str, ...], asked: str) -> str:
     """The template's reasoning level for an effort of ``rank`` (0 low, 1 medium,
-    2 high), by GLM's level names; a template without that one takes its lowest."""
+    2 high, 3 the client's top), by GLM's level names; a template without that one
+    takes its lowest. High stays high: GLM's max nearly doubles an agent's output tokens."""
     if not efforts:
         raise ValueError(f"{asked}: this model has no reasoning levels")
-    wanted = ("low", "high", "max")[rank]
+    wanted = ("low", "high", "high", "max")[rank]
     return wanted if wanted in efforts else efforts[0]
 
 

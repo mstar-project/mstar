@@ -40,7 +40,7 @@ _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "strea
            "prefix_cache"}
 _COUNT_FIELDS = {"model", "messages", "system", "tools", "tool_choice", "thinking", "context_management",
                  "output_config"}
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "max": 2}
+_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "max": 3}
 
 _STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens"}
 

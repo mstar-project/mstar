@@ -525,8 +525,9 @@ stateless.
   ``thinking: {"type": "disabled"}``, ``reasoning.effort: "none"``) is a ``400``. A Messages
   request without ``thinking`` gets the model's default, and ``thinking.budget_tokens`` is
   checked as Anthropic checks it but not enforced. ``output_config.effort`` (Messages) and
-  ``reasoning.effort`` (Responses) pick the template's level. ``context_management`` is
-  served for keeping every thinking block; other edits are a ``400``. Claude Code's deferred
+  ``reasoning.effort`` (Responses) pick the template's level by name: ``high`` (Claude Code's
+  default) and ``medium`` are GLM's ``high``, ``max`` and ``xhigh`` its ``max``.
+  ``context_management`` is served for keeping every thinking block; other edits are a ``400``. Claude Code's deferred
   tools (``defer_loading``) and its tool search's ``tool_reference`` results go to the
   template, which lists a deferred tool once a result references it. Thinking blocks carry
   an empty ``signature``; a Responses reply carries its reasoning as a ``reasoning`` item's

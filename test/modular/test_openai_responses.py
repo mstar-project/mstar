@@ -89,7 +89,7 @@ def test_input_items_translate_onto_the_chat_template():
 
 @pytest.mark.parametrize("effort, glm52, glm53", [
     ("minimal", "high", "low"), ("low", "high", "low"), ("medium", "high", "high"),
-    ("high", "max", "max"), ("xhigh", "max", "max"),
+    ("high", "high", "high"), ("xhigh", "max", "max"),
 ])
 def test_reasoning_effort_maps_onto_each_templates_levels(effort, glm52, glm53):
     from mstar.api_server.openai import adapters, serving_responses

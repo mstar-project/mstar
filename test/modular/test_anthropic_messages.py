@@ -163,8 +163,8 @@ def test_claude_codes_request_translates():
         ("system", "# Environment\ncwd: /repo")]
     mk = adapter.chat_to_request(req, "/nonexistent").model_kwargs
     assert [m["role"] for m in mk["messages"]] == ["system", "user", "system"]
-    # keep 'all' is the template's clear_thinking off; Anthropic's default effort is GLM-5.3's top level
-    assert mk["chat_template_kwargs"] == {"enable_thinking": True, "clear_thinking": False, "reasoning_effort": "max"}
+    # keep 'all' is the template's clear_thinking off; effort high is the template's high
+    assert mk["chat_template_kwargs"] == {"enable_thinking": True, "clear_thinking": False, "reasoning_effort": "high"}
 
 
 # Claude Code 2.1.309's tool search, as recorded: a deferred tool, the search's call, and its
@@ -233,7 +233,7 @@ def test_a_request_can_turn_its_prefix_cache_off():
 
 
 @pytest.mark.parametrize("effort, glm52, glm53", [
-    ("low", "high", "low"), ("medium", "high", "high"), ("high", "max", "max"), ("max", "max", "max"),
+    ("low", "high", "low"), ("medium", "high", "high"), ("high", "high", "high"), ("max", "max", "max"),
 ])
 def test_effort_maps_onto_each_templates_levels(effort, glm52, glm53):
     from mstar.api_server.openai import adapters, serving_messages
