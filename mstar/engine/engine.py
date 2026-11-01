@@ -62,6 +62,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StepOrder,
     StopCheck,
+    StopPolicy,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -1138,6 +1139,15 @@ class Engine:
         if batch.committed is not None:
             self._runner.after_output_copy(batch.committed)
 
+    def step_finished(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        host_rows: HostRows | None = None,
+    ) -> None:
+        """A step's outputs are on the host (the stop check's copy) and its
+        stops not yet decided: so a request ending here has its state up to
+        date, e.g. its pages indexed for prefix reuse."""
+        self.extend_prefix_chains(batch, outputs, host_rows=host_rows)
+
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
@@ -1901,6 +1911,13 @@ class Engine:
                 self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
         laps.lap("tail")
         return outputs
+
+    def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
+        """The node's declared stop policies on ``graph_walk``
+        (``NodeSubmodule.get_stop_policies``); None when ``check_stop``
+        decides, or the node has no submodule here."""
+        mgmt = self._submodules.get(node_name)
+        return None if mgmt is None else mgmt.submodule.get_stop_policies(graph_walk)
 
     def check_stop_for_batch(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
