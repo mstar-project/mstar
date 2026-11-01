@@ -66,6 +66,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_TEXT_DECODE,
     VISION_ATTN,
     Qwen3OmniModelConfig,
 )
@@ -73,17 +74,22 @@ from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
     StopCheck,
 )
+from mstar.utils.knobs import device_loopback_enabled, ingraph_decode_rope
 
 logger = logging.getLogger(__name__)
 
 # The vision tower's block loop, as a piecewise capture region
 VISION_BLOCK_LOOP = "vision_block_loop"
+
+THINKER_DECODE_WALKS = frozenset({"thinker_decode", THINKER_TEXT_DECODE})
 
 
 def talker_text_mask(input_ids: torch.Tensor, config: Qwen3OmniModelConfig) -> torch.Tensor:
@@ -370,13 +376,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
       - prefill_audio:  splice audio embeddings, extend KV cache
       - prefill_vision: splice vision embeddings, extend KV cache
       - thinker_decode: embed previous token, single-step decode
+      - thinker_text_decode: the same with no audio output: the token loops
+        back on the device and nothing goes to the Talker
 
-    All walks produce ``thinker_states`` (layer-0 + layer-N concat) that
-    stream to the Talker partition.  ``thinker_decode`` additionally
-    produces ``logits`` for text token sampling.
+    All walks but the last produce ``thinker_states`` (layer-0 + layer-N
+    concat) that stream to the Talker partition.  The decode walks
+    additionally produce ``logits`` for text token sampling.
     """
 
     cuts_tensor_inputs = True
+    # thinker_text_decode reads its input ids off the sampler's slot masters
+    reads_device_loopback = True
 
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
@@ -478,9 +488,19 @@ class ThinkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
+        if graph_walk == THINKER_TEXT_DECODE:
+            if has_loopback and self._device_loopback():
+                # read off the sampler's slot master in `preprocess`
+                return ARNodeInputs(input_seq_len=1)
+            # the embeds are for a mixed step, which packs by embeds
+            token_id = inputs["text_inputs"][0].to(device).reshape(1)
+            return ARNodeInputs(
+                input_seq_len=1, input_ids=token_id, input_embeds=self.model.model.embed_tokens(token_id),
+            )
         start_pos = self.node_resources[THINKER_POS].position(
             rid=fwd_info.rid_handle, label="main"
         )
@@ -665,12 +685,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> SubmoduleStep:
         row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         kept_rids = None
-        if graph_walk != "thinker_decode":
+        if graph_walk not in THINKER_DECODE_WALKS:
             # decode rows, and the last prefill, keep their token through `postprocess`
             info = per_request_info or {}
             kept_rids = frozenset(
                 rid for rid, walk in zip(request_ids, row_walks, strict=True)
-                if walk == "thinker_decode" or (
+                if walk in THINKER_DECODE_WALKS or (
                     rid in info and info[rid].step_metadata.get("is_last_prefill", False)
                 )
             )
@@ -681,7 +701,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
         pos_advance = None
-        if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
+        if graph_walk not in THINKER_DECODE_WALKS and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
             # A vision row's 3D-grid MRoPE span differs from its token count, and
             # a cut audio row moves past its whole clip, so each advances the
             # counter by its own `mrope_pos_advance`.
@@ -722,10 +742,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         self.model.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
         device = self.get_device()
+        if graph_walk == THINKER_TEXT_DECODE:
+            return self._preprocess_text_decode(engine_inputs, inputs)
         # Concatenate across requests
-        input_embeds = torch.cat([
-            inp.input_embeds for inp in inputs
-        ], dim=0)
+        input_embeds = torch.cat(self._row_embeds(engine_inputs, inputs), dim=0)
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         seq_lens = [
             inp.input_seq_len for inp in inputs
@@ -751,15 +771,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # ``forward_batched``/``forward`` reassemble the list from kwargs.
             extra_inputs = self._deepstack_inputs(inputs, input_embeds.dtype, device)
 
-        if self.model.mask_padding:
-            # Real rows lead the bucket; the captured MoE skips the rest.
-            # A fill kernel, so no H2D copy.
-            num_valid = engine_inputs.real_seq_len
-            if num_valid is None:
-                num_valid = input_embeds.shape[0]
-            extra_inputs["num_valid_tokens"] = torch.full(
-                (1,), num_valid, dtype=torch.int64, device=device,
-            )
+        extra_inputs.update(self._num_valid_tokens(engine_inputs, input_embeds.shape[0]))
 
         return {
             "input_embeds": input_embeds,
@@ -774,8 +786,99 @@ class ThinkerSubmodule(ARNodeSubmodule):
             **extra_inputs
         }
 
+    def _num_valid_tokens(self, engine_inputs: ModelInputsFromEngine, rows: int) -> dict[str, torch.Tensor]:
+        if not self.model.mask_padding:
+            return {}
+        # Real rows lead the bucket; the captured MoE skips the rest.
+        # A fill kernel, so no H2D copy.
+        num_valid = engine_inputs.real_seq_len
+        if num_valid is None:
+            num_valid = rows
+        return {"num_valid_tokens": torch.full(
+            (1,), num_valid, dtype=torch.int64, device=self.get_device(),
+        )}
+
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         return mrope_position_ids(self.node_resources[THINKER_POS].pos_ids("main"), inputs)
+
+    def _device_loopback(self) -> bool:
+        return (
+            device_loopback_enabled()
+            and self.node_resources[THINKER_SAMPLER].has_slot_masters
+        )
+
+    def _row_embeds(
+        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
+    ) -> list[torch.Tensor]:
+        """Each row's embeds; a mixed step's loop-back rows embed their last
+        sampled token here."""
+        if all(inp.input_embeds is not None for inp in inputs):
+            return [inp.input_embeds for inp in inputs]
+        sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
+        embeds = self.model.model.embed_tokens(sampler.loopback_tokens(engine_inputs.request_ids))
+        return [
+            embeds[i:i + 1] if inp.input_embeds is None else inp.input_embeds
+            for i, inp in enumerate(inputs)
+        ]
+
+    def _preprocess_text_decode(
+        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        if any(inp.input_ids is None for inp in inputs):
+            sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
+            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            # rows whose last step ran elsewhere brought their token
+            routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
+            if routed:
+                sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
+            out["input_ids"] = ids
+        else:
+            out["input_ids"] = torch.cat([inp.input_ids for inp in inputs])
+        out.update(self._num_valid_tokens(engine_inputs, out["input_ids"].shape[0]))
+        if self._ingraph_rope(engine_inputs):
+            return out
+        out["cos_3d"], out["sin_3d"] = compute_3d_cos_sin(
+            self._position_ids_3d(inputs), self._get_inv_freq(self.get_device()),
+            mrope_section=self.MROPE_SECTION, target_dtype=self.model.model.embed_tokens.weight.dtype,
+        )
+        return out
+
+    @staticmethod
+    def _ingraph_rope(engine_inputs: ModelInputsFromEngine) -> bool:
+        """A step replayed on a leased slot, or being captured for one, builds
+        its rotary tables in the graph (``ingraph_decode_rope``)."""
+        ctx = getattr(getattr(engine_inputs, "step", None), "ctx", None)
+        return ingraph_decode_rope() and ctx is not None and getattr(ctx, "slot_lease", None) is not None
+
+    def _text_decode(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        cos_3d: torch.Tensor | None,
+        sin_3d: torch.Tensor | None,
+        num_valid_tokens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """One decode step of a request with no audio output: the sampled tokens."""
+        embeds = self.model.model.embed_tokens(input_ids)
+        if cos_3d is None or self._ingraph_rope(engine_inputs):
+            # one token per row, at the position resource's planned positions
+            pos = self.node_resources[THINKER_POS].pos_ids("main")[:input_ids.shape[0]]
+            cos_3d, sin_3d = compute_3d_cos_sin(
+                pos.unsqueeze(0).expand(3, -1), self._get_inv_freq(embeds.device),
+                mrope_section=self.MROPE_SECTION, target_dtype=embeds.dtype,
+            )
+        hidden, _, _ = self.model(
+            input_embeds=embeds,
+            cos_sin_3d=(cos_3d, sin_3d),
+            mrope_section=self.MROPE_SECTION,
+            label="main",
+            num_valid_tokens=num_valid_tokens,
+            keep_states=False,
+        )
+        return engine_inputs.resources[THINKER_SAMPLER].sample(
+            engine_inputs.request_ids, logits=self.model.lm_head(hidden),
+        )
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
@@ -854,6 +957,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ``deepstack`` (used by prefill_vision) is reassembled from per-layer
         ``deepstack_<i>`` kwargs — see ``_collect_deepstack_kwargs``.
         """
+        if graph_walk == THINKER_TEXT_DECODE:
+            return {"new_token": [self._text_decode(
+                engine_inputs, kwargs["input_ids"], cos_3d, sin_3d, kwargs.get("num_valid_tokens"),
+            )]}
         deepstack = self._collect_deepstack_kwargs(kwargs)
         request_info: CurrentForwardPassInfo = engine_inputs.single_request_info
         audio_output = request_info.step_metadata.get(
@@ -874,7 +981,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         result: NameToTensorList = {}
 
         # Decode: produce logits for text token sampling
-        if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
+        if graph_walk in THINKER_DECODE_WALKS or request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
                 engine_inputs.request_ids, logits=logits
@@ -921,6 +1028,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> list[AcceleratorGraphConfig]:
         vision_input = functools.partial(self._vision_capture_input, device)
         return [
+            BatchedAcceleratorGraphConfig(
+                capture_graph_walk=THINKER_TEXT_DECODE,
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1,
+                ),
+                capture_batch_sizes=[1, 2, 4, 8, 16, 32],
+            ),
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="thinker_decode",
                 single_request_inputs=ARNodeInputs(
@@ -1035,11 +1150,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """Batched Thinker forward shared between ``thinker_decode`` and the prefill walks.
 
         Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
-        Always packs ``thinker_states`` + ``thinker_mask`` in every per-rid
-        output dict so the captured CUDA graph has a static output shape
-        regardless of request metadata. Per-rid filtering happens in
-        ``unpack_packed_output``.
+        ``thinker_decode`` runs for audio output only, so every row's
+        ``thinker_states`` + ``thinker_mask`` go to the Talker. Prefill packs
+        them for ``unpack_packed_output`` to cut and filter per request.
         """
+        if graph_walk == THINKER_TEXT_DECODE:
+            new_tokens = self._text_decode(
+                engine_inputs, kwargs["input_ids"], cos_3d, sin_3d, kwargs.get("num_valid_tokens"),
+            )
+            # Row i is request i: one clone and one D2H copy per step. The
+            # prefix cache keys a reply from this host copy, under `text_inputs`.
+            return BatchedModelOutput(
+                row_outputs={"new_token": new_tokens},
+                check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+            )
 
         is_prefill = graph_walk in (
             "prefill_text", "prefill_audio", "prefill_vision", THINKER_MIXED,
@@ -1077,14 +1201,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     [layer_0_embed, layer_0_embed], dim=-1,
                 )
 
-            return {
-                "__batched_thinker_states__": thinker_states,
-                **{
-                    rid: {
-                        "new_token": [new_tokens[i:i + 1]]
-                    } for i, rid in enumerate(request_ids)
-                }
-            }
+            return BatchedModelOutput(
+                packed_outputs={"__batched_thinker_states__": thinker_states},
+                row_outputs={"new_token": new_tokens},
+                # a mixed step's text-decode rows take the stop check and the
+                # inline emit off these, as in a step of their own walk
+                check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+            )
 
         # thinker_decode (existing behavior)
         logits = self.model.lm_head(hidden)  # (batch, vocab)
@@ -1126,8 +1249,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         reattach the per-request talker masks, which live on the original
         ARNodeInputs (the captured graph never saw them — masks vary in
         shape with text content). Drops per-rid emission for requests with
-        ``audio_output=False``, mirroring ``filter_batched_output``'s gating
-        for the decode path.
+        ``audio_output=False``, which have no Talker to send them to.
         """
         packed_states = static_output.get("__batched_thinker_states__")
         if packed_states is None:
@@ -1160,7 +1282,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        return_token = request_info.graph_walk == "thinker_decode" or \
+        return_token = request_info.graph_walk in THINKER_DECODE_WALKS or \
             request_info.step_metadata.get("is_last_prefill", False)
         if not return_token:
             outputs.pop("new_token", None)
@@ -1198,42 +1320,56 @@ class ThinkerSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
+    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
+        ignore_eos = request_info.resource_configs[THINKER_SAMPLER].ignore_eos
+        decoded = request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1
+        return (not ignore_eos and token == self.config.im_end_token_id) or decoded >= request_info.max_tokens
+
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs or request_info.graph_walk != "thinker_decode":
+        if "new_token" not in outputs or request_info.graph_walk not in THINKER_DECODE_WALKS:
             return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos= request_info.resource_configs[THINKER_SAMPLER].ignore_eos
-        eos_token_id = self.config.im_end_token_id
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"thinker_decode_loop"}
-        return set()
+        return {"thinker_decode_loop"} if self._stops(outputs["new_token"][0].item(), request_info) else set()
 
-    def filter_batched_output(
+    def check_stop_batched(
         self,
-        request_info: CurrentForwardPassInfo,
-        rid_output: dict[str, list[torch.Tensor]],
-    ) -> dict[str, list[torch.Tensor]]:
-        """Drop ``thinker_states`` + ``thinker_mask`` for text-only requests.
-
-        ``forward_batched`` always emits these keys so the captured CUDA
-        graph's output shape is static.  Here, outside the captured
-        region, we gate them on the real request's ``audio_output`` flag
-        so the Talker edge stays unrouted for text-only requests (matches
-        the pre-capture eager-mode behaviour).
-        """
-        if request_info is None:
-            return rid_output
-        if request_info.step_metadata.get("audio_output", True):
-            return rid_output
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist``. Only a decode
+        row's stop can end the loop."""
+        if step_walk is not None and step_walk not in THINKER_DECODE_WALKS:
+            return {}
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
+            return None
         return {
-            k: v for k, v in rid_output.items()
-            if k not in ("thinker_states", "thinker_mask")
+            rid: {"thinker_decode_loop"} for rid, token in pairs
+            if request_infos[rid].graph_walk in THINKER_DECODE_WALKS and self._stops(token, request_infos[rid])
         }
+
+    def uniform_row_inputs(self, graph_walk: str, has_loopback: bool = False) -> ARNodeInputs | None:
+        if graph_walk == THINKER_TEXT_DECODE and has_loopback and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == THINKER_TEXT_DECODE and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the stop check already has the sampled token on the host
+        return {"text_inputs": "new_token"} if graph_walk == THINKER_TEXT_DECODE else {}
+
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # decode rows are one token each, like the template, and declare nothing else
+        return graph_walk in THINKER_DECODE_WALKS
 
 
 # ===================================================================

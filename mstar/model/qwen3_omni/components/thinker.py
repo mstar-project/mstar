@@ -215,7 +215,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         label: str = "main",
         num_valid_tokens: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        keep_states: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             input_embeds: [tokens, hidden_size] -- pre-embedded input
@@ -229,6 +230,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                 stored length and position counter advance when the runner
                 commits the declared step (vision prefill declares its
                 MRoPE 3D-grid span there).
+            keep_states: False skips the two states below, which only the
+                Talker reads.
 
         Returns:
             hidden_states: [tokens, hidden_size] -- final normed hidden states
@@ -239,7 +242,7 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         hidden_states = input_embeds
 
         # Capture input embeddings BEFORE any transformer layers
-        layer_0_embed = hidden_states.clone()
+        layer_0_embed = hidden_states.clone() if keep_states else None
         layer_n_hidden = None
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
 
@@ -264,7 +267,7 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                 )
 
             # Capture hidden states at the accept_hidden_layer for Talker
-            if layer_idx == self.accept_hidden_layer:
+            if keep_states and layer_idx == self.accept_hidden_layer:
                 layer_n_hidden = hidden_states.clone()
 
         # Final layer norm
