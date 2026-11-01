@@ -11,11 +11,12 @@ from mstar.utils.fp8_block import Fp8BlockQuantConfig
 # Engine resource labels for the one LLM node: the paged (latent) KV cache,
 # the attention resource planned over it, the token positions over it, the
 # sampler. Layers bind the first three by these names (``bind_resources``); the
-# model declares all four in ``get_node_resources``. The positions and the
-# sampler take `keys`' names, which `SampledTokenDecoder` declares its steps on.
+# model declares all four in ``get_node_resources``. The sampler takes `keys`'
+# name, which `SampledTokenDecoder` declares its step on; the node's ``POS_KEY``
+# names the positions.
 KV_RESOURCE = "kv"
 ATTN_RESOURCE = "attn"
-POS_RESOURCE = keys.ROPE
+POS_RESOURCE = "pos"
 SAMPLER_RESOURCE = keys.SAMPLER
 # dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
 DSA_RESOURCE = "dsa"

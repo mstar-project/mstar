@@ -200,7 +200,7 @@ def test_declare_step_shapes():
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     inputs = [sub.prepare_inputs("prefill", _fwd_info("r0", 8, True), {"text_inputs": [torch.tensor([1, 2, 3])]})]
     step = sub.declare_step("prefill", ["r0"], inputs)
-    assert set(step.keys()) == {"kv", "attn", "rope", "sampler"}
+    assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
     assert step.segments[0].span == 3
 
 

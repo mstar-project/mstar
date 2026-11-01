@@ -47,6 +47,7 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
 
     PREFILL_WALK = "prefill"
     ATTN_KEY = ATTN_RESOURCE
+    POS_KEY = POS_RESOURCE
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     # the engine's default ladder: the shipped configs serve at most 64 requests at once
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]

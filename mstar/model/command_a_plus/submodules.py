@@ -68,6 +68,8 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
     reads_device_loopback = False
+    # prefill stays eager: its captures are unmeasured on this model
+    CAPTURE_PREFILL = False
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         return {}
@@ -87,12 +89,8 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        # Prefill stays eager: its captures are unmeasured on this model. Decode
-        # captures uncompiled, as the eager forward runs (disable_torch_compile).
-        decode = [
-            config for config in super().get_accelerator_graph_configs(device, tp_world_size)
-            if config.capture_graph_walk == self.DECODE_WALK
-        ]
-        for config in decode:
+        # decode captures uncompiled, as the eager forward runs (disable_torch_compile)
+        configs = super().get_accelerator_graph_configs(device, tp_world_size)
+        for config in configs:
             config.compile = False
-        return decode
+        return configs
