@@ -765,7 +765,7 @@ def test_encoder_a_streams_last_frames_do_not_depend_on_its_batch(b_len, a_chunk
 
 def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
     """A pass pads every stream to its longest chunk, so a step holding an upload
-    or a large append is not batched: can_batch refuses it, by the chunk length
+    or an opening clip is not batched: can_batch refuses it, by the chunk length
     prepare_inputs reports, and the engine runs each stream's step on its own.
     Streams with a second or less share one pass. The frames are the offline
     ones either way."""

@@ -1,7 +1,16 @@
-"""``/v1/realtime`` (transcription intent): streaming speech-to-text over a WebSocket.
+"""``/v1/realtime``: OpenAI's Realtime API over a WebSocket, two intents.
 
-A subset of OpenAI's Realtime transcription session, enough for a client
-that streams microphone audio and wants partial transcripts:
+The conversation intent (:class:`RealtimeConversation`, GA events) serves a
+full-duplex model, one that declares a ``ClientAudio`` client stream and
+decides when to speak; see its docstring. The transcription intent
+(``?intent=transcription``, :class:`RealtimeTranscription`, the beta
+transcription-session events) streams speech-to-text with partial results.
+Both take audio in OpenAI's formats, converted on the socket to what the
+model hears.
+
+The transcription intent is a subset of OpenAI's Realtime transcription
+session, enough for a client that streams microphone audio and wants partial
+transcripts:
 
 Client events
     ``transcription_session.update``  ``{"session": {"input_audio_transcription":
@@ -11,10 +20,13 @@ Client events
     ``input_audio_buffer.commit``      end of the utterance: flush and finish
     ``input_audio_buffer.clear``       drop buffered audio and start over
 
-``input_audio_format`` is ``"pcm16"`` (16 kHz, the default) or OpenAI's
-``{"type": "audio/pcm", "rate": 24000}``; 24 kHz audio is resampled to the
-model's 16 kHz as it arrives, so partial ``audio_seconds`` stay on the
-client's timeline. The rate changes only with an empty buffer.
+``input_audio_format`` is ``"pcm16"`` (PCM16 at 16 kHz, the default; OpenAI
+reads it as 24 kHz), ``"g711_ulaw"`` or ``"g711_alaw"`` (8 kHz), or a GA format
+object (``{"type": "audio/pcm", "rate": N}`` at a rate in ``REALTIME_RATES``,
+``{"type": "audio/pcmu"}``, ``{"type": "audio/pcma"}``).
+Audio at another rate is resampled to 16 kHz as it arrives, so partial
+``audio_seconds`` stay on the client's timeline. The format changes only with
+an empty buffer.
 
 ``turn_detection`` null (the default) leaves ending an utterance to the
 client's commit. ``{"type": "server_vad", "threshold", "prefix_padding_ms",
@@ -64,33 +76,46 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import itertools
 import json
 import logging
 import math
 import re
 import reprlib
+import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from mstar.api_server import media_io
 from mstar.api_server.openai import realtime_vad
-from mstar.api_server.openai._util import now, rid
+from mstar.api_server.openai._util import error_type, now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
-from mstar.utils.utf8_stream import decode_joined
+from mstar.utils.utf8_stream import Utf8Stream, decode_joined
+
+if TYPE_CHECKING:
+    from mstar.streaming.topology import Connection
 
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
-# Input rates a session accepts; 24 kHz (OpenAI's pcm rate) is resampled to SAMPLE_RATE.
-INPUT_SAMPLE_RATES = (16000, 24000)
-# Appends up to this many input samples (4 ms at 24 kHz) cost less to resample
-# than a thread hop, so they resample on the event loop; longer ones go to a thread.
-INLINE_RESAMPLE_SAMPLES = 96
+# OpenAI's PCM16 rate, and G.711's
+OPENAI_PCM_RATE = 24000
+G711_RATE = 8000
+# The PCM rates a socket takes. A closed set bounds what resampling one
+# append costs (at most 6x its samples, about 100 taps each), which a bound on
+# the kernel's size alone does not.
+REALTIME_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
+# Audio up to this many samples (80 ms at 24 kHz) resamples in under half a
+# millisecond, short enough for the event loop every socket shares, and
+# saves the thread hop; longer audio goes to a thread.
+INLINE_RESAMPLE_SAMPLES = 1920
 # Longest server_vad prefix padding or silence window.
 MAX_VAD_MS = 10_000
 DEFAULT_CHUNK_SECONDS = 2.0
@@ -100,8 +125,16 @@ DEFAULT_UNFIXED_TOKENS = 5
 # session at 2 requests per second of audio. A shorter chunk is under a word
 # and adds little to the hypothesis.
 MIN_CHUNK_SECONDS = 0.5
-# Longest uncommitted item: the most audio one step decodes.
+# Longest uncommitted item: the most audio one step decodes. One append is
+# capped at this too, on both intents, as it is resampled before any other cap.
 MAX_ITEM_SECONDS = 300.0
+# Most silence a conversation pads one pause in the client's audio with:
+# longer than a reply, so a client that mutes its mic hears the agent out.
+MAX_PAD_SECONDS = 30.0
+# How late a client's audio may run (network jitter, this server's own event
+# loop) before the call counts a pause and pads it: silence padded into the
+# middle of speech reads to a duplex model as the user yielding the turn.
+JITTER_SECONDS = 0.2
 # Longest excerpt of a client value quoted in an error.
 EXCERPT_CHARS = 100
 # Longest language a session accepts: a code ("en", "zh-Hant") or a name.
@@ -159,8 +192,8 @@ class RealtimeSession:
     # the first byte of a sample whose second byte is in the next append;
     # kept across commit (the byte stream goes on), dropped by clear
     odd_byte: bytes = b""
-    # the client's audio rate; anything but SAMPLE_RATE goes through resampler
-    input_rate: int = SAMPLE_RATE
+    # the client's audio; any rate but SAMPLE_RATE goes through resampler
+    input_format: AudioFormat = field(default_factory=lambda: AudioFormat("audio/pcm", SAMPLE_RATE))
     resampler: media_io.StreamResampler | None = None
     # samples the last chunk was short of its boundary (see take_chunk)
     short: int = 0
@@ -177,10 +210,10 @@ class RealtimeSession:
     def chunk_samples(self) -> int:
         return int(round(self.chunk_seconds * SAMPLE_RATE))
 
-    def set_input_rate(self, rate: int) -> None:
+    def set_input_format(self, fmt: AudioFormat) -> None:
         self.clock_base, self.clock_in = self.stream_samples, 0
-        self.input_rate = rate
-        self.resampler = None if rate == SAMPLE_RATE else media_io.StreamResampler(rate, SAMPLE_RATE)
+        self.input_format = fmt
+        self.resampler = None if fmt.rate == SAMPLE_RATE else media_io.StreamResampler(fmt.rate, SAMPLE_RATE)
 
     def resample(self, audio: np.ndarray) -> np.ndarray:
         self.clock_in += int(audio.size)
@@ -207,7 +240,7 @@ class RealtimeSession:
         """After the resampler starts over (a commit or a clear), put the
         timeline back on the input clock: each start-over rounds its output
         up by less than a sample, which would add up over many of them."""
-        exact = self.clock_base + self.clock_in * SAMPLE_RATE // self.input_rate
+        exact = self.clock_base + self.clock_in * SAMPLE_RATE // self.input_format.rate
         if self.segmenter is not None:
             self.segmenter.shift(exact - self.stream_samples)
         self.stream_samples = exact
@@ -269,17 +302,79 @@ class RealtimeSession:
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
 
-def pcm16_to_float(payload: str, carry: bytes = b"") -> tuple[np.ndarray, bytes]:
-    """Base64 PCM16 (little-endian, mono) -> (float32 in [-1, 1), the odd
-    trailing byte). ``carry`` is the previous append's odd byte, so a sample
-    split across two appends is joined instead of shifting every sample after
-    it. Strict decoding: a malformed payload is an error, not silence."""
-    # whitespace is allowed (base64.encodebytes wraps lines); anything else
-    # outside the alphabet is an error. translate stays linear in the payload
-    # where split() would build a list of its pieces
-    raw = carry + base64.b64decode(payload.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
+class AudioFormat(NamedTuple):
+    """A socket's audio on the wire: ``codec`` ``audio/pcm`` (PCM16, little
+    endian, mono), ``audio/pcmu`` or ``audio/pcma`` (G.711), at ``rate`` Hz."""
+    codec: str
+    rate: int
+
+    def view(self) -> dict:
+        return {"type": self.codec, "rate": self.rate} if self.codec == "audio/pcm" else {"type": self.codec}
+
+
+def _audio_format(fmt, name: str) -> AudioFormat:
+    """The GA format object ``fmt``: ``{"type": "audio/pcm", "rate": N}``
+    (24 kHz when left out) or ``{"type": "audio/pcmu" | "audio/pcma"}``
+    (8 kHz)."""
+    fmt = _object(fmt, name)
+    codec = fmt.get("type")
+    if not isinstance(codec, str) or codec not in ("audio/pcm", "audio/pcmu", "audio/pcma"):
+        raise ValueError(f'{name}.type must be "audio/pcm", "audio/pcmu" or "audio/pcma"; got {_excerpt(codec)}')
+    if extra := sorted(set(fmt) - {"type", "rate"}):
+        # channels, encoding and the like would change how the bytes read
+        raise ValueError(f"{name} takes only type and rate; got {_excerpt(extra)}")
+    rate = fmt.get("rate", OPENAI_PCM_RATE if codec == "audio/pcm" else G711_RATE)
+    if codec != "audio/pcm" and rate != G711_RATE:
+        raise ValueError(f"{name}: {codec} is {G711_RATE} Hz; got rate {_excerpt(rate)}")
+    if isinstance(rate, bool) or not isinstance(rate, int) or rate not in REALTIME_RATES:
+        raise ValueError(f"{name}.rate {_excerpt(rate)} Hz is not supported; use one of {list(REALTIME_RATES)}")
+    return AudioFormat(codec, rate)
+
+
+def decode_base64(payload: str) -> bytes:
+    """An append's base64 payload, strictly: whitespace is allowed
+    (base64.encodebytes wraps lines), anything else outside the alphabet
+    raises, as does a payload that is not a string."""
+    # translate stays linear in the payload where split() would build a list of its pieces
+    return base64.b64decode(payload.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
+
+
+def decode_append(payload: str, carry: bytes = b"", codec: str = "audio/pcm") -> tuple[np.ndarray, bytes]:
+    """A base64 append in ``codec`` -> (float32 in [-1, 1), the odd trailing
+    byte). ``carry`` is the previous append's odd byte (PCM16 only; a G.711
+    sample is one byte), so a sample split across two appends is joined
+    instead of shifting every sample after it. Strict decoding: a malformed
+    payload is an error, not silence."""
+    raw = carry + decode_base64(payload)
+    if codec != "audio/pcm":
+        return media_io.g711_decode(raw, codec).astype(np.float32) / 32768.0, b""
     whole = len(raw) - len(raw) % 2
     return np.frombuffer(raw[:whole], dtype="<i2").astype(np.float32) / 32768.0, raw[whole:]
+
+
+def _append_error(audio: np.ndarray, rate: int) -> dict | None:
+    """The ``error`` for an append of more than ``MAX_ITEM_SECONDS`` of
+    ``rate`` audio, or None."""
+    if audio.size <= MAX_ITEM_SECONDS * rate:
+        return None
+    return error_event(f"an append holds at most {MAX_ITEM_SECONDS:g} s of audio; send it in shorter appends")
+
+
+def encode_audio(audio: np.ndarray, codec: str) -> str:
+    """float32 audio -> base64 in ``codec``."""
+    pcm = media_io.to_pcm16(audio)
+    return base64.b64encode(pcm.tobytes() if codec == "audio/pcm" else media_io.g711_encode(pcm, codec)).decode("ascii")
+
+
+# The transcription intent's beta names for formats. "pcm16" is 16 kHz, as an
+# omitted format is and as this endpoint has always read it (OpenAI reads it
+# as 24 kHz; a client at 24 kHz declares {"type": "audio/pcm", "rate": 24000}).
+_BETA_FORMATS = {
+    "pcm16": AudioFormat("audio/pcm", SAMPLE_RATE),
+    "g711_ulaw": AudioFormat("audio/pcmu", G711_RATE),
+    "g711_alaw": AudioFormat("audio/pcma", G711_RATE),
+}
+_BETA_NAMES = {fmt: name for name, fmt in _BETA_FORMATS.items()}
 
 
 def _excerpt(value) -> str:
@@ -329,26 +424,15 @@ def _object(value, name: str) -> dict:
     return value
 
 
-def _input_rate(fmt, current: int) -> int:
-    """The input rate an ``input_audio_format`` declares (``current`` when
-    absent): ``"pcm16"`` is 16 kHz, as this endpoint has always read it;
-    OpenAI's ``{"type": "audio/pcm", "rate": N}`` names its rate (24 kHz when
-    left out, OpenAI's only one)."""
+def _input_format(fmt, current: AudioFormat) -> AudioFormat:
+    """The transcription intent's ``input_audio_format`` (``current`` when absent)."""
     if fmt is None:
         return current
-    if fmt == "pcm16":
-        return SAMPLE_RATE
-    if isinstance(fmt, dict) and fmt.get("type") == "audio/pcm":
-        if extra := sorted(set(fmt) - {"type", "rate"}):
-            # channels, encoding and the like would change how the bytes read
-            raise ValueError(f"input_audio_format takes only type and rate; got {_excerpt(extra)}")
-        rate = fmt.get("rate", 24000)
-        if not isinstance(rate, bool) and rate in INPUT_SAMPLE_RATES:
-            return int(rate)
-        raise ValueError(f"input_audio_format.rate must be 16000 or 24000; got {_excerpt(rate)}")
-    raise ValueError(
-        f'input_audio_format must be "pcm16" or {{"type": "audio/pcm", "rate": 24000}}; got {_excerpt(fmt)}'
-    )
+    if isinstance(fmt, str) and fmt in _BETA_FORMATS:
+        return _BETA_FORMATS[fmt]
+    if isinstance(fmt, dict):
+        return _audio_format(fmt, "input_audio_format")
+    raise ValueError(f"input_audio_format must be pcm16, g711_ulaw, g711_alaw or an object; got {_excerpt(fmt)}")
 
 
 def _number(knobs: dict, name: str, default, lo: float, hi: float = math.inf, integer: bool = False,
@@ -490,15 +574,55 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
     return prefix + text
 
 
-def _event(kind: str, **fields) -> dict:
+def server_event(kind: str, **fields) -> dict:
+    """A server event: ``kind`` with a fresh ``event_id``."""
     return {"event_id": f"event_{uuid.uuid4().hex[:12]}", "type": kind, **fields}
 
 
-def _error(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict:
+def error_event(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict:
     error = {"type": kind, "message": message}
     if code is not None:
         error["code"] = code
-    return _event("error", error=error)
+    return server_event("error", error=error)
+
+
+def response_object(response_id: str, status: str, modalities: list[str], output: list | None = None,
+                    status_details: dict | None = None) -> dict:
+    """A GA ``realtime.response``, as ``response.created`` / ``.done`` carry it."""
+    response = {"id": response_id, "object": "realtime.response", "status": status,
+                "output_modalities": modalities, "max_output_tokens": "inf", "output": output or []}
+    if status_details is not None:
+        response["status_details"] = status_details
+    return response
+
+
+def content_event(kind: str, response_id: str, item_id: str, **fields) -> dict:
+    """A GA event about a response's one content part (``response.output_audio.delta`` and the like)."""
+    return server_event(kind, response_id=response_id, item_id=item_id, output_index=0, content_index=0, **fields)
+
+
+async def _events(ws: WebSocket, send):
+    """A socket's client events as dicts, until it disconnects. A frame that
+    is not a JSON object is answered with an ``error`` and skipped."""
+    while True:
+        # receive_text() raises KeyError on a binary frame
+        message = await ws.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        if message.get("text") is None:
+            await send(error_event("an event must be a JSON text message, not binary"))
+            continue
+        try:
+            event = json.loads(message["text"])
+        # ValueError covers JSONDecodeError and integers past Python's
+        # int-string digit limit; RecursionError is deep nesting
+        except (ValueError, RecursionError):
+            await send(error_event("not JSON"))
+            continue
+        if not isinstance(event, dict):
+            await send(error_event("an event must be a JSON object"))
+            continue
+        yield event
 
 
 class RealtimeTranscription:
@@ -523,9 +647,7 @@ class RealtimeTranscription:
         return {
             "id": s.session_id,
             "object": "realtime.transcription_session",
-            "input_audio_format": (
-                "pcm16" if s.input_rate == SAMPLE_RATE else {"type": "audio/pcm", "rate": s.input_rate}
-            ),
+            "input_audio_format": _BETA_NAMES.get(s.input_format) or s.input_format.view(),
             "turn_detection": s.turn_detection.view() if s.turn_detection is not None else None,
             "input_audio_transcription": {
                 "model": self.model_name,
@@ -537,32 +659,15 @@ class RealtimeTranscription:
                 "unfixed_chunks": s.unfixed_chunks,
                 "unfixed_tokens": s.unfixed_tokens,
                 "max_item_seconds": s.max_item_seconds,
-                "sample_rate": s.input_rate,
+                "sample_rate": s.input_format.rate,
             },
         }
 
     async def run(self) -> None:
         await self.ws.accept()
-        await self.send(_event("transcription_session.created", session=self._session_view()))
+        await self.send(server_event("transcription_session.created", session=self._session_view()))
         try:
-            while True:
-                # receive_text() raises KeyError on a binary frame
-                message = await self.ws.receive()
-                if message["type"] == "websocket.disconnect":
-                    raise WebSocketDisconnect(message.get("code", 1000), message.get("reason"))
-                if message.get("text") is None:
-                    await self.send(_error("an event must be a JSON text message, not binary"))
-                    continue
-                try:
-                    event = json.loads(message["text"])
-                # ValueError covers JSONDecodeError and integers past Python's
-                # int-string digit limit; RecursionError is deep nesting
-                except (ValueError, RecursionError):
-                    await self.send(_error("not JSON"))
-                    continue
-                if not isinstance(event, dict):
-                    await self.send(_error("an event must be a JSON object"))
-                    continue
+            async for event in _events(self.ws, self.send):
                 await self.handle(event)
         except WebSocketDisconnect:
             return
@@ -573,20 +678,23 @@ class RealtimeTranscription:
             try:
                 self.update(_object(event.get("session"), "session"))
             except (TypeError, ValueError) as exc:
-                await self.send(_error(str(exc)))
+                await self.send(error_event(str(exc)))
                 return
-            await self.send(_event("transcription_session.updated", session=self._session_view()))
+            await self.send(server_event("transcription_session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
             s = self.session
             try:
                 # not `or ""`: a null is an error, not an empty append, on every realtime path
-                audio, odd_byte = pcm16_to_float(event.get("audio", ""), s.odd_byte)
+                audio, odd_byte = decode_append(event.get("audio", ""), s.odd_byte, s.input_format.codec)
             except Exception:  # noqa: BLE001 — bad base64
-                await self.send(_error("audio is not base64", code="invalid_audio"))
+                await self.send(error_event("audio is not base64", code="invalid_audio"))
+                return
+            if (error := _append_error(audio, s.input_format.rate)) is not None:
+                await self.send(error)
                 return
             # with server_vad the segmenter ends a turn at the cap instead
             if s.segmenter is None and s.item_samples(audio.size) > s.max_item_seconds * SAMPLE_RATE:
-                await self.send(_error(
+                await self.send(error_event(
                     f"the item would pass {s.max_item_seconds:g} s of audio; "
                     "commit or clear the input audio buffer first",
                 ))
@@ -625,9 +733,9 @@ class RealtimeTranscription:
             s.clear()
             s.odd_byte = b""
             s.reset_stream()
-            await self.send(_event("input_audio_buffer.cleared"))
+            await self.send(server_event("input_audio_buffer.cleared"))
         else:
-            await self.send(_error(f"unknown event {_excerpt(kind)}"))
+            await self.send(error_event(f"unknown event {_excerpt(kind)}"))
 
     async def apply(self, ops: list[tuple]) -> None:
         """Carry out segmenter operations in order (see ``TurnSegmenter``).
@@ -647,9 +755,11 @@ class RealtimeTranscription:
             elif op[0] == "commit":
                 await self.commit()
             elif op[0] == "speech_started":
-                await self.send(_event("input_audio_buffer.speech_started", audio_start_ms=op[1], item_id=s.item_id))
+                await self.send(server_event("input_audio_buffer.speech_started", audio_start_ms=op[1],
+                                             item_id=s.item_id))
             else:
-                await self.send(_event("input_audio_buffer.speech_stopped", audio_end_ms=op[1], item_id=s.item_id))
+                await self.send(server_event("input_audio_buffer.speech_stopped", audio_end_ms=op[1],
+                                             item_id=s.item_id))
 
     async def _end_of_turn_failed(self, exc: Exception) -> None:
         """semantic_vad's end-of-turn model raised: the segmenter no longer
@@ -661,7 +771,7 @@ class RealtimeTranscription:
         logger.error("realtime end-of-turn model failed (error id %s, session %s); semantic_vad turns now end "
                      "on silence alone", error_id, s.session_id, exc_info=exc)
         silence_s = realtime_vad.EAGERNESS[s.turn_detection.eagerness][2] / 1000
-        await self.send(_error(
+        await self.send(error_event(
             f"semantic_vad's end-of-turn model failed (error id {error_id}); this session's turns now end after "
             f"{silence_s:g} s of silence; send transcription_session.update to switch to server_vad",
             kind="server_error", code="end_of_turn_failed",
@@ -676,8 +786,8 @@ class RealtimeTranscription:
         else:
             # nothing left to hear: what was held back is final now
             await self.emit(self.current_text(), hold=0)
-        await self.send(_event("input_audio_buffer.committed", item_id=s.item_id))
-        await self.send(_event(
+        await self.send(server_event("input_audio_buffer.committed", item_id=s.item_id))
+        await self.send(server_event(
             "conversation.item.input_audio_transcription.completed",
             item_id=s.item_id, transcript=self.current_text(),
         ))
@@ -686,13 +796,13 @@ class RealtimeTranscription:
     def update(self, session: dict) -> None:
         """Apply a session update, all or nothing."""
         s = self.session
-        rate = _input_rate(session.get("input_audio_format"), s.input_rate)
-        if rate != s.input_rate and s.item_samples():
-            raise ValueError("commit or clear the input audio buffer before changing the input sample rate")
-        if rate != s.input_rate and s.odd_byte:
+        fmt = _input_format(session.get("input_audio_format"), s.input_format)
+        if fmt != s.input_format and s.item_samples():
+            raise ValueError("commit or clear the input audio buffer before changing the input audio format")
+        if fmt != s.input_format and s.odd_byte:
             # a commit keeps the half sample, so only clear helps
             raise ValueError("half a sample is pending; clear the input audio buffer before changing "
-                             "the input sample rate")
+                             "the input audio format")
         td = _turn_detection(session["turn_detection"]) if "turn_detection" in session else s.turn_detection
         vad = end_of_turn = None
         if td != s.turn_detection:
@@ -728,8 +838,8 @@ class RealtimeTranscription:
         request = TranscriptionRequest.model_validate({**s.request.model_dump(), **fields}) if fields else s.request
         s.request = request
         s.chunk_seconds, s.unfixed_chunks, s.unfixed_tokens = chunk_seconds, unfixed_chunks, unfixed_tokens
-        if rate != s.input_rate:
-            s.set_input_rate(rate)
+        if fmt != s.input_format:
+            s.set_input_format(fmt)
         if td != s.turn_detection:
             old, s.turn_detection = s.segmenter, td
             s.segmenter = None if td is None else realtime_vad.TurnSegmenter(
@@ -773,7 +883,7 @@ class RealtimeTranscription:
             ).text
             hold = max(0, len(text) - len(stable_text))
         await self.emit(text, hold)
-        await self.send(_event(
+        await self.send(server_event(
             "mstar.transcription.partial", item_id=s.item_id, text=text, chunk_id=s.chunk_id,
             audio_seconds=sum(a.size for a in s.heard) / SAMPLE_RATE, created=now(),
         ))
@@ -806,9 +916,9 @@ class RealtimeTranscription:
             )
         if client_error:
             message = _clip(_scrub_paths(detail, self.api.upload_dir))
-            await self.send(_error(message))
+            await self.send(error_event(message))
         else:
-            await self.send(_error(f"realtime step failed (error id {error_id})", kind="server_error"))
+            await self.send(error_event(f"realtime step failed (error id {error_id})", kind="server_error"))
 
     async def emit(self, text: str, hold: int) -> None:
         """Send the part of ``text`` past what was already sent, minus the
@@ -822,6 +932,472 @@ class RealtimeTranscription:
         firm = delta[: max(0, len(delta) - hold)]
         if firm:
             s.emitted += firm
-            await self.send(_event(
+            await self.send(server_event(
                 "conversation.item.input_audio_transcription.delta", item_id=s.item_id, delta=firm,
             ))
+
+
+# Client events a conversation refuses with an ``unsupported`` error, the call
+# going on: the model decides when it speaks and has no turn to cancel or edit.
+_UNSUPPORTED_EVENTS = frozenset({
+    "response.create", "response.cancel", "output_audio_buffer.clear",
+    "conversation.item.truncate", "conversation.item.delete", "conversation.item.retrieve",
+})
+
+
+@dataclass(slots=True)
+class _AgentTurn:
+    """One agent reply: the text steps from its start mark to its end mark,
+    and the audio of the same steps."""
+    start: int                  # its first step
+    end: int | None = None      # its last step, once the end mark arrived
+    response_id: str = field(default_factory=lambda: f"resp_{uuid.uuid4().hex[:16]}")
+    item_id: str = field(default_factory=lambda: f"item_{uuid.uuid4().hex[:12]}")
+    text: Utf8Stream = field(default_factory=Utf8Stream)
+    transcript: list[str] = field(default_factory=list)
+
+    def item(self, status: str) -> dict:
+        content = [] if status == "in_progress" else [{"type": "output_audio", "transcript": "".join(self.transcript)}]
+        return {"id": self.item_id, "object": "realtime.item", "type": "message", "role": "assistant",
+                "status": status, "content": content}
+
+
+class RealtimeConversation:
+    """Drives one ``/v1/realtime`` conversation (OpenAI's GA events) with a
+    full-duplex model: one whose client stream declares ``ClientAudio`` and
+    that decides when to speak (see docs/clients.rst for the protocol).
+
+    The call is one engine request, opened by the first append with the
+    session's instructions as its prompt; formats and instructions are fixed
+    from then on. Input is decoded, resampled to the stream's rate and
+    appended as it comes; the data worker cuts it into the stream's frames.
+    Each reply between the model's ``turn_tokens`` marks is one response:
+    text and audio chunks are paired by the loop step the data worker
+    stamps on them (``metadata["step"]``), audio that arrives before its
+    step's text waits for it, and a response closes once its last step's
+    audio is sent. One response is in progress at a time, as OpenAI's
+    clients expect: a reply that starts while the one before is still
+    speaking opens when that one is done. Audio between replies is silence
+    and is not sent.
+    """
+
+    def __init__(self, api, model_name: str, websocket: WebSocket, stream: Connection):
+        self.api, self.model_name, self.ws = api, model_name, websocket
+        # the stream's rate, which each append is resampled to, and its frame's length
+        self.stream = stream.edge_name
+        self.rate = stream.audio.sample_rate
+        self.frame_seconds = stream.audio.frame_samples / self.rate
+        model = api.model
+        self.output_rate = model.get_output_sample_rate("audio")
+        self.voice = model.get_default_voice()
+        self.session_id = f"sess_{uuid.uuid4().hex[:16]}"
+        self.instructions = ""
+        self.turn_detection = "server_vad"
+        self.odd_byte = b""
+        self.request_id: str | None = None
+        self.key: str | None = None
+        self.relay_task: asyncio.Task | None = None
+        self.clock_task: asyncio.Task | None = None
+        self.played_until = 0.0              # when the call's audio so far has played, at real time
+        self.pad_left = MAX_PAD_SECONDS      # silence this pause may still take
+        self._input_lock = asyncio.Lock()    # one append on the stream at a time, padding included
+        self.turns: deque[_AgentTurn] = deque()   # replies whose last audio is not sent yet, oldest first
+        self.text_steps = 0                       # steps whose text has arrived
+        self.early: deque[tuple[int, bytes]] = deque()   # audio steps waiting for their text
+        self.closed = False
+        self._send_lock = asyncio.Lock()
+        self._set_formats(AudioFormat("audio/pcm", OPENAI_PCM_RATE), AudioFormat("audio/pcm", OPENAI_PCM_RATE))
+
+    async def send(self, event: dict) -> None:
+        text = json.dumps(event)
+        async with self._send_lock:
+            if self.closed:   # the call ended: events still arriving get no answer
+                return
+            try:
+                await self.ws.send_text(text)
+            except Exception:  # noqa: BLE001 — the client is gone, and the call ends with it (run() aborts it)
+                self.closed = True
+
+    async def close(self, code: int) -> None:
+        async with self._send_lock:
+            if not self.closed:
+                self.closed = True
+                with contextlib.suppress(Exception):   # the client may have gone first
+                    await self.ws.close(code=code)
+
+    def _session_view(self) -> dict:
+        return {
+            "type": "realtime", "object": "realtime.session", "id": self.session_id, "model": self.model_name,
+            "instructions": self.instructions, "output_modalities": ["audio"],
+            "audio": {
+                "input": {"format": self.input_format.view(), "turn_detection": {"type": self.turn_detection},
+                          "transcription": None},
+                "output": {"format": self.output_format.view(), "voice": self.voice},
+            },
+        }
+
+    async def run(self) -> None:
+        await self.ws.accept()
+        await self.send(server_event("session.created", session=self._session_view()))
+        try:
+            async for event in _events(self.ws, self.send):
+                await self.handle(event)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            for task in (self.clock_task, self.relay_task):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            if self.key is not None:
+                self.api.abort_submission(self.key)
+
+    async def handle(self, event: dict) -> None:
+        kind = event.get("type")
+        if kind == "session.update":
+            try:
+                ignored = self.update(_object(event.get("session"), "session"))
+            except (TypeError, ValueError) as exc:
+                await self.send(error_event(str(exc)))
+                return
+            for message in ignored:
+                await self.send(error_event(message, code="unsupported"))
+            await self.send(server_event("session.updated", session=self._session_view()))
+        elif kind == "input_audio_buffer.append":
+            await self.append(event.get("audio", ""))
+        elif kind == "input_audio_buffer.commit":
+            # the model hears the audio as it comes: nothing to flush
+            await self.send(server_event("input_audio_buffer.committed", previous_item_id=None,
+                                   item_id=f"item_{uuid.uuid4().hex[:12]}"))
+        elif kind == "input_audio_buffer.clear":
+            # what reached the call is the model's, a partial frame included: it hears audio as it comes.
+            # Under the lock: a padding push may be resampling off the event loop.
+            async with self._input_lock:
+                self.odd_byte = b""
+                if self.in_resampler is not None:
+                    self.in_resampler.reset()
+            await self.send(server_event("input_audio_buffer.cleared"))
+        elif kind == "conversation.item.create":
+            await self.create_item(event.get("item"))
+        elif isinstance(kind, str) and kind in _UNSUPPORTED_EVENTS:
+            await self.send(error_event(f"{kind} is not supported: this model decides when it speaks; keep streaming "
+                                   "input_audio_buffer.append", code="unsupported"))
+        else:
+            await self.send(error_event(f"unknown event {_excerpt(kind)}"))
+
+    def update(self, session: dict) -> list[str]:
+        """Apply a session update. One that is malformed, or would change
+        what the call has fixed, is refused whole (``ValueError``). An option
+        this model can't honour keeps its served value and is answered with
+        one of the returned messages, so a client's defaults (another voice,
+        input transcription) don't cost it the rest of the update."""
+        if session.get("type", "realtime") != "realtime":
+            raise ValueError(f'session.type must be "realtime"; got {_excerpt(session.get("type"))} '
+                             "(transcription sessions are /v1/realtime?intent=transcription)")
+        instructions = session.get("instructions", self.instructions)
+        if instructions is None:
+            instructions = ""
+        if not isinstance(instructions, str):
+            raise ValueError(f"instructions must be a string; got {_excerpt(instructions)}")
+        audio = _object(session.get("audio"), "audio")
+        audio_in = _object(audio.get("input"), "audio.input")
+        audio_out = _object(audio.get("output"), "audio.output")
+        in_fmt = (_audio_format(audio_in["format"], "audio.input.format")
+                  if audio_in.get("format") is not None else self.input_format)
+        out_fmt = (_audio_format(audio_out["format"], "audio.output.format")
+                   if audio_out.get("format") is not None else self.output_format)
+        if self.key is not None and (instructions, in_fmt, out_fmt) != (
+                self.instructions, self.input_format, self.output_format):
+            raise ValueError("instructions and audio formats are fixed once audio flows")
+        ignored = []
+        modalities = session.get("output_modalities")
+        if modalities is not None and modalities != ["audio"]:
+            ignored.append(f'output_modalities must be ["audio"] (this model always speaks); '
+                           f'got {_excerpt(modalities)}')
+        if session.get("tools"):
+            ignored.append("tools are not supported")
+        if session.get("max_output_tokens") not in (None, "inf"):
+            ignored.append("max_output_tokens is not supported: the model decides how long it speaks")
+        ignored += [f"audio.input.{name} is not supported" for name in ("transcription", "noise_reduction")
+                    if audio_in.get(name) is not None]
+        turn_detection = self.turn_detection
+        if "turn_detection" in audio_in:
+            td = audio_in["turn_detection"]
+            if td is None:
+                ignored.append("audio.input.turn_detection null is not supported: this model decides when it "
+                               "speaks; use server_vad or semantic_vad")
+            elif _object(td, "audio.input.turn_detection").get("type") not in ("server_vad", "semantic_vad"):
+                ignored.append(f"audio.input.turn_detection.type must be server_vad or semantic_vad; "
+                               f"got {_excerpt(td.get('type'))}")
+            elif fixed := [name for name in ("create_response", "interrupt_response")
+                           if td.get(name, True) is not True]:
+                ignored.append(f"audio.input.turn_detection.{fixed[0]} must be true: this model always "
+                               "answers and always yields")
+            else:
+                turn_detection = td["type"]
+        if audio_out.get("voice", self.voice) != self.voice:
+            ignored.append(f"audio.output.voice must be {self.voice!r}, the voice this server speaks in; "
+                           f"got {_excerpt(audio_out['voice'])}")
+        if audio_out.get("speed") not in (None, 1):
+            ignored.append("audio.output.speed is not supported")
+        self.instructions, self.turn_detection = instructions, turn_detection
+        if (in_fmt, out_fmt) != (self.input_format, self.output_format):
+            self._set_formats(in_fmt, out_fmt)
+        return ignored
+
+    def _set_formats(self, in_fmt: AudioFormat, out_fmt: AudioFormat) -> None:
+        """Before audio flows: the resamplers hold nothing yet."""
+        self.input_format, self.output_format = in_fmt, out_fmt
+        self.in_resampler = (None if in_fmt.rate == self.rate
+                             else media_io.StreamResampler(in_fmt.rate, self.rate))
+        self.out_resampler = (None if out_fmt.rate == self.output_rate
+                              else media_io.StreamResampler(self.output_rate, out_fmt.rate))
+
+    async def create_item(self, item) -> None:
+        """``conversation.item.create`` of a user message of ``input_audio``
+        parts: their audio goes on the stream as appends do."""
+        item = item if isinstance(item, dict) else {}
+        content = item.get("content") if item.get("type") == "message" and item.get("role") == "user" else None
+        if not content or not isinstance(content, list) or any(
+                not isinstance(part, dict) or part.get("type") != "input_audio" for part in content):
+            await self.send(error_event("conversation.item.create takes only a user message of input_audio parts",
+                                   code="unsupported"))
+            return
+        if not await self.append(*(part.get("audio", "") for part in content)):
+            return   # the error is sent; no part was taken
+        # the audio is not echoed back
+        item = {**item, "content": [{k: v for k, v in part.items() if k != "audio"} for part in content],
+                "id": item.get("id") or f"item_{uuid.uuid4().hex[:12]}", "object": "realtime.item",
+                "status": "completed"}
+        await self.send(server_event("conversation.item.added", previous_item_id=None, item=item))
+        await self.send(server_event("conversation.item.done", previous_item_id=None, item=item))
+
+    async def append(self, *payloads) -> bool:
+        """Put the audio of an append, or of an item's parts, on the call,
+        all or none; False, with an ``error`` sent (or the call over), if it
+        was not taken."""
+        odd_byte, pieces = self.odd_byte, []
+        for payload in payloads:
+            try:
+                # not `or ""`: a null is an error, not an empty append, on every realtime path
+                audio, odd_byte = decode_append(payload, odd_byte, self.input_format.codec)
+            except Exception:  # noqa: BLE001 — bad base64
+                await self.send(error_event("audio is not base64", code="invalid_audio"))
+                return False
+            pieces.append(audio)
+        audio = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+        if (error := _append_error(audio, self.input_format.rate)) is not None:
+            await self.send(error)
+            return False
+        if self.key is None and not await self.open():
+            return False   # not taken, its half sample neither: before the call, formats may still change
+        self.odd_byte = odd_byte
+        return await self._put(audio)
+
+    async def _put(self, audio: np.ndarray, padding: bool = False) -> bool:
+        """Resample ``audio`` (at the client's rate) to the stream's and
+        append it to the call; False if the call has ended (the relay
+        reports why)."""
+        async with self._input_lock:
+            # client audio after a pause plays from now; padding fills the pause
+            start = self.played_until if padding else max(self.played_until, time.monotonic())
+            self.played_until = start + audio.size / self.input_format.rate
+            if audio.size and not padding:
+                self.pad_left = MAX_PAD_SECONDS
+            if self.in_resampler is not None and audio.size:
+                # a long append, off the event loop: it would stall every other socket
+                audio = (self.in_resampler.push(audio) if audio.size <= INLINE_RESAMPLE_SAMPLES
+                         else await asyncio.to_thread(self.in_resampler.push, audio))
+            if not audio.size:
+                return True
+            try:
+                return self.api.stream_input(self.key, samples={self.stream: audio})
+            except ValueError as exc:  # past the call's input budget: the call ends with it
+                self.api.reject_input(self.key, f"append rejected: {exc}", 400)
+                return False
+            except Exception as exc:  # noqa: BLE001 — the client gets an error event, not a bare close
+                error_id = uuid.uuid4().hex[:12]
+                logger.error("realtime append failed (error id %s, session %s)", error_id, self.session_id,
+                             exc_info=exc)
+                await self.send(error_event(f"the append failed (error id {error_id})", kind="server_error"))
+                return False
+
+    async def _clock(self) -> None:
+        """Keep the call's audio up with real time while the client sends
+        none (a muted mic, a client waiting for the reply), since the model
+        steps only on audio it hears: once it is a frame past
+        ``JITTER_SECONDS`` behind, whole frames of silence go on, at most
+        ``MAX_PAD_SECONDS`` a pause, counted against the call's length cap
+        like the client's audio. Never while half a sample is pending, which
+        the silence would split."""
+        while True:
+            await asyncio.sleep(self.frame_seconds)
+            behind = min(time.monotonic() - JITTER_SECONDS - self.played_until, self.pad_left)
+            frames = int(behind / self.frame_seconds)
+            if frames < 1 or self.odd_byte or self._input_lock.locked():
+                continue   # (an append in flight may leave half a sample)
+            self.pad_left -= frames * self.frame_seconds
+            pad = np.zeros(round(frames * self.frame_seconds * self.input_format.rate), np.float32)
+            if not await self._put(pad, padding=True):
+                return   # the call has ended
+
+    async def open(self) -> bool:
+        """Open the call's engine request; False, with an ``error`` sent, if
+        the server refused it (at capacity, say)."""
+        text = self.instructions or None
+        try:
+            self.request_id = self.api.submit_request(
+                text=text, input_modalities=["text"] if text else [], output_modalities=["text", "audio"],
+                streaming=True, request_id=rid(f"rt-{self.session_id}"), end_input=False,
+            )
+        except HTTPException as exc:
+            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+            return False
+        except ValueError as exc:
+            await self.send(error_event(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
+            return False
+        self.key = self.api.submission_key(self.request_id)
+        # bound now, before anything else runs (see APIServer._bind)
+        self.relay_task = asyncio.create_task(self.relay(self.api.iter_result_chunks(self.request_id)))
+        self.played_until = time.monotonic()
+        self.clock_task = asyncio.create_task(self._clock())
+        return True
+
+    async def relay(self, chunks) -> None:
+        """Turn the call's output into response events until it ends, then
+        finish any reply still open and close the socket: a call that ended
+        takes no more audio."""
+        status, code = "incomplete", 1000
+        try:
+            async for chunk in chunks:
+                if chunk.modality == "text":
+                    await self._on_text(chunk)
+                elif chunk.modality == "audio":
+                    await self._on_audio(chunk)
+                elif chunk.modality == "error":
+                    http_status = int((chunk.metadata or {}).get("status") or 500)
+                    message = bytes(chunk.data).decode("utf-8", "replace")
+                    await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
+                                           kind=error_type(http_status)))
+                    status, code = "failed", 1011 if http_status >= 500 else 1000
+        except HTTPException as exc:
+            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+            status, code = "failed", 1011
+        except Exception as exc:  # noqa: BLE001 — the socket must still close
+            error_id = uuid.uuid4().hex[:12]
+            logger.error("realtime conversation failed (error id %s, session %s)", error_id, self.session_id,
+                         exc_info=exc)
+            await self.send(error_event(f"the call failed (error id {error_id})", kind="server_error"))
+            status, code = "failed", 1011
+        # no more text will come: held audio goes to its reply, and a reply still open ends here
+        while self.early:
+            await self._play(*self.early.popleft())
+        while self.turns:
+            await self._finish_turn(status)
+        await self.close(code)
+
+    async def _on_text(self, chunk) -> None:
+        meta = chunk.metadata or {}
+        step = meta["step"]
+        self.text_steps = step + 1
+        turn = self.turns[-1] if self.turns and self.turns[-1].end is None else None
+        data = bytes(chunk.data)
+        for mark in meta.get("turn", ()):
+            if mark == "start":
+                if turn is not None:   # no end mark: the open reply ends before this one
+                    logger.warning("realtime reply %s got no end mark; ending it at step %d", turn.response_id,
+                                   step - 1)
+                    await self._feed(turn, b"", final=True)
+                    turn.end = step - 1
+                turn = await self._start_turn(step)
+            elif mark == "end" and turn is not None:
+                await self._feed(turn, data, final=True)
+                data, turn.end, turn = b"", step, None
+        if turn is not None:   # between replies the text channel is padding
+            await self._feed(turn, data)
+        while self.early and self.early[0][0] < self.text_steps:
+            await self._play(*self.early.popleft())
+
+    async def _start_turn(self, step: int) -> _AgentTurn:
+        turn = _AgentTurn(start=step)
+        self.turns.append(turn)
+        if len(self.turns) == 1:
+            await self._open_turn(turn)
+        return turn
+
+    async def _open_turn(self, turn: _AgentTurn) -> None:
+        """Send the opening events of the oldest reply, and its transcript so far."""
+        await self.send(server_event("response.created", response=response_object(
+            turn.response_id, "in_progress", ["audio"])))
+        await self.send(server_event("conversation.item.added", previous_item_id=None, item=turn.item("in_progress")))
+        await self.send(server_event("response.output_item.added", response_id=turn.response_id, output_index=0,
+                               item=turn.item("in_progress")))
+        await self.send(content_event("response.content_part.added", turn.response_id, turn.item_id,
+                                      part={"type": "audio", "transcript": ""}))
+        if turn.transcript:
+            await self.send(content_event("response.output_audio_transcript.delta", turn.response_id,
+                                          turn.item_id, delta="".join(turn.transcript)))
+
+    async def _feed(self, turn: _AgentTurn, data: bytes, final: bool = False) -> None:
+        delta = turn.text.feed(data) + (turn.text.flush() if final else "")
+        if delta:
+            turn.transcript.append(delta)
+            if turn is self.turns[0]:   # a later reply's text goes out when it opens
+                await self.send(content_event("response.output_audio_transcript.delta", turn.response_id,
+                                              turn.item_id, delta=delta))
+
+    async def _on_audio(self, chunk) -> None:
+        step = chunk.metadata["step"]
+        if step >= self.text_steps:
+            self.early.append((step, bytes(chunk.data)))   # its text decides which reply it is in
+        else:
+            await self._play(step, bytes(chunk.data))
+
+    async def _play(self, step: int, pcm: bytes) -> None:
+        """Send step ``step``'s audio in the reply it belongs to, if any."""
+        while self.turns and self.turns[0].end is not None and self.turns[0].end < step:
+            await self._finish_turn("completed")   # a reply whose last step had no audio
+        turn = self.turns[0] if self.turns and self.turns[0].start <= step else None
+        if turn is None:
+            return   # silence between replies
+        last = turn.end == step
+        audio = (self._encode_out(pcm, last) if len(pcm) <= 2 * INLINE_RESAMPLE_SAMPLES
+                 else await asyncio.to_thread(self._encode_out, pcm, last))
+        if audio:
+            await self.send(content_event("response.output_audio.delta", turn.response_id, turn.item_id, delta=audio))
+        if last:
+            await self._finish_turn("completed")
+
+    def _encode_out(self, pcm: bytes, last: bool) -> str:
+        audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        if self.out_resampler is not None:
+            audio = self.out_resampler.push(audio)
+            if last:   # the reply ends: what the resampler holds goes out with it
+                audio = np.concatenate([audio, self.out_resampler.flush()])
+        return encode_audio(audio, self.output_format.codec) if audio.size else ""
+
+    async def _finish_turn(self, status: str) -> None:
+        """Close the oldest reply as ``status``: ``completed``, or
+        ``incomplete`` / ``failed`` when the call ended inside it; then
+        open the next."""
+        turn = self.turns[0]
+        if turn.end is None:
+            await self._feed(turn, b"", final=True)
+        self.turns.popleft()
+        if self.out_resampler is not None:
+            self.out_resampler.reset()   # already flushed, unless the reply ended early
+        transcript = "".join(turn.transcript)
+        await self.send(content_event("response.output_audio.done", turn.response_id, turn.item_id))
+        await self.send(content_event("response.output_audio_transcript.done", turn.response_id, turn.item_id,
+                                      transcript=transcript))
+        await self.send(content_event("response.content_part.done", turn.response_id, turn.item_id,
+                                      part={"type": "audio", "transcript": transcript}))
+        item = turn.item("completed" if status == "completed" else "incomplete")
+        await self.send(server_event("response.output_item.done", response_id=turn.response_id, output_index=0,
+                                     item=item))
+        await self.send(server_event("conversation.item.done", previous_item_id=None, item=item))
+        await self.send(server_event("response.done", response=response_object(
+            turn.response_id, status, ["audio"], output=[item],
+            status_details=None if status == "completed" else {"type": status})))
+        if self.turns:
+            await self._open_turn(self.turns[0])

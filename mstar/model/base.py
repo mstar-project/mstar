@@ -932,7 +932,9 @@ class Model(ABC):
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the
-        stream's first chunk, so a one-shot request needs no append.
+        stream's first chunk, so a one-shot request needs no append. A model
+        whose client streams all declare ``ClientAudio`` needs none: the data
+        worker turns its appends into items.
         """
         raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
 
@@ -1107,6 +1109,10 @@ class Model(ABC):
         speech codecs used by the audio models here.
         """
         return 24000
+
+    # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
+    # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
+    turn_tokens: tuple[int, int] | None = None
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

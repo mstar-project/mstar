@@ -177,18 +177,42 @@ async def audio_transcriptions(request: Request):
 
 @router.websocket("/v1/realtime")
 async def realtime(websocket: WebSocket):
-    """OpenAI Realtime API, transcription intent (``?intent=transcription``):
-    streaming speech-to-text with partial results. See ``serving_realtime``."""
-    api, model_name, adapter, err = _resolve("supports_realtime_transcription")
-    if err is not None:
+    """OpenAI Realtime API. A full-duplex model (one whose client stream
+    declares ``ClientAudio``) serves a conversation; ``?intent=transcription``
+    streams speech-to-text with partial results, for a model whose adapter
+    can continue a hypothesis. An omitted ``intent`` is the one the model
+    serves. See ``serving_realtime``."""
+    intent = websocket.query_params.get("intent")
+    api = _api()
+    audio = api.client_audio if api is not None else []
+    # why a model with an audio client stream can't hold a conversation (None: it can)
+    no_conversation = None
+    if audio:
+        channels = api.model.get_output_audio_channels("audio")
+        if api.model.turn_tokens is None:
+            no_conversation = "this model has no turn tokens, so it can't serve OpenAI Realtime conversations"
+        elif len(audio) > 1:
+            no_conversation = f"this model takes audio on {len(audio)} client streams, and a conversation feeds one"
+        elif channels != 1:
+            no_conversation = f"this model speaks in {channels} channels, and a conversation's audio is mono"
+        elif intent is None:
+            await serving_realtime.RealtimeConversation(api, api.model_name, websocket, audio[0]).run()
+            return
+    converses = bool(audio) and no_conversation is None
+    reason = None
+    if intent not in (None, "transcription"):
+        reason = f"unsupported intent {intent!r}; " + ("omit intent for a conversation" if converses
+                                                        else "use intent=transcription")
+    else:
+        api, model_name, adapter, err = _resolve("supports_realtime_transcription")
+        if err is not None:
+            reason = ("this model serves /v1/realtime conversations; omit intent" if converses
+                      else f"{no_conversation}; use /generate/ws" if audio
+                      else json.loads(bytes(err.body))["error"]["message"])
+    if reason is not None:
         # 1008 is policy violation, the served model has no such endpoint
         await websocket.accept()
-        await websocket.close(code=1008, reason=json.loads(bytes(err.body))["error"]["message"])
-        return
-    intent = websocket.query_params.get("intent", "transcription")
-    if intent != "transcription":
-        await websocket.accept()
-        await websocket.close(code=1008, reason=f"unsupported intent {intent!r}; use intent=transcription")
+        await websocket.close(code=1008, reason=reason)
         return
     await serving_realtime.RealtimeTranscription(api, model_name, adapter, websocket).run()
 

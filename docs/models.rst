@@ -832,12 +832,19 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   without egress.
 - Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
   request's text, primed before the first frame exactly as the reference
-  does): one clip uploaded with the request, or a live call over
+  does): one clip uploaded with the request, a live call over
   ``/generate/ws``, ``append`` messages until ``end_input`` (see
   :doc:`clients`; a one-shot request over the socket carries ``end_input:
-  true`` on its opening message, or it waits for appends). Output is clocked by
-  the input, one agent frame per 80 ms of user audio, so a live client keeps
-  streaming (silence included) for as long as it wants the agent to talk. The
+  true`` on its opening message, or it waits for appends), or an OpenAI
+  Realtime conversation over ``/v1/realtime``, which takes PCM16 at one of
+  the eight rates :doc:`clients` lists (8 to 48 kHz) or G.711, resamples it
+  to 16 kHz, appends it as it comes, and sends each agent reply as one
+  response (BOS / EOS on the agent text channel mark the reply,
+  ``metadata.turn`` on ``/generate``). The voice is ``Aria``. Output is clocked by
+  the input, one agent frame per 80 ms of user audio, so a ``/generate/ws``
+  client keeps streaming (silence included) for as long as it wants the agent
+  to talk; ``/v1/realtime`` pads a pause in the client's audio with silence,
+  up to 30 s. The
   model answers in the frames *after* the user stops, so append a few seconds
   of trailing silence to a clip. The checkpoint's demo recordings are
   two-channel conversations (user left, agent right); feed the left channel
@@ -849,11 +856,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
   call that ends with no more than 16 ms of audio, which the encoder cannot
   featurize, fails with a 500 (the worker reports it without a client status).
-  Appends must be 16 kHz audio (they are neither
-  resampled nor rescaled one by one, which would put a seam at every append).
-  Send appends of 80 ms or more: the encoder takes one append per step, so
-  shorter appends need several steps per frame and fall behind once a step
-  takes longer than an append.
+  ``/generate/ws`` appends must be 16 kHz audio (they are neither
+  resampled nor rescaled one by one, which would put a seam at every append);
+  ``/v1/realtime`` resamples for the client. On both, ``audio_in`` declares the
+  encoder's 80 ms frame (``ClientAudio``), and the data worker sends a live
+  call's audio in whole frames, a step each, the rest waiting for the next
+  append or the call's end.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
   weights on the duplex encoder the shared FastConformer replaced, and not
   since: an upload was one encoder pass, bit for bit that encoder's offline
@@ -877,16 +885,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   which keeps a call's last 70 frames per layer and runs the attention, each new
   frame over the 70 before it, with the relative-position term as a band of
   distances; its conv inputs (``encoder_state``); and its newest audio and mel
-  frames (``encoder_front``), the last two recurrent-state pools. A
-  call that appends one frame of audio (1280 samples) on the frame grid, every
-  live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
-  the call's start: an opening clip or append that is not a multiple of 1280
-  samples keeps the call off it for good); other calls take the front end
-  eagerly, then the layer stack as a graph when each got at most one frame (a
-  live step, the call's end), or eagerly (a one-shot upload, a large append:
-  a chunk over a second is not batched with other calls, so the engine runs
-  each call of that step on its own). Appends of other sizes are served the same,
-  without the whole-step graph.
+  frames (``encoder_front``), the last two recurrent-state pools. Every live
+  step, one frame (1280 samples) whatever the client's append size, runs whole
+  as a CUDA graph; other steps take the front end eagerly, then the layer stack
+  as a graph when each got at most one frame (the call's end), or eagerly (a
+  one-shot upload, an opening clip, the call's last append: a chunk over a
+  second is not batched with other calls, so the engine runs each call of that
+  step on its own).
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text

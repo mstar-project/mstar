@@ -8,7 +8,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from mstar.distributed.base import ShardingConfig
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model
+from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import ClientStreamLimits, Connection, find_client_stream
 
 # The limits a deployment may override, per client stream.
@@ -42,13 +44,18 @@ def check_client_streams(
 
 def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]:
     """What would otherwise fail every live call: each client stream needs
-    the one node that consumes it, in the partition it flows into."""
+    the one node that consumes it, in the partition it flows into, and a
+    ``ClientAudio`` stream needs text and audio emitted from inside a loop
+    that steps once per item from it."""
     if not connections:
         return []
     problems = []
-    if type(model).process_stream_chunk is Model.process_stream_chunk:
+    # the data worker turns appends into ClientAudio items itself
+    if type(model).process_stream_chunk is Model.process_stream_chunk and any(
+            conn.audio is None for conn in connections):
         problems.append(
-            f"{type(model).__name__} declares client streams but does not implement process_stream_chunk"
+            f"{type(model).__name__} declares client streams without ClientAudio but does not implement "
+            "process_stream_chunk"
         )
     names = [conn.edge_name for conn in connections]
     problems += [
@@ -56,6 +63,38 @@ def _consumer_problems(model: Model, connections: list[Connection]) -> list[str]
         for name in sorted({name for name in names if names.count(name) > 1})
     ]
     walks = model.get_graph_walk_graphs()
+    if any(conn.audio is not None for conn in connections):
+        # /v1/realtime pairs a declared-audio model's text with its audio by the emitting loop's step
+        loops = [loop for walk in walks.values() for loop in walk.get_loops().values()]
+        looped = {name for loop in loops for name in loop.get_nodes()}
+        nested = {name for loop in loops for name in loop.section.get_loops()}
+        # a top-level loop's own outputs are emitted at its exit, outside any loop
+        emitters = [(node.name, node.outputs) for walk in walks.values() for node in walk.get_nodes().values()
+                    if node.name not in looped]
+        emitters += [(loop.name, loop.outputs + loop.accumulated_outputs) for loop in loops if loop.name not in nested]
+        unlooped = sorted({
+            name for name, edges in emitters if any(
+                edge.next_node == EMIT_TO_CLIENT and edge.output_modality in ("text", "audio") for edge in edges)
+        })
+        if unlooped:
+            problems.append(f"{type(model).__name__} declares a ClientAudio client stream, so its text and audio "
+                            f"must come from inside a loop; {unlooped} emit outside one")
+        # step k's text and audio are one input frame's only if each emitting
+        # partition takes one item a step on every connection from the stream
+        walk_partition = {walk: p.name for p in model.get_partitions() for walk in p.graph_walks}
+        emitting = {walk_partition.get(name) for name, walk in walks.items() if any(
+            edge.next_node == EMIT_TO_CLIENT and edge.output_modality in ("text", "audio")
+            for node in walk.get_nodes().values() for edge in node.outputs)}
+        stepped = [conn for conn in model.get_partition_topology().connections
+                   if isinstance(policy := conn.chunk_policy_factory(), FixedChunkPolicy)
+                   and policy.next_chunk_size(1) == 1]
+        reached = {conn.to_partition for conn in stepped if conn.audio is not None}
+        while more := {conn.to_partition for conn in stepped if conn.from_partition in reached} - reached:
+            reached |= more
+        if unpaired := sorted(emitting - reached - {None}):
+            problems.append(f"{type(model).__name__} declares a ClientAudio client stream, so the partitions that "
+                            f"emit its text and audio must step once per item from it (FixedChunkPolicy("
+                            f"chunk_size=1) on each connection from the stream); {unpaired} do not")
     partitions = {p.name: p for p in model.get_partitions()}
     for conn in connections:
         try:

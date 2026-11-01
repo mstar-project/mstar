@@ -566,6 +566,11 @@ class StreamResampler:
         n = np.arange(-self.half, self.half + 1)
         cutoff = rolloff * 0.5 / max(self.up, self.down)          # cycles per upsampled sample
         self.kernel = 2 * cutoff * np.sinc(2 * cutoff * n) * np.kaiser(n.size, beta) * self.up
+        # the kernel by phase: row p weighs inputs -span..span around the one
+        # an output's center falls p upsampled samples past
+        self._span = self.half // self.up + 1
+        idx = np.arange(self.up)[:, None] - np.arange(-self._span, self._span + 1) * self.up + self.half
+        self._phases = np.where((idx >= 0) & (idx <= 2 * self.half), self.kernel[np.clip(idx, 0, 2 * self.half)], 0.0)
         self.reset()
 
     def reset(self) -> None:
@@ -595,16 +600,15 @@ class StreamResampler:
         if k_end <= self._k_out or not self._buf.size:
             n, self._k_out = max(0, k_end - self._k_out), max(self._k_out, k_end)
             return np.zeros(n, dtype=np.float32)
-        span = half // up + 1
-        taps = np.arange(-span, span + 1)[None, :]
+        span = self._span
+        # inputs before the stream and past what has arrived are silence
+        windows = np.lib.stride_tricks.sliding_window_view(
+            np.concatenate([np.zeros(span), self._buf, np.zeros(span + 1)]), 2 * span + 1)
         out = []
         for k0 in range(self._k_out, k_end, 4096):              # bounds the gather to 4096 rows
-            t = np.arange(k0, min(k0 + 4096, k_end))[:, None] * down   # centers, upsampled
-            ns = t // up + taps                                  # candidate input indices
-            idx = t - ns * up + half
-            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < self._n_in)
-            vals = self._buf[np.clip(ns - self._base, 0, self._buf.size - 1)]
-            out.append((np.where(ok, vals * self.kernel[np.clip(idx, 0, 2 * half)], 0.0)).sum(axis=1))
+            t = np.arange(k0, min(k0 + 4096, k_end)) * down      # centers, upsampled
+            # row t // up - base holds the inputs within span of the center's
+            out.append(np.einsum("ij,ij->i", windows[t // up - self._base], self._phases[t % up]))
         self._k_out = k_end
         keep = max(self._base, -(-(k_end * down - half) // up))  # first input the next output needs
         self._buf = self._buf[keep - self._base:]
@@ -612,13 +616,63 @@ class StreamResampler:
         return np.concatenate(out).astype(np.float32)
 
 
+# G.711 (8 kHz telephony), coded as CPython's audioop and Sun's g711.c code it:
+# mu-law from 14-bit magnitudes, A-law from 13-bit ones.
+_ULAW_SEG_END = np.array([0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF])
+_ALAW_SEG_END = np.array([0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF])
+
+
+def _ulaw_table() -> np.ndarray:
+    u = ~np.arange(256) & 0xFF
+    exponent, mantissa = (u >> 4) & 7, u & 0xF
+    magnitude = (((mantissa << 3) + 0x84) << exponent) - 0x84
+    return np.where(u & 0x80, -magnitude, magnitude).astype("<i2")
+
+
+def _alaw_table() -> np.ndarray:
+    a = np.arange(256) ^ 0x55
+    exponent, mantissa = (a >> 4) & 7, a & 0xF
+    magnitude = np.where(exponent == 0, (mantissa << 4) + 8,
+                         ((mantissa << 4) + 0x108) << np.maximum(exponent - 1, 0))
+    return np.where(a & 0x80, magnitude, -magnitude).astype("<i2")
+
+
+_G711_DECODE = {"audio/pcmu": _ulaw_table(), "audio/pcma": _alaw_table()}
+
+
+def g711_decode(data: bytes, law: str) -> np.ndarray:
+    """G.711 bytes (``law`` is ``"audio/pcmu"`` or ``"audio/pcma"``) -> int16 samples."""
+    return _G711_DECODE[law][np.frombuffer(data, dtype=np.uint8)]
+
+
+def g711_encode(pcm: np.ndarray, law: str) -> bytes:
+    """int16 samples -> G.711 bytes, one per sample."""
+    x = np.asarray(pcm, dtype=np.int32)
+    if law == "audio/pcmu":
+        x = x >> 2
+        mask = np.where(x < 0, 0x7F, 0xFF)
+        x = np.minimum(np.abs(x), 8159) + (0x84 >> 2)   # audioop's 14-bit clip
+        seg = np.searchsorted(_ULAW_SEG_END, x)
+        code = (np.minimum(seg, 7) << 4) | ((x >> (np.minimum(seg, 7) + 1)) & 0xF)
+    else:
+        x = x >> 3
+        mask = np.where(x >= 0, 0xD5, 0x55)
+        x = np.where(x >= 0, x, -x - 1)
+        seg = np.searchsorted(_ALAW_SEG_END, x)
+        code = (np.minimum(seg, 7) << 4) | ((x >> np.clip(seg, 1, 7)) & 0xF)
+    code = np.where(seg >= 8, 0x7F, code)
+    return (code ^ mask).astype(np.uint8).tobytes()
+
+
+def to_pcm16(audio) -> np.ndarray:
+    """Float waveform -> little-endian int16 samples. The inverse of reading
+    PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for sample."""
+    return np.clip(np.rint(np.asarray(audio, dtype=np.float64) * 32768.0), -32768, 32767).astype("<i2")
+
+
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
-    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
-    sample."""
-    scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
-    pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
-    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    """Float waveform -> 16-bit PCM WAV file at ``path`` (see :func:`to_pcm16`)."""
+    Path(path).write_bytes(pcm16_to_wav_bytes(to_pcm16(audio).tobytes(), sample_rate))
     return path
 
 
