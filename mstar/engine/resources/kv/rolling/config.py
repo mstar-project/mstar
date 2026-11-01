@@ -7,6 +7,10 @@ retained window shifts left behind the sink. A step's retained tokens and its
 own are therefore always one contiguous range, which the model hands to
 whatever attention it runs (a ragged kernel, say). The store runs no attention.
 
+The K/V live in one pool reserved at startup (``pool_tokens`` a layer). Each
+request takes a contiguous region of exactly its ``sink + window`` there, so
+requests of different sizes share the pool without each holding the largest.
+
 Unlike bounded KV, whose window is a ring that its own kernel reads in pieces,
 the range here is one slice, so the same kernel over the same keys gives the
 same bits as a cache the model kept itself.
@@ -29,22 +33,17 @@ class RollingKVConfig:
     num_layers: int
     num_heads: int
     head_dim: int
-    # the most tokens one request may keep per layer, its ``sink + window``; a
-    # request's K/V are allocated at its own size, so this bounds, not reserves
-    max_request_tokens: int
-    # requests resident at once; a request past them waits for one to end
-    max_slots: int = 1
+    # tokens a layer the pool holds, shared by every request's sink + window
+    pool_tokens: int
     # None takes the engine's KV dtype (``EngineResourceInfo.kv_dtype``)
     dtype: torch.dtype | None = None
 
     def __post_init__(self):
-        if self.max_slots < 1:
-            raise ValueError(f"max_slots must be >= 1, got {self.max_slots}")
-        if self.max_request_tokens < 1:
-            raise ValueError(f"max_request_tokens must be >= 1, got {self.max_request_tokens}")
+        if self.pool_tokens < 1:
+            raise ValueError(f"pool_tokens must be >= 1, got {self.pool_tokens}")
 
-    def request_bytes(self, tokens: int, dtype: torch.dtype) -> int:
-        """What a request keeping ``tokens`` per layer holds, keys and values of every layer."""
+    def token_bytes(self, tokens: int, dtype: torch.dtype) -> int:
+        """``tokens`` a layer, keys and values of every layer."""
         return self.num_layers * 2 * tokens * self.num_heads * self.head_dim * dtype.itemsize
 
 
@@ -80,11 +79,9 @@ class RollingKVSpec(NodeResourceSpec):
 
         return RollingKVManager
 
-    def apply_yaml_overrides(self, max_slots: int | None = None, max_request_tokens: int | None = None):
-        """How many requests stay resident, and how large a window each may keep,
-        are the deployment's memory trade."""
-        if max_slots is not None:
-            self.config.max_slots = max_slots
-        if max_request_tokens is not None:
-            self.config.max_request_tokens = max_request_tokens
+    def apply_yaml_overrides(self, pool_tokens: int | None = None):
+        """The pool's size is the deployment's memory trade: what it reserves at
+        startup against how many requests, and how large, it holds at once."""
+        if pool_tokens is not None:
+            self.config.pool_tokens = pool_tokens
         self.config.__post_init__()

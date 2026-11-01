@@ -15,13 +15,17 @@ max_seq_len: 512
 #   reference_numerics: false
 #   dit_compile_autotune: false
 
-# The dit's rolling K/V: each rollout allocates its own at its first chunk (4.7 GiB
-# of bf16 K/V at 464x832, 11.1 GiB at 720x1280) and frees them when it ends.
-# max_slots rollouts hold theirs at once; a rollout past them waits for one to end,
-# and the wait counts against the API server's request timeout (--timeout).
+# One rollout at a time. Raise this to run several rollouts at once; each one
+# also needs room in the K/V pool below, and waits for it when the pool is full
+# (the wait counts against the API server's request timeout, --timeout).
+max_concurrent_requests: 1
+
+# K/V memory for the DiT, reserved at startup and shared by all rollouts.
+# 64800 tokens = 11.1 GB: room for one rollout at the largest size (720x1280),
+# or two at the default size (464x832, 4.7 GB each).
 resources:
   dit_kv:
-    max_slots: 1
+    pool_tokens: 64800
 
 # Single-GPU colocated; the Wan VAE encode and decode are fused into the dit forward.
 node_groups:

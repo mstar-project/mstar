@@ -1,11 +1,12 @@
-"""Per-request rolling sink + window K/V, at most ``max_slots`` requests at once.
+"""A pool of rolling sink + window K/V, one contiguous region per request.
 
-A request's K/V are allocated at its first step, at its own size (its declared
-sink plus window), and freed when it is removed, so the store holds no memory a
-request isn't using. A step past ``max_slots`` requests, or whose K/V don't fit
-in free device memory while other requests hold theirs, is refused with
-``AllocationFailed``, which the worker answers by holding the request and
-retrying: it waits instead of running the device out of memory mid-stream.
+The pool (``pool_tokens`` a layer, keys and values) is reserved at startup. A
+request takes a region of exactly its declared sink plus window at its first
+step, first fit, and gives it back when it is removed. When no free gap is
+large enough but the free tokens are, the resident regions slide left to join
+the gaps. A request that doesn't fit is refused with ``AllocationFailed``, which
+the worker answers by holding it until a region frees; one larger than the
+whole pool fails.
 """
 
 from __future__ import annotations
@@ -62,13 +63,12 @@ def row_layout(pos: RollingPosition, span: int) -> tuple[RollingRow, Compaction 
 
 
 class _Request:
-    __slots__ = ("kv", "capacity", "written", "compacted_for")
+    __slots__ = ("offset", "capacity", "written", "compacted_for")
 
-    def __init__(self, kv: torch.Tensor):
-        # ``[layers, 2, capacity, H, D]``: one allocation, a contiguous ``[capacity, H, D]``
-        # per layer for keys and for values
-        self.kv = kv
-        self.capacity = kv.shape[2]
+    def __init__(self, offset: int, capacity: int):
+        # the request's region of the pool, ``[offset, offset + capacity)``
+        self.offset = offset
+        self.capacity = capacity
         self.written = 0
         # the ``written`` count the K/V were last compacted for, so a step planned
         # twice (or retried after a failed forward) shifts once
@@ -88,7 +88,15 @@ class RollingKVManager(Resource):
         # the resource key, which a deployment's ``resources:`` block names
         self.name = name
         self._device = torch.device(device)
-        self._dtype = config.dtype or kv_dtype or torch.get_default_dtype()
+        c = config
+        dtype = c.dtype or kv_dtype or torch.get_default_dtype()
+        # ``[layers, 2, pool_tokens, H, D]``: per layer, keys and values token-major, so a
+        # region is a plain ``[tokens, H, D]`` slice the attention kernels take as is.
+        # Empty: a region is only read up to what its request wrote.
+        self._pool = torch.empty((c.num_layers, 2, c.pool_tokens, c.num_heads, c.head_dim), dtype=dtype,
+                                 device=self._device)
+        # free gaps ``(start, length)``, by start, adjacent ones merged
+        self._free: list[tuple[int, int]] = [(0, c.pool_tokens)]
         self._requests: dict[int, _Request] = {}
         self._lock = threading.RLock()
         # rids the live admit allocated for, for ``rollback_admit``
@@ -96,8 +104,8 @@ class RollingKVManager(Resource):
         self._current: RollingPlan | None = None
 
     def can_capture(self) -> bool:
-        # A replay's padding rows would need scratch K/V to write into, and the
-        # requests' K/V move between steps; a step that declares this store runs eager.
+        # A replay's padding rows would need scratch K/V to write into, and regions
+        # move when the pool is rearranged; a step that declares this store runs eager.
         return False
 
     # Model-facing
@@ -115,18 +123,20 @@ class RollingKVManager(Resource):
         rows = self.current.rows
         if k.shape[0] != len(rows):
             raise ValueError(f"rolling KV step has {len(rows)} rows; write was given {k.shape[0]}")
+        kv = self._pool[layer_idx]
         for i, row in enumerate(rows):
-            kv = self._requests[row.rid].kv[layer_idx]
+            at = self._requests[row.rid].offset
             span = row.write_stop - row.write_start
-            kv[0, row.write_start:row.write_stop] = k[i, :span]
-            kv[1, row.write_start:row.write_stop] = v[i, :span]
+            kv[0, at + row.write_start:at + row.write_stop] = k[i, :span]
+            kv[1, at + row.write_start:at + row.write_stop] = v[i, :span]
 
     def window(self, layer_idx: int, row: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Row ``row``'s keys and values for this step, ``[1, kept, H, D]`` views
         in stream order: the sink, the retained window, then the step's own."""
         r = self.current.rows[row]
-        kv = self._requests[r.rid].kv[layer_idx]
-        return kv[0, None, :r.kept], kv[1, None, :r.kept]
+        at = self._requests[r.rid].offset
+        kv = self._pool[layer_idx]
+        return kv[0, at:at + r.kept][None], kv[1, at:at + r.kept][None]
 
     # Request lifecycle
 
@@ -143,20 +153,55 @@ class RollingKVManager(Resource):
             if req is None:
                 return
             if free:
-                del self._requests[rid]
-                self._admit_taken.discard(rid)
+                self._release(rid)
             else:
                 req.written, req.compacted_for = 0, None
 
-    def num_free_slots(self) -> int:
+    def num_free_tokens(self) -> int:
         with self._lock:
-            return self.config.max_slots - len(self._requests)
+            return sum(n for _, n in self._free)
 
-    def _allocate(self, capacity: int) -> torch.Tensor:
-        c = self.config
-        # empty: a request's K/V are only read up to what it wrote
-        return torch.empty((c.num_layers, 2, capacity, c.num_heads, c.head_dim), dtype=self._dtype,
-                           device=self._device)
+    # Pool regions
+
+    def _take(self, capacity: int) -> int | None:
+        """The start of a region of ``capacity`` tokens, first fit; None when no gap holds it."""
+        for i, (start, length) in enumerate(self._free):
+            if length >= capacity:
+                if length == capacity:
+                    del self._free[i]
+                else:
+                    self._free[i] = (start + capacity, length - capacity)
+                return start
+        return None
+
+    def _release(self, rid) -> None:
+        req = self._requests.pop(rid, None)
+        self._admit_taken.discard(rid)
+        if req is None:
+            return
+        gaps = sorted([*self._free, (req.offset, req.capacity)])
+        merged = [gaps[0]]
+        for start, length in gaps[1:]:
+            last_start, last_length = merged[-1]
+            if last_start + last_length == start:
+                merged[-1] = (last_start, last_length + length)
+            else:
+                merged.append((start, length))
+        self._free = merged
+
+    def _rearrange(self) -> None:
+        """Slide every resident region left, in pool order, so the free gaps join
+        into one at the end. Runs inside ``admit``, on the stream the steps run on,
+        so a region moves only after every step already issued has read it, and
+        the next step's plan takes its new offset."""
+        cursor = 0
+        for req in sorted(self._requests.values(), key=lambda r: r.offset):
+            if req.offset != cursor:
+                # only what the request holds: its sink and window so far
+                self._move_left(req.offset, cursor, min(req.written, req.capacity))
+                req.offset = cursor
+            cursor += req.capacity
+        self._free = [(cursor, self.config.pool_tokens - cursor)] if cursor < self.config.pool_tokens else []
 
     # Step lifecycle
 
@@ -175,31 +220,24 @@ class RollingKVManager(Resource):
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         "rolling KV step declares no position for a request", request_ids=frozenset({rid})))
                 capacity = pos.sink + pos.window
-                if capacity > self.config.max_request_tokens or pos.window < seg.span:
+                if capacity > self.config.pool_tokens or pos.window < seg.span:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"the request keeps a {pos.sink}-token sink and a {pos.window}-token window, writing "
-                        f"{seg.span} a step; a request may keep {self.config.max_request_tokens} tokens "
-                        f"(resources: {self.name}: max_request_tokens) and the window must hold the step",
+                        f"{seg.span} a step; the rolling KV pool holds {self.config.pool_tokens} tokens "
+                        f"(resources: {self.name}: pool_tokens) and the window must hold the step",
                         request_ids=frozenset({rid})))
                 req = self._requests.get(rid)
                 if req is None:
-                    if len(self._requests) >= self.config.max_slots:
+                    start = self._take(capacity)
+                    if start is None and self.num_free_tokens() >= capacity:
+                        self._rearrange()
+                        start = self._take(capacity)
+                    if start is None:
                         return AdmitOutcome(ok=False, reason=AllocationFailed(
-                            message=f"rolling KV is full: {self.config.max_slots} slots",
-                            pages_short=1, label=seg.label, request_id=rid))
-                    try:
-                        kv = self._allocate(capacity)
-                    except torch.OutOfMemoryError:
-                        if not self._requests:
-                            # nothing of this store's to wait for
-                            return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                                f"the request's rolling K/V ({capacity} tokens a layer) do not fit in free "
-                                "device memory", request_ids=frozenset({rid})))
-                        return AdmitOutcome(ok=False, reason=AllocationFailed(
-                            message=f"rolling KV: {capacity} tokens a layer do not fit in free device memory "
-                                    f"beside {len(self._requests)} resident requests",
-                            pages_short=1, label=seg.label, request_id=rid))
-                    req = self._requests[rid] = _Request(kv)
+                            message=f"rolling KV pool is full: {capacity} tokens wanted, "
+                                    f"{self.num_free_tokens()} of {self.config.pool_tokens} free",
+                            pages_short=capacity - self.num_free_tokens(), label=seg.label, request_id=rid))
+                    req = self._requests[rid] = _Request(start, capacity)
                     taken.add(rid)
                 elif capacity != req.capacity:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
@@ -212,15 +250,14 @@ class RollingKVManager(Resource):
         return ADMIT_OK
 
     def rollback_admit(self, step: RollingKVStep, ctx: StepContext) -> None:
-        """Free the K/V this step's admit allocated; K/V a request already held
-        stay with it."""
+        """Free the regions this step's admit took; a region a request already held
+        stays with it."""
         del step
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
             for rid in [r for r in self._admit_taken if ctx.is_real_row(r)]:
-                self._admit_taken.discard(rid)
-                self._requests.pop(rid, None)
+                self._release(rid)
 
     def plan(self, step: RollingKVStep, ctx: StepContext) -> RollingPlan:
         """Each row's write range, and the shift that makes room for it.
@@ -237,23 +274,25 @@ class RollingKVManager(Resource):
             pos = step.positions[seg.request_id]
             row, shift = row_layout(pos, seg.span)
             if shift is not None and req.compacted_for != pos.written:
-                self._shift(req.kv, shift)
+                self._move_left(req.offset + shift.src, req.offset + shift.dst, shift.length)
             req.compacted_for = pos.written
             rows.append(row._replace(rid=seg.request_id))
         self._current = RollingPlan(tuple(rows))
         return self._current
 
-    @staticmethod
-    def _shift(kv: torch.Tensor, shift: Compaction) -> None:
-        # The ranges overlap, and the move is to the left: copied left to right in
-        # blocks no longer than the distance moved, no block reads what an earlier
-        # one wrote, so no temporary is needed (half the traffic of a clone).
-        gap = shift.src - shift.dst
-        blocks = [(i, min(gap, shift.length - i)) for i in range(0, shift.length, gap)]
-        for layer in kv:
+    def _move_left(self, src: int, dst: int, length: int) -> None:
+        """Move pool tokens ``[src, src + length)`` to ``dst < src`` in every layer.
+        The ranges may overlap: copied left to right in blocks no longer than the
+        distance moved, no block reads what an earlier one wrote, so no temporary
+        is needed (half the traffic of a clone)."""
+        gap = src - dst
+        if length <= 0 or gap <= 0:
+            return
+        blocks = [(i, min(gap, length - i)) for i in range(0, length, gap)]
+        for layer in self._pool:
             for cache in layer:
                 for i, n in blocks:
-                    cache[shift.dst + i:shift.dst + i + n] = cache[shift.src + i:shift.src + i + n]
+                    cache[dst + i:dst + i + n] = cache[src + i:src + i + n]
 
     def commit(self, step: RollingKVStep, ctx: StepContext) -> None:
         if ctx.capture:
