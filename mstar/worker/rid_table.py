@@ -21,7 +21,7 @@ Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and the tensor sto
 force_cleanup_request), RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes,
 _decode, _unkeyed, _chunk_ends, _admit_restores, _admit_snaps, _admit_taken,
 _preplan_taken, _reserved}, KDAManager._verifying and RollingKVManager.{_requests,
-_admit_taken}
+_admit_taken, _wants, _reserved}
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
 release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
 sampler's remove_request), and WorkerProfileInfo.

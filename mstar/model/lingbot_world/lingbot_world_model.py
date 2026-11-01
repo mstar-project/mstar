@@ -31,11 +31,11 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
-from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec, ResourceReqConfig
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import Model, TensorAndMetadata, WalkStep
+from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -44,7 +44,14 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import DIT_ATTN, DIT_KV, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.lingbot_world.submodules import (
+    DIT_ATTN,
+    DIT_KV,
+    ROLLOUT_LOOP_NAME,
+    ROLLOUT_WALK,
+    LingBotDitSubmodule,
+    rolling_extent,
+)
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -59,9 +66,13 @@ REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
 _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
+# the rollout's rolling K/V tokens a layer, which process_prompt settles from the output size
+DIT_KV_TOKENS = "dit_kv_tokens"
 
 
 class LingBotWorldModel(Model):
+    INTERNAL_KWARGS = (DIT_KV_TOKENS,)
+
     def __init__(
         self,
         model_path_hf: str | None = None,
@@ -208,7 +219,7 @@ class LingBotWorldModel(Model):
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Validate, tokenize the prompt, resize the image and resample the
         camera trajectory, on the data worker.
 
@@ -253,12 +264,12 @@ class LingBotWorldModel(Model):
         self._ensure_tokenizer()
         text = self.prompt_clean(prompt)
         ids = self.tokenizer(text, truncation=True, max_length=cfg.text_len, add_special_tokens=True).input_ids
-        return {
+        return ProcessPromptOutput({
             "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             "image_inputs": [image],
             "camera_poses": [latent_camera_poses(poses[:frame_num], lat_f)],
             "intrinsics": [scale_intrinsics(intrinsics, cfg.intrinsics_height, cfg.intrinsics_width, height, width)],
-        }
+        }, {DIT_KV_TOKENS: sum(rolling_extent(cfg, (height, width), lat_f))})
 
     def _preprocess_image(self, image: torch.Tensor, kwargs: dict) -> torch.Tensor:
         """``[3, h, w]`` float32 in [-1, 1] at the output size: the reference's
@@ -317,6 +328,16 @@ class LingBotWorldModel(Model):
         lat_f = int(input_signals["camera_poses"][0].dims[0])
         request = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
         return [WalkStep(walk, step_metadata=request) for walk in (ENCODE_TEXT_WALK, ROLLOUT_WALK)]
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, ResourceReqConfig]:
+        """The rollout's rolling K/V, declared up front so it waits in the engine's
+        queue for room in the pool, and a size the pool can never hold is a 400.
+        ``process_prompt`` sizes it (``DIT_KV_TOKENS``), once it knows the output size."""
+        del input_modalities, output_modalities
+        tokens = model_kwargs.get(DIT_KV_TOKENS)
+        return {} if tokens is None else {DIT_KV: RollingKVReqConfig(tokens=int(tokens))}
 
     # ------------------------------------------------------------------
     # Submodule loading
