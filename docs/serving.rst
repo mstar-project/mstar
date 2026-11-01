@@ -356,7 +356,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
        ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
        ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
+       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,

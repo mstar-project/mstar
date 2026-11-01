@@ -375,9 +375,13 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
-The text stack compiles in Inductor's deterministic mode whatever ``-O`` says: on
-2x B300 the autotune bought no GPU time per step, and its per-process kernel picks
-changed greedy output between servers.
+The prefill, mixed and vision captures compile in Inductor's deterministic mode
+whatever ``-O`` says: autotuning them bought no GPU time and took a large part of
+the cold start. The decode capture keeps the ``-O`` level's tuned kernels, which win
+at one row. ``knobs: {compile_deterministic: true}`` compiles it deterministically
+too: greedy output then reproduces across server processes and the cold start
+shrinks again, at a cost to one-row decode (27B TP4 on H200: c=1 151 against 169
+tok/s, ITL 6.48 against 5.47 ms, the same from c=4 up).
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens

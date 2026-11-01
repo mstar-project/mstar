@@ -91,20 +91,26 @@ class LLMSubmodule(ARNodeSubmodule):
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
     # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs past 8192. From 256 up each bucket has 1/16 of slack, for the
-    # decode rows a mixed step carries beside its prompts and for batches a few
-    # tokens past a power of two, which would otherwise pad to twice the width.
-    # MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or extends it (static buffers
-    # are sized by the largest bucket).
+    # ladder runs past 8192. The powers of two stay, since a batch of prompts
+    # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
+    # above them for the decode rows a mixed step carries beside four prompts
+    # and for batches a few tokens over, which would otherwise pad to twice the
+    # width. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or extends it (static
+    # buffers are sized by the largest bucket).
     PREFILL_TOKEN_BUCKETS = [
         int(x) for x in os.environ.get(
-            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,272,544,1088,2176,4352,8704",
+            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704",
         ).split(",")
     ]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]
+    # Four prompts and their decode rows reach 2176, the only slack bucket a
+    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
+    # the forward all these captures share, and past Dynamo's limit the buckets
+    # compiled last run uncompiled inside their graphs.
+    MIXED_TOKEN_BUCKETS = [b for b in PREFILL_TOKEN_BUCKETS if b <= 2176 or b & (b - 1) == 0]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -205,7 +211,7 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=LLM_MIXED,
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                capture_token_lengths=self.MIXED_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
                 # the layout its GDN splits; a replay's padding rows stay empty
