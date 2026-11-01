@@ -20,6 +20,8 @@ KNOBS: dict[str, str] = {
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
+    "resident_planning": "MSTAR_RESIDENT_PLANNING",
+    "resident_slots": "MSTAR_RESIDENT_SLOTS",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -44,6 +46,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
     for key, value in settings.items():
         if key == "step_thread_core":
             out[key] = _step_thread_core_value(value)
+        elif key == "resident_planning":
+            out[key] = _resident_planning_value(value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -53,6 +57,14 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _resident_planning_value(value: object) -> str:
+    # yaml reads a bare ``off`` as False
+    text = "off" if value is False else str(value).strip().lower()
+    if text in ("auto", "off"):
+        return text
+    raise ValueError(f"`knobs: resident_planning` must be auto or off, got {value!r}")
 
 
 def _step_thread_core_value(value: object) -> str:
@@ -194,3 +206,21 @@ def step_thread_core() -> str | int:
     raise ValueError(
         f"MSTAR_STEP_THREAD_CORE must be auto, off or a CPU number, got {value!r}"
     )
+
+
+def resident_planning() -> str:
+    """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``auto``):
+    a captured decode step reads its rows off per-request tables held on the
+    device instead of having them rebuilt on the plan thread
+    (``mstar.engine.resources.resident``). ``auto`` turns it on for a node
+    whose submodule names resident walks and every resource of which is
+    resident-capable, and says why at startup when one is not; ``off`` keeps
+    the host plan everywhere."""
+    return _resident_planning_value(_setting("resident_planning", "auto"))
+
+
+def resident_slots() -> int:
+    """``resident_slots`` / ``MSTAR_RESIDENT_SLOTS`` (default 4096): request
+    rows of the resident tables, allocated once at startup since a captured
+    graph holds their addresses."""
+    return int(_setting("resident_slots", "4096"))

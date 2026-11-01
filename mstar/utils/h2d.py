@@ -138,6 +138,39 @@ class PinnedStager:
                 mirror.record(key, values)
 
 
+    def copy_runs_(self, dsts: Sequence[torch.Tensor], values: np.ndarray) -> None:
+        """Fill each of ``dsts`` from consecutive ``values``, in order: one
+        non-blocking copy per destination, all out of one pinned buffer. On a
+        stream behind a running graph the copies queue there, and a buffer per
+        copy would have ``copy_`` wait out that graph once the ring wraps."""
+        if not dsts:
+            return
+        capability = DeviceCapability.of(dsts[0].device)
+        if not capability.is_accelerator or not self._pinned:
+            at = 0
+            for dst in dsts:
+                dst.view(-1).copy_(torch.as_tensor(values[at: at + dst.numel()], dtype=self.dtype))
+                at += dst.numel()
+            return
+        with self._lock:
+            if len(values) > self._numel:
+                self._grow(len(values))
+            i = self._next
+            self._next = (i + 1) % self._depth
+            ev = self._events[i]
+            if ev is not None:
+                ev.synchronize()
+            self._views[i][: len(values)] = values
+            at = 0
+            for dst in dsts:
+                n = dst.numel()
+                dst.view(-1).copy_(self._bufs[i][at: at + n], non_blocking=True)
+                at += n
+            if ev is None:
+                ev = self._events[i] = torch.Event(device=dsts[0].device)
+            ev.record(torch.accelerator.current_stream(dsts[0].device))
+
+
 def to_device_nonblocking(
     data: torch.Tensor | Sequence,
     device: torch.device | str,

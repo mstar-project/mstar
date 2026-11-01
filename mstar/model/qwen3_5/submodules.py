@@ -349,6 +349,10 @@ class LLMSubmodule(ARNodeSubmodule):
             and self.node_resources[SAMPLER].has_slot_masters
         )
 
+    def resident_walks(self) -> frozenset[str]:
+        # with the tables staged outside the graph, `preprocess` reads positions
+        return frozenset({"decode"}) if ingraph_decode_rope() else frozenset()
+
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
         if graph_walk == "decode" and self._device_loopback():
             return frozenset({"text_inputs"})

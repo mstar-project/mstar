@@ -387,6 +387,10 @@ class SamplerResource(Resource):
             "with the sampler's configs (a mid-request config update?)"
         )
 
+    def resident_refusal(self) -> str | None:
+        # its masters already live by slot on the device, on numbers of its own
+        return None
+
     @property
     def supports_preplan(self):
         return True

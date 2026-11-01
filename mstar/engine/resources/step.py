@@ -80,6 +80,11 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # the node's `ResidentPlanner` when this step's capture reads the resident
+    # tables: a resource then stages nothing per row (see `resources/resident.py`)
+    resident: Any = None
+    # what that planner staged for this step
+    resident_plan: Any = None
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

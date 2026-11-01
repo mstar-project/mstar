@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -64,6 +64,15 @@ from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.kv.resident import KVResidentTables
+    from mstar.engine.resources.resident import (
+        CapturedResidentStep,
+        ResidentPlan,
+        ResidentPlanner,
+        ResidentWrites,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +502,8 @@ class _DecodePlanCache:
 
 class KVManager(AttentionResource):
     prefix_skip_safe = True
+    # this pool's resident tables, once a node's planner bound them
+    _resident: "KVResidentTables | None" = None
 
     def __init__(
         self,
@@ -534,6 +545,7 @@ class KVManager(AttentionResource):
             cfg, device, dtype
         )
         self.name = name
+        self._needs_remote_transfer = needs_remote_transfer
 
         self._arena = PageArena(
             kv_cache=self.kv_cache,
@@ -1630,7 +1642,9 @@ class KVManager(AttentionResource):
         graph_walk: str,
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
-        self._touch_plan_cache(rid)
+        # asked of a waiting row every readiness pass: a pool that retrieves
+        # from another node refuses resident planning, so its row stands
+        self._touch_plan_cache(rid, row=False)
         if self._host_copies:
             with self._lock:
                 self._land_host_copies()
@@ -2402,15 +2416,21 @@ class KVManager(AttentionResource):
         self._readonly_plans = {}
         self._readonly_rows = frozenset()
 
-    def _touch_plan_cache(self, rid: str | None = None) -> None:
+    def _touch_plan_cache(self, rid: str | None = None, row: bool = True) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
         commit: the plan caches no longer describe the streams if they hold
-        that request. A padding row's reset after a replay holds nothing."""
+        that request. A padding row's reset after a replay holds nothing.
+
+        ``row`` also marks its resident row stale. A touch of every stream
+        doesn't: those are refused admits and abandoned pre-plans, which leave
+        only pages past the row's committed columns."""
         if rid is None or rid in self._readonly_rows:
             self._drop_readonly_plans()
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
+        if row and rid is not None and self._resident is not None:
+            self._resident.planner.mark_stale(rid)
 
     def _split_padding(self, step: KVStep, ctx: StepContext):
         """``(n_real, (n_pad, span))`` of a step whose real segments come
@@ -2812,8 +2832,13 @@ class KVManager(AttentionResource):
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
             laps.lap("full")
-        for g, outputs in enumerate(res.groups):
-            self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
+        if ctx.resident is None:
+            for g, outputs in enumerate(res.groups):
+                self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
+        else:
+            # the replay fills the slot's addressing, so no reuse may skip re-staging it
+            for label in res:
+                self._staged_outputs.pop((ctx.slot_lease.slot, (label, 0)), None)
         laps.lap("setup_states")
         if readonly:
             self._readonly_plans[slot] = (key, epochs, res)
@@ -3093,6 +3118,7 @@ class KVManager(AttentionResource):
             return 0
         if touch:
             self._touch_plan_cache()
+            self._touch_plan_cache(rid)
         return self._release_oldest_locked(rid, stream, excess, policy.protected_prefix, group)
 
     def _settle_window_allotment(self, segment: Segment, stream: CacheStream) -> None:
@@ -3179,6 +3205,7 @@ class KVManager(AttentionResource):
                     "pages are offloaded or in transfer"
                 )
             self._touch_plan_cache()
+            self._touch_plan_cache(request_id)
             return self._release_oldest_locked(request_id, stream, num_tokens, stream.protected_prefix)
 
     # Eviction
@@ -4358,6 +4385,54 @@ class KVManager(AttentionResource):
     # Label / layer cursors come from `AttentionResource`; the readers resolve
     # them. TODO: rename the `set_layer_idx` call sites and drop this alias.
     set_layer_idx = AttentionResource.set_default_layer_idx
+
+    # Resident planning
+
+    def resident_refusal(self) -> str | None:
+        if len(self._groups) > 1:
+            return "a pool with sliding-window layers holds its pages per group, which a block table row can't"
+        if self.kv_cache.layout != KVLayout.NHD:
+            return f"the {self.kv_cache.layout.value} layout has no resident write path"
+        if self._needs_remote_transfer:
+            return "a pool read across nodes takes pages a resident row doesn't track"
+        return None
+
+    def bind_resident(self, planner: "ResidentPlanner") -> None:
+        from mstar.engine.resources.kv.resident import KVResidentTables
+
+        page_size = self._groups[0].page_size
+        self._resident = KVResidentTables(planner, page_size, -(-self.config.max_seq_len // page_size))
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        stream = self._streams[rid][writes.label]
+        if stream.released:
+            raise ValueError(
+                f"KV {self.name}: {rid}/{writes.label} released {stream.released} tokens, "
+                "which a block table row can't address"
+            )
+        writes.kv_len = stream.stored_len
+        self._resident.row(stream.stored_len, stream.page_indices, slot, row)
+
+    def resident_stage(self, plan: "ResidentPlan") -> None:
+        tables, streams, label = self._resident, self._streams, plan.writes.label
+        planner = tables.planner
+        for rid in plan.moved:
+            tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
+        tables.stage_step(plan, lambda rid: streams[rid][label].page_indices, planner.rewrite)
+        if _DEBUG_ASSERTS:
+            for rid, slot in zip(plan.rids, plan.slots.tolist(), strict=True):
+                held, stored = int(tables.host_len[slot]), streams[rid][label].stored_len
+                assert held == stored, f"KV {self.name}: resident row of {rid} at {held}, its stream at {stored}"
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        state = self._static_plan_state(step.slot, (step.label, 0))
+        self._resident.gather(step, state.token_to_page, state.token_to_cache)
+
+    def resident_commit(self, step: "CapturedResidentStep") -> None:
+        self._resident.commit(step)
+
+    def resident_advance(self, plan: "ResidentPlan") -> None:
+        self._resident.advance(plan)
 
     def reset_default_cursors(self) -> None:
         super().reset_default_cursors()

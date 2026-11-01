@@ -30,6 +30,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
+from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -44,6 +45,12 @@ from mstar.utils.h2d import H2DMirror, PinnedStager
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.resident import (
+        CapturedResidentStep,
+        ResidentPlanner,
+        ResidentTable,
+        ResidentWrites,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +139,10 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # the node's planner and this pool's table of slots, once bound
+    _resident: "ResidentPlanner | None" = None
+    _resident_table: "ResidentTable | None" = None
+
     @classmethod
     def build(
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
@@ -554,6 +565,9 @@ class RecurrentStatePool(Resource):
             "recurrent preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # the replay's kernels read the buffers its graph fills from the table
+            return self._current
         if self._preplanned:
             # Promotion: apply the fork copies staging left undone; see
             # `_pending_fork_state`.
@@ -1043,6 +1057,26 @@ class RecurrentStatePool(Resource):
                 "must carry a segment in the step declaration."
             )
         return found
+
+    # Resident planning
+
+    def resident_refusal(self) -> str | None:
+        if self.config.disable_sink_slot:
+            return "a pool with no sink slot has nowhere for a padding row"
+        return None
+
+    def bind_resident(self, planner: "ResidentPlanner") -> None:
+        self._resident = planner
+        self._resident_table = planner.table()
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        row[self._resident_table.col] = self._slots[rid][writes.label].index
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.label)
+        table = self._resident_table
+        # a padding row reads the trash row's zero, which is SINK_SLOT
+        gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
 
     # Engine lifecycle
 

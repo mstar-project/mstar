@@ -87,6 +87,11 @@ class FlashInferManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
+    def resident_refusal(self) -> str | None:
+        if self._window_left >= 0:
+            return "a sliding window reads pages a resident row no longer holds"
+        return None
+
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
         since its plans address only that group's pages. Checked in Python, so at eager and
