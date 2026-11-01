@@ -38,7 +38,15 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+)
 from mstar.model.glm5_next.config import (
     ATTN,
     DSA,
@@ -253,6 +261,8 @@ class Glm5NextModel(Model):
                     num_layers=len(self.config.kda_layer_indices),
                     blocks=kda_blocks,
                     max_slots=self.kda_max_requests + 1,  # + the sink
+                    # snapshots for prefix reuse are keyed by this cache's pages (`prefix_slots`)
+                    kv_cache=KV_CACHE,
                 ),
             ),
             LinearAttnSpec(
@@ -281,7 +291,16 @@ class Glm5NextModel(Model):
         return specs
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+        # The prompt's ids key its pages for prefix reuse, the DSA index keys on them and the KDA
+        # state's snapshots beside them. The reply's too, without MTP: a verify step writes a
+        # whole block of rows, whatever it accepts, so its rows are not its tokens.
+        return {KV_CACHE: {"main": KVLabel(
+            growth=(("decode", "decode_loop"),),
+            keys=PrefixKeys("text_inputs", ("prefill",), growth=self.config.mtp_num_draft_tokens == 0),
+        )}}
+
+    def checkpoint_path(self) -> str | None:
+        return self._resolve_checkpoint()
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],

@@ -119,11 +119,11 @@ class _Model(Model):
         return None
 
 
-def _preprocess(model: _Model, model_kwargs: dict) -> dict:
+def _preprocess(model: _Model, model_kwargs: dict, kv_key: str = "kv") -> dict:
     worker = PreprocessWorkerThread(
         *(queue.Queue() for _ in range(8)), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_StubTensorManager(), model=model,
-        model_config={"model": "stub", "resources": {"kv": {"page_size": PS}}},
+        model_config={"model": "stub", "resources": {kv_key: {"page_size": PS}}},
     )
     worker._process_input(PreprocessInput(
         request_id="r", text="hello", file_paths=None, input_modalities=["text"],

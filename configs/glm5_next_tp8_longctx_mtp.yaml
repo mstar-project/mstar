@@ -31,14 +31,20 @@ resources:
     # ~32 GB/rank next to ~38 GB of weights.
     max_num_pages: 8960
     page_size: 128
+    # the prefix cache above one rank: rank 0 decides each hit and the other ranks adopt it
+    prefix_cache_tp: true
   kda_state:
     max_slots: 65
+    # KDA states kept for prefix reuse, at page boundaries: a session's next turn restores its
+    # last prompt's. One request slot's memory each.
+    prefix_slots: 64
 # glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill, with its MTP pass, compiles
 # before the server binds.
 warmup_requests:
+  # each its own text: a warmup that hit another's cached prefix would skip the windows it is for
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
-  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
-  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+  - {text: "A lazy dog sleeps under the quick brown fox. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+  - {text: "Pack my box with five dozen liquor jugs now. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]
