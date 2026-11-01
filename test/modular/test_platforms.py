@@ -319,6 +319,50 @@ pool.shutdown()
     subprocess.run([sys.executable, "-c", code], env={**os.environ, "TORCHINDUCTOR_COMPILE_THREADS": "2"}, check=True)
 
 
+@pytest.mark.parametrize(
+    ("platform", "available", "built"),
+    [("RocmPlatform", True, True), ("RocmPlatform", False, False), ("CudaPlatform", True, False)],
+)
+def test_a_worker_builds_the_compile_pool_before_it_touches_the_model(platform, available, built):
+    # a model can compile at load, and the first compile builds the pool under inductor's defaults
+    code = f"""
+from types import SimpleNamespace
+
+import torch
+from torch._inductor.async_compile import AsyncCompile
+
+from mstar import platforms
+from mstar.platforms import compile as platform_compile
+from mstar.worker.engine_manager import EngineManager
+
+
+class ModelTouched(Exception):
+    pass
+
+
+class Model:
+    def __getattr__(self, name):
+        raise ModelTouched
+
+
+platform_compile.current_platform = platforms.{platform}()
+try:
+    EngineManager.build(
+        node_names={{"node"}}, device=torch.device("cpu"), model_config={{}}, parallel_groups=None,
+        transfer_engine_info=None, model=Model(), graph_runtime=None,
+        device_capability=SimpleNamespace(is_available={available}),
+    )
+except ModelTouched:
+    pass
+assert AsyncCompile.process_pool.cache_info().currsize == {int(built)}
+if {built}:
+    pool = AsyncCompile.process_pool()
+    assert pool.timer is None, "the pool would still quiesce"
+    pool.shutdown()
+"""
+    subprocess.run([sys.executable, "-c", code], env={**os.environ, "TORCHINDUCTOR_COMPILE_THREADS": "2"}, check=True)
+
+
 IN_GRAPH_KNOBS = ("ingraph_decode_rope", "sampler_ingraph_scatter")
 
 
