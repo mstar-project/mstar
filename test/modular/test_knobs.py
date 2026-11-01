@@ -49,7 +49,8 @@ def test_the_in_graph_sampler_scatter_is_on_by_default(monkeypatch):
 def test_step_thread_core_from_the_config_and_the_environment(monkeypatch):
     assert knobs.step_thread_core() == "off"
     # yaml reads a bare off as False
-    for value, expected in ((False, "off"), (True, "auto"), ("auto", "auto"), ("OFF", "off"), (12, 12)):
+    for value, expected in ((False, "off"), (True, "auto"), ("auto", "auto"), ("always", "always"), ("OFF", "off"),
+                            (12, 12)):
         knobs.configure({"step_thread_core": value})
         assert knobs.step_thread_core() == expected
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "off")

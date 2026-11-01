@@ -2142,7 +2142,9 @@ class Worker:
         self._step_cpus = plan.workers[slot] if plan.workers else None
         step = self._step_cpus
         if step is None:
-            logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
+            # a host that doesn't call for pinning is the API server's one line
+            if not plan.shallow:
+                logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
         else:
             logger.info(
                 "Worker %s: step threads (main, GPU, plan) on CPUs %s (%s; %s, worker %d of %d, mask %s)",
