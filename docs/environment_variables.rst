@@ -496,6 +496,18 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_CONDUCTOR_TICK_MS``
+     - ``1``
+     - While any request is in flight, the conductor's wait for a message is
+       at most this many milliseconds; with none it waits until its next
+       timed check. The tick does no work: a timer pending on a core keeps
+       the idle governor out of its deepest states there, so a thread woken
+       on that core mostly skips the exit. On a 2x B300 host (Xeon 6767P,
+       ``intel_idle``, C6 at 170 µs) a wake every 2 ms took 160 µs on an idle
+       core, 11-17 µs (median) with a 1 ms timer on it and 160 µs with a 3 ms
+       one, so a longer tick doesn't hold a core. ``0`` turns it off, for a
+       deployment that holds its cores out of deep idle itself or a host
+       without deep idle states. Read by ``Conductor.run``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``off``
      - Pin each worker's main, GPU and plan threads to one core's two

@@ -52,6 +52,9 @@ class _Comm:
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
 
+    def poll_for_messages(self, timeout_ms):
+        return bool(self.batches)
+
 
 class _ScriptDoneError(Exception):
     pass
