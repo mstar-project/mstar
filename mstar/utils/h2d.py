@@ -148,9 +148,9 @@ class PinnedStager:
         ahead of anything that reads ``dst`` after this call.
         """
         n = len(values)
+        if n > dst.numel():
+            raise ValueError(f"{n} values do not fit a destination of {dst.numel()}")
         total = dst.numel() if pad_value is not None else n
-        if n > total:
-            raise ValueError(f"{n} values do not fit a destination of {total}")
         if total == 0:
             return
         if mirror is not None:

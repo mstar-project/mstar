@@ -29,3 +29,12 @@ def test_a_strided_destination_gets_its_own_elements():
     buf = torch.zeros(4, 2, dtype=torch.int64, device="cuda")
     PinnedStager(torch.int64).copy_(buf[:, 0], np.arange(1, 5, dtype=np.int64))
     assert buf.tolist() == [[1, 0], [2, 0], [3, 0], [4, 0]]
+
+
+def test_more_values_than_the_destination_holds_are_refused():
+    # the raw copy has no size check of its own, so it would write the rest
+    # over whatever follows the destination
+    buf = torch.zeros(16, dtype=torch.int64, device="cuda")
+    with pytest.raises(ValueError):
+        PinnedStager(torch.int64).copy_(buf[:4], np.arange(1, 9, dtype=np.int64))
+    assert buf.tolist() == [0] * 16
