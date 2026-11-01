@@ -312,9 +312,7 @@ class ResidualCodePredictor(nn.Module):
         final norm: ``[bs, S, hidden]``. Bind the step first with
         ``depth.bind_step``, once per call: the depth loop binds it, not this
         frame, which would compile once per ``cache_pos``."""
-        # the residual stream is updated in place, so it starts from a copy: the
-        # projection may be the identity, and its input is the caller's
-        hidden_states = self.small_to_mtp_projection(inputs_embeds).clone()
+        hidden_states = self.small_to_mtp_projection(inputs_embeds)
         return run_layers(self.model.layers, hidden_states, self.model.norm)
 
     def depth_loop(
