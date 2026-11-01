@@ -205,6 +205,13 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
        joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
        stereo audio. Gated; LTX-2.x Community License.
+   * - ``minimax_h3`` *(Beta)*
+     - ``MiniMaxAI/MiniMax-H3``
+     - MiniMax-H3 (FL2VA) text- and first/last-frame-to-audio+video: a 33B packed-sequence
+       audio-video DiT, CFG-distilled (one forward per step, 50 sigma points by default), a
+       Qwen3-VL-32B conditioner (keyframes through its vision tower) and a ViT video VAE,
+       emitting an H.264 video at 24 fps with 32 kHz stereo audio (one mp4 with AAC on
+       ``/v1/videos/generations``). MiniMax H3 Community License Agreement.
    * - ``z_image_turbo``
      - ``Tongyi-MAI/Z-Image-Turbo``
      - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
@@ -1607,6 +1614,83 @@ request of a new shape pays its compile. ``vae_compile`` (on in these configs) c
 video VAE's decoder at load for ``vae_compile_shapes``, by default the same shapes (~55 dB
 from the eager decode; other shapes decode eager). The SP2 config doesn't capture 1088x1920
 but lists it there, so its two-stage decode runs compiled too.
+
+MiniMax-H3 (``minimax_h3``)
+---------------------------
+
+Text- and first/last-frame-to-audio+video on **MiniMax-H3** (``MiniMaxAI/MiniMax-H3``,
+its ``FL2VA`` checkpoint; MiniMax H3 Community License Agreement): a 33B packed-sequence
+audio-video DiT, guidance-distilled (one forward per step), a Qwen3-VL-32B conditioner
+and a ViT video VAE, at 24 fps with 32 kHz stereo audio. Not ported: ``Ref2VA``
+(reference audio/video/images), the H3-Context-IR prompt rewriter and the 2K regenerator.
+
+Nodes: ``text_encoder`` (Qwen3-VL through layer 50, keyframes through its vision tower,
+then the DiT's ``condition_proj`` and token refiner, once per request), ``vae_encoder``
+(keyframes), ``dit`` (the DiT scaffold's denoise loop; Ulysses sequence parallel),
+``vae_decoder`` and ``audio_decoder``. With ``vae_parallel: N`` the video decode is split
+by clips over ``vae_decoder_0`` .. ``vae_decoder_<N-1>`` (place them on the DiT's ranks)
+and cross-faded by ``video_combine``, with the same pixels as one decoder.
+
+.. code-block:: bash
+
+   mstar serve minimax_h3                                        # 4 GPUs: DiT SP4
+   mstar serve minimax_h3 --config configs/minimax_h3_sp8.yaml   # 8 GPUs: DiT SP8
+   mstar serve minimax_h3 --config configs/minimax_h3_2gpu.yaml  # 2 GPUs, no SP
+
+Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32, aspect 1:4 to
+4:1; default 768x1344, or the first keyframe's aspect ratio), ``num_frames`` (snapped up
+to 17n+5, 5 to 15 s; default 124), ``num_inference_steps`` (default 50 sigma points, i.e.
+49 forwards), ``flow_shift`` / ``audio_flow_shift`` (12 / 3), ``seed``; with one or two
+images, ``keyframe_anchors`` (``first`` / ``last`` per image; default ``first``, or both).
+A prompt longer than the text encoder's 262,144 positions (keyframe tokens included;
+``max_prompt_tokens`` sets a lower bound), a packed sequence over ``max_packed_rows`` rows
+(prompt, keyframe, audio and video rows), or Qwen's vision tokens typed into the prompt are
+a 400. The ``max_packed_rows`` default, 131072, covers the longest clip at 768p (14.4 s,
+~105k rows) with a ~25k-token prompt; a step's attention grows with the square of the rows,
+so a deployment may lower it. One request runs per denoise step.
+Outputs are an H.264 ``video`` and a stereo ``audio`` chunk (16-bit PCM).
+``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC (``image``
+is the first frame, ``extra_body.last_image`` the last); the mux needs the ``ffmpeg``
+binary on the server's ``PATH`` and falls back to video only without it.
+
+Deployment knobs: ``compile`` (the DiT's blocks, static per packed row count: each new count
+compiles once, ~8 s; past the engine's recompile limit new counts run eager), ``vae_tile_batch`` (256-px tiles per
+decoder call; 28 is one 768p clip), ``vae_parallel`` (a per-model stand-in for decode
+parallelism the engine does not provide yet), ``vae_compile`` (the decoder's blocks; not in
+the shipped config until measured), ``attention_backend`` (``flashinfer``, or ``sdpa``, the
+reference's kernel). Runtime needs: PyAV (video encoding), transformers' image processor
+(keyframes; a server that cannot import it, for example next to a torchaudio built for
+another torch, refuses to start), FlashInfer (``attention_backend: flashinfer``), and the
+``ffmpeg`` binary for the mp4's AAC track.
+
+At ``attention_backend: sdpa``, the serving code driven by ``test/minimax_h3/parity.py``
+(the nodes' modules without the engine, fp32 matmuls at "highest") is bit-identical to
+diffusers' MiniMax-H3 pipeline end to end (latents, frames, waveform). FlashInfer's FA3 and
+the compiled DiT are not bit-exact; served at 768p they stay within the reference's own
+spread across SDPA kernels.
+
+Measured on 4x H200 SXM with the node's other four GPUs idle, torch 2.12.1+cu132 and
+FlashInfer 0.7.2 (``benchmark/minimax_h3/bench_video.py``, one request at a time;
+1344x768, 124 frames, 50 steps, text only; one warmup and one timed request per row), end
+to end through ``/v1/videos/generations``:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Settings
+     - Seconds per clip
+   * - eager, one ``vae_decoder``
+     - 90.5
+   * - ``compile``
+     - 81.4
+   * - ``compile``, ``vae_parallel: 4`` (``configs/minimax_h3.yaml``)
+     - 77.4
+
+The DiT's 49 steps are ~75 s of a clip (~1.53 s each), and the GPUs run at their power
+cap throughout. With the other four GPUs busy, the shipped settings plus ``vae_compile``
+measured 82.9 s (median of 3). Async scheduling for the DiT (``tp_async_sched: [dit]``)
+measured within noise and is left off. Not done: CUDA-graph capture, more than one request
+per step, tensor parallelism, an SP8 run, and the ``Ref2VA`` checkpoint.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
