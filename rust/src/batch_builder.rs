@@ -51,6 +51,9 @@ pub struct BuildRequest<'a> {
     pub combined: bool,
     /// rows that cannot run this step; they stay parked
     pub blocked: &'a FxHashSet<u32>,
+    /// backlogged rows past the readiness check's stop: not run this step,
+    /// but parked in their place ahead of the blocked rows
+    pub deferred: &'a FxHashSet<u32>,
     pub caps: &'a KeyCaps,
     /// the caller's own rows and their walk
     pub pre: u32,
@@ -104,11 +107,18 @@ impl BatchBuilder for Fifo {
         }
         let (keep, out): (Vec<usize>, Vec<usize>) =
             (0..req.rows.len()).partition(|&i| !exclude.contains(&req.rows[i].rid));
-        let bs = max_bs.map_or(keep.len(), |m| (m as usize).min(keep.len()));
-        let mut result = BuildResult { scheduled: keep[..bs].to_vec(), ..Default::default() };
+        let (takeable, deferred): (Vec<usize>, Vec<usize>) =
+            keep.iter().partition(|&&i| !req.deferred.contains(&req.rows[i].rid));
+        let bs = max_bs.map_or(takeable.len(), |m| (m as usize).min(takeable.len()));
+        let mut result = BuildResult { scheduled: takeable[..bs].to_vec(), ..Default::default() };
+        // what is left of `keep` in row order, deferred rows in their place
+        let mut left: Vec<usize> = takeable[bs..].iter().chain(deferred.iter()).copied().collect();
+        if !deferred.is_empty() {
+            left.sort_unstable();
+        }
         // A fresh row the cap pushed out goes back to its ready queue only on
         // a step that served a backlog; otherwise it parks.
-        for &i in &keep[bs..] {
+        for &i in &left {
             if req.n_backlog > 0 && i >= req.n_backlog {
                 result.returned.push(i);
             } else {
@@ -145,7 +155,7 @@ fn compose_walks(req: &BuildRequest, exclude: &FxHashSet<u32>) -> (Option<i64>, 
     let mut cap = min_cap(walks.iter().map(|&w| caps.cap(w)));
     let mut left_out = Vec::new();
     for row in req.rows {
-        if exclude.contains(&row.rid) {
+        if exclude.contains(&row.rid) || req.deferred.contains(&row.rid) {
             continue;
         }
         let walk = row.walk;

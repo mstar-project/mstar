@@ -31,6 +31,10 @@ class BatchBuildRequest:
     # Rows that cannot run this step (waiting, not ready, or outside the
     # step's capture group); they stay parked.
     blocked_rids: set[int] = field(default_factory=set)
+    # Backlogged rows past the readiness check's stop: their readiness is
+    # unknown, so they must not run this step either, but they keep their
+    # place in the backlog ahead of the blocked rows.
+    deferred_rids: set[int] = field(default_factory=set)
     # Each real walk's cap (None or absent: uncapped); under `graph_walk`, the
     # cap of a step mixing walks.
     walk_caps: dict[str, int | None] = field(default_factory=dict)
@@ -125,16 +129,21 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             return BatchBuildResult(None)
 
         exclude = set(request.blocked_rids)
+        deferred = request.deferred_rids
         walk = _single_walk(batch, request)
         if walk is None:
-            max_bs, left_out = _compose_walks(batch, exclude, request)
+            max_bs, left_out = _compose_walks(
+                batch, exclude | deferred if deferred else exclude, request,
+            )
             exclude = exclude | left_out
         else:
             cap = request.walk_caps.get(walk)
             max_bs = None if cap is None else cap - request.pre_existing_batch_size
         if max_bs is not None and max_bs <= 0:
             return BatchBuildResult(None, backlog=batch)  # the caller's rows fill it
-        scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
+        scheduled, remainder = batch.split_off_first(
+            max_bs, exclude_rids=exclude, deferred_rids=deferred,
+        )
         if remainder is None:
             return BatchBuildResult(scheduled)
         give_back = {
@@ -167,7 +176,8 @@ def _min_cap(*caps: int | None) -> int | None:
 def _compose_walks(
     batch: "ScheduledBatch", exclude: set[int], request: BatchBuildRequest,
 ) -> tuple[int | None, set[int]]:
-    """Rows left for the step after the caller's, and the rows left out."""
+    """Rows left for the step after the caller's, and the rows left out.
+    Rows in ``exclude`` are neither counted nor left out."""
     caps = request.walk_caps
     row_caps = request.walk_row_caps
     n = request.pre_existing_batch_size

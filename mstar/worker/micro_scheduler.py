@@ -141,11 +141,14 @@ class ScheduledBatch:
         self._by_walk = None
 
     def split_off_first(
-        self, bs: int | None, exclude_rids: set[int] | None = None
+        self, bs: int | None, exclude_rids: set[int] | None = None,
+        deferred_rids: set[int] | None = None,
     ) -> "tuple[ScheduledBatch | None, ScheduledBatch | None]":
         """
         Return the first ScheduledBatch, as well as the remainder (None if
-        all requests have been scheduled)
+        all requests have been scheduled). Neither ``exclude_rids`` nor
+        ``deferred_rids`` are taken; in the remainder the rows left over keep
+        their order, deferred ones included, ahead of the excluded ones.
         """
         exclude_rids = exclude_rids or {}
         rids = self.request_to_worker_graph.keys() # as of py3.7, preserves ordering
@@ -155,36 +158,36 @@ class ScheduledBatch:
         keep_rids = [rid for rid in rids if rid not in exclude_rids]
         exclude_rids = [rid for rid in rids if rid in exclude_rids]
 
-        if len(keep_rids) <= bs and not exclude_rids:
-            # The whole point of the columnar block: the common case hands the
-            # batch back untouched, so nothing is re-sliced per edge.
-            return self, None
-        if not keep_rids:
-            return None, self
+        if deferred_rids:
+            taken = [rid for rid in keep_rids if rid not in deferred_rids][:bs]
+            taken_set = set(taken)
+            left = [rid for rid in keep_rids if rid not in taken_set] + exclude_rids
+            if not taken:
+                return None, self if left == list(rids) else self._part(left)
+        else:
+            if len(keep_rids) <= bs and not exclude_rids:
+                # The whole point of the columnar block: the common case hands the
+                # batch back untouched, so nothing is re-sliced per edge.
+                return self, None
+            if not keep_rids:
+                return None, self
+            taken = keep_rids[:bs]
+            left = keep_rids[bs:] + exclude_rids
+        return self._part(taken), self._part(left) if left else None
 
-        taken = keep_rids[:bs]
-        left = keep_rids[bs:] + exclude_rids
+    def _part(self, rids: list[int]) -> "ScheduledBatch":
+        """The rows ``rids`` of this batch, in that order."""
         return ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
             request_to_worker_graph={
-                rid: self.request_to_worker_graph[rid] for rid in taken
+                rid: self.request_to_worker_graph[rid] for rid in rids
             },
-            input_edges=self.input_edges.select_rids(set(taken)),
+            input_edges=self.input_edges.select_rids(set(rids)),
             output_signals=self.output_signals,
-            request_walks=self._walks_for(taken),
-            # shared, not trimmed to the walks each half keeps: an extra entry
+            request_walks=self._walks_for(rids),
+            # shared, not trimmed to the walks each part keeps: an extra entry
             # costs nothing, since outputs are only looked up for walks present
-            walk_output_signals=self.walk_output_signals,
-        ), ScheduledBatch(
-            node_name=self.node_name,
-            graph_walk=self.graph_walk,
-            request_to_worker_graph={
-                rid: self.request_to_worker_graph[rid] for rid in left
-            },
-            input_edges=self.input_edges.select_rids(set(left)),
-            output_signals=self.output_signals,
-            request_walks=self._walks_for(left),
             walk_output_signals=self.walk_output_signals,
         )
 

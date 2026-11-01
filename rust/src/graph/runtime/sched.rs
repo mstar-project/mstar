@@ -403,7 +403,9 @@ impl GraphRuntime {
         }
         let pos = self.sched.backlog.iter().position(|(k, _)| *k == key);
         let Some(pos) = pos else {
-            let built = self.sched_key_build(p, key, entries, None, FxHashSet::default(), anchor_group)?;
+            let built = self.sched_key_build(
+                p, key, entries, None, FxHashSet::default(), FxHashSet::default(), anchor_group,
+            )?;
             return Ok(KeyStep::Done(built));
         };
         let (_, batch) = self.sched.backlog.remove(pos);
@@ -439,11 +441,19 @@ impl GraphRuntime {
         &mut self, p: &Pass, ctx: KeyCtx, verdicts: &[u8], checked_anchor: Option<i64>,
     ) -> PyResult<Option<SBatch>> {
         let KeyCtx { key, entries, anchor_group, mut batch, waiting_rows, cands, .. } = ctx;
-        // waiting, not ready, failed or off the step's capture group
+        // blocked: waiting, not ready, failed or off the step's capture group;
+        // deferred: past the check's stop, readiness unknown, keeps its place
         let mut blocked = waiting_rows;
+        let mut deferred: FxHashSet<u32> = FxHashSet::default();
         for (i, rid) in cands.iter().enumerate() {
-            if verdicts.get(i).is_some_and(|v| *v != READY && *v != UNCHECKED) {
-                blocked.insert(*rid);
+            match verdicts.get(i) {
+                Some(&UNCHECKED) => {
+                    deferred.insert(*rid);
+                }
+                Some(v) if *v != READY => {
+                    blocked.insert(*rid);
+                }
+                _ => {}
             }
         }
         // a failed row is dropped rather than parked
@@ -451,12 +461,13 @@ impl GraphRuntime {
         blocked.retain(|r| !p.failed.contains(r));
         let backlogged = if batch.rows.is_empty() { None } else { Some(batch) };
         let anchor_group = checked_anchor.or(anchor_group);
-        self.sched_key_build(p, key, entries, backlogged, blocked, anchor_group)
+        self.sched_key_build(p, key, entries, backlogged, blocked, deferred, anchor_group)
     }
 
     fn sched_key_build(
         &mut self, p: &Pass, key: Key, entries: Vec<Entry>,
-        backlogged: Option<SBatch>, mut blocked: FxHashSet<u32>, anchor_group: Option<i64>,
+        backlogged: Option<SBatch>, mut blocked: FxHashSet<u32>, deferred: FxHashSet<u32>,
+        anchor_group: Option<i64>,
     ) -> PyResult<Option<SBatch>> {
         let fresh = if entries.is_empty() { None } else { self.sched_assemble(key, &entries)? };
         if backlogged.is_none() && fresh.is_none() {
@@ -465,7 +476,7 @@ impl GraphRuntime {
         if let Some(fresh) = &fresh {
             blocked.extend(Self::off_group(fresh, &entries, anchor_group));
         }
-        self.sched_build_and_schedule(p, key, backlogged, fresh, blocked)
+        self.sched_build_and_schedule(p, key, backlogged, fresh, blocked, deferred)
     }
 
     /// `_off_group`: the fresh rows outside the step's capture group -- the
@@ -568,6 +579,7 @@ impl GraphRuntime {
     fn sched_build_and_schedule(
         &mut self, p: &Pass, key: Key,
         backlog: Option<SBatch>, fresh: Option<SBatch>, blocked: FxHashSet<u32>,
+        deferred: FxHashSet<u32>,
     ) -> PyResult<Option<SBatch>> {
         let mut expected: FxHashSet<u32> = FxHashSet::default();
         for b in backlog.iter().chain(fresh.iter()) {
@@ -586,7 +598,7 @@ impl GraphRuntime {
         let rows: Vec<Row> = batch.rows.iter().map(|r| Row { rid: r.rid, walk: r.walk }).collect();
         let built = self.sched_builder()?.build(&BuildRequest {
             label: key.1, rows: &rows, n_backlog, combined: batch.combined, blocked: &blocked,
-            caps: self.sched_cfg(key)?, pre: p.pre, pre_walk: p.pre_walk,
+            deferred: &deferred, caps: self.sched_cfg(key)?, pre: p.pre, pre_walk: p.pre_walk,
         });
         let part = |idx: &[usize]| {
             (!idx.is_empty()).then(|| batch.with_rows(idx.iter().map(|&i| batch.rows[i].clone()).collect()))
@@ -602,6 +614,13 @@ impl GraphRuntime {
         if got != expected || n_out != rows.len() {
             return Err(PyRuntimeError::new_err(format!(
                 "batch builder dropped rows for ({}, {})",
+                self.interner.name(key.0), self.interner.name(key.1),
+            )));
+        }
+        // their readiness was never checked; a builder must leave them parked
+        if !deferred.is_empty() && built.scheduled.iter().any(|&i| deferred.contains(&rows[i].rid)) {
+            return Err(PyRuntimeError::new_err(format!(
+                "batch builder scheduled unchecked rows for ({}, {})",
                 self.interner.name(key.0), self.interner.name(key.1),
             )));
         }

@@ -303,14 +303,17 @@ class PythonSchedCore(SchedCore):
     def _finish_key(
         self, p: _Pass, chk: _BacklogCheck, result: CheckResult,
     ) -> ScheduledBatch | None:
-        blocked = self._backlog_blocked(p, chk, result)
+        blocked, deferred = self._backlog_blocked(p, chk, result)
         anchor_group = chk.anchor_group if result.anchor_group is None else result.anchor_group
         backlogged = chk.batch if len(chk.batch) else None  # empty: every row failed
-        return self._build_key(p, chk.key, chk.entries, backlogged, blocked, anchor_group)
+        return self._build_key(
+            p, chk.key, chk.entries, backlogged, blocked, anchor_group, deferred,
+        )
 
     def _build_key(
         self, p: _Pass, key: Key, entries: list[ReadyNodeEntry],
         backlogged: ScheduledBatch | None, blocked: set[int], anchor_group: int | None,
+        deferred: set[int] | None = None,
     ) -> ScheduledBatch | None:
         fresh = self._assemble_batch(*key, entries) if entries else None
         if backlogged is None and not fresh:
@@ -320,6 +323,7 @@ class PythonSchedCore(SchedCore):
         return self._build_and_schedule(BatchBuildRequest(
             node_name=key[0], graph_walk=key[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
+            deferred_rids=deferred or set(),
             walk_caps=self.keys.walk_caps(key),
             walk_row_caps=self.keys.walk_row_caps(key),
             pre_existing_batch_size=p.pre,
@@ -360,18 +364,25 @@ class PythonSchedCore(SchedCore):
         ), waiting
 
     @staticmethod
-    def _backlog_blocked(p: _Pass, chk: _BacklogCheck, result: CheckResult) -> set[int]:
-        """The backlogged rows that cannot run this step: waiting, not ready
-        or off the step's capture group. A failed row is not "not ready yet":
-        excluding it would put it straight back in the backlog, and this chunk
-        is out of ``self.backlog`` right now, so ``drop_rids`` cannot reach
-        it -- it is dropped from the batch here."""
+    def _backlog_blocked(
+        p: _Pass, chk: _BacklogCheck, result: CheckResult,
+    ) -> tuple[set[int], set[int]]:
+        """The backlogged rows that cannot run this step: blocked (waiting,
+        not ready or off the step's capture group), and deferred (past the
+        check's stop, so of unknown readiness; they keep their place). A
+        failed row is not "not ready yet": excluding it would put it straight
+        back in the backlog, and this chunk is out of ``self.backlog`` right
+        now, so ``drop_rids`` cannot reach it -- it is dropped from the batch
+        here."""
         failed = p.req.failed
         batch = chk.batch
-        blocked = chk.waiting | {
-            rid for rid, verdict in zip(chk.request.rids, result.verdicts, strict=True)
-            if verdict not in (Verdict.READY, Verdict.UNCHECKED)
-        }
+        blocked = set(chk.waiting)
+        deferred = set()
+        for rid, verdict in zip(chk.request.rids, result.verdicts, strict=True):
+            if verdict == Verdict.UNCHECKED:
+                deferred.add(rid)
+            elif verdict != Verdict.READY:
+                blocked.add(rid)
         dropped = blocked & failed
         if dropped:
             for rid in dropped:
@@ -379,7 +390,7 @@ class PythonSchedCore(SchedCore):
             batch.input_edges = batch.input_edges.select_rids(
                 batch.request_to_worker_graph.keys()
             )
-        return blocked - failed
+        return blocked - failed, deferred
 
     @staticmethod
     def _off_group(
@@ -459,6 +470,13 @@ class PythonSchedCore(SchedCore):
             expected |= request.fresh.request_to_worker_graph.keys()
         result: BatchBuildResult = self.batch_builder.build_batch(request)
         self._refuse_lost_rows(node_walk, expected, result)
+        if request.deferred_rids and result.scheduled is not None \
+                and not request.deferred_rids.isdisjoint(result.scheduled.request_to_worker_graph):
+            # their readiness was never checked; a builder must leave them parked
+            raise AssertionError(
+                f"batch builder scheduled unchecked rows for {node_walk}: "
+                f"{sorted(request.deferred_rids & result.scheduled.request_to_worker_graph.keys())}"
+            )
         # Whatever was popped past this step has to be remembered here, or it
         # would never run.
         if result.backlog is not None:

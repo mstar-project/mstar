@@ -1414,6 +1414,50 @@ def test_a_walk_that_would_shrink_the_step_waits_its_turn():
     assert next(iter(second.request_to_worker_graph)) == "p0"
 
 
+def test_rows_past_the_backlog_check_stay_parked():
+    """The check stops once a step's worth is ready, so rows past it have no
+    known readiness or capture group. When the per-walk row cap leaves checked
+    rows out, the step must not reach past the stop for them: here ``d1``
+    (another capture group) and ``d2`` (never checked) stay parked, ahead of
+    the rows the cap left out."""
+    rids = ["d0", "p0", "p1", "p2", "d1", "d2"]
+    prefill = {"p0", "p1", "p2"}
+    engine = _Engine(
+        max_bs={MIXED: 4, WALK: 4, "prefill": 4}, row_caps={"prefill": 1},
+        groups={rid: 2 if rid == "d1" else 1 for rid in rids},
+    )
+    sched = _combined_scheduler(engine)
+    manager = _Manager([], walks={rid: "prefill" for rid in prefill})
+    manager.per_request_info.update(dict.fromkeys(rids, object()))
+    _over(sched, manager)
+    parked = _batch(rids, walk=MIXED)
+    parked.request_walks = {rid: "prefill" if rid in prefill else WALK for rid in rids}
+    sched.core._backlog((NODE, MIXED), parked)
+
+    batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["d0", "p0"]
+    assert engine.checked == ["d0", "p0", "p1", "p2"]
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["d1", "d2", "p1", "p2"]
+
+
+def test_rows_that_stay_unready_are_not_rechecked_every_pass():
+    """An unready row goes behind the rows past the check's stop, so the next
+    pass starts on rows not yet tried and stops at a step's worth, rather than
+    re-checking every unready row first."""
+    engine = _Engine(max_bs=4, not_ready={f"r{i}" for i in range(10)})
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"r{i}" for i in range(40)])
+
+    per_pass = []
+    for _ in range(4):
+        before = len(engine.checked)
+        _next_batch(sched, _Manager([]))
+        per_pass.append(len(engine.checked) - before)
+
+    assert per_pass == [14, 4, 4, 4]
+
+
 def test_a_combined_walks_own_cap_overrides_its_walks():
     """The combined walk's own cap (its own captures) bounds a mixed step, not
     a smaller cap of one of the walks in it: the prompt joins the six."""
