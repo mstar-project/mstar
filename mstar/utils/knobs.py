@@ -21,6 +21,7 @@ KNOBS: dict[str, str] = {
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
+    "idle_hold": "MSTAR_IDLE_HOLD",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -45,6 +46,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
     for key, value in settings.items():
         if key == "step_thread_core":
             out[key] = _step_thread_core_value(value)
+        elif key == "idle_hold":
+            out[key] = _idle_hold_value(value)
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -67,6 +70,15 @@ def _step_thread_core_value(value: object) -> str:
     raise ValueError(
         f"`knobs: step_thread_core` must be auto, always, off or a CPU number, got {value!r}"
     )
+
+
+def _idle_hold_value(value: object) -> str:
+    # yaml reads a bare ``off`` as False
+    if value is False:
+        return "off"
+    if isinstance(value, str) and value.strip().lower() in ("qos", "off"):
+        return value.strip().lower()
+    raise ValueError(f"`knobs: idle_hold` must be qos or off, got {value!r}")
 
 
 def configure(settings: Mapping[str, object] | None) -> None:
@@ -205,3 +217,14 @@ def step_thread_core() -> str | int:
     raise ValueError(
         f"MSTAR_STEP_THREAD_CORE must be auto, always, off or a CPU number, got {value!r}"
     )
+
+
+def idle_hold() -> str:
+    """``idle_hold`` / ``MSTAR_IDLE_HOLD`` (default ``off``): ``qos`` has the
+    API server hold a PM QoS CPU latency request for its life
+    (``cpus.hold_idle``), which keeps every CPU of the host out of deep idle
+    states."""
+    value = _setting("idle_hold", "off").strip().lower()
+    if value in ("qos", "off"):
+        return value
+    raise ValueError(f"MSTAR_IDLE_HOLD must be qos or off, got {value!r}")

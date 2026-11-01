@@ -66,3 +66,22 @@ def test_step_thread_core_from_the_config_and_the_environment(monkeypatch):
 def test_a_bad_step_thread_core_fails_the_startup_check(value):
     with pytest.raises(ValueError, match="step_thread_core"):
         knobs.check({"step_thread_core": value})
+
+
+def test_idle_hold_from_the_config_and_the_environment(monkeypatch):
+    assert knobs.idle_hold() == "off"
+    # yaml reads a bare off as False
+    for value, expected in ((False, "off"), ("qos", "qos"), ("OFF", "off")):
+        knobs.configure({"idle_hold": value})
+        assert knobs.idle_hold() == expected
+    monkeypatch.setenv("MSTAR_IDLE_HOLD", "qos")
+    assert knobs.idle_hold() == "qos"
+    monkeypatch.setenv("MSTAR_IDLE_HOLD", "cstate")
+    with pytest.raises(ValueError, match="MSTAR_IDLE_HOLD"):
+        knobs.idle_hold()
+
+
+@pytest.mark.parametrize("value", [True, 1, "spin"])
+def test_a_bad_idle_hold_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="idle_hold"):
+        knobs.check({"idle_hold": value})

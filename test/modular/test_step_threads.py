@@ -494,6 +494,56 @@ def test_the_real_sysfs_reader_tolerates_a_host_without_cpuidle(tmp_path):
     assert cpus.deepest_idle([0], root) is None
 
 
+# ── the PM QoS hold ─────────────────────────────────────────────────────────
+
+@pytest.fixture
+def idle_hold():
+    yield
+    if cpus._idle_hold_fd is not None:
+        os.close(cpus._idle_hold_fd)
+    cpus._idle_hold_fd = None
+
+
+def test_the_hold_writes_the_latency_and_keeps_the_fd_open(tmp_path, idle_hold):
+    device = tmp_path / "cpu_dma_latency"
+    device.write_bytes(b"")
+    said = cpus.hold_idle(device)
+    assert int.from_bytes(device.read_bytes(), sys.byteorder) == cpus.IDLE_HOLD_US == 10
+    assert len(device.read_bytes()) == 4, "the device takes a 32-bit value"
+    assert f"holding {device} at 10 µs" in said
+    fd = cpus._idle_hold_fd
+    assert os.readlink(f"/proc/self/fd/{fd}") == str(device), "the request lasts as long as the fd"
+    assert "already holding" in cpus.hold_idle(device) and cpus._idle_hold_fd == fd
+
+
+def test_the_hold_says_when_the_device_is_absent(tmp_path, idle_hold):
+    device = tmp_path / "cpu_dma_latency"
+    said = cpus.hold_idle(device)
+    assert "nothing held" in said and "is absent" in said and cpus._idle_hold_fd is None
+
+
+def test_the_hold_says_when_the_device_is_not_writable(tmp_path, idle_hold, monkeypatch):
+    def refuse(*args):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(cpus.os, "open", refuse)
+    said = cpus.hold_idle(tmp_path / "cpu_dma_latency")
+    assert "nothing held" in said and "Permission denied" in said and cpus._idle_hold_fd is None
+
+
+def test_a_refused_write_closes_the_fd(tmp_path, idle_hold, monkeypatch):
+    device = tmp_path / "cpu_dma_latency"
+    device.write_bytes(b"")
+    closed = []
+    real_close = os.close
+
+    def refuse(*args):
+        raise OSError(22, "Invalid argument")
+    monkeypatch.setattr(cpus.os, "write", refuse)
+    monkeypatch.setattr(cpus.os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    said = cpus.hold_idle(device)
+    assert "nothing held" in said and "Invalid argument" in said and cpus._idle_hold_fd is None and closed
+
+
 # ── a CPU number, and off ───────────────────────────────────────────────────
 
 def test_a_number_is_the_first_workers_cpu_and_the_api_takes_the_last_core(tmp_path):

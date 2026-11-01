@@ -36,6 +36,7 @@ from __future__ import annotations
 import fcntl
 import math
 import os
+import sys
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ _PCI_DEVICES = Path("/sys/bus/pci/devices")
 _CPU_TOPOLOGY = "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list"
 _CPU_CLUSTER = "/sys/devices/system/cpu/cpu{}/topology/cluster_cpus_list"
 _CPU_ROOT = Path("/sys/devices/system/cpu")
+_PM_QOS_DEVICE = Path("/dev/cpu_dma_latency")
 # not TMPDIR: every server on the host has to find the same file
 _GPU_LOCK_DIR = Path("/tmp")
 
@@ -57,6 +59,8 @@ PINNABLE = hasattr(os, "sched_setaffinity")
 DEEP_IDLE_US = 100
 # settings that place by the GPU's rank
 PLACED = ("auto", "always")
+# CPU latency the idle hold asks for: admits C1 and C1E, refuses the C6 class
+IDLE_HOLD_US = 10
 
 
 # ── CPU lists ───────────────────────────────────────────────────────────────
@@ -333,6 +337,33 @@ def deepest_idle(cpus: Iterable[int], root: Path = _CPU_ROOT) -> IdleState | Non
             if deepest is None or int(latency) > deepest.latency_us:
                 deepest = IdleState(name or state.name, int(latency))
     return deepest
+
+
+_idle_hold_fd: int | None = None
+
+
+def hold_idle(device: Path = _PM_QOS_DEVICE) -> str:
+    """Hold a PM QoS CPU latency request of ``IDLE_HOLD_US`` for the life of
+    this process, and say what happened, for the log. The kernel keeps every
+    CPU of the host out of idle states slower than that while the fd stays
+    open, and drops the request however the process exits. Failing to get it
+    costs only the hold, so this never raises."""
+    global _idle_hold_fd
+    if _idle_hold_fd is not None:
+        return f"idle_hold qos: already holding {device}"
+    try:
+        fd = os.open(device, os.O_WRONLY)
+    except FileNotFoundError:
+        return f"idle_hold qos: nothing held, {device} is absent (a container often hides it)"
+    except OSError as e:
+        return f"idle_hold qos: nothing held, can't open {device}: {e.strerror}"
+    try:
+        os.write(fd, IDLE_HOLD_US.to_bytes(4, sys.byteorder))
+    except OSError as e:
+        os.close(fd)
+        return f"idle_hold qos: nothing held, can't write {device}: {e.strerror}"
+    _idle_hold_fd = fd
+    return f"idle_hold qos: holding {device} at {IDLE_HOLD_US} µs for this server's life"
 
 
 # ── building it ─────────────────────────────────────────────────────────────
