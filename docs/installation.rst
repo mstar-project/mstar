@@ -466,16 +466,19 @@ Verify the install
    mstar --help
    mstar-serve --help
 
-Optional: Rust support
-----------------------
+Rust extension
+--------------
 
-Parts of the runtime can run on Rust components (vendored in ``rust/``),
-each optional and selectable per process — without the extension everything
-runs on the pure-Python paths as before. Migrated so far (see
-:doc:`environment_variables` for the flags):
+Serving needs the ``mstar_rust`` extension (vendored in ``rust/``): the graph
+runtime is Rust, and a worker raises at startup without it. Importing ``mstar``
+does not need it. The extension carries (see :doc:`environment_variables` for
+the flags):
 
+* **Graph runtime**: graph state, scheduling, routing and speculation, and the
+  frames a worker sends. It holds a share of the Rust transport and of the Rust
+  tensor bookkeeper, and needs the msgpack codec.
 * **ZeroMQ control mesh** — ``MSTAR_RUST_ZMQ``: same endpoints, same wire
-  format as pyzmq.
+  format as pyzmq, which the API server and the conductor can still run on.
 * **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
   transport; requires the extension, interoperates on the same descriptor
   wire (and depends on the transport above only in the sense that both ship
@@ -485,31 +488,27 @@ runs on the pure-Python paths as before. Migrated so far (see
   extension or not. The legacy ``pickle`` codec is no longer supported.
   Loosely typed metadata uses data-only extensions; upgrade all deployment
   processes together, since legacy pickle frames are rejected.
-* **Graph runtime** — ``MSTAR_RUST_GRAPH``: graph state, scheduling,
-  routing and speculation, and the frames a worker sends. Unlike the others
-  this is not free-standing — it holds a share of the Rust transport and of
-  the Rust tensor bookkeeper, so it runs only where ``MSTAR_RUST_ZMQ``
-  resolved to Rust and the msgpack codec is in use. ``AUTO`` takes it
-  wherever that holds, so on a machine with the extension built, installing
-  it is what moves a worker onto the Rust runtime.
 
-The Linux wheels of ``mstar-ai`` on PyPI (x86_64 and aarch64, CPython 3.12 to
-3.14) carry the extension, so ``pip install mstar-ai`` there gets it; other
-platforms get the pure-Python wheel. The extension statically links libzmq
+There are two ways to get it. The Linux wheels of ``mstar-ai`` on PyPI (x86_64
+and aarch64, CPython 3.12 to 3.14) carry the extension, so ``pip install
+mstar-ai`` there is all it takes; other platforms get a pure-Python wheel with
+no extension, which cannot serve. The extension statically links libzmq
 4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is
 the upstream `v4.3.4 release <https://github.com/zeromq/libzmq/releases/tag/v4.3.4>`_.
-Elsewhere, or to build from a checkout, build the extension into your
-environment with `maturin <https://www.maturin.rs>`_ (needs `rustup
-<https://rustup.rs>`_, which installs the compiler version pinned in
-``rust-toolchain.toml``):
+Elsewhere, or from a checkout (``pip install -e .`` does not compile it), build
+the extension into your environment with `maturin <https://www.maturin.rs>`_
+(needs `rustup <https://rustup.rs>`_, which installs the compiler version pinned
+in ``rust-toolchain.toml``):
 
 .. code-block:: bash
 
    uv pip install maturin
    maturin develop --release -m rust/Cargo.toml
 
-Build with ``--release`` — an unoptimized debug build (maturin's default)
-costs real latency on the hot receive path. If ``mstar-ai`` came from a Linux
+The CPU test suites build a graph runtime too, so contributors need it as well,
+Mac contributors included: install ``cargo`` through rustup and run the same
+command. Build with ``--release`` — an unoptimized debug build (maturin's
+default) costs real latency on the hot receive path. If ``mstar-ai`` came from a Linux
 wheel that carries the extension, this build (a separate ``mstar-rust``
 distribution) takes precedence over the wheel's copy in the same environment;
 ``pip uninstall mstar-rust`` goes back to the wheel's, and neither uninstall
