@@ -2343,15 +2343,19 @@ KV cache, but samples no token, so it does not produce ``new_token``. The edge i
 in the graph because understanding requests need it. Treat declared edges as the possible
 outputs, and let the submodule decide which of them are produced on each step.
 
-**Choosing the walk per request.** BAGEL's transitions are driven by a schedule, unlike
-those of Orpheus. The output modality is known in advance from the request's
-``output_modalities``. ``get_initial_forward_pass_args`` therefore builds a prefill
-schedule, by iterating over the interleaved text and image inputs, and
-``get_partition_forward_pass_args`` advances through that schedule. It then transitions to
-``decode`` for text output, or to ``image_gen`` for image output. In ``think_mode``, the
-model first decodes a reasoning trace, and the EOS token then triggers the transition to
-``image_gen``. These are the same two methods that Orpheus implements. BAGEL only encodes
-a more complex state machine in them.
+**Choosing the walks per request.** BAGEL's plan follows a schedule, unlike Orpheus's two
+fixed steps. The output modality is known in advance from the request's
+``output_modalities``, so ``walk_plan`` builds the prefill schedule by iterating over the
+interleaved text and image inputs, one walk per text span or image, and then adds
+``decode`` for text output or ``image_gen`` for image output. In ``think_mode`` the model
+first decodes a reasoning trace, so the plan runs ``decode`` and then ``image_gen``.
+
+Each prefill walk reads one span, so ``process_prompt`` hands every span over as a signal
+of its own with :func:`mstar.model.multimodal.split_spans` (``text_inputs.0``,
+``image_inputs.0``, ...), and each step binds its walk's input to one:
+``WalkStep("prefill_text", bind={"text_inputs": "text_inputs.1"})``. An ids span keys the
+entry its ``source`` names, so ``split_spans`` renames the KV layout's ids-span sources to
+match. This is the same method Orpheus implements; BAGEL's plan is only longer.
 
 **Step 4 — Submodules.** Each node maps to a ``NodeSubmodule`` in ``bagel/submodules.py``:
 ``ViTEncoderSubmodule``, ``VAEEncoderSubmodule``, ``LLMSubmodule`` and

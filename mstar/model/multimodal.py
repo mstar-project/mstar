@@ -29,6 +29,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.keys import MIXED
 
 if TYPE_CHECKING:
+    from mstar.communication.tensors import NameToTensorList
     from mstar.conductor.request_info import WalkStep
     from mstar.graph.base import TensorPointerInfo
 
@@ -180,6 +181,44 @@ def prefill_plan(
         plan.append(part)
     flush()
     return plan
+
+
+def span_name(name: str, index: int) -> str:
+    """The signal that carries entry ``index`` of a prompt's ``name`` list on its own (see `split_spans`)."""
+    return f"{name}.{index}"
+
+
+def split_spans(
+    tensors: NameToTensorList, names: Iterable[str], kv_layout: dict | None = None,
+) -> tuple[NameToTensorList, dict | None]:
+    """``tensors`` with each list in ``names`` split into one signal per entry,
+    named by `span_name`, for a model that prefills each entry in a walk of its
+    own: its plan binds the walk's input to the entry (``WalkStep.bind``). The
+    list itself is left empty.
+
+    An ids span keys the next entry of its source (``Span.source``), so in each
+    label of ``kv_layout`` the ``k``-th ids span of a split list now names
+    entry ``k``'s signal.
+    """
+    names = set(names)
+    out = dict(tensors)
+    for name in names & set(tensors):
+        out[name] = []
+        out.update({span_name(name, i): [entry] for i, entry in enumerate(tensors[name])})
+    if kv_layout is None:
+        return out, None
+
+    def split(layout):
+        seen: dict[str, int] = {}
+        spans = []
+        for span in layout.spans:
+            if span.kind == "ids" and span.source in names:
+                seen[span.source] = seen.get(span.source, -1) + 1
+                span = span._replace(source=span_name(span.source, seen[span.source]))
+            spans.append(span)
+        return layout._replace(spans=tuple(spans))
+
+    return out, {key: {label: split(layout) for label, layout in labels.items()} for key, labels in kv_layout.items()}
 
 
 def find_media_spans(
