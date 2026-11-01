@@ -110,8 +110,8 @@ def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype):
     eps and RoPE theta, through an input projection (Qwen3-TTS 1.7B's widths):
     a frame's groups, teacher-forced, against the same layers over the whole
     depth sequence at once, norms, RoPE and causal attention in fp32. The
-    embedding sum is the Talker's own: rounded after every add (Qwen3-TTS) or
-    summed in fp32 and rounded once (Qwen3-Omni)."""
+    embedding sum is each Talker's: rounded after every add (Qwen3-TTS's
+    M* sum) or summed in fp32 and rounded once (Qwen3-Omni)."""
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.config import Qwen3TTSCodePredictorConfig
 
