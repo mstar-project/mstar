@@ -341,7 +341,7 @@ def test_a_step_with_logprobs_routes_through_the_store():
     batch.node_batch = SimpleNamespace(final_stream_rids=(), stream_partition_done_rids=())
     batch.batch.rids_by_walk = lambda: {"decode": [7]}
     tokens = torch.tensor([70])
-    plain = w._postprocess_request(batch, HostRows((7,), {"new_token": tokens}), engine)
+    plain = w._get_postprocess_request(batch, HostRows((7,), {"new_token": tokens}), engine, False, None, None)
     assert plain.inline is not None and plain.inline.signal == "text_inputs"
     rows = HostRows((7,), {"new_token": tokens, SAMPLED_LOGPROB: torch.tensor([-0.5])})
-    assert w._postprocess_request(batch, rows, engine).inline is None
+    assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None
