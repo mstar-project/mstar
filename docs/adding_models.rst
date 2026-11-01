@@ -1220,6 +1220,14 @@ methods are:
    The Qwen3-TTS and Qwen3-Omni Talkers and Fish S2 Pro's AR keep their EOS frame out of
    the codec stream this way.
 
+``emit_from_host_rows(...)`` (optional)
+   Outputs whose length only the step's own results decide, cut on the host from its
+   ``check_stop_buffers`` once the step has landed. It returns them per request, the
+   engine merges them into the step's outputs, and ``check_stop`` sees them before they
+   are routed. It runs on the main thread, off the host copy the stop check reads, so the
+   next step is launched without waiting for it. GLM-5.3-Flash's MTP verify step cuts its
+   accepted tokens here.
+
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
    its steps, with the request's first ``CurrentForwardPassInfo``. For host work worth
