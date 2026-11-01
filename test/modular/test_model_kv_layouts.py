@@ -330,10 +330,10 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
     dit._new_scheduler = lambda *args, **kw: SimpleNamespace(timesteps=torch.arange(4))
 
     output = model.process_prompt(prompt, ["text"], outputs, tensors={}, **kwargs)
-    args = model.get_initial_forward_pass_args("default", ["text"], outputs, {"text_inputs": []}, kwargs)
-    walk = args.full_metadata.graph_walk
+    prefill = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)[0]
+    walk = prefill.walk
     info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=1,
-                                  rid_handle="r", step_metadata=args.step_metadata)
+                                  rid_handle="r", step_metadata=dict(prefill.step_metadata))
     dit.prepare_inputs(walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
 
     state, layout = dit.request_states["r"], output.metadata["kv_layout"]["kv"]

@@ -100,24 +100,16 @@ def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
     """With windowed serving on, a text (reasoner) request still gets the
     decode walk on the window_decoder partition — never a reasoner walk that
     partition cannot run — and the default partition gets the reasoner
-    prefill; the decoder partition's transition keeps its walk pinned."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    prefill."""
     from mstar.model.cosmos3 import constants as C
 
     model = _model(tmp_path, enable_windowed_video=True)
     signals = {"text_inputs": [], "position_ids": []}
     mk = {"max_output_tokens": 8}
-    dec = model.get_initial_forward_pass_args(C.WINDOW_DECODER_PARTITION, ["text"], ["text"], signals, mk)
-    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK and dec.inputs == []
-    main = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, mk)
-    assert main.full_metadata.graph_walk == C.REASONER_PREFILL_WALK
-    pinned = model.get_partition_forward_pass_args(
-        C.WINDOW_DECODER_PARTITION,
-        CurrentForwardConductorMetadata(input_modalities=["text"], output_modalities=["text"],
-                                        graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs={}),
-        {},
-    )
-    assert pinned.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK and not pinned.request_done
+    (dec,) = model.walk_plan(C.WINDOW_DECODER_PARTITION, ["text"], ["text"], signals, mk)
+    assert (dec.walk, dict(dec.step_metadata)) == (C.VIDEO_DECODE_AR_WALK, {})
+    main = model.walk_plan("default", ["text"], ["text"], signals, mk)
+    assert main[0].walk == C.REASONER_PREFILL_WALK
 
 
 def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
@@ -157,7 +149,7 @@ def test_enable_reasoner_false_serves_generator_only(tmp_path) -> None:
     assert Cosmos3Model.REASONER_DECODE_WALK not in model.get_graph_walk_graphs()
     assert REASONER_NODE not in model.nodes
     with pytest.raises(ValueError, match="reasoner"):
-        model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": [], "position_ids": []})
+        model.walk_plan("default", ["text"], ["text"], {"text_inputs": [], "position_ids": []}, {})
 
 
 def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
@@ -176,38 +168,35 @@ def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
         assert wg.ranks == [0]
 
 
-def test_reasoner_request_state_machine(tmp_path) -> None:
+@pytest.mark.parametrize("vision", [True, False])
+def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -> None:
     model = _model(tmp_path)
-    sig = {k: [object()] for k in ("text_inputs", "position_ids", "pixel_values", "vision_grid_thw")}
-    fpa = model.get_initial_forward_pass_args("default", ["image", "text"], ["text"], sig, {"max_output_tokens": 32})
-    assert fpa.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_VISION_WALK
-    assert fpa.full_metadata.is_prefill
-    routed = {(e.next_node, e.name) for e in fpa.inputs}
-    assert routed == {(REASONER_NODE, "text_inputs"), (REASONER_NODE, "position_ids"),
-                      (VISION_ENCODER_NODE, "pixel_values"), (VISION_ENCODER_NODE, "vision_grid_thw")}
-    # Text-only prompts skip the encoder.
-    text_only = model.get_initial_forward_pass_args(
-        "default", ["text"], ["text"], {"text_inputs": [object()], "position_ids": [object()]},
-    )
-    assert text_only.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_WALK
+    names = ("text_inputs", "position_ids") + (("pixel_values", "vision_grid_thw") if vision else ())
+    plan = model.walk_plan("default", ["image", "text"] if vision else ["text"], ["text"],
+                           {k: [object()] for k in names}, {"max_output_tokens": 32, "enable_thinking": True})
+    prefill = Cosmos3Model.REASONER_PREFILL_VISION_WALK if vision else Cosmos3Model.REASONER_PREFILL_WALK
+    assert [(step.walk, dict(step.bind), dict(step.step_metadata)) for step in plan] == [
+        (prefill, {}, {"max_output_tokens": 32, "enable_thinking": True}),
+        (Cosmos3Model.REASONER_DECODE_WALK, {"text_inputs": "new_token"},
+         {"max_output_tokens": 32, "enable_thinking": True}),
+    ]
 
-    token = object()
-    nxt = model.get_partition_forward_pass_args("default", fpa.full_metadata, {"new_token": [token]})
-    assert nxt.full_metadata.graph_walk == Cosmos3Model.REASONER_DECODE_WALK
-    assert not nxt.full_metadata.is_prefill and not nxt.request_done
-    assert [(e.next_node, e.name, e.tensor_info) for e in nxt.inputs] == [(REASONER_NODE, "text_inputs", [token])]
-    done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
-    assert done.request_done
 
-    # Text requests open the reasoner label + sampler; media requests keep
-    # the two guidance labels and no sampler.
-    rc = model.get_request_resource_configs({"default": fpa}, {"temperature": 0.0, "top_k": 5})
+def test_reasoner_opens_its_label_and_sampler_and_media_the_guidance_labels(tmp_path) -> None:
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+
+    def opened(outputs):
+        # what the conductor hands it at ingest: each partition's first step, under the request's modalities
+        md = CurrentForwardConductorMetadata(input_modalities=["text"], output_modalities=outputs,
+                                             graph_walk="", is_prefill=True)
+        return {"default": ForwardPassArgs(full_metadata=md, inputs=[], unpersist_tensors=[])}
+
+    model = _model(tmp_path)
+    rc = model.get_request_resource_configs(opened(["text"]), {"temperature": 0.0, "top_k": 5})
     assert set(rc) == {KV_CACHE, SAMPLER}
     assert rc[KV_CACHE].needed_labels == ["main"]
     assert rc[SAMPLER].temperature == 0.0 and rc[SAMPLER].top_k == 5
-    gen = model.get_initial_forward_pass_args("default", ["text"], ["image"], {"text_inputs": [object()]}, {})
-    assert gen.full_metadata.graph_walk == Cosmos3Model.PREFILL_WALK
-    grc = model.get_request_resource_configs({"default": gen}, {})
+    grc = model.get_request_resource_configs(opened(["image"]), {})
     assert set(grc) == {KV_CACHE} and grc[KV_CACHE].needed_labels == ["main", "uncond"]
 
 
@@ -419,10 +408,3 @@ def test_a_chat_the_template_refuses_is_a_bad_request(tmp_path) -> None:
     with pytest.raises(ValueError, match="System message must be at the beginning"):
         model.process_prompt("What is ahead?", ["text"], ["text"])
 
-
-def test_forward_pass_args_type(tmp_path) -> None:
-    model = _model(tmp_path)
-    fpa = model.get_initial_forward_pass_args(
-        "default", ["text"], ["text"], {"text_inputs": [object()], "position_ids": [object()]},
-    )
-    assert isinstance(fpa, ForwardPassArgs)

@@ -8,6 +8,7 @@ and ZMQ stubbed: the stub communicator records every send and replays one
 scripted batch of inbound messages per run-loop iteration.
 """
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -15,11 +16,12 @@ import yaml
 torch = pytest.importorskip("torch")
 
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
-from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.conductor import Conductor, _walk_io  # noqa: E402
 from mstar.conductor.request_info import (  # noqa: E402
     FINAL_PREFILL,
     CurrentForwardConductorMetadata,
     PartitionDefinition,
+    PartitionState,
     WalkStep,
 )
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig  # noqa: E402
@@ -263,6 +265,18 @@ def test_ingest_releases_the_union_of_every_partitions_declaration(tmp_path, mon
 # ---------------------------------------------------------------------------
 # A model's walk plan: what the conductor sends and releases at each step
 # ---------------------------------------------------------------------------
+
+
+def plan_step(model, plan, k, signals) -> ForwardPassArgs:
+    """What the conductor sends a request entering ``plan[k]``: its edges and
+    step metadata, by the conductor's own `_plan_step`."""
+    c = Conductor.__new__(Conductor)
+    c._walk_inputs, _, _ = _walk_io(model)
+    c._growth_walks = frozenset(
+        walk for labels in model.kv_labels().values() for label in labels.values() for walk, _ in label.growth
+    )
+    pstate = PartitionState("p", CurrentForwardConductorMetadata(graph_walk="", is_prefill=True), plan=list(plan))
+    return c._plan_step(SimpleNamespace(persist_signals=signals), pstate, k)
 
 
 class _PlanModel(_ToyModel):
