@@ -1,5 +1,5 @@
 """A serving YAML's ``platform_overrides``: what each platform serves, and the
-Qwen3-Omni configs that rely on them."""
+Qwen3-Omni and FLUX.2 klein configs that rely on them."""
 
 from pathlib import Path
 
@@ -77,3 +77,22 @@ def test_the_gentle_ramp_configs_are_their_base_with_a_chunk_schedule(ramp, base
     config = _shipped(ramp)
     assert config.pop("model_kwargs") == {"codec_chunk_schedule": [4, 5, 6, 8, 10, 13, 16, 20]}
     assert config == _shipped(base)
+
+
+@pytest.mark.parametrize("name, bf16", [
+    ("flux2_klein.yaml", "flux2_klein_bf16.yaml"),
+])
+def test_the_klein_configs_serve_bf16_on_cuda_and_fp8_on_rocm(monkeypatch, name, bf16):
+    """On AMD GPUs the override adds fp8 and the knob it needs to the file's
+    model_kwargs and drops none of them. CUDA serves the bf16 file unchanged."""
+    expected = _shipped(bf16)
+    monkeypatch.setattr(serving_config, "_built_for", CudaPlatform)
+    assert load_serving_config(str(CONFIGS / name)) == expected
+
+    monkeypatch.setattr(serving_config, "_built_for", RocmPlatform)
+    resolved = load_serving_config(str(CONFIGS / name))
+    assert resolved["model_kwargs"] == {**expected["model_kwargs"], "linear_dtype": "fp8"}
+    assert resolved["knobs"] == {"dit_exact_ops": True}
+    assert {k: v for k, v in resolved.items() if k not in ("model_kwargs", "knobs")} == {
+        k: v for k, v in expected.items() if k != "model_kwargs"
+    }
