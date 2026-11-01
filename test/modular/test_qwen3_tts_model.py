@@ -161,6 +161,15 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
     assert captured["fix_mistral_regex"] is True
 
 
+def test_the_codec_walk_may_run_beside_the_talker():
+    from mstar.model.qwen3_tts.submodules import CodecSubmodule
+    from mstar.worker.engine_manager import _refuse_unsuitable_side_walks
+
+    model = _make_model()
+    assert CodecSubmodule.side_stream_walks == {"codec_chunk"}
+    _refuse_unsuitable_side_walks({"Codec": CodecSubmodule}, model.get_node_resources(), model)
+
+
 def test_qwen3_tts_declares_talker_and_codec_graphs():
     model = _make_model()
 

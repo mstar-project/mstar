@@ -17,6 +17,7 @@ The worker does not run one batch at a time. While batch N's kernels are on the 
 | `gpu_executor` (1 worker) | `_execute_on_gpu_thread`: declare → admit → plan → forward launch → commit |
 | Plan thread (1 worker) | Pre-plan for N+1, on its own CUDA stream, gated on N's commit event |
 | Side stream | D2H copies for `check_stop` pre-materialization |
+| `SideStepLane` stream | Kernels of a walk declared in `side_stream_walks`, launched from the GPU thread between two chain steps |
 
 Knobs, with the non-obvious default called out: **`MSTAR_TP_ASYNC_SCHED` is `0`, so async scheduling is OFF for lockstep-parallel (TP/SP) nodes.** It is expected to be flipped on and simply has not been yet, which has two consequences worth holding onto: the TP speculation path is not what a default `tp2` run exercises, so a change there needs the flag set to be tested at all; and a change that only works with it off will break when it flips. Set to `1` for every parallel node, or to a comma-separated node list. The worker `all_gather`s the value and raises if it disagrees across the ranks of an instance — an instance of invariant 11 made into a startup check.
 
@@ -48,6 +49,15 @@ The loop is circular, so this starts at an arbitrary point: **batch N is running
 **6. Launch N+1.** Submit to the GPU thread, which starts queuing kernels. The main thread then blocks on the step's `launch_started_event` (set at launch, or on completion by `_submit_gpu_step`; timeout `MSTAR_LAUNCH_WAIT_MS`) so it holds off the GIL until the GPU thread reaches the forward launch. Staleness is checked on the GPU thread, after the plan future resolves and after prepare. From submission on, the GPU thread owns the pre-plan.
 
 **7. Postprocess N.** Now wait for the actual GPU work (`event_sync`), D2H the outputs, pre-materialize on the side stream, run `check_stop` to look for EOS, extend prefix hash chains from the host copy of sampled tokens, then route and send outputs. The side stream exists because the default stream has GPU(N+1) queued behind GPU(N)'s outputs by this point.
+
+## Steps beside the chain
+
+A walk in `side_stream_walks` (`mstar/worker/side_steps.py`) stays out of the stages above. The lane launches its step at the top of a pass and postprocesses it after N's, once it has landed, so it costs no pass and the chain never yields to it. One step at a time; it is never speculated, pre-planned or lockstep, which `EngineManager` enforces at startup.
+
+- **Overlap needs its own capture stream.** Graphs captured on one stream must not run at once; the chain never overlaps its own, but a side step overlaps all of them. Sharing a capture stream, a prefill beside a codec window derailed about 1 in 2000 rows at c=8: the sentence reads fine, EOS never comes, and the request runs to the frame cap. Seeded c=1 and WER both miss it (at c=1 a prefill never overlaps a codec step), so soak at c=8 and count runaways.
+- **Its inputs are main-stream allocations.** The main thread clones and stacks them there, so the step waits on a fence behind the main stream, and postprocess (which frees them first) waits for the step to land.
+- **It lands between two chain steps, whenever it finishes.** Postprocess state that assumes the next postprocess is the chain's next step does not hold for it: `clear_pending_loop_stops` is skipped for a side step, or the speculative step past an EOS gets routed and the audio gains a frame. A seeded byte compare finds this; WER does not.
+- **It fails alone.** A raise in a side step fails its rows, not the chain's, and a chain error leaves it to finish (`_handle_main_loop_error`).
 
 ## What breaks it
 
