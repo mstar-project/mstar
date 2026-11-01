@@ -29,8 +29,7 @@ contract that makes this capture-safe:
 A step that splits a media row (chunked prefill) must slice its media by
 the host pad counts of each piece.
 
-The decoder module (``self.model``) provides (``Qwen3DenseLM`` has the first
-three):
+The decoder module (``self.model``, e.g. ``Qwen3DenseLM``) provides:
 
 - ``embed(ids) -> [tokens, hidden]``
 - ``forward(input_embeds, *, label, **decoder_kwargs) -> [tokens, hidden]``,
