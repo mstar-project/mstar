@@ -92,7 +92,7 @@ class _Model(Model):
     def get_loop_caps(self, **model_kwargs):
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         return {"kv": KVReqConfig(needed_labels=["main", "uncond"])}
 
     def get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities,

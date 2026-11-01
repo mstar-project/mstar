@@ -120,7 +120,7 @@ class CommandAPlusModel(Model):
                         enable_repetion_penalty=True),
         ]
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
                         repetition_penalty=1.04, ignore_eos=False)
         supplied = model_kwargs or {}

@@ -695,7 +695,7 @@ def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
     (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
     model = Qwen3_5DenseModel(str(ckpt))
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
 

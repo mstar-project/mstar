@@ -84,7 +84,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -368,9 +368,7 @@ class Cosmos3Model(Model):
         return {REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Which cache labels a request is opened with.
 
@@ -380,7 +378,8 @@ class Cosmos3Model(Model):
         writes costs nothing — labels are created on first write.
         """
         mk = model_kwargs or {}
-        if self._is_text_request(partition_fwd_args):
+        # a text request decodes on the reasoner, every other generates media
+        if "text" in output_modalities:
             sampling = self.get_sampling_config(REASONER_NODE, mk)
             return {
                 KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]),
@@ -409,17 +408,6 @@ class Cosmos3Model(Model):
             repetition_penalty=float(mk.get("repetition_penalty", 1.0)),
             ignore_eos=bool(mk.get("ignore_eos", False)),
         )
-
-    @staticmethod
-    def _is_text_request(partition_fwd_args: dict[str, ForwardPassArgs] | None) -> bool:
-        """Whether a request decodes text (the reasoner) rather than
-        generating media: read off the initial forward-pass args the
-        conductor resolved for its partitions."""
-        for args in (partition_fwd_args or {}).values():
-            md = getattr(args, "full_metadata", None)
-            if md is not None and "text" in (md.output_modalities or []):
-                return True
-        return False
 
     def _reasoner_enabled(self) -> bool:
         """Whether the reasoner walks (and the vision_encoder + reasoner

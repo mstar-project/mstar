@@ -456,18 +456,18 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     with pytest.raises(ValueError, match=r"max_new_tokens=5000 is outside \[1, 4096\]"):
         model.resolve_generation_kwargs({"max_new_tokens": 5000})
 
-    configs = model.get_request_resource_configs({}, {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
+    configs = model.get_request_resource_configs([], [], {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
     assert configs[T3_SAMPLER].temperature == 0.5
     assert configs[T3_SAMPLER].repetition_penalty == 1.2
     assert isinstance(configs[T3_KV], KVReqConfig)
     assert configs[T3_KV].needed_labels == [COND_LABEL, UNCOND_LABEL]
-    assert model.get_request_resource_configs({}, {"cfg_weight": 0})[T3_KV].needed_labels == [COND_LABEL]
+    assert model.get_request_resource_configs([], [], {"cfg_weight": 0})[T3_KV].needed_labels == [COND_LABEL]
 
     turbo = _make_model("turbo")
     knobs = turbo.resolve_generation_kwargs({"cfg_weight": 0.5, "exaggeration": 0.7, "min_p": 0.1})
     assert knobs["cfg_weight"] == 0.0 and knobs["exaggeration"] == 0.0 and knobs["min_p"] == 0.0
     assert knobs["top_k"] == 1000 and knobs["top_p"] == 0.95
-    assert turbo.get_request_resource_configs({}, {})[T3_KV].needed_labels == [COND_LABEL]
+    assert turbo.get_request_resource_configs([], [], {})[T3_KV].needed_labels == [COND_LABEL]
 
 
 # Each of these hung a request for 600 s, failed its whole batch, or was
@@ -833,10 +833,10 @@ def test_sampler_min_p_goes_through_the_resource():
     order only exists inside the sampler, so the knob rides the request's
     SamplingReqConfig and the T3 node declares the capability."""
     model = _make_model()
-    assert model.get_request_resource_configs({}, {"seed": 1})[T3_SAMPLER].min_p == 0.05
+    assert model.get_request_resource_configs([], [], {"seed": 1})[T3_SAMPLER].min_p == 0.05
     assert _sampler_spec(model).enable_min_p is True
     turbo = _make_model("turbo")
-    assert turbo.get_request_resource_configs({}, {"min_p": 0.1, "seed": 1})[T3_SAMPLER].min_p == 0.0
+    assert turbo.get_request_resource_configs([], [], {"min_p": 0.1, "seed": 1})[T3_SAMPLER].min_p == 0.0
     assert _sampler_spec(turbo).enable_min_p is False
 
 

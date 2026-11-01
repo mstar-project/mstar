@@ -1103,7 +1103,7 @@ def test_kv_labels_pass_the_load_checks_and_the_longest_request_fits(model):
     kwargs["max_new_tokens"] = model.config.max_speech_tokens
     out = model.process_prompt(text, ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip(30.0)]}, **kwargs)
     model_kwargs = {**kwargs, **out.metadata}
-    configs = model.get_request_resource_configs({}, model_kwargs)
+    configs = model.get_request_resource_configs([], [], model_kwargs)
     layout = model_kwargs["kv_layout"]
     refuse_undeclared_labels("CosyVoice3Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
     caps = model.get_loop_caps(**model_kwargs)

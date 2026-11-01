@@ -40,7 +40,6 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
@@ -152,10 +151,9 @@ class CanaryModel(Model):
         check_kv_pools_fit(self, config, config_path, logger)
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         return {
             SAMPLER: SamplingReqConfig(

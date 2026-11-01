@@ -466,7 +466,7 @@ def test_process_prompt_lays_out_the_rows_the_talker_prefill_writes(model, ref_t
     prefill = talker.prepare_inputs(walk, _info("r", 0, step), edges)
     assert span.length == prefill.input_seq_len, "the layout and the prefill disagree on its rows"
 
-    configs = model.get_request_resource_configs({}, meta)
+    configs = model.get_request_resource_configs([], [], meta)
     for key in ("base_kv", "res_kv"):
         configs.setdefault(key, KVReqConfig(needed_labels=["main"]))
     refuse_undeclared_labels("VoxCPM2Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)

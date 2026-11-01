@@ -184,7 +184,7 @@ class ModelIntegrationTests(unittest.TestCase):
         # decode is seeded from the prefill's decode_input
         plan = model.walk_plan(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [object()]}, {})
         self.assertEqual(plan, [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "decode_input"})])
-        cfg = model.get_request_resource_configs({}, {"temperature": 0})[SAMPLER]
+        cfg = model.get_request_resource_configs([], [], {"temperature": 0})[SAMPLER]
         self.assertEqual((cfg.temperature, cfg.top_p, cfg.repetition_penalty), (0, 0.95, 1.04))
 
     def test_local_checkpoint_node_runs_prefill_and_four_decode_steps(self):

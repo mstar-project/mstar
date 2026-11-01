@@ -138,7 +138,7 @@ def test_registry_and_deployment_config():
     assert not plain.files and not greedy.files
     model.process_prompt(plain.text, ["text"], ["audio"], **plain.model_kwargs)
     model.process_prompt(greedy.text, ["text"], ["audio"], **greedy.model_kwargs)
-    sampling = model.get_request_resource_configs({}, greedy.model_kwargs)
+    sampling = model.get_request_resource_configs([], [], greedy.model_kwargs)
     assert sampling[AR_SAMPLER].temperature == 0.0
     ((media,),) = [clone.files]
     assert media.modality == "audio" and media.path.startswith("hf://")
@@ -658,9 +658,11 @@ def test_walk_plan_per_request_kind(inputs, kwargs, walks):
 
 def test_sampling_defaults_and_greedy():
     model = tiny_model()
-    default = model.get_request_resource_configs({})[AR_SAMPLER]
+    default = model.get_request_resource_configs([], [], {})[AR_SAMPLER]
     assert (default.temperature, default.top_p, default.top_k, default.repetition_penalty) == (0.8, 0.8, 30, 1.0)
-    greedy = model.get_request_resource_configs({}, {"do_sample": False, "temperature": 0.7, "top_k": 5})[AR_SAMPLER]
+    greedy = model.get_request_resource_configs(
+        [], [], {"do_sample": False, "temperature": 0.7, "top_k": 5},
+    )[AR_SAMPLER]
     assert greedy.temperature == 0.0 and greedy.top_k == 5
 
 

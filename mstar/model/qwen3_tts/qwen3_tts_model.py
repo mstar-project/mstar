@@ -64,7 +64,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -930,14 +930,13 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
         The CodePredictor's ``subtalker_*`` knobs drive its own sampler
         resource; ``*_dosample=False`` maps to temperature 0 (greedy)."""
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         generation = self.config.generation
         do_sample = model_kwargs.get("do_sample", generation.do_sample)

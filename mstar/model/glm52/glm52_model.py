@@ -25,7 +25,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -341,10 +341,9 @@ class Glm52Model(Model):
         return input_ids[0]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {

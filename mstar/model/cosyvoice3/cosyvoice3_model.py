@@ -54,7 +54,6 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
@@ -233,11 +232,9 @@ class CosyVoice3Model(Model):
         ]
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args, model_kwargs
+        del input_modalities, output_modalities, model_kwargs
         return {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
 
     def resolve_generation_kwargs(self, model_kwargs: dict | None) -> dict[str, Any]:

@@ -21,7 +21,6 @@ from jinja2 import TemplateError
 
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs
 from mstar.model.cosmos3.cosmos3_model import (
     DIT_NODE,
     REASONER_NODE,
@@ -183,20 +182,12 @@ def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -
 
 
 def test_reasoner_opens_its_label_and_sampler_and_media_the_guidance_labels(tmp_path) -> None:
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
-
-    def opened(outputs):
-        # what the conductor hands it at ingest: each partition's first step, under the request's modalities
-        md = CurrentForwardConductorMetadata(input_modalities=["text"], output_modalities=outputs,
-                                             graph_walk="", is_prefill=True)
-        return {"default": ForwardPassArgs(full_metadata=md, inputs=[], unpersist_tensors=[])}
-
     model = _model(tmp_path)
-    rc = model.get_request_resource_configs(opened(["text"]), {"temperature": 0.0, "top_k": 5})
+    rc = model.get_request_resource_configs(["text"], ["text"], {"temperature": 0.0, "top_k": 5})
     assert set(rc) == {KV_CACHE, SAMPLER}
     assert rc[KV_CACHE].needed_labels == ["main"]
     assert rc[SAMPLER].temperature == 0.0 and rc[SAMPLER].top_k == 5
-    grc = model.get_request_resource_configs(opened(["image"]), {})
+    grc = model.get_request_resource_configs(["text"], ["image"], {})
     assert set(grc) == {KV_CACHE} and grc[KV_CACHE].needed_labels == ["main", "uncond"]
 
 

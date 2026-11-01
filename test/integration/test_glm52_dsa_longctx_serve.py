@@ -167,7 +167,7 @@ class _Serve:
         # ignore_eos: reduced EOS ids live inside the byte vocab; greedy decode
         # on random weights may hit one and break the exact-length assertions.
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
         self.runner.ingest_request(rid, self.overrides)
 

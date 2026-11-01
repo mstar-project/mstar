@@ -722,8 +722,7 @@ class Conductor:
         return cap, caps
 
     def _get_resource_configs(
-        self, model_kwargs: dict,
-        partition_fwd_args: dict[str, ForwardPassArgs]
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """The per-resource config each new request is opened with.
 
@@ -734,9 +733,7 @@ class Conductor:
         A KV resource with declared labels gets a config even when the model
         returned none, or its keys and layout would have nowhere to go.
         """
-        configs = self.model.get_request_resource_configs(
-            partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
-        )
+        configs = self.model.get_request_resource_configs(input_modalities, output_modalities, model_kwargs)
         # a model that builds its sampler config from its own keys would drop it unseen
         if model_kwargs.get("return_logprobs") and not any(
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()
@@ -1400,10 +1397,8 @@ class Conductor:
         else:
             released = [info for fwd_args in partition_fwd_args.values() for info in fwd_args.unpersist_tensors]
 
-        # after the initial fwd args: the configs are derived from them (BAGEL
-        # reads `requires_cfg` off the metadata the model just settled)
         request_data.resource_configs = self._get_resource_configs(
-            model_kwargs, partition_fwd_args
+            body.initial_input_modalities, body.initial_output_modalities, model_kwargs,
         )
         # keyed by resource, so each config is handed only its own chain
         kwargs = model_kwargs or {}

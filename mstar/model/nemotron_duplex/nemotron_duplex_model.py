@@ -76,7 +76,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ClientChunk, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
@@ -619,11 +619,9 @@ class NemotronDuplexModel(Model):
         ]
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         return {

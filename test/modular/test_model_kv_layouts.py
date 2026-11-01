@@ -88,9 +88,8 @@ def _pointer(tensor: torch.Tensor):
 
 
 def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
-    from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
+    from mstar.conductor.request_info import DEFAULT_PARTITION
     from mstar.model.bagel.submodules import IMAGE_SENTINELS, VAEEncoderSubmodule, vit_patches, vit_preprocess
-    from mstar.model.base import ForwardPassArgs
 
     cfg = model.config
     images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
@@ -98,14 +97,7 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     tensors = out.new_input_tensors
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
     plan = model.walk_plan(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
-    # what the conductor hands it at ingest: the request's modalities on its first step's args
-    opened = CurrentForwardConductorMetadata(
-        graph_walk=plan[0].walk, is_prefill=True, input_modalities=input_modalities,
-        output_modalities=output_modalities,
-    )
-    config = model.get_request_resource_configs(
-        {DEFAULT_PARTITION: ForwardPassArgs(full_metadata=opened, inputs=[], unpersist_tensors=[])}, kwargs,
-    )["kv"]
+    config = model.get_request_resource_configs(input_modalities, output_modalities, kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
     config.apply_conductor_config(
         kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"]["kv"].items()},
@@ -263,7 +255,7 @@ def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
     output = model.process_prompt("hello", ["text", "audio"] if clip else ["text"], ["audio"],
                                   tensors=tensors, cfg_weight=cfg_weight)
 
-    opened = model.get_request_resource_configs({}, {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
+    opened = model.get_request_resource_configs([], [], {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
     assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
 
 

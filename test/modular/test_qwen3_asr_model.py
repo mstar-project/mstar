@@ -590,10 +590,10 @@ def test_request_kwargs_are_checked_before_the_conductor_reads_them():
     assert model.get_max_output_tokens(max_output_tokens="32") == 32
     with pytest.raises(ValueError, match="max_output_tokens"):
         model.get_max_output_tokens(max_output_tokens="abc")
-    cfgs = model.get_request_resource_configs({}, {"temperature": "0.5", "ignore_eos": "true"})
+    cfgs = model.get_request_resource_configs([], [], {"temperature": "0.5", "ignore_eos": "true"})
     assert cfgs["sampler"].temperature == 0.5 and cfgs["sampler"].ignore_eos is True
     with pytest.raises(ValueError, match="top_p"):
-        model.get_request_resource_configs({}, {"top_p": "abc"})
+        model.get_request_resource_configs([], [], {"top_p": "abc"})
 
 
 def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device(monkeypatch):

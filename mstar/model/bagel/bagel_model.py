@@ -40,7 +40,7 @@ from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import DEFAULT_PARTITION, WalkStep
+from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -87,7 +87,6 @@ from mstar.model.bagel.submodules import (
 )
 from mstar.model.base import (
     DECODE,
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
@@ -924,8 +923,7 @@ class BagelModel(Model):
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource knobs a new request is opened with.
 
@@ -938,9 +936,9 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
 
         model_kwargs = model_kwargs or {}
-        request = partition_fwd_args[DEFAULT_PARTITION].full_metadata
-        target_output = request.output_modalities[0]
-        params = self._request_params(request.input_modalities, request.output_modalities, model_kwargs)
+        # the guidance `walk_plan` settles, from the same request
+        target_output = output_modalities[0]
+        params = self._request_params(input_modalities, output_modalities, model_kwargs)
         cfg = self._requires_cfg(target_output=target_output, **params)
         # only a generation's image_gen_cfg runs the CFG nodes
         nodes = self._LLM_NODES if self._has_cfg_parallel and target_output == "image" else {"LLM"}

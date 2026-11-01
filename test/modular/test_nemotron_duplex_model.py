@@ -353,7 +353,7 @@ def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
 
 def test_duplex_request_resource_configs():
     model = _make_model()
-    cfg = model.get_request_resource_configs({}, None)
+    cfg = model.get_request_resource_configs([], [], {})
     assert set(cfg) == {NANO_SAMPLER, TALKER_KV}
     assert isinstance(cfg[TALKER_KV], KVReqConfig)
     assert cfg[TALKER_KV].get_labels("eartts_talker", "talker_decode") == ["main", "uncond"]
@@ -361,7 +361,7 @@ def test_duplex_request_resource_configs():
     assert isinstance(text, SamplingReqConfig)
     assert text.temperature == model.config.temperature and text.top_p == model.config.top_p
     # request knobs override the config defaults
-    greedy = model.get_request_resource_configs({}, {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]
+    greedy = model.get_request_resource_configs([], [], {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]
     assert greedy.temperature == 0.0 and greedy.ignore_eos is True
 
 

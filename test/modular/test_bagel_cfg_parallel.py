@@ -97,10 +97,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model = _bare_model()
     model._has_llm_disaggregation = True
     # a text-to-image request, guided or not by its own cfg_text_scale
-    request = SimpleNamespace(input_modalities=["text"], output_modalities=["image"])
-    args = {"default": SimpleNamespace(full_metadata=request)}
-
-    config = model.get_request_resource_configs(args, {"cfg_text_scale": 4.0})["kv"]
+    config = model.get_request_resource_configs(["text"], ["image"], {"cfg_text_scale": 4.0})["kv"]
 
     assert config.publish_labels_per_node_walk == {
         ("LLM", "prefill_text"): ["main", "cfg_text", "cfg_img"],
@@ -112,7 +109,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     }
     assert config.get_publish_labels("LLM", "decode", ["main", "cfg_img"]) == []
 
-    config = model.get_request_resource_configs(args, {"cfg_text_scale": 1.0})["kv"]
+    config = model.get_request_resource_configs(["text"], ["image"], {"cfg_text_scale": 1.0})["kv"]
     assert {
         tuple(labels)
         for labels in config.publish_labels_per_node_walk.values()

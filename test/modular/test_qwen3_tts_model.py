@@ -634,7 +634,7 @@ def test_qwen3_tts_walk_plan_prefills_then_decodes():
     assert [dict(step.step_metadata) for step in talker] == [prompt, {}]
     # Residual-group sampling rides the code predictor's own per-request
     # sampler config, not step metadata.
-    configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
+    configs = model.get_request_resource_configs([], [], {"subtalker_top_k": 7})
     assert configs[CODE_PRED_SAMPLER].top_k == 7
 
     assert [step.walk for step in model.walk_plan("Codec", ["text"], ["audio"], {}, {})] == ["codec_chunk"]
@@ -1316,7 +1316,7 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     model = _make_model()
     generation = model.config.generation
 
-    default = model.get_request_resource_configs({})[CODE_PRED_SAMPLER]
+    default = model.get_request_resource_configs([], [], {})[CODE_PRED_SAMPLER]
     assert default.temperature == generation.subtalker_temperature
     assert default.top_k == generation.subtalker_top_k
     assert default.top_p == generation.subtalker_top_p
@@ -1324,20 +1324,20 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     assert default.repetition_penalty == 1
 
     overridden = model.get_request_resource_configs(
-        {},
+        [], [],
         {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
     )[CODE_PRED_SAMPLER]
     assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
     # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
     greedy = model.get_request_resource_configs(
-        {}, {"subtalker_dosample": False}
+        [], [], {"subtalker_dosample": False}
     )[CODE_PRED_SAMPLER]
     assert greedy.temperature == 0.0
 
     # Two samplers, one per head; only the Talker's carries a vocab for the
     # repetition penalty (see get_node_resources).
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {TALKER_SAMPLER, CODE_PRED_SAMPLER}
     specs = {
         spec.resource_key: spec for spec in model.get_node_resources()

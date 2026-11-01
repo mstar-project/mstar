@@ -32,7 +32,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.keys import KV_CACHE, MIXED, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -359,7 +359,7 @@ class MultimodalDecoderModel(Model):
         )
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
         sampling = dict(self.sampling_defaults)

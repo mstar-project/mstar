@@ -742,16 +742,18 @@ class Model(ABC):
 
     def get_request_resource_configs(
         self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
-        CFG, retention. The conductor resolves this once per request and the
+        CFG, retention. The conductor resolves this once per request, from the
+        request's modalities and kwargs as `walk_plan` gets them, and the
         engine hands each config to its resource at ingest.
         """
-        del model_kwargs, partition_fwd_args
+        del input_modalities, output_modalities, model_kwargs
         return {}
 
     def get_sampling_config(

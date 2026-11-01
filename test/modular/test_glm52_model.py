@@ -171,7 +171,7 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
 def test_glm52_request_config_is_the_sampler_config():
     model = _make_model()
     cfg = model.config
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {SAMPLER_RESOURCE}
     sampling = configs[SAMPLER_RESOURCE]
     assert isinstance(sampling, SamplingReqConfig)
@@ -181,7 +181,7 @@ def test_glm52_request_config_is_the_sampler_config():
     assert sampling.repetition_penalty == cfg.repetition_penalty
     assert sampling.ignore_eos is cfg.ignore_eos
     over = model.get_request_resource_configs(
-        {}, {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
+        [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
     assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
     assert over.temperature == cfg.temperature
 

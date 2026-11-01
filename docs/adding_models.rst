@@ -278,12 +278,12 @@ differ per request, such as sampling parameters and the set of cache labels a re
 uses, come from a separate method::
 
    get_request_resource_configs(
-       self, partition_fwd_args: dict[str, ForwardPassArgs],
-       model_kwargs: dict | None = None,
+       self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
    ) -> dict[str, ResourceReqConfig]
 
 The returned dict is keyed by ``resource_key``. The conductor calls this method once per
-request, and the engine passes each config to its resource when the request is ingested.
+request, with the request's modalities and kwargs as ``walk_plan`` gets them, and the
+engine passes each config to its resource when the request is ingested.
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
@@ -323,8 +323,7 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 
 .. code-block:: python
 
-   def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-       model_kwargs = model_kwargs or {}
+   def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
        return {
            SAMPLER: SamplingReqConfig(
@@ -2270,9 +2269,10 @@ config never routes requests to them.
 **Per-request resources.** Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
 BAGEL's ``get_request_resource_configs`` therefore returns a ``KVReqConfig`` that names
-the active labels per node and walk, together with a ``SamplingReqConfig``. A request with
-guidance disabled names only ``"main"``, so a PD-disaggregated transfer copies only that
-stream.
+the active labels per node and walk, together with a ``SamplingReqConfig``. It settles
+guidance from the request's modalities and kwargs as its ``walk_plan`` does (an edit, image
+in and image out, defaults to image guidance). A request with guidance disabled names only
+``"main"``, so a PD-disaggregated transfer copies only that stream.
 
 The ``LLM`` node is deliberately coarse. It contains the text embedding, the lm_head and
 the flow projection. These always run on the same GPU, so splitting them into separate

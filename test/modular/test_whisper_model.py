@@ -880,7 +880,7 @@ def test_process_prompt_builds_window_and_prompts():
     coerced = model.process_prompt(*args, language="en", temperature="0.2").new_input_tensors
     assert coerced["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert model.get_max_output_tokens(max_output_tokens="40") == 40
-    assert model.get_request_resource_configs({}, {"temperature": "0.5"})["sampler"].temperature == 0.5
+    assert model.get_request_resource_configs([], [], {"temperature": "0.5"})["sampler"].temperature == 0.5
 
 
 def test_postprocess_renders_language_and_timestamps_only():

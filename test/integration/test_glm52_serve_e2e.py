@@ -185,7 +185,7 @@ class _Serve:
         # vocab, so greedy decode on random weights can hit one and stop
         # early — which would break the exact-length assertions below.
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
         )
         self.runner.ingest_request(rid, self.overrides)
 

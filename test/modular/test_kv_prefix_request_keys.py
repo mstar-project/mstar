@@ -427,8 +427,8 @@ def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
 class _SamplerOnlyModel(_Model):
     """Declares a stream and asks for no config of its own, as Orpheus did."""
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-        del partition_fwd_args, model_kwargs
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
+        del input_modalities, output_modalities, model_kwargs
         return {"sampler": SamplingReqConfig()}
 
 
@@ -438,7 +438,7 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     each handed its own chain."""
     declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model, _kv_labels=declared), model_kwargs or {}, {},
+        SimpleNamespace(model=model, _kv_labels=declared), ["text"], ["text"], model_kwargs or {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)
