@@ -344,9 +344,10 @@ def get_rope_index_vision(
                 (num_tokens,), float(start_pos), dtype=torch.float, device=device
             )
         else:
+            # a video's frame groups step by their time, from start_pos like h and w
             temporal = (
                 torch.arange(grid_t, dtype=torch.float, device=device) * seconds_per_grid * position_id_per_seconds
-            ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float()
+            ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float() + float(start_pos)
 
         h_index = (
             torch.arange(llm_grid_h, dtype=torch.float, device=device)

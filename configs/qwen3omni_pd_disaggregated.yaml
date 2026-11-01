@@ -6,7 +6,7 @@ node_groups:
   
   - node_names: [Thinker]
     ranks: [0]
-    graph_walks: [prefill_text, prefill_audio, prefill_vision]
+    graph_walks: [prefill_text, prefill_audio, prefill_vision, prefill_audio_vision]
 
   - node_names: [Thinker]
     ranks: [1]
