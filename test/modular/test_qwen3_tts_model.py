@@ -1224,7 +1224,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     configs = {c.capture_graph_walk: c for c in submodule.get_accelerator_graph_configs(torch.device("cpu"))}
     graph_config = configs["talker_decode"]
     # 64 rows a step: the top bucket is also the Talker's batch cap
-    assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 24, 32, 48, 64]
+    assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
     assert submodule.max_batch_size("talker_decode") == 64
     template_kwargs = graph_config.single_request_inputs.kwargs
     assert set(template_kwargs) == {"suppress_eos", "text_condition"}
