@@ -31,6 +31,7 @@ from mstar.model.command_a_plus.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -195,12 +196,10 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
         text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         tokens = self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)
-        return {
-            rid: {"new_token": [tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # row i is request i, so the stop check and the sampler's log-prob rows share one host copy
+        return BatchedModelOutput(row_outputs={"new_token": tokens}, check_stop_buffers={"new_token": tokens})
 
     def postprocess(self, request_id, request_info, outputs, **kwargs):
         # Metadata only: check_stop reads the token values, off the GPU thread.

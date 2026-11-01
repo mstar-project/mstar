@@ -87,7 +87,8 @@ class NodeTests(unittest.TestCase):
             tracked = step.steps[SAMPLER].prefill_tracked_tokens
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
-            self.assertEqual([output[rid]["new_token"][0].item() for rid in engine.request_ids], expected)
+            self.assertEqual(output.row_outputs["new_token"].tolist(), expected)
+            self.assertIs(output.check_stop_buffers["new_token"], output.row_outputs["new_token"])
             self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
         attention.select_last_hidden.assert_called_once()
 
@@ -142,7 +143,7 @@ class NodeTests(unittest.TestCase):
         output = self.node.forward_batched(
             "prefill_image", engine, **self.node.preprocess("prefill_image", engine, [inputs]),
         )
-        self.assertEqual(output["a"]["new_token"][0].item(), 5)
+        self.assertEqual(output.row_outputs["new_token"].tolist(), [5])
 
     def test_invalid_inputs_fail_before_cache_planning(self):
         for walk, tensor in (
@@ -192,6 +193,8 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertTrue(model.get_partition_forward_pass_args(DEFAULT_PARTITION, first.full_metadata, {}).request_done)
         cfg = model.get_request_resource_configs({}, {"temperature": 0})[SAMPLER]
         self.assertEqual((cfg.temperature, cfg.top_p, cfg.repetition_penalty), (0, 0.95, 1.04))
+        self.assertFalse(cfg.return_logprobs)
+        self.assertTrue(model.get_request_resource_configs({}, {"return_logprobs": True})[SAMPLER].return_logprobs)
 
     def test_local_checkpoint_node_runs_prefill_and_four_decode_steps(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
@@ -213,7 +216,8 @@ class ModelIntegrationTests(unittest.TestCase):
                 self.assertEqual(declaration.segments[0].span, len(tokens))
                 pos.positions["main"] = torch.arange(offset, offset + len(tokens))
                 offset += len(tokens)
-                result = node.forward_batched(walk, engine, **node.preprocess(walk, engine, inputs))["a"]
+                output = node.forward_batched(walk, engine, **node.preprocess(walk, engine, inputs))
+                result = {"new_token": [output.row_outputs["new_token"]]}
                 node.postprocess("a", request, result)
                 tokens = result["decode_input" if step == 0 else "text_inputs"][0]
                 self.assertEqual(tokens.shape, (1,))

@@ -148,7 +148,7 @@ class CommandAPlusModel(Model):
 
     def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
         defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
-                        repetition_penalty=1.04, ignore_eos=False)
+                        repetition_penalty=1.04, ignore_eos=False, return_logprobs=False, logprobs_mode="raw")
         supplied = model_kwargs or {}
         return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
 

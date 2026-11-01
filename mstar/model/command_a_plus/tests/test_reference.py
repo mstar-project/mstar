@@ -198,7 +198,7 @@ class ReferenceTests(unittest.TestCase):
                     logits = actual.compute_logits(observed["norm"][ends])
                     ref_logits = torch.stack(ref_logits)
                     self.compare({"logits": logits}, {"logits": ref_logits}, errors, 0.01)
-                    predicted = torch.cat([output[rid]["new_token"][0] for rid in rids])
+                    predicted = output.row_outputs["new_token"]
                     torch.testing.assert_close(predicted.long(), logits.argmax(-1))
                     for row, token in enumerate(predicted.long()):
                         if token != ref_logits[row].argmax():
@@ -215,7 +215,7 @@ class ReferenceTests(unittest.TestCase):
                             first_logits = logits.clone()
                         else:
                             torch.testing.assert_close(logits, first_logits, atol=0, rtol=0)
-                    rows = [output[rid]["new_token"][0] for rid in rids]
+                    rows = list(predicted.split(1))
                     torch.cuda.synchronize()
             finally:
                 for rid in rids:
