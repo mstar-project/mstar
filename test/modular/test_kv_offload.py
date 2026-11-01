@@ -13,9 +13,11 @@ what both a leak and a double-free break.
 
 from __future__ import annotations
 
+import ctypes
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -30,6 +32,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVLayout, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import PageCopies
 from mstar.engine.resources.kv.manager import KVManager
@@ -801,7 +804,7 @@ def test_pool_copies_keep_every_layer_and_element(copier_cls):
     device = mgr.kv_cache.tensor
     device.copy_(torch.randn_like(device))
     expected = device.clone()
-    src, dst, host = [5, 2, 9], [3, 11, 7], [0, 1, 2]
+    src, dst, host = [5, 6, 9], [3, 4, 7], [0, 1, 2]
 
     pool.copy_out(device, PageCopies(gpu=src, cpu=host))
     pool.sync()
@@ -814,6 +817,67 @@ def test_pool_copies_keep_every_layer_and_element(copier_cls):
         assert torch.equal(device[:, d], expected[:, s])
     others = [p for p in range(device.shape[1]) if p not in dst]
     assert (device[:, others] == -99.0).all()
+
+
+def test_a_copier_checks_each_pair_of_caches_once():
+    """Checking a pair costs the host more than the copies the copier then queues, so the copier keeps
+    each pair's pitches and strides."""
+
+    class _Counting(page_copier._Memcpy2DCopier):
+        _max_pitch = 1 << 62
+
+        def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+            return 0
+
+    copier = _Counting()
+    checked = []
+    check = copier._check
+    copier._check = lambda dst, src: checked.append((dst, src)) or check(dst, src)
+    host, device, other = (torch.zeros(2, 4, 3) for _ in range(3))
+    stream = SimpleNamespace(cuda_stream=0)
+
+    copier.copy(host, [0], device, [1], stream)
+    copier.copy(host, [2], device, [3], stream)
+    assert len(checked) == 1, "a second copy between the same two caches checked them again"
+    copier.copy(other, [0], device, [1], stream)
+    assert len(checked) == 2, "a copy into another cache used the first pair's pitches and strides"
+    # as if `later` had taken the id of a freed cache
+    later = torch.zeros(2, 4, 3)
+    copier._layouts[id(later), id(device)] = copier._layouts.pop((id(other), id(device)))
+    copier.copy(later, [0], device, [1], stream)
+    assert len(checked) == 3, "a cache at a reused id got the freed cache's pitches and strides"
+
+
+def test_pages_adjacent_in_both_caches_go_as_one_copy():
+    """A call per page costs a 60-page reload about 160 µs of host time, and adjacent pages are one block
+    per layer."""
+    calls = []
+
+    class _Recording(page_copier._Memcpy2DCopier):
+        _max_pitch = 1 << 62
+
+        def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+            calls.append((dst, dpitch, src, spitch, width, height))
+            return 0
+
+    # float32, [layers, pages, 3]: a page is 12 bytes, a layer 96 bytes on the host and 72 on the device
+    host, device = torch.zeros(2, 8, 3), torch.zeros(2, 6, 3)
+    # pages as (host, device): (5, 2) to (6, 4) is adjacent on the host only, and (6, 4) to (0, 5) on the device only
+    _Recording().copy(host, [4, 5, 6, 0], device, [1, 2, 4, 5], SimpleNamespace(cuda_stream=0))
+
+    h, d = host.data_ptr(), device.data_ptr()
+    want = [(h + 48, 96, d + 12, 72, 24, 2), (h + 72, 96, d + 48, 72, 12, 2), (h, 96, d + 60, 72, 12, 2)]
+    assert calls == want, "a copy didn't cover exactly a run of pages adjacent in both caches"
+
+
+@requires_cuda
+@requires_nvidia
+def test_copies_on_cuda_keep_the_gil():
+    """Beside a thread running Python, queueing four page copies took 15 ms dropping the GIL and 28 µs keeping it."""
+    _loadable(page_copier.CudartCopier)
+    copier = page_copier.make_page_copier.__wrapped__()
+    fn = getattr(copier, "_fn", None)
+    assert fn is not None and fn._flags_ & ctypes._FUNCFLAG_PYTHONAPI, f"{copier.name} drops the GIL on every copy"
 
 
 @requires_cuda
@@ -845,15 +909,15 @@ def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
     counting the refusals it stood for, keeps the log readable."""
     mgr = _make_manager(cpu_offload_pages=1)
     pool = mgr._cpu_pool
-    assert pool.place("held", "main", [1], [], stored_len=0, position=0)
+    assert pool.place("held", "main", (GroupPages([1]),), [], position=0)
     clock = [100.0]
     monkeypatch.setattr(cpu_page_pool.time, "monotonic", lambda: clock[0])
 
     with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
         for _ in range(50):
-            assert pool.place("r0", "main", [2], [], stored_len=0, position=0) is None
+            assert pool.place("r0", "main", (GroupPages([2]),), [], position=0) is None
         clock[0] += cpu_page_pool._EXHAUSTED_LOG_INTERVAL
-        assert pool.place("r0", "main", [2], [], stored_len=0, position=0) is None
+        assert pool.place("r0", "main", (GroupPages([2]),), [], position=0) is None
 
     warnings = [r.getMessage() for r in caplog.records if "exhausted" in r.getMessage()]
     assert len(warnings) == 2

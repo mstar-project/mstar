@@ -92,6 +92,15 @@ def test_cuda_arch_and_capability(monkeypatch, capability, arch, hopper):
     assert platform.has_cuda_capability(*capability)
 
 
+def test_cuda_cpu_device_has_no_capability(monkeypatch):
+    """A CPU device on a GPU host (a resource built with CPU stand-ins) asks no GPU."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    platform = CudaPlatform()
+    assert platform.cuda_capability(torch.device("cpu")) is None
+    assert platform.arch(torch.device("cpu")) is None
+    assert not platform.has_cuda_capability(9, device=torch.device("cpu"))
+
+
 @pytest.mark.parametrize(
     ("hip", "cuda", "xpu", "expected"),
     [
@@ -210,9 +219,10 @@ def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, ro
         _per_worker_graphs=dict.fromkeys(workers), per_worker_sharding_config=dict.fromkeys(workers),
         parallel_config=SimpleNamespace(per_worker_config=dict.fromkeys(workers)),
         model_config={}, _all_worker_graph_ids_to_graph_walks={}, _all_worker_graph_ids_to_nodes={},
-        _all_worker_graph_ids_to_dyn_loops={}, hostname="host", socket_path_prefix="/tmp/x",
+        _all_worker_graph_ids_to_dyn_loops={}, _all_worker_graph_ids_to_instances={},
+        hostname="host", socket_path_prefix="/tmp/x",
         _dist_init_method="", model=None, enable_nvtx=False, enable_prof=False, device_type="cuda",
-        rank_devices=None, log_level="INFO", tensor_comm_protocol=None, tcp_transfer_device="",
+        _worker_devices=["cuda:0", "cuda:1"], log_level="INFO", tensor_comm_protocol=None, tcp_transfer_device="",
         _status_interval_s=None,
         _mps_requested=False, _mps=None,
         shutdown=None,

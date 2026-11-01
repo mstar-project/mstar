@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+    from mstar.engine.resources.kv.host_writes import HostWrites
     from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 
@@ -28,6 +29,8 @@ class PageArena:
     sealed: list[bool] = field(init=False, repr=False)
     index: "PrefixIndex | None" = field(default=None, init=False, repr=False)
     trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    # queues each page a release leaves to the index alone, for a copy to the host
+    writes: "HostWrites | None" = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -65,6 +68,8 @@ class PageArena:
                 freed.append(page)
             elif self.num_owners[page] == 1 and self.index is not None:
                 self.index.set_shared(page, False)
+                if self.writes is not None:
+                    self.writes.queue(self.index.key_of(page))
         self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:

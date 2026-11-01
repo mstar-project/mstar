@@ -49,7 +49,7 @@ from mstar.model.lingbot_world.components.dit import (
 )
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule, StepOrder
 from mstar.model.wan22.submodules import _SingleRequestMixin
 
 logger = logging.getLogger(__name__)
@@ -233,6 +233,12 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
         self.keep_chunk_outputs = False
+
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Every rollout chunk emits frames to the client, so a session's
+        stream keeps moving while others run."""
+        del graph_walk
+        return StepOrder.TURNS
 
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)

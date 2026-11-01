@@ -19,6 +19,10 @@ when it is placed and its end, and is approximate for that reason:
   the pages it could take;
 - each replica's pool is charged every label of the request's layout, also
   those whose pages another node group's pool holds, so it evicts early;
+- each replica's pool is taken to be written by this set of groups alone: a KV
+  node whose groups sit on overlapping but different rank sets feeds one pool
+  from two sets, each mirror sees only its own, and both over-predict free
+  pages and hits there;
 - ``ran`` is per partition: a pass of a walk that skips the cache counts as
   run, and a pass that wrote the prompt but was aborted before it came back
   does not;
@@ -31,8 +35,9 @@ when it is placed and its end, and is approximate for that reason:
   the pool keeps a few per prefill in ``prefix_slots``; the mirror counts the
   KV hit whole, so it over-predicts there.
 
-Only the GPU pool is modelled; the host pool (``cpu_offload_pages``) holds
-offloaded live requests, not a cache.
+Only the GPU pool is modelled. With a host pool (``cpu_offload_pages``) a
+cached page the GPU evicted can come back from the host, so it under-predicts
+hits there.
 
 Kernel-free, since the conductor builds it.
 """

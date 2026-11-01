@@ -172,7 +172,8 @@ class CanaryModel(Model):
         return self.get_max_output_tokens()
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
@@ -334,15 +335,12 @@ class CanaryModel(Model):
             from mstar.model.components.fastconformer import FastConformerEncoder
             from mstar.model.components.fastconformer_submodule import FastConformerEncoderSubmodule
 
-            with torch.device("meta"):
-                encoder = FastConformerEncoder(self.config.encoder)
-            encoder = _materialize(encoder, device, autocast_dtype)
             prefix = "model.encoder."
-            loaded = encoder.load_hf_weights(
-                (k.removeprefix(prefix), v) for k, v in self._weights(device, prefix)
+            encoder = FastConformerEncoder.load(
+                self.config.encoder, ((k.removeprefix(prefix), v) for k, v in self._weights(device, prefix)),
+                device=device, dtype=autocast_dtype,
             )
-            check_loaded(encoder, loaded, "Canary encoder")
-            return FastConformerEncoderSubmodule(encoder.eval())
+            return FastConformerEncoderSubmodule(encoder)
         if node_name == "decoder":
             from mstar.model.canary.decoder import CanaryDecoderModel
             from mstar.model.canary.submodules import CanaryDecoderSubmodule

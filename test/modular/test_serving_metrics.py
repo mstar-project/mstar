@@ -20,7 +20,7 @@ import types
 
 import httpx
 import pytest
-from api_server_helpers import make_test_api_server
+from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -35,6 +35,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.communication import wire
+from mstar.communication.event import EventWakeup
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
 from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
@@ -48,6 +49,7 @@ class _DataWorker:
     reports each request's preprocess-finish time once asked to."""
 
     def __init__(self):
+        self.results_wakeup = EventWakeup()
         self.inputs = []
         self.aborted = []
         self.chunks = queue.Queue()
@@ -101,10 +103,11 @@ class _DataWorker:
         pass
 
 
-class _Conductor:
+class _Conductor(StandInSocket):
     """The API server's socket to the conductor."""
 
     def __init__(self):
+        super().__init__()
         self.inbox = queue.Queue()
 
     def get_all_new_messages(self):
@@ -703,7 +706,7 @@ class _StubTensorManager:
 def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     """The real data worker thread stamps the handoff without ``--log-stats``
     once ``report_preprocess_finish`` is called, and skips the input summary."""
-    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
     from mstar.api_server.request_types import PreprocessInput
 
     class _Model:
@@ -716,10 +719,10 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
-    facade.profile_queue = queue.Queue()
+    facade.profile_queue = ResultQueue(EventWakeup())
     stop = threading.Event()
     worker = PreprocessWorkerThread(
-        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=ResultQueue(EventWakeup()),
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
@@ -1050,14 +1053,16 @@ class _RealDataWorker:
     stand-in transport and conductor, and the API server's message thread."""
 
     def __init__(self, tmp_path, *, metrics, enable_prof=False):
-        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 
         self.model, self.sent, self.tmp_path = _MediaModel(), [], tmp_path
         facade = self.facade = PreprocessWorker.__new__(PreprocessWorker)
         for name in ("request_input_queue", "result_tensor_input_queue", "cleanup_request_queue",
-                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
-                     "output_queue", "profile_queue"):
+                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
             setattr(facade, name, queue.Queue())
+        facade.results_wakeup = EventWakeup()
+        facade.output_queue = ResultQueue(facade.results_wakeup)
+        facade.profile_queue = ResultQueue(facade.results_wakeup)
         facade.timing_requested, facade.stop_event = threading.Event(), threading.Event()
         facade.worker_metrics_requested = threading.Event()
         facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}

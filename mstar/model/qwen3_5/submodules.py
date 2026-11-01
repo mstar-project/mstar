@@ -37,21 +37,21 @@ from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.qwen3_vit import (
+    vision_interpolation,
+    vision_seq_lengths,
+)
+from mstar.model.components.qwen3_vit import (
+    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    vision_position_ids as vision_grid_position_ids,
+)
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
     vision_position_advance,
     vision_position_ids,
 )
-from mstar.model.qwen3_5.components.vision import (
-    Qwen3_5VisionModel,
-    vision_interpolation,
-    vision_seq_lengths,
-)
-from mstar.model.qwen3_5.components.vision import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
-    vision_position_ids as vision_grid_position_ids,
-)
+from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -139,10 +139,10 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
         self.vision_config = vision_config
-        # only a decode row's token ends decode_loop; a prefill is not in it yet
         self.token_stop = TokenStop(
             loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
-            sampler=SAMPLER, walk="decode",
+            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+            last_prefill_flag="last_prefill",
         )
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
 

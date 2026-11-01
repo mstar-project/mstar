@@ -42,7 +42,7 @@ def _speculation(rids: list[str]) -> Speculation:
             per_request_info={r: object() for r in rids},
             per_request_input_metadata={r: None for r in rids},
             final_stream_rids=set(rids),
-            stream_partition_done_rids=set(rids),
+            partition_done_rids=set(rids),
         ),
         consumed_edges={("tok", NODE)},
         continuing_rids=set(rids),
@@ -57,7 +57,7 @@ def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     committed: list[tuple] = []
     worker = SimpleNamespace(
-        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.edge.name))),
         # The staged ingests are settled per rid before the chunks go back, so
         # the chunk leaves the node's slot first; see Worker._settle_speculation.
         _graph_runtime=SimpleNamespace(
@@ -113,7 +113,7 @@ def test_failed_settle_after_success_returns_nothing():
     """
     returned: list[tuple[str, str]] = []
     worker = SimpleNamespace(
-        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.edge.name))),
         _graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
         engine_manager=SimpleNamespace(
             get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),

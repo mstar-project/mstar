@@ -38,6 +38,7 @@ from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -651,8 +652,8 @@ def _init_latents_and_time_index(
         generator=g,
         device=device,
     )
-    if torch.is_autocast_enabled():
-        latents = latents.to(torch.get_autocast_gpu_dtype())
+    if torch.is_autocast_enabled(latents.device.type):
+        latents = latents.to(torch.get_autocast_dtype(latents.device.type))
     time_idx = torch.zeros(latents.shape[0], device=device)
     return latents, time_idx
 
@@ -1466,8 +1467,8 @@ class LLMSubmodule(ARNodeSubmodule):
 
         # Euler step: x_{t-dt} = x_t - v * dt  (velocity points data -> noise)
         latents = latents - v_final * dt
-        if torch.is_autocast_enabled():
-            latents = latents.to(torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled(latents.device.type):
+            latents = latents.to(torch.get_autocast_dtype(latents.device.type))
         return {
             "latents": [latents],
             "time_index": [time_index + 1]
@@ -1677,8 +1678,15 @@ class LLMSubmodule(ARNodeSubmodule):
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and self.eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens):
+        hit_eos = not ignore_eos and self.eos_token_id == token
+        if request_info.graph_walk != "decode":
+            # The last prefill's token comes before decode_loop exists. The
+            # conductor says whether a stop there ends the request: not for an
+            # earlier prefill's throwaway token, nor for a think-then-image
+            # request, whose image_gen only the conductor's transition can start.
+            ends = request_info.step_metadata.get("prefill_stop_ends", False)
+            return {END_PARTITION} if hit_eos and ends else set()
+        if hit_eos or request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens:
             return {"decode_loop"}
         return set()
 
@@ -1896,8 +1904,8 @@ class CombineCFGSubmodule(NodeSubmodule):
 
         # Euler step
         new_latents = latents - v_final * dt
-        if torch.is_autocast_enabled():
-            new_latents = new_latents.to(torch.get_autocast_gpu_dtype())
+        if torch.is_autocast_enabled(new_latents.device.type):
+            new_latents = new_latents.to(torch.get_autocast_dtype(new_latents.device.type))
 
         new_time_index = time_index + 1
         return {

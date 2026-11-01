@@ -513,7 +513,7 @@ class _Graph:
     def update_dynamic_loop_iters(self, per_request_info, partition):
         pass
 
-    def mark_stream_partition_done(self, rid, partition):
+    def mark_partition_done(self, rid, partition):
         pass
 
     def complete_and_route_batch(self, route_input):
@@ -637,6 +637,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.utils.containers import RecentSet
     from mstar.worker.micro_scheduler import MicroScheduler
+    from mstar.worker.stream_buffers import StreamBufferManager
     from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
 
     w = Worker.__new__(Worker)
@@ -649,7 +650,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._max_consecutive_spec = 1
     w._device_loopback = {}
     w._host_rows_slot = 0
-    w._stream_buffer_rids = set()
     w._phase_period = 0
     w._phase_buf = {}
     w._gpu_spans = []
@@ -669,7 +669,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._graph_runtime = graph
     w.engine_manager = SimpleNamespace(
         get_engine=lambda node: engine, warmup_all=lambda: None,
-        remove_request=engine.remove_request, evictable_nodes=lambda: (),
+        remove_request=engine.remove_request,
     )
     w.request_state = graph
     w.parallel_nodes = {NODE}
@@ -683,7 +683,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.scheduler.runtime = graph
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
-    w._last_active = {}
     w._hold_logged = {}
     w._in_flight_rids = set()
     w._pending_removes = {}
@@ -695,6 +694,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._streaming_edge_names = set()
     w._consumer_node_cache = {}
     w._stream_partition = {}
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._metrics = None
     for setup in _DESIGN_SETUP:

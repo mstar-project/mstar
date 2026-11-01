@@ -50,8 +50,6 @@ def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
     imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
     if _VARLEN_IMPORT_ERROR is not None:
         return _VARLEN_IMPORT_ERROR
-    if device is not None and torch.device(device).type != "cuda":
-        return None
     capability = current_platform.cuda_capability(device)
     if capability is not None and not _fa3_has_kernel(capability):
         return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
@@ -197,6 +195,8 @@ class DenseAttentionManager(AttentionManager):
 
         self._wrapper_class = wrapper_class
         self._wrappers: dict[EagerSlotKey, PrefixedPrefillWrapper] = {}
+        # wrapper -> the (cu_q, cu_k, causal) it was last planned with
+        self._planned: dict[EagerSlotKey, tuple] = {}
         self._wrapper_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
@@ -298,14 +298,14 @@ class DenseAttentionManager(AttentionManager):
         )
 
         self._current_plans = {
-            plan_label: self._build_plan(kv_out, step.causal, self._wrapper(plan_label, ctx.slot))
+            plan_label: self._build_plan(kv_out, step.causal, EagerSlotKey(label=plan_label, slot=ctx.slot))
             for plan_label, kv_out in plan_outputs.items()
         }
 
-    def _build_plan(self, kv_out: KVPlanOutput, causal: bool, wrapper: PrefixedPrefillWrapper) -> DensePlan:
+    def _build_plan(self, kv_out: KVPlanOutput, causal: bool, slot_key: EagerSlotKey) -> DensePlan:
         """The per-segment gather layout plus the cumulative lengths one varlen
         kernel needs, in the packed order the KV plan defined."""
-        page_size = self._kv_config.page_size
+        page_size = self._kv_config.tokens_per_page
         segments: list[DenseSegment] = []
         cu_q = [0]
         cu_k = [0]
@@ -331,15 +331,23 @@ class DenseAttentionManager(AttentionManager):
             max_q = max(max_q, view.to_compute)
             max_k = max(max_k, view.length)
 
-        # Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them
-        # non-blocking (from pageable memory that copy would sync the stream),
-        # FlashInfer's plan reads them on the host.
-        pin = self._on_cuda
-        wrapper.plan(
-            torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),
-            torch.tensor(cu_k, dtype=torch.int32, pin_memory=pin),
-            causal=causal,
-        )
+        # A wrapper holds the schedule of its last plan until it is planned
+        # again (``run`` only reads it), and a denoising request keeps its
+        # layout from step to step, so an unchanged layout is not replanned:
+        # FlashInfer's plan is a device kernel plus a stream sync.
+        wrapper = self._wrapper(slot_key.label, slot_key.slot)
+        layout = (tuple(cu_q), tuple(cu_k), causal)
+        if self._planned.get(slot_key) != layout:
+            # Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them
+            # non-blocking (from pageable memory that copy would sync the
+            # stream), FlashInfer's plan reads them on the host.
+            pin = self._on_cuda
+            wrapper.plan(
+                torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),
+                torch.tensor(cu_k, dtype=torch.int32, pin_memory=pin),
+                causal=causal,
+            )
+            self._planned[slot_key] = layout
         return DensePlan(
             segments=tuple(segments),
             cu_q=tuple(cu_q),

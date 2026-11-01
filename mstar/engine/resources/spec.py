@@ -23,7 +23,17 @@ logger = logging.getLogger(__name__)
 class CombinedSplit:
     """A combined walk run on two kernels: decode for one-token rows, prefill
     for the rows of ``prefill_walks``, captured for as many as
-    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""
+    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows).
+
+    The engine orders a step of ``combined_walk`` with the rows of
+    ``prefill_walks`` last, so both kernels read the step's tokens in place:
+    the decode kernel the leading run of one-token rows, the prefill kernel
+    the rows after it (under capture every token, the run as one leading
+    sequence). Every walk of ``combined_walk`` outside ``prefill_walks`` must
+    be one token per row: its rows go first, and a multi-token one there
+    ends the run, so it and every decode row after it count as prompt rows,
+    and a captured step's plan raises if its prompt rows then exceed
+    ``max_prefill_rows``."""
     combined_walk: str
     prefill_walks: tuple[str, ...]
 
@@ -99,6 +109,10 @@ class NodeResourceSpec(ABC):
         into ``EngineResourceInfo.dependencies``."""
         return set()
 
+    def combined_splits(self) -> "tuple[CombinedSplit, ...]":
+        """The combined walks this resource runs on split kernels."""
+        return ()
+
     @property
     def writes_prefix_snapshots(self) -> bool:
         """Fills the snapshot slots of the recurrent pool it depends on, so a hit can restore them."""
@@ -132,6 +146,12 @@ class NodeResourceSpec(ABC):
         """A mirror of this resource for the replicas ``ctx`` describes; None
         (the default) leaves the resource out of the replica pick there."""
         return None
+
+    def derive(self, specs: Mapping[str, "NodeResourceSpec"]) -> list[str]:
+        """Set what this spec takes from the specs that read it (a KV pool keeps the window its
+        attentions declare), after a deployment's overrides; return what is wrong with it.
+        Idempotent: it runs wherever the specs resolve (`resolve_spec_dependencies`)."""
+        return []
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
@@ -200,11 +220,30 @@ def spec_dependency_problems(specs: Sequence[NodeResourceSpec]) -> list[str]:
 def resolve_spec_dependencies(
     specs: Sequence[NodeResourceSpec],
 ) -> dict[str, NodeResourceSpec]:
-    """Index specs by resource key, checking uniqueness and ``depends_on``."""
+    """Index specs by resource key, checking uniqueness and ``depends_on``, and derive what each
+    takes from the others (`NodeResourceSpec.derive`)."""
+    by_key = _indexed(specs)
+    _derive(by_key)
+    return by_key
+
+
+def _indexed(specs: Sequence[NodeResourceSpec]) -> dict[str, NodeResourceSpec]:
     problems = spec_dependency_problems(specs)
     if problems:
         raise ValueError(problems[0])
     return {spec.resource_key: spec for spec in specs}
+
+
+def derive_specs(by_key: Mapping[str, NodeResourceSpec]) -> list[tuple[str, str]]:
+    """Run every spec's `NodeResourceSpec.derive`; each problem as (resource key, message)."""
+    return [(key, message) for key, spec in by_key.items() for message in spec.derive(by_key)]
+
+
+def _derive(by_key: Mapping[str, NodeResourceSpec]) -> None:
+    problems = derive_specs(by_key)
+    if problems:
+        key, message = problems[0]
+        raise ValueError(f"resource {key!r}: {message}")
 
 
 TOP_LEVEL_KV_CACHE = (
@@ -228,18 +267,26 @@ def apply_yaml_overrides(
 
     ``resources: {<resource_key>: {...}}``, one block per resource, so a model
     with two pools of the same kind (whisper's decoder cache and its encoder
-    context) can have each tuned on its own. An unknown key is an error: it
+    context) can have each tuned on its own. An unknown key is a ValueError: it
     would otherwise be a silently ineffective setting.
+
+    Then derives what the specs derive (`resolve_spec_dependencies`), with or without
+    overrides and after them, so a deployment's page size or backend is what the derivation
+    checks, as validation checks it.
     """
     if "kv_cache" in model_config:
         raise ValueError(TOP_LEVEL_KV_CACHE)
+    by_key = _indexed(specs)
     overrides = model_config.get("resources") or {}
-    if not overrides:
-        return
-    by_key = resolve_spec_dependencies(specs)
     unknown = sorted(overrides.keys() - by_key.keys())
     if unknown:
         raise ValueError(unknown_overrides_message(unknown, by_key))
     for key, kwargs in overrides.items():
-        by_key[key].apply_yaml_overrides(**kwargs)
-    logger.info("Resource specs after YAML overrides: %s", specs)
+        try:
+            by_key[key].apply_yaml_overrides(**kwargs)
+        except TypeError as e:
+            # a key the resource doesn't take: a bad config, as every other problem here is
+            raise ValueError(f"resources.{key}: {e}") from e
+    _derive(by_key)
+    if overrides:
+        logger.info("Resource specs after YAML overrides: %s", specs)

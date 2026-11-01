@@ -330,14 +330,17 @@ def _sync_routing(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Make every rank use group rank 0's top-k.
+    """Make every rank use group rank 0's top-k. Expert parallelism only.
 
     Ranks compile the router separately, so a near-tie can resolve
-    differently per rank; sharded dispatch would then give a token more or
-    fewer than k experts. Both tensors travel in one fp32 tensor, which holds
-    expert ids below 2**24 and bf16/fp16/fp32 weights exactly. Other ranks
-    send zeros, so the all-reduce is an exact broadcast; a plain
-    ``dist.broadcast`` is not dynamo-traceable and would break the graph.
+    differently per rank; EP dispatch would then give a token more or fewer
+    than k experts. Under tensor parallelism each rank runs all k slots on its
+    slice of every expert, so a disagreement only mixes two experts' slices in
+    one slot, and the all-reduce after the experts has the same shape either
+    way: not worth an all-reduce per MoE layer. Both tensors travel in one fp32
+    tensor, which holds expert ids below 2**24 and bf16/fp16/fp32 weights
+    exactly. Other ranks send zeros, so the all-reduce is an exact broadcast; a
+    plain ``dist.broadcast`` is not dynamo-traceable and would break the graph.
     """
     top_k = selected_experts.shape[-1]
     packed = torch.cat([selected_experts.float(), routing_weights.float()], dim=-1)
@@ -660,9 +663,6 @@ class ParallelSparseMoeBlock(nn.Module):
                 self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
             )
         else:
-            routing_weights, selected_experts = _sync_routing(
-                self.comm_group, routing_weights, selected_experts,
-            )
             out = self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
         out = out.view(input_shape)
         return (out, router_states_next) if return_router_states else out
@@ -774,9 +774,6 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
                 self.num_experts, selected_experts, routing_weights,
             )
         else:
-            routing_weights, selected_experts = _sync_routing(
-                self.comm_group, routing_weights, selected_experts,
-            )
             routed = self._dispatch_tp(flat, routing_weights, selected_experts)
         shared_gate = torch.sigmoid(self.shared_expert_gate(flat))
         out = (routed + shared_gate * shared).view(input_shape)

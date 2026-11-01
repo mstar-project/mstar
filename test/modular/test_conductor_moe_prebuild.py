@@ -18,7 +18,7 @@ def test_only_a_model_that_asks_builds_the_op(monkeypatch, prebuild):
     monkeypatch.setattr(Conductor, "shutdown", lambda self: None)  # its atexit hook
     conductor = object.__new__(Conductor)
     conductor.model = SimpleNamespace(prebuild_fused_moe=prebuild) if prebuild else object()
-    conductor._sorted_ranks, conductor.worker_ids = [], []
+    conductor._sorted_ranks, conductor.worker_ids, conductor._worker_devices = [], [], []
     conductor._mps_requested = False
     conductor._launch_workers()
     assert built == ([1] if prebuild else [])
