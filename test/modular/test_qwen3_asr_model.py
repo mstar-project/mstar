@@ -17,6 +17,7 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
+from mstar.model.base import WalkStep  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
@@ -461,11 +462,11 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
 
 
 # --------------------------------------------------------------------------
-# model: graph, resources, state machine
+# model: graph, resources, walk plan
 # --------------------------------------------------------------------------
 
 
-def test_graph_resources_and_state_machine():
+def test_graph_resources_and_walk_plan():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {PREFILL_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
@@ -482,16 +483,14 @@ def test_graph_resources_and_state_machine():
     assert attn.config.decode_tensor_cores is False  # narrow GQA: the CUDA-core decode kernel
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
-    args = model.get_initial_forward_pass_args(
+    # the prefill splices the audio where process_prompt put its placeholders
+    assert model.walk_plan(
         "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
-        model_kwargs={"audio_slot": 5, "audio_tokens": 37},
-    )
-    assert args.full_metadata.graph_walk == PREFILL_WALK
-    assert args.step_metadata == {"is_prefill": True, "audio_slot": 5, "audio_tokens": 37}
-    assert [(e.next_node, e.name) for e in args.inputs] == [(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")]
-    nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
-    assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill
-    assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
+        {"audio_slot": 5, "audio_tokens": 37},
+    ) == [
+        WalkStep(PREFILL_WALK, step_metadata={"audio_slot": 5, "audio_tokens": 37}),
+        WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"}),
+    ]
 
 
 def test_llm_weight_remap():

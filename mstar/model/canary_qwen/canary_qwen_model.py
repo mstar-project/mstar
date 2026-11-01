@@ -25,7 +25,6 @@ from collections.abc import Iterable, Iterator
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -40,7 +39,16 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    WalkStep,
+)
 from mstar.model.canary_qwen.config import (
     ATTN,
     DECODE_LOOP,
@@ -215,54 +223,16 @@ class CanaryQwenModel(Model):
         )
         return {PREFILL_WALK: prefill, DECODE_WALK: decode}
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=PREFILL_WALK,
-            is_prefill=True,
-        )
-        audio = GraphEdge(next_node="audio_encoder", name="audio")
-        audio.tensor_info = input_signals.get("audio", [])
-        text = GraphEdge(next_node="llm", name="text_inputs")
-        text.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [audio, text]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """prefill -> decode loop -> done."""
-        metadata = partition_metadata
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = DECODE_WALK
-        elif metadata.graph_walk == DECODE_WALK:
-            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
-        edge = GraphEdge(next_node="llm", name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=[edge],
-            unpersist_tensors=list(edge.tensor_info),
-            step_metadata={"is_prefill": False},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # the prefill hears the clip and samples the first token; decode feeds each one back
+        return [WalkStep(PREFILL_WALK), WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"})]
 
     # -------------------------------------------------------------------
     # prompt / output

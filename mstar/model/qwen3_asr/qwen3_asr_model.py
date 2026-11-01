@@ -31,10 +31,6 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -51,7 +47,16 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    WalkStep,
+)
 from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
@@ -262,66 +267,19 @@ class Qwen3ASRModel(Model):
         return {PREFILL_WALK: prefill, DECODE_WALK: decode}
 
     # -------------------------------------------------------------------
-    # Model ABC: forward pass args
+    # Model ABC: walk plan
     # -------------------------------------------------------------------
 
-    @staticmethod
-    def _edge(node: str, name: str, tensor_info: list[TensorPointerInfo]) -> GraphEdge:
-        edge = GraphEdge(next_node=node, name=name)
-        edge.tensor_info = list(tensor_info)
-        return edge
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        inputs = [
-            self._edge(ENCODER_NODE, "audio", input_signals.get("audio", [])),
-            self._edge(LLM_NODE, "text_inputs", input_signals.get("text_inputs", [])),
-        ]
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk=PREFILL_WALK,
-                is_prefill=True,
-            ),
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={
-                "is_prefill": True,
-                "audio_slot": (model_kwargs or {}).get("audio_slot"),
-                "audio_tokens": (model_kwargs or {}).get("audio_tokens"),
-            },
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Single-partition state machine: prefill -> decode loop -> done."""
-        metadata = partition_metadata
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = DECODE_WALK
-        elif metadata.graph_walk == DECODE_WALK:
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True,
-            )
-        inputs = [self._edge(LLM_NODE, "text_inputs", persist_signals.get("new_token", []))]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": False},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        audio = {key: model_kwargs.get(key) for key in self.INTERNAL_KWARGS}
+        return [WalkStep(PREFILL_WALK, step_metadata=audio), WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"})]
 
     # -------------------------------------------------------------------
     # Model ABC: media loading + prompt processing
