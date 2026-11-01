@@ -710,8 +710,7 @@ class Worker:
         # (graph_walk, node) -> innermost enclosing loop, for ending a
         # stream-terminated loop and refusing an END_PARTITION from inside a
         # loop in _postprocess_batch. Structural, so it is derived from the
-        # model here rather than asked of the graph runtime per step -- which
-        # also keeps it identical under both runtimes.
+        # model here rather than asked of the graph runtime per step.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
         if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(

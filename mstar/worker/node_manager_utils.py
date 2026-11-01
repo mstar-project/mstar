@@ -193,7 +193,7 @@ class PerRequestInfo:
     """What the worker still owns for a request.
 
     Everything graph-shaped -- node/loop routing, the sharding config, the
-    worker graph ids, the live queues -- belongs to PythonGraphRuntime. What
+    worker graph ids, the live queues -- belongs to the graph runtime. What
     is left is the forward-pass info (a wire object) and the stream buffers
     (which hold real tensors), neither of which can live behind the runtime's
     contract.
@@ -211,10 +211,9 @@ class PerRequestInfo:
 class RequestStateManager:
     """Per-request forward-pass info and stream buffers.
 
-    Was WorkerGraphsManager, which owned the worker graphs too; those moved to
-    PythonGraphRuntime one method at a time. What remains is request state the
-    runtime deliberately does not take: CurrentForwardPassInfo is a wire object
-    it treats as opaque, and a StreamBuffer holds tensors.
+    What remains here is request state the graph runtime deliberately does not
+    take: CurrentForwardPassInfo is a wire object it treats as opaque, and a
+    StreamBuffer holds tensors.
     """
     per_request_info: dict[int, PerRequestInfo] = field(default_factory=dict)
 

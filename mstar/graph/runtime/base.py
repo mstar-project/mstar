@@ -150,7 +150,7 @@ class ColumnarEdgeSpecs:
         is_streaming: bool,
         next_node: str | None = None,
     ) -> list[GraphEdge]:
-        """Rebuild real ``GraphEdge`` objects, for the Python runtime's ingest.
+        """Rebuild real ``GraphEdge`` objects.
 
         ``next_node`` overrides the column, for a caller whose whole batch
         shares one destination.
@@ -231,9 +231,8 @@ class ColumnarEdgeSpecs:
 
         For tests and debugging; production walks the columns. Comparing two
         blocks field by field would be sensitive to ``signal_names`` ORDER,
-        which is an implementation detail -- the Python runtime discovers names
-        in ``ready_inputs`` order and Rust in the node's input order -- so a
-        parity check wants this instead.
+        which is an implementation detail (Rust discovers names in the node's
+        input order), so a check on a block wants this instead.
         """
         out = []
         at = 0
@@ -708,9 +707,8 @@ class GraphRuntime(ABC):
     ):
         """Drop stale output tensor_info before a pass writes new ones.
 
-        Internal to the Python runtime, which calls it from its own
-        completion; no worker call site. A no-op in Rust, which derives
-        outputs from the tensors it is handed and caches nothing to drop.
+        No worker call site. A no-op in Rust, which derives outputs from the
+        tensors it is handed and caches nothing to drop.
         """
         pass
 

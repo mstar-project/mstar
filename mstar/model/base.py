@@ -375,7 +375,7 @@ def _divide_into_worker_graphs(
         # chunk every iteration. TODO: that makes "N steps on ONE chunk" (flow
         # matching over a streamed latent) inexpressible. Honouring it instead
         # means changing this, Loop._is_streamed_input, and the Rust held_mask
-        # together, or the two runtimes disagree.
+        # together.
         ext_inps = set([
             (name, dest) for name, dest in graph._external_inputs \
                 if name not in input_streams

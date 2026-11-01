@@ -123,11 +123,11 @@ jobs:
               subprocess.run([f"{venv}/bin/pip", "install", "-q", "--no-deps", whl], check=True)
               subprocess.run([f"{venv}/bin/python", "-c", check, expected], check=True)
               print("ok", whl)
-      # These wheels turn the Rust transport and graph runtime on by default
-      # (MSTAR_RUST_ZMQ / MSTAR_RUST_GRAPH AUTO) on Python versions and an
-      # architecture rust-transport never runs, so each one also runs test/rust
-      # with its dependencies installed (CPU torch). From a copy of test/, so
-      # `mstar` imports from the wheel rather than the checkout.
+      # These wheels carry the Rust transport and graph runtime on Python
+      # versions and an architecture rust-transport never runs, so each one
+      # also runs test/rust with its dependencies installed (CPU torch). From a
+      # copy of test/, so `mstar` imports from the wheel rather than the
+      # checkout.
       - name: Run test/rust against each wheel
         shell: python
         run: |
