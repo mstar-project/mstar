@@ -5,6 +5,11 @@ node_groups:
   # encoder runs once per request, then idles.
   - node_names: [LLM, vision_encoder]
     ranks: [0]
+# A burst of prompts prefills before decode runs again. MI325X, 0.8B c=64: +0.6 to +2 % tok/s on
+# chat prompts, +4 % on 1k-token prompts.
+platform_overrides:
+  rocm:
+    eager_yield_nodes: [LLM]
 resources:
   gdn_state:
     max_slots: 129

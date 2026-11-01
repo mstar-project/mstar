@@ -4,6 +4,7 @@ import asyncio
 import base64
 import collections
 import contextlib
+import importlib.util
 import itertools
 import json
 import logging
@@ -2566,6 +2567,9 @@ def default_preprocess_threads(cpus: int | None = None) -> int:
 
 
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
+    # uvicorn makes the same choice silently, and h11 costs tokens/s under streaming
+    if importlib.util.find_spec("httptools") is None:
+        logger.info("httptools is not installed, uvicorn will serve HTTP with h11: pip install 'mstar-ai[server]'")
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
     # docs/serving.rst); on by default, as uvicorn's.

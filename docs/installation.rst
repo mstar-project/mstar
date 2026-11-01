@@ -185,6 +185,11 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
        ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a
        model's runtime, so not part of ``.[all]``.
+   * - ``.[server]``
+     - ``uvicorn[standard]``, for uvicorn's C HTTP parser ``httptools``. Without it
+       uvicorn takes ``h11``, which works but costs API-process CPU when streaming
+       tokens, and the server logs the fallback at startup. A serving feature, so
+       not part of ``.[all]``.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``

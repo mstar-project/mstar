@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -541,8 +541,12 @@ class PreprocessWorkerThread:
     _encode_pool: ThreadPoolExecutor | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
-    # decode, far less than a request's preprocess, which is one per pass.
+    # decode, far less than a media request's preprocess, which is one per pass.
     MAX_APPENDS_PER_PASS = 32
+    # New text-only requests per pass. Tokenizing one costs about what an
+    # append does, and one per pass queues a burst behind a pass of token
+    # delivery each, which holds every row of the burst out of the next step.
+    MAX_TEXT_REQUESTS_PER_PASS = 8
 
     def __init__(
         self,
@@ -1591,20 +1595,27 @@ class PreprocessWorkerThread:
         self._next_transfer_publish = now + STATUS_INTERVAL_S
         transfers.publish()
 
-    def _next_inputs(self) -> list[PreprocessInput | ClientAppend]:
-        """This pass's input: up to MAX_APPENDS_PER_PASS items in arrival
-        order, ending at the first new request (a preprocess each, seconds for
-        media), so output delivery gets its turn between requests."""
-        batch: list[PreprocessInput | ClientAppend] = []
-        while len(batch) < self.MAX_APPENDS_PER_PASS:
+    def _next_inputs(self) -> Iterator[PreprocessInput | ClientAppend]:
+        """This pass's input, taken one item at a time: up to
+        MAX_APPENDS_PER_PASS items in arrival order, ending at the first new
+        request with media (seconds of preprocess), the
+        MAX_TEXT_REQUESTS_PER_PASS-th without, or one a peer could not take, so
+        output delivery gets its turn and a full peer holds the rest undecoded."""
+        # getattr: tests take input from a thread with a plain communicator
+        flush = getattr(self.communicator, "flush", lambda: False)
+        taken = text_requests = 0
+        while taken < self.MAX_APPENDS_PER_PASS:
             try:
                 item = self.in_queue.get_nowait()
             except queue.Empty:
-                break
-            batch.append(item)
-            if not isinstance(item, ClientAppend):
-                break
-        return batch
+                return
+            taken += 1
+            yield item
+            if isinstance(item, ClientAppend):
+                continue
+            text_requests += 1
+            if item.file_paths or text_requests >= self.MAX_TEXT_REQUESTS_PER_PASS or flush():
+                return
 
     def _process_waiting_input(self, pre_input: PreprocessInput | ClientAppend) -> None:
         if not self._is_pending(pre_input.request_id):

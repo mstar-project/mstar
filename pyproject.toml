@@ -96,6 +96,13 @@ metrics = [
     "prometheus-client>=0.20",
 ]
 
+# Optional: uvicorn's standard extra, for its HTTP parser in C (httptools). Without
+# it uvicorn takes h11, whose Python send is a quarter of the API process's GIL time
+# when it streams tokens. The server runs either way and logs the fallback.
+server = [
+    "uvicorn[standard]",
+]
+
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
