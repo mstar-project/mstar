@@ -240,6 +240,61 @@ def test_the_shm_protocol_builds_the_arena(tmp_path):
     assert type(mgr) is ArenaShmCommunicationManager
 
 
+def _fake_dev_shm(monkeypatch, mib, segment_mb=None, max_segments=None):
+    """/dev/shm reports ``mib`` MiB, all free; the sizing knobs as given."""
+    from types import SimpleNamespace
+
+    from mstar.communication import arena
+
+    blocks = (mib << 20) // 4096
+    monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+        f_frsize=4096, f_blocks=blocks, f_bavail=blocks))
+    monkeypatch.setattr(arena, "_sizing_logged", False)
+    for k, v in (("SEGMENT_MB", segment_mb), ("MAX_SEGMENTS", max_segments)):
+        if v is None:
+            monkeypatch.delenv(f"MSTAR_SHM_ARENA_{k}", raising=False)
+        else:
+            monkeypatch.setenv(f"MSTAR_SHM_ARENA_{k}", str(v))
+    return arena
+
+
+@pytest.mark.parametrize("mib, sizes", [
+    (64, (16, 1)), (1024, (256, 1)), (64 << 10, (256, 32)),
+], ids=["64MiB", "1GiB", "64GiB"])
+def test_unset_sizing_knobs_fit_four_entities_in_dev_shm(monkeypatch, caplog, mib, sizes):
+    arena = _fake_dev_shm(monkeypatch, mib)
+    with caplog.at_level("INFO", logger=arena.__name__):
+        assert arena._arena_sizing()[:2] == arena._arena_sizing()[:2] == sizes
+    assert [r.getMessage() for r in caplog.records] == [  # once per process
+        f"ARENA: /dev/shm is {mib} MiB; each entity's arena grows to {sizes[1]} segments of "
+        f"{sizes[0]} MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and _SEGMENT_MB override)"]
+
+
+def test_sizing_knobs_set_by_hand_are_taken_as_given(monkeypatch, tmp_path):
+    assert _fake_dev_shm(monkeypatch, 64, 1, 4)._arena_sizing()[:2] == (1, 4)
+    assert _fake_dev_shm(monkeypatch, 64, None, 4)._arena_sizing()[:2] == (256, 4)
+    _fake_dev_shm(monkeypatch, 1024, 256, 32)
+    with pytest.raises(RuntimeError, match="exceeds /dev/shm"):
+        ArenaShmCommunicationManager(
+            my_entity_id="big", hostname="localhost", device="cpu",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+
+
+def test_a_small_dev_shm_gets_an_arena_that_spills(monkeypatch, tmp_path):
+    """64 MiB of /dev/shm: one 16 MiB segment, and a 20 MiB tensor goes to a
+    file instead of failing."""
+    _fake_dev_shm(monkeypatch, 64)
+    prod, cons = (ArenaShmCommunicationManager(
+        my_entity_id=e, hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path)) for e in ("s0", "s1"))
+    assert prod._segment_bytes == 16 << 20 and prod._arena.num_segments == 1
+    infos = prod.store_and_return_tensor_info("r", {"x": [torch.ones(8), torch.ones(5 << 20)]})["x"]
+    prod.register_for_send("r", list(infos))
+    assert infos[0].shm_segment is not None and infos[1].shm_segment is None
+    cons.start_read_tensors("r", [GraphEdge(next_node="B", name="x", tensor_info=infos)])
+    assert torch.equal(cons.tensor_store.get_tensor(infos[1].uuid), torch.ones(5 << 20))
+
+
 def test_instance_unique_names_no_collision(tmp_path):
     """Two servers with the SAME entity id must not share /dev/shm names —
     a fixed name would let the second create() truncate the first's live
