@@ -179,6 +179,12 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
     return keyed
 
 
+def names_checkpoint(model: "Model") -> bool:
+    """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
+    which may download the checkpoint (BAGEL's does)."""
+    return type(model).checkpoint_path is not Model.checkpoint_path
+
+
 def video_metadata_dict(metadata_obj) -> dict:
     # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
     return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
@@ -201,8 +207,9 @@ class WorkerGraph:
     # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
     # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
     # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (the conductor's lockstep
-    # routing unit — every rank of an instance runs a request together). With
+    # ``_instance_ranks`` are the whole instances (every rank of an instance runs
+    # a request together; empty without TP/SP, so the data-parallel replicas the
+    # conductor routes to are ``replica_ranks``). With
     # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
     # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
     # __post_init__ to the instance size (tp*sp) so the conductor — which models
@@ -248,6 +255,12 @@ class WorkerGraph:
             self._tp_comm_size = tp
             # Conductor routes to the lockstep unit (the whole instance).
             self.tp_size = inst
+
+    @property
+    def replica_ranks(self) -> list[list[int]]:
+        """The ranks of each data-parallel replica: the lockstep instances, or
+        one rank apiece without TP/SP. The conductor routes a request to one."""
+        return self._instance_ranks or [[r] for r in self.ranks]
 
 
 def _combine_sections_sequential_or_parallel(
@@ -585,6 +598,8 @@ class Model(ABC):
 
         The prefix cache hashes the checkpoint's manifest into its root. None leaves
         the weights out, so the cache stays shut unless the deployment sets a salt.
+        An override returns a path: processes that must not download it read the
+        override alone (``names_checkpoint``).
         """
         return None
 

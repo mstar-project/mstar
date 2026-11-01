@@ -21,7 +21,6 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     CGSlotSpec,
     EngineResourceInfo,
-    KeyedWalks,
     Resource,
 )
 from mstar.engine.resources.kv.keys import fingerprint
@@ -142,9 +141,8 @@ class RecurrentStatePool(Resource):
         if info.joint_comm_group is not None:
             world_size = info.joint_comm_group.world_size
             config.shard(world_size)
-        kv = info.dependencies.get(config.kv_cache)
-        if world_size > 1 or kv is None or not kv.config.prefix_cache:
-            # no snapshot slots where the prefix cache can't open
+        # no snapshot slots where the engine keeps them from serving a hit
+        if spec.resource_key not in info.prefix_caches:
             config = replace(config, prefix_slots=0)
         # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
@@ -660,14 +658,9 @@ class RecurrentStatePool(Resource):
         return self._kv.keyed_walks(label) if self._kv is not None else frozenset()
 
     def bind_kv(self, kv: "KVManager") -> None:
-        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names."""
-        self._kv = kv
-
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        del root, walks
-        if not self.config.prefix_slots:
-            self._kv = None
-        return self._kv is not None
+        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
+        A pool with no snapshot slots keys none."""
+        self._kv = kv if self.config.prefix_slots else None
 
     def close_prefix_cache(self) -> None:
         self._kv = None
