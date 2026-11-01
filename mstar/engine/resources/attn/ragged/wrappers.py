@@ -122,10 +122,11 @@ class _RaggedPrefillBase(ABC):
     def _plan(self, cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> None:
         # A wrapper keeps the schedule of its last plan until it is planned again
         # and ``run`` only reads it, so a layout it already holds is not replanned:
-        # FlashInfer's plan is a device kernel plus a stream sync, and a denoising
-        # request keeps its layout from step to step. Each (label, slot) has its
-        # own wrapper, so this compares against what this slot's schedule says,
-        # never against what the previous step ran.
+        # a plan costs host time, plus a stream sync on a backend whose plan reads
+        # the layout back from the device, and a denoising request keeps its
+        # layout from step to step. Each (label, slot) has its own wrapper, so this
+        # compares against what this slot's schedule says, never against what the
+        # previous step ran.
         layout = self._layout_key(cu_seqlens, kv_cu_seqlens, causal)
         if layout == self._planned_layout:
             return
