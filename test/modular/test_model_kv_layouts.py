@@ -240,35 +240,21 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_canary_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.canary.canary_model import CanaryModel
-    from mstar.model.canary.submodules import CanaryDecoderSubmodule
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
+    """The prefill emits the first of max_output_tokens, so the decode loop's
+    cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
+    ends at the prefill."""
+    if model_name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
 
-    model = object.__new__(CanaryModel)
-    model.config = SimpleNamespace(max_position_embeddings=1024)
-    decoder = object.__new__(CanaryDecoderSubmodule)
-    decoder.stop_token_ids = frozenset()
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+    else:
+        from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
 
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
-        decoder.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_canary_qwen_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
-    from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
-
-    llm = object.__new__(CanaryQwenLLMSubmodule)
-    llm.stop_token_ids = frozenset()
-
-    assert CanaryQwenModel.get_loop_caps(
-        object.__new__(CanaryQwenModel), max_output_tokens=max_tokens,
-    )["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+        model = object.__new__(CanaryQwenModel)
+    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max(1, max_tokens - 1)
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
