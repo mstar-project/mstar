@@ -68,3 +68,12 @@ def test_declared_policies_stop_the_rows_check_stop_does(model, seed):
             }
             assert declared == set(expected), (walk, rid)
     assert declared_walks
+
+
+def test_a_withholding_token_stop_refuses_the_runtime_check():
+    """The runtime's check never calls ``check_stop``, which is what withholds."""
+    from mstar.model.submodule_base import TokenStop
+
+    with pytest.raises(ValueError, match="runtime_check"):
+        TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
+                  withhold=("codes",), runtime_check=True)

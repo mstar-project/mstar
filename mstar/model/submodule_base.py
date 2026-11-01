@@ -46,7 +46,8 @@ class HostRows(NamedTuple):
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
 
 
-class TokenStop(NamedTuple):
+@dataclass(frozen=True)
+class TokenStop:
     """When an AR submodule's sampled token ends its decode loop: on a stop
     id, unless the request's sampler config sets ``ignore_eos``. The token
     budget is the loop's cap (``Model.get_loop_caps``), which the runtime
@@ -80,6 +81,11 @@ class TokenStop(NamedTuple):
     # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
     # check_stop, which can end the partition
     runtime_check: bool = False
+
+    def __post_init__(self):
+        if self.withhold and self.runtime_check:
+            # the runtime's check never calls check_stop, which is what withholds
+            raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
 
 
 class DeviceLoopback(NamedTuple):
