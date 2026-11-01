@@ -240,16 +240,16 @@ def test_the_cached_plan_keeps_its_indptrs_while_the_ring_turns(kv):
 
 def test_a_plan_built_across_a_touch_of_its_rows_is_not_reused(kv, monkeypatch):
     """A pre-plan builds on the plan thread while the main thread can tear a
-    request down: the entry keeps the epochs from before the views."""
-    build = kv._sequence_views
+    request down: the entry keeps the epochs from before the build."""
+    build = kv._plan_label
 
     def touched(*args, **kwargs):
         kv._touch_plan_cache("b")
         return build(*args, **kwargs)
 
-    monkeypatch.setattr(kv, "_sequence_views", touched)
+    monkeypatch.setattr(kv, "_plan_label", touched)
     first = _read(kv, ("a", "b"))
-    monkeypatch.setattr(kv, "_sequence_views", build)
+    monkeypatch.setattr(kv, "_plan_label", build)
     assert _read(kv, ("a", "b")) is not first
 
 

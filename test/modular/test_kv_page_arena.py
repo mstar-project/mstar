@@ -146,3 +146,32 @@ def test_the_index_hears_each_page_that_gains_or_loses_a_second_owner(backend):
     assert arena.free_pages()[-3:] == [2, 1, 0]
     with pytest.raises(AssertionError):
         arena.release(pages[:1])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_page_a_release_leaves_to_the_index_is_queued_for_the_host(backend):
+    arena = new_page_arena(8, backend)
+    queued = []
+
+    class Index:
+        def set_shared(self, page, shared):
+            pass
+
+        def key_of(self, page):
+            return b"key%d" % page
+
+    class Writes:
+        def queue(self, key):
+            queued.append(key)
+
+    pages = arena.acquire(2)
+    arena.retain(pages)
+    arena.writes = Writes()
+    arena.release(pages)
+    assert queued == [], "no index: nothing to tell"
+    arena.retain(pages)
+    arena.index = Index()
+    arena.release(pages[:1])
+    assert queued == [b"key0"]
+    arena.release(pages)  # page 0 freed, page 1 left to its one owner
+    assert queued == [b"key0", b"key1"]
