@@ -49,7 +49,6 @@ import copy
 import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NamedTuple
 
 import torch
@@ -61,6 +60,7 @@ from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self._uncaptured_layouts: OrderedDict[Hashable, Any] = OrderedDict()
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
         # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
-        self._seed_pool: ThreadPoolExecutor | None = None
+        self._seed_pool: ThreadPool | None = None
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
         self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
@@ -213,7 +213,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         bucket_key = self.bucket_key_for(info)
         if self._seed_pool is None:
             # a CPU randn is single-threaded and releases the GIL
-            self._seed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mstar-seed")
+            self._seed_pool = ThreadPool(max_workers=2, thread_name_prefix="mstar-seed")
         state.add("seed_draw", (bucket_key, self._seed_pool.submit(self._draw_seeds, info, bucket_key)))
 
     def _draw_seeds(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> dict[str, torch.Tensor]:

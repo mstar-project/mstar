@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.model.submodule_base import InputMetadata
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -54,16 +54,22 @@ def make_executing_batch(
     final_edges: dict[int, set[str]] | None = None,
     per_request_input_metadata: dict[int, InputMetadata] | None = None,
     request_walks: dict[int, str] | None = None,
+    engine: Engine | None = None,
 ) -> ExecutingBatch:
     """One step's batch, with the step context the engine drives it through.
 
     ``final_edges`` maps a rid to the streams whose final chunk the step
-    consumes. The context starts unleased and eager; a slot is reserved
-    later, once the real token count is known.
+    consumes. ``engine`` orders a split walk's rows (``Engine.order_split_rows``).
+    The context starts unleased and eager; a slot is reserved later, once the
+    real token count is known.
     """
     final_stream_rids, stream_partition_done_rids = streams.settle_final(
         node_name, final_edges or {},
     )
+    if request_walks and engine is not None:
+        # Every path to a mixed step comes through here, a TP follower's too,
+        # so each rank orders the leader's rows alike.
+        request_ids = engine.order_split_rows(node_name, graph_walk, request_ids, request_walks)
     return ExecutingBatch(
         node_name=node_name,
         per_request_info=per_request_info,

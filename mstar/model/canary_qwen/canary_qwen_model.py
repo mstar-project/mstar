@@ -53,7 +53,7 @@ from mstar.model.canary_qwen.config import (
 )
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import check_kv_pools_fit, check_loaded, kv_pages
+from mstar.model.utils import check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -350,31 +350,14 @@ class CanaryQwenModel(Model):
 
     def _create_submodule(self, node_name: str, device: str, autocast_dtype: torch.dtype | None):
         if node_name == "audio_encoder":
-            from mstar.model.components.audio_features import NemoLogMel
-            from mstar.model.components.fastconformer import FastConformerEncoder, nemo_to_hf_name
+            from mstar.model.components.fastconformer import load_nemo_perception
             from mstar.model.components.fastconformer_submodule import FastConformerEncoderSubmodule
 
-            with torch.device("meta"):
-                encoder = FastConformerEncoder(self.config.encoder)
-                proj = torch.nn.Linear(self.config.encoder.hidden_size, self.config.llm.hidden_size)
-            if autocast_dtype is not None:
-                encoder, proj = encoder.to(autocast_dtype), proj.to(autocast_dtype)
-            encoder, proj = encoder.to_empty(device=device), proj.to_empty(device=device)
-            loaded = encoder.load_hf_weights(
-                (nemo_to_hf_name(k), v) for k, v in self._weights(device, "perception.encoder.")
+            encoder, proj, log_mel = load_nemo_perception(
+                self.config.encoder, self.config.llm.hidden_size, self._weights(device, "perception."),
+                device=device, dtype=autocast_dtype,
             )
-            check_loaded(encoder, loaded, "Canary-Qwen encoder")
-            featurizer = dict(self._weights(device, "perception.preprocessor.featurizer."))
-            head = dict(self._weights(device, "perception.proj."))
-            with torch.no_grad():
-                proj.weight.copy_(head["weight"])
-                proj.bias.copy_(head["bias"])
-            # the filters NeMo's preprocessor runs with: the checkpoint's copies
-            log_mel = NemoLogMel(
-                num_mel_bins=self.config.encoder.num_mel_bins, device=device,
-                mel_filters=featurizer["fb"], window=featurizer["window"],
-            )
-            return FastConformerEncoderSubmodule(encoder.eval(), projection=proj.eval(), log_mel=log_mel)
+            return FastConformerEncoderSubmodule(encoder, projection=proj, log_mel=log_mel)
         if node_name == "llm":
             from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
             from mstar.model.components.qwen3_lm import Qwen3DenseLM

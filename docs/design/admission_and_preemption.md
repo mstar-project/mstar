@@ -111,7 +111,7 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads the least recently active request first, as it does today, since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
+Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads first, as it does today (the row last in the refused step's line), since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
 Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 
@@ -149,7 +149,7 @@ Why this shape:
 - **Newest first.** No request is dropped for a newer one's page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
 - **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
-- **Not the least recently active request.** Today's offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.
+- **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be dropped every time it grows.
 
 ### 3.3 Earmarks

@@ -111,7 +111,9 @@ def _bh2_rhos(rks: list[torch.Tensor], hh: torch.Tensor, order: int, device: tor
         b.append(h_phi_k * factorial_i / b_h)
         factorial_i *= i + 1
         h_phi_k = h_phi_k / hh - 1 / factorial_i
-    return torch.linalg.solve(torch.stack(rows), torch.stack(b))
+    # solve_ex: the same factorization as solve, without solve's host-side
+    # check of the LAPACK info (a device sync every step)
+    return torch.linalg.solve_ex(torch.stack(rows), torch.stack(b)).result
 
 
 def unipc_predictor_step(

@@ -59,6 +59,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StepOrder,
     StopCheck,
 )
 from mstar.platforms.compile import with_inductor_overrides
@@ -489,6 +490,8 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
+        # (node, combined walk) -> the walks whose rows a step of it runs last
+        self._split_prompt_walks: dict[tuple[str, str], frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -568,6 +571,7 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
+            self._add_split_row_order(spec, relevant_nodes)
             declared_by[spec.resource_key] = frozenset(spec.nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
@@ -1410,6 +1414,7 @@ class Engine:
                 phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
+            self._add_resource_host_rows(submodule_mgmt, out)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -1434,6 +1439,23 @@ class Engine:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
+
+    @staticmethod
+    def _add_resource_host_rows(
+        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput,
+    ) -> None:
+        """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
+        for key, resource in submodule_mgmt.resources.items():
+            if not (rows := resource.step_host_rows()):
+                continue
+            if out.check_stop_buffers is None:
+                raise RuntimeError(
+                    f"resource {key!r} has rows for the host (e.g. log-probs), but this node's "
+                    "forward hands over no row-addressed stop buffers",
+                )
+            if clash := rows.keys() & out.check_stop_buffers.keys():
+                raise RuntimeError(f"resource {key!r} adds host rows {sorted(clash)} the step already has")
+            out.check_stop_buffers = {**out.check_stop_buffers, **rows}
 
     def _exec_per_request(
         self, batch: ExecutingBatch
@@ -2284,6 +2306,33 @@ class Engine:
             per_request_input_metadata={request_id: input_metadata},
         )
 
+    def _add_split_row_order(self, spec: NodeResourceSpec, nodes: set[str]) -> None:
+        """Record the row order ``spec``'s split kernels read (``CombinedSplit``)."""
+        for split in spec.combined_splits():
+            last = frozenset(split.prefill_walks)
+            for node in nodes:
+                key = (node, split.combined_walk)
+                if self._split_prompt_walks.setdefault(key, last) != last:
+                    raise ValueError(
+                        f"resource {spec.resource_key!r}: {node!r} splits combined walk "
+                        f"{split.combined_walk!r} with prefill walks {sorted(last)}, "
+                        f"another resource with {sorted(self._split_prompt_walks[key])}"
+                    )
+
+    def order_split_rows(
+        self, node_name: str, graph_walk: str, request_ids: list[int],
+        request_walks: Mapping[int, str],
+    ) -> list[int]:
+        """``request_ids`` as a step of ``graph_walk`` runs them: a walk run on
+        split kernels takes its prefill walks' rows last, in their order."""
+        last = self._split_prompt_walks.get((node_name, graph_walk))
+        if last is None:
+            return request_ids
+        first = [rid for rid in request_ids if request_walks.get(rid) not in last]
+        if len(first) == len(request_ids):
+            return request_ids
+        return first + [rid for rid in request_ids if request_walks.get(rid) in last]
+
     @staticmethod
     def _max_rows_in_combined(
         resource_key: str,
@@ -2311,6 +2360,10 @@ class Engine:
     def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
         """Rows of ``graph_walk`` a step mixing it with another walk may hold."""
         return self._submodules[node_name].submodule.max_rows_in_combined(graph_walk)
+
+    def get_step_order(self, node_name: str, graph_walk: str) -> StepOrder:
+        """The submodule's ``step_order`` for ``graph_walk``."""
+        return self._submodules[node_name].submodule.step_order(graph_walk)
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.

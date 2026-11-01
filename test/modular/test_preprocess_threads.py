@@ -47,7 +47,7 @@ def test_usable_cpus_is_the_affinity_capped_by_the_quota(monkeypatch):
 
 @pytest.mark.parametrize(("usable", "threads"), [(1, 1), (7, 1), (8, 2), (12, 3), (16, 4), (40, 4), (256, 4)])
 def test_default_preprocess_threads(usable, threads):
-    assert entrypoint.default_preprocess_threads(usable) == threads
+    assert cpus.CpuPlan(frozenset(range(256)), usable).preprocess_threads == threads
 
 
 class _Model:
@@ -67,6 +67,6 @@ class _Pinned:
 def test_config_then_model_then_default(monkeypatch, model, config, expect):
     calls = []
     monkeypatch.setattr("torch.set_num_threads", calls.append)
-    monkeypatch.setattr(entrypoint, "default_preprocess_threads", lambda: 3)
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(12)), usable=12))  # 3 threads
     entrypoint._set_preprocess_threads(model, config)
     assert calls == ([] if expect is None else [expect])

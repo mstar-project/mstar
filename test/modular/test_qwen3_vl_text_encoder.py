@@ -33,14 +33,16 @@ from mstar.model.components.diffusion.weight_loading import (  # noqa: E402
     load_native,
     materialize,
 )
+from mstar.model.components.qwen3_vit import (  # noqa: E402
+    vision_interpolation,
+    vision_position_ids,
+    vision_seq_lengths,
+)
 from mstar.model.components.qwen_vision import (  # noqa: E402
     VISION_ATTN,
     FrameSDPA,
     QwenVisionConfig,
     QwenVisionModel,
-    vision_interpolation,
-    vision_position_ids,
-    vision_seq_lengths,
 )
 
 TAP = 3
