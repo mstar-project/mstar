@@ -17,7 +17,7 @@ class _Span:
         return False
 
 
-def _worker(target):
+def _worker(target, eager=False):
     peeked, excluded = [], []
     fake = SimpleNamespace(
         _can_speculate=lambda batch: True,
@@ -31,6 +31,7 @@ def _worker(target):
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or True,
             get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
+            yields_eagerly=lambda node: eager,
         ),
     )
     fake._build_speculation = Worker._build_speculation.__get__(fake)
@@ -60,3 +61,22 @@ def test_with_no_target_the_chain_keys_on_the_step():
     worker._build_speculation(_pending(), 1, _SpecFairness(peek=True, max_consecutive=8))
 
     assert peeked == [("LLM", "mixed")]
+
+
+def test_a_chain_speculates_one_step_before_it_looks_for_other_work():
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    worker, peeked, _ = _worker(target)
+
+    _, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert peeked == [] and yielded_from is None
+
+
+def test_an_eager_yield_node_looks_from_the_chains_first_step():
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    worker, peeked, excluded = _worker(target, eager=True)
+
+    _, yielded_from = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
+
+    assert peeked == [("LLM", "decode")]
+    assert yielded_from == ("LLM", "decode") and excluded == [("LLM", "decode")]
