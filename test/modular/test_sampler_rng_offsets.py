@@ -2,7 +2,9 @@
 
 A step samples eagerly (no slot lease: a prefill past the capture buckets, a
 batch over the largest bucket) or under a captured graph, and both draw from
-the request's one offset counter.
+the request's one offset counter. Both ways the captured sampler keeps it are
+covered: the in-graph scatter (the default where a node reads its tokens back on
+the device, rows taken at admission) and the scatter after the replay.
 """
 
 from __future__ import annotations
@@ -23,11 +25,21 @@ from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 V = 64
 RID = 7
 LEASE = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
+NODE, WALK = "llm", "decode"
 
 
-def _resource(device: torch.device) -> SamplerResource:
+@pytest.fixture(params=[True, False], ids=["ingraph_scatter", "scatter_after_replay"])
+def ingraph(request, monkeypatch) -> bool:
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if request.param else "0")
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
+    return request.param
+
+
+def _resource(device: torch.device, ingraph: bool) -> SamplerResource:
     res = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=device)
+    res.enable_device_loopback_reader()
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=1, max_seq_len=1)
+    assert res._cg_buffers.ingraph_scatter is ingraph
     return res
 
 
@@ -35,6 +47,9 @@ def _ingest(res: SamplerResource, rid: int, seed: int) -> None:
     cfg = SamplingReqConfig(temperature=1.0)
     cfg.apply_conductor_config(seed=seed, resource_key="sampler")
     res.ingest_request(rid, cfg)
+    if res._cg_buffers.ingraph_scatter:
+        # admission takes its row
+        assert res.reserve(rid, NODE, WALK, None) is None
 
 
 def _ctx(rid: int, captured: bool) -> StepContext:
@@ -75,26 +90,26 @@ def _run(res: SamplerResource, rid: int, modes: str, step: SamplerStep = Sampler
 
 # between them, every transition (EE, EC, CC, CE) from either first step
 @pytest.mark.parametrize("modes", ["EECCE", "CCEEC"])
-def test_offsets_are_unique_across_eager_and_captured_steps(drawn, modes):
-    res = _resource(torch.device("cpu"))
+def test_offsets_are_unique_across_eager_and_captured_steps(drawn, ingraph, modes):
+    res = _resource(torch.device("cpu"), ingraph)
     _ingest(res, RID, seed=1)
     _run(res, RID, modes)
     assert [offset for _, offset in drawn] == list(range(len(modes)))
     assert len({seed for seed, _ in drawn}) == 1
 
 
-def test_a_dropped_eager_draw_does_not_advance(drawn):
-    res = _resource(torch.device("cpu"))
+def test_a_dropped_eager_draw_does_not_advance(drawn, ingraph):
+    res = _resource(torch.device("cpu"), ingraph)
     _ingest(res, RID, seed=1)
     _run(res, RID, "E", SamplerStep(kept_rids=frozenset()))
     _run(res, RID, "EC")
     assert [offset for _, offset in drawn] == [0, 0, 1]
 
 
-def test_a_recycled_slot_starts_at_zero(drawn):
+def test_a_recycled_slot_starts_at_zero(drawn, ingraph):
     """A slot reused after eager and captured draws starts at offset 0,
     whichever path draws first."""
-    res = _resource(torch.device("cpu"))
+    res = _resource(torch.device("cpu"), ingraph)
     _ingest(res, RID, seed=1)
     _run(res, RID, "ECE")
     slot = res._cg_buffers._rid_to_slot[RID]
@@ -109,13 +124,13 @@ def test_a_recycled_slot_starts_at_zero(drawn):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
-def test_eager_prefill_and_captured_decode_draw_independently():
+def test_eager_prefill_and_captured_decode_draw_independently(ingraph):
     """Real FlashInfer draws and a real graph replay: with the same near-flat
     logits on an eager step and the captured step after it, two independent
     draws agree about 1/V of the time. Two draws at one offset always agree."""
     pytest.importorskip("flashinfer")
     device = torch.device("cuda")
-    res = _resource(device)
+    res = _resource(device, ingraph)
     pad = -1
     res.ingest_capture_row(pad)
     step = SamplerStep()
