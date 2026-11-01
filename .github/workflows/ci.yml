@@ -148,8 +148,8 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
         run: pytest test/modular/test_dynamo_bridges.py test/modular/test_dynamo_registration_smoke.py -v
-  # Vendored Rust transport (rust/): cargo tests, then the pyzmq interop
-  # pytest against a freshly built extension.
+  # Vendored Rust transport (rust/): cargo tests, then pytest test/rust
+  # against a freshly built extension.
   rust-transport:
     runs-on: ubuntu-latest
     steps:
@@ -191,7 +191,7 @@ jobs:
           # prometheus-client: the frontend's /metrics test renders a real registry;
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
           # parity cases run the Python app through fastapi's TestClient
-          pip install pytest==9.2.0 pyzmq msgpack numpy pyyaml prometheus-client \
+          pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
             fastapi uvicorn python-multipart httpx
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
