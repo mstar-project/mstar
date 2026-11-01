@@ -81,6 +81,7 @@ def test_the_gentle_ramp_configs_are_their_base_with_a_chunk_schedule(ramp, base
 
 @pytest.mark.parametrize("name, bf16, schedule", [
     ("flux2_klein.yaml", "flux2_klein_bf16.yaml", "flux2_klein_fp8_bpff.yaml"),
+    ("flux2_klein_9b.yaml", "flux2_klein_9b_bf16.yaml", "flux2_klein_9b_fp8_bbpf.yaml"),
 ])
 def test_the_klein_configs_serve_bf16_on_cuda_and_a_step_schedule_on_rocm(monkeypatch, name, bf16, schedule):
     """On AMD GPUs the override serves the named schedule file with the solo text encoder and
@@ -112,47 +113,18 @@ def test_the_klein_configs_serve_bf16_on_cuda_and_a_step_schedule_on_rocm(monkey
 @pytest.mark.parametrize("platform", [CudaPlatform, RocmPlatform])
 @pytest.mark.parametrize("fp8, bf16", [
     ("flux2_klein_fp8.yaml", "flux2_klein_bf16.yaml"),
+    ("flux2_klein_9b_fp8_keep.yaml", "flux2_klein_9b_bf16.yaml"),
 ])
 def test_the_named_fp8_klein_configs_are_their_bf16_file_with_fp8_and_the_knob(monkeypatch, platform, fp8, bf16):
     monkeypatch.setattr(serving_config, "_built_for", platform)
     expected = load_serving_config(str(CONFIGS / bf16))
     resolved = load_serving_config(str(CONFIGS / fp8))
-    keep = resolved["model_kwargs"].pop("linear_keep_bf16")  # the text stream, no faster in fp8
-    assert keep and all(pattern.startswith("double_blocks.") for pattern in keep)
+    # the keep list is the fp8 file's business: at least the text stream, no faster in fp8
+    keep = resolved["model_kwargs"].pop("linear_keep_bf16")
+    assert any(pattern.startswith("double_blocks.") for pattern in keep)
+    bf16_kwargs = {k: v for k, v in expected["model_kwargs"].items() if k != "linear_keep_bf16"}
     assert resolved == {
         **expected,
-        "model_kwargs": {**expected["model_kwargs"], "linear_dtype": "fp8"},
+        "model_kwargs": {**bf16_kwargs, "linear_dtype": "fp8"},
         "knobs": {"dit_exact_ops": True},
     }
-
-
-@pytest.mark.parametrize("name, bf16", [
-    ("flux2_klein_9b.yaml", "flux2_klein_9b_bf16.yaml"),
-])
-def test_the_klein_configs_serve_bf16_on_cuda_and_fp8_on_rocm(monkeypatch, name, bf16):
-    """On AMD GPUs the override adds fp8, the knob it needs and the solo text encoder
-    to the file's model_kwargs and drops none of them. CUDA serves the bf16 file
-    without its override, so its encoder stays batched."""
-    monkeypatch.setattr(serving_config, "_built_for", CudaPlatform)
-    expected = load_serving_config(str(CONFIGS / bf16))
-    assert OVERRIDES_KEY not in expected
-    assert "text_encoder_max_batch_size" not in expected["model_kwargs"]
-    assert load_serving_config(str(CONFIGS / name)) == expected
-
-    monkeypatch.setattr(serving_config, "_built_for", RocmPlatform)
-    resolved = load_serving_config(str(CONFIGS / name))
-    # both files move to the ragged attention resource and the solo text encoder on AMD GPUs; the default adds fp8
-    # and the knob it needs
-    on_amd = load_serving_config(str(CONFIGS / bf16))["model_kwargs"]
-    assert on_amd == {**expected["model_kwargs"], "attention_backend": "auto", "text_encoder_max_batch_size": 1}
-    fp8_kwargs = dict(resolved["model_kwargs"])
-    assert fp8_kwargs.pop("linear_dtype") == "fp8"
-    # the keep list is the fp8 default's business (the twin may carry one for a linear_dtype edit)
-    fp8_kwargs.pop("linear_keep_bf16", None)
-    assert fp8_kwargs == {k: v for k, v in on_amd.items() if k != "linear_keep_bf16"}
-    assert resolved["knobs"] == {"dit_exact_ops": True}
-    assert {k: v for k, v in resolved.items() if k not in ("model_kwargs", "knobs")} == {
-        k: v for k, v in expected.items() if k != "model_kwargs"
-    }
-    # a bf16 deployment on AMD GPUs differs from the CUDA one by the attention kernel and the solo text encoder alone
-    assert load_serving_config(str(CONFIGS / bf16)) == {**expected, "model_kwargs": on_amd}
