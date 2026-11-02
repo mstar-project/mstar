@@ -236,6 +236,12 @@ class _RaggedManagerBase:
         return self._config.max_segments_per_request
 
     @property
+    def max_segments_per_step(self) -> int | None:
+        """Segments a one-row replay's plan holds for its whole step, as
+        configured; None for a resource sized per request."""
+        return self._config.max_segments_per_step
+
+    @property
     def force_double_buffer(self):
         # plan H2Ds each layout into static buffers that a captured replay reads
         return True
@@ -251,9 +257,10 @@ class _RaggedManagerBase:
 
         Built on the first plan for that key, like the paged backend's. Its
         static buffers are fixed for its lifetime, so they are sized off the
-        config's per-request ceilings and the bucket — NOT off this first
-        plan's ``num_rows``, which is only one of the layouts the bucket will
-        replay.
+        config's segment ceiling at the bucket's batch size
+        (``max_segments_for``) and the bucket's token count — NOT off this
+        first plan's ``num_rows``, which is only one of the layouts the bucket
+        will replay.
         """
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)

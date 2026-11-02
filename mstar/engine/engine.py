@@ -24,7 +24,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
-from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
+from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -54,6 +54,7 @@ from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
+    ARNodeSubmodule,
     BatchedModelOutput,
     BatchedStopCheck,
     ChunkingPolicy,
@@ -103,6 +104,26 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 # stops, and it was a quarter of the gpu thread's host time at batch 32.
 _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
+
+
+@contextmanager
+def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
+    """Hold the caching allocator to ``gpu_memory_fraction`` while a node that
+    asks for cuDNN's algorithm search (``capture_cudnn_benchmark``) is sized.
+    The search tries workspaces as large as the device has free, and the
+    allocator keeps them until sizing's ``empty_cache``, past the share a
+    co-located worker plans around. A try past the cap fails and cuDNN
+    skips that algorithm. Any other allocation past it fails too, so the
+    boot fails when the node's eager step does not fit in the share."""
+    if fraction is None or not submodule_mgmt.submodule.capture_cudnn_benchmark:
+        yield
+        return
+    previous = torch.cuda.get_per_process_memory_fraction(device)
+    torch.cuda.set_per_process_memory_fraction(fraction, device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_per_process_memory_fraction(previous, device)
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -647,13 +668,11 @@ class Engine:
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
-            if getattr(submodule, "reads_device_loopback", False):
+            loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
+            if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
-                # reads them back on the device (see NodeSubmodule)
-                for resource in resources.values():
-                    enable = getattr(resource, "enable_device_loopback_reader", None)
-                    if enable is not None:
-                        enable()
+                # reads them back on the device (see DeviceLoopback)
+                resources[loopback.sampler].enable_device_loopback_reader()
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -710,11 +729,45 @@ class Engine:
                     node_name, exc_info=True
                 )
 
+    def _compile_regions(self) -> None:
+        """Compile and warm each node's ``compile_regions`` with dynamic=True
+        (a whole-forward compile uses dynamic=None) in torch.compile's default
+        mode: the compile level (``MSTAR_COMPILE_LEVEL``) tunes captured
+        forwards, whose shapes are fixed per bucket."""
+        if not self.device_capability.is_available:
+            return
+        for node_name, submodule_mgmt in self._submodules.items():
+            submodule = submodule_mgmt.submodule
+            regions = submodule.compile_regions()
+            if regions and not submodule.disable_torch_compile:
+                raise ValueError(
+                    f"{node_name} declares compile_regions but its forward is compiled whole; "
+                    "set disable_torch_compile"
+                )
+            for path, examples in regions.items():
+                owner_path, _, name = path.rpartition(".")
+                owner = submodule
+                for part in filter(None, owner_path.split(".")):
+                    owner = getattr(owner, part)
+                target = getattr(owner, name)
+                if isinstance(target, torch.nn.Module):
+                    owner, name, target = target, "forward", target.forward
+                # an instance attribute shadows the method for every caller
+                setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
+                with torch.no_grad(), fp32_precision_scope(submodule_mgmt.fp32_precision), autocast_scope(
+                    self._autocast_dtype_for(node_name), self._device.type, node_name,
+                ):
+                    for args in examples:
+                        getattr(owner, name)(*args)
+                logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
+
     def _autocast_dtype_for(self, node_name: str) -> torch.dtype | None:
         """This node's resolved dtype, or None for one that opted out."""
         return self._submodules[node_name].node_dtype
 
     def warmup(self) -> None:
+        # before capture: a region inside a captured graph compiles in its warm-up
+        self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
@@ -815,8 +868,11 @@ class Engine:
             """A plan over what ``size`` says each runner's buckets cost."""
             pools: dict[str, dict] = {}
             for node_name, submodule_mgmt in self._submodules.items():
-                # sizing runs the forwards and captures, so under the node's precision too
-                with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                # sizing runs the forwards and captures, so under the node's precision too,
+                # and it runs a node's only warm-up forwards, where cuDNN can time its convs
+                with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                        _search_cap(submodule_mgmt, self._gpu_memory_fraction, self._device), \
+                        cudnn_benchmark(submodule_mgmt.submodule.capture_cudnn_benchmark):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
@@ -2456,10 +2512,13 @@ class Engine:
 
     def splits_by_capture_key(self, node_name: str, graph_walk: str) -> bool:
         """Whether ``capture_group`` can tell this walk's requests apart: the
-        submodule opts in and the walk has a capture."""
+        submodule opts in and the node captures, the walk's whole forward or
+        any piecewise region (a region is not tied to a walk)."""
         submodule_mgmt = self._submodules[node_name]
         if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
             return False
+        if submodule_mgmt.piecewise_runners:
+            return True
         cg_runner = submodule_mgmt.accelerator_graph_runner
         return cg_runner is not None and cg_runner.captures_walk(graph_walk)
 
@@ -2470,19 +2529,17 @@ class Engine:
     ) -> Any | None:
         """The capture bucket this one request would replay, by
         ``cg_key_info``; None when the walk has no capture or the submodule
-        does not split by it.
+        does not split by it. On a node whose only capture is a piecewise
+        region it is a scheduler group, not a bucket.
 
         A batch spanning two groups matches no capture and runs eager, so the
         scheduler batches each group on its own when the submodule opts in
         (``split_batches_by_capture_key``). ``input_metadata`` is the step's
         input facts the lease will see, e.g. the stream chunk it consumes.
         """
+        if not self.splits_by_capture_key(node_name, graph_walk):
+            return None
         submodule_mgmt = self._submodules[node_name]
-        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
-            return None
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        if cg_runner is None or not cg_runner.captures_walk(graph_walk):
-            return None
         if input_metadata is None:
             return submodule_mgmt.submodule.cg_key_info(graph_walk, {request_id: request_info})
         return submodule_mgmt.submodule.cg_key_info(

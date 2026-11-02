@@ -151,6 +151,19 @@ Communication
        ``PIN_MAX_MB x num_entities`` — a consumer pins peer segments too,
        so one process can pin more than its own arena holds. Segments
        past the budget stay unpinned: copies work, without async overlap.
+   * - ``MSTAR_SHM_ARENA_GATHER_MAX_BYTES``
+     - ``16384``
+     - Largest item (bytes) a consumer gathers with others of the same
+       shape, dtype and segment into one pinned buffer and one H2D copy,
+       instead of a copy per item (``_read_many_from_arena``). The default
+       is the crossover measured on an H200 host; ``0`` disables the
+       gather. Read in ``ArenaShmCommunicationManager.__init__``.
+   * - ``MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES``
+     - ``512``
+     - Up to this item size (bytes, 8-byte aligned) the gather indexes
+       8-byte words in one pass; larger items are copied one slice each.
+       Measured on an H200 host. Read in
+       ``ArenaShmCommunicationManager.__init__``.
    * - ``MSTAR_SHM_ARENA_SLOT_TTL_S``
      - ``0``
      - TTL backstop for abort-orphaned slots (a request aborted after
@@ -640,7 +653,7 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
        Whisper, which also keeps its timestamp rule state in the sampler's
        declared loop-back state) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
@@ -648,11 +661,11 @@ Worker scheduling
        master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
-     - A captured step of a text walk (Qwen3.5 decode, text prefill and
-       mixed) builds its rotary tables inside the graph from the position
-       resource's planned positions instead of building them before the
-       replay (``LLMSubmodule._rope_in_graph``). Experiment knob, measured
-       and gated on its own.
+     - A captured Qwen3.5 text prefill or mixed step builds its rotary tables
+       inside the graph from the position resource's planned positions instead
+       of building them before the replay (``LLMSubmodule._rope_in_graph``); a
+       captured decode step always does. Experiment knob, measured and gated
+       on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``1``
      - The captured sampler gathers its RNG offsets from the slot masters

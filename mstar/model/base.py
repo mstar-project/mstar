@@ -571,6 +571,14 @@ class Model(ABC):
     # the model's config.yaml overrides either. See
     # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
+    # ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt``
+    # may run for several requests at once. The data worker then prepares
+    # requests on a pool (``CpuPlan.prepare_workers`` at this process's intra-op
+    # thread count; ``preprocess_workers`` in the model's config.yaml overrides
+    # it) and still hands them to the
+    # conductor in arrival order. Declare it only once those calls are checked
+    # for shared state, and for the GIL: work that holds it gains nothing here.
+    PREPROCESS_PARALLEL: bool = False
 
     def _get_worker_graphs_for_graph_walk(
         self,
@@ -887,7 +895,7 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features``, ``audio_seqlens`` from the
+        ``image_grid_thw``, ``audio_features`` from the
         raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
@@ -941,11 +949,7 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
-        try:
-            img = read_image(filepath, rgb=True)
-        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
-            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
-        img = img.to(device).float().div_(255.0)  # CxHxW
+        img = read_image(filepath, rgb=True).to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 

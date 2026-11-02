@@ -331,7 +331,7 @@ def section_solve(s3gen: S3Gen, ests: Estimators, ref: ReferenceConditioning, n_
 
 def _solve_inputs(s3gen: S3Gen, rows: list[FlowRow]):
     """Mirror of the tensor set-up in ``S3Gen.tokens_to_mel_rows`` up to the solve."""
-    from mstar.model.chatterbox.components.s3gen_flow import lengths_to_mask
+    from mstar.model.components.masking import length_mask
 
     ratio = s3gen.config.token_mel_ratio
     lookahead = s3gen.config.encoder.pre_lookahead_len * ratio
@@ -354,7 +354,7 @@ def _solve_inputs(s3gen: S3Gen, rows: list[FlowRow]):
         valid = int(h_lens[i])
         cond[i, :, :mel_prompt] = ref.prompt_feat[0].transpose(0, 1)
         noise[i, :, :valid] = s3gen._draw_noise(1, mel_prompt, valid - mel_prompt, row.generator)[0]
-    mask = lengths_to_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
+    mask = length_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
     return mu, mask, spk, cond, noise
 
 
