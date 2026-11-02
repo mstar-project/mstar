@@ -10,6 +10,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
+from mstar.engine.resources.kv.manager import SpanCursor
 from mstar.model.base import LabelLayout
 from mstar.model.submodule_base import InputMetadata
 
@@ -98,7 +99,7 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     )
 
     cfg = model.config
-    images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
+    images = [torch.rand(3, 480, 640) for modality in input_modalities if modality == "image"]
     out = model.process_prompt(prompt, input_modalities, output_modalities, tensors={"image_inputs": images}, **kwargs)
     tensors = {"text_inputs": out.new_input_tensors.get("text_inputs", []),
                "image_inputs": out.new_input_tensors.get("image_inputs", images)}
@@ -218,6 +219,29 @@ def test_bagel_peaks_at_its_footprint_on_every_label(
 
     held = pool.held(1)
     assert all(peak == footprint for peak, footprint in held.values()), f"(peak, footprint) by label: {held}"
+
+
+_BAGEL_STEPS = {
+    **{name: _BAGEL_RUNS[name] for name in ("understanding an image", "text to image, think", "an edit")},
+    "understanding two adjacent images": (["image", "image", "text"], ["text"], {}, "What is this?"),
+}
+
+
+@pytest.mark.parametrize(
+    ("input_modalities", "output_modalities", "kwargs", "prompt"), _BAGEL_STEPS.values(), ids=_BAGEL_STEPS,
+)
+def test_bagel_runs_a_walk_for_each_span_of_its_layout(
+    input_modalities, output_modalities, kwargs, prompt, _bagel_checks,
+):
+    config, _, walks = _bagel_request(_bagel_checks, prompt, input_modalities, output_modalities, kwargs)
+    spans = config.kv_layout["main"].spans
+    cursor = SpanCursor(spans)
+
+    for walk, rows in walks[:len(spans)]:
+        assert [span.length for span in cursor.next_step(walk)] == [rows], (
+            "the lookup of a walk would sum other slots than the walk writes, and drop the layout"
+        )
+        cursor.done += 1
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])

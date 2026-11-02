@@ -169,9 +169,11 @@ class SpanCursor:
 
     def next_step(self, walk: str) -> tuple[PrefixSpan, ...]:
         """The spans from ``done`` on that one step of ``walk`` writes: a row can
-        hold several, text around an attachment, in layout order."""
+        hold several, text around an attachment, up to the next span that opens a step."""
         end = self.done
-        while end < len(self.spans) and self.spans[end].walk == walk:
+        while end < len(self.spans) and self.spans[end].walk == walk and (
+            end == self.done or not self.spans[end].opens_step
+        ):
             end += 1
         return self.spans[self.done:end]
 

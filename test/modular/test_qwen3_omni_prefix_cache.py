@@ -11,6 +11,8 @@ from torch import nn
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
+from mstar.engine.resources.kv.config import PrefixSpan
+from mstar.engine.resources.kv.manager import SpanCursor
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
@@ -273,6 +275,53 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
     )
+
+
+def _image(height: int = 64) -> torch.Tensor:
+    return torch.rand(3, height, 96)
+
+
+_VIDEO_INPUTS = {"input_metadata": {"video_inputs": [{"video_sample_fps": 2.0}]}}
+_STEPS = {
+    "two images back to back": (["image", "image", "text"], {"image_inputs": [_image(), _image(128)]}, {}, [2, 2]),
+    "image, text, image, text": (
+        ["image", "text", "image", "text"], {"image_inputs": [_image(), _image(128)]}, {}, [2, 3],
+    ),
+    "three images": (["image", "image", "image", "text"], {"image_inputs": [_image()] * 3}, {}, [2, 1, 2]),
+    "image, video, text": (
+        ["image", "video", "text"], {"image_inputs": [_image()], "video_inputs": [torch.zeros(4, 3, 64, 96)]},
+        _VIDEO_INPUTS, [2, 2],
+    ),
+    "image, audio, text": (
+        ["image", "audio", "text"], {"image_inputs": [_image()], "audio_inputs": [torch.zeros(16000)]}, {}, [2, 2],
+    ),
+}
+
+
+def _row_length(model, walk: str, entry: dict) -> int:
+    """What the Thinker's row writes for a schedule entry: its text and its attachment with two sentinels."""
+    text = sum(len(ids) for ids in entry["text_inputs"])
+    if walk == "prefill_audio":
+        return text + model.config.audio_encoder.tokens_for_frames(entry["audio_features"].shape[-1]) + 2
+    return text + int(entry["image_grid_thw"].prod()) // model.config.vision.spatial_merge_size ** 2 + 2
+
+
+@pytest.mark.parametrize(("modalities", "tensors", "kwargs", "steps"), _STEPS.values(), ids=_STEPS.keys())
+def test_the_layout_says_where_each_step_the_schedule_runs_ends(model, modalities, tensors, kwargs, steps):
+    out = _prompt(model, modalities, tensors, **kwargs)
+    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+    schedule = model._build_thinker_prefill_schedule(modalities, out.new_input_tensors)
+    cursor = SpanCursor(tuple(PrefixSpan(*row) for row in layout.row()[0]))
+
+    assert len(schedule) == len(steps)
+    for (walk, entry), count in zip(schedule, steps, strict=True):
+        step = cursor.next_step(walk)
+        assert len(step) == count, f"{walk} would look up {len(step)} spans where its step writes {count}"
+        assert sum(span.length for span in step) == _row_length(model, walk, entry), (
+            "the lookup would sum other slots than the row writes, and drop the layout"
+        )
+        cursor.done += len(step)
+    assert cursor.done == len(layout.spans)
 
 
 def test_a_step_writes_its_talker_rows_as_one_span(model):

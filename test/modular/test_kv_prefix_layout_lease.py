@@ -14,6 +14,7 @@ the cache keeps a copy of the page up to the image's end for a repeat to reuse.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -61,13 +62,20 @@ def _walks(parts: list) -> list[tuple[str, int]]:
     ]
 
 
-def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK, decode: int = 0) -> KVReqConfig:
-    """What the preprocess worker sends for ``parts``, keyed by its own code."""
+def _config(
+    parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK, decode: int = 0, opens: tuple | None = None,
+) -> KVReqConfig:
+    """What the preprocess worker sends for ``parts``, keyed by its own code. ``opens``
+    holds the indices of the parts that open a step, by default every part."""
     layouts = {"kv": {"main": LabelLayout(spans=tuple(
-        Span("ids", text_walk, slots, slots, "text_inputs") if isinstance(part, list)
+        Span("ids", text_walk, slots, slots, "text_inputs", opens_step=opens is None or i in opens)
+        if isinstance(part, list)
         # The span's source holds the digest itself, which the stand-in `_digest` returns.
-        else Span("digest", image_walk, slots, 1, part[1] if isinstance(part, tuple) else DIGEST)
-        for part, (_, slots) in zip(parts, _walks(parts), strict=True)
+        else Span(
+            "digest", image_walk, slots, 1, part[1] if isinstance(part, tuple) else DIGEST,
+            opens_step=opens is None or i in opens,
+        )
+        for i, (part, (_, slots)) in enumerate(zip(parts, _walks(parts), strict=True))
     ), growth=(("decode_loop", 1),))}}
     walks = (text_walk, image_walk)
     worker = SimpleNamespace(
@@ -173,10 +181,10 @@ def _one_row(parts: list = PARTS) -> tuple[_Node, int]:
     node = _Node.__new__(_Node)
     _TextNode.__init__(node)
     node.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((IMAGE_WALK,), ("decode",))})
-    node.runner.ingest_request("seed", {"kv": _config(parts, text_walk=IMAGE_WALK)})
+    node.runner.ingest_request("seed", {"kv": _config(parts, text_walk=IMAGE_WALK, opens=(0,))})
     length = sum(slots for _, slots in _walks(parts))
     node.step("seed", length, IMAGE_WALK)
-    node.runner.ingest_request(RID, {"kv": _config(parts, text_walk=IMAGE_WALK)})
+    node.runner.ingest_request(RID, {"kv": _config(parts, text_walk=IMAGE_WALK, opens=(0,))})
     return node, length
 
 
@@ -202,7 +210,10 @@ def test_a_partly_served_row_leaves_the_counter_where_its_own_positions_start():
 
 def test_a_whole_row_the_cache_holds_moves_the_counter_past_its_spans():
     # the prompt's last token always runs, so a whole row is one a later walk follows
-    spans = (PrefixSpan(10, 10, IMAGE_WALK), PrefixSpan(22, 1, IMAGE_WALK, digest=DIGEST), PrefixSpan(5, 5, TEXT_WALK))
+    spans = (
+        PrefixSpan(10, 10, IMAGE_WALK), PrefixSpan(22, 1, IMAGE_WALK, digest=DIGEST, opens_step=False),
+        PrefixSpan(5, 5, TEXT_WALK),
+    )
     cursor = SpanCursor(spans)
     step = cursor.next_step(IMAGE_WALK)
 
@@ -224,6 +235,108 @@ def test_a_row_may_place_its_own_positions_though_it_opens_with_text():
     row = ARNodeInputs(input_seq_len=length, custom_pos_ids=torch.zeros(3, length))
 
     assert node.runner.resolve_cached_prefix(RID, NODE, IMAGE_WALK, row).tokens == 4 * PAGE_SIZE
+
+
+# Two images of one walk, a step each: text and the first image, then text, the second image and text.
+BETWEEN = list(range(60, 65))
+OTHER_DIGEST = bytes(range(1, 33))
+TWO_IMAGES = [TEXT, (IMAGE, DIGEST), BETWEEN, (IMAGE, OTHER_DIGEST), TAIL]
+TWO_STEPS = (len(TEXT) + IMAGE, len(BETWEEN) + IMAGE + len(TAIL))
+
+
+def _two_steps(seeded: list = TWO_IMAGES, parts: list = TWO_IMAGES) -> _Node:
+    """A request of two steps of one walk, after an earlier request ran both steps of ``seeded``."""
+    node = _Node.__new__(_Node)
+    _TextNode.__init__(node)
+    node.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((IMAGE_WALK,), ("decode",))})
+    node.runner.ingest_request("seed", {"kv": _config(seeded, text_walk=IMAGE_WALK, opens=(0, 2))})
+    for length in TWO_STEPS:
+        node.step("seed", length, IMAGE_WALK)
+    node.runner.ingest_request(RID, {"kv": _config(parts, text_walk=IMAGE_WALK, opens=(0, 2))})
+    return node
+
+
+def test_a_repeat_of_two_steps_of_one_walk_is_served_from_the_cache(caplog):
+    node = _two_steps()
+
+    first, second = (node.walk(IMAGE_WALK, length) for length in TWO_STEPS)
+
+    held = 6 * PAGE_SIZE  # every whole page but the last, which the prompt's final token has to run in
+    assert (first, second) == (TWO_STEPS[0], held - TWO_STEPS[0]), (
+        "the first step should be served whole and the second from the lease's end"
+    )
+    assert node.stream.chain is not None and "its chain ends here" not in caplog.text
+    assert node.stream.stored_len == sum(TWO_STEPS)
+    assert node.stream.span_cursor.done == len(TWO_IMAGES)
+
+
+def test_the_counter_stands_past_a_served_step_when_the_next_one_reads_it():
+    node = _two_steps()
+
+    node.walk(IMAGE_WALK, TWO_STEPS[0])
+
+    assert node.rope.position(RID, "main") == len(TEXT) + 1, "an image moves it by its advance, not its slots"
+    assert node.probe(IMAGE_WALK, TWO_STEPS[1]).position == len(TEXT) + 1, (
+        "a partly served row places its own positions from where the step before it ended"
+    )
+
+
+def test_two_steps_are_served_no_further_than_the_image_they_share():
+    other_second = [TEXT, (IMAGE, DIGEST), BETWEEN, (IMAGE, bytes(range(2, 34))), TAIL]
+    node = _two_steps(parts=other_second)
+
+    first, second = (node.walk(IMAGE_WALK, length) for length in TWO_STEPS)
+
+    assert (first, second) == (TWO_STEPS[0], 0), "another image's KV would have served the second step"
+
+
+def test_consecutive_spans_of_one_walk_with_no_mark_are_a_step_each():
+    # as BAGEL lays out two adjacent images, which run a walk each
+    parts = [TEXT, (IMAGE, DIGEST), (IMAGE, OTHER_DIGEST), TAIL]
+    node = _Node(parts)
+
+    answers = [node.walk(walk, length) for walk, length in _walks(parts)]
+
+    assert answers == [len(TEXT), IMAGE, IMAGE, 6 * PAGE_SIZE - len(TEXT) - 2 * IMAGE], (
+        "two adjacent items would be summed against one walk's row, and the layout dropped"
+    )
+    assert node.stream.chain is not None
+
+
+def test_windows_past_the_keyed_spans_are_never_looked_up(caplog):
+    # as Cosmos3 chains its windows: keyed text, then rows of one walk, a step each
+    node = _Node.__new__(_Node)
+    _TextNode.__init__(node)
+    node.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK,), ("decode",))})
+    config = _config([TEXT])
+    layout = config.kv_layout["main"]
+    windows = (PrefixSpan(8, 8, IMAGE_WALK), PrefixSpan(8, 8, IMAGE_WALK))
+    config.kv_layout["main"] = replace(layout, spans=(*layout.spans, *windows))
+    node.runner.ingest_request(RID, {"kv": config})
+
+    served = [node.walk(TEXT_WALK, len(TEXT)), *(node.walk(IMAGE_WALK, span.length) for span in windows)]
+
+    assert served == [0, 0, 0] and "its chain ends here" not in caplog.text
+    assert node.stream.stored_len == len(TEXT) + 16
+
+
+def test_a_row_of_the_older_forms_parses_and_opens_a_step():
+    config = KVReqConfig()
+    config.apply_conductor_config(
+        kv_layout={"main": [[[5, 5, IMAGE_WALK, 0], [7, 1, IMAGE_WALK, 0, DIGEST, b"end"]], [], 0, None, 2]},
+    )
+    spans = config.kv_layout["main"].spans
+
+    assert [span.opens_step for span in spans] == [True, True]
+    assert (spans[1].digest, spans[1].end_key) == (DIGEST, b"end")
+    assert SpanCursor(spans).next_step(IMAGE_WALK) == spans[:1]
+
+
+def test_the_mark_reaches_the_manager_on_a_keyed_span():
+    spans = _config(TWO_IMAGES, text_walk=IMAGE_WALK, opens=(0, 2)).kv_layout["main"].spans
+
+    assert [span.opens_step for span in spans] == [True, False, True, False, False]
+    assert [span.digest for span in spans] == [None, DIGEST, None, OTHER_DIGEST, None]
 
 
 _DISAGREEING = {

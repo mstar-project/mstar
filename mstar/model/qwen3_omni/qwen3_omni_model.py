@@ -1415,7 +1415,7 @@ class Qwen3OmniModel(Model):
                 advance = int(positions.max()) + 2 - position
                 span = Span("digest", walk, rows, advance, ("video", step.index))
                 kept = rows
-            thinker.append(span)
+            thinker.append(span._replace(opens_step=new_step))
             if new_step:
                 talker_rows.append(0)
             talker_rows[-1] += kept

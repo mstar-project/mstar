@@ -172,9 +172,10 @@ class ClientChunk(NamedTuple):
 
 
 class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write,
-    and consecutive spans of one walk are one row of one step, as text around an
-    attachment is.
+    """One write to a KV stream. A layout lists them in the order the walks write.
+
+    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
+    the span before it then writes it too, in the same row, as text around an attachment is.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
@@ -192,6 +193,7 @@ class Span(NamedTuple):
     source: str | tuple[str, int]
     params: tuple = ()
     scratch: int = 0
+    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -216,8 +218,9 @@ class LabelLayout(NamedTuple):
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
-        wire's msgpack path."""
+        ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
+        request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
+        worker keys the span."""
         for span in self.spans:
             if span.kind not in ("ids", "digest", "rows"):
                 raise ValueError(f"a span of kind {span.kind!r}")
@@ -228,7 +231,7 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step] for span in self.spans],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
