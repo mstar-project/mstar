@@ -32,7 +32,7 @@ from run_parity import DEVICE, bind_resources, drive, open_request  # noqa: E402
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import StepRunner  # noqa: E402
-from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel  # noqa: E402
+from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, ROLLOUT_WALK  # noqa: E402
 
 PROMPT = "A quiet suburban street on a clear afternoon, the camera driving slowly forward."
@@ -100,11 +100,13 @@ def main():
     ap.add_argument("--image")
     ap.add_argument("--resource-overrides", default="{}", help="JSON: resource key -> apply_yaml_overrides kwargs")
     ap.add_argument("--solo-only", action="store_true", help="skip the interleaved pair (a one-slot deployment)")
+    ap.add_argument("--reference-numerics", action="store_true",
+                    help="REFERENCE_MODEL_KWARGS: FA2 attention and an eager DiT; needs flash-attn")
     args = ap.parse_args()
     import json
 
     image_path = args.image or hf_hub_download("nvidia/Cosmos3-Edge", "assets/edge_action_id_av_0_output.png")
-    model = LingBotWorldModel()
+    model = LingBotWorldModel(**(REFERENCE_MODEL_KWARGS if args.reference_numerics else {}))
     cfg = model.config
     cs = cfg.chunk_size
     num_frames = (args.chunks * cs - 1) * 4 + 1
