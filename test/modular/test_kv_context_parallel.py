@@ -781,6 +781,9 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
     (dict(backend=AttnBackend.DENSE), "backend 'dense'"),
     # its decode lse base isn't known
     (dict(flashinfer_backend="cudnn"), "flashinfer_backend 'cudnn'"),
+    # only FlashInfer's paged manager plans a ring
+    (dict(mla=True, shard=SequenceShard(("main",), 0, None, 0, CommGroup.trivial()), sp_exchange="ring"),
+     "sp_exchange 'ring' on backend 'flashinfer_mla'"),
 ])
 def test_attention_a_placed_pool_cannot_serve_is_refused_at_build(attention, refused):
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())

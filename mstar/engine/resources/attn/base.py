@@ -296,6 +296,12 @@ class AttentionManager(AttentionResource):
                 # before it degrades to FlashInfer on some hosts, so a config loads on none
                 (f"backend {backend.value!r}", backend == AttnBackend.DENSE),
                 (f"flashinfer_backend {flashinfer_backend!r}", flashinfer_backend not in lse_known),
+                # only FlashInfer's paged manager plans a ring (`FlashInferManager._ring_wrapper`); dense is
+                # refused above
+                (
+                    f"sp_exchange 'ring' on backend {backend.value!r}",
+                    spec.split_exchange == "ring" and backend not in (AttnBackend.FLASHINFER, AttnBackend.DENSE),
+                ),
             ) if refused]
             if unsupported:
                 raise ValueError(
