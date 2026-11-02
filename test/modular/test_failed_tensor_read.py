@@ -598,7 +598,9 @@ def test_a_failed_submit_keeps_the_buffers_for_good(engine, failure, when):
     assert isinstance(error, AsyncReadError) and "submit failed" in str(error)
     assert error.unknown == {ptrs[1]}
     mgr.get_ready_tensors()
+    assert mgr.has_inflight_reads("bad")
     mgr.force_cleanup_request("bad")
+    assert not mgr.has_inflight_reads("bad")
     for _ in range(3):
         mgr.get_ready_tensors()
     assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
@@ -621,7 +623,7 @@ def test_an_unknown_status_keeps_the_buffers_for_good(engine):
     engine.report(src[1].data_ptr(), 7)
     mgr.get_ready_tensors()
     mgr.get_ready_tensors()
-    assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
+    assert _kept(mgr) == ptrs and _never_freed(mgr) == ptrs
     assert [r for _, r, _ in engine.polls].count(src[1].data_ptr()) == 1
     assert engine.unregistered == []
 
@@ -632,6 +634,71 @@ def test_an_unknown_status_keeps_the_buffers_for_good(engine):
     assert "unknown status 9" in str(error) and error.unknown == set(reader_ptrs)
     mgr.get_ready_tensors()
     assert _never_freed(mgr) == ptrs + reader_ptrs
+
+
+@pytest.mark.parametrize("where", ["submit", "reader", "manager"])
+@pytest.mark.parametrize("bookkeeper", ["python", "rust"])
+def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkeeper):
+    """Losing a transfer's status must not authorize freeing its source.
+
+    Forced removal clears its handle association, but keeps its destination
+    buffers pinned; reusing that handle must not inherit the old drain.
+    """
+    from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping, TensorStore
+    from mstar.worker.rid_table import RidTable
+    from mstar.worker.worker import Worker
+
+    bookkeeping = PythonTensorBookkeeping
+    if bookkeeper == "rust":
+        pytest.importorskip("mstar_rust")
+        bookkeeping = RustTensorBookkeeping
+    table = RidTable()
+    table.intern("other")
+    rid = table.intern("request")
+    mgr = engine.manager()
+    mgr.tensor_store = TensorStore(bookkeeping=bookkeeping())
+    mgr.rid_to_str = table.name
+    src = _sources(2 if where == "manager" else 1)
+    if where == "manager":
+        engine.plan = {src[0].data_ptr(): [[-1]], src[1].data_ptr(): [[0]]}
+    else:
+        engine.plan = {src[0].data_ptr(): ["submit-fails"] if where == "submit" else [[9]]}
+    future, ptrs = _start(mgr, rid, src)
+    assert future.exception(timeout=5) is not None
+    mgr.get_ready_tensors()
+    if where == "manager":
+        engine.report(src[1].data_ptr(), 9)
+        mgr.get_ready_tensors()
+
+    worker = Worker.__new__(Worker)
+    worker.worker_id = "receiver"
+    worker._graph_runtime = SimpleNamespace(get_rid_handle=table.handle)
+    worker.tensor_manager = mgr
+    worker.communicator = mgr.communicator
+    worker._draining_rids = {"request"}
+    worker._reads_done_sent = set()
+    worker.scheduler = SimpleNamespace(pending_tp_follow_count={})
+    for _ in range(3):
+        mgr.get_ready_tensors()
+        worker._complete_drain_if_ready("request")
+        assert mgr.has_inflight_reads(rid)
+        assert mgr.inflight_read_rids([rid]) == frozenset({rid})
+        assert not worker._reads_done_sent
+    assert _never_freed(mgr) == ptrs
+
+    mgr.force_cleanup_request(rid)
+    table.release(rid)
+    assert table.intern("next") == rid
+    mgr.get_ready_tensors()
+    assert not mgr.has_inflight_reads(rid)
+    assert mgr.inflight_read_rids([rid]) == frozenset()
+    assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
+    assert engine.unregistered == []
+    worker._draining_rids = {"next"}
+    worker._complete_drain_if_ready("next")
+    [(entity, ack)] = mgr.communicator.sent
+    assert entity == "conductor" and ack.message_type == ConductorMessageType.READS_DONE
+    assert ack.body.request_id == "next"
 
 
 def test_buffers_whose_unregister_fails_are_kept(engine):
@@ -645,6 +712,7 @@ def test_buffers_whose_unregister_fails_are_kept(engine):
     mgr.get_ready_tensors()
     assert engine.unregistered == ptrs
     assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
+    assert not mgr.has_inflight_reads("a"), "an unregister failure does not restart a stopped transfer"
 
 
 @pytest.mark.parametrize("hcas, outcome", [(1, "read"), (0, "failed")])
