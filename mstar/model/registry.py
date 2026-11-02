@@ -23,6 +23,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
     "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "minicpm_o": ("mstar.model.minicpm_o.minicpm_o_model", "MiniCPMOModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
     "omnilingual_asr_ctc_1b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
@@ -191,6 +192,8 @@ HF_MODELS: dict[str, dict] = {
     # ASR-benchmark checkpoint. ``whisper_large_v3_turbo`` is the 4-decoder-
     # layer distillation that serves the same encoder several times faster.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # MiniCPM-o 4.5: Qwen3-8B over SigLIP image slices and Whisper audio, half-duplex chat.
+    "minicpm_o": {"model_path_hf": "openbmb/MiniCPM-o-4_5"},
     "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
     # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
     # FLUX.1 VAE), text-to-image only. Apache-2.0.

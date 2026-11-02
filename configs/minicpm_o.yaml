@@ -1,0 +1,7 @@
+model: "minicpm_o"
+max_seq_len: 16384
+node_groups:
+  # The encoders run once per request and then idle, so they share the
+  # LLM's GPU (the whole checkpoint is ~19 GB in bf16).
+  - node_names: [LLM, vision_encoder, audio_encoder]
+    ranks: [0]
