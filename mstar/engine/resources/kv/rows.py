@@ -169,6 +169,7 @@ class KVRows(RowFills):
         and left it with the stream, so the admit of the step that runs
         reserves nothing, yet the row has never been given the page."""
         order = rows.order
+        idx = rows.diff.idx
         page_size = self.page_size
         for label, (lens_buf, pages) in self.labels.items():
             lens = rows.mirror(lens_buf)[:len(order)]
@@ -183,7 +184,7 @@ class KVRows(RowFills):
                 first = int(lens[i]) // page_size
                 if first >= self.max_pages:
                     raise ValueError(f"a row of {label} grows past its {self.max_pages} pages")
-                slots.append(rows.slot_of(rid))
+                slots.append(int(idx[i]))
                 at.append(first)
                 # admit gave the stream this page; an IndexError here is a step admitted without it
                 values.append(streams[rid][label].page_indices[first])

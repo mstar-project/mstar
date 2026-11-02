@@ -1,6 +1,7 @@
 import functools
 import itertools
 import logging
+import operator
 import os
 import threading
 from collections import Counter
@@ -75,6 +76,8 @@ from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_ca
 from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
+
+_RID, _LABEL, _SPAN = (operator.itemgetter(i) for i in range(3))  # Segment's fields
 
 # Off by default: `assert_pages_conserved` walks every stream of every live
 # request after each admit, commit, reset and remove, and after each change to
@@ -2673,9 +2676,9 @@ class KVManager(AttentionResource):
         out = {}
         for label, segments in by_label.items():
             n = len(segments)
-            if any(seg.span != 1 for seg in segments) or [
-                seg.request_id for seg in segments[:len(order)]
-            ] != list(order):
+            if any(map((1).__ne__, map(_SPAN, segments))) or list(
+                map(_RID, segments[:len(order)])
+            ) != order:
                 raise ValueError(
                     f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} must "
                     "compute one token a row, in row order"
@@ -2718,7 +2721,14 @@ class KVManager(AttentionResource):
                 f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} takes "
                 "no forks, sink rows, combined labels, eager writes or retention"
             )
-        by_label = group_by_plan_label(step.segments, {})
+        if len(kv_rows.labels) == 1:
+            # the usual walk: one label, so the step's segments in order are its group
+            (only,) = kv_rows.labels
+            segments = list(step.segments)
+            labels = set(map(_LABEL, segments))
+            by_label = {only: segments} if labels == {only} else {label: [] for label in labels}
+        else:
+            by_label = group_by_plan_label(step.segments, {})
         if by_label.keys() != kv_rows.labels.keys():
             raise ValueError(
                 f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} carries "
