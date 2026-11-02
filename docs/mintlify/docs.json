@@ -1,0 +1,42 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "M*",
+  "description": "A disaggregated, any-to-any multimodal inference engine.",
+  "colors": {
+    "primary": "#7B61FF",
+    "light": "#A78BFA",
+    "dark": "#7B61FF"
+  },
+  "logo": {
+    "light": "/images/mstar-logo.svg",
+    "dark": "/images/mstar-logo.svg"
+  },
+  "favicon": "/images/mstar-logo.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "pages": ["index", "installation", "quickstart"]
+      },
+      {
+        "group": "Understand M*",
+        "pages": ["architecture"]
+      },
+      {
+        "group": "Guides and reference",
+        "pages": ["reference"]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      { "label": "GitHub", "href": "https://github.com/mstar-project/mstar" }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/mstar-project/mstar"
+    }
+  }
+}
