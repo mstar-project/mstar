@@ -18,7 +18,9 @@ tensor manager's per-request state (including ChunkingManagement.prepared, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
 RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
 _leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
-_admit_snaps} (purged by remove_request), and WorkerProfileInfo.
+_admit_snaps} (purged by remove_request), PersistentBatch.{_order, _slot_of,
+_forgotten} (forgotten by Engine.remove_request, released at the walk's next
+step; a reused handle rejoins fresh), and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

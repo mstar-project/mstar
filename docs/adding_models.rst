@@ -2014,8 +2014,9 @@ writes joining rows, ``check_in`` reads leaving rows back (host state in an
 ``released`` frees what a removed request's row held. The base
 ``RowState()`` keeps nothing. While planning, a resource writes the step's
 changes through ``ctx.rows`` (``write_at``, ``advance``). A pre-planned step
-is planned again at exec with the same ``ctx.rows``, so write on one of the
-two passes (``ctx.is_preplan``).
+is planned again at exec, with the same ``ctx.rows`` or, if the pre-plan was
+dropped, a fresh one, so write on the exec pass, or on both when the write
+repeats the same values (``advance`` refuses a second call for a buffer).
 
 The engine refuses the walk at startup if a resource returns None (the
 default), the walk has no batch cap, the node is tensor- or
