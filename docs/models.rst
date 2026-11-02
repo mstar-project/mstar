@@ -651,6 +651,9 @@ Qwen3-TTS notes
   reference's 0.9%. It raises ``model_kwargs: {talker_max_batch: 64}`` on AMD
   GPUs: above the Talker's default 32 rows decode splits into half-batches
   that take turns, and a step costs most of its time whatever its rows.
+  It also captures the codec at 12 and 24 windows
+  (``codec_capture_batch_sizes``), since a padded row costs the conv stack what
+  a real one does.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
