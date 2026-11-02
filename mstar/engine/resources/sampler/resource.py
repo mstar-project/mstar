@@ -548,9 +548,12 @@ class SamplerResource(Resource):
 
     def _check_rows_take_no_prompt(self, step: SamplerStep, ctx: StepContext) -> None:
         # a held row's mask is the live one, so tokens added to the request's
-        # would be overwritten when the row leaves
+        # would be overwritten when the row leaves. A cached prefix left over
+        # from before any penalty went live matters only to a request it penalises.
+        configs = self._sampler._sampling_config
         if any(not ctx.is_padding_row(rid) for rid in step.prefill_tracked_tokens) or any(
-            rid in self._cached_prefix for rid in ctx.request_ids
+            rid in self._cached_prefix and rid in self._penalty_rids and configs[rid].penalize_prompt
+            for rid in ctx.request_ids
         ):
             raise RuntimeError(
                 f"walk {ctx.graph_walk!r} keeps persistent rows, which hold the seen-token "

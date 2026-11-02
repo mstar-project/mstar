@@ -9,6 +9,7 @@ draws differently. (FlashInfer draws every row from row 0's seed and offset,
 so a request's offset shows whenever it lands in row 0.)
 """
 import random
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
+from mstar.engine.resources.base import CachedPrefix  # noqa: E402
 from mstar.engine.resources.sampler.config import (  # noqa: E402
     SAMPLED_LOGPROB,
     LoopbackState,
@@ -384,3 +386,19 @@ def test_rows_report_the_log_probs_their_requests_asked_for():
             else:
                 want = torch.log_softmax(logits[rid].float(), -1)[seen[rid][0]]
                 torch.testing.assert_close(rows[i], want, rtol=1e-3, atol=1e-3)
+
+
+def test_a_cached_prefix_bars_rows_only_from_a_request_it_penalises():
+    """A prefix-cache hit kept while no penalty was live is folded into the
+    request's own mask, which its row would overwrite; that matters only to a
+    request that penalises its prompt."""
+    engine = _engine(penalty=True)
+    sampler = engine._resources["sampler"]
+    hit = (SimpleNamespace(input_ids=torch.arange(3, device="cuda")), CachedPrefix("main", 3, 3))
+    engine.add_request(0, {"sampler": _config(0, 1)})
+    sampler.apply_cached_prefix(0, NODE, OTHER_WALK, *hit)
+    engine.add_request(1, {"sampler": _config(1, 1, penalty=4.0)})
+    _step(engine, ROWS_WALK, [0, 1])
+    sampler.apply_cached_prefix(1, NODE, OTHER_WALK, *hit)
+    with pytest.raises(RuntimeError, match="can't add prompt tokens to penalise"):
+        _step(engine, ROWS_WALK, [0, 1])
