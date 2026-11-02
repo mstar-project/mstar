@@ -36,7 +36,7 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource, build_reso
 from mstar.engine.resources.context_parallel import ContextParallel, ZigzagWrapper, merge, zigzag_rows, zigzag_share
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import KVCache
+from mstar.engine.resources.kv.cache import KVCache, _kv_scatter_nhd_eager
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
@@ -444,35 +444,40 @@ def _plan(attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, sha
 
 class _PlacedKV:
     """The KV resource an attention over a placed pool binds, and its ``AttentionCallable`` writes
-    through: one layer holding ``case``'s stored context, the step's slots NaN until written, each
-    token addressed as ``KVManager.write_kv`` addresses a placed pool (``write_slots``)."""
+    through: one layer holding ``case``'s stored context, the step's slots NaN until written.
+    ``write_kv`` is ``KVManager``'s own, over a plan addressing each step token as a placed
+    pool's does (``write_slots``) and the cache's own scatter."""
+
+    write_kv = KVManager.write_kv
 
     def __init__(self, placement, case: _Case):
-        self.placement, self.default_label, self._shard = placement, "main", None
+        self.placement, self._sequence_shard = placement, None
+        self._default_label, self._default_layer_idx, self._layer_group = "main", 0, [0]
         self.cache = case.cache(placement, stored_only=True)
         logical = [(view.page_idxs[pos // CP_PAGE], pos % CP_PAGE) for view in case.plan["main"].views
                    for pos in range(view.length - view.to_compute, view.length)]
         pages, offsets = placement.write_slots(*(np.array(a) for a in zip(*logical, strict=True)))
-        self.page, self.slot = (torch.as_tensor(a, dtype=torch.long, device=case.q.device) for a in (pages, offsets))
+        page, slot = (torch.as_tensor(a, dtype=torch.long, device=case.q.device) for a in (pages, offsets))
+        self._current_plan_states = {("main", 0): types.SimpleNamespace(
+            ready=None, token_to_page=page, token_to_cache=slot, total_tokens=len(logical),
+        )}
+        self.kv_cache = types.SimpleNamespace(
+            write_tokens=lambda layer_idx, k, v, page_idx, cache_idx: _kv_scatter_nhd_eager(
+                self.cache, k, v, page_idx, cache_idx,
+            ),
+        )
 
     def bind_sequence_shard(self, shard):
-        self._shard = shard
+        self._sequence_shard = shard
 
     def set_default_label(self, label):
-        self.default_label = label
+        self._default_label = label
 
     def set_default_layer_idx(self, layer_idx):
         assert layer_idx == 0
 
     def layer_view(self):
         return self.cache
-
-    def write_kv(self, k, v, label=None, tokens=None):
-        if self._shard is not None:
-            self._shard.check_bypass(label or self.default_label, "KV write_kv")
-        page, slot = (self.page[: k.shape[0]], self.slot[: k.shape[0]]) if tokens is None \
-            else (self.page[tokens], self.slot[tokens])
-        self.cache[page, 0, slot], self.cache[page, 1, slot] = k, v
 
 
 def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False, causal=True, split=None):

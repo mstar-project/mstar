@@ -334,8 +334,6 @@ def test_the_thinkers_cache_stays_open_under_a_sequence_shard(size, sp_exchange)
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
     model.config = Qwen3OmniModelConfig()
     specs = model.get_node_resources()
-    if not any(isinstance(spec, SeqShardSpec) for spec in specs):
-        specs.append(SeqShardSpec("thinker_shard", {"Thinker"}, ("main",), 0))
     apply_yaml_overrides(specs, {"resources": {
         THINKER_KV: {"context_parallel": True, "prefix_cache_tp": True}, THINKER_ATTN: {"sp_exchange": sp_exchange},
     }})
