@@ -166,13 +166,14 @@ You must implement these abstract methods:
    (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
    once, then repeats the decode walk until EOS.
 
-``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
+``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
    weights here, on ``device``. Return ``None`` for dummy mode.
 
-   ``tp_group`` and ``sp_group`` are the node's tensor-parallel and sequence-parallel
-   communicators when the node is sharded. Pass ``tp_group`` to the parallel-linear
-   constructors. See :ref:`Step 6 <tensor-parallelism>`.
+   ``tp_group`` is the node's tensor-parallel communicator when the node is sharded. Pass
+   it to the parallel-linear constructors. See :ref:`Step 6 <tensor-parallelism>`. A node on
+   sequence-parallel ranks gets no communicator: its resources run the exchanges (see
+   **Sequence and context parallelism** under `Tuning resources per deployment`_).
 
    ``moe_parallel`` is the node group's ``ep_config``, parsed into a
    ``MoeParallelConfig``. It is passed only to an EP-enabled node whose group sets one,
@@ -705,18 +706,17 @@ The spec types are:
        default, ``RaggedAttnBackend.FLASHINFER``, or ``RaggedAttnBackend.DENSE``),
        ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` and
-       ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
-       ``workspace_mb``. ``DENSE`` runs FA3
+       ``max_tokens_per_request``, ``compile_op`` and ``workspace_mb``. ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
-       missing. By default the heads are split across all TP × SP ranks of the node;
-       ``shard_over_sp=False`` splits them across the TP ranks only, for an attention
-       each sequence-parallel rank runs whole over its own tokens (one over a
-       replicated stream, or a cross-attention from the rank's query shard).
+       missing. The heads are split across the node's TP ranks.
        ``workspace_mb`` sizes each label's FlashInfer workspace per slot (default
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512); a node with many labels can declare less,
-       since a ragged prefill only uses it for split-KV partials. ``compile_op``,
-       ``shard_over_sp`` and ``workspace_mb`` are the model's declaration; the serving
-       config's ``resources:`` overrides take only the backends and the two ceilings.
+       since a ragged prefill only uses it for split-KV partials. The spec's
+       ``sp_exchange="ulysses"`` attends a label the node's sequence shard splits by
+       Ulysses, splitting the heads over TP × SP (see **Sequence and context
+       parallelism**). ``compile_op``, ``workspace_mb`` and ``sp_exchange`` are the
+       model's declaration; the serving config's ``resources:`` overrides take only the
+       backends and the two ceilings.
        See `Cacheless attention (encoder towers)`_ for ``compile_op``.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
@@ -765,6 +765,12 @@ The spec types are:
        no saved state (a request's first step, or a padding row) reads ``start``, zeros
        when none is given. ``gather`` / ``scatter_`` need the sink, so leave
        ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
+   * - ``SeqShardSpec(labels=..., axis=..., walks=None)``
+     - Whether a step's tokens split over the node's sequence-parallel ranks, and each
+       listed label's per-rank ranges. ``declare_step`` gives every step of the node a
+       ``SeqShardStep``, and the model brackets its layer stack with the resource's
+       ``scatter`` / ``gather``. See **Sequence and context parallelism** under
+       `Tuning resources per deployment`_.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -1004,9 +1010,10 @@ LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
 Called with ``return_lse=True``, a ragged or ragged cross-attention resource's ``run`` on the
 FlashInfer backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32,
 natural log) from the same plan, which is what merging attentions over disjoint key sets
-needs; a compiled caller breaks there even with ``compile_op``. Under sequence parallelism
-LTX-2.5's audio queries attend each rank's share of the video tokens, and ``gather_merge``
-(``mstar/engine/resources/context_parallel.py``, the merge context parallelism uses) merges them.
+needs; a compiled caller breaks there even with ``compile_op``. A label exchanged over SP ranks
+on its step can't return one, and on SP ranks every label of an ``sp_exchange`` resource is, copied
+steps included: on a split step the resource merges the partials itself (LTX-2.5's audio queries
+over each rank's share of the video tokens, merged by ``gather_merge``).
 
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1569,15 +1576,6 @@ buffer and commit persists it, so the step must list the name in
 ``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.
 
-.. warning::
-
-   Where the callable is passed into a traced function, create one ``AttentionCallable``
-   per transformer, not one per layer. Dynamo specializes ``ulysses_attention`` on the
-   identity of its ``run_attention`` argument. A per-layer callable therefore retraces
-   that frame once per layer and exceeds the recompile limit. The shared ``Attention``
-   layer creates one callable per layer. That is safe only because the callable is never
-   passed into a traced function.
-
 Loading weights
 ~~~~~~~~~~~~~~~
 
@@ -2066,11 +2064,98 @@ that a misspelled setting is never silently ignored:
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
        ``max_tokens_per_request``. The two ceilings size CUDA-graph buckets, which is a
        memory-against-coverage trade the deployment makes, not the model.
+   * - ``SeqShardSpec``
+     - ``min_tokens`` (see **Sequence and context parallelism** below)
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
 ``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
 ``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
+
+**Sequence and context parallelism.** A node's ``sp_size`` ranks share each of its steps, along
+two axes:
+
+1. **Per step, the tokens are split or copied.** A ``SeqShardSpec`` on the node decides, every step:
+   split, each rank runs the token-local layers (norms, MLPs, projections) on its contiguous share
+   of each listed label; or copied, every rank runs them all. Without one, every step is copied.
+2. **Per paged KV pool, stored K/V is split by head or by position.** By head (the default) over the
+   node's ``tp * sp`` ranks; by position with ``context_parallel: true`` (below), heads over TP.
+
+Each attention resource derives what it does from the two, and the model writes no exchange:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Tokens / storage
+     - By head
+     - By position (``context_parallel``)
+     - Cacheless (ragged)
+   * - Copied
+     - head slice: this rank's heads of q, k and v, write and attend, gather the heads
+     - each rank attends its slots, partials merged (below)
+     - heads over TP; with ``sp_exchange``, a head slice
+   * - Split
+     - Ulysses: one all-to-all from split tokens to split heads, write and attend, one back
+     - refused at load for now
+     - ``sp_exchange="ulysses"``: Ulysses; without it, refused at plan
+   * - Cross, split queries
+     - n/a
+     - n/a
+     - each rank's queries over every key
+   * - Cross, split keys
+     - n/a
+     - n/a
+     - each rank's partial over its keys, merged by log-sum-exp (``gather_merge``)
+   * - Cross, both split
+     - n/a
+     - n/a
+     - refused at plan
+
+Splitting is declared in four places:
+
+- ``SeqShardSpec(resource_key, nodes, labels, axis, walks=None)`` names the labels whose tokens
+  split. ``axis=0`` cuts a label's packed tokens into contiguous ranges; ``axis=1`` cuts each row
+  of a ``[B, S, ...]`` layout alike (every row of the label one length). ``walks`` limits splitting
+  to those walks; the others plan copied. A step splits only when it isn't one token a row, its
+  listed tokens reach ``max(sp_size, min_tokens)``, and every listed label has at least
+  ``sp_size`` tokens (a row, on axis 1). ``min_tokens`` (default 0) is a ``resources:`` override,
+  a deployment's trade between the exchanges' cost and the split layers' saving. A captured step
+  decides from its bucket's size, not its prompt's, so capture and replay split alike. Declare
+  the spec over every node of the attention resources that depend on it: a resource spanning
+  nodes the shard doesn't cover is refused.
+- **Every** ``declare_step`` branch of the node puts a ``SeqShardStep`` in its step, at any SP size
+  (at one rank its plan is a constant); the attention resources refuse a step without one, so a
+  forgotten branch fails on one GPU. ``SubmoduleStep(segments=...)`` fills its segments. A step
+  whose KV plan combines labels (``KVStep(combined_labels=...)``) gives the shard step the same
+  mapping, so the combined label gets a range too.
+- The forward **brackets** its layer stack: ``shard.scatter(label, *xs, dim=None)`` before it
+  (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
+  ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
+  outside a step (a warmup compile); at one rank they trace straight through a compiled frame,
+  and on SP ranks each breaks the graph once. Everything between them runs on this rank's tokens.
+  LTX-2.5 brackets the DiT in its denoise step (``mstar/model/ltx2_5/submodules.py``); Cosmos3
+  brackets the generation layer stack after its whole-sequence prologue
+  (``mstar/model/cosmos3/components/transformer.py``).
+- The attention is reached through the resource: a paged attention through ``AttentionCallable``
+  (``q=None`` writes K/V alone), a ragged one through its ``run``. A layer that writes through
+  ``write_target`` or calls ``attn.run`` itself on a split label raises, since it would treat this
+  rank's share as the whole step. A cacheless self-attention that may see split tokens declares
+  ``RaggedAttentionSpec(..., sp_exchange="ulysses")``; it is a no-op on a node with no
+  ``SeqShardSpec``, so one declaration serves every deployment shape.
+
+Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
+the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
+sampler); recurrent state doesn't, so a splitting node can't own any. The engine and the conductor
+also refuse, before a worker starts: a node on SP ranks that neither declares a ``SeqShardSpec``
+nor places its pools by position; a shard with no attention that can take split tokens; a
+pool stored by position (``context_parallel``) on a node that splits its steps, not yet supported; a
+head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size``; a ragged
+``sp_exchange`` whose heads don't divide by ``tp * sp``; a ragged cross-attention under a shard on
+axis 0 (a packed split can leave a rank none of a row); expert
+parallelism; piecewise captures; a capture replayed under listed and unlisted walks; and a packed
+capture of a listed walk unless the shard lists one label on axis 0 (its padding joins that
+label). The load log prints each splitting node's resolved strategies.
 
 **Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
 over the ranks that would otherwise store the same KV heads: slot ``s`` lives on partner
@@ -2083,11 +2168,10 @@ page. Attention runs on each rank's slots and merges the partials across the par
   the KV heads. They are the contiguous blocks ``kv_head_replicas``
   (``mstar/distributed/utils.py``) gives, as ``QKVParallelLinear`` loads them; a model that
   shards K and V itself must match. Each layer exchanges queries and partials over the TP group.
-- **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone
-  and the node loads without its SP group, so every layer but attention runs replicated across
-  SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
-  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials.
-  Chunked prefill stays off on SP ranks, so SP mode prefills a prompt in one step.
+- **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone.
+  Without a ``SeqShardSpec`` every layer but attention runs copied across SP; prefer TP mode
+  where it applies. Every paged pool of the node must set the key. Each layer all-gathers the
+  partials. Chunked prefill stays off on SP ranks, so SP mode prefills a prompt in one step.
 
 A page's tokens (``page_size``, 128 when it is unset) must be divisible by ``P``; the conductor
 checks these rules against ``node_groups`` before it starts a worker. ``max_num_pages`` counts

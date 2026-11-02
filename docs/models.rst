@@ -1426,13 +1426,16 @@ Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
-half the tokens, and only the video self-attention exchanges them (one all-to-all
-each way); the cross-attentions run on each rank's own tokens, and the audio queries
-over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
-weights instead and all-reduces after every block's attentions and feed-forwards.
+``ltx2_5_sp2`` splits each step's video tokens over the two ranks (the DiT's sequence
+shard): each rank holds the whole DiT and half the tokens, and only the video
+self-attention exchanges them (Ulysses, one all-to-all each way); the cross-attentions
+run on each rank's own tokens, and the audio queries over the video merge the ranks'
+partial attentions. The attention resources do the exchanges, so it needs
+``attention_backend: flashinfer`` (``sdpa`` is refused on SP ranks). ``ltx2_5_tp2`` shards
+the weights instead and all-reduces after every block's attentions and feed-forwards.
 
-Performance (2x H100, warm; diffusers with the same recipe and seeds):
+Performance (2x H100, warm; diffusers with the same recipe and seeds; the ``ltx2_5_sp2`` column
+was measured before the exchanges moved into the attention resources):
 
 ======================================  ================  ================  ================
                                         diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
