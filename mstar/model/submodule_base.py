@@ -1106,6 +1106,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return frozenset()
 
+    def counted_loops(self, graph_walk: str) -> Mapping[str, int | None]:
+        """Loops around this node in ``graph_walk`` that must run an exact
+        number of iterations, because the node indexes a per-request schedule
+        by the loop's count: loop name -> that number, or None when each
+        request picks its own, which the model then declares as the loop's cap
+        (``Model.get_loop_caps``). Startup refuses a fixed count that isn't the
+        loop's ``max_iters``, and a per-request one the model doesn't cap.
+        Empty by default."""
+        del graph_walk
+        return {}
+
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         """Output signals whose client-facing value is one scalar per row that
         the stop check already copies to the host, as signal name -> the name

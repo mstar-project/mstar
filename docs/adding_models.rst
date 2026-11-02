@@ -2621,8 +2621,9 @@ batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
 the graph — and asks the model for the hooks below. The loop ends on its iteration count:
 a model whose request picks its step count returns it from ``get_loop_caps``
 (``{"denoise_loop": steps}``), resolved exactly as ``schedule_for`` resolves it, and a
-stage that always runs its graph ``max_iters`` declares nothing. The scaffold refuses an
-iteration past the schedule. The hooks:
+stage whose schedule has a fixed length returns it from ``counted_loops(graph_walk)``,
+which must equal the loop's ``max_iters``. Startup refuses a model that does neither.
+The hooks:
 
 .. code-block:: python
 

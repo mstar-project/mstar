@@ -53,7 +53,7 @@ Every attention in the DiT should go through a ragged resource, so the model get
 
 ## Ending the loop
 
-The loop ends on its iteration count. A model whose request picks its step count declares it as the loop's cap in `get_loop_caps` (z_image, flux2_klein); the loop then completes after that iteration and neither graph runtime speculates past it. A model whose stage always runs its graph `max_iters` declares no cap (ltx2_5: caps are keyed by loop name, and its two stages share one). The conductor refuses a cap below 1 or above the loop's `max_iters`.
+The loop ends on its iteration count. A model whose request picks its step count declares it as the loop's cap in `get_loop_caps` (z_image, flux2_klein); the loop then completes after that iteration and neither graph runtime speculates past it. A model whose stage always runs its graph `max_iters` declares no cap and returns the stage's fixed step count from `counted_loops(graph_walk)` (ltx2_5: caps are keyed by loop name, and its two stages share one). Worker startup refuses a scaffold loop that is neither capped nor has `max_iters` equal to its fixed count, so a model that forgets the cap fails to start rather than failing its first request. The conductor refuses a cap below 1 or above the loop's `max_iters`.
 
 ## State
 

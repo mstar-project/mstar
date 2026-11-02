@@ -22,7 +22,8 @@ Conventions the base fixes:
 * The loop ends on its iteration count: a model whose request picks its own
   step count declares it as the loop's cap (``Model.get_loop_caps``), so the
   loop completes after that iteration and the async worker never speculates
-  past it.
+  past it. A subclass whose schedule has a fixed length per walk says so in
+  :meth:`~DenoiseLoopSubmodule.counted_loops`, and startup checks either.
 
 * The loop-back edges are :attr:`~DenoiseLoopSubmodule.loop_back_names`
   (``latents`` plus whatever ``SOLVER_STATE`` a multi-step scheduler carries);
@@ -293,6 +294,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """Derived per-key state (e.g. rotary tables); cached by :meth:`layout`."""
         return None
 
+    def counted_loops(self, graph_walk: str) -> Mapping[str, int | None]:
+        """Default: each request's schedule picks its own step count, so the model
+        caps the loop at it. A subclass whose schedule length is fixed per walk
+        returns that length instead."""
+        del graph_walk
+        return {self.loop_name: None}
+
     def attention_segments(self, bucket_key: Hashable) -> Sequence[tuple[str, int]]:
         """``(label, span)`` for every span one request's layers attend over, in
         declaration order. Default: one ``"main"`` segment of all its tokens."""
@@ -372,7 +380,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if k >= state["schedule"].num_steps:
             raise RuntimeError(
                 f"{type(self).__name__}: iteration {k} is past request {fwd_info.request_id}'s "
-                f"{state['schedule'].num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
+                f"{state['schedule'].num_steps} steps; the loop's cap (Model.get_loop_caps) or max_iters "
+                f"must be its step count"
             )
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
