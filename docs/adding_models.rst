@@ -616,6 +616,12 @@ The spec types are:
        reserved or released per step. ``attend`` takes an optional per-distance score
        term (``rel_bias``) for relative-position attention. Float32 by default (Triton
        kernels). See `Bounded (sink + window) caches`_.
+   * - ``RollingKVSpec(config=RollingKVConfig(...))``
+     - Per-request sink + window K/V kept compacted in stream order, in regions of a pool
+       reserved at startup (``pool_tokens``), with no attention of its own: a step writes its
+       tokens with ``write`` and hands ``window`` (one contiguous range) to whatever attention
+       the model runs, a ragged one say. For long chunks where that kernel's speed matters (a
+       causal video DiT). See `Rolling (compacted) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
@@ -1070,6 +1076,36 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 compute in it. The streaming FastConformer (``encoder_kv_config`` in
 ``mstar/model/components/fastconformer_stream.py``, Nemotron VoiceChat's ``ENCODER_KV``) is
 the per-query example.
+
+Rolling (compacted) caches
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
+earlier chunks (Self-Forcing's rolling cache; LingBot-World's ``DIT_KV``) declares a
+``RollingKVSpec``. Its chunks are thousands of queries over tens of thousands of keys, so
+the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
+streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
+store therefore runs no attention: it keeps the stream's first ``sink`` tokens and its last
+``window`` (the step's included) in stream order, shifting the window left behind the sink
+when a step would overflow, so a step's keys are always one contiguous slice.
+
+Each step declares its rows' ``RollingPosition(written, sink, window)`` in tokens
+(``RollingKVStep``), so the retention can follow a request's own geometry. ``plan`` applies
+the shift, once per step even when planned twice; the model then calls ``write(layer, k, v)``
+(as often as its denoise loop rewrites the chunk; the last write stays) and attends
+``window(layer)`` with its own kernel.
+
+The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. The model declares
+each request's size by returning ``RollingKVReqConfig(tokens=sink + window)`` from
+``get_request_resource_configs``; a request it declares nothing for fails at its first step.
+A request waits in the engine's admission queue, in arrival order, until the pool has its
+room, which is then set aside for it, and one larger than the whole pool is a 400 at the
+conductor. Its first step takes a contiguous region of exactly that size (first fit), given
+back when the request ends, so requests of different sizes share the pool instead of each
+holding the largest. When no free gap holds a new request but the free tokens do, the
+resident regions slide left to join the gaps, a copy of what they hold, between steps. How
+many requests run at once is the deployment's ``max_concurrent_requests``, not the store's. A step that declares this store
+runs eager (no capture yet), and it does not shard across ranks yet.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -2053,6 +2089,8 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``RollingKVSpec``
+     - ``pool_tokens``
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**)
    * - ``AttentionSpec``

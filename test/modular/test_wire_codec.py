@@ -343,6 +343,21 @@ def test_none_in_a_field_with_a_non_none_default_survives():
     assert out.top_p == 1
 
 
+def test_a_rolling_kv_request_config_crosses_the_wire_typed():
+    from mstar.communication.wire import _encoder
+    from mstar.engine.resources.kv.rolling import RollingKVReqConfig
+
+    assert _encoder(RollingKVReqConfig).__name__ == "_encode_dataclass"
+    fi = _fwd_info()
+    fi.resource_configs = {"dit_kv": RollingKVReqConfig(tokens=27144)}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p",
+                          request_info=fi, inputs=[]),
+    )
+    assert roundtrip(msg).body.request_info.resource_configs == {"dit_kv": RollingKVReqConfig(tokens=27144)}
+
+
 def test_non_mstar_types_are_refused_rather_than_imported_from_the_wire():
     from dataclasses import dataclass
 

@@ -30,10 +30,11 @@ two attentions are whatever ``DitAttention`` the caller hands it: served, the
 engine's ragged attention resource; without one, the reference's FA2 varlen
 (``REFERENCE_ATTENTION``), with which the forward is bit-identical to the
 reference's on the same inputs. The other differences from the reference are
-structural only: batch 1 without the list
-wrapping, the cache indices kept as Python ints instead of 1-element device
-tensors read back with ``.item()``, and one index computation per forward
-instead of one per layer (every layer sees the same indices).
+structural only: batch 1 without the list wrapping, and the rolling K/V held
+by the engine's rolling KV store, which keeps the reference's layout (sink,
+then the latest window, compacted by the same shift-left eviction) with its
+indices planned once per step on the host instead of per layer from
+1-element device tensors read back with ``.item()``.
 
 ``wan22.components.dit`` is not reused: it is the diffusers layout and its
 numerics (explicit ``type_as`` casts, SDPA, fp32-island weights) are the
@@ -42,8 +43,7 @@ diffusers pipeline's, not this checkpoint's reference.
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -164,116 +164,60 @@ class WanLayerNorm(nn.LayerNorm):
         return super().forward(x.float()).type_as(x)
 
 
-@dataclass
-class RollingKVCache:
-    """Per-request self-attention K/V for every layer: ``capacity`` tokens
-    (``local_attn_size`` latent frames, or the whole rollout when -1), the
-    first ``sink_tokens`` never evicted. ``global_end`` is the absolute token
-    the stream has reached, ``local_end`` where it sits in the buffer.
-
-    Eviction is the reference's: when a forward past the frontier would
-    overflow the buffer, the tokens behind the sink shift left by the overflow
-    and the new chunk lands at the end. A forward that re-writes the current
-    chunk (the denoise steps, then the commit) overwrites it in place.
-    """
-
-    k: list[torch.Tensor]
-    v: list[torch.Tensor]
-    sink_tokens: int
-    windowed: bool
-    global_end: int = 0
-    local_end: int = 0
-    cross_k: list[torch.Tensor] = field(default_factory=list)
-    cross_v: list[torch.Tensor] = field(default_factory=list)
-
-    @classmethod
-    def allocate(
-        cls, num_layers: int, capacity: int, num_heads: int, head_dim: int,
-        sink_tokens: int, windowed: bool, device, dtype=torch.bfloat16,
-    ) -> "RollingKVCache":
-        shape = (1, capacity, num_heads, head_dim)
-        return cls(
-            k=[torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)],
-            v=[torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)],
-            sink_tokens=sink_tokens,
-            windowed=windowed,
-        )
-
-    @property
-    def capacity(self) -> int:
-        return self.k[0].shape[1]
-
-    def plan(self, current_start: int, num_new: int) -> "_WritePlan":
-        current_end = current_start + num_new
-        if not self.windowed:
-            return _WritePlan(current_start, current_end, 0, 0, current_end)
-        if current_end > self.global_end and num_new + self.local_end > self.capacity:
-            evicted = num_new + self.local_end - self.capacity
-            rolled = self.local_end - evicted - self.sink_tokens
-            local_end = self.local_end + current_end - self.global_end - evicted
-        else:
-            evicted = rolled = 0
-            local_end = self.local_end + current_end - self.global_end
-        return _WritePlan(local_end - num_new, local_end, evicted, rolled, current_end)
-
-    def window(self, plan: "_WritePlan") -> slice:
-        """The buffer tokens a forward under ``plan`` attends: the sink and
-        the latest window, ending with the chunk it writes."""
-        return slice(max(0, plan.local_end - self.capacity), plan.local_end)
-
-    def write(self, layer: int, k: torch.Tensor, v: torch.Tensor, plan: "_WritePlan") -> None:
-        """Apply ``plan`` to one layer: shift the tokens behind the sink left by
-        the eviction, then write the chunk's ``[1, L, H, D]`` K/V."""
-        self.write_layer(self.k[layer], self.v[layer], k, v, plan)
-
-    def write_layer(
-        self, k_cache: torch.Tensor, v_cache: torch.Tensor, k: torch.Tensor, v: torch.Tensor, plan: "_WritePlan",
-    ) -> None:
-        if plan.evicted:
-            src = slice(self.sink_tokens + plan.evicted, self.sink_tokens + plan.evicted + plan.rolled)
-            dst = slice(self.sink_tokens, self.sink_tokens + plan.rolled)
-            k_cache[:, dst] = k_cache[:, src].clone()
-            v_cache[:, dst] = v_cache[:, src].clone()
-        k_cache[:, plan.local_start:plan.local_end] = k
-        v_cache[:, plan.local_start:plan.local_end] = v
-
-
-@dataclass(frozen=True)
-class _WritePlan:
-    local_start: int
-    local_end: int
-    evicted: int
-    rolled: int
-    current_end: int
-
-
 def attended_frames(config: LingBotWorldConfig, chunk: int) -> int:
     """Latent frames of rolling K/V that chunk ``chunk``'s queries attend, its
-    own included: what ``RollingKVCache.window`` spans once the chunk is written."""
+    own included: the sink and the latest window once the chunk is written."""
     frames = (chunk + 1) * config.chunk_size
     return min(frames, config.local_attn_size) if config.local_attn_size > -1 else frames
 
 
-class ChunkWindow:
-    """One chunk's window attention for every block: write the chunk's K/V
-    into a layer's rolling cache, then attend over the window. Eager inside a
-    compiled block, and handed to it as one object rather than as the plan's
-    integers: the cache offsets change chunk to chunk, and Dynamo guards on
-    integer arguments, so traced (or passed as ints) they would recompile
-    every block every chunk."""
+class WindowStore(Protocol):
+    """Where the rolling self-attention K/V live: the engine's rolling KV store
+    (``RollingKVManager``) when served, a scratch one at warmup. ``write`` puts
+    the chunk's ``[1, L, H, D]`` K/V in layer ``layer``; ``window`` returns
+    what the chunk attends there, the sink and the latest window ending with
+    the chunk, in stream order."""
 
-    def __init__(self, attend: Attend, cache: "RollingKVCache", plan: "_WritePlan"):
+    def write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None: ...
+
+    def window(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class ChunkOnlyStore:
+    """A ``WindowStore`` that keeps nothing: each layer attends the chunk alone,
+    as chunk 0 does. For tracing the compiled blocks at load."""
+
+    def __init__(self):
+        self._kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        self._kv[layer] = (k, v)
+
+    def window(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._kv[layer]
+
+
+class ChunkWindow:
+    """One forward's window attention, block after block: write the chunk's K/V
+    into the store at the next layer, then attend over that layer's window.
+    Eager inside a compiled block, and handed to it as one object that counts
+    the layers itself: Dynamo guards on integer arguments, so a layer index
+    passed in would recompile every block for every layer."""
+
+    def __init__(self, attend: Attend, store: WindowStore, num_layers: int):
         self.attend = attend
-        self.cache = cache
-        self.plan = plan
+        self.store = store
+        self.num_layers = num_layers
+        self.layer = 0
 
     @torch.compiler.disable
-    def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        self.cache.write_layer(*kv, k, v, self.plan)
-        window = self.cache.window(self.plan)
-        return self.attend(q, kv[0][:, window], kv[1][:, window])
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        layer = self.layer
+        if layer >= self.num_layers:
+            raise RuntimeError(f"ChunkWindow called past its {self.num_layers} layers in one forward")
+        self.layer += 1
+        self.store.write(layer, k, v)
+        return self.attend(q, *self.store.window(layer))
 
 
 class CausalSelfAttention(nn.Module):
@@ -288,16 +232,14 @@ class CausalSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps)
         self.norm_k = WanRMSNorm(dim, eps=eps)
 
-    def forward(
-        self, x: torch.Tensor, rope: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor], window: ChunkWindow,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope: torch.Tensor, window: ChunkWindow) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
         roped_query = causal_rope_apply(q, rope).type_as(v)
         roped_key = causal_rope_apply(k, rope).type_as(v)
-        x = window(roped_query, roped_key, v, kv)
+        x = window(roped_query, roped_key, v)
         return self.o(x.flatten(2))
 
 
@@ -349,12 +291,11 @@ class CausalBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, e: torch.Tensor, cam: tuple[torch.Tensor, torch.Tensor], cross_k: torch.Tensor,
-        cross_v: torch.Tensor, rope: torch.Tensor, kv: tuple[torch.Tensor, torch.Tensor], window: ChunkWindow,
-        text_attend: Attend,
+        cross_v: torch.Tensor, rope: torch.Tensor, window: ChunkWindow, text_attend: Attend,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), rope, kv, window)
+        y = self.self_attn(self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), rope, window)
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -419,7 +360,7 @@ class LingBotCausalDiT(nn.Module):
 
     def compile_blocks(self, autotune: bool = False, **compile_kwargs) -> None:
         """Compile each block's forward in place (``compile_utils.compile_blocks``:
-        deterministic unless ``autotune``). The cache write and window attention
+        deterministic unless ``autotune``). The K/V write and window attention
         (``ChunkWindow``) and a ragged text attention stay eager, so a block
         traces once for every chunk; the reference's text attention
         (``REFERENCE_ATTENTION``) is not disabled and compiles with the block."""
@@ -432,14 +373,15 @@ class LingBotCausalDiT(nn.Module):
             self._freqs[device] = self._freqs_cpu.to(device)
         return self._freqs[device]
 
-    def new_cache(self, frame_seqlen: int, total_latent_frames: int, device) -> RollingKVCache:
+    def text_kv(self, context: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Every block's cross-attention K/V for ``context`` ``[L, 4096]``, zero-padded
+        to ``text_len``: computed on a request's first chunk and reused for its rollout."""
         cfg = self.config
-        windowed = cfg.local_attn_size > -1
-        frames = cfg.local_attn_size if windowed else total_latent_frames
-        return RollingKVCache.allocate(
-            cfg.num_layers, frame_seqlen * frames, cfg.num_heads, cfg.head_dim,
-            sink_tokens=cfg.sink_size * frame_seqlen, windowed=windowed, device=device,
-        )
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+            padded = torch.cat([context, context.new_zeros(cfg.text_len - context.size(0), context.size(1))])
+            text = self.text_embedding(padded.unsqueeze(0))
+            kv = [block.cross_attn.text_kv(text) for block in self.blocks]
+        return [k for k, _ in kv], [v for _, v in kv]
 
     def chunk_conditioning(self, plucker: torch.Tensor, start_frame: int) -> ChunkConditioning:
         """``ChunkConditioning`` for a chunk's Plucker rays ``[1, 384, f, h, w]``
@@ -463,19 +405,19 @@ class LingBotCausalDiT(nn.Module):
             )
 
     def forward(
-        self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor, y: torch.Tensor,
-        chunk: ChunkConditioning, cache: RollingKVCache, current_start: int,
+        self, x: torch.Tensor, t: torch.Tensor, text_kv: tuple[list[torch.Tensor], list[torch.Tensor]],
+        y: torch.Tensor, chunk: ChunkConditioning, store: WindowStore,
         attention: DitAttention = REFERENCE_ATTENTION,
     ) -> torch.Tensor:
         """One chunk: ``x`` ``[16, f, h, w]`` fp32 noisy latents, ``t`` ``[1]``
-        timestep, ``context`` ``[L, 4096]`` text embeds, ``y`` ``[20, f, h, w]``
+        timestep, ``text_kv`` the request's ``text_kv``, ``y`` ``[20, f, h, w]``
         mask + image latent, ``chunk`` its ``chunk_conditioning``. Writes the
-        chunk's K/V at absolute token ``current_start``; returns the fp32 flow
-        prediction ``[16, f, h, w]``."""
+        chunk's K/V to ``store`` and attends its window there; returns the fp32
+        flow prediction ``[16, f, h, w]``."""
         with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-            return self._forward(x, t, context, y, chunk, cache, current_start, attention)
+            return self._forward(x, t, text_kv, y, chunk, store, attention)
 
-    def _forward(self, x, t, context, y, chunk, cache, current_start, attention):
+    def _forward(self, x, t, text_kv, y, chunk, store, attention):
         cfg = self.config
 
         x = self.patch_embedding(torch.cat([x, y], dim=0).unsqueeze(0))
@@ -498,22 +440,10 @@ class LingBotCausalDiT(nn.Module):
             # each block adding and scaling [L, 6, dim] fp32 tensors.
             e, e0 = e[:, :1], e0[:, :1]
 
-        if not cache.cross_k:
-            padded = torch.cat([context, context.new_zeros(cfg.text_len - context.size(0), context.size(1))])
-            text = self.text_embedding(padded.unsqueeze(0))
-            for block in self.blocks:
-                k, v = block.cross_attn.text_kv(text)
-                cache.cross_k.append(k)
-                cache.cross_v.append(v)
-
-        plan = cache.plan(current_start, seq_len)
-        window = ChunkWindow(attention.window, cache, plan)
+        cross_k, cross_v = text_kv
+        window = ChunkWindow(attention.window, store, len(self.blocks))
         for i, block in enumerate(self.blocks):
-            # the layer's buffers, not its index: a compiled block would guard on the int
-            x = block(x, e0, chunk.cam[i], cache.cross_k[i], cache.cross_v[i], chunk.rope,
-                      (cache.k[i], cache.v[i]), window, attention.text)
-        cache.global_end = plan.current_end
-        cache.local_end = plan.local_end
+            x = block(x, e0, chunk.cam[i], cross_k[i], cross_v[i], chunk.rope, window, attention.text)
 
         x = self.head(x, e)
         c = cfg.out_dim
