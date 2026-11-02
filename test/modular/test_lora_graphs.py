@@ -147,7 +147,7 @@ def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
         thread.join()
         return refused
 
-    with pytest.raises(RuntimeError, match="outside its node's planned step"):
+    with pytest.raises(RuntimeError, match="no planned step addressing its rows"):
         delta()
     for end in (pool.commit, pool.rollback_admit):
         s, c = P.step(["r"]), P.ctx(["r"])
@@ -158,6 +158,48 @@ def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
         end(s, c)
         with pytest.raises(RuntimeError, match="outside"):
             delta()
+
+
+class _Warmed(torch.nn.Module):
+    """A node whose ``fc`` the engine compiles and warms (``compile_regions``)."""
+
+    disable_torch_compile = True
+
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(4, 4, dtype=F64)
+
+    def compile_regions(self):
+        return {"fc": [(torch.ones(2, 4, dtype=F64),)]}
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(compiled, monkeypatch):
+    """The engine warms compile_regions (and warmup_compiles) outside any step: a bound
+    module there adds no delta, eager or traced, instead of refusing for want of a plan,
+    and the pool is left with none."""
+    from lora_module_helpers import pool as lora_pool
+    from lora_module_helpers import serve
+
+    from mstar.engine.engine import Engine
+    from mstar.model.components.lora.modules import bind_module_lora, module_lora_spec
+
+    real = torch.compile
+    monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
+                        else (lambda fn, **kw: fn))
+    torch._dynamo.reset()
+    with torch.device("meta"):
+        spec = module_lora_spec(_Warmed(), resource_key="lora", nodes={"N"}, root_path="")
+    node, pool = _Warmed(), lora_pool(serve(spec, {}))
+    bind_module_lora(node, {"lora": pool})
+    engine = object.__new__(Engine)
+    engine._device, engine._device_capability = CPU, SimpleNamespace(is_available=True)
+    engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None,
+                                               lora_pools=(pool,))}
+    engine._compile_regions()
+    assert pool._current is None and pool.active
+    with pytest.raises(RuntimeError, match="no plan"):
+        node.fc(torch.ones(2, 4, dtype=F64))
 
 
 # --- base-only captures ------------------------------------------------------------------
@@ -304,15 +346,17 @@ def test_a_base_only_step_launches_no_delta_captured_or_eager(adapters):
 
 
 def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapters):
-    """A region captured with LoRA plans its own rows (active), and its commit restores
-    the enclosing base-only step's state for the eager code after it."""
+    """A region whose capture records LoRA kernels plans its own rows (active), and its commit restores
+    the enclosing base-only step's state for the eager code after it. Past the step, and
+    past a region's capture (which plans outside any step), no plan is left: a delta
+    refuses, eager or compiled, rather than add a base-only skip or a capture's rows."""
     pool = LoraAdapterPool(P.make_spec(adapters[1]), "cpu", backend=(backend := _CountingBackend()))
     P.ingest(pool, "b", None)
     outer_s, outer_c = P.step(["b"]), P.ctx(["b"])
     assert pool.admit(outer_s, outer_c).ok
     pool.plan(outer_s, outer_c)
     assert not pool.active
-    region = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 4, "vision_block_loop"))
+    region = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 4, "backbone_layers"))
     rs = P.step(["b"], [4])
     rc = StepContext(request_ids=["b"], graph_walk=PIECEWISE_WALK, slot=0, capture=False, slot_lease=region)
     assert pool.admit(rs, rc).ok
@@ -320,6 +364,74 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
     assert pool.active
     pool.commit(rs, rc)
     assert not pool.active and not _delta_runs(pool, backend)
+    pool.commit(outer_s, outer_c)
+    delta = pool.layer_delta("qkv", 0)
+    x, y = torch.randn(4, P.HIDDEN, dtype=F64), torch.zeros(4, P.Q_OUT + 2 * P.KV_OUT, dtype=F64)
+
+    def layer(x, y):
+        return delta(x, y) * 2
+
+    torch._dynamo.reset()
+    compiled = torch.compile(layer, backend="eager")
+    with pytest.raises(RuntimeError, match="no plan"):
+        compiled(x, y)
+    cs, cc = P.step([-1], [4]), StepContext(
+        request_ids=[-1], graph_walk=PIECEWISE_WALK, slot=0, capture=True, slot_lease=region)
+    assert pool.admit(cs, cc).ok
+    pool.plan(cs, cc)
+    pool.commit(cs, cc)
+    for call in (delta, compiled):
+        with pytest.raises(RuntimeError, match="no plan"):
+            call(x, y)
+
+
+class _Attn(Resource):
+    build = None
+    force_double_buffer = False
+
+
+def _region_runner(pool, **config):
+    from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+
+    config = PiecewisePackedConfig(
+        capture_fn=lambda inp: inp.static_inputs["x"], make_static_inputs=lambda shape: {},
+        attn_key="attn", total_tokens=[8], **config,
+    )
+    # records the buckets the region claims buffers for, which it captures under
+    step_runner = SimpleNamespace(built=[])
+    step_runner.build_accelerator_graph_buffers = lambda specs, **kwargs: step_runner.built.extend(specs)
+    return PiecewiseAcceleratorGraphRunner(
+        label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
+        step_runner=step_runner,
+        device=CPU, autocast_dtype=None, num_slots=2, node_name="N", lora_keys=("lora",),
+    )
+
+
+def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_base_rows(adapters):
+    """A region's step carries the node's LoRA rows, laid out from its segments as the
+    node's are. A region replayed as one row per step, which addresses every row to the
+    first request's adapter, is captured base-only, recording no LoRA kernel, and leased
+    only for a step none of whose rows runs one; a step with one runs the region eagerly
+    under the node's step."""
+    pool = P.make_pool(adapters[1])
+    runner = _region_runner(pool, capture_batch_sizes=[2])
+    bucket = BucketKey(PIECEWISE_WALK, 2, 8, "N_region")
+    step = runner._declare(["r0", -5], [5, 3], bucket, capture=False, slot=0, real_bs=1)
+    assert step.steps["lora"].segments == (Segment("r0", "main", 5), Segment(-5, "main", 3))
+    assert runner.prepare_for_capture() and not runner.dropped_shapes
+
+    for rid, adapter in (("b0", None), ("b1", None), ("r1", "a1")):
+        P.ingest(pool, rid, adapter)
+    one_row = _region_runner(pool, capture_batch_sizes=[1], lease_before_step=True, one_row_per_step=True)
+    assert one_row.prepare_for_capture() and not one_row.dropped_shapes
+    assert {spec.bucket.cg_key_info for spec in runner._step_runner.built} == {"N_region"}
+    assert {spec.bucket.cg_key_info for spec in one_row._step_runner.built} == {LoraBaseOnly("N_region")}
+    assert one_row.can_lease([], ["b0", "b1"]) and not one_row.can_lease([], ["b0", "r1"])
+    # every row, not only the first one the replay names
+    with pytest.raises(RuntimeError, match="replays one row per step"):
+        one_row.run({}, request_ids=["b0", "r1"])
+    assert runner.can_lease([], ["b0", "r1"])
 
 
 def test_the_base_only_choice_is_the_same_on_every_rank(adapters):

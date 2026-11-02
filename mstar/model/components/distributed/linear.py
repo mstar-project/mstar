@@ -3,9 +3,30 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, split_tensor_along_last_dim
+from mstar.engine.resources.lora.config import LoraTarget
+from mstar.model.components.lora.capable import LoraBound, LoraCapable, apply_lora
 
 
-class ColumnParallelLinear(nn.Module):
+class _ColumnLora(LoraBound):
+    """A bound column-parallel linear: its delta on this rank's output columns, before
+    they are gathered."""
+
+    def forward(self, input_):
+        output_parallel = apply_lora(self.lora_delta, input_, self._local(input_))
+        return self._gather(output_parallel)
+
+
+class _RowLora(LoraBound):
+    """A bound row-parallel linear: its delta a partial sum over this rank's input
+    columns, like the base output, so before the all-reduce (or the caller's, with
+    ``reduce_results=False``)."""
+
+    def forward(self, input_):
+        input_parallel, output_parallel = self._local(input_)
+        return self._reduce(apply_lora(self.lora_delta, input_parallel, output_parallel))
+
+
+class ColumnParallelLinear(nn.Module, LoraCapable):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -16,6 +37,8 @@ class ColumnParallelLinear(nn.Module):
     computes its shard's part of the window, so the result does not depend on
     the TP size.
     """
+
+    lora_twin = _ColumnLora
 
     def __init__(
         self,
@@ -106,27 +129,33 @@ class ColumnParallelLinear(nn.Module):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, nn.Parameter | None]:
-        bias = self.bias if not self.skip_bias_add else None
+        return self._gather(self._local(input_))
 
-        # Matrix multiply.
+    def _local(self, input_) -> torch.Tensor:
+        """This rank's output columns."""
+        bias = self.bias if not self.skip_bias_add else None
         start = self._local_output_start
         if start:
-            output_parallel = torch.nn.functional.pad(
+            return torch.nn.functional.pad(
                 torch.nn.functional.linear(
                     input_, self.weight[start:], None if bias is None else bias[start:],
                 ),
                 (start, 0), value=float("-inf"),
             )
-        else:
-            output_parallel = torch.nn.functional.linear(input_, self.weight, bias)
+        return torch.nn.functional.linear(input_, self.weight, bias)
 
+    def _gather(self, output_parallel: torch.Tensor) -> torch.Tensor:
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
-            output = self.comm_group.all_gather(output_parallel, dim=-1)
-        else:
-            output = output_parallel
+            return self.comm_group.all_gather(output_parallel, dim=-1)
+        return output_parallel
 
-        return output
+    def lora_target(self) -> LoraTarget:
+        return LoraTarget(
+            in_features=self.input_size_per_partition,
+            out_slices=(self.output_size_per_partition * self.tp_size,),
+            parallel="column",
+        )
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -196,6 +225,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             f"dst {tuple(dst.shape)} vs src {tuple(src.shape)}"
         )
         dst.copy_(src)
+
+    def lora_target(self) -> LoraTarget:
+        # a slice per sub-shard, named by the index the stacked rules route by
+        return LoraTarget(
+            in_features=self.input_size_per_partition,
+            out_slices=tuple(self.output_sizes),
+            parallel="column",
+            slice_names=tuple(range(len(self.output_sizes))),
+        )
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -309,8 +347,22 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
         dst.copy_(src)
 
+    def lora_target(self) -> LoraTarget:
+        # the checkpoint's widths: K/V heads replicated past their count still count once,
+        # and the target's heads (`slice_units`) replicate them as the loader does
+        kv = self.total_num_kv_heads
+        return LoraTarget(
+            in_features=self.input_size_per_partition,
+            out_slices=(
+                self.total_num_heads * self.head_size, kv * self.head_size, kv * self.v_head_size,
+            ),
+            parallel="column",
+            slice_names=("q", "k", "v"),
+            slice_units=(self.total_num_heads, kv, kv),
+        )
 
-class RowParallelLinear(nn.Module):
+
+class RowParallelLinear(nn.Module, LoraCapable):
     """Linear layer with row parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -323,6 +375,8 @@ class RowParallelLinear(nn.Module):
               | A_p |
                -   -
     """
+
+    lora_twin = _RowLora
 
     def __init__(
         self,
@@ -417,6 +471,11 @@ class RowParallelLinear(nn.Module):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, nn.Parameter | None]:
+        _, output_parallel = self._local(input_)
+        return self._reduce(output_parallel)
+
+    def _local(self, input_) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(this rank's input columns, its partial output)``."""
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -429,14 +488,22 @@ class RowParallelLinear(nn.Module):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = torch.nn.functional.linear(input_parallel, self.weight, bias_)
+        return input_parallel, torch.nn.functional.linear(input_parallel, self.weight, bias_)
 
+    def _reduce(self, output_parallel: torch.Tensor) -> torch.Tensor:
         if self.reduce_results and self.tp_size > 1:
             output = self.comm_group.all_reduce(output_parallel)
         else:
             output = output_parallel
 
         return output
+
+    def lora_target(self) -> LoraTarget:
+        return LoraTarget(
+            in_features=self.input_size_per_partition * self.tp_size,
+            out_slices=(self.output_size_per_partition,),
+            parallel="row",
+        )
 
 class KVColumnParallelLinear(ColumnParallelLinear):
     """One K or V projection, sharded by head, replicated when heads run out.
@@ -499,3 +566,11 @@ class KVColumnParallelLinear(ColumnParallelLinear):
             f"vs shard {tuple(shard.shape)}"
         )
         param.data.copy_(shard)
+
+    def lora_target(self) -> LoraTarget:
+        return LoraTarget(
+            in_features=self.input_size_per_partition,
+            out_slices=(self.total_num_kv_heads * self.head_size,),
+            parallel="column",
+            slice_units=(self.total_num_kv_heads,),
+        )

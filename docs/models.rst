@@ -608,6 +608,9 @@ Qwen3-Omni notes
   pick the captured bucket (or the eager GEMMs' shapes), and a prefix-cached
   audio prefix keeps the embeddings it was first computed with, so a later
   request reusing it inherits that first batch's rounding.
+- A prompt runs one Thinker prefill per attachment: each attachment's row also
+  holds the text before it, and the last one the text after it, so text, a clip
+  and text is one step. A prompt with no attachment is one text prefill.
 - Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
   25-frame chunks behind 25 frames of left context. Playback stays gapless
   while the Talker produces frames at about 1.5x real time over the first 50
