@@ -68,6 +68,7 @@ runpy.run_module("pytest", run_name="__main__")
         python -c 'import mstar_rust; from mstar.api_server.rust_frontend import find_server_binary; print(find_server_binary())'
         python -m pytest test/rust/ test/modular/test_request_cleanup_race.py \
             test/modular/test_teardown_barrier.py test/modular/test_worker_drain.py \
+            test/modular/test_failed_tensor_read.py \
             -v --junitxml="$report_dir/rust.xml"
         ;;
 esac

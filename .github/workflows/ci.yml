@@ -258,4 +258,4 @@ jobs:
           # the row store needs the columnar tensor store; CPU Core skips most of it
           pytest test/rust/ test/modular/test_row_output_store.py \
             test/modular/test_request_cleanup_race.py test/modular/test_teardown_barrier.py \
-            test/modular/test_worker_drain.py -v
+            test/modular/test_worker_drain.py test/modular/test_failed_tensor_read.py -v
