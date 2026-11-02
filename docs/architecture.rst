@@ -78,3 +78,23 @@ Execution flow (simplified)
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
+
+Request teardown
+----------------
+
+Each ``WORKER_GRAPHS_DONE`` includes the sender's worker ID and whether it still
+has asynchronous tensor reads for the request, including reads outside the completed
+graph. The conductor keeps the latest report from each worker across partitions.
+When all partitions finish, it notifies the client immediately. If any worker's
+latest report has outstanding reads, it sends ``DRAIN_REQUEST`` to every participating
+worker and waits for their ``READS_DONE`` acknowledgements before sending the hard
+``REMOVE_REQUEST`` that frees tensor storage. Draining the whole group includes TP
+leaders, which forward drains to their followers in schedule order.
+
+With clear reports from all workers, successful requests add no drain messages and
+wait only for the preprocess worker to finish delivering outputs. These reports
+are snapshots, not input fences: arbitrary inputs arriving after a worker's last
+report are outside this guarantee. Client-streaming requests always drain workers
+because inputs can arrive after a completion report;
+abort and failure paths also retain their unconditional drain barrier. The existing
+``MSTAR_DRAIN_TTL_S`` timeout can still force cleanup if a participant never acknowledges.

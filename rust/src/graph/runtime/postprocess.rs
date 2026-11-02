@@ -509,6 +509,7 @@ impl GraphRuntime {
             pp.completion_id, args.info_rids, args.request_infos, args.ntc_rids,
             args.new_token_counts, args.consumed_rids, args.stream_tokens_consumed,
             args.prof_rids, args.profiling, args.publish_rids, args.publications, args.skip_rids,
+            args.inflight_read_rids,
         )
     }
 
@@ -558,6 +559,8 @@ pub(super) struct SendArgs {
     pub publications: Vec<Option<Vec<u8>>>,
     /// rids that failed after routing: none of their frames go out
     pub skip_rids: Vec<u32>,
+    /// Sparse read snapshot from the worker's tensor manager.
+    pub inflight_read_rids: Vec<u32>,
 }
 
 #[cfg(test)]

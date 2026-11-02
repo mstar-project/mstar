@@ -1168,10 +1168,9 @@ class Worker:
                 )
 
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
-        # ignoring ref counts / persist. Safe because the conductor only sends
-        # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
-        # on the abort/fail path via a prior DrainRequest, on the happy path
-        # once the api server finished reading the outputs.
+        # ignoring ref counts / persist. The conductor gates REMOVE_REQUEST on
+        # completion reports and output delivery, adding the READS_DONE barrier
+        # for outstanding worker reads, client streams, and abort/failure.
         laps = PhaseLaps("worker.msg.remove_request.")
         self._mark_removed(body.request_id)
         freed = self.engine_manager.remove_request(request_id)
@@ -1201,10 +1200,13 @@ class Worker:
         laps.lap("runtime")
 
     def _drain_request(self, body: DrainRequest) -> None:
-        """Phase-1 teardown (abort/fail): stop scheduling this rid, then ACK
+        """Phase-1 teardown: stop scheduling this rid, then ACK
         READS_DONE once its in-flight reads finish. The hard cleanup
         (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
         only after every reader has ACKed."""
+        # A forwarded drain can arrive after removal on another socket.
+        if body.request_id in self._removed_rids:
+            return
         if self.is_tp_follower and body.source not in (
             MessageSource.TP_RANK_0, MessageSource.SELF
         ):
@@ -4286,6 +4288,9 @@ class Worker:
                 ],
             ),
             failed_rids=failed_rids,
+            inflight_read_rids=(
+                self.tensor_manager.inflight_read_rids(info_rids) if info_rids else frozenset()
+            ),
         )
 
     def _walk_signals(self, batch: ScheduledBatch, walk: str):

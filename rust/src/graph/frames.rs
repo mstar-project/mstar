@@ -236,6 +236,8 @@ fn str_counts(out: &mut Vec<u8>, pairs: &[(String, i64)]) {
 /// Python's and ride through untouched.
 pub struct WorkerGraphsDone<'a> {
     pub request_id: &'a str,
+    pub worker_id: &'a str,
+    pub has_inflight_reads: bool,
     pub worker_graph_ids: &'a [u32],
     pub is_first_tp_rank: bool,
     pub persist_signals: Vec<(Sym, Vec<TensorPointerInfo>)>,
@@ -259,6 +261,8 @@ impl WorkerGraphsDone<'_> {
     fn body(&self, out: &mut Vec<u8>, it: &StrToId, bk: &StrToId) {
         w_map_counted(out, |m| {
             w_str(m.key("request_id"), self.request_id);
+            w_str(m.key("worker_id"), self.worker_id);
+            w_bool(m.key("has_inflight_reads"), self.has_inflight_reads);
             w_arr(m.key("worker_graph_ids"), self.worker_graph_ids.len() as u32);
             for &w in self.worker_graph_ids {
                 w_u64(m.buf(), w as u64);

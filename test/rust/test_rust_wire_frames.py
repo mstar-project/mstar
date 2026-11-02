@@ -147,6 +147,7 @@ def _send(rt, completion_id, **aos):
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
         skip_rids=aos.get("skip_rids", []),
+        inflight_read_rids=aos.get("inflight_read_rids", []),
     )
 
 
@@ -190,15 +191,17 @@ def _sent(msg):
     return decode(encode(msg))
 
 
-def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
+@pytest.mark.parametrize("inflight", [False, True])
+def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path, inflight):
     mesh = _Mesh(tmp_path, outs=[("out", "", False)])
     rid = mesh.admit()
-    got = mesh.run(rid, uuids=[])
+    got = mesh.run(rid, uuids=[], inflight_read_rids=[rid] if inflight else [rid + 1])
 
     assert got["conductor"] == [_sent(ConductorMessage(
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
+            worker_id=ME, has_inflight_reads=inflight,
             partition_name="default", graph_walk=WALK,
         ),
     ))]

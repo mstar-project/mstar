@@ -73,6 +73,22 @@ def _shm_manager(tmp_path):
     return mgr, comm
 
 
+def test_inflight_read_snapshot_excludes_finished_and_synchronous_reads(tmp_path):
+    mgr, _ = _shm_manager(tmp_path)
+    assert mgr.inflight_read_rids(range(5)) == frozenset()
+    pending, done, cancelled, failed = (Future() for _ in range(4))
+    done.set_result(None)
+    cancelled.cancel()
+    failed.set_exception(RuntimeError("transfer failed before draining"))
+    mgr.pending = [
+        FutureAndPointers(future=f, graph_edges=[], request_id=rid)
+        for rid, f in [(0, pending), (0, pending), (1, done), (2, None), (3, cancelled), (4, failed)]
+    ]
+    assert mgr.inflight_read_rids(range(5)) == frozenset({0, 4})
+    pending.set_result(None)
+    assert mgr.inflight_read_rids(range(5)) == frozenset({4})
+
+
 def _edge(*uuids, name="x"):
     edge = GraphEdge(next_node="node", name=name)
     edge.tensor_info = [SimpleNamespace(uuid=u, source_entity="worker_0") for u in uuids]
@@ -163,6 +179,19 @@ class _CountingFuture(Future):
     def result(self, timeout=None):
         self.result_calls += 1
         return super().result(timeout)
+
+
+def test_read_snapshot_queries_only_reporting_requests_and_short_circuits(tmp_path):
+    mgr, _ = _shm_manager(tmp_path)
+    unrelated, active = _CountingFuture(), _CountingFuture()
+    mgr.pending = [
+        FutureAndPointers(unrelated, [], 9),
+        FutureAndPointers(active, [], 1),
+        FutureAndPointers(active, [], 1),
+    ]
+    assert mgr.inflight_read_rids([]) == frozenset()
+    assert mgr.inflight_read_rids([1]) == frozenset({1})
+    assert unrelated.done_calls == 0 and active.done_calls == 1
 
 
 def test_a_finished_read_is_queried_once_while_it_waits_behind_an_earlier_one(tmp_path):
@@ -508,11 +537,14 @@ def test_the_drain_waits_for_a_failed_reads_running_transfers(engine):
     assert mgr.has_inflight_reads("r")
     future.exception(timeout=5)
     assert mgr.has_inflight_reads("r"), "the reader is done, the transfer is not"
+    assert mgr.inflight_read_rids(["r"]) == frozenset({"r"})
     mgr.get_ready_tensors()
     assert mgr.take_failed_reads() and mgr.has_inflight_reads("r")
+    assert mgr.inflight_read_rids(["r"]) == frozenset({"r"})
     engine.report(src[1].data_ptr(), 1)
     mgr.get_ready_tensors()
     assert not mgr.has_inflight_reads("r")
+    assert mgr.inflight_read_rids(["r"]) == frozenset()
 
 
 def test_a_torn_down_requests_kept_read_no_longer_holds_a_drain(engine):
@@ -525,6 +557,7 @@ def test_a_torn_down_requests_kept_read_no_longer_holds_a_drain(engine):
     assert mgr.has_inflight_reads("r")
     mgr.force_cleanup_request("r")
     assert not mgr.has_inflight_reads("r") and _kept(mgr) == ptrs
+    assert mgr.inflight_read_rids(["r"]) == frozenset()
 
 
 def test_the_data_worker_holds_reads_done_for_a_failed_reads_running_transfer(tmp_path):

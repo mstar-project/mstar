@@ -909,4 +909,5 @@ class RustGraphRuntime(GraphRuntime):
                 ]
             ),
             skip_rids=list(input.failed_rids),
+            inflight_read_rids=list(input.inflight_read_rids),
         )

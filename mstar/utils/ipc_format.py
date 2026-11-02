@@ -339,6 +339,10 @@ class WorkerGraphsDone(MessageBody):
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)
+    # Request-wide read snapshot, including reads outside the completed graph.
+    # The sender identifies the rank whose previous snapshot this replaces.
+    worker_id: str = ""
+    has_inflight_reads: bool = False
 
 
 @dataclass
