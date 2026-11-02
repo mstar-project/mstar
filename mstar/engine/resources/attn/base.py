@@ -33,6 +33,7 @@ from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
     from mstar.engine.resources.context_parallel import ContextParallel
+    from mstar.engine.resources.kv.manager import KVManager
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -69,7 +70,7 @@ class AttentionManager(AttentionResource):
     # how split steps reach it (`AttentionSpec.split_exchange`), set by `build`
     _split_exchange: SpExchange = "ulysses"
     # the KV resource, which the ring writes and reads itself (`exchange`)
-    _kv = None
+    _kv: "KVManager | None" = None
 
     @property
     def splits(self) -> bool:
@@ -115,12 +116,11 @@ class AttentionManager(AttentionResource):
         exchange, which here comes before warmup and the capture plan read free memory, and a
         routing fault hangs at startup rather than in a request. Every rank binds the same
         resources in the same order."""
-        p = group.world_size
+        from mstar.engine.resources.context_parallel import ring_hop
+
         one = torch.zeros(1, device=self._device)
-        for i in range(1, p):
-            to, back = [0] * p, [0] * p
-            to[(group.rank + i) % p] = back[(group.rank - i) % p] = 1
-            group.all_to_all_rows(one, to, back)
+        for i in range(1, group.world_size):
+            group.all_to_all_rows(one, *ring_hop(group.world_size, group.rank, i, 1, 1))
 
     @torch.compiler.disable
     def exchange(self, run, q, k, v, label: str | None = None):

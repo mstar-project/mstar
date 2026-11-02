@@ -178,6 +178,14 @@ def stripe_owners(qo_indptr: np.ndarray, stored: np.ndarray, size: int) -> np.nd
     return (stored.astype(np.int64)[row] + np.arange(int(qo_indptr[-1])) - qo_indptr[:-1].astype(np.int64)[row]) % size
 
 
+def ring_hop(size: int, rank: int, offset: int, send: int, recv: int) -> tuple[list[int], list[int]]:
+    """A ring hop's ``all_to_all_rows`` counts at ``offset``: ``send`` rows to rank ``rank + offset``,
+    ``recv`` back from rank ``rank - offset``, of ``size``."""
+    to, back = [0] * size, [0] * size
+    to[(rank + offset) % size], back[(rank - offset) % size] = send, recv
+    return to, back
+
+
 def _ring_rows(
     stored: np.ndarray, lens: np.ndarray, size: int, rank: int, partner: int, causal: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -297,8 +305,7 @@ class RingAttentionWrapper:
         out = lse = None
         for i in range(p):
             j = (r - i) % p
-            to, back = [0] * p, [0] * p
-            to[(r + i) % p], back[j] = counts[r], counts[j]
+            to, back = ring_hop(p, r, i, counts[r], counts[j])
             queries = group.all_to_all_rows(q, to, back) if i else q
             part = _masked(*self._paged[j].run(queries, kv_cache_layer, return_lse=True), self._valid[j])
             if i:
