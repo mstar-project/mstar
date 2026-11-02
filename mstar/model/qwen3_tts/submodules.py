@@ -136,8 +136,10 @@ class TalkerSubmodule(ARNodeSubmodule):
     # for this path. The whole decode forward (CodePredictor loop included) is
     # still CUDA-graph captured.
     disable_torch_compile = True
+    # A deployment can raise it (``talker_max_batch``): past this many live rows
+    # decode splits into half-batches that take turns, and a step costs most of
+    # its time whatever its rows.
     MAX_BATCH_SIZE = 32
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     # Prefill prompts are short (a sentence plus the ChatML frame, an optional
     # instruction and speaker slot): a few token buckets cover them, and the
     # eager alternative costs ~20 ms of launch overhead per request.
@@ -151,8 +153,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         talker_model: Qwen3TTSTalkerModel,
         code_predictor: Qwen3TTSCodePredictor,
         config: Qwen3TTSModelConfig,
+        max_batch_size: int | None = None,
     ) -> None:
         super().__init__()
+        self.MAX_BATCH_SIZE = max_batch_size or type(self).MAX_BATCH_SIZE
+        self.DECODE_CAPTURE_BATCH_SIZES = [
+            *(size for size in (1, 2, 4, 8, 16, 32) if size < self.MAX_BATCH_SIZE), self.MAX_BATCH_SIZE,
+        ]
         self.model = talker_model
         self.code_predictor = code_predictor
         self.config = config

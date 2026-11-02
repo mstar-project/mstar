@@ -2247,6 +2247,30 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     assert encoder.calls == 4
 
 
+def test_talker_cap_sets_its_capture_sizes():
+    config = _tiny_model_config()
+    talker, predictor = Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config)
+    default = TalkerSubmodule(talker, predictor, config)
+    assert default.max_batch_size("talker_decode") == 32
+    assert default.DECODE_CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32]
+
+    raised = TalkerSubmodule(talker, predictor, config, max_batch_size=64)
+    assert raised.max_batch_size("talker_decode") == 64
+    assert raised.DECODE_CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32, 64]
+    batch = SimpleNamespace(graph_walk="talker_decode")
+    assert raised.can_batch(batch, [object()] * 64) and not raised.can_batch(batch, [object()] * 65)
+    assert not default.can_batch(batch, [object()] * 33)
+
+
+def test_only_the_amd_split_config_raises_the_talker_cap():
+    from mstar.platforms.serving_config import apply_platform_overrides
+
+    config = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_1p7b_split_bf16.yaml").read_text(encoding="utf-8"))
+    assert apply_platform_overrides(config, "cuda")["model_kwargs"] == {"codec_dtype": "bfloat16"}
+    rocm = apply_platform_overrides(config, "rocm")["model_kwargs"]
+    assert rocm == {"codec_dtype": "bfloat16", "talker_max_batch": 64}
+
+
 def test_qwen3_tts_codec_dtype_option():
     from mstar.model.qwen3_tts.qwen3_tts_model import codec_dtype
 
