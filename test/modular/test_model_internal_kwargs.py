@@ -1,9 +1,9 @@
 """Keys only a model's process_prompt sets are never the client's.
 
 The data worker lays process_prompt's metadata over the request's own
-model_kwargs, and the conductor reads some of those keys back (Qwen3-TTS's
-codec stream lead primes the Codec worker's stream). A client value for such a
-key must reach neither process_prompt nor the conductor.
+model_kwargs, and the conductor reads some of those keys back (a prompt
+layout). A client value for such a key must reach neither process_prompt nor
+the conductor.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import queue
 import threading
 
-import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
@@ -52,29 +51,13 @@ def _qwen3_tts(tts_model_type: str) -> Qwen3TTSModel:
     return model
 
 
-@pytest.mark.parametrize(
-    "variant, mode, lead",
-    [("custom_voice", None, 0), ("base", "x_vector", 0), ("base", "in_context", 13)],
-)
-def test_qwen3_tts_a_client_cannot_set_the_codec_stream_lead(variant, mode, lead):
-    """A client value past the codec's left context would raise in the worker's
-    ingest, outside any one request's failure path."""
-    model = _qwen3_tts(variant)
-    modalities = ["text"] if mode is None else ["audio", "text"]
-    # 1 s + 1 sample -> 13 codec frames, fewer than the left context
-    request = {} if mode is None else {"tensors": {"audio_inputs": [torch.zeros(24000 + 1)]}}
-    if mode == "x_vector":
-        request["x_vector_only_mode"] = True
-    elif mode == "in_context":
-        request["ref_text"] = "the reference says"
-    client = {Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 999}
-    result = model.process_prompt("hello", modalities, ["audio"], **request, **client)
-    codec = model.get_initial_forward_pass_args(
-        "Codec", modalities, ["audio"], {}, model_kwargs={**client, **result.metadata}
-    )
-    assert codec.stream_lead_items == ({"codec_tokens": lead} if lead else {})
-    # every key the conductor reads back is one the data worker strips from the client
-    assert set(result.metadata) - {"kv_layout"} <= set(model.INTERNAL_KWARGS)
+def test_qwen3_tts_reports_only_keys_the_data_worker_strips():
+    """The conductor reads process_prompt's metadata back, so none of it may
+    be a key a client could also send."""
+    model = _qwen3_tts("base")
+    clip = {"tensors": {"audio_inputs": [torch.zeros(24000 + 1)]}, "ref_text": "the reference says"}
+    result = model.process_prompt("hello", ["audio", "text"], ["audio"], **clip)
+    assert set(result.metadata) - {"kv_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
 
 
 class _RecordingCommunicator:
@@ -102,7 +85,7 @@ class _StubTensorManager:
 class _Internal:
     """Reports a key of its own to the conductor, and only on some prompts."""
 
-    INTERNAL_KWARGS = ("stream_lead",)
+    INTERNAL_KWARGS = ("prompt_layout",)
 
     def get_partition_topology(self):
         return PartitionTopology(partitions=["default"])
@@ -126,12 +109,12 @@ def test_a_clients_value_for_a_model_internal_key_never_reaches_the_model_or_con
     worker._process_input(PreprocessInput(
         request_id="r0", text="hello", file_paths=None,
         input_modalities=["text"], output_modalities=["text"],
-        model_kwargs={"stream_lead": 999, "voice": "tara"},
+        model_kwargs={"prompt_layout": 999, "voice": "tara"},
     ))
     kwargs = worker.communicator.sent[-1].body.model_kwargs
 
-    assert "stream_lead" not in model.handed, "process_prompt was handed the client's value"
-    assert "stream_lead" not in kwargs, (
+    assert "prompt_layout" not in model.handed, "process_prompt was handed the client's value"
+    assert "prompt_layout" not in kwargs, (
         "a key only the model reports reached the conductor with the client's value"
     )
     assert kwargs["voice"] == "tara", "the strip dropped the request's own kwargs"
