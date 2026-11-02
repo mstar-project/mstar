@@ -8,6 +8,7 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -274,7 +275,10 @@ class Glm52Model(Model):
         model_kwargs: dict,
     ) -> list[WalkStep]:
         # one prefill over the prompt, then decode until the stop check ends it
-        return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing

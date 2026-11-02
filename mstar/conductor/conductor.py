@@ -21,7 +21,6 @@ from mstar.api_server.request_types import (
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
-    FINAL_PREFILL,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
@@ -37,7 +36,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import Model, WorkerGraph, growth_walks, streamed_inputs
+from mstar.model.base import Model, WorkerGraph, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
@@ -779,7 +778,6 @@ class Conductor:
         }
         # what the walk plans need of each walk (`_plan_step`, `_next_plan_args`, `_consumed`)
         self._walk_inputs, self._walk_persists, self._repeating_walks = _walk_io(self.model)
-        self._growth_walks = growth_walks(self.model)
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
@@ -1977,21 +1975,16 @@ class Conductor:
     def _plan_step(self, request_data: RequestData, pstate: PartitionState, k: int) -> ForwardPassArgs:
         """Enter step ``k`` of the partition's plan: each input of its walk gets
         the persisted signal its ``bind`` names, or its own name's, or an
-        empty edge (an empty loop-back seed, a chunk tick); and the step before
-        a KV growth walk is marked `FINAL_PREFILL`."""
-        plan = pstate.plan
-        step = plan[k]
+        empty edge (an empty loop-back seed, a chunk tick)."""
+        step = pstate.plan[k]
         held = request_data.persist_signals
         inputs = [
             GraphEdge(next_node=node, name=name, tensor_info=list(held.get(step.bind.get(name, name), ())))
             for name, node in self._walk_inputs[step.walk]
         ]
-        step_metadata = dict(step.step_metadata)
-        if k + 1 < len(plan) and plan[k + 1].walk in self._growth_walks:
-            step_metadata[FINAL_PREFILL] = True
         pstate.cursor = k
         pstate.graph_walk = step.walk
-        return ForwardPassArgs(inputs=inputs, step_metadata=step_metadata)
+        return ForwardPassArgs(inputs=inputs, step_metadata=dict(step.step_metadata))
 
     def _next_plan_args(self, request_data: RequestData, partition_name: str, done: bool) -> ForwardPassArgs:
         """Where a report moves a partition's plan, as the args of its next step.

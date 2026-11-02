@@ -277,14 +277,6 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
     return keyed
 
 
-def growth_walks(model: "Model") -> frozenset[str]:
-    """The walks that grow a KV label: the conductor marks the plan step before
-    one `FINAL_PREFILL`."""
-    return frozenset(
-        walk for labels in model.kv_labels().values() for label in labels.values() for walk, _ in label.growth
-    )
-
-
 def names_checkpoint(model: "Model") -> bool:
     """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
     which may download the checkpoint (BAGEL's does)."""
@@ -878,8 +870,9 @@ class Model(ABC):
 
         The conductor runs the plan: it sends each step's inputs from the walk's
         graph (see `WalkStep`), releases a persisted tensor once no later step
-        reads it, sets `FINAL_PREFILL` on the step before a walk that grows a KV
-        label, and ends the partition after the last step reports. A step whose
+        reads it, and ends the partition after the last step reports. The step
+        that samples the reply's first token sets `FINAL_PREFILL` in its
+        ``step_metadata``. A step whose
         walk a stream feeds, and that is a bare node (or its chunk loop), runs
         once per chunk until the worker reports the stream's final chunk. A
         ``ValueError`` refuses the request with a 400, and so do a plan of

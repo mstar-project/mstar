@@ -19,6 +19,7 @@ import pytest
 import torch
 from jinja2 import TemplateError
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.cosmos3.cosmos3_model import (
@@ -176,8 +177,9 @@ def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -
     plan = model.walk_plan("default", ["image", "text"] if vision else ["text"], ["text"],
                            {k: [object()] for k in names}, {**knobs, MEDIA_LAYOUT: layout})
     # the reasoner splices the encoder's tokens and places its positions by the intake's layout
-    prefill = (Cosmos3Model.REASONER_PREFILL_VISION_WALK, {**knobs, MEDIA_LAYOUT: layout}) if vision else (
-        Cosmos3Model.REASONER_PREFILL_WALK, knobs)
+    first = {FINAL_PREFILL: True}
+    prefill = (Cosmos3Model.REASONER_PREFILL_VISION_WALK, {**knobs, MEDIA_LAYOUT: layout, **first}) if vision else (
+        Cosmos3Model.REASONER_PREFILL_WALK, {**knobs, **first})
     assert [(step.walk, dict(step.bind), dict(step.step_metadata)) for step in plan] == [
         (prefill[0], {}, prefill[1]),
         (Cosmos3Model.REASONER_DECODE_WALK, {"text_inputs": "new_token"}, knobs),
@@ -297,7 +299,6 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     prefill walk it, or a one-token budget, ends the partition."""
     import types
 
-    from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.engine.resources.position.config import PositionConfig
     from mstar.engine.resources.position.manager import RopeManager
     from mstar.model.components.mrope import layout_position_ids
@@ -332,7 +333,7 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
         info = types.SimpleNamespace(
             graph_walk=walk, max_tokens=max_tokens,
             resource_configs={SAMPLER: types.SimpleNamespace(ignore_eos=ignore_eos)},
-            # the conductor marks the prefill, the step before decode, as the reply's first token's
+            # the walk plan marks the prefill, the step before decode, as the reply's first token's
             step_metadata={} if walk == Cosmos3Model.REASONER_DECODE_WALK else {FINAL_PREFILL: True},
         )
         return sub.check_stop("r", info, {"new_token": [torch.tensor([token])]})

@@ -59,7 +59,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition
+from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -1581,10 +1581,11 @@ class Cosmos3Model(Model):
             }
             if has_vision:
                 # where the encoder's tokens and the prompt's positions go
-                prefill = WalkStep(self.REASONER_PREFILL_VISION_WALK,
-                                   step_metadata={**knobs, MEDIA_LAYOUT: model_kwargs.get(MEDIA_LAYOUT) or {}})
+                prefill = WalkStep(self.REASONER_PREFILL_VISION_WALK, step_metadata={
+                    **knobs, MEDIA_LAYOUT: model_kwargs.get(MEDIA_LAYOUT) or {}, FINAL_PREFILL: True,
+                })
             else:
-                prefill = WalkStep(self.REASONER_PREFILL_WALK, step_metadata=knobs)
+                prefill = WalkStep(self.REASONER_PREFILL_WALK, step_metadata={**knobs, FINAL_PREFILL: True})
             decode = WalkStep(self.REASONER_DECODE_WALK, bind={"text_inputs": "new_token"}, step_metadata=knobs)
             return [prefill, decode]
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)

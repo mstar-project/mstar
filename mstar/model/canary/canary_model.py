@@ -23,6 +23,7 @@ import logging
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -219,7 +220,10 @@ class CanaryModel(Model):
         model_kwargs: dict,
     ) -> list[WalkStep]:
         # the prefill hears the clip and samples the first token; decode feeds each one back
-        return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # prompt / output

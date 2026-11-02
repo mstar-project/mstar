@@ -38,6 +38,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -1349,10 +1350,10 @@ class BagelModel(Model):
         straight to image generation.
 
         Every step carries the request's guidance and image params. The step
-        before decode, the one that samples the reply's first token, is the
-        conductor's `FINAL_PREFILL`; ``prefill_stop_ends`` says whether a stop
-        there ends the request, which only a text reply's does: a
-        think-then-image request still has its image to make.
+        before decode, the one that samples the reply's first token, is marked
+        `FINAL_PREFILL`; ``prefill_stop_ends`` says whether a stop there ends
+        the request, which only a text reply's does: a think-then-image
+        request still has its image to make.
         """
         target_output = output_modalities[0]  # "text" or "image"
         params = self._request_params(input_modalities, output_modalities, model_kwargs)
@@ -1379,8 +1380,12 @@ class BagelModel(Model):
         if not schedule:
             # a request with nothing to prefill opens on decode
             after = [decode, *after[1:]]
+        first_token = after[0] is decode
         return [
-            WalkStep(walk, bind={name: span}, step_metadata=params) for walk, name, span in schedule
+            WalkStep(walk, bind={name: span}, step_metadata={
+                **params, FINAL_PREFILL: first_token and k == len(schedule) - 1,
+            })
+            for k, (walk, name, span) in enumerate(schedule)
         ] + after
 
     def get_sampling_config(

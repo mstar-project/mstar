@@ -1189,7 +1189,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
         request_info = engine_inputs.single_request_info
         kwargs.update(request_info.step_metadata)
-        # the conductor marks the prefill that samples the reply's first token
+        # the walk plan marks the prefill that samples the reply's first token
         kwargs["sample_prefill_token"] = kwargs.pop(FINAL_PREFILL, False)
 
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)

@@ -5,6 +5,7 @@ from itertools import chain
 
 import torch
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -99,9 +100,11 @@ class CommandAPlusModel(Model):
         if not input_signals.get("text_inputs"):
             raise ValueError("Command A+ prefill requires text_inputs")
         if input_signals.get("pixel_values"):
-            prefill = WalkStep(self.image_walk, step_metadata={MEDIA_LAYOUT: model_kwargs[MEDIA_LAYOUT]})
+            prefill = WalkStep(self.image_walk, step_metadata={
+                MEDIA_LAYOUT: model_kwargs[MEDIA_LAYOUT], FINAL_PREFILL: True,
+            })
         else:
-            prefill = WalkStep("prefill")
+            prefill = WalkStep("prefill", step_metadata={FINAL_PREFILL: True})
         # one prefill over the prompt, then decode until the stop check ends it
         return [prefill, WalkStep("decode", bind={"text_inputs": "new_token"})]
 

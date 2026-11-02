@@ -12,6 +12,7 @@ import torch
 
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
+    FINAL_PREFILL,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
@@ -317,7 +318,7 @@ def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():
     w._walk_drivers = w.partition_topology.walk_drivers()
     w._graph_runtime.get_output_signals = lambda node, walk: ["thinker_states"]
     fwd = w.request_state.get_fwd_info(0, "Thinker")
-    fwd.step_metadata = {"is_last_prefill": True}
+    fwd.step_metadata = {FINAL_PREFILL: True}
     _pass(w, "Thinker", "thinker_decode", _decode(3))
     _pass(w, "Projector", "thinker_decode", _decode(3))
     _pass(w, "Thinker", "thinker_decode", _decode(4))
@@ -326,7 +327,7 @@ def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():
         ("thinker_decode", "Projector", _decode(3), fwd),
         ("thinker_decode", "Thinker", _decode(4), fwd),
     ]
-    assert seen[0][3].step_metadata == {"is_last_prefill": True}
+    assert seen[0][3].step_metadata == {FINAL_PREFILL: True}
 
 
 def test_a_pass_allocates_nothing_per_row():

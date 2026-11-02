@@ -205,7 +205,6 @@ def _conductor(passes=1):
     c._walk_inputs = {"decode": (), "snac_chunk": ()}
     c._walk_persists = dict.fromkeys(c._walk_inputs, frozenset())
     c._repeating_walks = frozenset({"snac_chunk"})
-    c._growth_walks = frozenset()
     c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()

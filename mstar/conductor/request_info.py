@@ -7,8 +7,8 @@ from mstar.engine.resources import PublishedInfo, ResourceReqConfig
 
 DEFAULT_PARTITION = "default"
 
-# Step metadata the conductor sets on the step that samples a request's first
-# token: a plan step whose next step's walk grows a KV label (`KVLabel.growth`).
+# Step metadata a walk plan sets on the step that samples the reply's first
+# token, the last prefill before decode (`TokenStop.last_prefill_flag`).
 FINAL_PREFILL = "final_prefill"
 
 

@@ -41,7 +41,6 @@ def _conductor(rid="r"):
     c._walk_inputs = {"a": (), "a_decode": (("text_inputs", "llm"),), "b": (), "c": ()}
     c._walk_persists = dict.fromkeys(c._walk_inputs, frozenset())
     c._repeating_walks = frozenset({"b", "c"})
-    c._growth_walks = frozenset()
     plans = {"A": [WalkStep("a"), WalkStep("a_decode", bind={"text_inputs": "new_token"})],
              "B": [WalkStep("b")], "C": [WalkStep("c")]}
     conns = {

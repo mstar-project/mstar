@@ -7,7 +7,7 @@ multimodal prompt as one row). It owns the engine contract: the capture
 configs, device loop-back of the sampled token, the step declaration around
 the sampler and the position resource, the forward through the sampler, and
 the stop: a `TokenStop` over its prefill and decode walks (a stop id; a
-stop, or a one-token budget, on the step the conductor marks `FINAL_PREFILL`
+stop, or a one-token budget, on the step the walk plan marks `FINAL_PREFILL`
 ends the partition, and the model's loop cap is the decode budget). A model subclasses it with its resource steps
 and its attention key, and an MRoPE model adds its own positions.
 
@@ -148,7 +148,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         self._encoders = tuple(encoders)
         self._media_walks = frozenset(media_walk_names(self._encoders))
         # a prefill walk's token is the reply's first only on the step before
-        # decode, which the conductor marks
+        # decode, which the walk plan marks
         prefills = self._media_walks | ({self.PREFILL_WALK} if self.PREFILL_WALK else set())
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),

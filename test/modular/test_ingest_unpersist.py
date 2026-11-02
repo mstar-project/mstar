@@ -26,8 +26,7 @@ from mstar.conductor.request_info import (  # noqa: E402
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig  # noqa: E402
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
-from mstar.model.base import KVLabel, LabelLayout, Model, Span, growth_walks  # noqa: E402
-from mstar.model.components.token_step import TokenStepNode  # noqa: E402
+from mstar.model.base import KVLabel, LabelLayout, Model, Span  # noqa: E402
 from mstar.model.submodule_base import ChunkingPolicy, chunk_tick_name  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge  # noqa: E402
@@ -38,7 +37,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
     SetupDone,
     WorkerGraphsDone,
 )
-from mstar.worker.engine_manager import _refuse_ungrown_decode_walks  # noqa: E402
 
 PREPROCESS = "api_server_preprocess_worker"
 
@@ -169,7 +167,6 @@ def plan_step(model, plan, k, signals) -> ForwardPassArgs:
     step metadata, by the conductor's own `_plan_step`."""
     c = Conductor.__new__(Conductor)
     c._walk_inputs, _, _ = _walk_io(model)
-    c._growth_walks = growth_walks(model)
     return c._plan_step(SimpleNamespace(persist_signals=signals), PartitionState("p", plan=list(plan)), k)
 
 
@@ -185,6 +182,8 @@ def _decoder_walks(prefills=("prefill",)):
 
 
 DECODE = WalkStep("decode", bind={"text_inputs": "new_token"})
+# the prefill that samples the reply's first token
+LAST_PREFILL = {FINAL_PREFILL: True}
 PROMPT_KV = {"kv_layout": {"kv": {"main": LabelLayout(
     spans=(Span("ids", "prefill", 4, 4, "text_inputs"),), growth=(("decode_loop", 1),),
 ).row()}}}
@@ -192,8 +191,9 @@ REF, TAIL, LANG, EMB = 303, 404, 505, 606
 
 
 def _p2():
-    model = _ToyModel(_decoder_walks([("prefill", ())]), {"default": [WalkStep("prefill"), DECODE]},
-                       {"default": ["prefill", "decode"]}, growth=True)
+    model = _ToyModel(_decoder_walks([("prefill", ())]),
+                      {"default": [WalkStep("prefill", step_metadata=LAST_PREFILL), DECODE]},
+                      {"default": ["prefill", "decode"]}, growth=True)
     return model, {"text_inputs": [PROMPT]}, PROMPT_KV, [
         ("default", "prefill", {"new_token": TOKEN}, False), ("default", "decode", {}, False),
     ], [
@@ -217,7 +217,10 @@ def _rebound_name():
     and the prompt walk's own re-persist means it consumes the language token."""
     model = _ToyModel(
         _decoder_walks([("detect", ()), ("prompt", ("tail",))]),
-        {"default": [WalkStep("detect"), WalkStep("prompt", bind={"text_inputs": "new_token"}), DECODE]},
+        {"default": [
+            WalkStep("detect"), WalkStep("prompt", bind={"text_inputs": "new_token"}, step_metadata=LAST_PREFILL),
+            DECODE,
+        ]},
         {"default": ["detect", "prompt", "decode"]}, growth=True,
     )
     return model, {"text_inputs": [PROMPT], "tail": [_info(TAIL)]}, PROMPT_KV, [
@@ -484,12 +487,3 @@ def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, case):
     assert [(f.request_id, f.status) for f in failed] == [("r", 400)]
     assert message in failed[0].error_message
     assert not _sends(c, ("NEW_REQUEST",)) and "r" not in c.requests
-
-
-def test_a_token_decoder_whose_decode_walk_grows_no_kv_is_refused_at_load():
-    """The conductor marks no step `FINAL_PREFILL` before a walk that grows no
-    KV label, so a stop on the prefill would end nothing."""
-    walks, plans = _decoder_walks([("prefill", ())]), {"default": [WalkStep("prefill"), DECODE]}
-    _refuse_ungrown_decode_walks({"llm": TokenStepNode()}, _ToyModel(walks, plans, growth=True))
-    with pytest.raises(ValueError, match="'llm' decodes in 'decode'"):
-        _refuse_ungrown_decode_walks({"llm": TokenStepNode()}, _ToyModel(walks, plans))

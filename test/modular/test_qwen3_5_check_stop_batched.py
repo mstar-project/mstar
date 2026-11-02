@@ -17,7 +17,7 @@ EOS = 7
 def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=False):
     return SimpleNamespace(
         graph_walk=walk,
-        # the conductor marks the step before decode
+        # the walk plan marks the step before decode
         step_metadata={FINAL_PREFILL: last_prefill},
         resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": done},

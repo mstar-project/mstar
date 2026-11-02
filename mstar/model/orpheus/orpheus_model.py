@@ -27,7 +27,7 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition
+from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -216,7 +216,10 @@ class OrpheusModel(Model):
         model_kwargs: dict,
     ) -> list[WalkStep]:
         if partition_name == "LLM":
-            return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
+            return [
+                WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+                WalkStep("decode", bind={"text_inputs": "new_token"}),
+            ]
         if partition_name == "SNAC":
             # runs on each window of the LLM's tokens until the worker reports the last
             return [WalkStep("snac_chunk")]

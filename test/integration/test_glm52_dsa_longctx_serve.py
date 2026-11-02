@@ -181,7 +181,7 @@ class _Serve:
         return CurrentForwardPassInfo(
             request_id=self.rid, graph_walk="prefill", fwd_index=0, random_seed=0,
             max_tokens=max_tokens, resource_configs=self.overrides,
-            # the conductor marks the prefill, the step before decode, as the reply's first token's
+            # the walk plan marks the prefill, the step before decode, as the reply's first token's
             step_metadata={FINAL_PREFILL: True},
         )
 

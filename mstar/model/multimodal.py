@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.keys import MIXED
@@ -31,7 +32,6 @@ from mstar.model.keys import MIXED
 if TYPE_CHECKING:
     from mstar.communication.tensors import NameToTensorList
     from mstar.graph.base import TensorPointerInfo
-    from mstar.model.base import WalkStep
 
 TEXT = "text"
 VIDEO = "video"
@@ -580,11 +580,9 @@ def media_prefill_step(
     model_name: str,
 ) -> WalkStep:
     """The one prefill walk a request runs over its whole prompt
-    (``text_inputs``, one tensor): with media in its ``layout``, the walk over
-    the encoders it runs (`media_encoders`), which carries the layout; without,
-    ``prefill_text``."""
-    from mstar.model.base import WalkStep
-
+    (``text_inputs``, one tensor), marked `FINAL_PREFILL`: with media in its
+    ``layout``, the walk over the encoders it runs (`media_encoders`), which
+    carries the layout; without, ``prefill_text``."""
     texts = signals.get("text_inputs", [])
     if not texts:
         # the conductor answers this with a 400
@@ -601,5 +599,5 @@ def media_prefill_step(
         if sent:
             # a text prefill would drop them
             raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
-        return WalkStep("prefill_text")
-    return WalkStep(media_walk_name(present), step_metadata={MEDIA_LAYOUT: layout or {}})
+        return WalkStep("prefill_text", step_metadata={FINAL_PREFILL: True})
+    return WalkStep(media_walk_name(present), step_metadata={MEDIA_LAYOUT: layout or {}, FINAL_PREFILL: True})

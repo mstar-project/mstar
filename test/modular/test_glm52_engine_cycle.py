@@ -86,7 +86,7 @@ class _Driver:
         rids = list(batch)
         for info, _ in batch.values():
             info.graph_walk = walk
-            # the conductor marks the prefill, the step before decode, as the reply's first token's
+            # the walk plan marks the prefill, the step before decode, as the reply's first token's
             info.step_metadata = {FINAL_PREFILL: True} if walk == "prefill" else {}
         inputs = [
             self.sub.prepare_inputs(walk, info, {"text_inputs": [text]})

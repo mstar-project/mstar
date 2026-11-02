@@ -27,6 +27,7 @@ from collections.abc import Iterable, Iterator
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -250,7 +251,9 @@ class CanaryQwenModel(Model):
     ) -> list[WalkStep]:
         # the prefill hears the clip (spliced in where MEDIA_LAYOUT says) and samples
         # the first token; decode feeds each one back
-        prefill = WalkStep(PREFILL_WALK, step_metadata={MEDIA_LAYOUT: model_kwargs.get(MEDIA_LAYOUT)})
+        prefill = WalkStep(PREFILL_WALK, step_metadata={
+            MEDIA_LAYOUT: model_kwargs.get(MEDIA_LAYOUT), FINAL_PREFILL: True,
+        })
         return [prefill, WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"})]
 
     # -------------------------------------------------------------------

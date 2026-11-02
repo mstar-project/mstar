@@ -39,7 +39,7 @@ from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import PartitionDefinition
+from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -728,9 +728,11 @@ class Qwen3OmniModel(Model):
         audio_output = "audio" in output_modalities
         if partition_name == "Thinker":
             thinker = {"audio_output": audio_output}
+            prefills = self._build_thinker_prefill_schedule(input_modalities, input_signals)
+            # the last prefill samples the reply's first token
             return [
-                WalkStep(walk, bind=bind, step_metadata=thinker)
-                for walk, bind in self._build_thinker_prefill_schedule(input_modalities, input_signals)
+                WalkStep(walk, bind=bind, step_metadata={**thinker, FINAL_PREFILL: k == len(prefills) - 1})
+                for k, (walk, bind) in enumerate(prefills)
             ] + [WalkStep("thinker_decode", bind={"text_inputs": "new_token"}, step_metadata=thinker)]
         if partition_name not in ("Talker", "Code2Wav"):
             raise ValueError(f"Unknown partition: {partition_name!r}")

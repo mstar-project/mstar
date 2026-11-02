@@ -130,7 +130,7 @@ def _span(kind: str, rid: str) -> int:
 
 
 def _step_metadata(kind: str, rid: str) -> dict:
-    """The walk's step metadata: the conductor's mark on the step before
+    """The walk's step metadata: the walk plan's mark on the step before
     decode, and a grid prompt's ``MEDIA_LAYOUT``, as intake lays it out."""
     from mstar.conductor.request_info import FINAL_PREFILL
     from mstar.model.multimodal import MEDIA_LAYOUT

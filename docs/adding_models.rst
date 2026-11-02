@@ -163,11 +163,10 @@ You must implement these abstract methods:
    A persisted tensor a step reads is released when the step is sent, unless a later step
    of some partition reads it with no walk of that partition persisting the name in
    between; anything else stays held until the request ends. ``step_metadata`` carries
-   request constants to every node of the step's walk. The conductor sets
-   ``FINAL_PREFILL`` (from ``mstar.conductor.request_info``) in the step metadata of a
-   step whose next step's walk grows a KV label (``KVLabel.growth``): the step that
-   samples the first token. The decode walk of a token decoder (``TokenStepNode``) must
-   therefore grow one; the worker checks this when it loads the node.
+   request constants to every node of the step's walk. The step that samples the reply's
+   first token, the last prefill before decode, sets ``FINAL_PREFILL`` (from
+   ``mstar.conductor.request_info``) in its step metadata; ``media_prefill_step`` does
+   this for a ``MultimodalDecoderModel``.
    A step whose walk a stream feeds and that is a bare node runs once per chunk until the
    worker reports the stream's final chunk; any other step advances when its walk
    reports, and the partition is done after its last step. A ``ValueError`` here refuses
@@ -1249,7 +1248,7 @@ methods are:
    the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. Its
    ``last_prefill_flag`` names the ``step_metadata`` flag of the pass whose token is the
    reply's first, so a stop id sampled on an earlier pass ends nothing. ``SampledTokenDecoder``
-   names ``FINAL_PREFILL``, which the conductor sets on the plan step before a KV growth walk. It suits a partition with nothing left to run once
+   names ``FINAL_PREFILL``, which the model's walk plan sets on that step. It suits a partition with nothing left to run once
    generation stops: ``END_PARTITION`` ends the partition whatever its plan has left, so a
    model that runs another walk after its loop (an ``align`` walk, or image generation after
    thinking) or publishes final-only state at the loop's stop must not return it there. Keep
@@ -2748,7 +2747,7 @@ the encoders' outputs into the prompt's embeddings inside the forward
 (``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
-loop; a stop id on the prefill row (the step the conductor marks ``FINAL_PREFILL``), or
+loop; a stop id on the prefill row (the step the walk plan marks ``FINAL_PREFILL``), or
 a one-token budget, ends the partition before decode runs. The loop's cap,
 ``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
 ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and

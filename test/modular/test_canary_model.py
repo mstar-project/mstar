@@ -384,7 +384,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one(width):
     node = _tiny_node()
 
     def info(ignore_eos=False, decoded=0, max_tokens=100, walk="decode"):
-        # the conductor marks the prefill, the step before decode, FINAL_PREFILL
+        # the walk plan marks the prefill, the step before decode, FINAL_PREFILL
         return SimpleNamespace(graph_walk=walk, resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
                                dynamic_loop_iter_counts={"decode_loop": decoded}, max_tokens=max_tokens,
                                step_metadata={FINAL_PREFILL: walk == "prefill"})

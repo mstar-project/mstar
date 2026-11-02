@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
@@ -259,7 +260,7 @@ def test_the_plan_runs_the_thinker_and_with_audio_out_the_talker_and_the_vocoder
     thinker = {"audio_output": audio}
     talker = {"voice": "Chelsie", "talker_max_tokens": 7}
     assert plans == {
-        "Thinker": [("prefill_text", {"text_inputs": "text_inputs.0"}, thinker),
+        "Thinker": [("prefill_text", {"text_inputs": "text_inputs.0"}, {**thinker, FINAL_PREFILL: True}),
                     ("thinker_decode", {"text_inputs": "new_token"}, thinker)],
         "Talker": [("talker_prefill", {}, talker), ("talker_last_prefill", {}, talker),
                    ("talker_decode", {}, {"talker_max_tokens": 7})] if audio else [],

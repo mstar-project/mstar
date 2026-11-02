@@ -353,7 +353,7 @@ def test_llm_check_stop():
         ignore_eos = False
 
     def info(walk, decoded, max_tokens=4096):
-        # the conductor marks the prefill, the step before decode, FINAL_PREFILL
+        # the walk plan marks the prefill, the step before decode, FINAL_PREFILL
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": _Cfg()},
                               "dynamic_loop_iter_counts": {"decode_loop": decoded},
@@ -467,7 +467,7 @@ def test_graph_resources_and_walk_plan():
         "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
         {MEDIA_LAYOUT: layout},
     ) == [
-        WalkStep(PREFILL_WALK, step_metadata={MEDIA_LAYOUT: layout}),
+        WalkStep(PREFILL_WALK, step_metadata={MEDIA_LAYOUT: layout, FINAL_PREFILL: True}),
         WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"}),
     ]
 

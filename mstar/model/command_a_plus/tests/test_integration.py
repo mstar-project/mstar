@@ -39,7 +39,7 @@ def info(walk="prefill", max_tokens=6, ignore_eos=False, index=0, layout=None):
         request_id="a", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=max_tokens,
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": index} if walk == "decode" else {},
-        # the conductor marks the prefill, the step before decode, as the reply's first token's
+        # the walk plan marks the prefill, the step before decode, as the reply's first token's
         step_metadata={
             **({} if walk == "decode" else {FINAL_PREFILL: True}), **({} if layout is None else {MEDIA_LAYOUT: layout}),
         },
