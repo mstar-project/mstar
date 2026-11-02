@@ -17,13 +17,13 @@
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
 The rolling self-attention K/V live in the engine's rolling KV store
-(``DIT_KV``): a slot per request, the sink plus the latest window kept
-compacted, so a chunk's keys are one contiguous range. The attention over
-them is a ragged cross-attention (``DIT_ATTN``) whose step pairs the chunk's
-queries with that range and with the text. The text K/V (computed once per
-request) and the VAE encoder's and decoder's causal-conv caches stay in the
-request's ``PerRequestState``; a request seeds them only once its first chunk
-holds a slot, so the slots bound them too.
+(``DIT_KV``): each request takes a region of the pool, its sink plus the
+latest window kept compacted, so a chunk's keys are one contiguous range. The
+attention over them is a ragged cross-attention (``DIT_ATTN``) whose step
+pairs the chunk's queries with that range and with the text. The text K/V
+(computed once per request) and the VAE encoder's and decoder's causal-conv
+caches stay in the request's ``PerRequestState``; a request seeds them only
+once its first chunk holds a region, so the pool bounds them too.
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
