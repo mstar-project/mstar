@@ -754,7 +754,7 @@ class LoraAdapterPool(Resource):
         in its now-unheld slot, as a cache."""
         del step
         if ctx.graph_walk != PIECEWISE_WALK:
-            self._current = None
+            self._unplanned()
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
@@ -772,18 +772,24 @@ class LoraAdapterPool(Resource):
 
     def commit(self, step: LoraStep, ctx: StepContext) -> None:
         del step
-        if ctx.graph_walk != PIECEWISE_WALK:
-            # nothing reads the addressing past the step's forward: a delta called
-            # before the next plan refuses rather than add these rows' adapters
-            self._current = None
-        elif self._enclosing is not None:
+        if ctx.graph_walk == PIECEWISE_WALK and self._enclosing is not None:
             # the region is done; the eager code after it reads the enclosing plan
             (self._current, self.active), self._enclosing = self._enclosing, None
+        else:
+            # nothing reads the addressing past the step's (or a region capture's)
+            # forward: a delta called before the next plan refuses rather than add
+            # these rows' adapters
+            self._unplanned()
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
             for rid in [r for r in self._admit_taken if ctx.is_real_row(r)]:
                 del self._admit_taken[rid]
+
+    def _unplanned(self) -> None:
+        """No step's addressing: a delta refuses until the next plan, eagerly in its own
+        check, compiled in ``addressing`` (which it reaches with ``active`` set)."""
+        self._current, self.active = None, True
 
     def _take(self, rid, slot: int) -> None:
         """Caller holds the lock."""

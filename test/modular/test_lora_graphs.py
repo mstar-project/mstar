@@ -304,7 +304,9 @@ def test_a_base_only_step_launches_no_delta_captured_or_eager(adapters):
 
 def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapters):
     """A region captured with LoRA plans its own rows (active), and its commit restores
-    the enclosing base-only step's state for the eager code after it."""
+    the enclosing base-only step's state for the eager code after it. Past the step, and
+    past a region's capture (which plans outside any step), no plan is left: a delta
+    refuses, eager or compiled, rather than add a base-only skip or a capture's rows."""
     pool = LoraAdapterPool(P.make_spec(adapters[1]), "cpu", backend=(backend := _CountingBackend()))
     P.ingest(pool, "b", None)
     outer_s, outer_c = P.step(["b"]), P.ctx(["b"])
@@ -319,6 +321,25 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
     assert pool.active
     pool.commit(rs, rc)
     assert not pool.active and not _delta_runs(pool, backend)
+    pool.commit(outer_s, outer_c)
+    delta = pool.layer_delta("qkv", 0)
+    x, y = torch.randn(4, P.HIDDEN, dtype=F64), torch.zeros(4, P.Q_OUT + 2 * P.KV_OUT, dtype=F64)
+
+    def layer(x, y):
+        return delta(x, y) * 2
+
+    torch._dynamo.reset()
+    compiled = torch.compile(layer, backend="eager")
+    with pytest.raises(RuntimeError, match="no plan"):
+        compiled(x, y)
+    cs, cc = P.step([-1], [4]), StepContext(
+        request_ids=[-1], graph_walk=PIECEWISE_WALK, slot=0, capture=True, slot_lease=region)
+    assert pool.admit(cs, cc).ok
+    pool.plan(cs, cc)
+    pool.commit(cs, cc)
+    for call in (delta, compiled):
+        with pytest.raises(RuntimeError, match="no plan"):
+            call(x, y)
 
 
 def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
