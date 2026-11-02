@@ -83,19 +83,6 @@ def gather_sequence(
     ).contiguous()
 
 
-def my_rows(group: CommGroup, batch: int) -> slice:
-    """This rank's even share of ``batch`` leading rows, for a lockstep instance
-    that splits a batch rather than the sequence (e.g. CFG branches, one per
-    rank). No communication; ``group.all_gather(x, dim=0)`` reassembles the
-    batch, and a trivial group keeps every row. A batch the instance cannot
-    split evenly is refused: every rank holds the same ``batch`` and group, so
-    all of them raise."""
-    share, rem = divmod(batch, group.world_size)
-    if rem or not share:
-        raise ValueError(f"cannot split {batch} rows evenly over a {group.world_size}-rank instance")
-    return slice(group.rank * share, (group.rank + 1) * share)
-
-
 def ulysses_attention(
     sp_group: CommGroup,
     q: torch.Tensor,

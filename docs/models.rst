@@ -375,10 +375,11 @@ BAGEL notes
   image guidance off, and the main branch alone outside ``cfg_interval``, about
   -37% latency at 1024² on an H200. A step then computes fewer rows and returns
   the main branch's velocity outside the interval where it used to recombine all
-  three, which is equal only up to rounding, so images move: seeded
-  text-to-image at the default guidance is about 31 dB PSNR from the previous
-  output (about 60 dB between two cold boots of one version), and generation
-  without guidance about 41 dB. Edits stay within their boot-to-boot spread.
+  three, which is equal only up to rounding, so images move. Against the
+  previous output on one GPU, seeded text-to-image at the default guidance is
+  34 dB PSNR at worst and 45 dB at the median (58–60 dB between two boots of
+  one version), text-to-image without guidance 42 / 53 dB, and edits 24 / 40 dB,
+  about what two runs of one version's edit differ by (23 / 39 dB).
 - A guided request's steps inside ``cfg_interval`` run as a walk of their own,
   ``image_gen_guided2`` (``image_gen_guided3`` with image guidance), between
   ``image_gen_head`` and ``image_gen``. A config that places ``LLM`` per walk
@@ -458,19 +459,35 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder ``32 ... 8192`` (powers of two); a step pads to its bucket and a longer
-one runs eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
+ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
+step's decode rows and batches a few tokens over; a mixed step keeps only the
+powers of two past 2176); a step pads to its bucket and a longer one runs
+eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
 deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` add 3072, 5120, 6144 and
-7168, which cut the padding of compute-bound long prefills (+2% output tok/s
-on 9B, random 1024/256 at c=64/128, H200); the same ladder was not a win on
-0.8B, whose prefill is launch-bound. Each bucket adds captures and startup time.
+worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 8192,
+2176 for a mixed step, and 3072, 5120, 6144 and 7168 in place of 4352 and 8704
+(with those two the ladder makes 84 compiles, Dynamo's whole recompile limit,
+leaving none spare). Adding 3072-7168 cut the padding of
+compute-bound long prefills (+2% output tok/s on 9B, random 1024/256 at
+c=64/128, H200, measured before 2176 was added); the same ladder was not a win
+on 0.8B, whose prefill is launch-bound. Each bucket adds captures and startup
+time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on
 0.8B, H200). Greedy output can differ from earlier releases at near-tie
-tokens; prefill and eager steps are unchanged.
+tokens; prefill and eager steps are unchanged (``knobs: {ingraph_decode_rope: true}``
+does the same for captured text prefill and mixed steps).
+
+The prefill, mixed and vision captures compile in Inductor's deterministic mode
+whatever ``-O`` says: autotuning them bought no GPU time and took about a fifth of
+the cold start. The decode capture keeps the ``-O`` level's tuned kernels. ``knobs:
+{compile_deterministic: true}`` compiles it deterministically too: greedy output then
+reproduces across server processes and the cold start more than halves. One-row
+decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
+at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
+c=4 up it makes no difference.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
@@ -481,8 +498,11 @@ With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
 token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
 token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
-with a 400. Top alternatives and OpenAI's ``logprobs`` are not supported yet. On
-any deployment,
+with a 400. Add ``enable_processed_logprobs: true`` and ``"logprobs_mode":
+"processed"`` for the log-prob under the distribution it was actually drawn from
+(penalties and top-k/top-p applied); greedy requests want ``"raw"``, as a greedy
+token scores 0 there. Top alternatives and OpenAI's ``logprobs`` are not
+supported yet. On any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.
@@ -1524,11 +1544,14 @@ first use. The first DiT call after startup is traced twice (a guard on the
 rotary table), so a server compiles at most two graphs per listed shape plus
 one.
 
-**UniPC runs inline, inside the DiT node.** Unlike cosmos3, the scheduler is not
-a separate stage: the solver state (the order-2 history buffer and the
-corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
-travels with the request rather than living in a scheduler object on one rank.
-Requests are therefore independent and the loop is resumable across ranks.
+**UniPC runs inline, inside the DiT node.** The scheduler is the DiT scaffold's
+(``components/diffusion/unipc.py``, which cosmos3 runs too), not a separate
+stage: the solver state (the order-2 history buffer and the corrector's
+``last_sample``) is carried on the denoise loop's own edges, so it travels with
+the request rather than living in a scheduler object on one rank. Requests are
+therefore independent and the loop is resumable across ranks. ``dit_max_batch_size``
+(default 1) lets requests at one latent grid and guidance scale share a forward,
+each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
@@ -1555,18 +1578,9 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
-**Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
-the dit as a two-rank lockstep instance (``sp_size: 2``, though nothing splits
-the sequence) that splits the classifier-free guidance batch: each rank runs one
-branch at batch 1 and the two noise predictions are all-gathered
-every step, so a guided step costs one branch's forward (502 vs 1000 ms at
-1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps;
-measured on that earlier version). The
-text encoder and VAE run on rank 0. Without guidance both ranks compute the same
-step, correct but no faster. For throughput under concurrency,
-``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
-at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
-decode; measured on that earlier version), while one request takes the 1-GPU time.
+**Two GPUs.** ``configs/wan22_dp2.yaml`` serves a whole replica per GPU: 5.2
+videos/min at 4 concurrent on H200s (measured on an earlier version), while one
+request takes the 1-GPU time.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

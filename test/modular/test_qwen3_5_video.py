@@ -588,6 +588,35 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
     assert not config.can_lease([request(2), request(3)])
 
 
+def test_vision_block_loop_replays_exactly_when_leased():
+    """The forward replays when its step leased the region and runs eagerly
+    otherwise, whatever the runner's buckets allow: ``can_lease`` may have
+    refused a batch that fits one."""
+    from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP
+
+    class Runner:
+        def can_run(self, batch_size, total_tokens):
+            return True
+
+        def run(self, **kwargs):
+            self.ran = kwargs
+            return SimpleNamespace(get_view=lambda name: "replayed")
+
+    encoder, runner = _encoder(max_segments=4), Runner()
+    hidden = cos = sin = torch.zeros(8, 32)
+
+    def replay(leases):
+        engine_inputs = SimpleNamespace(
+            piecewise_runners={VISION_BLOCK_LOOP: runner}, piecewise_leases=leases, request_ids=["r"],
+        )
+        return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, (4, 4))
+
+    assert replay({}) is None
+    assert not hasattr(runner, "ran")
+    assert replay({VISION_BLOCK_LOOP: object()}) == "replayed"
+    assert runner.ran["seq_lens"] == [4, 4]
+
+
 def test_vision_batch_that_overflows_one_replay_runs_request_by_request():
     """Requests that fit a replay alone but not together are not packed into
     one eager step: ``can_batch`` refuses, and each replays on its own."""

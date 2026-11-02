@@ -145,15 +145,13 @@ class AuTEncoderSubmodule(NodeSubmodule):
     def _replay_encode(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, windows: list[int],
     ) -> torch.Tensor | None:
-        """The stack replayed for the whole packed batch, or None if the step
-        did not lease it."""
-        runner = engine_inputs.piecewise_runners.get(AUT_ENCODE)
-        if runner is None:
+        """The stack replayed for the whole packed batch, or None if not leased."""
+        if AUT_ENCODE not in engine_inputs.piecewise_leases:
             return None
         bs = len(engine_inputs.request_ids)
         # an owned copy: the encoder states leave this worker after the step,
         # and the buffer is the next replay's
-        return runner.run(
+        return engine_inputs.piecewise_runners[AUT_ENCODE].run(
             static_inputs={"hidden": hidden},
             request_ids=list(engine_inputs.request_ids),
             seq_lens=windows,

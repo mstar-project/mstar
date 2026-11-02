@@ -449,7 +449,6 @@ class _Encoder:
         self.node.bind_node_resources(self.resources)
         self.runner = StepRunner(self.resources)
         self.regions = {}       # the piecewise runners, captured on CPU, by label, when a test sets them
-        self.leases = {}        # the regions the last declaration's step leased
 
     def prepare(self, handle, chunk, final=False):
         inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
@@ -464,7 +463,6 @@ class _Encoder:
         engine._submodules = {"conformer_encoder": SimpleNamespace(piecewise_runners=self.regions)}
         ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
         engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
-        self.leases = ctx.piecewise_leases
         return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
 
     def step(self, rids, inputs) -> BatchedModelOutput:
@@ -486,13 +484,9 @@ class _Encoder:
             step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))
             assert self.runner.admit(step).ok
             self.runner.plan(step)
-        from mstar.engine.engine import SubmoduleManagement
-
-        # the regions the engine hands this step's forward
-        runners = SubmoduleManagement.runners_for(SimpleNamespace(piecewise_runners=self.regions), self.leases)
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
-            piecewise_runners=runners, step=step,
+            piecewise_runners=dict(self.regions), step=step,
         )
         with torch.no_grad():
             out = self.node.forward_batched("encode", engine_inputs,

@@ -223,8 +223,8 @@ class OmniASRCTCSubmodule(NodeSubmodule):
                 rows[row] = x[i, :n]
         packed = rows[0] if len(rows) == 1 else torch.cat(rows)
         frames = [r.shape[0] for r in rows]
-        runner = engine_inputs.piecewise_runners.get(ENCODER_LOOP)
-        if runner is not None:
+        if ENCODER_LOOP in engine_inputs.piecewise_leases:
+            runner = engine_inputs.piecewise_runners[ENCODER_LOOP]
             # all of the step's segments under one row (`one_row_per_step`);
             # a copy, since the output buffer is overwritten by the next
             # step's replay
