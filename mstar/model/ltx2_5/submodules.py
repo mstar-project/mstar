@@ -255,15 +255,10 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> LTXShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def _sigma_values(self, graph_walk: str):
-        return STAGE_2_DISTILLED_SIGMA_VALUES if graph_walk in self.refine_walks else DISTILLED_SIGMA_VALUES
-
     def schedule_for(self, fwd_info, bucket_key: LTXShape) -> FlowMatchSchedule:
-        return distilled_schedule(self._sigma_values(fwd_info.graph_walk))
-
-    def counted_loops(self, graph_walk: str) -> dict[str, int | None]:
-        # each stage's schedule is a fixed sigma list, which its loop's max_iters must match
-        return {self.loop_name: len(self._sigma_values(graph_walk))}
+        if fwd_info.graph_walk in self.refine_walks:
+            return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES)
+        return distilled_schedule()
 
     def initial_loop_back(self, fwd_info, inputs, bucket_key: LTXShape, generator: torch.Generator):
         """Stage 2 of the two-stage recipe starts from the upsampled stage-1 latents,

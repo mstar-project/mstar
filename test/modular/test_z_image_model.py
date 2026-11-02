@@ -104,6 +104,17 @@ def test_schedule_and_caption_bucket_from_token_count():
     assert shape == ZShape(grid=(64, 48), cap_len=64) and shape.image_tokens_padded == 3072
 
 
+@pytest.mark.parametrize("requested", [3, 10**6])
+def test_the_loop_cap_is_the_schedules_step_count(requested):
+    """The DiT indexes its schedule by the loop counter, so the loop must end on
+    the step count the schedule is built from, clamped to the loop's ceiling."""
+    model = _make_model()
+    plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
+                           {"num_inference_steps": requested})
+    steps = plan[-1].step_metadata["num_inference_steps"]
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP: steps}
+
+
 def test_capture_shapes_cover_sizes_times_caption_buckets():
     model = _make_model(capture_sizes=[[1024, 1024]], capture_caption_lengths=[32, 64])
     assert [s.cap_len for _, s in model.capture_buckets()] == [32, 64]

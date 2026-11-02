@@ -165,10 +165,15 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
         model.process_prompt("x", ["image", "text"], ["image"], tensors=too_many)
 
 
-def test_steps_are_clamped_to_the_loop_ceiling():
+@pytest.mark.parametrize("requested", [3, 10_000])
+def test_the_loop_cap_is_the_schedules_step_count(requested):
+    """The DiT indexes its schedule by the loop counter, so the loop must end on
+    the step count the schedule is built from, clamped to the loop's ceiling."""
     model = _make_model()
-    plan = model.walk_plan("default", ["text"], ["image"], _text_signals(), {"num_inference_steps": 10_000})
-    assert plan[0].step_metadata["num_inference_steps"] == model.config.max_denoise_steps
+    plan = model.walk_plan("default", ["text"], ["image"], _text_signals(), {"num_inference_steps": requested})
+    steps = plan[0].step_metadata["num_inference_steps"]
+    assert steps == min(requested, model.config.max_denoise_steps)
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP: steps}
 
 
 # ----------------------------------------------------------------------

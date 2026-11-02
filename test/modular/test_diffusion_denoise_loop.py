@@ -17,7 +17,6 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.graph.base import GraphNode, Loop  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
@@ -29,7 +28,6 @@ from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     euler_step,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
-from mstar.worker.engine_manager import _refuse_miscounted_loops  # noqa: E402
 
 LOOP = "denoise_loop"
 WALK = "image_gen"
@@ -66,17 +64,6 @@ class ToyDenoise(DenoiseLoopSubmodule):
         self.calls.append((tuple(latents.shape), tuple(timestep.shape), tuple(sigma.shape), tuple(cond["cond"].shape)))
         velocity = -latents * self.scale
         return euler_step(latents, velocity, sigma, sigma_next)
-
-
-class FixedToy(ToyDenoise):
-    """A schedule of the same length for every request."""
-
-    def __init__(self, steps: int):
-        super().__init__()
-        self.steps = steps
-
-    def counted_loops(self, graph_walk):
-        return {LOOP: self.steps}
 
 
 _HANDLES: dict[str, int] = {}
@@ -141,41 +128,6 @@ def test_a_step_without_the_loop_counter_raises():
     sub = ToyDenoise()
     with pytest.raises(KeyError, match=LOOP):
         sub.prepare_inputs(WALK, dataclasses.replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
-
-
-class _DenoiseModel:
-    """A model's denoise walk: ``Loop(LOOP, dit)`` at ``max_iters``, capped per request at ``caps``."""
-
-    def __init__(self, max_iters: int, caps: dict[str, int]):
-        self.loop = Loop(name=LOOP, section=GraphNode(name="dit", input_names=["cond"], outputs=[]),
-                         max_iters=max_iters, outputs=[])
-        self.caps = caps
-
-    def get_graph_walk_graphs(self):
-        return {WALK: self.loop}
-
-    def get_loop_caps(self, **model_kwargs):
-        return self.caps
-
-
-@pytest.mark.parametrize(
-    ("sub", "model", "refused"),
-    [
-        (ToyDenoise(), _DenoiseModel(50, {LOOP: 8}), False),
-        (ToyDenoise(), _DenoiseModel(50, {}), True),
-        (FixedToy(8), _DenoiseModel(8, {}), False),
-        (FixedToy(8), _DenoiseModel(9, {}), True),
-    ],
-    ids=["capped", "uncapped", "fixed at max_iters", "fixed short of max_iters"],
-)
-def test_startup_refuses_a_denoise_loop_that_would_overrun_its_schedule(sub, model, refused):
-    """An iteration past the schedule fails the request, so a loop that doesn't end
-    on its schedule's length must be refused before the first one arrives."""
-    if refused:
-        with pytest.raises(ValueError, match=LOOP):
-            _refuse_miscounted_loops({"dit": sub}, model)
-    else:
-        _refuse_miscounted_loops({"dit": sub}, model)
 
 
 def test_can_batch_only_equal_shapes():

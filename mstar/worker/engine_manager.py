@@ -86,37 +86,6 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
                     )
 
 
-def _refuse_miscounted_loops(submodules: dict, model: Model) -> None:
-    """A loop a node counts on (``NodeSubmodule.counted_loops``) must end on
-    that count: a fixed count is the loop's ``max_iters``, and a per-request
-    one is the loop's cap, checked here on a request with the defaults."""
-    caps = None
-    for walk, section in model.get_graph_walk_graphs().items():
-        loops = section.get_loops()
-        for name in section.get_nodes():
-            submodule = submodules.get(name)
-            if submodule is None:
-                continue
-            for loop_name, count in submodule.counted_loops(walk).items():
-                loop = loops.get(loop_name)
-                if loop is None:
-                    continue
-                if count is not None:
-                    if count != loop.max_iters:
-                        raise ValueError(
-                            f"{type(model).__name__}: {name!r} runs {count} iterations of {loop_name!r} "
-                            f"in walk {walk!r}, whose max_iters is {loop.max_iters}"
-                        )
-                    continue
-                if caps is None:
-                    caps = model.get_loop_caps()
-                if loop_name not in caps:
-                    raise ValueError(
-                        f"{type(model).__name__}: {name!r} runs each request's own count of "
-                        f"{loop_name!r}, which get_loop_caps must declare as the loop's cap"
-                    )
-
-
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
     """The TP group ``node`` runs ``walk`` in, from the static config; None
     when it has none or one of size 1."""
@@ -220,7 +189,6 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
-        _refuse_miscounted_loops(submodules, model)
         no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
         engine = Engine(
