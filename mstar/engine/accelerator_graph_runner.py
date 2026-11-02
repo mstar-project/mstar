@@ -2209,14 +2209,15 @@ class PiecewiseAcceleratorGraphRunner:
 
     def can_lease(self, inputs: list[NodeInputs], request_ids: Sequence) -> bool:
         """The config's ``can_lease`` for this batch; True when it sets none. A
-        ``one_row_per_step`` replay addresses every row to the first request's LoRA
-        adapter, so it is refused a batch any of whose rows runs one (the pool's answer
-        is the same on every rank), which runs the region eagerly under the node's step."""
-        if self._config.one_row_per_step and any(
-            self._resources[key].runs_adapters(request_ids) for key in self._lora_keys
-        ):
+        ``one_row_per_step`` region on a LoRA node is captured base-only (``_bucket``),
+        so it is refused a batch any of whose rows runs an adapter (the pool's answer is
+        the same on every rank), which runs the region eagerly under the node's step."""
+        if self._config.one_row_per_step and self._runs_adapters(request_ids):
             return False
         return self._config.can_lease is None or self._config.can_lease(inputs)
+
+    def _runs_adapters(self, request_ids: Sequence) -> bool:
+        return any(self._resources[key].runs_adapters(request_ids) for key in self._lora_keys)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,
@@ -2249,9 +2250,15 @@ class PiecewiseAcceleratorGraphRunner:
         is baked into the graph.
 
         A ``one_row_per_step`` region replays the step as one row named by its
-        first request, however many requests or segments it is passed.
+        first request, however many requests or segments it is passed, and base-only
+        on a LoRA node (``can_lease``): no row may run an adapter.
         """
         if self._config.one_row_per_step:
+            if request_ids is not None and self._runs_adapters(request_ids):
+                raise RuntimeError(
+                    f"piecewise {self._label!r} replays one row per step, base-only, but a "
+                    "row of this step runs a LoRA adapter (can_lease refuses such a step)"
+                )
             real_bs = 1
             if request_ids is not None:
                 request_ids = request_ids[:1]

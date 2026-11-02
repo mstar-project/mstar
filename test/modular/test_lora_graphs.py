@@ -345,7 +345,7 @@ def test_a_base_only_step_launches_no_delta_captured_or_eager(adapters):
 
 
 def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapters):
-    """A region captured with LoRA plans its own rows (active), and its commit restores
+    """A region whose capture records LoRA kernels plans its own rows (active), and its commit restores
     the enclosing base-only step's state for the eager code after it. Past the step, and
     past a region's capture (which plans outside any step), no plan is left: a delta
     refuses, eager or compiled, rather than add a base-only skip or a capture's rows."""
@@ -355,7 +355,7 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
     assert pool.admit(outer_s, outer_c).ok
     pool.plan(outer_s, outer_c)
     assert not pool.active
-    region = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 4, "vision_block_loop"))
+    region = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 4, "backbone_layers"))
     rs = P.step(["b"], [4])
     rc = StepContext(request_ids=["b"], graph_walk=PIECEWISE_WALK, slot=0, capture=False, slot_lease=region)
     assert pool.admit(rs, rc).ok
@@ -427,6 +427,9 @@ def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_bas
     assert {spec.bucket.cg_key_info for spec in runner._step_runner.built} == {"N_region"}
     assert {spec.bucket.cg_key_info for spec in one_row._step_runner.built} == {LoraBaseOnly("N_region")}
     assert one_row.can_lease([], ["b0", "b1"]) and not one_row.can_lease([], ["b0", "r1"])
+    # every row, not only the first one the replay names
+    with pytest.raises(RuntimeError, match="base-only"):
+        one_row.run({}, request_ids=["b0", "r1"])
     assert runner.can_lease([], ["b0", "r1"])
 
 
