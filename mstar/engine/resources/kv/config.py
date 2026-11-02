@@ -328,7 +328,8 @@ class PrefixSpan:
     ``length`` is how many slots the write fills and ``advance`` is how far it
     moves the position counter. ``digest`` is an item's digest, and None for
     ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end.
+    page up to the item's end. ``opens_step`` is False for a span the step of the
+    span before it writes too, in one row.
     """
     length: int
     advance: int
@@ -336,6 +337,7 @@ class PrefixSpan:
     scratch: int = 0
     digest: bytes | None = None
     end_key: bytes | None = None
+    opens_step: bool = True
 
 
 @dataclass
