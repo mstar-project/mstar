@@ -550,8 +550,6 @@ class SendInput(NamedTuple):
     new_token_counts: ParallelList[int, dict[str, int]]
 
     # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
-    # rid -> {edge name -> tokens consumed}; from StreamBuffer._consumed
-    stream_tokens_consumed: ParallelList[int, dict[str, int]] | None = None
     # rid -> (rx_info, tx_info, graph_timings). All three are populated only
     # under enable_prof, so this is None in production.
     profiling: ParallelList[int, Profiling] | None = None
@@ -575,7 +573,7 @@ class PostprocessNeed(IntEnum):
     # the outputs stored as tensors, to route: resume with ``stored``
     STORE = 2
     # the send's Python payloads (forward-pass info, publication, new-token
-    # counts, stream consumption, profiling): resume with ``send``
+    # counts, profiling): resume with ``send``
     SEND = 3
 
 

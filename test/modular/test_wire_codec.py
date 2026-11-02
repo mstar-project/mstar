@@ -203,7 +203,6 @@ def test_worker_graphs_done_full():
             new_token_counts={"tok": 5},
             resource_publish_info={},
             partition_name="p0", partition_done=True,
-            stream_tokens_consumed={"audio": 12},
             output_signal_names=["tok", "tok"],
             rx_info=[RxInfo(edge_name="e", source_entity="w1", dest_entity="w0",
                             count=2, num_bytes=99, time=0.5)],
@@ -216,7 +215,6 @@ def test_worker_graphs_done_full():
     assert body.is_first_tp_rank is False
     assert [i.uuid for i in body.persist_signals["kv"]] == ["u-a", "u-b"]
     assert body.persist_signals["kv"][0].dtype is torch.bfloat16
-    assert body.stream_tokens_consumed == {"audio": 12}
     assert body.rx_info[0].num_bytes == 99
     assert body.tx_info[0].time == pytest.approx(0.25)
     assert body.partition_done is True

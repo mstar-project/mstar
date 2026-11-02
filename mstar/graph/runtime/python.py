@@ -1629,10 +1629,6 @@ class PythonGraphRuntime(GraphRuntime):
         fwd_infos = dict(iter(input.per_request_info))
         new_token_counts = dict(iter(input.new_token_counts))
         nested_idxs = completion.nested_loop_indices
-        consumed = (
-            {} if input.stream_tokens_consumed is None
-            else dict(iter(input.stream_tokens_consumed))
-        )
         profiling = (
             {} if input.profiling is None else dict(iter(input.profiling))
         )
@@ -1741,7 +1737,6 @@ class PythonGraphRuntime(GraphRuntime):
                     rid, routing, info, fwd_info, partition,
                     graph_walk=rid_walk,
                     resource_publish_info=publications.get(rid, {}),
-                    stream_tokens_consumed=consumed.get(rid, {}),
                     # A speculatively-scheduled node has not really finished
                     # the partition, so it must not report done.
                     partition_done=(
@@ -1804,7 +1799,6 @@ class PythonGraphRuntime(GraphRuntime):
         partition: str,
         graph_walk: str,
         resource_publish_info: dict[str, PublishedInfo],
-        stream_tokens_consumed: dict[str, int],
         partition_done: bool,
         profiling: Profiling | None,
     ):
@@ -1847,7 +1841,6 @@ class PythonGraphRuntime(GraphRuntime):
                 partition_name=partition,
                 partition_done=partition_done,
                 graph_walk=graph_walk,
-                stream_tokens_consumed=stream_tokens_consumed,
                 stream_items_sent=stream_items_sent,
                 graph_timings=graph_timings,
                 rx_info=rx_info,
