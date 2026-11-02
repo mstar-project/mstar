@@ -117,6 +117,13 @@ def _thread(model, config=None, pending=None) -> PreprocessWorkerThread:
     )
 
 
+@pytest.fixture(autouse=True)
+def _two_intra_op_threads(monkeypatch):
+    # the pool divides the CPUs left by this process's intra-op threads, so
+    # 8 usable CPUs give 4 workers wherever the tests run
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 2)
+
+
 @pytest.fixture
 def worker(monkeypatch):
     monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
@@ -171,7 +178,6 @@ def test_a_higher_thread_count_shrinks_the_pool(usable, threads, workers):
 
 def test_only_a_model_that_declares_it_gets_a_pool(monkeypatch):
     monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
-    monkeypatch.setattr(torch, "get_num_threads", lambda: 2)
     serial, parallel = _thread(_Serial()), _thread(_Model())
     assert serial._prepare_pool is None
     assert parallel._prepare_workers == 4 and parallel._prepare_pool is not None
