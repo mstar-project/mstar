@@ -385,7 +385,7 @@ def test_a_step_that_writes_nothing_after_a_replay_zeroes_the_addressing(monkeyp
         h.kv.plan(step, ctx)
         h.kv.commit(step, ctx)
         torch.cuda.synchronize()
-        return h.kv._current_plan_states[LABEL].staging
+        return h.kv._current_plan_states[LABEL, 0].staging
 
     assert not read().any()
     h.step([0], 0)  # the replay writes row 0's page and offset

@@ -295,6 +295,8 @@ class FlashInferManager(AttentionManager):
 
     def row_state(self, space, node_name: str, graph_walk: str) -> RowFills:
         # a step of the walk reads its arrays off the KV rows (`_plan_rows`)
+        if graph_walk in self._row_fills:
+            raise ValueError(f"{node_name}: walk {graph_walk!r} already keeps rows in this attention")
         fills = self._row_fills[graph_walk] = RowFills()
         return fills
 

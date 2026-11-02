@@ -9,7 +9,9 @@ slot a held row's admit took fresh.
 The pool's slot table stays the host truth, and a row changes no state, so the
 rows need nothing read back. Rows report every slot as holding state: the pool
 zeroes a slot whenever it frees or resets one, so a slot with no saved state
-reads as the zeros a fresh row would start from.
+reads as the zeros a fresh row would start from. The sink is the exception: a
+padding row's ``gather`` reads what earlier padding rows left there, where the
+slot path reads zeros; padding rows' outputs are dropped either way.
 """
 from __future__ import annotations
 

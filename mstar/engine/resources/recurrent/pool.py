@@ -981,6 +981,8 @@ class RecurrentStatePool(Resource):
         labels = space.labels.get(self._name)
         if not labels:
             return RowState()
+        if graph_walk in self._rows:
+            raise ValueError(f"{node_name}: walk {graph_walk!r} already keeps rows in pool {self._name!r}")
         rows = self._rows[graph_walk] = RecurrentRows(space, labels, self.pad_index)
         return rows
 

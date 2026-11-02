@@ -166,6 +166,8 @@ class FlashInferCrossManager(CrossAttentionManager):
 
     def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
         # plans per request; only the plan is kept, by rows (`_rows_plans`)
+        if graph_walk in self._rows_walks:
+            raise ValueError(f"{node_name}: walk {graph_walk!r} already keeps rows in this attention")
         self._rows_walks.add(graph_walk)
         return RowState()
 

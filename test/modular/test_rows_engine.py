@@ -499,3 +499,19 @@ def test_a_persistent_walk_takes_no_piecewise_lease():
         ctx = StepContext(request_ids=(0, 1), graph_walk=walk, slot=0, capture=False)
         engine._maybe_lease_piecewise_regions(NODE, ctx, inputs)
         assert dict(ctx.piecewise_leases) == leased, walk
+
+
+class _Unbatched(_Toy):
+    def can_batch(self, batch, model_inputs):
+        return False
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_a_persistent_walk_s_step_that_would_run_unbatched_raises(n):
+    """Its rows' writes go back to their slots after a batched forward, which
+    an unbatched one, even of a single request, never runs."""
+    engine = _engine("cpu", sub=_Unbatched())
+    for rid in range(n):
+        engine.add_request(rid)
+    with pytest.raises(RuntimeError, match="must run batched"):
+        _step(engine, ROWS_WALK, list(range(n)))

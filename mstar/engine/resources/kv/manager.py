@@ -2710,10 +2710,13 @@ class KVManager(AttentionResource):
     def _write_rows(self, step: KVStep, ctx: StepContext, kv_rows: KVRows) -> dict:
         """The rows a step of a persistent walk changes: those that joined and
         the pages held rows gained. Its segments by label."""
-        if step.pre_forks or step.post_forks or step.sink or step.combined_labels or step.eager_write:
+        if (
+            step.pre_forks or step.post_forks or step.sink or step.combined_labels
+            or step.eager_write or step.retention
+        ):
             raise ValueError(
                 f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} takes "
-                "no forks, sink rows, combined labels or eager writes"
+                "no forks, sink rows, combined labels, eager writes or retention"
             )
         by_label = group_by_plan_label(step.segments, {})
         if by_label.keys() != kv_rows.labels.keys():
@@ -3264,6 +3267,8 @@ class KVManager(AttentionResource):
     def row_state(self, space, node_name: str, graph_walk: str) -> RowState:
         # a read-only step's plan is kept by rows (`_rows_plans`); the labels
         # the walk extends keep their lengths and pages in them (`kv.rows`)
+        if graph_walk in self._rows_walks:
+            raise ValueError(f"{node_name}: walk {graph_walk!r} already keeps rows in KV {self.name}")
         self._rows_walks.add(graph_walk)
         labels = space.labels.get(self.name)
         if not labels:

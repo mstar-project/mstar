@@ -1562,15 +1562,16 @@ class Engine:
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
                 if not batch.running_batched and lease is None:
-                    # the unbatched forward has per-request outputs: no rows to stay on
-                    batch.rows_only = False
-                    batch.loopback_rids = frozenset()
-                if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
+                    # the rows' writes go back to their slots after a batched forward
                     if batch.step_context.rows is not None:
                         raise RuntimeError(
                             f"{batch.node_name}: walk {batch.graph_walk!r} keeps "
                             "persistent rows, so its steps must run batched"
                         )
+                    # the unbatched forward has per-request outputs: no rows to stay on
+                    batch.rows_only = False
+                    batch.loopback_rids = frozenset()
+                if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
