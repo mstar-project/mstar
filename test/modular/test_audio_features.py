@@ -11,13 +11,12 @@ import numpy as np
 import pytest
 import torch
 
-from mstar.api_server.media_io import AudioTooLongError
+from mstar.api_server.media_io import MAX_AUDIO_SECONDS
 from mstar.model.components.audio_features import (
     LogMelSpectrogram,
     NemoLogMel,
     clip_samples,
     librosa_mel_filters,
-    load_audio_file,
     load_speech_file,
     sinusoid_positions,
     slaney_mel_filter_bank,
@@ -86,20 +85,16 @@ def test_sinusoid_positions_match_hf():
         sinusoid_positions(10, 63)
 
 
-def test_load_audio_file_decodes_and_resamples(tmp_path):
+def test_load_speech_file_decodes_and_resamples(tmp_path):
     sf = pytest.importorskip("soundfile")
     t = np.arange(8000) / 8000.0
     stereo = np.stack([np.sin(2 * np.pi * 440 * t)] * 2, axis=1).astype(np.float32)
     sf.write(tmp_path / "a.flac", stereo, 8000)
-    wave = load_audio_file(str(tmp_path / "a.flac"), 16_000)
+    wave = load_speech_file(str(tmp_path / "a.flac"), 16_000, MAX_AUDIO_SECONDS)
     assert wave.dtype == torch.float32 and wave.dim() == 1
     assert abs(wave.numel() - 16_000) <= 16
     sf.write(tmp_path / "b.wav", stereo[:, :1], 16_000)
-    assert load_audio_file(str(tmp_path / "b.wav")).numel() == 8000
-    # a bounded decode refuses a longer file, and a shorter one comes back whole
-    with pytest.raises(AudioTooLongError):
-        load_audio_file(str(tmp_path / "b.wav"), 16_000, max_seconds=0.25)
-    assert load_audio_file(str(tmp_path / "b.wav"), 16_000, max_seconds=5.0).numel() == 8000
+    assert load_speech_file(str(tmp_path / "b.wav"), 16_000, MAX_AUDIO_SECONDS).numel() == 8000
 
 
 def test_load_speech_file_refuses_a_file_past_the_limit_as_it_decodes(tmp_path):

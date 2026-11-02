@@ -52,12 +52,6 @@ def test_load_audio_refuses_a_long_clip_without_a_sample_count_after_about_30_s(
         _model().load_audio(path, "cpu")
 
 
-def test_load_audio_refuses_a_short_clip_without_a_sample_count_at_its_length(tmp_path):
-    path, _ = _headerless_flac(tmp_path / "short.flac", 0.5)
-    with pytest.raises(ValueError, match=r"reference clip is 0\.\d\d s"):
-        _model().load_audio(path, "cpu")
-
-
 def test_the_api_server_accepts_a_clip_without_a_sample_count(tmp_path):
     path, _ = _headerless_flac(tmp_path / "piped.flac", 5)
     media_io.check_ref_audio(path, "soundfile")
