@@ -924,8 +924,8 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
         assert cfg.compile is False
         # One live world again: the bucket cannot be wider than it.
         assert cfg.capture_batch_sizes == [1]
-        # The v1 engine always dispatches batched; a submodule captured on bare
-        # `forward` is captured on a method that never runs.
+        # A captured forward returns per-row outputs: the engine maps a replay's
+        # entries back by row id.
         assert cfg.capture_forward_method == "forward_batched"
         assert cfg.single_request_inputs.input_seq_len == config.tokens_per_frame
 
@@ -1194,6 +1194,11 @@ def test_the_encoder_emits_the_dit_s_priming_latent(encoder, ae_config):
     # here rather than left for the dit to guess at.
     assert latent.shape == (1, 1, ae_config.channels, *ae_config.latent_shape[1:])
     assert latent.dtype == torch.bfloat16
+    # capture runs the method its config names, keyed by row
+    cfg = encoder.get_accelerator_graph_configs(torch.device("cpu"))[0]
+    captured = getattr(encoder, cfg.capture_forward_method)(PRIME_WALK, _engine_inputs(), image=image)
+    assert set(captured) == {"r0"}
+    assert torch.equal(captured["r0"]["latent"][0], latent)
 
 
 def _seed_hw_info(

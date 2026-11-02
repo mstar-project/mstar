@@ -58,43 +58,12 @@ def _loop_step(fwd_info: CurrentForwardPassInfo, step_index: torch.Tensor) -> in
     return int(step_index.reshape(-1)[0].item())
 
 
-class _SingleRequestMixin:
-    """Serve one request per step through the engine's batched entry point.
-
-    The engine always dispatches to ``forward_batched``; a submodule that only
-    defines ``forward`` never runs.  The codec nodes do not batch — each
-    request's waveform has its own length and the codec is small enough that
-    padding would cost more than it saves — so they cap at one and hand the row
-    to ``forward``, rather than claiming a batching they do not implement.
-    """
-
-    def max_batch_size(self, graph_walk: str):
-        return 1
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-        assert len(request_ids) == 1, (
-            f"{type(self).__name__} does not batch; got {len(request_ids)} "
-            "requests in one step (max_batch_size should have capped it at 1)"
-        )
-        return {
-            request_ids[0]: self.forward(
-                graph_walk, engine_inputs=engine_inputs, **kwargs
-            )
-        }
-
-
 # ---------------------------------------------------------------------------
 # ref_encoder
 # ---------------------------------------------------------------------------
 
 
-class OmniVoiceRefEncoderSubmodule(_SingleRequestMixin, NodeSubmodule):
+class OmniVoiceRefEncoderSubmodule(NodeSubmodule):
     """Higgs-Audio-v2 encode of the cloning reference.
 
     Consumes ``ref_audio_inputs`` — one mono waveform already resampled to the
@@ -113,6 +82,10 @@ class OmniVoiceRefEncoderSubmodule(_SingleRequestMixin, NodeSubmodule):
         super().__init__()
         self.codec = codec
         self.config = config
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each waveform has its own length
+        return 1
 
     def prepare_inputs(
         self,
@@ -461,7 +434,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 # ---------------------------------------------------------------------------
 
 
-class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
+class OmniVoiceCode2WavSubmodule(NodeSubmodule):
     """Decode the finished canvas and apply the reference's output shaping.
 
     Emits ``audio_output``, 1-D **int16 PCM** at the codec's sample rate: the
@@ -480,6 +453,10 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         super().__init__()
         self.codec = codec
         self.config = config
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each waveform has its own length
+        return 1
 
     def prepare_inputs(
         self,
