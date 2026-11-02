@@ -170,9 +170,10 @@ You must implement these abstract methods:
    A step whose walk a stream feeds and that is a bare node runs once per chunk until the
    worker reports the stream's final chunk; any other step advances when its walk
    reports, and the partition is done after its last step. A ``ValueError`` here refuses
-   the request with a 400, and so do a plan of ``[]`` for every partition (nothing would
-   ever run), a step whose walk is not one of its partition's, and a ``bind`` key that
-   is not an input of the step's walk. Qwen3.5 (through ``MultimodalDecoderModel``),
+   the request with a 400, and so does a plan of ``[]`` for every partition (nothing would
+   ever run). A plan the conductor can't run is a model bug, refused with a 500: a step
+   whose walk is not one of its partition's, or a ``bind`` key that is not an input of
+   the step's walk. Qwen3.5 (through ``MultimodalDecoderModel``),
    Z-Image, Orpheus and Chatterbox are references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``

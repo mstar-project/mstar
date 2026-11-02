@@ -875,9 +875,10 @@ class Model(ABC):
         ``step_metadata``. A step whose
         walk a stream feeds, and that is a bare node (or its chunk loop), runs
         once per chunk until the worker reports the stream's final chunk. A
-        ``ValueError`` refuses the request with a 400, and so do a plan of
-        ``[]`` for every partition, a step whose walk is not the partition's,
-        and a ``bind`` key that is not an input of the step's walk.
+        ``ValueError`` refuses the request with a 400, and so does a plan of
+        ``[]`` for every partition. A plan the conductor can't run is a model
+        bug, refused with a 500: a step whose walk is not the partition's, or a
+        ``bind`` key that is not an input of the step's walk.
         """
 
     @abstractmethod

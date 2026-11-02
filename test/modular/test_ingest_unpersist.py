@@ -464,26 +464,28 @@ def test_a_walk_plan_sends_each_steps_inputs_and_releases_their_last_read(tmp_pa
 
 
 _REFUSED = {
-    # no worker would ever report on it, so nothing would end it
-    "no partition has a walk": ({"default": []}, None, "no walk to run"),
-    # a walk the model doesn't have fails the same check
-    "a walk of another partition": ({"A": [WalkStep("b")], "B": []}, {"A": ["a"], "B": ["b"]},
+    # no worker would ever report on it, so nothing would end it; the request's
+    # content can lead there (a model with no walk for its modalities)
+    "no partition has a walk": ({"default": []}, None, 400, "no walk to run"),
+    # a model bug: a walk the model doesn't have fails the same check
+    "a walk of another partition": ({"A": [WalkStep("b")], "B": []}, {"A": ["a"], "B": ["b"]}, 500,
                                     "not one of its walks"),
-    "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None,
+    "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None, 500,
                                          "not inputs of that walk"),
 }
 
 
 @pytest.mark.parametrize("case", list(_REFUSED))
-def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, case):
-    """A 400, before any worker hears of the request."""
-    plans, groups, message = _REFUSED[case]
+def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog, case):
+    """Before any worker hears of the request: a 400 when the request leads
+    there, a 500 whose text only the log has when the model's plan is wrong."""
+    plans, groups, status, message = _REFUSED[case]
     walks = {name: GraphNode(name=f"n{name}", input_names=["x"], outputs=[]) for name in ("a", "b")}
     c = _conductor(_ToyModel(walks, plans, groups), [{"node_names": ["na", "nb"], "ranks": [0]}], tmp_path,
                    monkeypatch)
     _run(c, [[_new_request("r", {"x": [_info(PROMPT)]})]])
 
     failed = [m.body for _, m in c.comm.sent if getattr(m, "message_type", None) == "request_failed"]
-    assert [(f.request_id, f.status) for f in failed] == [("r", 400)]
-    assert message in failed[0].error_message
+    assert [(f.request_id, f.status) for f in failed] == [("r", status)]
+    assert message in (failed[0].error_message if status == 400 else caplog.text)
     assert not _sends(c, ("NEW_REQUEST",)) and "r" not in c.requests

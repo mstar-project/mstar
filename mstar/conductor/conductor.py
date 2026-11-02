@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 
 import torch
 import yaml
+from fastapi import HTTPException
 
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -1302,19 +1303,19 @@ class Conductor:
             )
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key
-            # that isn't an input of the step's walk
+            # that isn't an input of the step's walk. A model bug, so a 500.
             for step in pstate.plan:
                 if step.walk not in p.graph_walks:
-                    raise ValueError(
+                    raise HTTPException(status_code=500, detail=(
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} runs {step.walk!r}, "
                         f"which is not one of its walks {sorted(p.graph_walks)}"
-                    )
+                    ))
                 inputs = {name for name, _ in self._walk_inputs[step.walk]}
                 if unknown := sorted(set(step.bind) - inputs):
-                    raise ValueError(
+                    raise HTTPException(status_code=500, detail=(
                         f"{type(self.model).__name__}'s plan binds {unknown} on {step.walk!r}, which are not "
                         f"inputs of that walk; its inputs are {sorted(inputs)}"
-                    )
+                    ))
             pstate.is_done = not pstate.plan
         if all(pstate.is_done for pstate in partition_states.values()):
             # no worker would ever report, so nothing would end the request
@@ -2005,7 +2006,9 @@ class Conductor:
         if partition_name in self.producer_triggered_partitions:
             k = next((j for j in range(k, len(plan)) if plan[j].walk == walk), None)
             if k is None:
-                raise ValueError(f"partition {partition_name!r} ran walk {walk!r}, which its plan has no more of")
+                raise HTTPException(status_code=500, detail=(
+                    f"partition {partition_name!r} ran walk {walk!r}, which its plan has no more of"
+                ))
             pstate.cursor = k
             if k + 1 < len(plan) and not self._walk_inputs[plan[k + 1].walk]:
                 return stay
