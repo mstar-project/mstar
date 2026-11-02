@@ -61,7 +61,7 @@ def test_an_eager_step_of_one_token_prompts_samples_every_row(manager):
         [SequenceView(rid, "main", [1 + i], 1, 1) for i, rid in enumerate("abc")], page_size=16,
     )
     ctx = types.SimpleNamespace(
-        slot_lease=None, is_preplan=False, force_prefill=False, slot=0,
+        slot_lease=None, is_preplan=False, force_prefill=False, slot=0, plan_phase="res.plan",
         plan_results={"kv": {"main": types.SimpleNamespace(cpu_indptrs=indptrs)}},
     )
     manager.plan(AttentionStep(causal=True), ctx)

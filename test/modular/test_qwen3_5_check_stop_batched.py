@@ -75,7 +75,8 @@ def test_a_last_prefill_stop_token_ends_the_partition(mixed):
     }
     if mixed:
         infos["dec"] = _info()
-    tokens = torch.tensor([EOS, EOS, EOS, 3, EOS][:len(infos)])
+    # early, last, media and ignored sample a stop id; one doesn't, dec does
+    tokens = torch.tensor([EOS, EOS, EOS, EOS, 3, EOS][:len(infos)])
     got = LLMSubmodule.check_stop_batched(_sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}))
     assert got == {
         "last": {END_PARTITION}, "media": {END_PARTITION}, "one": {END_PARTITION},
