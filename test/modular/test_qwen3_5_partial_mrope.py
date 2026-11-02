@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.model.qwen3_5.components import language_model
+from mstar.model.qwen3_5.components import language_model, vision
 from mstar.model.qwen3_5.components.language_model import Qwen3_5LanguageModel
 from mstar.model.qwen3_5.components.rope import apply_partial_mrope, compute_inv_freq
+from mstar.model.qwen3_5.components.vision import VisionRotaryEmbedding
 from mstar.model.qwen3_5.config import FULL_ATTENTION, Qwen3_5Config
 
 
@@ -69,3 +70,30 @@ def test_rope_frequencies_keep_the_cast_elsewhere(monkeypatch):
     monkeypatch.setattr(language_model, "current_platform", SimpleNamespace(is_rocm=lambda: False))
     lm = _tiny_language_model().to(dtype=torch.bfloat16)
     assert lm.inv_freq.dtype is torch.bfloat16
+
+
+def _vision_rope() -> VisionRotaryEmbedding:
+    return VisionRotaryEmbedding(SimpleNamespace(head_dim=72, rope_theta=10000.0))
+
+
+def test_vision_rope_frequencies_are_upstreams():
+    dim = 36
+    want = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+    assert torch.equal(_vision_rope().inv_freq, want)
+
+
+def test_vision_rope_frequencies_survive_the_dtype_cast_on_rocm(monkeypatch):
+    monkeypatch.setattr(vision, "current_platform", SimpleNamespace(is_rocm=lambda: True))
+    rope = _vision_rope().to(dtype=torch.bfloat16)
+    want = compute_inv_freq(36, 10000.0)
+    assert rope.inv_freq.dtype is torch.float32
+    assert torch.equal(rope.inv_freq, want)
+    position_ids = torch.tensor([[0, 255]])
+    cos, _ = rope(position_ids)
+    assert torch.equal(cos[0, 18:36], (255.0 * want).cos())
+
+
+def test_vision_rope_frequencies_keep_the_cast_elsewhere(monkeypatch):
+    monkeypatch.setattr(vision, "current_platform", SimpleNamespace(is_rocm=lambda: False))
+    rope = _vision_rope().to(dtype=torch.bfloat16)
+    assert rope.inv_freq.dtype is torch.bfloat16
