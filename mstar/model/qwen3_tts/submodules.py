@@ -56,12 +56,10 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
+from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
-from mstar.model.qwen3_tts.components.speaker_encoder import (
-    Qwen3TTSMelFrontEnd,
-    Qwen3TTSSpeakerEncoder,
-)
+from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
@@ -999,9 +997,12 @@ class CodecSubmodule(ARNodeSubmodule):
         # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
         # trimmed PCM in ``batch_postprocess``; None leaves it untouched.
         self.watermarker = watermarker
-        # Base streams may lead with a full reference tail: capture those windows too.
+        # The shapes the codec captures; any other window (a terminal flush, a
+        # shorter reference tail) pads up to the next one. Base streams may
+        # lead with a full reference tail: capture those windows too.
         leads = (0, config.codec.left_context_frames) if config.supports_reference_audio else (0,)
-        self.windows = config.codec.codec_windows(leads)
+        policy = config.codec.chunk_policy()
+        self.windows = sorted({size for lead in leads for size in policy.window_sizes(lead)})
         self.max_window = self.windows[-1]
         self.total_upsample = 1
         for factor in (
@@ -1379,7 +1380,7 @@ class RefEncoderSubmodule(NodeSubmodule):
     def __init__(
         self,
         speaker_encoder: Qwen3TTSSpeakerEncoder,
-        mel_front_end: Qwen3TTSMelFrontEnd,
+        mel_front_end: MatchaLogMel,
         codec_encoder: torch.nn.Module,
         config: Qwen3TTSModelConfig,
     ) -> None:
@@ -1426,7 +1427,7 @@ class RefEncoderSubmodule(NodeSubmodule):
             return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
         device_type = waveform.device.type
         with torch.autocast(device_type=device_type, enabled=False):
-            mels = self.mel_front_end(waveform.unsqueeze(0))
+            mels = self.mel_front_end(waveform.unsqueeze(0)).transpose(1, 2)  # [1, frames, mel]
         encoder_dtype = next(self.speaker_encoder.parameters()).dtype
         speaker_embed = self.speaker_encoder(mels.to(encoder_dtype))[0]
 

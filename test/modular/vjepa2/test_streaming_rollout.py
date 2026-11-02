@@ -271,3 +271,20 @@ class TestInitialWalkRouting:
         assert m._initial_walk(
             {"rollout_horizon": 1, "stream_rollout": True}
         ) == VJepa2Model.PREFILL_VIDEO
+
+
+@pytest.mark.parametrize("model_factory", [_make_masked_model, _make_ac_model])
+def test_the_plan_is_the_routed_walk_and_needs_the_video(model_factory):
+    from mstar.graph.base import TensorPointerInfo
+
+    m = model_factory()
+    frames = {"video_frames": [TensorPointerInfo(
+        dims=[1], dtype="float32", nbytes=0, address=0, stride=[], uuid=0, source_session_id="", source_entity="",
+    )]}
+    [step] = m.walk_plan("default", ["video"], ["video"], frames, {"rollout_horizon": 4})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT and dict(step.step_metadata) == {"rollout_horizon": 4}
+    [step] = m.walk_plan("default", ["video"], ["video"], frames, {})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO and not step.step_metadata and not step.bind
+    # every walk starts at the encoder: without frames the request could never finish
+    with pytest.raises(ValueError, match="video_frames"):
+        m.walk_plan("default", ["video"], ["video"], {}, {})

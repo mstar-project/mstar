@@ -1104,8 +1104,9 @@ Cosmos3 environment requirements
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
-  when available (torchcodec >= 0.9), otherwise with ``torchvision``'s
-  ``write_video``, which needs the PyAV (``av``) package.
+  when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
+  ``image_io.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
+  covers a torchcodec that cannot load FFmpeg.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
@@ -1143,13 +1144,13 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The decode step is captured into CUDA graphs per batch bucket and, by default,
-compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
-turns it off): the eager step is over a thousand tiny kernels, and the fused
-step runs at the weight-streaming floor (about twice the uncompiled rate at
-batch size 1 on an H100). Concurrent chat requests share decode steps
-(continuous batching over the captured decode graphs, padded to the next batch
-bucket). Requests never see each other's data, but the batch bucket changes the
+The reasoner is a ``SampledTokenDecoder``: its decode steps are captured into
+CUDA graphs per batch bucket, each compiled first: the eager decode step is over
+a thousand tiny kernels, and the fused step runs at the weight-streaming floor
+(about twice the uncompiled rate at batch size 1 on an H100). Its prefills, text
+and vision (one vision prompt a step), run eagerly and uncompiled. Concurrent chat requests share
+decode steps (continuous batching over the captured decode graphs, padded to the
+next batch bucket). Requests never see each other's data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run
 where two candidate tokens tie: in every measured divergence the two tokens'
 logits were equal or one bf16 ulp apart, the first differing token came after
@@ -1562,8 +1563,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``async_scheduling``
    The engine's speculative scheduling of the image nodes: the worker assembles a batch's
    next denoise step while the current one runs and merges requests that became ready
-   meanwhile, so requests at different steps share a forward. On by default; a step a
-   request speculates past its schedule is vetoed before any forward, and ``false``
+   meanwhile, so requests at different steps share a forward. On by default; the loop's cap
+   (the request's step count) keeps speculation from running past its schedule, and ``false``
    restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
    to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
    concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the

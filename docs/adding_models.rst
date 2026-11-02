@@ -42,20 +42,16 @@ One vocabulary note for this page. A **tensor bundle** routed between nodes is a
 usually has length 1.
 
 The diagram below shows the request flow at the conductor and model level. Its
-granularity is one graph walk. The conductor is notified when a walk completes, and only
-then asks the model what to do next. Everything that happens inside a walk is described
-in later steps and is omitted here::
+granularity is one graph walk. The model decides at ingest which walks a request runs; the
+conductor runs them in order, moving on as each walk completes. Everything that happens
+inside a walk is described in later steps and is omitted here::
 
    process_prompt()              # text/media -> initial tensors
         │
         ▼
-   get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
+   walk_plan()                   # per partition: the walks to run (e.g. prefill, decode)
         │
-        ▼   (conductor walks the graph, the engine runs each node)
-   get_partition_forward_pass_args() # asked after each graph walk completes:
-                                     #   what's next? done?
-        │
-        ▼
+        ▼   (conductor sends each walk its inputs, the engine runs each node)
    postprocess()                 # model output tensor -> bytes for the client
 
 What you will create
@@ -156,15 +152,29 @@ You must implement these abstract methods:
    separately. :mod:`mstar.model.multimodal` turns either into the prefill plan
    that ``process_prompt`` and the schedule builder both work from.
 
-``get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None) -> ForwardPassArgs``
-   Build the first :class:`mstar.model.base.ForwardPassArgs` for a partition. It names
-   the graph walk to start on and the input edges that feed it.
-
-``get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals, incoming_connections=None) -> ForwardPassArgs``
-   The conductor calls this after each graph walk completes. It returns the next walk,
-   the inputs for that walk, and whether the request is finished
-   (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
-   once, then repeats the decode walk until EOS.
+``walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs) -> list[WalkStep]``
+   The walks a partition runs for this request, in order, as
+   :class:`mstar.model.base.WalkStep` s; ``[]`` when the request doesn't use the
+   partition. A prefill-decode model returns
+   ``[WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]``.
+   The conductor derives each step's input edges from the walk's graph: every external
+   and loop-back input that no stream feeds gets the persisted signal of its own name,
+   the one ``bind`` names, or an empty edge (a denoise loop's seed, a chunk loop's tick).
+   A persisted tensor a step reads is released when the step is sent, unless a later step
+   of some partition reads it with no walk of that partition persisting the name in
+   between; anything else stays held until the request ends. ``step_metadata`` carries
+   request constants to every node of the step's walk. The conductor sets
+   ``FINAL_PREFILL`` (from ``mstar.conductor.request_info``) in the step metadata of a
+   step whose next step's walk grows a KV label (``KVLabel.growth``): the step that
+   samples the first token. The decode walk of a token decoder (``TokenStepNode``) must
+   therefore grow one; the worker checks this when it loads the node.
+   A step whose walk a stream feeds and that is a bare node runs once per chunk until the
+   worker reports the stream's final chunk; any other step advances when its walk
+   reports, and the partition is done after its last step. A ``ValueError`` here refuses
+   the request with a 400, and so do a plan of ``[]`` for every partition (nothing would
+   ever run), a step whose walk is not one of its partition's, and a ``bind`` key that
+   is not an input of the step's walk. Qwen3.5 (through ``MultimodalDecoderModel``),
+   Z-Image, Orpheus and Chatterbox are references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
@@ -208,45 +218,52 @@ You must implement these abstract methods:
 .. note::
 
    The metadata ``process_prompt`` returns is laid over the request's own
-   ``model_kwargs``, so a key the model reads back there (a prompt layout, a
-   stream lead) must be set in every mode and listed in ``INTERNAL_KWARGS``: the
-   data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
-   lists its prompt layout, speaker, language, clip digest and codec stream lead.
+   ``model_kwargs``, so a key the model reads back there (a prompt layout) must be
+   set in every mode and listed in ``INTERNAL_KWARGS``: the data worker drops a
+   client's value for it before ``process_prompt``. Qwen3-TTS lists its prompt
+   layout, speaker, language and clip digest.
 
 .. note::
 
-   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
-   request's ``metadata.kwargs``, so a request fact stored under a key that a
-   later walk's step metadata also uses is overwritten by that walk's value. Keep
-   such facts under their own key: LTX-2.5 nests the request's geometry under
-   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
+   A stream that starts with context-only items (a voice clone's reference frames)
+   says so in the metadata as ``"stream_lead_items": {edge: n}``: ``edge`` names a
+   streaming ``Connection``, and ``n``, at most that edge's policy's left context,
+   leads the first window as context and is never output. Leave the key out when
+   ``n`` is 0. The data worker drops a client's value, and the consumer partition's
+   workers prime the stream with it (Qwen3-TTS, VoxCPM2).
 
 The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
-``load_video``, and the partition methods described at the end of this page.
+``load_video``, and the partition methods described at the end of this page. The default
+``load_audio`` decodes an upload to mono at the class attribute ``AUDIO_INPUT_RATE``
+(16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30 minutes); set those rather
+than overriding it.
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
    end a reply, which are dropped unless the request sets ``ignore_eos``.
    ``postprocess`` and ``postprocess_inline`` derive their text paths from it. A text
    chunk may end inside a character, since the API server joins a request's text
-   chunks before decoding them, so a byte-level BPE model should declare
-   ``mstar.model.utils.TextChunkDetokenizer`` (or ``ByteLevelDetokenizer``), which
-   emits each token's raw bytes, rather than ``tokenizer.decode([id])``, which turns
-   a split character into U+FFFD.
+   chunks before decoding them, so declare a detokenizer from ``mstar.model.utils``
+   that emits each token's raw bytes (``TextChunkDetokenizer`` or
+   ``ByteLevelDetokenizer`` for byte-level BPE, ``SentencePieceDetokenizer`` for a
+   SentencePiece vocabulary) rather than ``tokenizer.decode([id])``, which turns a
+   split character into U+FFFD.
 
 ``postprocess(self, output, modality, request_kwargs=None) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on. Override it for any modality other than
-   text, and hand text to ``super().postprocess``.
+   images, and so on. The default encodes text through ``text_output`` and mono audio
+   as headerless 16-bit PCM (a float waveform in [-1, 1] is scaled and truncated;
+   integer samples are cast). Override it for any other modality, or for audio with
+   more than one channel, and hand the rest to ``super().postprocess``.
 
 ``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]``
    ``postprocess`` for one decode step's inline values (one sampled token id per
    request), called once per step. With ``text_output`` declared, each id maps to
-   its memoized bytes; otherwise each value goes through ``postprocess`` as a
-   one-element tensor.
+   its bytes (the detokenizer's ``token_bytes``); otherwise each value goes through
+   ``postprocess`` as a one-element tensor.
 
 ``Model.nodes`` is a read-only property. It returns the sorted set of node names that
 appear in any graph walk.
@@ -259,12 +276,12 @@ differ per request, such as sampling parameters and the set of cache labels a re
 uses, come from a separate method::
 
    get_request_resource_configs(
-       self, partition_fwd_args: dict[str, ForwardPassArgs],
-       model_kwargs: dict | None = None,
+       self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
    ) -> dict[str, ResourceReqConfig]
 
 The returned dict is keyed by ``resource_key``. The conductor calls this method once per
-request, and the engine passes each config to its resource when the request is ingested.
+request, with the request's modalities and kwargs as ``walk_plan`` gets them, and the
+engine passes each config to its resource when the request is ingested.
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
@@ -309,8 +326,7 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 
 .. code-block:: python
 
-   def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-       model_kwargs = model_kwargs or {}
+   def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
        return {
            SAMPLER: SamplingReqConfig(
@@ -396,15 +412,16 @@ BAGEL lays out its prompt:
 
 ``get_loop_caps(self, **model_kwargs) -> dict[str, int]``
    The iterations each named loop may run for this request. The conductor refuses a request
-   whose cap is past its loop's graph ``max_iters``, or whose layout at its caps holds more
+   whose cap is below 1 or past its loop's graph ``max_iters``, or whose layout at its caps holds more
    positions than its pool's ``max_seq_len``, with a 400. A request that sets no length has
-   the default ``max_output_tokens`` cut to the context its prompt leaves, and a stop check
-   reads that length from ``request_info.max_tokens``, which carries the cut. A model that
-   reads a length from another key lists it in ``LENGTH_KWARGS``. Speculation never runs past a
-   cap. A model whose stop
-   check ends a loop at a count returns that count, so the cap and the stop check end the
-   loop on the same iteration; ``test/modular/test_model_kv_layouts.py`` checks this for
-   every model. Growth on an uncapped loop is counted to its graph ``max_iters``.
+   the default ``max_output_tokens`` cut to the context its prompt leaves, and
+   ``request_info.max_tokens`` carries the cut. A model that reads a length from another key
+   lists it in ``LENGTH_KWARGS``. Speculation never runs past a cap, so the cap is the
+   loop's budget: a token decoder (``TokenStepNode``) returns ``max_output_tokens - 1`` for
+   its decode loop, the prefill having sampled the first token, and its stop check counts
+   nothing. A model whose own stop check also ends a loop at a count returns that count, so
+   the two end the loop on the same iteration; ``test/modular/test_model_kv_layouts.py``
+   checks this per model. Growth on an uncapped loop is counted to its graph ``max_iters``.
 
 Where ``process_prompt`` computes a length that a walk computes another way, such as a
 media item's rows, the walk asserts the two agree: BAGEL's ViT walk against
@@ -774,8 +791,9 @@ appears in no spec, so it receives no resources:
 
 .. code-block:: python
 
-   # mstar/model/orpheus/config.py
-   KV_CACHE, ATTN, SAMPLER, ROPE = "kv_cache", "attn", "sampler", "rope"
+   # mstar/model/orpheus/config.py: the keys its SampledTokenDecoder reads, and its attention's
+   KV_CACHE, SAMPLER, ROPE = keys.KV_CACHE, keys.SAMPLER, keys.ROPE
+   ATTN = "attn"
 
    # mstar/model/orpheus/orpheus_model.py
    def get_node_resources(self) -> list[NodeResourceSpec]:
@@ -1228,12 +1246,13 @@ methods are:
    reports the partition done with that pass, and the conductor ends it rather than start
    decode. Return it only from a row outside any loop; from inside one the request fails.
    ``TokenStop`` does this for the walks in its ``prefill_walks``, whose token counts toward
-   the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. A
-   model that prefills a prompt over several passes sets ``last_prefill_flag`` to the
-   ``step_metadata`` flag of its last pass, or a stop id sampled on its first pass ends
-   the request. It suits a partition with nothing left to run once generation stops: a model that runs
-   another walk after its loop (an ``align`` walk, or image generation after thinking) or
-   publishes final-only state at the loop's stop needs its own transition instead. Keep
+   the budget, so ``get_loop_caps`` gives the loop ``max(1, max_output_tokens - 1)``. Its
+   ``last_prefill_flag`` names the ``step_metadata`` flag of the pass whose token is the
+   reply's first, so a stop id sampled on an earlier pass ends nothing. ``SampledTokenDecoder``
+   names ``FINAL_PREFILL``, which the conductor sets on the plan step before a KV growth walk. It suits a partition with nothing left to run once
+   generation stops: ``END_PARTITION`` ends the partition whatever its plan has left, so a
+   model that runs another walk after its loop (an ``align`` walk, or image generation after
+   thinking) or publishes final-only state at the loop's stop must not return it there. Keep
    ``check_stop_batched``, if you write one, in agreement.
    To also keep some of this step's outputs from being routed, return
    ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
@@ -1751,8 +1770,9 @@ in batched guidance that packs the conditional and unconditional sequences toget
 static buffer must hold all of them, and this field scales the buffer independently of the
 per-label span.
 
-For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a packed
-``prefill`` graph:
+For example, a token decoder that captures a batched ``decode`` graph and a packed
+``prefill`` graph declares the following (``SampledTokenDecoder`` builds these, and a
+mixed one, for its subclasses):
 
 .. code-block:: python
 
@@ -2173,7 +2193,7 @@ A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
 encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
-rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
+rgb24 frames for PyAV's ``image_io.encode_mp4`` (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
 A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
 frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
 copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
@@ -2328,9 +2348,10 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
 
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
 the model's start and end tokens, and returns ``{"text_inputs": [ids]}``.
-``get_submodule`` builds either the Llama LLM submodule, which is an ``ARNodeSubmodule``,
-or the SNAC decoder submodule, and caches the result. ``postprocess`` returns the raw
-bytes of the audio tensor for the ``audio`` modality.
+``get_submodule`` builds either the Llama LLM submodule, a ``SampledTokenDecoder`` that
+declares little beyond its walk names, resource steps and capture buckets, or the SNAC
+decoder submodule, and caches the result. The SNAC submodule emits int16
+PCM, which the default ``postprocess`` passes through as raw bytes.
 
 Orpheus also demonstrates the async partition API, described in the next section. The LLM
 and the SNAC decoder run as two partitions connected by a streaming edge. Audio is
@@ -2386,9 +2407,10 @@ config never routes requests to them.
 **Per-request resources.** Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
 BAGEL's ``get_request_resource_configs`` therefore returns a ``KVReqConfig`` that names
-the active labels per node and walk, together with a ``SamplingReqConfig``. A request with
-guidance disabled names only ``"main"``, so a PD-disaggregated transfer copies only that
-stream.
+the active labels per node and walk, together with a ``SamplingReqConfig``. It settles
+guidance from the request's modalities and kwargs as its ``walk_plan`` does (an edit, image
+in and image out, defaults to image guidance). A request with guidance disabled names only
+``"main"``, so a PD-disaggregated transfer copies only that stream.
 
 The ``LLM`` node is deliberately coarse. It contains the text embedding, the lm_head and
 the flow projection. These always run on the same GPU, so splitting them into separate
@@ -2459,15 +2481,19 @@ KV cache, but samples no token, so it does not produce ``new_token``. The edge i
 in the graph because understanding requests need it. Treat declared edges as the possible
 outputs, and let the submodule decide which of them are produced on each step.
 
-**Choosing the walk per request.** BAGEL's transitions are driven by a schedule, unlike
-those of Orpheus. The output modality is known in advance from the request's
-``output_modalities``. ``get_initial_forward_pass_args`` therefore builds a prefill
-schedule, by iterating over the interleaved text and image inputs, and
-``get_partition_forward_pass_args`` advances through that schedule. It then transitions to
-``decode`` for text output, or to ``image_gen`` for image output. In ``think_mode``, the
-model first decodes a reasoning trace, and the EOS token then triggers the transition to
-``image_gen``. These are the same two methods that Orpheus implements. BAGEL only encodes
-a more complex state machine in them.
+**Choosing the walks per request.** BAGEL's plan follows a schedule, unlike Orpheus's two
+fixed steps. The output modality is known in advance from the request's
+``output_modalities``, so ``walk_plan`` builds the prefill schedule by iterating over the
+interleaved text and image inputs, one walk per text span or image, and then adds
+``decode`` for text output or ``image_gen`` for image output. In ``think_mode`` the model
+first decodes a reasoning trace, so the plan runs ``decode`` and then ``image_gen``.
+
+Each prefill walk reads one span, so ``process_prompt`` hands every span over as a signal
+of its own with :func:`mstar.model.multimodal.split_spans` (``text_inputs.0``,
+``image_inputs.0``, ...), and each step binds its walk's input to one:
+``WalkStep("prefill_text", bind={"text_inputs": "text_inputs.1"})``. An ids span keys the
+entry its ``source`` names, so ``split_spans`` renames the KV layout's ids-span sources to
+match. This is the same method Orpheus implements; BAGEL's plan is only longer.
 
 **Step 4 — Submodules.** Each node maps to a ``NodeSubmodule`` in ``bagel/submodules.py``:
 ``ViTEncoderSubmodule``, ``VAEEncoderSubmodule``, ``LLMSubmodule`` and
@@ -2555,11 +2581,13 @@ overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model wit
 can call the same way.
 
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
-Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``);
-Whisper's declares its own, since it writes the context eagerly and captures prefill. The
-context segments have a non-zero span in the prefill step that writes them, and a span of
-0 in every later step. The ``commit`` in the prefill step converts the reservation into
-resident pages that the later steps read.
+Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``),
+a ``SampledTokenDecoder`` that adds only the cross-attention part: the context segments,
+and the encoder output on the prefill row, which its decoder writes into the context
+before its layers read it. Whisper's declares its own, since it writes the context eagerly
+and captures prefill. The context segments have a non-zero span in the prefill step that
+writes them, and a span of 0 in every later step. The ``commit`` in the prefill step
+converts the reservation into resident pages that the later steps read.
 
 Worked example: an image DiT on the diffusion scaffold
 ------------------------------------------------------
@@ -2585,9 +2613,13 @@ iteration. The step index is the engine's loop counter
 
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
 the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
-step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
-``bucket_key`` with the Euler update inside the graph — and asks the model for:
+batching (``can_batch``), stacked ``forward_batched``, the ragged-attention
+``declare_step`` and one CUDA-graph bucket per ``bucket_key`` with the Euler update inside
+the graph — and asks the model for the hooks below. The loop ends on its iteration count:
+a model whose request picks its step count returns it from ``get_loop_caps``
+(``{"denoise_loop": steps}``), resolved exactly as ``schedule_for`` resolves it, and a
+stage that always runs its graph ``max_iters`` declares nothing. The scaffold refuses an
+iteration past the schedule. The hooks:
 
 .. code-block:: python
 
@@ -2631,7 +2663,7 @@ Shared pieces to build the components from: ``flow_match.py`` (shift schedules a
 exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
 attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
 ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
-family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
+family), ``image_io.py`` (latent packing, PNG, the mp4 encoder) and ``lora.py`` (static LoRA merge at load,
 also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``).
 
 Two pieces swap a one-pass kernel in for what Inductor would emit, inside a compiled
@@ -2674,8 +2706,8 @@ Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder
 
 The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
 which declares the walks (``media_walks(max_iters, encoders)`` and
-``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
-through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
+``text_combined_walks()``), plans the one prefill walk ``media_prefill_step`` picks
+and then decode (``walk_plan``), decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
 request's output budget less the prefill's token), the KV label and its one-span layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
@@ -2716,9 +2748,9 @@ the encoders' outputs into the prompt's embeddings inside the forward
 (``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 ``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
-loop; a stop id on the prefill row, or a one-token budget, ends the partition before
-decode runs. The loop's cap, ``max(1, max_output_tokens - 1)``, is the only budget.
-A media row's tensor holds exactly the pads in its
+loop; a stop id on the prefill row (the step the conductor marks ``FINAL_PREFILL``), or
+a one-token budget, ends the partition before decode runs. The loop's cap,
+``max(1, max_output_tokens - 1)``, is the only budget. A media row's tensor holds exactly the pads in its
 ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
@@ -2737,10 +2769,19 @@ writes:
 
 Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
 (the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
-``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
-position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
-``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, and ``MIXED_MAX_PREFILL_ROWS``
-caps a mixed step's prompt rows.
+``Qwen3_5ForCausalLM`` and ``Qwen3DenseLM`` do. The sampler is declared under
+``mstar.model.keys``' ``SAMPLER``, and the positions under the node's ``POS_KEY``
+(``ROPE`` unless the model's layers name another ``pos_key``). ``MSTAR_DECODE_BUCKETS``
+sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt
+rows, ``COMPILE_MODE`` names every capture's ``compile_mode`` (``None``, the default,
+takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
+only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
+calls it something other than ``prefill_<name>`` (the Cosmos3 reasoner's
+``reasoner_prefill_vision``). A graph that names its other walks otherwise sets
+``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
+It reports a text prompt's length and a decode row's one token
+(``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
+prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image
@@ -2751,13 +2792,20 @@ tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
 provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
 ``project(encoded, **tensors)``. A prompt whose spans under some label exceed the
 ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
-A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
+A tower builds on the pieces in ``mstar/model/components/vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
 ``VisionRotaryEmbedding`` (axial 2D rope; ``keep_fp32`` keeps its frequencies fp32
 through the node's dtype cast) and ``VisionBlock``, whose attention runs over the packed
 patches through the ragged resource under the block's ``label`` (Qwen3.5's frames;
 Muse Glimmer's windows and frames), q, k and v as one projection a split checkpoint
-loads by stacked-param rules.
+loads by stacked-param rules. An encoder of another medium need only send its ``MediaEncoder.output``,
+a row per pad in prompt order: Higgs-Audio's audio tower and Qwen3-ASR's packed AuT
+encoder are plain ``NodeSubmodule`` s on the audio walk. That walk is ``prefill_audio``
+unless the lone encoder's ``MediaEncoder.walk`` names it: Qwen3-ASR's keeps ``prefill``,
+the name its configs and metrics read. A model whose graph is not
+``MultimodalDecoderModel``'s (Canary-Qwen's LLM node is ``llm``) writes its own walks and
+hands its LLM node its ``MediaEncoder`` s and ``text_prompts`` itself, with
+``MEDIA_LAYOUT`` on the prefill step.
 
 Advanced: async partitions and streaming
 ----------------------------------------
@@ -2772,16 +2820,17 @@ Override these methods:
 - ``get_partition_topology()`` declares the partitions and the streaming ``Connection``
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
-- ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it. Every walk belongs to exactly one
-  partition.
+- ``get_partitions()`` declares each ``PartitionDefinition``: its name and its walks.
+  Every walk belongs to exactly one partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
-The consuming partition's ``get_partition_forward_pass_args`` reads
-``incoming_connections``, which provides token counts and a ``producer_done`` flag for
-each stream from another partition, and uses them to decide when to run. A stream from the
-client (below) has no entry there.
+A consuming partition's plan needs nothing about the stream. A step whose walk a stream
+feeds, and that is a bare node (or its chunk loop), runs once per chunk the stream brings,
+and the partition ends when the worker reports the pass that consumed the stream's final
+chunk. For a stream from another partition, the conductor tells the consumer
+``producer_done`` once the producer partition is done; the data worker ends a stream from
+the client (below) itself.
 
 The consumer receives each chunk as its items stacked along a new leading dimension, or as
 the item itself when the chunk holds one. Don't write into a streamed input in place: a
@@ -2819,8 +2868,9 @@ context is reused across calls, so a hook must not keep it.
 
 Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
 ``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
-ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
-``talker_last_prefill`` has run.
+ones run ``talker_decode``. Its plan lists the three walks. The conductor follows the walk
+each pass reports and enters the next step only to send it something, so it feeds
+``talker_decode`` its first input once ``talker_last_prefill`` has run.
 
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -2840,7 +2890,8 @@ producer ``CLIENT``:
 ``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
 ``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
 chunk policy, exactly as it would a stream from another partition. Its partition
-self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+self-triggers from the stream, and the conductor sends its walk none of the streamed
+input. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
 that the model implements ``process_stream_chunk``. A partition may take several client
 streams (audio and video, say): each has its own buffer and its own end.
@@ -2896,8 +2947,7 @@ Checklist
          [ ] get_node_resources
          [ ] get_graph_walk_graphs
          [ ] process_prompt
-         [ ] get_initial_forward_pass_args
-         [ ] get_partition_forward_pass_args
+         [ ] walk_plan
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs

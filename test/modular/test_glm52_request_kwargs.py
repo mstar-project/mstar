@@ -32,7 +32,7 @@ def _intake(model: Glm52Model, kwargs: dict) -> int:
     # in the order _admit_request runs them
     max_output_tokens = conductor._max_output_tokens(kwargs)
     conductor._loop_caps(kwargs)
-    configs = conductor._get_resource_configs(kwargs, {})
+    configs = conductor._get_resource_configs(["text"], ["text"], kwargs)
     for specs in conductor._resource_specs():
         for key, cfg in configs.items():
             cfg.validate(specs.get(key))
@@ -45,8 +45,8 @@ def _intake(model: Glm52Model, kwargs: dict) -> int:
 ])
 def test_a_null_kwarg_is_unset(kwargs):
     m = _model()
-    sampling = m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
-    default = m.get_request_resource_configs({}, {})[SAMPLER_RESOURCE]
+    sampling = m.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
+    default = m.get_request_resource_configs([], [], {})[SAMPLER_RESOURCE]
     assert sampling == default
     assert _intake(m, kwargs) == _intake(m, {}) == m.get_max_output_tokens()
     out = m.process_prompt("Hi", ["text"], ["text"], **kwargs)

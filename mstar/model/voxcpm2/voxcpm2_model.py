@@ -26,7 +26,6 @@ Request modes (``process_prompt``), as the reference ``VoxCPM.generate``:
 from __future__ import annotations
 
 import hashlib
-import itertools
 import logging
 import math
 import re
@@ -36,11 +35,7 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -53,13 +48,13 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
+    WalkStep,
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.voxcpm2.config import (
@@ -83,8 +78,6 @@ from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 STREAM_EDGE = "latent_patches"
-# model_kwargs key: prompt patches leading a continuation's VAE stream
-STREAM_LEAD_KEY = "vae_stream_lead_patches"
 _CJK = re.compile(r"^[\u4e00-\u9fff]{2,}$")
 logger = logging.getLogger(__name__)
 
@@ -117,21 +110,6 @@ def decoder_receptive_field_patches(config: VoxCPM2Config) -> int:
     return math.ceil(decoder_receptive_field_frames(decoder) / config.patch_size)
 
 
-def stream_window_widths(schedule: tuple[int, ...], chunk: int, context: int) -> tuple[int, ...]:
-    """Widths, in patches, of the VAE windows ``ScheduledLeftContextChunkPolicy``
-    pops for a stream without a primed lead: the schedule's ramp, then
-    ``chunk`` new patches behind a context that grows up to ``context``. No
-    window, primed or final, is wider than the widest of these."""
-    widths, delivered = {context + max((chunk, *schedule))}, 0
-    for k in itertools.count():
-        new = schedule[k] if k < len(schedule) else chunk
-        held = min(delivered, context)
-        widths.add(held + new)
-        delivered += new
-        if k >= len(schedule) and held == context:
-            return tuple(sorted(widths))
-
-
 class VoxCPM2Model(Model):
     """VoxCPM2 TTS: Talker + RefEncoder partition, streaming VAEDecoder partition.
 
@@ -157,7 +135,7 @@ class VoxCPM2Model(Model):
     REF_MIN_PEAK = 1e-3
     # the reference demo offers 1 to 3; float32 overflows to inf past about 3.4e38
     MAX_CFG_VALUE = 10.0
-    INTERNAL_KWARGS = (*TALKER_STEP_METADATA, STREAM_LEAD_KEY)
+    INTERNAL_KWARGS = TALKER_STEP_METADATA
     LENGTH_KWARGS = ("max_new_tokens", "max_output_tokens", "max_len")
     # English speech measured at 1.3 to 2.9 patches per text token (24 zero-shot
     # requests of 1,300 to 1,700 tokens), so text up to max_len / 3 tokens fits in max_len patches
@@ -319,19 +297,28 @@ class VoxCPM2Model(Model):
             PartitionDefinition(
                 name="Talker",
                 graph_walks={"talker_prefill", "talker_prefill_clone", "talker_decode"},
-                initial_walk="talker_prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="VAEDecoder",
                 graph_walks={"vae_chunk"},
-                initial_walk=None,
-                producer_partitions=["Talker"],
             ),
         ]
 
+    def stream_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        """The Talker -> VAEDecoder edge's chunking, in patches."""
+        return ScheduledLeftContextChunkPolicy(
+            schedule=self.stream_schedule, chunk=self.stream_chunk_patches, left_context=self.stream_left_context,
+        )
+
+    def stream_window_widths(self) -> tuple[int, ...]:
+        """Widths, in patches, of the VAE windows to capture: those an unprimed
+        stream pops, plus the widest window of a fully primed one, which any
+        other primed window pads up to."""
+        policy = self.stream_chunk_policy()
+        widest = max(policy.window_sizes(self.stream_left_context))
+        return tuple(sorted({*policy.window_sizes(), widest}))
+
     def get_partition_topology(self) -> PartitionTopology:
-        schedule, chunk, context = self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
         return PartitionTopology(
             partitions=["Talker", "VAEDecoder"],
             connections=[
@@ -339,11 +326,7 @@ class VoxCPM2Model(Model):
                     from_partition="Talker",
                     to_partition="VAEDecoder",
                     edge_name=STREAM_EDGE,
-                    chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
-                        schedule=schedule,
-                        chunk=chunk,
-                        left_context=context,
-                    ),
+                    chunk_policy_factory=self.stream_chunk_policy,
                 )
             ],
         )
@@ -492,16 +475,17 @@ class VoxCPM2Model(Model):
             "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             "gen_params": [torch.tensor([cfg_value], dtype=torch.float32)],
         }
-        # every key is set in every mode: the data worker lays this over the
-        # request's own kwargs, so a key left out stays client-controlled
+        # every INTERNAL_KWARGS key is set in every mode: the data worker lays
+        # this over the request's own kwargs, so a key left out stays client-controlled
         lead = min(self.config.prompt_context_patches, ref_patches) if mode == MODE_REF_CONTINUATION else 0
         metadata = {
             PATCH_BUDGET_KEY: max_patches,
             PROMPT_MODE_KEY: mode,
             MIN_LEN_KEY: min_len,
             REF_DIGEST_KEY: digest,
-            STREAM_LEAD_KEY: lead,
         }
+        if lead:  # the data worker strips a client's stream_lead_items
+            metadata["stream_lead_items"] = {STREAM_EDGE: lead}
         # both LMs write the same rows: the prompt (``build_prompt``), then one per decode step
         walk = "talker_prefill" if mode == MODE_ZERO_SHOT else "talker_prefill_clone"
         prefill = Span("ids" if mode == MODE_ZERO_SHOT else "rows", walk, prompt_len, prompt_len, "text_inputs")
@@ -509,96 +493,33 @@ class VoxCPM2Model(Model):
         metadata["kv_layout"] = {BASE_KV: {"main": layout}, RES_KV: {"main": layout}}
         return ProcessPromptOutput(outputs, metadata)
 
-    # -- conductor state machine -------------------------------------------------
+    # -- walk plan ------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         if partition_name == "Talker":
             # the mode process_prompt built the prompt for, not the caller's
             # input_modalities: a clip sent with ["text"] still clones
             if PROMPT_MODE_KEY not in model_kwargs:
                 raise ValueError(f"VoxCPM2 request is missing {PROMPT_MODE_KEY}, which process_prompt sets")
             clone = int(model_kwargs[PROMPT_MODE_KEY]) != MODE_ZERO_SHOT
-            walk = "talker_prefill_clone" if clone else "talker_prefill"
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk=walk,
-                is_prefill=True,
-                kwargs={PATCH_BUDGET_KEY: int(model_kwargs.get(PATCH_BUDGET_KEY, 0))},
-            )
-            routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
-            if clone:
-                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
-            inputs = []
-            for name, node in routes:
-                edge = GraphEdge(next_node=node, name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
-                request_done="audio" not in output_modalities,
+            budget = int(model_kwargs.get(PATCH_BUDGET_KEY, 0))
+            if "audio" not in output_modalities:
+                return []
+            prefill = WalkStep(
+                "talker_prefill_clone" if clone else "talker_prefill",
                 step_metadata={key: model_kwargs[key] for key in TALKER_STEP_METADATA if key in model_kwargs},
             )
+            # the prefill's patch spends a one-patch budget; a decode step would only veto itself
+            return [prefill] if budget == 1 else [prefill, WalkStep("talker_decode")]
         if partition_name == "VAEDecoder":
-            lead = int(model_kwargs.get(STREAM_LEAD_KEY, 0))
-            return ForwardPassArgs(
-                full_metadata=CurrentForwardConductorMetadata(
-                    input_modalities=input_modalities,
-                    output_modalities=output_modalities,
-                    graph_walk="vae_chunk",
-                    is_prefill=False,
-                ),
-                inputs=[],
-                unpersist_tensors=[],
-                request_done="audio" not in output_modalities,
-                stream_lead_items={STREAM_EDGE: lead} if lead else {},
-            )
-        raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == "Talker":
-            if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
-                if partition_metadata.kwargs.get(PATCH_BUDGET_KEY) == 1:
-                    return ForwardPassArgs(
-                        full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True
-                    )
-                partition_metadata.graph_walk = "talker_decode"
-                partition_metadata.is_prefill = False
-                edge = GraphEdge(next_node="Talker", name="latent_patch")
-                edge.tensor_info = persist_signals.get("latent_patch", [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                )
-            if partition_metadata.graph_walk == "talker_decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-            raise ValueError(f"Talker entered an unexpected graph walk: {partition_metadata.graph_walk!r}")
-        if partition_name == "VAEDecoder":
-            partition_metadata.graph_walk = "vae_chunk"
-            return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[])
+            return [WalkStep("vae_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
 
     # -- output ---------------------------------------------------------------------
@@ -619,18 +540,6 @@ class VoxCPM2Model(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.output_sample_rate
-
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Raw little-endian PCM16 at 48 kHz."""
-        del request_kwargs
-        if modality != "audio":
-            raise ValueError(f"Unsupported VoxCPM2 output modality: {modality!r}")
-        if output.numel() == 0:
-            return b""
-        pcm = output.detach().cpu()
-        if pcm.is_floating_point():
-            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
-        return pcm.contiguous().numpy().tobytes()
 
     # -- worker-side construction ---------------------------------------------------
 
@@ -672,9 +581,7 @@ class VoxCPM2Model(Model):
                 submodule = submodules.VAEDecoderSubmodule(
                     load_audio_vae(self.config, checkpoint, device),
                     self.config,
-                    window_buckets=stream_window_widths(
-                        self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
-                    ),
+                    window_buckets=self.stream_window_widths(),
                 )
             self._submodule_cache[node_name] = submodule
         return self._submodule_cache[node_name]

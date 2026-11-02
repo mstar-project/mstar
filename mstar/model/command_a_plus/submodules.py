@@ -1,41 +1,17 @@
 """Packed prefill, one-token-per-request decode, and the image encoder for Command A+."""
 
-from collections.abc import Mapping
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
-    Segment,
-    SlotLease,
-    SubmoduleStep,
-)
-from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
+from mstar.engine.resources import AttentionStep, KVStep
+from mstar.engine.resources.step import ResourceStep
 from mstar.model.command_a_plus.components.vision import CommandAPlusVisionEncoder
-from mstar.model.command_a_plus.config import (
-    GLOBAL_ATTN,
-    KV_CACHE,
-    LOCAL_ATTN,
-    PREFILL_WALKS,
-    ROPE,
-    SAMPLER,
-    CommandAPlusTextConfig,
-)
-from mstar.model.submodule_base import (
-    ARNodeInputs,
-    ARNodeSubmodule,
-    ModelInputsFromEngine,
-    NodeInputs,
-    NodeSubmodule,
-    TokenStop,
-)
+from mstar.model.command_a_plus.config import GLOBAL_ATTN, KV_CACHE, LOCAL_ATTN
+from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 
 class CommandAPlusVisionSubmodule(NodeSubmodule):
@@ -77,137 +53,44 @@ class CommandAPlusVisionSubmodule(NodeSubmodule):
         }
 
 
-class CommandAPlusLLMSubmodule(ARNodeSubmodule):
+class CommandAPlusLLMSubmodule(SampledTokenDecoder):
+    """The Command A+ text stack; image rows are spliced in at their pads."""
+
     # Decode replays CUDA graphs of the same eager kernels; torch.compile stays
     # off until compiled numerics get their own parity checks.
     disable_torch_compile = True
+    PREFILL_WALK = "prefill"
+    # both attention resources plan the same packing
+    ATTN_KEY = LOCAL_ATTN
+    # the ladder it captured before moving onto the scaffold: wider decode
+    # steps are unmeasured on this MoE (graph memory, fused-MoE tiles)
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    # decode reads its ids back from the routed token and emits a tensor a
+    # request, as before the scaffold; the device path is a measured change
+    reads_device_loopback = False
+    # prefill stays eager: its captures are unmeasured on this model
+    CAPTURE_PREFILL = False
 
-    def __init__(
-        self, language_model: CommandAPlusForCausalLM, config: CommandAPlusTextConfig, image_token_id: int,
-    ):
-        super().__init__()
-        self.language_model = language_model
-        self.config = config
-        self.image_token_id = image_token_id
-        self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token", stop_ids=frozenset({config.eos_token_id}),
-            sampler=SAMPLER, prefill_walks=frozenset(PREFILL_WALKS),
-        )
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        return {}
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        # no prefill is captured, so nothing sizes an image step: uncapped, as before
+        return None
+
+    def layer_steps(self) -> dict[str, ResourceStep]:
+        # one KV cache, read through a windowed and an unwindowed resource
+        return {
+            KV_CACHE: KVStep(),
+            LOCAL_ATTN: AttentionStep(causal=True),
+            GLOBAL_ATTN: AttentionStep(causal=True),
+        }
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="decode",
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1,
-                ),
-                compile=False,
-            ),
-        ]
-
-    @staticmethod
-    def _check_walk(graph_walk: str) -> None:
-        if graph_walk not in (*PREFILL_WALKS, "decode"):
-            raise ValueError(f"Unknown Command A+ graph walk: {graph_walk!r}")
-
-    def prepare_inputs(
-        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList, **kwargs,
-    ) -> ARNodeInputs:
-        self._check_walk(graph_walk)
-        tokens = inputs["text_inputs"]
-        if len(tokens) != 1 or tokens[0].ndim != 1 or tokens[0].numel() == 0:
-            raise ValueError("text_inputs must contain one nonempty 1D token tensor")
-        ids = tokens[0]
-        if ids.dtype not in (torch.int32, torch.int64):
-            raise ValueError("text_inputs must contain integer token IDs")
-        if graph_walk == "decode" and ids.numel() != 1:
-            raise ValueError("decode requires exactly one token per request")
-        ids = ids.to(device=self.get_device(), dtype=torch.long)
-        if graph_walk != "prefill_image":
-            return ARNodeInputs(input_ids=ids, input_seq_len=ids.numel())
-        # Embedded here, so a chunked prefill cuts the embeddings with the ids.
-        (image_embeds,) = inputs["image_embeds"]
-        embeds = self.language_model.model.embed(ids)
-        embeds = embeds.masked_scatter(
-            (ids == self.image_token_id).unsqueeze(-1), image_embeds.to(embeds.device, embeds.dtype),
-        )
-        return ARNodeInputs(input_ids=ids, input_embeds=embeds, input_seq_len=ids.numel())
-
-    def declare_step(
-        self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
-        slot_lease: SlotLease | None = None,
-        piecewise_leases: Mapping[str, SlotLease] | None = None, **kwargs,
-    ) -> SubmoduleStep:
-        self._check_walk(graph_walk)
-        return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            steps={
-                KV_CACHE: KVStep(),
-                LOCAL_ATTN: AttentionStep(causal=True),
-                GLOBAL_ATTN: AttentionStep(causal=True),
-                ROPE: PositionStep(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens={
-                        rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-                    } if graph_walk in PREFILL_WALKS else {},
-                ),
-            },
-        )
-
-    def preprocess(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-        inputs: list[ARNodeInputs],
-    ) -> dict[str, Any]:
-        self._check_walk(graph_walk)
-        ids = torch.cat([inp.input_ids for inp in inputs])
-        if graph_walk == "prefill_image":
-            return {"text_inputs": ids, "input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
-        return {"text_inputs": ids}
-
-    def _sample(self, graph_walk, engine_inputs, text_inputs, input_embeds=None):
-        self._check_walk(graph_walk)
-        embeddings = self.language_model.model.embed(text_inputs) if input_embeds is None else input_embeds
-        hidden = self.language_model(embeddings, label="main")
-        if graph_walk in PREFILL_WALKS:
-            # Both managers have the same packing. Pick the final real prompt
-            # token for each request, never the last row of the whole batch.
-            hidden = engine_inputs.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
-        logits = self.language_model.compute_logits(hidden)
-        return engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
-
-    def forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
-    ) -> NameToTensorList:
-        return {"new_token": [self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)]}
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return True
-
-    def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        tokens = self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)
-        return {
-            rid: {"new_token": [tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
-
-    def postprocess(self, request_id, request_info, outputs, **kwargs):
-        # Metadata only: check_stop reads the token values, off the GPU thread.
-        if "new_token" not in outputs:
-            return
-        if request_info.graph_walk in PREFILL_WALKS:
-            if request_info.max_tokens > 1:
-                outputs["decode_input"] = outputs["new_token"]
-            return
-        outputs["text_inputs"] = outputs["new_token"]
+        # decode captures uncompiled, as the eager forward runs (disable_torch_compile)
+        configs = super().get_accelerator_graph_configs(device, tp_world_size)
+        for config in configs:
+            config.compile = False
+        return configs

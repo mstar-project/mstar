@@ -55,7 +55,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -76,7 +76,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ClientChunk, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
@@ -619,11 +619,9 @@ class NemotronDuplexModel(Model):
         ]
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         return {
@@ -717,16 +715,13 @@ class NemotronDuplexModel(Model):
     def get_partitions(self) -> list[PartitionDefinition]:
         return [
             PartitionDefinition(
-                name="Encoder", graph_walks={"encode"}, initial_walk="encode",
-                producer_partitions=[],
+                name="Encoder", graph_walks={"encode"},
             ),
             PartitionDefinition(
-                name="LLM", graph_walks={"decode"}, initial_walk="decode",
-                producer_partitions=["Encoder"],
+                name="LLM", graph_walks={"decode"},
             ),
             PartitionDefinition(
-                name="Talker", graph_walks={"talker_decode"}, initial_walk="talker_decode",
-                producer_partitions=["LLM"],
+                name="Talker", graph_walks={"talker_decode"},
             ),
         ]
 
@@ -861,9 +856,9 @@ class NemotronDuplexModel(Model):
         return wav
 
     def load_audio(self, filepath: str, device: str):
-        """Decode an uploaded audio file to 16 kHz mono via soundfile (the base uses
-        torchcodec, whose native libs aren't always available). Returns the same
-        ``TensorAndMetadata`` shape the data worker expects."""
+        """Decode an uploaded audio file to 16 kHz mono via soundfile, refused past
+        ``max_upload_channels`` channels or the longest session (with the session
+        error), with the file's own rate as ``source_sample_rate`` in the metadata."""
         import soundfile as sf
 
         from mstar.api_server.media_io import AudioTooLongError, check_resample_rate, read_soundfile_capped
@@ -890,92 +885,29 @@ class NemotronDuplexModel(Model):
                                                            source_sample_rate=sr))
 
     # -------------------------------------------------------------------
-    # Forward-pass-args state machines — one per async partition
-    # (Encoder -> LLM -> Talker), mirroring qwen3_omni.
+    # Walk plan: one walk per partition (Encoder -> LLM -> Talker)
     # -------------------------------------------------------------------
 
-    @staticmethod
-    def _has_prompt(input_signals, model_kwargs=None) -> bool:
-        """Whether the request seeded ``text_inputs`` with prompt ids rather
-        than the no-prompt sentinel: ``process_prompt`` adds a ``has_prompt``
-        signal alongside (the tensors themselves are not readable here)."""
-        return bool(input_signals.get("has_prompt"))
-
-    def _meta(self, imod, omod, walk, is_prefill):
-        return CurrentForwardConductorMetadata(
-            input_modalities=imod, output_modalities=omod, graph_walk=walk, is_prefill=is_prefill,
-        )
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        if partition_name == "Encoder":                    # self-triggered by the client's audio
-            return ForwardPassArgs(
-                full_metadata=self._meta(input_modalities, output_modalities, "encode", True),
-                inputs=[], unpersist_tensors=[], step_metadata={},
-            )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """Each partition runs its one stream-fed loop, which reports once,
+        when its stream ends (the LLM loop's cap is the request's token cap, so
+        it ends there too). The LLM's first step gets the fed-back seeds and
+        prompt ids ``process_prompt`` made; ``prompt_pending`` tells the worker
+        that step is prompt + frame, which no fixed-shape capture fits. The
+        ``has_prompt`` signal says so before any tensor is readable."""
+        if partition_name == "Encoder":
+            return [WalkStep("encode")]
         if partition_name == "LLM":
-            # Straight into the frame-synchronous decode loop, self-triggered
-            # by the audio stream. Seed iteration 0's fed-back tokens (agent
-            # BOS / PAD, function PAD) and the prompt ids (a -1 sentinel when
-            # there is no prompt) so the node is ready before any loop-back
-            # exists. ``prompt_pending`` tells the worker that this request's
-            # first step is prompt + frame, which no fixed-shape capture fits.
-            has_prompt = self._has_prompt(input_signals, model_kwargs)
-            edges = []
-            for name in ("prev_text", "prev_func", "text_inputs"):
-                e = GraphEdge(next_node="nano_llm", name=name)
-                e.tensor_info = input_signals.get(name, [])
-                edges.append(e)
-            return ForwardPassArgs(
-                full_metadata=self._meta(input_modalities, output_modalities, "decode", has_prompt),
-                inputs=edges, unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
-                step_metadata={"prompt_pending": has_prompt},
-            )
+            return [WalkStep("decode", step_metadata={"prompt_pending": bool(input_signals.get("has_prompt"))})]
         if partition_name == "Talker":
-            return ForwardPassArgs(
-                full_metadata=self._meta(input_modalities, output_modalities, "talker_decode", False),
-                inputs=[], unpersist_tensors=[], request_done=False,
-            )
-        raise ValueError(f"Unknown partition: {partition_name!r}")
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        m = partition_metadata
-
-        # All three partitions are stream-terminated: each ends when its node
-        # consumes the final chunk of its upstream stream, which the worker
-        # reports and the conductor turns into the partition's request_done
-        # (and producer_done for the next partition). Nothing here guesses the
-        # end from the connection counters: ``consumed_count`` counts chunks
-        # popped for execution, so a counter-based end can fire while the last
-        # step is still running and its output would arrive for a finished
-        # request (observed as sessions losing their final audio frame).
-        if partition_name == "LLM":
-            m.is_prefill = False                            # the prompt rode the first step
-            edges = []
-            for name in ("prev_text", "prev_func"):        # fed-back tokens for AddFusion
-                e = GraphEdge(next_node="nano_llm", name=name)
-                e.tensor_info = persist_signals.get(name, [])
-                edges.append(e)
-            return ForwardPassArgs(
-                full_metadata=m, inputs=edges,
-                unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
-                request_done=False, step_metadata={"prompt_pending": False},
-            )
-
-        if partition_name in ("Encoder", "Talker"):  # self-triggered by the upstream stream
-            return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=False)
+            return [WalkStep("talker_decode")]
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
@@ -1183,11 +1115,7 @@ class NemotronDuplexModel(Model):
             token_ids = output.tolist() if output.dim() else [int(output)]
             # PAD fills every silent frame; it and BOS/EOS are not reply text
             return self.tokenizer.decode(token_ids, skip_special_tokens=True).encode("utf-8")
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for NemotronDuplex: {modality!r}")
+        return super().postprocess(output, modality, **kwargs)
 
     # -------------------------------------------------------------------
     # Sharding — nano_llm attention/MLP are TP-eligible (Phase 10).

@@ -261,7 +261,7 @@ class CommandAPlusDecoderLayer(nn.Module):
 class CommandAPlusLanguageModel(nn.Module):
     """Text backbone over packed token embeddings, returning final hidden states.
 
-    As in Orpheus, the node's preprocessing calls ``embed_tokens`` separately.
+    The node embeds the ids itself (``embed``), splicing image rows in, so
     ``forward`` takes ``[total_step_tokens, hidden_size]``; resource plans carry
     request boundaries, positions and cached history. The causal-LM wrapper
     provides tied output logits and checkpoint loading.
@@ -352,6 +352,11 @@ class CommandAPlusForCausalLM(nn.Module):
         self.model = CommandAPlusLanguageModel(config, comm_group)
         self.logit_scale = config.logit_scale
 
+    # The decoder contract `SampledTokenDecoder` drives.
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed(input_ids)
+
     def forward(
         self,
         query_sequence: torch.Tensor,
@@ -360,7 +365,7 @@ class CommandAPlusForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(query_sequence, label=label)
 
-    def compute_logits(
+    def logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:

@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
@@ -14,10 +14,10 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.glm52._testing import fake_quantize_fp8_block, per_request_outputs
+from mstar.model.glm52._testing import fake_quantize_fp8_block, per_request_outputs, recorded_logits
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import KV_RESOURCE, SAMPLER_RESOURCE, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
@@ -185,7 +185,7 @@ class _Serve:
         # vocab, so greedy decode on random weights can hit one and stop
         # early — which would break the exact-length assertions below.
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
         )
         self.runner.ingest_request(rid, self.overrides)
 
@@ -193,12 +193,12 @@ class _Serve:
         return CurrentForwardPassInfo(
             request_id=self.rid, graph_walk="prefill", fwd_index=0, random_seed=0,
             max_tokens=max_tokens, resource_configs=self.overrides,
+            # the conductor marks the prefill, the step before decode, as the reply's first token's
+            step_metadata={FINAL_PREFILL: True},
         )
 
-    def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor,
-             batched: bool = True) -> dict:
-        """One forward; ``batched`` is the engine's path for this node
-        (``can_batch`` is True), the unbatched ``forward`` returns logits."""
+    def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor) -> dict:
+        """One forward through ``forward_batched``, the engine's path for this node."""
         rid = self.rid
         inputs = [self.submodule.prepare_inputs(walk, info, {"text_inputs": [text]})]
         step = self.submodule.declare_step(walk, [rid], inputs)
@@ -214,11 +214,8 @@ class _Serve:
                 resources=self.resources, step=step,
             )
             kw = self.submodule.preprocess(walk, engine_inputs, inputs)
-            if batched:
-                raw = self.submodule.forward_batched(walk, engine_inputs, **kw)
-                out = per_request_outputs(raw, [rid])[rid]
-            else:
-                out = self.submodule.forward(walk, engine_inputs, **kw)
+            raw = self.submodule.forward_batched(walk, engine_inputs, **kw)
+            out = per_request_outputs(raw, [rid])[rid]
             if step is not None:
                 self.runner.commit(step)
         return out
@@ -231,12 +228,11 @@ class _Serve:
 
 
 def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
-    """The real serve loop: prefill -> decode -> check_stop, all through
-    ``forward_batched`` and the sampler resource (greedy)."""
+    """The real serve loop: prefill -> decode to the request's loop cap or a
+    stop, all through ``forward_batched`` and the sampler resource (greedy)."""
     serve = _Serve(model, submodule)
     info = serve.info(max_tokens)
     generated: list[int] = []
-    stopped = False
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -245,31 +241,29 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        stopped = END_PARTITION in submodule.check_stop(serve.rid, info, out)
-        if not stopped:
+        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
             info.graph_walk = "decode"
-            for step in range(max_tokens + 4):  # +slack; check_stop must break first
+            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
                 assert out["text_inputs"] is out["new_token"]
-                info.dynamic_loop_iter_counts["decode_loop"] = step
-                stop = submodule.check_stop(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
-                if stop:
-                    stopped = True
+                if submodule.check_stop(serve.rid, info, out):
                     break
     finally:
         serve.close()
-    return generated, stopped
+    return generated
 
 
 def _prefill_logits(model, submodule, prompt_ids):
-    """The unbatched forward's logits for the prompt's last row."""
+    """The logits the prefill hands the sampler, for the prompt's last row."""
     serve = _Serve(model, submodule)
     try:
-        return serve.step("prefill", serve.info(8), prompt_ids, batched=False)["logits"][0]
+        with recorded_logits(serve.resources[SAMPLER_RESOURCE]) as logits:
+            serve.step("prefill", serve.info(8), prompt_ids)
+        return logits[0]
     finally:
         serve.close()
 
@@ -290,7 +284,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert isinstance(submodule, Glm52LLMSubmodule)
 
     # The fp8-resident containers survived autocast + device move.
-    moe = submodule.language_model.model.layers[1].mlp
+    moe = submodule.model.model.layers[1].mlp
     assert moe.experts.gate_up_proj_fp8.dtype == torch.uint8
     assert moe.experts.gate_up_proj_fp8.is_cuda
     assert moe.experts.gate_up_proj_scale_inv.dtype == torch.float32
@@ -310,9 +304,8 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert torch.isfinite(logits).all()
 
     MAX_TOKENS = 6
-    generated, stopped = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
+    generated = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
 
-    assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
@@ -328,7 +321,7 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
     prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
-        _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)[0]
+        _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)
         for _ in range(2)
     ]
     assert runs[0] == runs[1], runs

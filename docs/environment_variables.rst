@@ -238,13 +238,13 @@ model, so they are named for it.
    * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
      - unset
      - Cosmos3: any nonempty value disables denoise, prefill and reasoner
-       decode capture. The deployment option
+       captures. The deployment option
        ``model_kwargs.accelerator_graph: false`` also disables all these
        captures and cannot be overridden by this variable.
    * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
      - unset
-     - Cosmos3: any nonempty value disables only the understanding-tower
-       prefill capture. Denoise and reasoner decode captures remain eligible
+     - Cosmos3: any nonempty value disables only the DiT's understanding-tower
+       prefill capture. Denoise and reasoner captures remain eligible
        when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
@@ -573,7 +573,7 @@ Worker scheduling
        the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
-       Qwen3.5 alone.
+       Qwen3.5 alone; Orpheus, Higgs-Audio, GLM-5.2 and Command A+ pin their own.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
@@ -655,9 +655,10 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       (``reads_device_loopback``: the decode walks of Qwen3-ASR, of
        Whisper, which also keeps its timestamp rule state in the sampler's
-       declared loop-back state) and only when the sampler has graph
+       declared loop-back state, and of every ``SampledTokenDecoder`` node
+       but Orpheus's) and only when the sampler has graph
        buffers; the sampler keeps the masters for those nodes alone, so a
        node that takes its tokens on the host does not pay the eager-step
        master write. ``0`` keeps every node on the per-request tensor path.

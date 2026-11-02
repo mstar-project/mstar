@@ -174,6 +174,10 @@ class Qwen3DenseLM(nn.Module):
             )
         return loaded
 
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.embed_tokens.weight.dtype
+
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 

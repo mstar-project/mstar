@@ -95,12 +95,8 @@ class CanaryDecoderModel(nn.Module):
         self.norm = nn.LayerNorm(h)
         self.proj_out = nn.Linear(h, config.vocab_size)
 
-    def embed(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """Token embeddings plus sinusoids at the position resource's planned
-        ids (a static buffer under a captured graph), then the LayerNorm."""
-        tokens = self.embed_tokens(input_ids)
-        pos = sinusoid_positions(position_ids[:input_ids.shape[0]], self.config.hidden_size).to(tokens.dtype)
-        return self.embedding_layernorm(tokens + pos)
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     def write_cross_kv(self, encoder_states: torch.Tensor) -> None:
         """Project the encoder output to per-layer K/V and write it into the
@@ -111,11 +107,21 @@ class CanaryDecoderModel(nn.Module):
             layer.encoder_attn.context_kv.set_default_layer_idx(layer_idx)
             layer.encoder_attn.context_kv.write_kv(k, v, label=CONTEXT_LABEL)
 
-    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.proj_out(hidden_states)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
-        hidden_states = input_embeds
+    def forward(
+        self, input_embeds: torch.Tensor, *, label: str, position_ids: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The token embeddings plus sinusoids at ``position_ids`` (one per
+        token), through the stack and its final norm. ``encoder_states``, on
+        the prefill only, is written into the context pages that step
+        reserved before the layers read them."""
+        if encoder_states is not None:
+            self.write_cross_kv(encoder_states)
+        pos = sinusoid_positions(position_ids, self.config.hidden_size).to(input_embeds.dtype)
+        hidden_states = self.embedding_layernorm(input_embeds + pos)
         # bind the label once and advance the layer index per layer on both
         # caches; passing them as arguments would make inductor specialize
         self.layers[0].self_attn.attend.bind_step(label)

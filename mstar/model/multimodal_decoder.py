@@ -3,10 +3,10 @@
 An ``LLM`` node (a `SampledTokenDecoder`) behind the model's media encoders,
 on `mstar.model.multimodal`'s walks. The base owns what every such model
 writes the same way: the walks and the mixed text step, the decode loop's
-cap, media intake, the KV label and layout, the prefill walk, the
-forward-pass args, the sampler (its spec, and each request's config over
-the checkpoint's generation_config defaults), sharding, the submodule
-cache, and where the files come from. A model sets `NAME` and
+cap, media intake, the KV label and layout, the walk plan, the sampler
+(its spec, and each request's config over the checkpoint's
+generation_config defaults), sharding, the submodule cache, and where the
+files come from. A model sets `NAME` and
 `METADATA_FILES`, and writes its own ``__init__`` (calling this one, then
 setting ``config``, with ``max_position_embeddings`` and ``stop_token_ids``,
 ``tokenizer`` and ``media``, a `MediaIntake` per attachment modality),
@@ -27,15 +27,11 @@ from typing import NamedTuple
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
 from mstar.model.keys import KV_CACHE, MIXED, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -43,17 +39,14 @@ from mstar.model.multimodal import (
     VIDEO,
     MediaEncoder,
     MediaPads,
-    PrefillStep,
     PromptPart,
     check_attachments,
     expand_media_pads,
-    initial_prefill_args,
     media_encoders,
     media_layout,
     media_prefill_step,
     media_walk_name,
     media_walks,
-    next_prefill_args,
     parts_from_modalities,
     text_combined_walks,
 )
@@ -129,6 +122,11 @@ class MultimodalDecoderModel(Model):
 
     # one per attachment modality the model takes, set by its `__init__`
     media: tuple[MediaIntake, ...] = ()
+    # False for a model every prompt of which carries media (an audio-only
+    # STT checkpoint): no text-only prefill walk, no mixed step, no prefix keys
+    # (only a text span is keyed), and its LLM node captures neither. The
+    # model's intake must refuse a text-only request itself.
+    TEXT_PROMPTS = True
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
@@ -177,11 +175,11 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return text_combined_walks()
+        return text_combined_walks() if self.TEXT_PROMPTS else {}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
-        return media_walks(self.config.max_position_embeddings, self.encoders)
+        return media_walks(self.config.max_position_embeddings, self.encoders, text=self.TEXT_PROMPTS)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the prefill emits the first of max_output_tokens, so the loop runs one fewer
@@ -195,6 +193,8 @@ class MultimodalDecoderModel(Model):
         # A text prompt's one `ids` span is keyed for the prefix cache, and its replies extend the
         # keys; a media prompt's one `rows` span is not (`LabelLayout.keyed_count`), so nothing of
         # it is.
+        if not self.TEXT_PROMPTS:
+            return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
             keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
@@ -359,7 +359,7 @@ class MultimodalDecoderModel(Model):
         )
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
         sampling = dict(self.sampling_defaults)
@@ -369,34 +369,28 @@ class MultimodalDecoderModel(Model):
         return {SAMPLER: SamplingReqConfig(**sampling)}
 
     # -----------------------------------------------------------------------
-    # Forward pass args
+    # Walk plan
     # -----------------------------------------------------------------------
 
     def _prefill_step(
         self, signals: dict[str, list[TensorPointerInfo]], layout: dict | None = None,
-    ) -> PrefillStep:
+    ) -> WalkStep:
         """`media_prefill_step`, carrying `process_prompt`'s media layout."""
         return media_prefill_step(signals, self.encoders, layout, model_name=self.NAME)
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        step = self._prefill_step(input_signals, (model_kwargs or {}).get(MEDIA_LAYOUT))
-        return initial_prefill_args(step, input_modalities, output_modalities)
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        return next_prefill_args(partition_metadata, persist_signals)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the whole prompt, then decode until the stop check ends it
+        return [
+            self._prefill_step(input_signals, model_kwargs.get(MEDIA_LAYOUT)),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -----------------------------------------------------------------------
     # Submodules

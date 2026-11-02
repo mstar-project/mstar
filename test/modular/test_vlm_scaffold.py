@@ -9,21 +9,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.request_info import WalkStep
 from mstar.graph.base import Parallel
 from mstar.model.keys import MIXED, ROPE, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
-    PrefillStep,
     expand_media_pads,
-    initial_prefill_args,
     media_layout,
     media_prefill_step,
     media_walk_names,
     media_walks,
-    next_prefill_args,
     vision_encoder,
-    walk_input_edges,
 )
 
 IMAGE_PAD, VIDEO_PAD, AUDIO_PAD = 90, 91, 80
@@ -117,8 +114,7 @@ def _signals(**counts: int) -> dict[str, list[str]]:
 
 def test_a_text_prompt_is_one_prefill_text_walk():
     signals = _signals(text_inputs=1)
-    step = media_prefill_step(signals, [VISION], model_name="m")
-    assert step == PrefillStep("prefill_text", {("LLM", "text_inputs"): ["text_inputs0"]})
+    assert media_prefill_step(signals, [VISION], model_name="m") == WalkStep("prefill_text")
     # encoder inputs with no layout to place them by are refused, not dropped
     with pytest.raises(ValueError, match="no media layout"):
         media_prefill_step(_signals(text_inputs=1, pixel_values=1), [VISION], model_name="m")
@@ -135,66 +131,7 @@ def test_a_media_prompt_is_one_walk_over_the_encoders_it_needs(counts, walk):
     # the layout's runs name the encoders, as they do the KV layout's walk
     layout = {"offset": [3] * len(counts), "output": [encoder[name].output for name in counts]}
     step = media_prefill_step(signals, [VISION, AUDIO], layout, model_name="m")
-    assert step.walk == walk and step.metadata == {MEDIA_LAYOUT: layout}
-    edges = {(e.next_node, e.name): e.tensor_info for e in walk_input_edges(step)}
-    assert edges == {
-        ("LLM", "text_inputs"): ["text_inputs0"],
-        **{(encoder[name].node, name): signals[name] for name in counts},
-    }
-
-
-def test_the_walks_run_the_prefill_then_decode_then_finish():
-    signals = _signals(text_inputs=1)
-    first = initial_prefill_args(media_prefill_step(signals, [VISION], model_name="m"), ["text"], ["text"])
-    assert first.step_metadata == {"is_prefill": True}
-    meta = first.full_metadata
-    assert meta.graph_walk == "prefill_text"
-    decode = next_prefill_args(meta, {"new_token": ["tok"]})
-    assert meta.graph_walk == "decode" and not meta.is_prefill
-    assert [(e.next_node, e.name, e.tensor_info) for e in decode.inputs] == [("LLM", "text_inputs", ["tok"])]
-    assert next_prefill_args(meta, {}).request_done
-
-
-@pytest.mark.parametrize("knobs", [
-    {"return_logprobs": True}, {"logprobs_mode": "processed"},
-])
-def test_a_request_sets_its_sampling_knobs(knobs):
-    """Log-probs (#914) reach the sampler's config like every other knob."""
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-
-    model = object.__new__(Qwen3_5DenseModel)
-    model.sampling_defaults = {}
-    config = model.get_request_resource_configs({}, knobs)[SAMPLER]
-    assert {k: getattr(config, k) for k in knobs} == knobs
-
-
-def test_qwen3_5_floors_a_float_images_levels():
-    """Qwen3.5 (and Qwen3-Omni) hand the processor floored levels, as their
-    parity was measured with; the shared helper rounds by default."""
-    from mstar.model.multimodal import as_uint8_chw
-    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
-
-    half = torch.full((3, 2, 2), 0.5)  # 127.5 levels
-    assert as_uint8_chw(half).max() == 128 and as_uint8_chw(half, truncate=True).max() == 127
-    model = object.__new__(Qwen3_5DenseModel)
-    model.vision_config = SimpleNamespace(spatial_merge_size=2)
-    seen = []
-
-    def processor(images, return_tensors):
-        seen.extend(images)
-        return {"pixel_values": torch.zeros(4, 8), "image_grid_thw": torch.tensor([[1, 2, 2]])}
-
-    model._image_processor = processor
-    model._image_intake(half, {})
-    assert int(seen[0].max()) == 127
-
-
-def test_a_media_walk_carries_its_layout_in_step_metadata():
-    signals = _signals(text_inputs=1, pixel_values=1)
-    layout = {"offset": [1], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
-    step = media_prefill_step(signals, [VISION], layout, model_name="m")
-    first = initial_prefill_args(step, ["image", "text"], ["text"])
-    assert first.step_metadata == {"is_prefill": True, MEDIA_LAYOUT: layout}
+    assert step == WalkStep(walk, step_metadata={MEDIA_LAYOUT: layout})
 
 
 @pytest.mark.parametrize(("texts", "match"), [(0, "nothing to prefill"), (2, "2 text tensors")])
@@ -266,6 +203,47 @@ def test_every_media_walk_replays_one_capture_that_caps_it():
     assert llm.max_batch_size("decode") is None
 
 
+def test_a_node_keeps_its_walk_name_and_can_capture_decode_only():
+    """A lone encoder's declared walk names its media walk (configs and
+    metrics read walk names), and CAPTURE_PREFILL = False leaves decode as the
+    only capture."""
+    from dataclasses import replace
+
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    named = replace(AUDIO, walk="prefill")
+    assert media_walk_names([named]) == ["prefill"]
+    assert media_walk_names([VISION, named]) == ["prefill_vision", "prefill", "prefill_vision_audio"]
+
+    class DecodeOnly(LLMSubmodule):
+        CAPTURE_PREFILL = False
+
+    llm = object.__new__(DecodeOnly)
+    SampledTokenDecoder.__init__(
+        llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=()), (named,),
+    )
+    assert [c.capture_graph_walk for c in llm.get_accelerator_graph_configs(torch.device("cpu"))] == ["decode"]
+
+
+def test_a_media_only_model_has_no_text_walk_mixed_step_or_prefix_keys():
+    """TEXT_PROMPTS = False (an audio-only STT model) drops the text prefill
+    walk, the mixed step and the prefix keys from the model, and the text and
+    mixed captures from its LLM node."""
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    walks = media_walks(8, [AUDIO], text=False)
+    assert set(walks) == {"prefill_audio", "decode"}
+    llm = object.__new__(LLMSubmodule)
+    SampledTokenDecoder.__init__(
+        llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=()),
+        (AUDIO,), text_prompts=False,
+    )
+    captured = {w for c in llm.get_accelerator_graph_configs(torch.device("cpu")) for w in c.replay_graph_walks}
+    assert captured == {"prefill_audio", "decode"}
+
+
 def test_qwen_media_capture_stages_every_media_buffer():
     """The captured media step's static inputs are `preprocess`'s outputs:
     the ids, a row per token for every encoder's media, and the cos/sin built
@@ -317,3 +295,37 @@ def test_glimmer_encoder_declares_windows_and_frames():
     assert [(seg.label, seg.span) for seg in step.segments] == [
         (VISION_WINDOW, 4), (VISION_WINDOW, 4), (VISION_FULL, 8),
     ]
+
+
+@pytest.mark.parametrize("knobs", [
+    {"return_logprobs": True}, {"logprobs_mode": "processed"},
+])
+def test_a_request_sets_its_sampling_knobs(knobs):
+    """Log-probs (#914) reach the sampler's config like every other knob."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.sampling_defaults = {}
+    config = model.get_request_resource_configs([], [], knobs)[SAMPLER]
+    assert {k: getattr(config, k) for k in knobs} == knobs
+
+
+def test_qwen3_5_floors_a_float_images_levels():
+    """Qwen3.5 (and Qwen3-Omni) hand the processor floored levels, as their
+    parity was measured with; the shared helper rounds by default."""
+    from mstar.model.multimodal import as_uint8_chw
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    half = torch.full((3, 2, 2), 0.5)  # 127.5 levels
+    assert as_uint8_chw(half).max() == 128 and as_uint8_chw(half, truncate=True).max() == 127
+    model = object.__new__(Qwen3_5DenseModel)
+    model.vision_config = SimpleNamespace(spatial_merge_size=2)
+    seen = []
+
+    def processor(images, return_tensors):
+        seen.extend(images)
+        return {"pixel_values": torch.zeros(4, 8), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+
+    model._image_processor = processor
+    model._image_intake(half, {})
+    assert int(seen[0].max()) == 127

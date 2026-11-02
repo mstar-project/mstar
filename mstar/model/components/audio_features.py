@@ -13,13 +13,15 @@ captures into a CUDA graph).
 
 NVIDIA's FastConformer models (Canary, Parakeet, Nemotron ASR) take NeMo's
 recipe instead, ``NemoLogMel``: preemphasis, natural log, and per-bin
-standardization over the clip.
+standardization over the clip. ``MatchaLogMel`` is the 24 kHz TTS reference
+mel (Chatterbox's S3Gen, CosyVoice3, the Qwen3-TTS speaker encoder).
 """
 from __future__ import annotations
 
 import functools
 import math
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -155,17 +157,22 @@ class LogMelSpectrogram(nn.Module):
         )
 
 
-def librosa_mel_filters(sampling_rate: int, n_fft: int, num_mel_bins: int) -> np.ndarray:
+def librosa_mel_filters(
+    sampling_rate: int, n_fft: int, num_mel_bins: int, fmin: float = 0.0, fmax: float | None = None,
+) -> np.ndarray:
     """``librosa.filters.mel(norm="slaney")`` as float32 ``(n_mels, 1 + n_fft // 2)``,
     with librosa's own arithmetic and its float32 rounding of each row before
-    the area normalization, so NeMo-trained encoders see their exact filters."""
+    the area normalization, so encoders trained on librosa features (NeMo,
+    the Matcha/CosyVoice mels) see their exact filters. ``fmax`` defaults to
+    Nyquist."""
     f_sp = 200.0 / 3
     min_log_hz, min_log_mel, logstep = 1000.0, 1000.0 / (200.0 / 3), np.log(6.4) / 27.0
 
     def hz_to_mel(f: float) -> float:
         return min_log_mel + np.log(f / min_log_hz) / logstep if f >= min_log_hz else f / f_sp
 
-    mels = np.linspace(hz_to_mel(0.0), hz_to_mel(sampling_rate / 2.0), num_mel_bins + 2)
+    fmax = sampling_rate / 2.0 if fmax is None else fmax
+    mels = np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), num_mel_bins + 2)
     mel_f = f_sp * mels
     log_t = mels >= min_log_mel
     mel_f[log_t] = min_log_hz * np.exp(logstep * (mels[log_t] - min_log_mel))
@@ -177,6 +184,45 @@ def librosa_mel_filters(sampling_rate: int, n_fft: int, num_mel_bins: int) -> np
         weights[i] = np.maximum(0, np.minimum(-ramps[i] / fdiff[i], ramps[i + 2] / fdiff[i + 1]))
     weights *= (2.0 / (mel_f[2:num_mel_bins + 2] - mel_f[:num_mel_bins]))[:, None]
     return weights
+
+
+class MatchaLogMel(nn.Module):
+    """The Matcha/CosyVoice log-mel, ``[B, T] -> [B, num_mels, F]``.
+
+    Reflect-pads ``(n_fft - hop) / 2`` samples on both sides, takes an
+    uncentered STFT, ``sqrt(|X|^2 + 1e-9)``, the librosa (Slaney) mel filter
+    bank and ``log(max(x, 1e-5))``. A waveform whose length is a multiple of
+    the hop yields exactly ``T / hop`` frames. The filter bank and window are
+    buffers, so it can be captured in a CUDA graph. The argument names are
+    ``S3GenMelConfig``'s fields, so a config is passed as ``**asdict(config)``.
+    """
+
+    def __init__(
+        self, sample_rate: int, n_fft: int, num_mels: int, hop_size: int, win_size: int,
+        fmin: float = 0.0, fmax: float | None = None,
+    ):
+        super().__init__()
+        self.n_fft, self.hop_size, self.win_size = n_fft, hop_size, win_size
+        mel = torch.from_numpy(librosa_mel_filters(sample_rate, n_fft, num_mels, fmin, fmax))
+        self.register_buffer("mel_basis", mel, persistent=False)
+        self.register_buffer("window", torch.hann_window(win_size), persistent=False)
+        self.pad = (n_fft - hop_size) // 2
+
+    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+        if wav.dim() == 1:
+            wav = wav[None]
+        wav = F.pad(wav.unsqueeze(1), (self.pad, self.pad), mode="reflect").squeeze(1)
+        spec = torch.stft(
+            wav, self.n_fft, hop_length=self.hop_size, win_length=self.win_size, window=self.window,
+            center=False, pad_mode="reflect", normalized=False, onesided=True, return_complex=True,
+        )
+        spec = torch.view_as_real(spec)
+        spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-9)
+        spec = torch.matmul(self.mel_basis, spec)
+        return torch.log(torch.clamp(spec, min=1e-5))
+
+    def num_frames(self, num_samples: int) -> int:
+        return (num_samples + 2 * self.pad - self.n_fft) // self.hop_size + 1
 
 
 class NemoLogMel:
@@ -388,21 +434,6 @@ def _ffmpeg_decoder_loads() -> bool:
     return getattr(sys.modules.get("torchcodec._core.ops"), "_FFMPEG_AVAILABLE", True)
 
 
-def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:
-    """Decode an audio file to a float32 mono waveform at ``sample_rate``.
-
-    libsndfile (``soundfile``) first — it needs no FFmpeg and covers WAV,
-    FLAC, OGG and MP3 — then torchcodec for anything else (M4A, WebM, ...).
-    Resampling goes through torchaudio. Audio longer than ``max_seconds``
-    (default ``media_io.MAX_AUDIO_SECONDS``) is refused while it decodes.
-    """
-    from mstar.api_server.media_io import MAX_AUDIO_SECONDS
-
-    if max_seconds is None:
-        max_seconds = MAX_AUDIO_SECONDS
-    return _resample(*_decode(path, sample_rate, max_seconds), sample_rate)
-
-
 def _decode(path: str, sample_rate: int, max_seconds: float) -> tuple[torch.Tensor, int]:
     """The waveform and its rate: libsndfile at the file's own rate, else
     FFmpeg, which decodes straight to ``sample_rate``."""
@@ -427,11 +458,14 @@ def _resample(waveform: torch.Tensor, rate: int, sample_rate: int) -> torch.Tens
 
 
 def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.Tensor:
-    """:func:`load_audio_file` for request uploads, refused past the model's
-    ``max_seconds`` as it decodes, so a small file whose header understates
-    its length cannot expand past it. An undecodable file is the client's
-    error, so it surfaces as ``ValueError`` (HTTP 400). A missing decoder or
-    memory, and anything after the decode, is the server's, and stays as it is."""
+    """Decode a request's audio upload to a float32 mono waveform at
+    ``sample_rate``: libsndfile (``soundfile``) first, which needs no FFmpeg
+    and covers WAV, FLAC, OGG and MP3, then torchcodec for anything else, and
+    torchaudio to resample. Refused past ``max_seconds`` as it decodes, so a
+    small file whose header understates its length cannot expand past it. An
+    undecodable file is the client's error, so it surfaces as ``ValueError``
+    (HTTP 400). A missing decoder or memory, and anything after the decode, is
+    the server's, and stays as it is."""
     try:
         # decoded at its own rate, so a resampling failure isn't blamed on the file
         waveform, rate = _decode(path, sample_rate, max_seconds)
@@ -443,6 +477,38 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
         # FFmpeg's message (paths, internals) stays out of the response
         raise ValueError("could not decode the audio upload") from exc
     return _resample(waveform, rate, sample_rate)
+
+
+def load_reference_clip(
+    path: str, sample_rate: int, max_seconds: float, check_seconds: Callable[[float], None],
+) -> torch.Tensor:
+    """A voice-cloning reference clip as a float32 mono waveform at ``sample_rate``.
+
+    ``check_seconds`` (the model's length rule, which raises; the model reuses
+    it in ``process_prompt`` on the decoded clip) runs on the
+    length the header declares before anything decodes: a small compressed
+    file can hold hours of audio. The header can understate it, so the decode
+    stops past ``max_seconds`` too; a header with no length is checked on what
+    decodes.
+    """
+    import soundfile
+
+    from mstar.api_server.media_io import read_soundfile_capped
+    from mstar.model.media_limits import read_sound_file, sound_file_seconds
+
+    info = soundfile.info(path)
+    check_resample_rate(info.samplerate, sample_rate)
+    seconds = sound_file_seconds(info.frames, info.samplerate)
+    if seconds is not None:
+        check_seconds(seconds)
+        waveform, rate = read_soundfile_capped(path, max_seconds)
+        audio = torch.from_numpy(waveform)
+    else:
+        # no sample count in the header (a FLAC written to a pipe)
+        waveform, rate = read_sound_file(path, max_seconds)
+        check_seconds(len(waveform) / rate)
+        audio = torch.from_numpy(waveform).mean(dim=1)
+    return _resample(audio, rate, sample_rate)
 
 
 SAMPLE_RATE = 16_000

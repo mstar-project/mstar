@@ -1,22 +1,15 @@
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any
 
 from mstar.engine.resources import PublishedInfo, ResourceReqConfig
 
-
-@dataclass
-class CurrentForwardConductorMetadata:
-    """
-    Full-model forward pass-level metadata for running the current
-    forward pass. On the conductor/model level.
-    """
-    graph_walk: str
-    is_prefill: bool
-    input_modalities: list[str] = field(default_factory=list)
-    output_modalities: list[str] = field(default_factory=list)
-    kwargs: dict = field(default_factory=dict)
-
-
 DEFAULT_PARTITION = "default"
+
+# Step metadata the conductor sets on the step that samples a request's first
+# token: a plan step whose next step's walk grows a KV label (`KVLabel.growth`).
+FINAL_PREFILL = "final_prefill"
 
 
 @dataclass
@@ -93,13 +86,27 @@ def merge_publish_info(
 class PartitionDefinition:
     """Defines a partition within a model's computation graph.
 
-    Each partition has its own set of graph walks and transition logic,
-    and can run asynchronously relative to other partitions.
+    Each partition has its own set of graph walks and its own walk plan
+    (`Model.walk_plan`), and can run asynchronously relative to other
+    partitions.
     """
     name: str                                                   # e.g., "LLM", "SNAC"
     graph_walks: set[str]                                       # walks this partition uses
-    initial_walk: str | None = None                             # first walk, or None = triggered later
-    producer_partitions: list[str] = field(default_factory=list)  # partitions feeding tokens to this one
+
+
+@dataclass(frozen=True)
+class WalkStep:
+    """One step of a partition's plan (`Model.walk_plan`): a walk to run.
+
+    The conductor sends each input of the walk, other than a streamed one, the
+    persisted signal of the same name, or an empty edge when there is none.
+    ``bind`` renames: ``{"text_inputs": "new_token"}`` feeds a decode loop's
+    ``text_inputs`` the prefill's ``new_token``. ``step_metadata`` reaches
+    every node of the walk.
+    """
+    walk: str
+    bind: Mapping[str, str] = MappingProxyType({})
+    step_metadata: Mapping[str, Any] = MappingProxyType({})
 
 
 @dataclass
@@ -110,8 +117,6 @@ class StreamingConnectionState:
     from_partition: str
     to_partition: str
     edge_name: str
-    token_count: int = 0
-    consumed_count: int = 0
     producer_done: bool = False
     # destination worker -> stream items the producer sent there, which
     # producer_done carries so the consumer waits for the last of them
@@ -122,7 +127,8 @@ class StreamingConnectionState:
 class PartitionState:
     """Per-partition conductor-level state for a request."""
     partition_name: str
-    metadata: CurrentForwardConductorMetadata
+    # the walk running: the plan's current step, or the walk a stream moved it to
+    graph_walk: str = ""
     fwd_pass_number: int = 0
     random_seed: int = 0
     is_done: bool = False
@@ -133,6 +139,9 @@ class PartitionState:
     # a report since the last advance set `partition_done` (it can be the
     # next pass's; see `Conductor._process_done_forward`)
     worker_reported_done: bool = False
+    # the walks this request runs here (`Model.walk_plan`), and the step running
+    plan: list[WalkStep] = field(default_factory=list)
+    cursor: int = 0
     num_output_tokens: int = 0
     # resource label -> PublishedInfo, accumulated across all TP ranks and
     # handed back out on the next forward

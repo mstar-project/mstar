@@ -106,6 +106,11 @@ class OrpheusForCausalLM(nn.Module):
             gather_output=True,
         )
 
+    # The decoder contract `SampledTokenDecoder` drives.
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
     def forward(
         self,
         query_sequence: torch.Tensor,
@@ -114,6 +119,9 @@ class OrpheusForCausalLM(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         return self.model(query_sequence=query_sequence, label=label)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden)
 
     def load_weights(self, weights) -> set[str]:
         """Load HF Llama-style weights into the fused parameters; tie the
