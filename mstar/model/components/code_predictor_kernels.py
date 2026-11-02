@@ -110,7 +110,9 @@ def _cp_embed_accumulate_kernel(
         e = tl.load(W + tok * s_w + h0 + offs)
         tl.store(Emb + b * s_emb + h0 + offs, e)
         acc = tl.load(Sum + b * s_sum + h0 + offs)
-        tl.store(Sum + b * s_sum + h0 + offs, acc + e.to(acc.dtype))
+        # in fp32, rounded once to the sum's dtype, as torch's add_ computes it
+        total = acc.to(tl.float32) + e.to(tl.float32)
+        tl.store(Sum + b * s_sum + h0 + offs, total.to(acc.dtype))
     tl.store(Codes + b * s_codes + group, tok.to(Codes.dtype.element_ty))
 
 
@@ -120,8 +122,8 @@ def cp_embed_accumulate(
     all_codes: torch.Tensor, group: int,
 ) -> torch.Tensor:
     """For a depth step's sampled ``tokens (bs,)``: record them as ``all_codes[:, group]``,
-    look up their embeddings in ``weight (V, H)`` and add those to ``emb_sum (bs, H)`` in
-    its dtype. Returns the embeddings, the next depth step's input. One launch for what
+    look up their embeddings in ``weight (V, H)`` and add those to ``emb_sum (bs, H)``,
+    rounded to its dtype. Returns the embeddings, the next depth step's input. One launch for what
     was an index_select, a copy and a promoting add."""
     bs, hidden = tokens.shape[0], weight.shape[1]
     assert tokens.is_contiguous() and weight.stride(1) == 1 and emb_sum.stride(1) == 1 and hidden % 256 == 0
@@ -261,11 +263,17 @@ class ResidualCodePredictor(nn.Module):
     the checkpoint's ``talker.code_predictor.*``: ``model.layers``,
     ``model.norm``, ``model.codec_embedding.{g - 1}`` (group ``g``'s table),
     ``lm_head.{g - 1}`` and the projection. ``max_batch_size`` sizes the depth
-    cache: the most rows a depth loop runs at once.
+    cache: the most rows a depth loop runs at once. ``embed_sum_dtype`` is the
+    dtype a frame's embedding sum accumulates in (None: the embeddings' own,
+    rounding after every add); each Talker keeps the sum it had before the
+    two shared this predictor.
     """
 
-    def __init__(self, cp: Any, talker_width: int, max_batch_size: int) -> None:
+    def __init__(
+        self, cp: Any, talker_width: int, max_batch_size: int, *, embed_sum_dtype: torch.dtype | None,
+    ) -> None:
         super().__init__()
+        self.embed_sum_dtype = embed_sum_dtype
         self.num_code_groups = cp.num_code_groups
         residual = cp.num_code_groups - 1
         self.depth = DepthKV((
@@ -312,9 +320,7 @@ class ResidualCodePredictor(nn.Module):
         final norm: ``[bs, S, hidden]``. Bind the step first with
         ``depth.bind_step``, once per call: the depth loop binds it, not this
         frame, which would compile once per ``cache_pos``."""
-        # the residual stream is updated in place, so it starts from a copy: the
-        # projection may be the identity, and its input is the caller's
-        hidden_states = self.small_to_mtp_projection(inputs_embeds).clone()
+        hidden_states = self.small_to_mtp_projection(inputs_embeds)
         return run_layers(self.model.layers, hidden_states, self.model.norm)
 
     def depth_loop(
@@ -326,10 +332,11 @@ class ResidualCodePredictor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Groups 1..G-1 of the frames whose group-0 codes the Talker sampled.
 
-        The depth sequence opens with the Talker's hidden state and group 0's
-        embedding, as the reference's code-predictor prefill does: one
-        two-token pass whose second token predicts group 1, then one token per
-        group. Every op is graph-safe, so a capture records the loop as is.
+        The depth sequence opens with the Talker's hidden state at position 0,
+        then one token per group: group ``g - 1``'s embedding at position
+        ``g`` predicts group ``g``. One-token passes throughout, so every pass
+        runs ``bs`` rows. Every op is graph-safe, so a capture records the
+        loop as is.
 
         Args:
             last_hidden: ``[bs, talker_width]``, the Talker's hidden state.
@@ -340,22 +347,21 @@ class ResidualCodePredictor(nn.Module):
 
         Returns:
             The frames' codes ``[bs, G]``, and the sum of their G embeddings,
-            the Talker's next input: accumulated in fp32 and returned in
-            ``layer0_embed``'s dtype.
+            the Talker's next input: accumulated in ``embed_sum_dtype`` and
+            returned in ``layer0_embed``'s dtype.
         """
         bs = layer0_codes.shape[0]
         codes = torch.empty(bs, self.num_code_groups, dtype=torch.long, device=layer0_codes.device)
         codes[:, 0] = layer0_codes
-        # a copy even when the embeddings are fp32: the sum is updated in place
-        embed_sum = layer0_embed.to(torch.float32, copy=True)
+        # a copy even when the dtypes match: the sum is updated in place
+        embed_sum = layer0_embed.to(self.embed_sum_dtype or layer0_embed.dtype, copy=True)
         embed = layer0_embed
+        # position 0 only fills the cache: group 0's code is the Talker's
+        self.depth.bind_step(0)
+        self.forward_depth_unrolled(last_hidden.unsqueeze(1))
         for group in range(1, self.num_code_groups):
-            if group == 1:
-                self.depth.bind_step(0)
-                hidden = self.forward_depth_unrolled(torch.stack([last_hidden, embed], dim=1))[:, 1]
-            else:
-                self.depth.bind_step(group)
-                hidden = self.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
+            self.depth.bind_step(group)
+            hidden = self.forward_depth_unrolled(embed.unsqueeze(1)).squeeze(1)
             logits = torch.matmul(hidden, self.lm_head_weight[group - 1].t())
             embed = cp_embed_accumulate(
                 sample(logits), self.model.codec_embedding[group - 1].weight, embed_sum, codes, group,

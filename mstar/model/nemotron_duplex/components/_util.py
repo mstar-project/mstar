@@ -1,6 +1,6 @@
 """Small helpers shared by the Nemotron-VoiceChat component ports.
 
-These stages (Conformer STT, RNN-T, EarTTS talker, RVQ codec) are ported to
+These stages (EarTTS talker, RVQ codec) are ported to
 **exact checkpoint parity** so the single composite ``model.safetensors`` loads
 with no missing / unexpected / shape-mismatched tensors. The forward passes for
 the audio stages are Phase 4/5 (they need the NeMo / EarTTS reference to verify

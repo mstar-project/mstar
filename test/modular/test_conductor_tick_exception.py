@@ -7,7 +7,7 @@ error, its concurrency slot is freed, and every other request in the same
 tick carries on.
 """
 import re
-from collections import Counter, deque
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -106,7 +106,6 @@ def _conductor(*ticks, requests):
     c._startup_message_backlog = []
     c.requests = dict(requests)
     c.draining = {}
-    c._replica_load = Counter()
     c.waiting_queue = []
     c.max_concurrent_requests = None
     c._early_reads_done = {}
@@ -117,6 +116,8 @@ def _conductor(*ticks, requests):
     c._drain_ttl_s = 120.0
     c.worker_graphs = {0: SimpleNamespace(graph_walks={"decode"})}
     c.producer_triggered_partitions = set()
+    c._stream_fed_partitions = set()
+    c._client_streams = {}
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}}
     c._wait_for_workers_ready = lambda: None
 

@@ -21,6 +21,8 @@ from mstar.engine.resources.attn import cross as cross_mod
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
+    SINK_PAGE,
+    HostLens,
     KVPlanOutput,
     KVPlanOutputs,
     PagedIndptrs,
@@ -46,6 +48,7 @@ class _RecordingWrapper:
 
     def plan(self, **kwargs):
         self.plans += 1
+        self.last_plan = kwargs
         # a real CUDA-graph wrapper raises here when the row count exceeds the
         # batch_size it was built with
         rows = kwargs["qo_indptr"].shape[0] - 1
@@ -247,3 +250,24 @@ def test_a_captured_key_keeps_its_kind():
     manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
     with pytest.raises(AssertionError, match="captured as decode"):
         manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([2, 0])))
+
+
+def test_the_plan_hands_the_wrapper_host_kv_lens():
+    """A captured decode wrapper calls FlashInfer's planner directly only when
+    the plan carries host lengths; they are FlashInfer's ``get_seq_lens`` of
+    the context rows, and a padding row's empty context is one sink token."""
+    manager = _manager()
+    ctx = _ctx(("r0", "r1", "r2"), _query([1, 1, 1]))
+    ctx.plan_results[CTX_KV][CONTEXT] = _plan_output([
+        SequenceView(request_id="r0", label=CONTEXT, page_idxs=[1, 2, 9], length=20, to_compute=0),
+        SequenceView(request_id="r1", label=CONTEXT, page_idxs=[3], length=16, to_compute=0),
+        SequenceView(request_id="r2", label=CONTEXT, page_idxs=[], length=0, to_compute=0),
+    ])
+    manager.plan(AttentionStep(causal=False), ctx)
+    plan = manager._current_plan_states["main"].last_plan
+    assert isinstance(plan["kv_lens"], HostLens)
+    assert plan["kv_lens"].tolist() == [20, 16, 1]
+    # only the pages the written length covers
+    assert plan["paged_kv_indices"].tolist() == [1, 2, 3, SINK_PAGE]
+    assert plan["paged_kv_indptr"].tolist() == [0, 2, 3, 4]
+    assert plan["paged_kv_last_page_len"].tolist() == [4, 16, 1]

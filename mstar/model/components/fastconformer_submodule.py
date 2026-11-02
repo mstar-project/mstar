@@ -130,14 +130,10 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
         # the features are computed for the whole batch in preprocess; the
         # length check stays here, so a clip too short fails only its request
         audio = inputs["audio"][0]
-        frames = self.log_mel.num_frames(audio.numel())
-        if frames < 2:
-            raise ValueError(
-                f"audio of {audio.numel()} samples is shorter than two {self.log_mel.hop_length}-sample frames"
-            )
+        self.log_mel.check_length(audio.numel())
         return NodeInputs(
             tensor_inputs={"audio": audio},
-            input_seq_len=self.encoder.config.output_lengths(frames),
+            input_seq_len=self.encoder.config.output_lengths(self.log_mel.num_frames(audio.numel())),
         )
 
     def preprocess(

@@ -557,7 +557,7 @@ def test_the_vision_compile_regions_take_their_start_up_examples():
     config = _encoder(max_segments=4).config
     encoder = VisionEncoderSubmodule(Qwen3_5VisionModel(config), config, (torch.zeros(1), torch.ones(1)))
     regions = encoder.compile_regions()
-    assert set(regions) == {"model.embed", "model.merger"}
+    assert set(regions) == {"model.embed", "model.encode", "model.merger"}
     with torch.no_grad():
         hidden, _, _ = encoder.model.embed(*regions["model.embed"][0])
         (rows,) = regions["model.merger"][0]
@@ -588,6 +588,35 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
     assert not config.can_lease([request(2), request(3)])
 
 
+def test_vision_block_loop_replays_exactly_when_leased():
+    """The forward replays when its step leased the region and runs eagerly
+    otherwise, whatever the runner's buckets allow: ``can_lease`` may have
+    refused a batch that fits one."""
+    from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP
+
+    class Runner:
+        def can_run(self, batch_size, total_tokens):
+            return True
+
+        def run(self, **kwargs):
+            self.ran = kwargs
+            return SimpleNamespace(get_view=lambda name: "replayed")
+
+    encoder, runner = _encoder(max_segments=4), Runner()
+    hidden = cos = sin = torch.zeros(8, 32)
+
+    def replay(leases):
+        engine_inputs = SimpleNamespace(
+            piecewise_runners={VISION_BLOCK_LOOP: runner}, piecewise_leases=leases, request_ids=["r"],
+        )
+        return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, (4, 4))
+
+    assert replay({}) is None
+    assert not hasattr(runner, "ran")
+    assert replay({VISION_BLOCK_LOOP: object()}) == "replayed"
+    assert runner.ran["seq_lens"] == [4, 4]
+
+
 def test_vision_batch_that_overflows_one_replay_runs_request_by_request():
     """Requests that fit a replay alone but not together are not packed into
     one eager step: ``can_batch`` refuses, and each replays on its own."""
@@ -603,6 +632,34 @@ def test_vision_batch_that_overflows_one_replay_runs_request_by_request():
     assert encoder.can_batch(None, [request(top // 2), request(top // 2)])
     assert not encoder.can_batch(None, [request(top // 2), request(top // 2 + 256)])
     assert not encoder.can_batch(None, [request(64, 2), request(64, 3)])
+
+
+def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
+    """The scheduler groups vision requests by `cg_key_info`: requests that fit
+    a replay alone share steps, and one past the top patch bucket or the
+    segment ceiling is a group of its own, so a long video's embeddings are
+    not held back for its batch's others. The engine splits a node whose only
+    capture is a piecewise region."""
+    from mstar.engine.engine import Engine
+    from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY
+
+    encoder = _encoder(max_segments=4)
+
+    def info(*grid):
+        return SimpleNamespace(step_metadata={STEP_GRIDS_KEY: list(grid)})
+
+    image, video, frames = info((1, 16, 16)), info((2, 128, 128)), info((5, 16, 16))
+    assert encoder.cg_key_info("prefill_vision", {1: image}) is None
+    assert encoder.cg_key_info("prefill_vision", {2: video}) == (2,)
+    assert encoder.cg_key_info("prefill_vision", {3: frames}) == (3,)
+
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"vision_encoder": SimpleNamespace(
+        submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
+    )}
+    assert engine.splits_by_capture_key("vision_encoder", "prefill_vision")
+    assert engine.capture_group("vision_encoder", "prefill_vision", 2, video) == (2,)
+    assert engine.capture_group("vision_encoder", "prefill_vision", 1, image) is None
 
 
 def test_vision_encoder_refuses_patches_it_would_not_normalize():

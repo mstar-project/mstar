@@ -7,6 +7,7 @@ import functools
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import torch
@@ -23,7 +24,15 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -39,9 +48,11 @@ from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -675,6 +686,11 @@ class ViTEncoderSubmodule(NodeSubmodule):
         return out
 
 
+def _unguided(fwd_info: CurrentForwardPassInfo) -> bool:
+    """A guided prompt writes two labels from one input, as `_skip_cached_prefix` refuses."""
+    return not fwd_info.step_metadata.get("requires_cfg", False)
+
+
 # Added to the request seed for the VAE posterior draw, so it is a different
 # stream from the diffusion's initial noise (seeded with the request seed itself).
 _VAE_NOISE_SEED_OFFSET = 0x9E3779B9
@@ -1168,6 +1184,34 @@ class LLMSubmodule(ARNodeSubmodule):
             del cache[next(iter(cache))]
         return cached
 
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        if graph_walk == "decode":
+            return InputSeqLenInfo(1)
+        return None
+
+    MAX_BATCH_TOKENS = 1024
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        # resource_step_info is the row's requires_cfg flag, the same for every chunk
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, resource_step_info=None), start, end,
+        )
+        cut.resource_step_info = inputs.resource_step_info
+        return cut
+
     def declare_step(
         self,
         graph_walk: str,
@@ -1269,12 +1313,13 @@ class LLMSubmodule(ARNodeSubmodule):
             if "prefill_text" in row_walks:
                 # cfg_text keeps the pre-text context, so it forks before
                 # anything plans or writes: the prompt rows only, not a
-                # decode row sharing the step
+                # decode row sharing the step, and a chunked prompt on its
+                # first chunk
                 fork_rids = frozenset(
-                    rid for rid, walk in zip(request_ids, row_walks, strict=True)
-                    if walk == "prefill_text" and rid in guided_rids
+                    rid for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
+                    if walk == "prefill_text" and rid in guided_rids and inp.chunk_start == 0
                 )
-                pre_forks = (("main", "cfg_text"),)
+                pre_forks = (("main", "cfg_text"),) if fork_rids else ()
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
@@ -1422,10 +1467,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 label="main", **kwargs
             )
         if sample_token:
-            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
-            assert qo_indptr_buf is not None
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
-            last_hidden = hidden.index_select(0, last_token_indices)
+            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
             logits = self.lm_head(last_hidden)
             # `_LOGITS` is the private handoff to whichever dispatcher called:
             # the shape of a sampled token is `forward` vs `forward_batched`'s
@@ -1454,10 +1496,7 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
         if sample_token:
-            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
-            assert qo_indptr_buf is not None
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
-            last_hidden = hidden.index_select(0, last_token_indices)
+            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
             logits = self.lm_head(last_hidden)
             return {_LOGITS: [logits]}
         return {}
@@ -1888,8 +1927,15 @@ class LLMSubmodule(ARNodeSubmodule):
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and self.eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens):
+        hit_eos = not ignore_eos and self.eos_token_id == token
+        if request_info.graph_walk != "decode":
+            # The last prefill's token comes before decode_loop exists. The
+            # conductor says whether a stop there ends the request: not for an
+            # earlier prefill's throwaway token, nor for a think-then-image
+            # request, whose image_gen only the conductor's transition can start.
+            ends = request_info.step_metadata.get("prefill_stop_ends", False)
+            return {END_PARTITION} if hit_eos and ends else set()
+        if hit_eos or request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens:
             return {"decode_loop"}
         return set()
 

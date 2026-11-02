@@ -11,10 +11,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput  # noqa: E402
 from mstar.communication.codec import default_codec  # noqa: E402
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
+from mstar.communication.event import EventWakeup  # noqa: E402
 from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
@@ -116,9 +117,10 @@ def _request(request_id, **model_kwargs):
 
 def _thread(peer, tensor_manager=None):
     queues = {name: queue.Queue() for name in (
-        "in_queue", "result_tensor_queue", "out_queue", "profile_queue", "cleanup_request_queue",
+        "in_queue", "result_tensor_queue", "cleanup_request_queue",
         "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
     )}
+    queues["out_queue"], queues["profile_queue"] = ResultQueue(EventWakeup()), ResultQueue(EventWakeup())
     out = OutboxCommunicator(peer)
     wt = PreprocessWorkerThread(
         **queues, stop_event=threading.Event(), communicator=out,

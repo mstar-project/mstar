@@ -43,8 +43,8 @@ _MIB = 2**20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a throwaway capture needs a GPU")
 
 
-# a node with no float32 setting of its own
-_NO_PRECISION = SimpleNamespace(fp32_precision=None)
+# a node with no float32 or cuDNN-search setting of its own
+_NO_PRECISION = SimpleNamespace(fp32_precision=None, submodule=SimpleNamespace(capture_cudnn_benchmark=False))
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
@@ -667,6 +667,29 @@ def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monk
         signature.bind(*args, **kwargs)
     except TypeError as error:
         pytest.fail(f"torch {torch.__version__} refuses the snapshot call, so every capture would fail: {error}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the reference is dropped in torch's CUDA snapshot")
+def test_sizing_a_throwaway_capture_keeps_the_references_to_its_pool_id(monkeypatch):
+    """Sizing leaves the id's references as they were: past 256 pools the id is no cached
+    small int, so a dropped reference frees it while the pool's handle still holds it."""
+    pool_id = (0, int("1000007"))
+    held = [pool_id[1]] * 4  # so the id outlives a dropped reference and the count stays readable
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: pool_id)
+    monkeypatch.setattr(accelerator_graph_runner, "_graph_nodes", lambda graph: 0)
+    measured = ExecutableMemory()
+    measured.per_node = 0.0
+    before = sys.getrefcount(pool_id[1])
+
+    memory = accelerator_graph_runner._capture_thrown_away(
+        lambda pool, keep_graph: (object(), {}), "decode", measured,
+    )
+    # read as `before` was: inside the assert, pytest's rewrite holds one more reference
+    after = sys.getrefcount(pool_id[1])
+
+    assert memory is not None
+    assert after == before, "sizing the capture dropped a reference to its pool id"
+    del held
 
 
 def _cost(graph: int, kept: int = 0, peak: int = 0, slots: int = 1) -> CaptureCost:

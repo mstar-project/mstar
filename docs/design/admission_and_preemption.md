@@ -84,7 +84,7 @@ Rules:
 - **Size.** A preemptible request reserves its prompt. A guaranteed one also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.
-- **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
+- **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot and the sampler's in-graph row included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
 
 ```
 room = free + evictable - _unused
@@ -111,9 +111,9 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads the least recently active request first, as it does today, since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
+Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads first, as it does today (the row last in the refused step's line), since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
-Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
+Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 
 
 ### 3.1 Arrival numbers
@@ -149,7 +149,7 @@ Why this shape:
 - **Newest first.** No request is dropped for a newer one's page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
 - **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
-- **Not the least recently active request.** Today's offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.
+- **Not the row last in line.** Today's offload picks it, but under `TURNS` it can be the oldest request in the pool, so nothing guarantees progress.
 - **Not the largest request.** A long request would be dropped every time it grows.
 
 ### 3.3 Earmarks

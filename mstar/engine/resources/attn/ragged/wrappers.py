@@ -25,7 +25,8 @@ def padded_head_dim(head_dim: int) -> int:
 
 class _RaggedPrefillBase(ABC):
     """What the self- and cross-attention wrappers share: the graph-mode static
-    buffers and their padding. A backend subclass plans and runs its kernel.
+    buffers and their padding, and skipping a plan the wrapper already holds. A
+    backend subclass plans and runs its kernel.
     """
 
     def __init__(
@@ -54,6 +55,8 @@ class _RaggedPrefillBase(ABC):
             max_total_kv_tokens if max_total_kv_tokens is not None else max_total_tokens
         )
         self._num_segments = 0
+        # the layout this wrapper's schedule describes; see ``_plan``
+        self._planned_layout: tuple | None = None
 
         if accelerator_graph:
             assert max_num_segments is not None, "max_num_segments required for accelerator graph mode"
@@ -117,13 +120,37 @@ class _RaggedPrefillBase(ABC):
         return cu, total_tokens
 
     def _plan(self, cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> None:
+        # A wrapper keeps the schedule of its last plan until it is planned again
+        # and ``run`` only reads it, so a layout it already holds is not replanned:
+        # a plan costs host time, plus a stream sync on a backend whose plan reads
+        # the layout back from the device, and a denoising request keeps its
+        # layout from step to step. Each (label, slot) has its own wrapper, so this
+        # compares against what this slot's schedule says, never against what the
+        # previous step ran.
+        layout = self._layout_key(cu_seqlens, kv_cu_seqlens, causal)
+        if layout == self._planned_layout:
+            return
         cu, total_tokens = self._prepare_cu_seqlens(cu_seqlens, self.max_total_tokens)
         if kv_cu_seqlens is cu_seqlens:
             kv_cu = cu
         else:
             kv_cu, _ = self._prepare_cu_seqlens(kv_cu_seqlens, self.max_total_kv_tokens, "key ")
         self._num_segments = int(cu_seqlens.numel()) - 1
+        # a plan that raises may already have overwritten the schedule
+        self._planned_layout = None
         self._plan_kernel(cu, kv_cu, total_tokens, causal)
+        self._planned_layout = layout
+
+    @staticmethod
+    def _layout_key(cu_seqlens: torch.Tensor, kv_cu_seqlens: torch.Tensor, causal: bool) -> tuple:
+        q = cu_seqlens.tolist()
+        return q, q if kv_cu_seqlens is cu_seqlens else kv_cu_seqlens.tolist(), causal
+
+    def forget_plan(self) -> None:
+        """Replan on the next ``plan``, whatever its layout. For a plan whose
+        staging the wrapper's next user can't order against (a dropped pre-plan,
+        whose H2Ds went on the plan stream with nothing left to wait on them)."""
+        self._planned_layout = None
 
     @abstractmethod
     def _plan_kernel(

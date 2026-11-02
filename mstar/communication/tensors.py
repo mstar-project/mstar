@@ -15,7 +15,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -31,6 +31,7 @@ from mstar.observability.catalog import TRANSFER_API_SERVER
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.threads import ThreadPool
 
 try:
     from mooncake.engine import TransferEngine
@@ -379,7 +380,7 @@ class AsyncMooncakeReader:
     ):
         self._engine = engine
         self.max_batch_size = max_batch_size
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._executor = ThreadPool(max_workers=max_workers)
         self._pending: list[Future] = []
         # none on the host: host buffers have no GPU work to wait for, and a stream or event would
         # create a CUDA context on a GPU that other processes may have filled
@@ -876,10 +877,13 @@ class TensorCommunicationManager(ABC):
         server calls the store without registering, so a missing config means
         "no group" / TP=1 rather than an error.
         """
-        source_group = (
-            cfg.get_sharding_group(node_name, graph_walk)
-            if cfg is not None else None
-        )
+        return self._source_tp_at(cfg, NodeAndGraphWalk(node_name, graph_walk))
+
+    @staticmethod
+    def _source_tp_at(cfg: ShardingConfig | None, key: NodeAndGraphWalk) -> tuple[int, int]:
+        """``_source_tp`` for a key built once per batch: each row checks its
+        own config, and the key is the part of the lookup that costs."""
+        source_group = cfg.group_mapping.get(key) if cfg is not None else None
         if source_group is None:
             return 1, 0
         return source_group.tp_size, source_group._tp_rank or 0
@@ -1030,7 +1034,9 @@ class TensorCommunicationManager(ABC):
         row_of = {rid: i for i, rid in enumerate(row_request_ids)}
         sharding = self.sharding_configs
         first_cfg = sharding.get(request_ids[0]) if request_ids else None
-        tp_size, tp_rank = self._source_tp(first_cfg, node_name, graph_walk)
+        tp_key = NodeAndGraphWalk(node_name, graph_walk)
+        tp_size, tp_rank = self._source_tp_at(first_cfg, tp_key)
+        source_tp_at = self._source_tp_at
         columns = ColumnarTensorInfo(
             source_session_id=self.my_session_id,
             source_entity=self.my_entity_id,
@@ -1063,12 +1069,10 @@ class TensorCommunicationManager(ABC):
                     return None
                 rid_out = outputs.get(rid)
                 cfg = sharding.get(rid)
-                if cfg is not first_cfg and self._source_tp(
-                    cfg, node_name, graph_walk,
-                ) != (tp_size, tp_rank):
+                if cfg is not first_cfg and source_tp_at(cfg, tp_key) != (tp_size, tp_rank):
                     raise ValueError(
                         f"request {rid} has sharding "
-                        f"{self._source_tp(cfg, node_name, graph_walk)} for "
+                        f"{source_tp_at(cfg, tp_key)} for "
                         f"node {node_name!r} walk {graph_walk!r}, but the batch "
                         f"was built for {(tp_size, tp_rank)}; one batch is one "
                         "node on one worker and cannot mix sharding groups"

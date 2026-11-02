@@ -131,7 +131,7 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
@@ -1084,6 +1084,20 @@ class BagelModel(Model):
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.bagel.submodules import LLMSubmodule, _unguided
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(
+                walks=("prefill_text",), chunkable=True, max_batch_tokens=budget,
+                # a guided row's cfg streams hold context the cache never keyed
+                reuses_cached_prefix=_unguided,
+            ),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(MIXED_TEXT,), max_batch_tokens=budget),
+        )}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --
         # No output needed — conductor is notified when the worker graph completes.
@@ -1342,6 +1356,16 @@ class BagelModel(Model):
     def _image_gen_phase(metadata: CurrentForwardConductorMetadata) -> ImageGenPhase:
         return metadata.kwargs["image_gen_phases"][metadata.kwargs["image_gen_phase"]]
 
+    @staticmethod
+    def _prefill_token_metadata(sample_prefill_token: bool, target_output: str) -> dict:
+        """Whether this pass samples the reply's first token, and whether a stop
+        there ends the request: only for a text reply, which has no walk after
+        decode."""
+        return {
+            "sample_prefill_token": sample_prefill_token,
+            "prefill_stop_ends": sample_prefill_token and target_output == "text",
+        }
+
     def _get_fwd_pass_inputs(
         self,
         metadata: CurrentForwardConductorMetadata,
@@ -1468,7 +1492,7 @@ class BagelModel(Model):
         step_metadata =  self._get_step_metadata(full_metadata)
 
         sample_prefill_token = (think_mode or target_output != "image") and len(schedule) == 1
-        step_metadata["sample_prefill_token"] = sample_prefill_token
+        step_metadata.update(self._prefill_token_metadata(sample_prefill_token, target_output))
 
         inputs = self._get_fwd_pass_inputs(
             full_metadata, input_signals
@@ -1555,7 +1579,9 @@ class BagelModel(Model):
                 request_done = True
 
         step_metadata =  self._get_step_metadata(metadata)
-        step_metadata["sample_prefill_token"] = sample_prefill_token
+        step_metadata.update(
+            self._prefill_token_metadata(sample_prefill_token, metadata.kwargs["target_output"])
+        )
         inputs = self._get_fwd_pass_inputs(
             metadata, persist_signals
         )

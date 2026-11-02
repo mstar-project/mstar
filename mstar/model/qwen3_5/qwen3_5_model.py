@@ -83,7 +83,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
@@ -164,9 +164,6 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
-    # token streaming keeps three API-server threads busy: +4 to +8% tok/s on
-    # 0.8B text at c=64 before #849; re-measure pending (docs/serving.rst)
-    API_SWITCH_INTERVAL_S = 0.001
     INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
 
     def __init__(
@@ -238,6 +235,7 @@ class Qwen3_5DenseModel(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(_MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
@@ -306,6 +304,16 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
@@ -638,7 +646,8 @@ class Qwen3_5DenseModel(Model):
         })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
@@ -890,7 +899,9 @@ class Qwen3_5DenseModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
+        keys = [
+            "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos", "return_logprobs", "logprobs_mode",
+        ]
         return {
             SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs[k] for k in keys if k in model_kwargs}

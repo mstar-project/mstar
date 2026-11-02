@@ -13,11 +13,14 @@ KNOBS: dict[str, str] = {
     "device_loopback": "MSTAR_DEVICE_LOOPBACK",
     "sampler_ingraph_scatter": "MSTAR_SAMPLER_INGRAPH_SCATTER",
     "sampler_slots": "MSTAR_SAMPLER_SLOTS",
+    "ingraph_decode_rope": "MSTAR_INGRAPH_DECODE_ROPE",
     "kv_chain_lazy_steps": "MSTAR_KV_CHAIN_LAZY_STEPS",
     "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
+    "step_thread_core": "MSTAR_STEP_THREAD_CORE",
+    "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -40,7 +43,9 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
         )
     out = {}
     for key, value in settings.items():
-        if isinstance(value, bool):
+        if key == "step_thread_core":
+            out[key] = _step_thread_core_value(value)
+        elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
             out[key] = str(value)
@@ -49,6 +54,19 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _step_thread_core_value(value: object) -> str:
+    # yaml reads a bare ``off`` as False
+    if isinstance(value, bool):
+        return "auto" if value else "off"
+    if isinstance(value, int) and value >= 0:
+        return str(value)
+    if isinstance(value, str) and value.strip().lower() in ("auto", "off"):
+        return value.strip().lower()
+    raise ValueError(
+        f"`knobs: step_thread_core` must be auto, off or a CPU number, got {value!r}"
+    )
 
 
 def configure(settings: Mapping[str, object] | None) -> None:
@@ -75,21 +93,40 @@ def device_loopback_enabled() -> bool:
 
 def sampler_ingraph_scatter() -> bool:
     """``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default
-    off): the captured sampler gathers its RNG offsets from the slot masters
+    on): the captured sampler gathers its RNG offsets from the slot masters
     and scatters the advanced offsets and the sampled tokens back inside the
     graph, so a replayed step issues none of those launches on the gpu thread
     (each is a GIL release the main thread's postprocess can win). Padding
-    rows then address a trash master row, and the masters are allocated once
-    for ``sampler_slots`` concurrent requests, since a captured graph holds
-    their addresses."""
-    return _setting("sampler_ingraph_scatter", "0") == "1"
+    rows then address a trash master row, and the offset and last-token
+    masters are allocated once for ``sampler_slots`` concurrent requests,
+    since a captured graph holds their addresses; a request takes its row at
+    admission and waits while none is free."""
+    return _setting("sampler_ingraph_scatter", "1") == "1"
 
 
 def sampler_slots() -> int:
-    """``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): master rows
-    allocated up front when the in-graph scatter is on (see
-    ``sampler_ingraph_scatter``)."""
+    """``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): request rows
+    of the masters a captured graph indexes when the in-graph scatter is on
+    (see ``sampler_ingraph_scatter``), so the most requests admitted at once
+    on its node."""
     return int(_setting("sampler_slots", "4096"))
+
+
+def ingraph_decode_rope() -> bool:
+    """``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off): a
+    captured text prefill or mixed step builds its rotary tables inside the
+    graph from the position resource's planned positions instead of building
+    them before the replay. A captured decode step always does."""
+    return _setting("ingraph_decode_rope", "0") == "1"
+
+
+def compile_deterministic() -> bool:
+    """``compile_deterministic`` / ``MSTAR_COMPILE_DETERMINISTIC`` (default
+    off): Qwen3.5's decode capture compiles in Inductor's deterministic mode,
+    as its prefill captures always do, so greedy output reproduces across
+    server processes and the cold start shrinks, at the cost of one-row decode
+    speed. Qwen3.5's text walks are the only reader."""
+    return _setting("compile_deterministic", "0") == "1"
 
 
 def kv_chain_lazy_steps() -> int:
@@ -151,3 +188,19 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def step_thread_core() -> str | int:
+    """``step_thread_core`` / ``MSTAR_STEP_THREAD_CORE`` (default ``off``):
+    pin each worker's main, GPU and plan threads, and the API server's result
+    threads, to CPUs of their own. ``auto`` places them by the GPU's rank on
+    its NUMA node, a number is the first worker's CPU (see
+    ``mstar.utils.cpus``)."""
+    value = _setting("step_thread_core", "off").strip().lower()
+    if value in ("auto", "off"):
+        return value
+    if value.isdigit():
+        return int(value)
+    raise ValueError(
+        f"MSTAR_STEP_THREAD_CORE must be auto, off or a CPU number, got {value!r}"
+    )
