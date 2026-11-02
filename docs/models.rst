@@ -240,8 +240,8 @@ OmniVoice notes
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
 - The backbone's layer stack replays CUDA graphs per (requests, packed-token
-  bucket up to 4096 tokens) with attention through a ragged attention resource;
-  larger steps are GPU-bound and run eagerly. The layer loop is mstar's own over
+  bucket up to 8192 tokens) with attention through a ragged attention resource;
+  larger steps run the same layer loop eagerly. The layer loop is mstar's own over
   the reference's fused weights: q/k norms read the fused QKV output in place
   and each residual add folds into the next RMSNorm (flashinfer
   ``fused_add_rmsnorm``), so logits match the reference to half-precision
