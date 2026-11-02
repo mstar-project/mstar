@@ -108,7 +108,7 @@ def take_shard_edge(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec
     """Set ``spec.shard_key`` to the ``SeqShardSpec`` over its nodes, if any (a ``derive``).
     A shard sharing only some of ``spec``'s nodes is a problem: the spec would split on some of
     its nodes and not others."""
-    shards = [other for other in specs.values() if isinstance(other, SeqShardSpec) and other.nodes & spec.nodes]
+    shards = [other for other in specs.values() if other.splits_steps and other.nodes & spec.nodes]
     spec.shard_key = None
     if not shards:
         return []
