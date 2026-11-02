@@ -423,6 +423,7 @@ class SamplerResource(Resource):
         return kept - mid_prefill.keys()
 
     def plan(self, step: SamplerStep, ctx: StepContext):
+        laps = PhaseLaps(f"{ctx.plan_phase}.sampler.")
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
             self._kept_rids = self._kept_rids_of(step, ctx)
@@ -452,11 +453,13 @@ class SamplerResource(Resource):
         # eager prefill while a decode step sits pre-planned) plans inline
         # and the staged plan is dropped, exactly as `reset_pre_plan_for_batch`
         # would have done.
+        laps.lap("penalty")
         if self._preplanned and not ctx.is_preplan:
             if ctx.slot_lease is None or self._preplan_key != self._plan_key(ctx):
                 self.clear_preplan()
             else:
                 self._gather_dynamic(ctx, ctx.slot_lease)
+                laps.lap("dynamic")
                 self._cg_sampler = self._preplan_cg_sampler
                 self._preplan_cg_sampler = None
                 self._preplanned = False
@@ -482,6 +485,7 @@ class SamplerResource(Resource):
         # slot 0, a defaults row) and gates the scatter-back on the real count.
         self._cg_buffers.gather_static(ctx.request_ids, padded_bs, cg_slot)
         sampler = self._cg_buffers.sampler_for(padded_bs, cg_slot)
+        laps.lap("static")
         if ctx.is_preplan:
             self._preplan_cg_sampler = sampler
             self._preplan_key = self._plan_key(ctx)
@@ -489,6 +493,7 @@ class SamplerResource(Resource):
         else:
             # fresh inline (capture / no preplan): gather the per-step state too
             self._gather_dynamic(ctx, lease)
+            laps.lap("dynamic")
             self._cg_sampler = sampler
             self._step_slot = (cg_slot, padded_bs)
 
