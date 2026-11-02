@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.communication import CommGroup
 from mstar.model.loader.base import _apply_stacked
 from mstar.model.muse.components.text import (
@@ -642,7 +643,7 @@ def test_each_image_expands_to_its_tokens_with_one_bos(model_dir, low):
 
     signals = {k: list(v) for k, v in out.items()}
     step = model._prefill_step(signals, layout)
-    assert step.walk == "prefill_vision" and step.step_metadata == {MEDIA_LAYOUT: layout}
+    assert step.walk == "prefill_vision" and step.step_metadata == {MEDIA_LAYOUT: layout, FINAL_PREFILL: True}
 
 
 def test_a_spelled_out_patch_is_a_bad_request(model_dir):

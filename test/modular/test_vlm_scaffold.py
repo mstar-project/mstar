@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.conductor.request_info import WalkStep
+from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import Parallel
 from mstar.model.keys import MIXED, ROPE, SAMPLER
 from mstar.model.multimodal import (
@@ -114,7 +114,8 @@ def _signals(**counts: int) -> dict[str, list[str]]:
 
 def test_a_text_prompt_is_one_prefill_text_walk():
     signals = _signals(text_inputs=1)
-    assert media_prefill_step(signals, [VISION], model_name="m") == WalkStep("prefill_text")
+    step = media_prefill_step(signals, [VISION], model_name="m")
+    assert step == WalkStep("prefill_text", step_metadata={FINAL_PREFILL: True})
     # encoder inputs with no layout to place them by are refused, not dropped
     with pytest.raises(ValueError, match="no media layout"):
         media_prefill_step(_signals(text_inputs=1, pixel_values=1), [VISION], model_name="m")
@@ -131,7 +132,7 @@ def test_a_media_prompt_is_one_walk_over_the_encoders_it_needs(counts, walk):
     # the layout's runs name the encoders, as they do the KV layout's walk
     layout = {"offset": [3] * len(counts), "output": [encoder[name].output for name in counts]}
     step = media_prefill_step(signals, [VISION, AUDIO], layout, model_name="m")
-    assert step == WalkStep(walk, step_metadata={MEDIA_LAYOUT: layout})
+    assert step == WalkStep(walk, step_metadata={MEDIA_LAYOUT: layout, FINAL_PREFILL: True})
 
 
 @pytest.mark.parametrize(("texts", "match"), [(0, "nothing to prefill"), (2, "2 text tensors")])
