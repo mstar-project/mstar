@@ -91,6 +91,7 @@ from mstar.model.submodule_base import (
     StopCheck,
     TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -195,16 +196,18 @@ class VisionEncoderSubmodule(NodeSubmodule):
             for g in inputs["image_grid_thw"]
             for t, h, w in g.reshape(-1, 3).tolist()
         ]
-        # Built here, not in the forward, so the tower reads nothing off the host.
-        indices, weights = vision_interpolation(grid, vision.num_grid_per_side, merge, device)
+        # Built here, not in the forward, so the tower reads nothing off the host;
+        # and built on the host, as Qwen3.5's encoder does: on the device, the
+        # grid upload and the per-patch index maths each block on the stream.
+        indices, weights = vision_interpolation(grid, vision.num_grid_per_side, merge)
         return NodeInputs(
             # what the engine leases the captured block loop's bucket by
             input_seq_len=sum(t * h * w for t, h, w in grid),
             tensor_inputs={
                 "pixel_values": torch.cat(list(inputs["pixel_values"]), dim=0),
-                "indices": indices,
-                "weights": weights,
-                "position_ids": vision_grid_position_ids(grid, merge, device),
+                "indices": to_device_nonblocking(indices, device),
+                "weights": to_device_nonblocking(weights, device),
+                "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
                 # not a forward arg: `declare_step` makes a segment of each
                 "seq_lengths": vision_seq_lengths(grid),
             },
