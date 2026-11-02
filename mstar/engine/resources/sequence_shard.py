@@ -47,8 +47,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class SeqShardStep(ResourceStep):
-    """The step's segments and ``combined_labels`` (``SubmoduleStep`` fills both), so a combined
-    plan label gets a range over its sources too."""
+    """The step's segments and ``combined_labels`` (``SubmoduleStep`` fills both, unless the step
+    sets its own segments), so a combined plan label gets a range over its sources too."""
 
 
 @dataclass
