@@ -2528,8 +2528,9 @@ runs copied on a ring node (ring is eager only), so prefill buckets above ``min_
 all-gather would split run copied there. A step that combines labels (batched CFG's) has no
 stored positions to stripe by, so it fails at plan on a ring node. A step's peak memory is its resident tensors plus the
 larger of its attention and its MLP (or MoE) phase. All-gather's attention phase holds the
-whole step's q, k and v and ``P`` partials per query; ring's holds this rank's tokens alone. So
-ring lowers the peak only once attention outgrows the MLP phase. Estimated from allocation sites
+whole step's q, k and v and ``P`` partials per query; ring's holds this rank's tokens alone, and
+two fp32 copies of their result while a round merges. So ring lowers the peak only once attention
+outgrows the MLP phase. Estimated from allocation sites
 and unmeasured: for the Thinker's geometry from about ``P = 4`` (at ``P = 2`` the MoE phase is
 larger and the peaks equal), and sooner for dense models, whose MLP phase lacks the top-k
 expansion. Which is faster is unmeasured too.
