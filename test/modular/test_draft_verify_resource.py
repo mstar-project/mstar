@@ -126,6 +126,31 @@ def test_a_slot_is_read_out_before_its_next_step_writes_it():
     assert res.settle([2]) == VerdictBatch([2], ["main"], [1])
 
 
+
+def test_an_eager_step_s_tokens_survive_the_eager_step_after_it():
+    """Under device rewind a step's tokens are read at its stop check, after the next step has
+    been planned and may have landed. Two eager steps in a row (prompts past every mixed
+    bucket) must not share a mirror: eager mirrors rotate with the engine's slot ring."""
+    res, sampler = _resource()
+    res.enable_device_rewind([])
+    policy = DraftPolicy(max_drafts=K, device_rewind=True)
+    for rid in (1, 2):
+        res.ingest_request(rid)
+    records = []
+    for ring, accepted in ((0, [1, 2]), (1, [0, 3])):
+        ctx = StepContext(request_ids=(1, 2), graph_walk="decode", slot=ring, capture=False)
+        step = VerifyStep(segments=tuple(Segment(r, "main", K + 1) for r in (1, 2)), drafts=K)
+        res.plan(step, ctx)
+        res.apply_previous()
+        sampler.next = (torch.tensor([[10 + 10 * ring + j for j in range(K + 1)]] * 2), torch.tensor(accepted))
+        res.verify([1, 2], torch.full((2, K + 1), 5), torch.zeros(2 * (K + 1), 4))
+        res.commit(step, ctx)
+        records.append(res.take_record())
+    first = res.emit_record(records[0], [1, 2], [100, 100], [False, False], policy)
+    assert first.counts.tolist() == [2, 3] and first.tokens.tolist() == [10, 11, 10, 11, 12]
+    second = res.emit_record(records[1], [1, 2], [100, 100], [False, False], policy)
+    assert second.counts.tolist() == [1, 4] and second.tokens.tolist() == [20, 20, 21, 22, 23]
+
 def _emit(res, sampler, rids, accepted, tokens, max_tokens, ignore_eos=None, inputs=None, policy=POLICY):
     n = len(rids)
     ctx = _ctx(rids)

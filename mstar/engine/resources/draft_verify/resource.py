@@ -6,7 +6,7 @@ verdict, known on the device only and mid-step, says how much of it to take back
 resource carries it across:
 
 - ``plan`` numbers the step and writes the number into the step's slot (its capture slot, or
-  the eager one).
+  an eager one per slot of the engine's ring).
 - ``verify``, in the forward and capturable, runs the sampler's verify, settles the node's
   in-place state from the verdict on the device (``settle_verify``), and copies each row's
   verdict, then the step's number, to the slot's pinned host mirror. A host that reads the
@@ -113,9 +113,16 @@ class _Mirror:
     captured: bool
 
 
+def _slot(ctx: StepContext) -> int:
+    """The mirror a step's verdict lands in. An eager step's rotates with the engine's slot ring
+    as a capture slot's does: the step after it is planned, and may land, before its stop check
+    reads it."""
+    return ctx.slot_lease.slot if ctx.slot_lease is not None else -1 - ctx.slot
+
+
 class _Pending(NamedTuple):
     seq: int
-    slot: int | None
+    slot: int
     row: int
     label: str
     drafts: int
@@ -124,7 +131,7 @@ class _Pending(NamedTuple):
 class _Planned(NamedTuple):
     """The verify step planned last, until its commit."""
     seq: int
-    slot: int | None
+    slot: int
     drafts: int
     label: str
     # under device rewind: the rows whose last verdict this step takes back on the device, and
@@ -135,7 +142,7 @@ class _Planned(NamedTuple):
 
 class _StepRecord(NamedTuple):
     seq: int
-    slot: int | None
+    slot: int
     rows: tuple[int, ...]  # the real rows' handles
     positions: tuple[int, ...]  # and their rows in the mirror
 
@@ -164,8 +171,8 @@ class DraftVerifyResource(Resource):
         self._proposer: DraftProposer | None = None
         # the node's resources that `verify` settles on the device (RewindKind.DEVICE)
         self._settlers: list[Resource] = []
-        # capture slot (None: eager) -> its mirror
-        self._mirrors: dict[int | None, _Mirror] = {}
+        # capture slot -> its mirror; an eager step's is -1 - its ring slot (`_slot`)
+        self._mirrors: dict[int, _Mirror] = {}
         self._cg_rows = 0
         self._seq = 0
         self._planned: _Planned | None = None
@@ -302,7 +309,7 @@ class DraftVerifyResource(Resource):
                 )
             label = next(iter(labels), label)
         lease = ctx.slot_lease
-        slot = None if lease is None else lease.slot
+        slot = _slot(ctx)
         # this step's forward writes the slot's mirror: read the rows still pending there first
         self._harvest(slot=slot)
         mirror = self._mirror(slot, len(ctx.padded_request_ids), step.drafts + 3, lease is not None)
@@ -712,7 +719,7 @@ class DraftVerifyResource(Resource):
 
     # ── mirrors ──
 
-    def _mirror(self, slot: int | None, rows: int, width: int, captured: bool) -> _Mirror:
+    def _mirror(self, slot: int, rows: int, width: int, captured: bool) -> _Mirror:
         mirror = self._mirrors.get(slot)
         if mirror is not None and mirror.rows >= rows and mirror.width == width:
             return mirror
@@ -749,7 +756,7 @@ class DraftVerifyResource(Resource):
                 entries += [(table, rid, p) for rid, p in found if before is None or p.seq < before]
         if not entries:
             return
-        newest: dict[int | None, int] = {}
+        newest: dict[int, int] = {}
         for _, _, p in entries:
             newest[p.slot] = max(newest.get(p.slot, 0), p.seq)
         for s, seq in newest.items():
@@ -771,7 +778,7 @@ class DraftVerifyResource(Resource):
         if self._pending:
             self._harvest(rids=request_ids)
 
-    def _wait(self, slot: int | None, seq: int) -> None:
+    def _wait(self, slot: int, seq: int) -> None:
         """Until the verdict of step ``seq`` is in ``slot``'s mirror. A host spin, so the
         thread waiting is the plan thread or the gpu thread, never the main loop."""
         flag = self._mirrors[slot].seq_np
