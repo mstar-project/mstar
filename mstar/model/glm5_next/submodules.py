@@ -344,9 +344,30 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             )
         if graph_walk == "prefill":
             state.add("prompt_len", committed + seq_len)
+            # set by `split_inputs` when this prepare's probe finds a cached prefix
+            state.remove("cached")
             if self.mtp_k > 0:
                 state.add_all(mtp_generated=1, mtp_pending=None)
         return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len)
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        if start > 0:
+            # the prompt's first ``start`` tokens came from the prefix cache
+            self.request_state(fwd_info.rid_handle).add("cached", start)
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+
+    def cg_key_info(self, graph_walk: str, per_request_info: dict, per_request_input_metadata=None,
+                    **kwargs) -> str | None:
+        return self._cg_key(graph_walk, per_request_info)
+
+    def _cg_key(self, graph_walk: str, rids) -> str | None:
+        """Every capture's key (None), or for a prefill with a request past a cached prefix one no
+        capture has: its rows see more keys than a bucket's capture holds (DSA scores a captured
+        prefill's rows within its bucket)."""
+        if graph_walk == "prefill" and any(
+                rid in self.request_states and self.request_states[rid].get("cached") for rid in rids):
+            return "eager"
+        return None
 
     def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> None:
         """MTP verifies by argmax: refuse what it would silently ignore."""
@@ -401,6 +422,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
+            cg_key_info=self._cg_key(graph_walk, request_ids),
         )
 
     def preprocess(
@@ -433,7 +455,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         keep, start = [1.0] * num_tokens, 0
         for rid, inp in zip(engine_inputs.request_ids, inputs, strict=True):
             state = self.request_states.get(rid)
-            fresh = state is None or state.get("context", 0) == 0
+            fresh = state is None or (state.get("context", 0) == 0 and not state.get("cached"))
             if fresh and inp.input_seq_len > 0 and start < num_tokens:
                 keep[start] = 0.0
             start += inp.input_seq_len
@@ -869,10 +891,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         inputs: ARNodeInputs | None = None,
         **kwargs,
     ):
-        # The step ran, so its tokens are the request's context now.
+        # The step ran, so its tokens are the request's context now, a cached prefix's too.
         if inputs is not None:
             state = self.request_state(request_id)
-            state.add("context", state.get("context", 0) + inputs.input_seq_len)
+            state.add("context", state.get("context", 0) + state.get("cached", 0) + inputs.input_seq_len)
+            state.remove("cached")
         # the decode loop's text_inputs edge carries the emitted token; an MTP verify step set
         # it already, to the token after the accepted drafts
         if "new_token" not in outputs:

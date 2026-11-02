@@ -63,7 +63,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        drafts with MTP k=3 (greedy only). ``configs/glm5_next_tp8_longctx.yaml`` serves a
        1M-token window, and ``configs/glm5_next_tp8_longctx_mtp.yaml`` keeps MTP on there;
        ``python -m benchmark.glm.longctx_probe`` measures decode speed and passkey retrieval
-       by prompt length against a running server.
+       by prompt length against a running server. Prompts are keyed for prefix reuse (the
+       MLA and index pages, and KDA snapshots at page boundaries); replies too without MTP
+       at one rank.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
