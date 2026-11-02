@@ -1133,10 +1133,10 @@ def _causal_conv1d_update_kernel(
 
 @triton.jit
 def _causal_conv1d_decode_kernel(
-    x_ptr, w_ptr, bias_ptr, state_ptr, slots_ptr,
+    x_ptr, w_ptr, bias_ptr, state_ptr, slots_ptr, write_slots_ptr,
     dim, stride_x_row, stride_w_dim, stride_w_width, stride_state_slot, stride_state_dim, stride_state_tok,
     stride_slots, null_slot,
-    HAS_BIAS: tl.constexpr, SILU_ACTIVATION: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_BIAS: tl.constexpr, SILU_ACTIVATION: tl.constexpr, IN_PLACE: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -1159,9 +1159,14 @@ def _causal_conv1d_decode_kernel(
     acc += col1 * tl.load(w + stride_w_width, mask=mask, other=0.0)
     acc += col2 * tl.load(w + 2 * stride_w_width, mask=mask, other=0.0)
     acc += x * tl.load(w + 3 * stride_w_width, mask=mask, other=0.0)
-    tl.store(state, col1, mask=mask)
-    tl.store(state + stride_state_tok, col2, mask=mask)
-    tl.store(state + 2 * stride_state_tok, x, mask=mask)
+    if IN_PLACE:
+        dst = state
+    else:
+        dst = state_ptr + tl.load(write_slots_ptr + row * stride_slots).to(tl.int64) * stride_state_slot
+        dst = dst + cols * stride_state_dim
+    tl.store(dst, col1, mask=mask)
+    tl.store(dst + stride_state_tok, col2, mask=mask)
+    tl.store(dst + 2 * stride_state_tok, x, mask=mask)
     if SILU_ACTIVATION:
         acc = acc / (1 + tl.exp(-acc))
     tl.store(x_ptrs, acc, mask=mask)
@@ -1183,15 +1188,22 @@ def causal_conv1d_decode(
     activation: bool | str | None = None,
     conv_state_indices: torch.Tensor | None = None,
     null_block_id: int = NULL_BLOCK_ID,
+    write_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`causal_conv1d_update` for a decode step: one token a row, a width-4
-    filter, the output in place over ``x``, and bit-equal results.
+    filter, the output in place over ``x``, and bit-equal results. The new state
+    goes to the slots ``write_indices`` names, or back over the old one.
 
     The general kernel loads the state twice and branches on what a decode step
     never has, which on MI325X costs more than a launch per call at 64 rows.
-    Other operands go to the general kernel.
+    Other operands go to the general kernel, which only updates in place.
     """
     if not decode_kernel_fits(x, conv_state, weight):
+        if write_indices is not None:
+            raise ValueError(
+                f"a conv update with separate write slots needs a width-4 filter and a contiguous x, "
+                f"got x {tuple(x.shape)} and weight {tuple(weight.shape)}"
+            )
         return causal_conv1d_update(
             x, conv_state, weight, bias=bias, activation=activation,
             conv_state_indices=conv_state_indices, null_block_id=null_block_id,
@@ -1199,12 +1211,12 @@ def causal_conv1d_decode(
     rows, dim = x.shape
     block_n = 256
     _causal_conv1d_decode_kernel[(rows, triton.cdiv(dim, block_n))](
-        x, weight, bias, conv_state, conv_state_indices,
+        x, weight, bias, conv_state, conv_state_indices, write_indices,
         dim, x.stride(0), weight.stride(0), weight.stride(1),
         conv_state.stride(0), conv_state.stride(1), conv_state.stride(2),
         conv_state_indices.stride(0), null_block_id,
-        HAS_BIAS=bias is not None, SILU_ACTIVATION=activation in (True, "silu", "swish"), BLOCK_N=block_n,
-        num_warps=4,
+        HAS_BIAS=bias is not None, SILU_ACTIVATION=activation in (True, "silu", "swish"),
+        IN_PLACE=write_indices is None, BLOCK_N=block_n, num_warps=4,
     )
     return x
 

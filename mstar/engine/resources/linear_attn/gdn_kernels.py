@@ -62,6 +62,8 @@ class GDNDecodePlan:
 
     slots: torch.Tensor  # [n] int32, straight off the pool's addressing
     num_rows: int
+    # where each row writes, under a pool with twin slots; else in place
+    write_slots: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,9 @@ class GDNKernels(ABC):
     # prefix snapshots are copied from. Without them the pool's prefix cache
     # stays shut (see `GDNManager.bind_dependencies`).
     writes_snapshots: bool = False
+    # Whether the decode kernel reads one slot and writes another, which a pool
+    # with twin slots needs (see `GDNManager.bind_dependencies`).
+    writes_twin_slots: bool = False
 
     def without_qk_l2norm(self) -> GDNKernels:
         """These kernels for a caller that normalises q and k itself, as a

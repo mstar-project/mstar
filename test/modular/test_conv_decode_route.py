@@ -26,6 +26,20 @@ def test_route(monkeypatch, rocm, expected):
     assert called == [expected]
 
 
+def test_a_plan_with_write_slots_takes_the_decode_kernel():
+    called = {}
+    causal = causal_conv1d
+    w = _wrapper()
+    w._plan_state = wrappers.GDNDecodePlan(slots=torch.tensor([1, 2]), num_rows=2, write_slots=torch.tensor([3, 4]))
+    original = causal.causal_conv1d_decode
+    causal.causal_conv1d_decode = lambda **kw: called.update(kw)
+    try:
+        w.run_conv(torch.zeros(2, 8), torch.zeros(5, 8, 3), torch.zeros(8, 4))
+    finally:
+        causal.causal_conv1d_decode = original
+    assert called["write_indices"].tolist() == [3, 4]
+
+
 def test_fits():
     x, state, weight = torch.zeros(2, 8), torch.zeros(3, 8, 3), torch.zeros(8, 4)
     assert decode_kernel_fits(x, state, weight)

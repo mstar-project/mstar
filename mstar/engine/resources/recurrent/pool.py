@@ -73,7 +73,8 @@ class SlotState:
     # tokens the state has taken in, which places its page boundaries
     tokens: int = 0
     # under speculative decoding, the slots after `index` that hold the state
-    # after each further token of a verify row
+    # after each further token of a verify row; with twin slots, the slot a
+    # decode step writes, which becomes `index` when the step commits
     extra: tuple[int, ...] = ()
 
     @property
@@ -140,6 +141,9 @@ class RecurrentAddressing:
     # Under speculative decoding, each row's slots in token order (its
     # `slot_indices` entry first), `pad_index` throughout for a row with none
     host_slot_groups: Sequence[tuple[int, ...]] | None = None
+    # Under a decode step with twin slots, where each row writes: `slot_indices`
+    # is what it reads. None where rows update their slot in place.
+    write_slot_indices: torch.Tensor | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -172,17 +176,21 @@ class RecurrentStatePool(Resource):
                 "prefix_slots needs the sink slot: a captured step's padding "
                 "rows write their snapshots there"
             )
+        if config.twin_slots and config.spec_tokens:
+            raise ValueError("twin_slots and speculative decoding each keep their own slots; pick one")
         self._device = device
         self.config = config
         # the resource key, for errors
         self._name = name
+        # walks whose one-token rows update in place, however the pool is declared
+        self._in_place_walks: frozenset[str] = frozenset()
 
-        # One [num_layers, max_slots + prefix_slots, *shape] tensor per block. Layer-major so
+        # One [num_layers, allocated_slots + prefix_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
         # the slot-major view is K-contiguous (stride(-1) == 1).
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
-                (config.num_layers, config.max_slots + config.prefix_slots,
+                (config.num_layers, config.allocated_slots + config.prefix_slots,
                  *block.storage_shape(config.spec_tokens)),
                 dtype=block.resolved_dtype(kv_dtype),
                 device=device,
@@ -193,7 +201,7 @@ class RecurrentStatePool(Resource):
         # rid -> label -> slot. Mirrors `KVManager._streams`.
         self._slots: dict[str, dict[str, SlotState]] = {}
         # reversed so `pop` hands out ascending ids, as the page allocator does
-        self._free: list[int] = list(reversed(range(config.max_slots)))
+        self._free: list[int] = list(reversed(range(config.allocated_slots)))
         if not config.disable_sink_slot:
             sink = self._free.pop()
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
@@ -216,9 +224,9 @@ class RecurrentStatePool(Resource):
         self._cg_max_bs = 0
         self._cg_max_tokens = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
-        # (slot_indices, has_state) mirrors per captured buffer: a steady batch
+        # (slot_indices, has_state, write_slot_indices) mirrors per captured buffer: a steady batch
         # addresses the same slots every step, so its copies are skipped
-        self._cg_mirrors: dict[CGSlotKey, tuple[H2DMirror, H2DMirror]] = {}
+        self._cg_mirrors: dict[CGSlotKey, tuple[H2DMirror, H2DMirror, H2DMirror]] = {}
         # copy-only H2D for the addressing, see `_build_addressing`
         self._index_stager = PinnedStager(torch.int32)
         self._state_stager = PinnedStager(torch.bool)
@@ -238,7 +246,7 @@ class RecurrentStatePool(Resource):
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
         self._kv: KVManager | None = None
         self._snapshot_refusal: str | None = None
-        first = config.max_slots
+        first = config.allocated_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
         self._snap_meta: OrderedDict[int, bytes] = OrderedDict()
@@ -264,18 +272,19 @@ class RecurrentStatePool(Resource):
         # from the blocks, not the config: a dtype=None block is sized as resolved
         total_bytes = sum(t.nbytes for t in self._blocks.values())
         logger.info(
-            "recurrent state pool: %d usable slots (+%d sink, +%d snapshot) x "
+            "recurrent state pool: %d usable slots%s (+%d sink, +%d snapshot) x "
             "%d layers, %.2f MiB (%.2f KiB/slot), blocks=%s",
-            config.usable_slots, config.max_slots - config.usable_slots,
+            config.usable_slots, " with twins" if config.twin_slots else "",
+            config.max_slots - config.usable_slots,
             config.prefix_slots, config.num_layers,
-            total_bytes / 2**20, total_bytes / (config.max_slots + config.prefix_slots) / 2**10,
+            total_bytes / 2**20, total_bytes / (config.allocated_slots + config.prefix_slots) / 2**10,
             {n: tuple(b.shape) for n, b in config.blocks.items()},
         )
 
     # Storage access
 
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
-        """One layer's contiguous slot-major view of a block: ``[max_slots + prefix_slots, *shape]``."""
+        """One layer's contiguous slot-major view of a block: ``[allocated_slots + prefix_slots, *shape]``."""
         return self._blocks[name][layer_idx]
 
     def gather(
@@ -596,15 +605,33 @@ class RecurrentStatePool(Resource):
             self._maybe_apply_forks(step, ctx)
             self._apply_restores(step)
 
+        twins = self._writes_twins(step, ctx)
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
             self._current[label] = self._build_addressing(
-                label, segments, ctx, pending,
+                label, segments, ctx, pending, twins,
             )
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = self._current
         return self._current
+
+    def keep_in_place(self, walks: frozenset[str]) -> None:
+        """One-token rows of ``walks`` update their slot in place: a backend that
+        splits such a walk's rows between kernels, as a mixed step does."""
+        self._in_place_walks = walks
+
+    def _writes_twins(self, step: RecurrentStep, ctx: StepContext) -> bool:
+        """Whether this step's rows read one twin and write the other, the same
+        answer at capture, plan and commit: a replay runs what its capture
+        recorded, and commit must swap exactly what the kernels wrote."""
+        if not self.config.twin_slots or ctx.force_prefill:
+            return False
+        walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
+        if walk in self._in_place_walks:
+            return False
+        segments = step.segments or ()
+        return bool(segments) and all(seg.span == 1 for seg in segments)
 
     def clear_preplan(self):
         """Drop the staged plan; staging touched no live state, so nothing to rewind."""
@@ -624,11 +651,16 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.page_size if self._kv is not None else 0
+            twins = self._writes_twins(step, ctx)
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 slot = self._slots.get(segment.request_id, {}).get(segment.label)
                 if slot is not None:
+                    if twins:
+                        # before anything below reads the slot; the next plan
+                        # waits for this commit, so it reads what this step wrote
+                        slot.index, slot.extra = slot.extra[0], (slot.index,)
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
                     slot.tokens += segment.span
@@ -696,9 +728,9 @@ class RecurrentStatePool(Resource):
         with self._lock:
             freed = 0
             for name, block in self._blocks.items():
-                freed += block.nbytes - block[:, : self.config.max_slots].nbytes
+                freed += block.nbytes - block[:, : self.config.allocated_slots].nbytes
                 self._blocks[name] = torch.zeros(
-                    (block.shape[0], self.config.max_slots, *block.shape[2:]),
+                    (block.shape[0], self.config.allocated_slots, *block.shape[2:]),
                     dtype=block.dtype, device=block.device,
                 )
             self._snap_free = []
@@ -993,11 +1025,13 @@ class RecurrentStatePool(Resource):
     def _build_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
         pending_forks: dict[tuple[str, str], bool] | None = None,
+        twins: bool = False,
     ) -> RecurrentAddressing:
         pad = self.pad_index
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
+        writes = []
         spec = self.config.spec_tokens > 0
         groups = [] if spec else None
         pad_group = (pad,) * self.config.slots_per_request
@@ -1013,6 +1047,8 @@ class RecurrentStatePool(Resource):
                 has_state.append(False)
                 if spec:
                     groups.append(pad_group)
+                if twins:
+                    writes.append(pad)
             else:
                 indices.append(slot.index)
                 has_state.append(
@@ -1020,6 +1056,8 @@ class RecurrentStatePool(Resource):
                 )
                 if spec:
                     groups.append(slot.group)
+                if twins:
+                    writes.append(slot.extra[0])
 
         snapshots = ()
         if self._snap_writes and not ctx.capture:
@@ -1045,6 +1083,12 @@ class RecurrentStatePool(Resource):
         self._state_stager.copy_(
             target.has_state, has_state, pad_value=False, mirror=mirrors[1],
         )
+        if twins:
+            # the slots swap every step, but a step alternates between two
+            # captured buffers too, so at a steady batch these stay skipped
+            self._index_stager.copy_(
+                target.write_slot_indices, writes, pad_value=pad, mirror=mirrors[2],
+            )
         return RecurrentAddressing(
             slot_indices=target.slot_indices,
             has_state=target.has_state,
@@ -1059,11 +1103,12 @@ class RecurrentStatePool(Resource):
                 else self._kv.config.page_size if self._kv is not None else 0
             ),
             host_slot_groups=groups,
+            write_slot_indices=target.write_slot_indices if twins else None,
         )
 
     def _addressing_buffers(
         self, label: str, ctx: StepContext, num_rows: int,
-    ) -> tuple[RecurrentAddressing, tuple[H2DMirror | None, H2DMirror | None]]:
+    ) -> tuple[RecurrentAddressing, tuple[H2DMirror | None, H2DMirror | None, H2DMirror | None]]:
         """The buffers this step fills, and their mirrors (captured buffers only).
 
         Under capture they are static per (bucket, slot, label) and sized to the
@@ -1074,14 +1119,14 @@ class RecurrentStatePool(Resource):
             buf = self._eager_addressing.get(label)
             if buf is None or buf.slot_indices.numel() < num_rows:
                 buf = self._eager_addressing[label] = self._new_buffers(num_rows)
-            return buf, (None, None)
+            return buf, (None, None, None)
 
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         buf = self._cg_addressing.get(key)
         if buf is None:
             size = max(self._cg_max_bs, lease.bucket.bs, num_rows)
             buf = self._cg_addressing[key] = self._new_buffers(size)
-            self._cg_mirrors[key] = (H2DMirror(), H2DMirror())
+            self._cg_mirrors[key] = (H2DMirror(), H2DMirror(), H2DMirror())
         assert buf.slot_indices.numel() >= num_rows, (
             f"recurrent addressing for {key} holds "
             f"{buf.slot_indices.numel()} rows but this step planned {num_rows}"
@@ -1095,6 +1140,10 @@ class RecurrentStatePool(Resource):
             ),
             has_state=torch.zeros(size, dtype=torch.bool, device=self._device),
             num_rows=0,
+            write_slot_indices=(
+                torch.full((size,), self.pad_index, dtype=torch.int32, device=self._device)
+                if self.config.twin_slots else None
+            ),
         )
 
     def addressing(self, label: str = "main") -> RecurrentAddressing:

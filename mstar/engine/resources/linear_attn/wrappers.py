@@ -436,11 +436,11 @@ class GDNDecodeWrapper(GDNWrapper):
         self._plan_state: GDNDecodePlan | None = None
 
     def plan(
-        self, spans: list[int], slots: torch.Tensor
+        self, spans: list[int], slots: torch.Tensor, write_slots: torch.Tensor | None = None,
     ):
         # No conv metadata: `causal_conv1d_update` is one step per row and
         # takes the slots directly, so there is no varlen grid to precompute.
-        self._plan_state = GDNDecodePlan(slots=slots, num_rows=len(spans))
+        self._plan_state = GDNDecodePlan(slots=slots, num_rows=len(spans), write_slots=write_slots)
 
     def run_conv(
         self,
@@ -452,7 +452,7 @@ class GDNDecodeWrapper(GDNWrapper):
     ):
         from mstar.utils.causal_conv1d import causal_conv1d_decode, causal_conv1d_update
         conv = causal_conv1d_decode if current_platform.is_rocm() else causal_conv1d_update
-        return conv(
+        common = dict(
             x=x,
             conv_state=conv_layer,
             weight=weight,
@@ -461,6 +461,9 @@ class GDNDecodeWrapper(GDNWrapper):
             conv_state_indices=self._plan_state.slots,
             null_block_id=self._null_slot_id,
         )
+        if self._plan_state.write_slots is not None:
+            return causal_conv1d_decode(**common, write_indices=self._plan_state.write_slots)
+        return conv(**common)
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
         return self._kernel.run(self._plan_state, q, k, v, a, b, state, a_log, dt_bias)
