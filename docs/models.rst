@@ -373,10 +373,11 @@ BAGEL notes
   image guidance off, and the main branch alone outside ``cfg_interval``, about
   -37% latency at 1024² on an H200. A step then computes fewer rows and returns
   the main branch's velocity outside the interval where it used to recombine all
-  three, which is equal only up to rounding, so images move: seeded
-  text-to-image at the default guidance is about 31 dB PSNR from the previous
-  output (about 60 dB between two cold boots of one version), and generation
-  without guidance about 41 dB. Edits stay within their boot-to-boot spread.
+  three, which is equal only up to rounding, so images move. Against the
+  previous output on one GPU, seeded text-to-image at the default guidance is
+  34 dB PSNR at worst and 45 dB at the median (58–60 dB between two boots of
+  one version), text-to-image without guidance 42 / 53 dB, and edits 24 / 40 dB,
+  about what two runs of one version's edit differ by (23 / 39 dB).
 - A guided request's steps inside ``cfg_interval`` run as a walk of their own,
   ``image_gen_guided2`` (``image_gen_guided3`` with image guidance), between
   ``image_gen_head`` and ``image_gen``. A config that places ``LLM`` per walk
