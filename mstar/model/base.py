@@ -881,7 +881,8 @@ class Model(ABC):
         bug, refused with a 500: a step whose walk is not the partition's, a
         ``bind`` key that is not an input of the step's walk, or a later step
         whose walk takes no input the conductor sends. In a partition a stream
-        moves, the partition ends on its last step's first report, so that step
+        moves, the conductor moves past a step on its first report when it is
+        the last step or the next step takes inputs it sends, so such a step
         must run once.
         """
 

@@ -176,9 +176,10 @@ You must implement these abstract methods:
    whose walk is not one of its partition's, a ``bind`` key that is not an input of
    the step's walk, or a later step whose walk takes no input the conductor sends (it moves
    a worker onto a step only by sending it inputs). In a partition a stream moves
-   (``Connection.consumer_walk``), the stream decides how many passes each step runs, and
-   the partition ends on its last step's first report, so that step must run once (a
-   ``Loop``, say). Qwen3.5 (through ``MultimodalDecoderModel``),
+   (``Connection.consumer_walk``), the stream decides how many passes each step runs, but
+   the conductor moves past a step on its first report when it is the last step (the
+   partition ends) or the next step takes inputs it sends, so such a step must run once
+   (a ``Loop``, say). Qwen3.5 (through ``MultimodalDecoderModel``),
    Z-Image, Orpheus and Chatterbox are references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
