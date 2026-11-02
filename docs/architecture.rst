@@ -82,5 +82,6 @@ Execution flow (simplified)
 Successful cleanup waits for every worker's ``READS_DONE`` before removing request
 state. Model workers are drained; the API data worker ACKs after delivering all
 expected outputs. A read whose transfer status cannot be determined still holds
-the barrier, and its destination buffers remain pinned. The existing
+the barrier, even if it has no listed destination buffers. Any retained
+destination buffers remain pinned. The existing
 ``MSTAR_DRAIN_TTL_S`` timeout can still force cleanup of a stalled request.

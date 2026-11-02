@@ -115,6 +115,7 @@ def test_a_cancelled_read_counts_as_failed(tmp_path):
     assert mgr.get_ready_tensors() == {}
     (failed,) = mgr.take_failed_reads()
     assert failed.request_id == 7 and mgr.pending == []
+    assert not mgr.has_inflight_reads(7)
 
 
 def test_later_reads_of_a_failed_request_are_dropped_until_cleanup(tmp_path):
@@ -137,11 +138,13 @@ def test_later_reads_of_a_failed_request_are_dropped_until_cleanup(tmp_path):
     assert mgr.get_ready_tensors() == {}
     (dropped,) = mgr.take_failed_reads()
     assert dropped.error is first.error
-    assert mgr.pending == [] and not mgr.has_inflight_reads(7)
+    # The later reads finished, but the first failure's status is unknown.
+    assert mgr.pending == [] and mgr.has_inflight_reads(7)
     # the reads that completed are acked; the failed one is not
     assert _acked(comm) == [{13: 1}, {12: 1}]
 
     mgr.cleanup_request(7)
+    assert not mgr.has_inflight_reads(7)
     fresh = _edge()
     mgr.pending = [_read(7, fresh)]
     assert mgr.get_ready_tensors() == {7: [fresh]}
@@ -186,14 +189,16 @@ class _EventFuture:
     """Shaped like the SHM arena's ``_CudaEventFuture``: ``done()`` and
     ``result()`` only."""
 
-    def __init__(self, done):
+    def __init__(self, done, error=None):
         self.finished = done
+        self.error = error
 
     def done(self):
         return self.finished
 
     def result(self):
-        return None
+        if self.error is not None:
+            raise self.error
 
 
 def test_a_future_with_only_done_and_result_is_polled_like_any_other(tmp_path):
@@ -603,7 +608,7 @@ def test_an_unknown_status_keeps_the_buffers_for_good(engine):
     assert _never_freed(mgr) == ptrs + reader_ptrs
 
 
-@pytest.mark.parametrize("where", ["submit", "reader", "manager"])
+@pytest.mark.parametrize("where", ["submit", "reader", "manager", "event"])
 @pytest.mark.parametrize("bookkeeper", ["python", "rust"])
 def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkeeper):
     """Losing a transfer's status must not authorize freeing its source.
@@ -625,13 +630,21 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
     mgr = engine.manager()
     mgr.tensor_store = TensorStore(bookkeeping=bookkeeping())
     mgr.rid_to_str = table.name
-    src = _sources(2 if where == "manager" else 1)
-    if where == "manager":
-        engine.plan = {src[0].data_ptr(): [[-1]], src[1].data_ptr(): [[0]]}
+    if where == "event":
+        # Arena reads use an event future without transfer_uuids. An error
+        # still does not prove that the read stopped touching its source.
+        mgr._transfer_status = None
+        mgr.pending = [_read(rid, _edge(), _EventFuture(True, RuntimeError("event failed")))]
+        ptrs = []
     else:
-        engine.plan = {src[0].data_ptr(): ["submit-fails"] if where == "submit" else [[9]]}
-    future, ptrs = _start(mgr, rid, src)
-    assert future.exception(timeout=5) is not None
+        src = _sources(2 if where == "manager" else 1)
+        if where == "manager":
+            engine.plan = {src[0].data_ptr(): [[-1]], src[1].data_ptr(): [[0]]}
+        else:
+            engine.plan = {src[0].data_ptr(): ["submit-fails"] if where == "submit" else [[9]]}
+        future, ptrs = _start(mgr, rid, src)
+        assert future.exception(timeout=5) is not None
+    assert mgr.has_inflight_reads(rid)
     mgr.get_ready_tensors()
     if where == "manager":
         engine.report(src[1].data_ptr(), 9)
@@ -648,8 +661,8 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
     for _ in range(3):
         mgr.get_ready_tensors()
         worker._complete_drain_if_ready("request")
-        assert mgr.has_inflight_reads(rid)
         assert not worker._reads_done_sent
+        assert mgr.has_inflight_reads(rid)
     assert _never_freed(mgr) == ptrs
 
     mgr.force_cleanup_request(rid)
