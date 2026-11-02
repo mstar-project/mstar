@@ -2188,6 +2188,24 @@ torch's default. It does not size video decoding: each torchcodec decode that as
 ``media_limits.video_decode_threads`` (``Model.load_video`` does) runs FFmpeg with up to 8
 threads, no more than the CPUs the process's CPU plan leaves unpinned (``CpuPlan.left``).
 
+The data worker prepares one request at a time on its own thread, so a request's media
+decode holds up every request behind it and the output chunks of the ones running. A model
+whose ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt`` keep no shared
+state sets ``PREPROCESS_PARALLEL = True``, and requests then prepare on a pool sized to the
+CPUs left (``CpuPlan.prepare_workers``: at most 8, and the pool times the process's intra-op
+thread count stays within the CPUs left, so a higher ``preprocess_torch_threads`` means fewer
+workers).
+Tensors are still stored and requests still reach the conductor from the data worker's thread,
+in arrival order. A deployment sets the pool at the top level of its config; 1 turns it off:
+
+.. code-block:: yaml
+
+   model: "qwen3_omni"
+   preprocess_workers: 2
+
+The pool only helps work that releases the GIL, so measure each stage first. A model with
+client streams always prepares inline, since an append has to follow its request.
+
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
@@ -2197,12 +2215,6 @@ A permute in ``postprocess`` costs a host copy of the whole clip, or a slower co
 frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
 copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
 the CPUs.
-
-A model whose media load and ``process_prompt`` are thread-safe can also prepare several
-requests at once on a thread pool by setting ``PREPROCESS_WORKERS`` on the class above 1
-(the default 1 prepares them one at a time on the data-worker thread). The class value is
-the default pool size, which a deployment may change with ``preprocess_workers`` (see
-:doc:`serving`); a class left at 1 gets no pool. Requests are still handed on in arrival order.
 
 .. _tensor-parallelism:
 
@@ -2710,6 +2722,11 @@ The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag for
 each stream from another partition, and uses them to decide when to run. A stream from the
 client (below) has no entry there.
+
+The consumer receives each chunk as its items stacked along a new leading dimension, or as
+the item itself when the chunk holds one. Don't write into a streamed input in place: a
+one-item chunk is the stored tensor, which the producer may also have routed to other
+destinations, and a sliding window's overlap items reappear in the next chunk.
 
 Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
 later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer

@@ -12,7 +12,7 @@ from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import torch
 
@@ -180,39 +180,6 @@ def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> N
         on_late(f"the call's {', '.join(map(repr, sorted(streams)))} input has ended")
 
 
-class PreparingInput(NamedTuple):
-    """An input waiting its turn to be handed on, in arrival order: a request
-    whose prepare runs on the preprocess pool, or one prepared as it is handed
-    on, or an append (those two have no ``prepared``)."""
-    input: PreprocessInput | ClientAppend
-    profile: DataWorkerProfile | None = None
-    prepared: Future | None = None
-
-
-def _positive_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return value
-
-
-def preprocess_workers(model: Model | None, model_config: dict | None) -> int:
-    """``preprocess_workers`` from the serving config, else the model's
-    ``PREPROCESS_WORKERS``, at most the CPUs the process's plan leaves
-    unpinned, as the other pools are. A class value of 1 says its ``load_*``
-    and ``process_prompt`` are not thread-safe, so the config cannot add a
-    pool."""
-    if model is None:
-        return 1
-    declared = _positive_int(f"{type(model).__name__}.PREPROCESS_WORKERS", model.PREPROCESS_WORKERS)
-    workers = _positive_int("preprocess_workers", (model_config or {}).get("preprocess_workers", declared))
-    if workers > 1 and declared == 1:
-        raise ValueError(
-            f"preprocess_workers is {workers}, but {type(model).__name__}.PREPROCESS_WORKERS is 1: "
-            "its load_* and process_prompt are not declared thread-safe"
-        )
-    return min(workers, cpus.plan().left)
-
-
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
     """Delete a message's uploaded files; one already gone or unremovable is skipped."""
     for paths in (file_paths or {}).values():
@@ -221,6 +188,11 @@ def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+def _preprocess_loop(**kwargs):
+    worker = PreprocessWorkerThread(**kwargs)
+    worker.run()
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
@@ -280,8 +252,11 @@ class PreprocessWorker:
         is_pending: Callable[[str], bool] | None = None,
     ):
         check_media_limits()
-        # before the sockets and the thread exist: a bad value stops startup, with nothing to close
-        prep_workers = preprocess_workers(model, model_config)
+        # Here, before the thread starts: the thread reads it as it starts, and
+        # a value it cannot take would end the thread with every request waiting.
+        workers = (model_config or {}).get("preprocess_workers")
+        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
+            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -330,29 +305,30 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
-        self.data_worker = PreprocessWorkerThread(
-            in_queue=self.request_input_queue,
-            result_tensor_queue=self.result_tensor_input_queue,
-            out_queue=self.output_queue,
-            profile_queue=self.profile_queue,
-            cleanup_request_queue=self.cleanup_request_queue,
-            abort_request_queue=self.abort_request_queue,
-            reads_done_queue=self.reads_done_queue,
-            discard_tensor_queue=self.discard_tensor_queue,
-            stop_event=self.stop_event,
-            wakeup=self.wakeup,
-            communicator=self.communicator,
-            tensor_manager=self.tensor_manager,
-            model=model,
-            enable_prof=enable_prof,
-            timing_requested=self.timing_requested,
-            worker_metrics_requested=self.worker_metrics_requested,
-            model_config=model_config,
-            preprocess_workers=prep_workers,
-            enable_nvtx=enable_nvtx,
-            is_pending=is_pending,
+        self.thread = Thread(
+            target=_preprocess_loop,
+            kwargs=dict(
+                in_queue=self.request_input_queue,
+                result_tensor_queue=self.result_tensor_input_queue,
+                out_queue=self.output_queue,
+                profile_queue=self.profile_queue,
+                cleanup_request_queue=self.cleanup_request_queue,
+                abort_request_queue=self.abort_request_queue,
+                reads_done_queue=self.reads_done_queue,
+                discard_tensor_queue=self.discard_tensor_queue,
+                stop_event=self.stop_event,
+                wakeup=self.wakeup,
+                communicator=self.communicator,
+                tensor_manager=self.tensor_manager,
+                model=model,
+                enable_prof=enable_prof,
+                timing_requested=self.timing_requested,
+                worker_metrics_requested=self.worker_metrics_requested,
+                model_config=model_config,
+                enable_nvtx=enable_nvtx,
+                is_pending=is_pending,
+            )
         )
-        self.thread = Thread(target=self.data_worker.run)
         self.thread.start()
 
     def report_preprocess_finish(self) -> None:
@@ -371,9 +347,8 @@ class PreprocessWorker:
         self._signal()
 
     def queue_depth(self) -> int:
-        """Inputs (requests and client-stream appends) waiting in the data
-        worker: submitted, and neither being prepared nor handed on yet."""
-        return self.request_input_queue.qsize() + self.data_worker.waiting_inputs
+        """Requests submitted and not yet taken up by the data worker thread."""
+        return self.request_input_queue.qsize()
 
     def _signal(self):
         """End the thread's idle wait: new work is queued. getattr: tests
@@ -637,6 +612,21 @@ class ClientCall:
     charged: dict[str, int] = field(default_factory=dict)
 
 
+class PreparedInput(NamedTuple):
+    """What a request's preparation hands back: its tensors, their metadata
+    and its kwargs, none of them stored or sent yet."""
+    tensors: NameToTensorList
+    input_metadata: dict[str, list[dict]]
+    model_kwargs: dict
+
+
+class PreparingInput(NamedTuple):
+    """A request on the prepare pool, queued in arrival order."""
+    input: PreprocessInput
+    profile: DataWorkerProfile | None
+    future: Future[PreparedInput]
+
+
 class PreprocessWorkerThread:
     # next time the thread publishes its transfer counts; class-level so a
     # thread built without __init__ has one
@@ -645,11 +635,11 @@ class PreprocessWorkerThread:
     worker_metrics_requested: threading.Event | None = None
     # None (a thread built without __init__) postprocesses every output inline
     _encode_pool: ThreadPool | None = None
-    # None (a thread built without __init__) preprocesses one request at a time
-    _prep_pool: ThreadPool | None = None
-    _prep_workers = 1
     # class-level so a thread built without __init__ stamps no read times
     enable_prof = False
+    # None (no model that declares it, one CPU's worth of workers, or a thread
+    # built without __init__) prepares every request inline
+    _prepare_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -672,7 +662,6 @@ class PreprocessWorkerThread:
         model: Model | None = None,
         enable_prof: bool=False,
         model_config: dict | None = None,
-        preprocess_workers: int = 1,
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
@@ -752,21 +741,33 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        # Media load + process_prompt for several requests at once, for models
-        # that declare it (see `_take_new_input`).
-        self._prep_workers = preprocess_workers
-        if preprocess_workers > 1:
-            self._prep_pool = ThreadPool(preprocess_workers, thread_name_prefix="preprocess")
-        # inputs in arrival order, waiting to be handed on (`PreparingInput`)
-        self._preparing: deque[PreparingInput] = deque()
-        # those of them not being prepared, for the API server's queue gauge
-        self.waiting_inputs = 0
         self._encode_pool = ThreadPool(
             max_workers=cpus.plan().encode_workers, thread_name_prefix="mstar-encode",
         )
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
         self._encoded: deque[EncodedOutput] = deque()
+        self._prepare_workers = self._num_prepare_workers()
+        if self._prepare_workers > 1:
+            self._prepare_pool = ThreadPool(
+                max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
+            )
+        # Requests on the prepare pool, oldest first. They reach the conductor
+        # in this order, whichever finishes first.
+        self._preparing: deque[PreparingInput] = deque()
+
+    def _num_prepare_workers(self) -> int:
+        """Requests prepared at once. A model has to declare that its loaders
+        and ``process_prompt`` may overlap, and client streams need their
+        appends handled behind the request, so anything else runs inline."""
+        if not getattr(self.model, "PREPROCESS_PARALLEL", False) or self._client_edges:
+            return 1
+        workers = (self._model_config or {}).get("preprocess_workers")
+        if workers is not None:
+            return int(workers)
+        # each request runs on this process's intra-op pool, which the config
+        # or the model may size above the plan's default
+        return cpus.plan().prepare_workers(torch.get_num_threads())
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -831,21 +832,22 @@ class PreprocessWorkerThread:
 
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
-        prepared: Future | None = None,
     ):
-        """Hand one request to the conductor. ``prepared``: its
-        ``_prepare_input`` already run on the preprocess pool."""
+        self._start_input(input)
+        self._finish_input(input, self._prepare_input(input), profile)
+
+    def _start_input(self, input: PreprocessInput) -> None:
+        """Count the request as started here. On this thread, as it leaves the
+        queue, so a release later in the queue's order finds it."""
         self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
-        tensors, input_metadata, model_kwargs = (
-            prepared.result() if prepared is not None else self._prepare_input(input)
-        )
-        self._store_and_send(input, tensors, input_metadata, model_kwargs, profile)
 
-    def _prepare_input(self, input: PreprocessInput) -> tuple[NameToTensorList, dict, dict]:
-        """Load the request's media and run the model's ``process_prompt``.
-        Reads no state this thread mutates, so it may run on the preprocess pool."""
+    def _prepare_input(self, input: PreprocessInput) -> PreparedInput:
+        """Decode the request's media and run the model's prompt processing.
+        Runs on the prepare pool when there is one, so it reads only what
+        ``__init__`` fixed and writes nothing the thread owns."""
         file_states: dict[str, list[tuple[int, int, int]]] = {}
+
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
         if input.file_paths and self._keyed_labels:
@@ -902,12 +904,14 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return tensors, input_metadata, model_kwargs
+        return PreparedInput(tensors, input_metadata, model_kwargs)
 
-    def _store_and_send(
-        self, input: PreprocessInput, tensors: NameToTensorList, input_metadata: dict,
-        model_kwargs: dict, profile: DataWorkerProfile | None,
+    def _finish_input(
+        self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
+        """Store a prepared request's tensors and hand it to the conductor."""
+        tensors, input_metadata, model_kwargs = prepared
+
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
         # conductor, so a failure here still finds no remote reader; held
@@ -1525,10 +1529,7 @@ class PreprocessWorkerThread:
     ):
         # The request is gone, so don't start a read — just ack the tensors back
         # to the producing worker so it can free the source buffers.
-        self.tensor_manager.ack_unread_tensors(
-            request_id=result.request_id,
-            graph_edges=[result.graph_edge],
-        )
+        self.tensor_manager.ack_unread_tensors([result.graph_edge])
 
     def _fail_unread_outputs(self, failed: FailedRead) -> None:
         """Fail the request of a read that will not be delivered: one error
@@ -1868,8 +1869,11 @@ class PreprocessWorkerThread:
     def _next_inputs(self) -> list[PreprocessInput | ClientAppend]:
         """This pass's input: up to MAX_APPENDS_PER_PASS items in arrival
         order, ending at the first new request (a preprocess each, seconds for
-        media), so output delivery gets its turn between requests."""
+        media), so output delivery gets its turn between requests. None while
+        the prepare pool is full, so requests wait in the queue undecoded."""
         batch: list[PreprocessInput | ClientAppend] = []
+        if self._prepare_pool is not None and len(self._preparing) >= self._prepare_workers:
+            return batch
         while len(batch) < self.MAX_APPENDS_PER_PASS:
             try:
                 item = self.in_queue.get_nowait()
@@ -1880,89 +1884,7 @@ class PreprocessWorkerThread:
                 break
         return batch
 
-    def _take_input(
-        self, pre_input: PreprocessInput | ClientAppend,
-        profile: DataWorkerProfile | None = None, prepared: Future | None = None,
-    ) -> None:
-        # again here: a request submitted after the event was set
-        # sees it set, so the conductor gets ENABLE_METRICS first
-        self._send_enable_metrics_if_requested()
-        # Releases queued before this request was submitted belong
-        # to an earlier request under its id: apply them first.
-        self._process_releases()
-        if self._client_edges and prepared is None:
-            # Routes too, so a call's held items go out before this input's
-            # preprocess, which may take seconds. One prepared on the pool
-            # only stores and sends here, and the pass drains routes first.
-            try:
-                self._process_messages()
-            except Exception:  # noqa: BLE001 — the pass's inputs still go
-                logger.exception("PreprocessWorkerThread message handling failed")
-        try:
-            self._process_waiting_input(pre_input, profile, prepared)
-        except Exception:  # noqa: BLE001 — the pass's other input still goes
-            logger.exception("Input for request %s failed", pre_input.request_id)
-
-    def _take_new_input(self, sends_pending: bool) -> bool:
-        """Start up to ``_prep_workers`` requests' prepares and hand every input
-        on in arrival order, while peers take what was already sent. On the
-        pool the prepares overlap; without one, a request is prepared as it is
-        handed on, one per pass. Appends hold no prepare slot. Until handed on,
-        an input is in the state of one still in ``in_queue``: nothing here
-        tracks it yet.
-
-        The order is global, not per request: a stream's append can wait behind
-        another request's prepare, but the conductor sees requests in the order
-        the API server took them, as with one worker."""
-        did_work = False
-        preparing = self._preparing
-        requests = sum(not isinstance(entry.input, ClientAppend) for entry in preparing)
-        while not sends_pending and requests < self._prep_workers:
-            inputs = self._next_inputs()
-            did_work = did_work or bool(inputs)
-            for pre_input in inputs:
-                if isinstance(pre_input, ClientAppend):
-                    preparing.append(PreparingInput(pre_input))
-                    continue
-                requests += 1
-                # one the API server let go of is dropped as it is handed on
-                if self._prep_pool is None or not self._is_pending(pre_input.request_id):
-                    preparing.append(PreparingInput(pre_input))
-                    continue
-                profile = self._start_profile(pre_input) if self.timing_requested.is_set() else None
-                future = self._prep_pool.submit(self._prepare_input, pre_input)
-                if self.wakeup is not None:
-                    self.wakeup.register_future(future)
-                preparing.append(PreparingInput(pre_input, profile, future))
-            if not inputs or isinstance(inputs[-1], ClientAppend):
-                break  # in_queue is empty, or this pass's appends are taken
-        while not sends_pending and preparing and (preparing[0].prepared is None or preparing[0].prepared.done()):
-            did_work = True
-            entry = preparing.popleft()
-            self._publish_waiting()
-            self._take_input(*entry)
-            sends_pending = self.communicator.flush()
-        self._publish_waiting()
-        return did_work
-
-    def _publish_waiting(self) -> None:
-        """``waiting_inputs`` for ``queue_depth``; set before each hand-off too,
-        as an inline prepare holds this thread. Without a pool every input in
-        ``_preparing`` waits; with one, a prepare's end wakes the thread, so
-        the next pass counts it."""
-        if self._prep_pool is None:
-            self.waiting_inputs = len(self._preparing)
-            return
-        self.waiting_inputs = sum(
-            entry.prepared is None or entry.prepared.done() for entry in self._preparing
-        )
-
-    def _process_waiting_input(
-        self, pre_input: PreprocessInput | ClientAppend,
-        profile: DataWorkerProfile | None = None, prepared: Future | None = None,
-    ) -> None:
-        """``profile`` and ``prepared``: a request's, when the preprocess pool
-        started it (see `_take_new_input`)."""
+    def _process_waiting_input(self, pre_input: PreprocessInput | ClientAppend) -> None:
         if not self._is_pending(pre_input.request_id):
             # The API server let go of it while it waited (aborted, or its
             # call ended): nothing will read it, so nothing is sent. An abort
@@ -1978,23 +1900,70 @@ class PreprocessWorkerThread:
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(pre_input.request_id, exc, "stream input")
             return
+        profile = None
         try:
-            if profile is None and prepared is None and self.timing_requested.is_set():
+            if self.timing_requested.is_set():
                 profile = self._start_profile(pre_input)
-            self._process_input(pre_input, profile, prepared)
+            if self._prepare_pool is not None:
+                self._submit_prepare(pre_input, profile)
+            else:
+                self._process_input(pre_input, profile)
         except Exception as exc:  # noqa: BLE001 — any failure must reach the client
-            if profile is not None:
-                profile.failed = True
-                self.profile_queue.put(profile)
-            # A request whose media load or prompt processing fails never
-            # reaches the conductor, so nothing downstream would ever complete
-            # it; surface the failure as an error chunk instead of leaving the
-            # client to hit the server timeout.
-            self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
-            # Never reached the conductor, so there are no remote readers to
-            # race: hard-drop the (possibly persisted) input signals directly.
-            self._cleanup_request_state(pre_input.request_id, force=True)
-            self._removed(pre_input.request_id)
+            self._input_failed(pre_input, profile, exc)
+
+    def _input_failed(
+        self, pre_input: PreprocessInput, profile: DataWorkerProfile | None, exc: Exception,
+    ) -> None:
+        if profile is not None:
+            profile.failed = True
+            self.profile_queue.put(profile)
+        # A request whose media load or prompt processing fails never
+        # reaches the conductor, so nothing downstream would ever complete
+        # it; surface the failure as an error chunk instead of leaving the
+        # client to wait out the server timeout.
+        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
+        # Never reached the conductor, so there are no remote readers to
+        # race: hard-drop the (possibly persisted) input signals directly.
+        self._cleanup_request_state(pre_input.request_id, force=True)
+        self._removed(pre_input.request_id)
+
+    def _submit_prepare(self, pre_input: PreprocessInput, profile: DataWorkerProfile | None) -> None:
+        """Prepare on the pool; :meth:`_release_prepared` finishes the request."""
+        self._start_input(pre_input)
+        try:
+            future = self._prepare_pool.submit(self._prepare_input, pre_input)
+        except RuntimeError as exc:  # shut down under a stopping server
+            self._input_failed(pre_input, profile, exc)
+            return
+        self._preparing.append(PreparingInput(pre_input, profile, future))
+        if self.wakeup is not None:
+            self.wakeup.register_future(future)
+
+    def _release_prepared(self) -> bool:
+        """Finish the oldest prepared request, one per pass so output delivery
+        gets its turn, as it does between inline requests. The request waits
+        on the pool for its turn behind older ones, so a conductor sees
+        requests in arrival order.
+
+        An abort that landed during preparation found nothing to stop. The API
+        server lets go of a request before it queues the abort, so the request
+        is dropped here unsent, as one still in the queue is; the conductor
+        takes an abort and a READS_DONE for a rid it never saw."""
+        if self._prepare_pool is None or not self._preparing or not self._preparing[0].future.done():
+            return False
+        pre_input, profile, future = self._preparing.popleft()
+        try:
+            if self._is_pending(pre_input.request_id):
+                self._finish_input(pre_input, future.result(), profile)
+            else:
+                self._cleanup_request_state(pre_input.request_id, force=True)
+                self._removed(pre_input.request_id)
+                if profile is not None:
+                    profile.preprocess_finish_time = time.perf_counter()
+                    self.profile_queue.put(profile)
+        except Exception as exc:  # noqa: BLE001 — any failure must reach the client
+            self._input_failed(pre_input, profile, exc)
+        return True
 
     def _idle_wait(self):
         """How a pass that found nothing waits: on the communicator's poll,
@@ -2077,7 +2046,27 @@ class PreprocessWorkerThread:
                 # New input. None while a peer can't take what we already
                 # sent: as a blocking send did, that holds new work back, so
                 # the outbox stays short and inputs wait undecoded.
-                did_work = self._take_new_input(sends_pending) or did_work
+                for pre_input in [] if sends_pending else self._next_inputs():
+                    did_work = True
+                    # again here: a request submitted after the event was set
+                    # sees it set, so the conductor gets ENABLE_METRICS first
+                    self._send_enable_metrics_if_requested()
+                    # Releases queued before this request was submitted belong
+                    # to an earlier request under its id: apply them first.
+                    self._process_releases()
+                    if self._client_edges:
+                        # Routes too, so a call's held items go out before this
+                        # input, which may be a multi-second media preprocess.
+                        try:
+                            self._process_messages()
+                        except Exception:  # noqa: BLE001 — the pass's inputs still go
+                            logger.exception("PreprocessWorkerThread message handling failed")
+                    try:
+                        self._process_waiting_input(pre_input)
+                    except Exception:  # noqa: BLE001 — the pass's other input still goes
+                        logger.exception("Input for request %s failed", pre_input.request_id)
+                if not sends_pending:
+                    did_work = self._release_prepared() or did_work
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
             # a new input's profile update or error chunks, and anything a
@@ -2099,6 +2088,7 @@ class PreprocessWorkerThread:
         # leave the input signals of in-flight requests in /dev/shm.
         for request_id in list(self.in_flight_requests):
             self._hard_cleanup(request_id)
-        for pool in (self._encode_pool, self._prep_pool):
-            if pool is not None:
-                pool.shutdown(wait=False, cancel_futures=True)
+        if self._encode_pool is not None:
+            self._encode_pool.shutdown(wait=False, cancel_futures=True)
+        if self._prepare_pool is not None:
+            self._prepare_pool.shutdown(wait=False, cancel_futures=True)
