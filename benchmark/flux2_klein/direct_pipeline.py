@@ -142,9 +142,6 @@ def main():
     model.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(args.repo)))
     t0 = time.perf_counter()
     subs = {name: model.get_submodule(name, device=device) for name in ("text_encoder", "dit", "vae_decoder")}
-    if args.vae_compile:
-        # as the engine does at load: compile the decode for this grid (unwarmed grids decode eagerly)
-        subs["vae_decoder"].warmup([model.config.latent_grid(args.height, args.width)])
     torch.cuda.synchronize()
     print(f"loaded in {time.perf_counter() - t0:.1f}s; peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     oracle = Path(args.oracle_dir) if args.oracle_dir else None

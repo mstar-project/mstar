@@ -447,14 +447,15 @@ def test_vae_compile_knob_reaches_the_decoder_node():
 
     vae = FakeVae()
     plain = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig())
-    assert plain._decode_one == vae.decode and plain._decode_batch_sizes == ()  # parity path: eager, any batch
+    # parity path: eager, any batch
+    assert plain._vae_decode._decode_one == vae.decode and plain._vae_decode._batch_sizes == ()
     compiled = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
-    assert compiled._decode_one != vae.decode and compiled._decode_batch_sizes == (1, 2, 4, 8)
+    assert compiled._vae_decode._decode_one != vae.decode and compiled._vae_decode._batch_sizes == (1, 2, 4, 8)
     assert _make_model(vae_compile=True).vae_compile is True and _make_model().vae_compile is False
 
 
 def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(monkeypatch):
-    import mstar.model.flux2_klein.submodules as subs
+    import mstar.model.components.diffusion.decode_utils as subs
     from mstar.model.components.diffusion.decode_utils import decode_in_chunks
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
@@ -482,7 +483,7 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
     assert vae.shapes == [(bs, lc, 64 * ph, 64 * pw) for bs in (1, 2, 4, 8)]
     vae.shapes.clear()
-    out = node._decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
+    out = node._vae_decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
     assert [s[0] for s in vae.shapes] == [4, 2, 1] and out.shape[0] == 7
     assert torch.equal(out[:, 0, 0, 0], torch.arange(7.0))  # rows stay in order
     # eager path: no warmup, any batch in one call
@@ -570,46 +571,6 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(Flux2KleinConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040), [])
-
-
-def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
-    """A latent shape the compiled decode was not warmed with goes to the eager decode: an in-request
-    max-autotune compile cost 40-100 s on 1024x768 / 512^2 edits."""
-    import mstar.model.flux2_klein.submodules as subs
-    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
-
-    class RecordingVae(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(1))
-            self.eager, self.compiled = [], []
-
-        @property
-        def dtype(self):
-            return self.weight.dtype
-
-        def decode(self, x):
-            self.eager.append(tuple(x.shape))
-            return x
-
-    def fake_compile(vae):
-        def compiled(x):
-            vae.compiled.append(tuple(x.shape))
-            return x
-        return compiled
-
-    monkeypatch.setattr(subs, "compile_vae_decode", fake_compile)
-    config = Flux2KleinConfig()
-    vae = RecordingVae()
-    node = KleinVaeDecoderSubmodule(vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-                                    decode_batch_sizes=(1, 2))
-    lc, (ph, pw) = config.vae.latent_channels, config.vae.patch_size
-    assert len(vae.compiled) == 2 and vae.eager == []
-    vae.compiled.clear()
-    node._decode(torch.zeros(3, lc, 64 * ph, 64 * pw))  # warmed grid: compiled chunks of 2 + 1
-    assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
-    node._decode(torch.zeros(2, lc, 48 * ph, 64 * pw))  # unwarmed grid: eager, no compile
-    assert vae.eager == [(2, lc, 48 * ph, 64 * pw)] and [s[0] for s in vae.compiled] == [2, 1]
 
 
 def test_blank_prompts_are_rejected():

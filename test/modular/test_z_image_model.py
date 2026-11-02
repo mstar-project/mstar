@@ -162,8 +162,9 @@ def test_requests_above_max_image_area_are_rejected():
 
 
 def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
-    """Mirror of the klein test: unwarmed latent shapes skip the compiled decode (no in-request autotune)."""
-    import mstar.model.z_image.submodules as subs
+    """A latent shape the compiled decode was not warmed with goes to the eager decode: an in-request
+    max-autotune compile cost 40-100 s on 1024x768 / 512^2 edits."""
+    import mstar.model.components.diffusion.decode_utils as subs
     from mstar.model.z_image.config import ZImageConfig
     from mstar.model.z_image.submodules import ZImageVaeDecoderSubmodule
 
@@ -196,10 +197,10 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     h, w = config.latent_grid(1024, 1024)
     assert len(vae.compiled) == 2 and vae.eager == []
     vae.compiled.clear()
-    node._decode_fn(torch.zeros(2, c, h * p, w * p))
-    assert [s[0] for s in vae.compiled] == [2] and vae.eager == []
-    node._decode_fn(torch.zeros(1, c, h * p // 2, w * p))
-    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2]
+    node._vae_decode(torch.zeros(3, c, h * p, w * p))  # warmed grid: compiled chunks of 2 + 1
+    assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
+    node._vae_decode(torch.zeros(1, c, h * p // 2, w * p))  # unwarmed grid: eager
+    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2, 1]
 
 
 def test_blank_prompts_are_rejected():

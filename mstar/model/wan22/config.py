@@ -45,7 +45,6 @@ class Wan22Config:
     text_max_seq_len: int = 512
 
     # Wan2.2-VAE (vae/config.json)
-    vae_z_dim: int = 48
     vae_scale_factor_spatial: int = 16  # pixels per latent cell (H and W)
     vae_scale_factor_temporal: int = 4  # frames per latent frame
 
