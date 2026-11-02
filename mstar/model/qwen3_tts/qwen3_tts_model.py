@@ -407,6 +407,9 @@ class Qwen3TTSModel(Model):
         # capture (default ``TalkerSubmodule.MAX_BATCH_SIZE``). Raising it costs
         # one more pair of graphs per capture.
         self.talker_max_batch = kwargs.get("talker_max_batch")
+        # Server-init knob: the codec's capture batch sizes (default
+        # ``CodecSubmodule.CAPTURE_BATCH_SIZES``); see ``CodecSubmodule.__init__``.
+        self.codec_capture_batch_sizes = kwargs.get("codec_capture_batch_sizes")
         # Server-init knob: opt-in AudioSeal watermark on the codec's output
         # (``mstar.model.audio_watermark``). Checked here so a missing package
         # fails the server at startup, not at the first request.
@@ -1266,7 +1269,9 @@ class Qwen3TTSModel(Model):
             decoder.to(dtype=self.codec_dtype)
         watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
         watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
-        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
+        return CodecSubmodule(
+            decoder, self.config, watermarker=watermarker, capture_batch_sizes=self.codec_capture_batch_sizes,
+        )
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
