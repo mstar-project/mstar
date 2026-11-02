@@ -399,9 +399,9 @@ hit counted, and is never dropped or moved to the host. So does a request in the
 node that keeps no token ids to rebuild it. A request with images whose whole prompt runs on
 one prefill walk, such as a Qwen3.5 chat with images, can be dropped at one rank: the worker
 keeps a host copy of what that walk read besides the token ids, the encoder's output included,
-and rebuilds the request from it. Bagel, Qwen3-Omni and Higgs Audio requests with media, whose
-prompts run on several walks, and requests with images above one rank keep no copies and stay
-guaranteed. A Qwen3.5 video stays guaranteed for its frames. Voice requests then queue when the
+and rebuilds the request from it. Bagel and Qwen3-Omni requests with media, whose prompts run on
+several walks, Higgs Audio requests, whose node declares no rebuild policy, and requests with
+images above one rank keep no copies and stay guaranteed. A Qwen3.5 video stays guaranteed for its frames. Voice requests then queue when the
 pool is short and are never preempted mid-stream.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests
