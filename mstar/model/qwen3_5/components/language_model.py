@@ -17,6 +17,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.engine.resources.convenience import PackedAttentionCallable
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -54,9 +55,19 @@ class RopeCache:
     def __init__(self):
         self.cos: torch.Tensor | None = None
         self.sin: torch.Tensor | None = None
+        # On a step whose layers take the packed prologue (see
+        # `Qwen3_5Attention.forward`): the step's 1D positions and the cos/sin
+        # tables over all positions, ``[positions, rotary_dim // 2]``.
+        self.positions: torch.Tensor | None = None
+        self.tables: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    def set(self, cos: torch.Tensor | None, sin: torch.Tensor | None) -> None:
+    def set(
+        self, cos: torch.Tensor | None, sin: torch.Tensor | None,
+        positions: torch.Tensor | None = None,
+        tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
         self.cos, self.sin = cos, sin
+        self.positions, self.tables = positions, tables
 
 
 class Qwen3_5Attention(Attention):
@@ -108,6 +119,10 @@ class Qwen3_5Attention(Attention):
             input_is_parallel=True, reduce_results=True,
         )
 
+    def bind_resources(self, resources: dict) -> None:
+        super().bind_resources(resources)
+        self.attend = PackedAttentionCallable(kv=self.kv, attn=self.attn)
+
     def _apply_rope(self, q, k, label):
         """Interleaved 3D MRoPE over the partial rotary dim; 1D RoPE when no
         cos/sin was set (a text-only bring-up harness)."""
@@ -119,7 +134,21 @@ class Qwen3_5Attention(Attention):
         num_tokens = hidden_states.shape[0]
         q_dim = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
         kv_dim = self.num_kv_heads * self.head_dim
-        q, k, v = self.qkv_proj(hidden_states).split([q_dim, kv_dim, kv_dim], dim=-1)
+        qkv = self.qkv_proj(hidden_states)
+        if self.rope_cache is not None and self.rope_cache.positions is not None:
+            # a decode replay: split, q/k norm, rotation and the cache write in
+            # one kernel (`attn.prologue`)
+            cos, sin = self.rope_cache.tables
+            out, gate = self.attend.attend_packed(
+                qkv, self.q_norm.weight, self.k_norm.weight, cos, sin, self.rope_cache.positions,
+                self.num_heads, self.num_kv_heads, self.head_dim, self.q_norm.variance_epsilon,
+                self.output_gate,
+            )
+            out = out.reshape(num_tokens, self.num_heads * self.head_dim)
+            if self.output_gate:
+                out = out * torch.sigmoid(gate.reshape(num_tokens, -1))
+            return self.o_proj(out)
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
         if self.output_gate:
             q, gate = torch.chunk(
                 q.view(num_tokens, self.num_heads, self.head_dim * 2), 2, dim=-1,
@@ -240,6 +269,7 @@ class Qwen3_5LanguageModel(nn.Module):
             persistent=False,
         )
         self.norm = _norm(config)
+        self._packed: bool | None = None
         self._rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None
 
         # precomputed: which cursor each layer advances, and to what index
@@ -277,6 +307,21 @@ class Qwen3_5LanguageModel(nn.Module):
             )
         return result
 
+    @property
+    def packed_prologue(self) -> bool:
+        """Whether every full-attention layer takes the packed prologue on a
+        decode replay, which asks the KV cache for flat write slots. One rank
+        only: under TP the K/V heads can replicate past their count, which the
+        kernel's layout does not hold. Settled on first read, once the layers
+        are bound."""
+        if self._packed is None:
+            attn = [layer.self_attn for layer in self.layers if isinstance(layer.self_attn, Qwen3_5Attention)]
+            self._packed = (
+                self.comm_group.world_size == 1 and bool(attn)
+                and all(a.q_norm is not None and a.attend.enable() for a in attn)
+            )
+        return self._packed
+
     def build_cos_sin(
         self, position_ids_3d: torch.Tensor, dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -303,8 +348,13 @@ class Qwen3_5LanguageModel(nn.Module):
     def forward(
         self, query_sequence: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        self.rope_cache.set(*(cos_sin or (None, None)))
+        """``positions`` (1D, one per token) instead of ``cos_sin`` sends the
+        full-attention layers down the packed prologue: only a decode replay
+        whose layers all take it (``packed_prologue``) passes them."""
+        tables = self.rope_tables(query_sequence.dtype) if positions is not None else None
+        self.rope_cache.set(*(cos_sin or (None, None)), positions=positions, tables=tables)
         # bind the label once per resource kind, advance the index per layer
         for attr, idx in self._bind_through.items():
             getattr(self.layers[idx].self_attn, attr).bind_step(label)

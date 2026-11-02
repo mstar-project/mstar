@@ -4,10 +4,17 @@ step's. CPU only."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
 import torch
 
 from mstar.engine.resources.attn import prologue
+from mstar.engine.resources.kv.manager import KVManager
+from mstar.model.qwen3_5.components.language_model import Qwen3_5Attention, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.components.rope import apply_partial_mrope, compute_3d_cos_sin, compute_inv_freq
+from mstar.utils.h2d import PinnedStager
 
 T, H, KH, D, HALF = 5, 4, 2, 32, 4
 
@@ -71,3 +78,67 @@ def test_the_rope_tables_are_the_steps_tables():
     table_cos, table_sin = freqs.cos().to(torch.bfloat16), freqs.sin().to(torch.bfloat16)
     assert torch.equal(cos[:, :32], table_cos[pos]) and torch.equal(cos[:, 32:], table_cos[pos])
     assert torch.equal(sin[:, :32], table_sin[pos])
+
+
+def _manager(flat: bool) -> KVManager:
+    kv = KVManager.__new__(KVManager)
+    kv.kv_cache = SimpleNamespace(page_size=16)
+    kv._plan_stager = PinnedStager(torch.long)
+    kv._flat_slots = False
+    kv._device = torch.device("cpu")
+    kv._cg_max_seq_len = 8
+    kv._static_plan_states = {}
+    kv._staged_outputs = {}
+    kv._current_plan_states = {}
+    kv._preplan_states = {}
+    kv._default_label = "main"
+    if flat:
+        kv.stage_flat_slots()
+    return kv
+
+
+def _decode_step(kv: KVManager) -> None:
+    indptrs = SimpleNamespace(is_decode=True, decode_pages=[3, 5, 7], decode_offsets=np.array([0, 15, 2]))
+    lease = SimpleNamespace(slot=0, bucket=SimpleNamespace(num_tokens=4))
+    kv._setup_plan_states({"main": indptrs}, SimpleNamespace(is_preplan=False), lease)
+
+
+def test_flat_slots_are_staged_only_for_a_layer_that_asked():
+    plain = _manager(flat=False)
+    _decode_step(plain)
+    assert plain.write_flat_slots() is None
+
+    asked = _manager(flat=True)
+    _decode_step(asked)
+    # the padding row writes the sink page
+    assert asked._current_plan_states["main"].token_to_slot[:4].tolist() == [3 * 16, 5 * 16 + 15, 7 * 16 + 2, 0]
+    assert asked.write_flat_slots().tolist() == [48, 95, 114]
+
+
+def _stack(world_size: int, enabled: bool):
+    asked = []
+
+    def enable():
+        asked.append(True)
+        return enabled
+
+    layers = []
+    for _ in range(2):
+        attn = Qwen3_5Attention.__new__(Qwen3_5Attention)
+        attn.q_norm = object()
+        attn.attend = SimpleNamespace(enable=enable)
+        layers.append(SimpleNamespace(self_attn=attn))
+    # a delta-net layer has no say in it
+    layers.append(SimpleNamespace(self_attn=object()))
+    return SimpleNamespace(_packed=None, comm_group=SimpleNamespace(world_size=world_size), layers=layers), asked
+
+
+@pytest.mark.parametrize(
+    ("world_size", "enabled", "packed", "asks"), [(1, True, True, 2), (1, False, False, 1), (2, True, False, 0)],
+)
+def test_which_stacks_take_the_packed_prologue(world_size, enabled, packed, asks):
+    stack, asked = _stack(world_size, enabled)
+    assert Qwen3_5LanguageModel.packed_prologue.fget(stack) is packed
+    # settled once, so the slots are asked for once
+    assert Qwen3_5LanguageModel.packed_prologue.fget(stack) is packed
+    assert len(asked) == asks

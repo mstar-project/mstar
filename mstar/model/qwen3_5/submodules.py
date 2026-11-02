@@ -177,7 +177,7 @@ class LLMSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         """Decode, text prefill and vision prefill all capture."""
-        if self._speculative:
+        if self._speculative or self.model.model.packed_prologue:
             # built here, before any capture, so no replay rebuilds them
             self.model.model.rope_tables(self.model.model.embed_tokens.weight.dtype)
 
@@ -681,18 +681,28 @@ class LLMSubmodule(ARNodeSubmodule):
         captured = self._captured_decode(engine_inputs, graph_walk)
         if input_ids is None and input_embeds is None:
             input_ids = sampler.loopback_tokens()
-        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
+        text = self.model.model
+        positions = None
+        if captured and ingraph_decode_rope() and text.packed_prologue:
+            # the attention layers rotate from the planned positions themselves
+            num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
+            positions = self.node_resources[ROPE].pos_ids("main")[:num_tokens]
+            cos_3d = sin_3d = None
+        elif (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
             # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
             # positions, inside the graph; the static cos/sin stay unread
             num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
-            self.model.model.embed_tokens(input_ids)
+            text.embed_tokens(input_ids)
             if input_embeds is None
             else input_embeds
         )
-        hidden = self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d))
+        hidden = text(
+            embeds, label="main", cos_sin=None if positions is not None else (cos_3d, sin_3d),
+            positions=positions,
+        )
 
         if graph_walk == "decode":
             return sampler.sample(self.model.lm_head(hidden))

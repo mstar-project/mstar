@@ -67,6 +67,46 @@ class AttentionCallable:
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
 
+class PackedAttentionCallable(AttentionCallable):
+    """``AttentionCallable`` that can also take a packed q(+gate)/k/v row
+    whose norm, rotation and cache write run as one kernel
+    (``attn.prologue``), on a step whose KV plan staged flat write slots.
+
+    ``enable()`` asks the KV manager for those slots; it returns whether this
+    platform has the kernel, and the layer keeps its own path otherwise.
+    """
+
+    def enable(self) -> bool:
+        from mstar.engine.resources.attn import prologue
+
+        if not (prologue.available() and self.attn is not None and self.attn.requires_kv_write
+                and hasattr(self.kv, "stage_flat_slots")):
+            return False
+        self.kv.stage_flat_slots()
+        return True
+
+    @torch.compiler.disable
+    def attend_packed(
+        self, qkv: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
+        cos: torch.Tensor, sin: torch.Tensor, positions: torch.Tensor,
+        heads: int, kv_heads: int, head_dim: int, eps: float, gated: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attention over this step's packed rows: ``(out, gate)``, ``gate``
+        empty when ``gated`` is off. ``cos``/``sin`` are tables over positions
+        (``[positions, rotary_dim / 2]``)."""
+        from mstar.engine.resources.attn.prologue import QKV_NORM_ROPE_CACHE
+
+        layer = self.kv.layer_view()
+        slots = self.kv.write_flat_slots()
+        if slots is None:
+            raise RuntimeError("the packed prologue needs a step whose KV plan staged flat slots (a decode replay)")
+        q, gate, k, v = QKV_NORM_ROPE_CACHE(
+            qkv, q_weight, k_weight, cos, sin, positions, layer[:, 0], layer[:, 1], slots,
+            heads, kv_heads, head_dim, eps, gated,
+        )
+        return self.attn.run(q, kv_cache_layer=layer, k=k, v=v), gate
+
+
 class LinearAttnCallable:
     """A recurrent state pool plus the resource running kernels against it,
     mirroring :class:`AttentionCallable`.

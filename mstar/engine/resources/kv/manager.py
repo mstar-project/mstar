@@ -460,6 +460,9 @@ class KVPlanState:
     # an eager-write state a pre-plan built on its own stream: the writer waits
     # on it (the replay's plan-done wait comes after an eager write)
     ready: Any = None
+    # page * page_size + offset per token, staged for a decode replay once a
+    # layer asked for them (`KVManager.stage_flat_slots`)
+    token_to_slot: torch.Tensor | None = None
 
     def copy_(self, other: "KVPlanState", capture_len: int):
         """Stage a step's addressing into this captured state.
@@ -649,6 +652,7 @@ class KVManager(AttentionResource):
         # copy-only H2D into those, see `_setup_plan_states`
         self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
+        self._flat_slots = False
         # the plan cache (`_fast_decode_plan`): bumped by everything that
         # changes a stream's pages or length other than a step's commit
         self._plan_epoch = 0
@@ -2219,6 +2223,15 @@ class KVManager(AttentionResource):
                 n_capture = lease.bucket.num_tokens
                 self._plan_stager.copy_(plan_state.token_to_page[:n_capture], pages, pad_value=SINK_PAGE)
                 self._plan_stager.copy_(plan_state.token_to_cache[:n_capture], offsets, pad_value=0)
+                if self._flat_slots and indptrs.is_decode:
+                    page_size = self.kv_cache.page_size
+                    if plan_state.token_to_slot is None:
+                        plan_state.token_to_slot = torch.full_like(plan_state.token_to_page, SINK_PAGE * page_size)
+                    self._plan_stager.copy_(
+                        plan_state.token_to_slot[:n_capture],
+                        np.asarray(pages, dtype=np.int64) * page_size + np.asarray(offsets, dtype=np.int64),
+                        pad_value=SINK_PAGE * page_size,
+                    )
                 plan_state.total_tokens = len(pages)
                 self._staged_outputs[(lease.slot, label)] = indptrs
             else:
@@ -4208,6 +4221,24 @@ class KVManager(AttentionResource):
         plan_state = self._current_plan_states[label]
         n = plan_state.total_tokens
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
+
+    def stage_flat_slots(self) -> None:
+        """A layer that hands a kernel one flat slot per token
+        (``page * page_size + offset``) asks for them here, at bind time;
+        decode replays then stage them beside the (page, offset) pairs. Nodes
+        that never ask pay nothing."""
+        self._flat_slots = True
+
+    @torch.compiler.disable
+    def write_flat_slots(self, label: str = None) -> torch.Tensor | None:
+        """This step's flat write slots (``stage_flat_slots``), or None where
+        the step staged none: anything but a decode replay."""
+        if label is None:
+            label = self._default_label
+        plan_state = self._current_plan_states[label]
+        if plan_state.token_to_slot is None:
+            return None
+        return plan_state.token_to_slot[:plan_state.total_tokens]
 
     @torch.compiler.disable
     def write_kv(
