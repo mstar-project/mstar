@@ -36,7 +36,7 @@ class _Ctx:
 
 
 def _lease(runners, inputs):
-    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(piecewise_runners=runners)})
+    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(piecewise_runners=runners)}, _rows={})
     ctx = _Ctx()
     Engine._maybe_lease_piecewise_regions(engine, "node", ctx, inputs)
     return ctx.piecewise_leases

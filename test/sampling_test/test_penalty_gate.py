@@ -48,6 +48,7 @@ class _RecordingBuffers:
     """Stands in for SamplerBuffers, recording just what the gate controls."""
 
     ingraph_scatter = False
+    fixed_masters = False
 
     def __init__(self):
         self.sampler = _RecordingSampler()

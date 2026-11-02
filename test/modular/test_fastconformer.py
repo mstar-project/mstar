@@ -461,6 +461,7 @@ class _Encoder:
 
         engine = Engine.__new__(Engine)
         engine._submodules = {"conformer_encoder": SimpleNamespace(piecewise_runners=self.regions)}
+        engine._rows = {}
         ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
         engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
         return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
