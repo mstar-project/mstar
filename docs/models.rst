@@ -384,6 +384,10 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+On AMD GPUs the 0.8B, 2B and 9B configs also set ``gdn_state.twin_slots``: a request
+holds two slots, a decode step reads one and writes the other, and ``max_slots`` still
+counts requests. The state's memory doubles, and its traffic takes 22-48 % less time
+at 16-64 rows (0.8B, MI325X), with the same values.
 
 On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
 auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
