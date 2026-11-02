@@ -52,7 +52,7 @@ class _Recorder(GDNManager):
 def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans, kind):
     gdn = _Recorder()
     segments = [SimpleNamespace(span=s) for s in spans]
-    addressing = SimpleNamespace(slot_indices=torch.zeros(4, dtype=torch.long),
+    addressing = SimpleNamespace(slot_indices=torch.zeros(4, dtype=torch.long), write_slot_indices=None,
                                  has_state=torch.zeros(4, dtype=torch.bool),
                                  snapshots=(), snapshot_every=0)
     ctx = SimpleNamespace(force_prefill=force_prefill, slot_lease=None, graph_walk="decode")
