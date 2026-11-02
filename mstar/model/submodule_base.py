@@ -844,6 +844,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
+    # the LoRA pools among this node's resources; set by `bind_node_resources`
+    lora_keys: tuple[str, ...] = ()
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
@@ -873,6 +876,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
+        from mstar.engine.resources.lora.pool import LoraAdapterPool
+
+        self.lora_keys = tuple(k for k, r in resources.items() if isinstance(r, LoraAdapterPool))
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1267,7 +1273,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         precision; the node's resources are bound but nothing is admitted or
         planned, so it must not read or change resource state. On a lockstep
         node every rank calls it in the same order, so it may run the
-        collectives its forward runs. Default: nothing."""
+        collectives its forward runs. It runs outside a planned step, so a
+        node serving LoRA adapters runs no adapted linear here: an eager delta
+        refuses the call, and a compiled one would read another step's
+        addressing. Default: nothing."""
 
     def can_use_accelerator_graphs(
         self,

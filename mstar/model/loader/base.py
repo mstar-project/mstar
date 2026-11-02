@@ -86,7 +86,7 @@ def _dispatch_loader(
         loader(param, loaded_weight, shard_id)
 
 
-def _apply_stacked(
+def apply_stacked(
     name: str, stacked: list[StackedParamRule],
 ) -> tuple[str, str | int | None]:
     """Return ``(target_name, shard_id)`` after applying stacked rules,
@@ -98,7 +98,7 @@ def _apply_stacked(
 
 
 class _StackedMatcher:
-    """``_apply_stacked`` without trying every rule on every name.
+    """``apply_stacked`` without trying every rule on every name.
 
     Per-expert rule lists run to thousands of rules. A suffix with a token
     between two dots (``.experts.gate_proj.__expert7__.weight``) can only
@@ -161,7 +161,7 @@ def load_weights_into(
 
     Returns: set of parameter paths that received a tensor.
     """
-    apply_stacked = _StackedMatcher(stacked_params or [])
+    match_stacked = _StackedMatcher(stacked_params or [])
     params_dict = dict(module.named_parameters())
     loaded: set[str] = set()
     dropped: list[str] = []
@@ -176,7 +176,7 @@ def load_weights_into(
                 continue
             name = mapped
 
-        target, shard_id = apply_stacked(name)
+        target, shard_id = match_stacked(name)
         if target not in params_dict:
             # Not an error: the checkpoint may carry extra keys (lm_head
             # ties, kv-scale, etc.). Caller can verify completeness via
