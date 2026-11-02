@@ -37,11 +37,18 @@ torch.set_float32_matmul_precision("high")
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
+from mstar.engine.resources.kv.rolling import RollingKVReqConfig  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.components.camera import plucker_embedding  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
-from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, first_frame_mask  # noqa: E402
+from mstar.model.lingbot_world.submodules import (  # noqa: E402
+    DIT_KV,
+    ROLLOUT_LOOP_NAME,
+    ROLLOUT_WALK,
+    first_frame_mask,
+    rolling_extent,
+)
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
 DEVICE = torch.device("cuda")
@@ -114,6 +121,17 @@ def bind_resources(model, sub, overrides: dict | None = None) -> StepRunner:
     return StepRunner(resources)
 
 
+def open_request(sub, runner: StepRunner, rid: int, image: torch.Tensor, num_latent_frames: int) -> None:
+    """Open ``rid`` as the worker does: ingest the rolling K/V it declares (its sink
+    plus window at the output size, as ``get_request_resource_configs`` returns), then
+    admit it through the engine's queue, which sets that room aside."""
+    tokens = sum(rolling_extent(sub.config, tuple(image.shape[-2:]), num_latent_frames))
+    runner.ingest_request(rid, {DIT_KV: RollingKVReqConfig(tokens=tokens)})
+    admitted = runner.admit_retrieve(rid, "dit", ROLLOUT_WALK)
+    if not (admitted.outcome.ok and admitted.outcome.ready):
+        raise RuntimeError(f"request {rid} was not admitted: {admitted.outcome.reason}")
+
+
 def drive(sub, walk: str, info: CurrentForwardPassInfo, inputs: dict, runner: StepRunner | None = None) -> dict:
     """One step of a batch of one, as the engine runs it: prepare_inputs, then
     with a ``runner`` the declared step's admit and plan, the forward, and the
@@ -148,6 +166,7 @@ def rollout(sub, runner: StepRunner, text_embeds, image, camera_poses, intrinsic
     info = fwd_info("rollout", md, rid)
     inputs = {"text_embeds_pos": [text_embeds], "image_inputs": [image],
               "camera_poses": [camera_poses], "intrinsics": [intrinsics], "clock": []}
+    open_request(sub, runner, rid, image, md["num_latent_frames"])
     latents, pixels, conditions, frames, times = [], [], [], [], []
     stops = []
     encode = submodules.encode_condition_chunk

@@ -1095,17 +1095,16 @@ the shift, once per step even when planned twice; the model then calls ``write(l
 (as often as its denoise loop rewrites the chunk; the last write stays) and attends
 ``window(layer)`` with its own kernel.
 
-The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. A request takes a
-contiguous region of exactly its sink plus window at its first step (first fit) and gives it
-back when it ends, so requests of different sizes share the pool instead of each holding
-the largest. When no free gap holds a new request but the free tokens do, the resident
-regions slide left to join the gaps, a copy of what they hold, between steps. A model that
-returns a ``RollingKVReqConfig(tokens=sink + window)`` from ``get_request_resource_configs``
-gets the engine's admission queue: a request waits, in arrival order, until the pool has
-its room, which is then set aside for it, and one larger than the whole pool is a 400 at
-the conductor. Without one, a request that doesn't fit is refused with ``AllocationFailed``
-and retried until a region frees. How many requests run at once is the
-deployment's ``max_concurrent_requests``, not the store's. A step that declares this store
+The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. The model declares
+each request's size by returning ``RollingKVReqConfig(tokens=sink + window)`` from
+``get_request_resource_configs``; a request it declares nothing for fails at its first step.
+A request waits in the engine's admission queue, in arrival order, until the pool has its
+room, which is then set aside for it, and one larger than the whole pool is a 400 at the
+conductor. Its first step takes a contiguous region of exactly that size (first fit), given
+back when the request ends, so requests of different sizes share the pool instead of each
+holding the largest. When no free gap holds a new request but the free tokens do, the
+resident regions slide left to join the gaps, a copy of what they hold, between steps. How
+many requests run at once is the deployment's ``max_concurrent_requests``, not the store's. A step that declares this store
 runs eager (no capture yet), and it does not shard across ranks yet.
 
 Step 3 — Declare the computation graph

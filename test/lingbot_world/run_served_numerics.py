@@ -28,7 +28,7 @@ import torch
 torch.set_float32_matmul_precision("high")
 
 from huggingface_hub import hf_hub_download  # noqa: E402
-from run_parity import DEVICE, bind_resources, drive  # noqa: E402
+from run_parity import DEVICE, bind_resources, drive, open_request  # noqa: E402
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import StepRunner  # noqa: E402
@@ -67,6 +67,10 @@ class Session:
     @property
     def done(self) -> bool:
         return len(self.latents) >= self.num_chunks
+
+    def open(self, sub, runner: StepRunner) -> None:
+        open_request(sub, runner, self.rid, self.inputs["image_inputs"][0],
+                     self.info.step_metadata["num_latent_frames"])
 
 
 def step_chunk(sub, runner: StepRunner, s: Session) -> None:
@@ -132,7 +136,7 @@ def main():
 
     # solo A
     solo = Session(1, 42, tensors_a, text_embeds, cs)
-    runner.ingest_request(solo.rid)
+    solo.open(sub, runner)
     while not solo.done:
         step_chunk(sub, runner, solo)
     finish(sub, runner, solo)
@@ -150,7 +154,7 @@ def main():
     # A and B interleaved, chunk by chunk; A again under a fresh handle
     a, b = Session(2, 42, tensors_a, text_embeds, cs), Session(3, 7, tensors_b, text_embeds, cs)
     for s in (a, b):
-        runner.ingest_request(s.rid)
+        s.open(sub, runner)
     while not (a.done and b.done):
         for s in (a, b):
             if not s.done:

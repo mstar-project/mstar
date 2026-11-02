@@ -19,8 +19,8 @@ max_seq_len: 512
 max_concurrent_requests: 1
 
 # K/V memory for the DiT, reserved at startup and shared by all rollouts.
-# 64800 tokens = 11.1 GB: room for one rollout at the largest size (720x1280),
-# or two at the default size (464x832, 4.7 GB each).
+# 64800 tokens = 11.1 GiB: room for one rollout at the largest size (720x1280),
+# or two at the default size (464x832, 4.7 GiB each).
 resources:
   dit_kv:
     pool_tokens: 64800
