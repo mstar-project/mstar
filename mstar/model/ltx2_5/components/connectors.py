@@ -20,9 +20,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import sdpa_attention
+from mstar.model.components.diffusion.attention import Attend, sdpa_attention
 from mstar.model.ltx2_5.components.layers import (
-    Attend,
     GatedAttention,
     GeluFeedForward,
     RotaryTable,

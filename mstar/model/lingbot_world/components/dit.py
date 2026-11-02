@@ -41,7 +41,6 @@ diffusers pipeline's, not this checkpoint's reference.
 """
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -50,6 +49,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+from mstar.model.components.diffusion.attention import Attend
 from mstar.model.lingbot_world.config import LingBotWorldConfig
 
 
@@ -88,10 +88,6 @@ def _flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch
         dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), deterministic=False,
     ).unflatten(0, (b, lq))
     return x.type(out_dtype)
-
-
-# ``(q, k, v) -> out`` on ``[1, L, H, D]`` tensors; ``k`` / ``v`` have their own length.
-Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class DitAttention(NamedTuple):
