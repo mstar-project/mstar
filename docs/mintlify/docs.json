@@ -17,15 +17,19 @@
     "groups": [
       {
         "group": "Get started",
-        "pages": ["index", "installation", "quickstart"]
+        "pages": ["index", "installation", "quickstart", "reference"]
       },
       {
-        "group": "Understand M*",
-        "pages": ["architecture"]
+        "group": "User guide",
+        "pages": ["serving", "metrics", "clients", "evaluation"]
       },
       {
-        "group": "Guides and reference",
-        "pages": ["reference"]
+        "group": "Reference",
+        "pages": ["architecture", "models", "asr", "api", "environment_variables"]
+      },
+      {
+        "group": "Contributing",
+        "pages": ["adding_models"]
       }
     ]
   },

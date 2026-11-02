@@ -1,6 +1,6 @@
 # Mintlify documentation
 
-This directory contains the first stage of the M* Mintlify site. The existing
+This directory contains the M* Mintlify site. The existing
 Sphinx source and publishing workflow remain active during migration.
 
 ## Preview and validate
@@ -44,18 +44,27 @@ Official instructions: [quickstart](https://www.mintlify.com/docs/quickstart),
 
 ## Migration status
 
-- Introduction, quickstart, and architecture are adapted from the corresponding
-  `.rst` sources. Installation contains the common setup paths and links to the
-  full guide for advanced setup.
-- Serving, clients, models, speech recognition, metrics, environment variables,
-  evaluation, and model authoring currently link to the existing site through
-  `reference.mdx`.
+- Installation, quickstart, architecture, serving, clients, models, speech
+  recognition, metrics, environment variables, evaluation, and model authoring
+  are converted from the corresponding `.rst` guides. The introduction and
+  `reference.mdx` provide the landing page and guide navigation.
 - The generated Python API reference continues to use Sphinx. Migrating narrative
-  pages does not replace the docstring generation pipeline.
+  pages does not replace the docstring generation pipeline. `api.mdx` links to
+  that reference; Python symbol links in the guides open their source on GitHub.
+- Both copies are maintained manually during migration. There is no automatic
+  RST-to-MDX synchronization.
 
-During this transition, keep overlapping content consistent with the `.rst`
-sources. When moving each remaining guide, check code blocks, tables, callouts,
-diagrams, internal links, and section anchors; then replace its external link in
-this site. Once all guides have moved, update the repository's contribution and
-agent instructions to name the canonical sources. Retire or redirect the old
-site only after checking the replacement and its API-reference coverage.
+The `.rst` files remain the canonical sources during this transition, as required
+by the repository's contribution and agent instructions. Update a guide's `.rst`
+and `.mdx` files together when changing overlapping content. Check code blocks,
+tables, callouts, internal links, and section anchors in the local preview.
+
+Converted headings have explicit IDs, such as `## Metrics {#serving-metrics}`.
+Keep an ID stable when editing a heading so incoming section links continue to
+work. For links within Mintlify, use `/page` or `/page#section-id`.
+
+Follow-ups are automated documentation checks, a decision on generated Python API
+reference hosting, and a public-site cutover. At cutover, update the repository's
+contribution and agent instructions to name the new canonical sources. Retire or
+redirect the old site only after checking the replacement and its API-reference
+coverage.
