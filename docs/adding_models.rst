@@ -946,6 +946,36 @@ compute in it. Nemotron VoiceChat's streaming encoder (``ENCODER_KV``,
 ``encoder_kv_config`` in ``mstar/model/nemotron_duplex/components/conformer.py``) is the
 per-query example.
 
+Admission: capacity a request holds until it is removed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A resource whose capacity can run out before a request starts, and that the request then holds
+until it is removed (KV pages, recurrent-state slots, sampler rows), answers for that capacity
+through the admission hooks on ``Resource``. The runner's ``Admission`` decides who gets it and
+when: one arrival order across resources, and a request takes everything it asks for or nothing.
+Capacity a single step takes and gives back goes through ``admit`` and ``rollback_admit``
+instead.
+
+- ``ask(rid, node_name, graph_walk)`` returns ``ASKS`` while the request needs this resource's
+  capacity to start on the node, None when it needs none, or a failing outcome when it can
+  never fit.
+- ``reserve(rid, node_name, graph_walk, published, passing=False)`` takes what the request asked
+  for and returns None, or returns a mark of what it didn't fit against.
+- ``unreserve(rid)`` gives back what ``reserve`` took, when another resource the request asks
+  didn't fit.
+- ``grew_since(mark)`` says whether a request that didn't fit against ``mark`` may fit now. The
+  runner tries a blocked queue again only once it is True, so a pass that changed nothing costs
+  one call.
+
+A request is admitted once it is first in every queue it waits in. A resource may also let a later
+request pass a first request that can't start:
+
+- ``passes = True`` opts in. A resource that leaves it False keeps strict order, and a request
+  waiting in its queue can't pass anywhere.
+- ``may_pass()`` says whether any request could pass now.
+- ``reserve(..., passing=True)`` takes the passer's capacity behind the blocked first request. The
+  resource decides what it keeps for that request, so passing can't starve it.
+
 Step 3 — Declare the computation graph
 --------------------------------------
 

@@ -27,7 +27,8 @@ class Admission:
     """The queues of the resources that ask, and the nodes each request was admitted on.
 
     A waiting request is admitted once it is first in every queue it is in and each resource it
-    asked reserves for it, all or nothing.
+    asked reserves for it, all or nothing. It may also pass a first request that can't start, in a
+    queue whose resource `passes`, when it is first in every other queue it is in (`_pass`).
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -100,7 +101,9 @@ class Admission:
 
         Nothing is tried until a resource whose first waiting request didn't fit has grown, or a
         queue has a new first request, so a pass that changed neither costs one
-        `Resource.grew_since` for each such resource.
+        `Resource.grew_since` for each such resource. After the in-order sweep, while a resource
+        that `passes` has a first request that can't start, each later waiting request is tried, in
+        arrival order, to pass it.
         """
         started = []
         if self._started:
