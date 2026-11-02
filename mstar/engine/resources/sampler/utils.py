@@ -2585,8 +2585,8 @@ class SamplerBuffers:
         seen = self.seen_tokens
         if seen is not None and len(seen.master) <= self._top_slot:
             # vocab-wide, so it grows to the slots in use even while the other
-            # masters are fixed (persistent rows keep their own masks)
-            seen.grow_master(max(2 * len(seen.master), self._top_slot + 1))
+            # masters are fixed (persistent rows keep their own masks), never past them
+            seen.grow_master(min(max(2 * len(seen.master), self._top_slot + 1), self._master_capacity + 1))
         cap = self._master_capacity
         if self._device_capacity >= cap:
             return

@@ -328,7 +328,7 @@ def test_unchanged_rows_reuse_their_slots_plan(kv, space):
     kv._plan_epoch += 1
     for slot in (0, 1):
         assert _rows_read(kv, space, (0, 1), slot=slot) is first[slot]
-        assert kv._current_plan_states["main"] is kv._static_plan_state(slot, "main", 4)
+        assert kv._current_plan_states["main", 0] is kv._static_plan_state(slot, ("main", 0), 4)
 
 
 def test_rows_that_changed_plan_again(kv, space):
@@ -360,4 +360,4 @@ def test_a_slot_another_step_staged_plans_again(kv, space):
     first = _rows_read(kv, space, (0, 1))
     _read(kv, (0, 1), sink=frozenset({(1, "main")}))
     again = _rows_read(kv, space, (0, 1))
-    assert again is not first and kv._staged_outputs[(0, "main")] is again["main"]
+    assert again is not first and kv._staged_outputs[0, ("main", 0)] is again["main"]
