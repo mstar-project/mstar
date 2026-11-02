@@ -632,6 +632,13 @@ class Engine:
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
             first_node = min(relevant_nodes)
+            # one resource is sized by one head-shard count
+            if len({shards[node] for node in relevant_nodes}) > 1:
+                raise ValueError(
+                    f"resource {spec.resource_key!r} serves nodes that split heads different ways "
+                    f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
+                    "positions over its SP ranks and another runs its own sequence parallelism"
+                )
             joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
             self._resources[spec.resource_key] = build_resource(
                 spec,
