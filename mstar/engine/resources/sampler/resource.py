@@ -251,8 +251,9 @@ class SamplerResource(Resource):
             self._logprob_rids.add(rid)
         if self._history is not None:
             self._history.register(rid)
-        if self._cg_buffers is not None and not self._cg_buffers.ingraph_scatter:
-            # with the in-graph scatter the row is taken at admission (`reserve`)
+        bufs = self._cg_buffers
+        if bufs is not None and not (bufs.ingraph_scatter or bufs.fixed_masters):
+            # with fixed masters the row is taken at admission (`reserve`)
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )

@@ -185,7 +185,8 @@ def _admitted(engine, walk, rids) -> dict[int, CurrentForwardPassInfo]:
     readiness check does: that is where the sampler takes a request's slot."""
     infos = {rid: _info(rid, walk) for rid in rids}
     for rid, info in infos.items():
-        assert engine.check_ready(NODE, rid, info).ok, rid
+        outcome = engine.check_ready(NODE, rid, info)
+        assert outcome.ok and outcome.ready, rid
     return infos
 
 
@@ -402,3 +403,17 @@ def test_a_cached_prefix_bars_rows_only_from_a_request_it_penalises():
     sampler.apply_cached_prefix(1, NODE, OTHER_WALK, *hit)
     with pytest.raises(RuntimeError, match="can't add prompt tokens to penalise"):
         _step(engine, ROWS_WALK, [0, 1])
+
+
+@pytest.mark.parametrize("ingraph_scatter", ["0", "1"])
+def test_requests_past_the_fixed_masters_wait_for_a_row(monkeypatch, ingraph_scatter):
+    """Rows fix the sampler's masters, so a request takes its row at admission
+    and one past them waits there, rather than failing to register at ingest."""
+    monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", str(MAX_ROWS))
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", ingraph_scatter)
+    engine = _engine()
+    for rid in range(MAX_ROWS + 2):
+        engine.add_request(rid, {"sampler": _config(rid, 1)})
+    queued = [engine.check_ready(NODE, rid, _info(rid, ROWS_WALK)).queued for rid in range(MAX_ROWS + 2)]
+    assert queued == [False] * MAX_ROWS + [True] * 2
+    _step(engine, ROWS_WALK, list(range(MAX_ROWS)))
