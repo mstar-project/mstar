@@ -11,7 +11,7 @@ its log-sum-exp; the partners exchange partials and ``merge`` them, exactly.
 
 A step split over SP partners by stored position (``stripe_owners``) attends by passing queries
 round the partners instead (``RingAttentionWrapper``): each rank attends every partner's queries
-over its own slots, causally, and the partials go back to their queries' rank.
+over its own slots, and the partials go back to their queries' rank.
 """
 
 import math
@@ -178,19 +178,43 @@ def stripe_owners(qo_indptr: np.ndarray, stored: np.ndarray, size: int) -> np.nd
     return (stored.astype(np.int64)[row] + np.arange(int(qo_indptr[-1])) - qo_indptr[:-1].astype(np.int64)[row]) % size
 
 
+def _ring_rows(
+    stored: np.ndarray, lens: np.ndarray, size: int, rank: int, partner: int, causal: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Partner ``partner``'s queries of a striped step as rank ``rank`` of ``size`` plans them over
+    its slots (``RingAttentionWrapper``): per planned row, its queries, its keys' logical end and
+    the step's row it comes from. ``stored`` and ``lens`` are each step row's stored and new
+    tokens."""
+    first = (partner - stored) % size
+    n = np.maximum(0, -(-(lens - first) // size))
+    if not causal:
+        # every query of a row sees the row whole
+        keep = n > 0
+        return n[keep], (stored + lens)[keep], np.flatnonzero(keep)
+    # partner's first query in each row, at KV position p0, apart where it sees no key here
+    p0 = stored + first
+    sink = (n > 0) & (p0 < rank)
+    queries = np.stack([sink, n - sink], 1).ravel()
+    ends = np.stack([p0 + 1, p0 + (n - 1) * size + 1], 1).ravel()
+    keep = queries > 0
+    return queries[keep], ends[keep], np.repeat(np.arange(len(lens)), 2)[keep]
+
+
 class RingAttentionWrapper:
     """A split step's attention over an SP-placed pool by striped pass-Q. The step's tokens are
     striped over the partners by KV position (``stripe_owners``), so each rank holds the queries
     whose K/V it writes into its own slots. In round ``i`` a rank attends partner ``(r - i) % P``'s
-    queries over its slots, the stored context and the step's own tokens together, with one causal
-    call; the partial goes back to that partner, which merges it in place (``merge_into``).
+    queries over its slots, the stored context and the step's own tokens together, with one call
+    (``_ring_rows``); the partial goes back to that partner, which merges it in place
+    (``merge_into``).
 
     One causal call is exact because a partner's queries in a row sit at KV positions ``p0 + aP``,
     and this rank's keys at or below ``p`` number ``(p - r) // P + 1``: one more per query, so the
     kernel's bottom-right causal mask over the local length to the row's last query is the right
     one. Only a row's first query can see no key here (``p0 < r``); it plans as a row of its own
     over one sink slot, masked out of the merge (``_masked``), and its own rank always holds a key
-    of it. A row this partner holds no query of is left out of its plan.
+    of it. Not causal, each row's queries see its whole length, and a row with no slot here is
+    masked the same way. A row this partner holds no query of is left out of its plan.
 
     ``paged`` is one eager wrapper over this rank's slots per partner, all planned per step.
     Eager only: a striped shard plans a leased step copied."""
@@ -211,10 +235,10 @@ class RingAttentionWrapper:
         self._qo_indptr_buf = None
 
     @torch.compiler.disable
-    def plan(self, kv_out, counts: tuple[int, ...]) -> None:
+    def plan(self, kv_out, counts: tuple[int, ...], causal: bool = True) -> None:
         """``kv_out``: the step's logical ``KVPlanOutput`` for the label; ``counts``: each partner's
         queries, as the sequence shard striped them (``SeqRange.counts``), which this checks
-        against the pool's plan."""
+        against the pool's plan; ``causal``: the step's."""
         p, r = self._placement.size, self._placement.index
         indptrs = kv_out.cpu_indptrs
         qo = indptrs.qo_indptr.numpy().astype(np.int64)
@@ -227,16 +251,7 @@ class RingAttentionWrapper:
         indices = indptrs.paged_kv_indices.numpy()
         self._valid = []
         for j in range(p):
-            # partner j's first query in each row, at KV position p0, and how many it holds
-            first = (j - stored) % p
-            n = np.maximum(0, -(-(lens - first) // p))
-            p0 = stored + first
-            sink = (n > 0) & ((p0 - r) // p < 0)
-            # per row, the sink row of its first query (if it sees no key here), then the rest
-            queries = np.stack([sink, n - sink], 1).ravel()
-            ends = np.stack([p0 + 1, p0 + (n - 1) * p + 1], 1).ravel()
-            keep = queries > 0
-            queries, ends, rows = queries[keep], ends[keep], np.repeat(np.arange(len(lens)), 2)[keep]
+            queries, ends, rows = _ring_rows(stored, lens, p, r, j, causal)
             pages = -(-ends // self._page_size)
             kv_indptr, ids = token_runs(kvp[rows], pages)
             logical = PagedIndptrs(
@@ -246,8 +261,10 @@ class RingAttentionWrapper:
                 paged_kv_last_page_len=torch.from_numpy((ends - (pages - 1) * self._page_size).astype(np.int32)),
             )
             local, valid_rows = self._placement.local_indptrs(logical, self._page_size)
-            assert ((local.kv_lens.numpy() >= queries) | ~valid_rows).all(), "a causal row with more queries than keys"
-            self._paged[j].plan(causal=True, dtype=self._dtype, **local.to_kwargs_dict())
+            assert not causal or ((local.kv_lens.numpy() >= queries) | ~valid_rows).all(), (
+                "a causal row with more queries than keys"
+            )
+            self._paged[j].plan(causal=causal, dtype=self._dtype, **local.to_kwargs_dict())
             self._valid.append(to_device_nonblocking(np.repeat(valid_rows, queries), self._device, torch.bool))
         self._counts = tuple(counts)
         self._qo_indptr_buf = to_device_nonblocking(qo.astype(np.int32), self._device, torch.int32)

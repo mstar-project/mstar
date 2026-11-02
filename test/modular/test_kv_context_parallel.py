@@ -507,7 +507,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
                  else JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
         dtype = torch.bfloat16 if cuda else torch.float32
         if split is not None:
-            _split_step(joint, device, dtype, split)
+            _split_step(joint, device, dtype, split, causal)
             everyone = [None] * world
             dist.all_gather_object(everyone, calls)
             _assert_paired(everyone)
@@ -581,12 +581,12 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
         dist.destroy_process_group()
 
 
-def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, split: str) -> None:
+def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, split: str, causal: bool) -> None:
     """``PREFILL_ROWS`` (odd, rows with and without stored context, one shorter than P, a riding
     decode row) through a sequence shard and ``AttentionCallable`` over a placed pool whose step
     slots hold NaN until the step writes them: split by ``split``, then copied on the same node
-    (``min_tokens`` above the step). Each gathers to one rank's attention, and the sampler's rows
-    are each row's last token of the whole step."""
+    (``min_tokens`` above the step), with the step's ``causal``. Each gathers to one rank's
+    attention, and the sampler's rows are each row's last token of the whole step."""
     group = joint.sp_group
     shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=device)
     case = _Case.build(PREFILL_ROWS, device, dtype)
@@ -602,11 +602,11 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
     for split_it in (True, False):
         shard.min_tokens = 0 if split_it else n + 1
         kv.cache = case.cache(kv.placement, stored_only=True)
-        _plan(attn, case, shard=shard)
+        _plan(attn, case, shard=shard, causal=causal)
         assert (shard.split_range("main") is not None) == split_it
         out = shard.gather("main", attend(*shard.scatter("main", q, k, v)))
         assert torch.isfinite(out).all(), "a step token's K/V wasn't written"
-        torch.testing.assert_close(out.float(), case.want(), **tol)
+        torch.testing.assert_close(out.float(), case.want(causal), **tol)
         last = attn.select_last_hidden(torch.arange(n, device=device)[:, None])
         assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
 
@@ -624,11 +624,12 @@ def _assert_paired(everyone: list) -> None:
             assert [receiver[i][3][a] for receiver in everyone] == sender[i][4], everyone
 
 
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("split", ["all_gather", "ring"])
-def test_sp_ranks_split_a_step_over_a_placed_pool_like_one_rank(tmp_path, split, world):
-    mp.spawn(_over_ranks, args=(world, "gloo", str(tmp_path / "store"), True, PREFILL_ROWS, False, False, True, split),
-             nprocs=world)
+def test_sp_ranks_split_a_step_over_a_placed_pool_like_one_rank(tmp_path, split, world, causal):
+    mp.spawn(_over_ranks, nprocs=world,
+             args=(world, "gloo", str(tmp_path / "store"), True, PREFILL_ROWS, False, False, causal, split))
 
 
 def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(monkeypatch):

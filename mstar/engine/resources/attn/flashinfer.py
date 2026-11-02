@@ -328,7 +328,7 @@ class FlashInferManager(AttentionManager):
             if r is not None and self._split_exchange == "ring":
                 assert lease is None, "a striped sequence shard plans a leased step copied"
                 wrapper = self._ring_wrapper(label, ctx.slot)
-                wrapper.plan(kv_out, r.counts)
+                wrapper.plan(kv_out, r.counts, causal=step.causal)
                 plan_states[label] = wrapper
                 continue
             if lease is not None:
