@@ -1,10 +1,10 @@
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
 
-from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy
 
 
@@ -21,6 +21,9 @@ class StreamChunk:
     # items in this chunk (context included); lets a consumer pick its
     # capture bucket before the chunk tensor is unpacked
     num_items: int = 0
+    # items this pop took out of the buffer for good (the stride it advanced
+    # by, or everything on a flush); the buffer no longer holds them
+    released: list = field(default_factory=list)
 
     @property
     def info(self) -> "StreamChunkInfo":
@@ -38,18 +41,30 @@ class StreamChunkInfo(NamedTuple):
 
 
 class StreamingEdge(NamedTuple):
-    """A synthetic streaming-input edge and the chunk it carries."""
-    edge: GraphEdge
+    """A popped chunk as a synthetic input edge into its consumer node: the
+    uuid of each of its items, and its place in the stream."""
+    name: str
+    next_node: str
+    uuids: list[int]
     chunk: StreamChunkInfo
+
+
+def collate(items: list[torch.Tensor]) -> torch.Tensor:
+    """A chunk's items as its consumer takes them: one item as itself,
+    several stacked. A consumer must not write into it: a single item is the
+    stored tensor, which other destinations may read too."""
+    return items[0] if len(items) == 1 else torch.stack(items)
 
 
 @dataclass
 class StreamBuffer:
     """Per-request, per-edge buffer on the CONSUMER worker.
 
-    Tensors arrive one-by-one via normal RDMA routing.
-    The buffer accumulates them and applies a ChunkPolicy to decide
-    when the consuming node has enough data to proceed.
+    Items arrive one-by-one via normal routing: tensors, or handles to them
+    (the worker puts each item's uuid and collates the tensors when the
+    consuming batch is built). The buffer accumulates them
+    and applies a ChunkPolicy to decide when the consuming node has enough
+    data to proceed.
 
     For sliding-window policies the buffer keeps old items so that
     pop_chunk can return the full window while only advancing by stride.
@@ -60,6 +75,8 @@ class StreamBuffer:
     policy: ChunkPolicy
     # dim to join a chunked producer's pieces on; None keeps them separate
     join_dim: int | None = None
+    # joins pieces held by handle into one item; None means they are tensors
+    joiner: Callable[[list], object] | None = None
     # Items carry the consumer walk the producer assigned them, and a chunk
     # never spans two walks (set for connections that drive their consumer's
     # walk)
@@ -84,6 +101,12 @@ class StreamBuffer:
     # flush). Guards the empty-buffer final flush below so it fires exactly
     # once and ``has_chunk_ready`` doesn't spin returning True forever.
     _final_chunk_emitted: bool = False
+
+    # Whether a chunk may be ready: set by everything that can make one ready
+    # (an item arriving, the producer's done signal, a refused edge coming
+    # back, a pop that may leave another chunk), cleared by a poll that found
+    # nothing. Lets the poll skip a buffer without asking its policy.
+    maybe_ready: bool = True
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
@@ -128,9 +151,10 @@ class StreamBuffer:
         self._num_tensors_registered += len(tensor_ids)
         self._tensor_ids_in_order.append((tuple(tensor_ids), walk))
 
-    def put(self, tensor_id: str, item: torch.Tensor) -> None:
-        """Called when a tensor arrives via normal RDMA routing."""
+    def put(self, tensor_id: str, item) -> None:
+        """Called when an item arrives via normal routing."""
         self._id_to_tensor[tensor_id] = item
+        self.maybe_ready = True
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
@@ -164,9 +188,8 @@ class StreamBuffer:
         which the producer drops every position of -- so it is joined, not
         skipped.
 
-        The one place that assumes the buffer holds tensors rather than uuids.
-        A buffer that stores uuids instead joins here too, by reading the
-        pieces, concatenating and storing the result under a fresh uuid.
+        A buffer that holds uuids joins through its ``joiner``, which reads
+        the pieces, concatenates them and stores the result under a fresh uuid.
 
         A consumer that can take the pieces as they come should do that
         instead (``ChunkingPolicy.per_chunk_outputs``), as Qwen3-Omni's Talker
@@ -176,6 +199,8 @@ class StreamBuffer:
         """
         if len(pieces) == 1:
             return pieces[0]
+        if self.joiner is not None:
+            return self.joiner(pieces)
         return torch.cat(pieces, dim=self.join_dim)
 
     def signal_done(self, num_items: int = 0) -> None:
@@ -183,6 +208,7 @@ class StreamBuffer:
         it sent in total."""
         self.producer_done = True
         self._num_items_expected = num_items
+        self.maybe_ready = True
 
     def _producer_done_and_all_read(self) -> bool:
         return (
@@ -247,12 +273,14 @@ class StreamBuffer:
         if run < buf_len and not self.policy.is_ready(run):
             # The next items run under another walk: flush this walk's run
             items = self._buffer[:run]
+            released = items
             self._buffer = self._buffer[run:]
             self._consumed += run
             stride = run
         elif self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
+            released = items
             self._buffer.clear()
             self._consumed += len(items)
             stride = len(items)
@@ -260,6 +288,7 @@ class StreamBuffer:
             stride = self.policy.next_chunk_size(buf_len)
             # Return the first `window` items (overlapping sliding window)
             items = self._buffer[:window]
+            released = self._buffer[:stride]
             # Advance by stride — discard items that fell out of the window
             self._buffer = self._buffer[stride:]
             self._consumed += stride
@@ -286,6 +315,7 @@ class StreamBuffer:
             is_final=is_final,
             context_items=min(max(self._delivered_end - offset, 0), len(items)),
             num_items=len(items),
+            released=released,
         )
         self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
@@ -293,12 +323,11 @@ class StreamBuffer:
 
     def store_uningested_edge(self, streaming_edge: StreamingEdge):
         self._waiting_graph_edges.append(streaming_edge)
+        self.maybe_ready = True
 
     def _collate(self, items: list) -> dict[str, torch.Tensor | None]:
         if not items:
             return {"data": None}
         if isinstance(items[0], torch.Tensor):
-            if len(items) == 1:
-                return {"data": items[0]}
-            return {"data": torch.stack(items)}
+            return {"data": collate(items)}
         return {"data": items}
