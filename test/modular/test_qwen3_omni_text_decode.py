@@ -1,19 +1,28 @@
 """A Qwen3-Omni request with no audio output decodes on its own walk: its token loops back
 on the device, reaches the client inline and sends nothing to the Talker. A request with
-audio output keeps ``thinker_decode``."""
+audio output keeps ``thinker_decode``. The Thinker declares the loop-back and the stop; the
+hooks behind them are ``ARNodeSubmodule``'s."""
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
+from test_graph_runtime import StubTensorManager, _sharding_config
+from torch.overrides import TorchFunctionMode
 
 pytest.importorskip("flashinfer")
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
+from mstar.graph.base import Loop  # noqa: E402
+from mstar.graph.runtime.python import PythonGraphRuntime  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
+from mstar.model.base import WorkerGraph  # noqa: E402
 from mstar.model.components.mrope import mrope_position_ids  # noqa: E402
 from mstar.model.qwen3_omni.components.rope import compute_3d_cos_sin, compute_rope_freqs  # noqa: E402
 from mstar.model.qwen3_omni.config import (  # noqa: E402
+    THINKER_ATTN,
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
@@ -21,33 +30,76 @@ from mstar.model.qwen3_omni.config import (  # noqa: E402
 )
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 from mstar.model.qwen3_omni.submodules import ThinkerSubmodule  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput, HostRows, ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import (  # noqa: E402
+    ARNodeInputs,
+    BatchedModelOutput,
+    DeviceLoopback,
+    HostRows,
+    ModelInputsFromEngine,
+)
+from mstar.utils.containers import ParallelList  # noqa: E402
+from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 EOS = 7
+HIDDEN = 4
+DECODE_WALKS = ("thinker_decode", THINKER_TEXT_DECODE)
+PREFILL_WALKS = ("prefill_text", "prefill_audio", "prefill_vision")
+_T = torch.Tensor
+_HOST_READS = {_T.item, _T.tolist, _T.cpu, _T.numpy, _T.__int__, _T.__float__, _T.__bool__, _T.__index__}
 
 
-def _info(walk, decoded=0, max_tokens=100, ignore_eos=False):
-    return SimpleNamespace(
-        graph_walk=walk, max_tokens=max_tokens, dynamic_loop_iter_counts={"thinker_decode_loop": decoded},
-        resource_configs={THINKER_SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
-    )
+class _HostReads(TorchFunctionMode):
+    """Records every host read of a tensor's values made inside the block."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads: list[str] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func in _HOST_READS:
+            self.reads.append(func.__name__)
+        return func(*args, **(kwargs or {}))
+
+
+class _Body:
+    """The Thinker body: hands its input back, and its layer-0 and layer-N rows unless told not to keep them."""
+
+    mask_padding = False
+
+    def __init__(self):
+        self.model = SimpleNamespace(embed_tokens=torch.nn.Embedding.from_pretrained(
+            torch.arange(32.0).unsqueeze(-1).expand(-1, HIDDEN).clone(),
+        ))
+        self.calls = []
+
+    def __call__(self, input_embeds, keep_states=True, **kwargs):
+        self.calls.append({"keep_states": keep_states, **kwargs})
+        return input_embeds, input_embeds if keep_states else None, input_embeds if keep_states else None
+
+    def lm_head(self, hidden):
+        return hidden
+
+    def maybe_log_expert_load(self, synthetic=False):
+        pass
 
 
 @pytest.fixture
 def thinker():
-    sub = object.__new__(ThinkerSubmodule)
-    sub.__dict__.update(
-        config=SimpleNamespace(im_end_token_id=EOS, thinker_head_dim=128, thinker_text=SimpleNamespace(rope_theta=1e6)),
-        _inv_freq=None,
-        node_resources={THINKER_SAMPLER: SimpleNamespace(has_slot_masters=True)},
-        model=SimpleNamespace(
-            mask_padding=False,
-            model=SimpleNamespace(embed_tokens=torch.nn.Embedding.from_pretrained(torch.arange(32.0).unsqueeze(-1))),
-            maybe_log_expert_load=lambda synthetic=False: None,
-        ),
-    )
+    sub = ThinkerSubmodule(_Body(), SimpleNamespace(
+        im_end_token_id=EOS, thinker_head_dim=128, thinker_hidden_size=HIDDEN,
+        thinker_text=SimpleNamespace(rope_theta=1e6),
+        vision=SimpleNamespace(deepstack_visual_indexes=[]),
+    ))
+    sub.bind_node_resources({THINKER_SAMPLER: SimpleNamespace(has_slot_masters=True)})
     sub.get_device = lambda: torch.device("cpu")
     return sub
+
+
+def _info(walk, ignore_eos=False):
+    return SimpleNamespace(
+        graph_walk=walk, max_tokens=100, step_metadata={"audio_output": False},
+        resource_configs={THINKER_SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
+    )
 
 
 def _model():
@@ -63,14 +115,56 @@ def _metadata(audio_output: bool, walk="prefill_text") -> CurrentForwardConducto
     )
 
 
+def _engine_inputs(request_ids, tokens, captured=False):
+    sampler = SimpleNamespace(
+        loopback_tokens=lambda rids: torch.tensor(tokens),
+        overwrite_rows=lambda rows, *updates: SamplerResource.overwrite_rows(sampler, rows, *updates),
+        sample=lambda request_ids, logits: logits[:, 0].long(),
+        _row_stager=PinnedStager(torch.long, numel=64),
+    )
+    return ModelInputsFromEngine(
+        request_ids=request_ids, per_request_info={}, captured=captured,
+        resources={THINKER_SAMPLER: sampler, THINKER_ATTN: SimpleNamespace(select_last_hidden=lambda h: h[-2:])},
+    )
+
+
+# ---- what the walk declares ----
+
 def test_the_walk_loops_its_token_and_emits_it_with_no_edge_to_the_talker():
     model = _model()
     walk = model.get_graph_walk_graphs()[THINKER_TEXT_DECODE]
-    assert walk.name == "thinker_decode_loop", "the loop's cap and stop check are the decode walk's"
+    assert walk.name == "thinker_decode_loop", "the loop's cap and stop are the decode walk's"
     assert [(edge.next_node, edge.name) for edge in walk.section.outputs] == [
         ("Thinker", "text_inputs"), (EMIT_TO_CLIENT, "text_inputs"),
     ]
     assert THINKER_TEXT_DECODE in model.get_combined_graph_walks()["Thinker"][THINKER_MIXED]
+
+
+def test_the_thinker_declares_its_loop_back_and_its_stop(thinker):
+    assert thinker.device_loopback == DeviceLoopback(
+        walk=THINKER_TEXT_DECODE, signal="text_inputs", sampler=THINKER_SAMPLER, buffer="new_token",
+    )
+    stop = thinker.token_stop
+    assert (stop.loop, stop.buffer, stop.sampler) == ("thinker_decode_loop", "new_token", THINKER_SAMPLER)
+    assert stop.stop_ids == frozenset({EOS})
+    assert stop.walk is None, "both decode walks end the loop"
+    assert not stop.prefill_walks, "a stop at prefill ending the partition isn't this model's behaviour"
+    for hook in (
+        "uniform_row_inputs", "device_loopback_signals", "inline_client_signals",
+        "check_stop", "check_stop_batched", "loopback_inputs",
+    ):
+        assert hook not in vars(ThinkerSubmodule), f"{hook} follows from the declarations"
+
+
+def test_every_config_that_splits_the_thinker_by_walk_places_the_text_walk():
+    root = Path(__file__).resolve().parents[2]
+    split = [
+        group for path in root.glob("configs/qwen3omni*.yaml")
+        for group in yaml.safe_load(path.read_text())["node_groups"]
+        if "thinker_decode" in group.get("graph_walks", ())
+    ]
+    assert split, "the prefill/decode configs split the Thinker by walk"
+    assert all(THINKER_TEXT_DECODE in group["graph_walks"] for group in split)
 
 
 @pytest.mark.parametrize(("audio_output", "walk"), [(False, THINKER_TEXT_DECODE), (True, "thinker_decode")])
@@ -96,36 +190,49 @@ def test_only_the_text_walk_keeps_its_token_on_the_device(thinker):
 def test_the_tensor_path_stays_with_loop_back_off(thinker, monkeypatch):
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
     assert thinker.device_loopback_signals(THINKER_TEXT_DECODE) == frozenset()
-    row = thinker.prepare_inputs(
-        THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([5])]}, has_loopback=True,
-    )
+    assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=True) is None
+    row = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([5])]}, has_loopback=True)
     assert row.input_ids.tolist() == [5], "a row brings its token when nothing keeps it"
+    assert thinker.inline_client_signals(THINKER_TEXT_DECODE) == {"text_inputs": "new_token"}
 
 
-def test_only_decode_steps_are_declared_input_free(thinker):
-    assert thinker.step_is_input_free(THINKER_TEXT_DECODE) and thinker.step_is_input_free("thinker_decode")
-    assert not thinker.step_is_input_free("prefill_text") and not thinker.step_is_input_free(THINKER_MIXED)
+def test_an_eager_only_sampler_keeps_the_tensor_path(thinker):
+    thinker.bind_node_resources({THINKER_SAMPLER: SimpleNamespace(has_slot_masters=False)})
+    assert thinker.device_loopback_signals(THINKER_TEXT_DECODE) == frozenset()
+    assert thinker.uniform_row_inputs(THINKER_TEXT_DECODE, has_loopback=True) is None
 
+
+@pytest.mark.parametrize("walk", DECODE_WALKS)
+def test_a_decode_step_is_declared_input_free(thinker, walk):
+    assert thinker.step_is_input_free(walk)
+    template = ARNodeInputs(input_seq_len=1, input_ids=torch.zeros(1, dtype=torch.long))
+    row = ARNodeInputs(input_seq_len=1)
+    declared, real = (
+        thinker.declare_step(walk, ["a", "b"], [one, one], per_request_info={}) for one in (template, row)
+    )
+    assert [(s.request_id, s.span) for s in declared.segments] == [(s.request_id, s.span) for s in real.segments]
+    assert declared.cg_key_info is real.cg_key_info is None
+    for step in (declared, real):
+        sampler = step.steps[THINKER_SAMPLER]
+        assert sampler.kept_rids is None and not sampler.prefill_tracked_tokens
+        assert step.steps[THINKER_POS].advance is None
+
+
+@pytest.mark.parametrize("walk", [*PREFILL_WALKS, THINKER_MIXED])
+def test_a_step_that_reads_its_inputs_is_not_input_free(thinker, walk):
+    assert not thinker.step_is_input_free(walk)
+
+
+# ---- the loop-back row ----
 
 def test_a_loop_back_row_brings_no_token_and_a_routed_one_does(thinker):
     row = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {}, has_loopback=True)
     assert row.input_ids is None and row.input_embeds is None and row.input_seq_len == 1
     routed = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor(9)]})
-    assert routed.input_ids.tolist() == [9] and routed.input_embeds.shape == (1, 1)
+    assert routed.input_ids.tolist() == [9] and routed.input_embeds.shape == (1, HIDDEN)
 
 
-def _engine_inputs(request_ids, tokens):
-    sampler = SimpleNamespace(
-        loopback_tokens=lambda rids: torch.tensor(tokens),
-        overwrite_rows=lambda rows, *updates: SamplerResource.overwrite_rows(sampler, rows, *updates),
-        _row_stager=None,
-    )
-    return ModelInputsFromEngine(
-        request_ids=request_ids, per_request_info={}, resources={THINKER_SAMPLER: sampler},
-    )
-
-
-def test_a_decode_step_takes_each_rows_last_token_and_a_routed_row_keeps_its_own(thinker, monkeypatch):
+def test_a_decode_step_takes_each_rows_last_token_and_a_routed_row_keeps_its_own(thinker):
     thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
     row = ARNodeInputs(input_seq_len=1)
     routed = ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([7]))
@@ -134,11 +241,50 @@ def test_a_decode_step_takes_each_rows_last_token_and_a_routed_row_keeps_its_own
     assert out["cos_3d"].shape[0] == 3, "an eager step stages its rotary tables"
 
 
-def test_a_mixed_step_embeds_its_loop_back_rows_beside_the_prompts(thinker):
-    prompt = ARNodeInputs(input_seq_len=2, input_embeds=torch.tensor([[1.0], [2.0]]))
-    row = ARNodeInputs(input_seq_len=1)
-    embeds = thinker._row_embeds(_engine_inputs(["a", "b"], [5, 6]), [prompt, row])
-    assert torch.cat(embeds).squeeze(-1).tolist() == [1.0, 2.0, 6.0]
+def test_a_padding_row_of_a_capture_keeps_what_its_slot_reads(thinker):
+    rows = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=0, input_ids=torch.tensor([0]))]
+    out = thinker.preprocess(THINKER_TEXT_DECODE, _engine_inputs(["a", "b"], [11, 12], captured=True), rows)
+    assert out["input_ids"].tolist() == [11, 12]
+
+
+def test_a_step_of_routed_rows_alone_takes_their_tokens(thinker):
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0]))
+    rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([t])) for t in (3, 4)]
+    out = thinker.preprocess(THINKER_TEXT_DECODE, _engine_inputs(["a", "b"], [11, 12]), rows)
+    assert out["input_ids"].tolist() == [3, 4]
+
+
+def test_a_captured_decode_step_builds_its_rotary_tables_in_the_graph(thinker):
+    planned = torch.tensor([4.0, 5.0, 6.0, 99.0])
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: planned)
+    engine_inputs = _engine_inputs(["a", "b", "c"], [1, 2, 3], captured=True)
+    out = thinker.preprocess(THINKER_TEXT_DECODE, engine_inputs, [ARNodeInputs(input_seq_len=1)] * 3)
+    assert "cos_3d" not in out and "sin_3d" not in out
+
+    tokens = thinker.forward_batched(THINKER_TEXT_DECODE, engine_inputs, **out)
+    call = thinker.model.calls[-1]
+    assert call["keep_states"] is False, "nothing reads the Talker's states on this walk"
+    want = compute_3d_cos_sin(
+        planned[:3].unsqueeze(0).expand(3, -1), thinker._get_inv_freq(torch.device("cpu")),
+        mrope_section=thinker.MROPE_SECTION, target_dtype=torch.float32,
+    )
+    assert torch.equal(call["cos_sin_3d"][0], want[0]) and torch.equal(call["cos_sin_3d"][1], want[1])
+    assert isinstance(tokens, BatchedModelOutput)
+
+
+def test_a_decode_step_reads_nothing_on_the_host(thinker):
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
+    rows = [
+        ARNodeInputs(input_seq_len=1),
+        thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([7])]}, has_loopback=False),
+        thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {}, has_loopback=True),
+    ]
+    for captured in (False, True):
+        engine_inputs = _engine_inputs(["a", "b", "c"], [11, 12, 13], captured=captured)
+        with _HostReads() as reads:
+            out = thinker.preprocess(THINKER_TEXT_DECODE, engine_inputs, rows)
+            thinker.forward_batched(THINKER_TEXT_DECODE, engine_inputs, **out)
+        assert reads.reads == []
 
 
 def test_the_rope_from_the_plan_is_the_rope_custom_positions_gave():
@@ -152,16 +298,31 @@ def test_the_rope_from_the_plan_is_the_rope_custom_positions_gave():
     assert torch.equal(from_plan[0], from_rows[0]) and torch.equal(from_plan[1], from_rows[1])
 
 
-def test_the_batched_stop_check_agrees_with_the_per_request_one(thinker):
+def test_a_text_decode_output_is_addressed_by_row(thinker):
+    assert "filter_batched_output" not in vars(ThinkerSubmodule), (
+        "a per-row filter would keep the step out of the engine's rows-only path"
+    )
+    engine_inputs = _engine_inputs(["a", "b"], [1, 2], captured=True)
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([1.0, 2.0]))
+    out = thinker.forward_batched(THINKER_TEXT_DECODE, engine_inputs, input_ids=torch.tensor([1, 2]))
+    assert set(out.row_outputs) == {"new_token"} and not out.per_rid_outputs and not out.packed_outputs
+    assert set(out.check_stop_buffers) == {"new_token", "text_inputs"}
+    assert out.check_stop_buffers["new_token"] is out.check_stop_buffers["text_inputs"], "one host copy a step"
+
+
+# ---- the stop, on both walks ----
+
+def test_either_decode_walk_ends_the_loop_and_both_checks_agree(thinker):
     # rows in forward order, plus a padding row a replay leaves at the end
-    tokens = torch.tensor([EOS, 3, EOS, 3, EOS, 0])
-    rids = ("eos", "word", "ignored", "budget", "prefill")
+    tokens = torch.tensor([EOS, EOS, 3, 3, EOS, EOS, 0])
+    rids = ("text", "audio", "text-word", "audio-word", "text-ignored", "audio-ignored")
     infos = {
-        "eos": _info(THINKER_TEXT_DECODE),
-        "word": _info(THINKER_TEXT_DECODE),
-        "ignored": _info("thinker_decode", ignore_eos=True),
-        "budget": _info(THINKER_TEXT_DECODE, decoded=9, max_tokens=10),
-        "prefill": _info("prefill_text"),
+        "text": _info(THINKER_TEXT_DECODE),
+        "audio": _info("thinker_decode"),
+        "text-word": _info(THINKER_TEXT_DECODE),
+        "audio-word": _info("thinker_decode"),
+        "text-ignored": _info(THINKER_TEXT_DECODE, ignore_eos=True),
+        "audio-ignored": _info("thinker_decode", ignore_eos=True),
     }
     batched = thinker.check_stop_batched(list(reversed(rids)), infos, HostRows(rids, {"new_token": tokens}))
     per_request = {}
@@ -169,23 +330,108 @@ def test_the_batched_stop_check_agrees_with_the_per_request_one(thinker):
         got = thinker.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
-    assert batched == per_request == {"eos": {"thinker_decode_loop"}, "budget": {"thinker_decode_loop"}}
-    assert thinker.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
-    assert thinker.check_stop_batched(["eos"], infos, HostRows(rids, {"new_token": tokens}), "prefill_text") == {}
+    assert batched == per_request == {"text": {"thinker_decode_loop"}, "audio": {"thinker_decode_loop"}}
+    assert thinker.check_stop_batched(["text"], infos, HostRows(("text",), {})) is None, "no such buffer staged"
+    assert thinker.check_stop("text", infos["text"], {}) == set(), "a row with no token decides nothing"
 
 
-def test_a_step_keeps_a_decode_rows_token_and_drops_a_mid_prompt_one(thinker):
+def _runtime(model: Qwen3OmniModel, walk: str):
+    """The graph runtime, with the request on ``walk``."""
+    walks = model.get_graph_walk_graphs()
+    names = [*PREFILL_WALKS, *DECODE_WALKS]
+    ids = list(range(len(names)))
+    runtime = PythonGraphRuntime(
+        my_worker_id="w0",
+        my_worker_graphs=[
+            WorkerGraph(section=walks[w], graph_walks={w}, ranks=[0], worker_graph_id=i)
+            for i, w in zip(ids, names, strict=True)
+        ],
+        all_wg_ids_to_graph_walks={i: {w} for i, w in zip(ids, names, strict=True)},
+        all_wg_ids_to_dyn_loops={
+            i: {walks[w].name} if isinstance(walks[w], Loop) else set() for i, w in zip(ids, names, strict=True)
+        },
+        all_wg_ids_to_nodes=dict.fromkeys(ids, {"Thinker"}),
+        node_to_partition={"Thinker": "Thinker"},
+        sharding_config=_sharding_config(),
+        tensor_manager=StubTensorManager(),
+    )
+    rid = runtime.add_request(
+        request_id="r", partition="Thinker", graph_walk=walk, partition_worker_graph_ids=ids,
+        worker_graph_to_workers=ParallelList(ids, [["w0"]] * len(ids)),
+        loop_caps=model.get_loop_caps(max_output_tokens=16),
+    )
+    return runtime, rid
+
+
+@pytest.mark.parametrize(("walk", "stops"), [
+    *((walk, True) for walk in DECODE_WALKS),
+    *((walk, False) for walk in PREFILL_WALKS),
+])
+def test_only_a_decode_walk_has_the_loop_a_stop_id_ends(thinker, walk, stops):
+    """A prefill row can sample the stop id too, and the check names the loop for it. No prefill
+    walk carries the loop, so the runtime has nothing to stop: decode still runs."""
+    model = _model()
+    model.config = SimpleNamespace(
+        thinker_text=SimpleNamespace(max_position_embeddings=64),
+        talker_text=SimpleNamespace(max_position_embeddings=64),
+    )
+    named = thinker.check_stop_batched(["r"], {"r": _info(walk)}, HostRows(("r",), {"new_token": torch.tensor([EOS])}))
+    assert named == {"r": {"thinker_decode_loop"}}
+
+    runtime, rid = _runtime(model, walk)
+    stopped = runtime.stop_loops_batched(
+        partition="Thinker", graph_walk=walk, last_node_run="Thinker",
+        loop_names=ParallelList([rid], [sorted(named["r"])]),
+    )
+    assert stopped == ([rid] if stops else [])
+
+
+# ---- a mixed step ----
+
+def test_a_mixed_step_embeds_its_loop_back_rows_beside_the_prompts(thinker):
+    prompt = ARNodeInputs(input_seq_len=2, input_embeds=torch.full((2, HIDDEN), 20.0))
+    row = ARNodeInputs(input_seq_len=1)
+    routed = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor(9)]})
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(
+        pos_ids=lambda label: torch.tensor([0.0, 1.0, 2.0, 3.0]),
+    )
+    out = thinker.preprocess(THINKER_MIXED, _engine_inputs(["a", "b", "c"], [5, 6, 7]), [prompt, row, routed])
+    assert out["input_embeds"][:, 0].tolist() == [20.0, 20.0, 6.0, 9.0]
+    assert out["seq_lens"] == [2, 1, 1]
+    assert out["cos_3d"].shape[0] == 4
+
+
+def test_a_mixed_step_keeps_a_decode_rows_token_and_drops_a_mid_prompt_one(thinker):
     rows = [
         ARNodeInputs(input_seq_len=1, graph_walk=THINKER_TEXT_DECODE),
+        ARNodeInputs(input_seq_len=1, graph_walk="thinker_decode"),
         ARNodeInputs(input_seq_len=4, graph_walk="prefill_text", input_ids=torch.arange(4)),
     ]
-    step = thinker.declare_step(THINKER_MIXED, ["decode", "prompt"], rows, per_request_info={})
-    sampler = next(s for s in step.steps.values() if hasattr(s, "kept_rids"))
-    assert sampler.kept_rids == frozenset({"decode"})
+    step = thinker.declare_step(THINKER_MIXED, ["text", "audio", "prompt"], rows, per_request_info={})
+    assert step.steps[THINKER_SAMPLER].kept_rids == frozenset({"text", "audio"})
+    assert set(step.steps[THINKER_SAMPLER].prefill_tracked_tokens) == {"prompt"}
 
 
-def test_a_text_decode_output_is_addressed_by_row(thinker):
-    assert BatchedModelOutput(row_outputs={"new_token": torch.zeros(1)}).per_rid_outputs == {}
-    assert "filter_batched_output" not in vars(ThinkerSubmodule), (
-        "a per-row filter would keep the step out of the engine's rows-only path"
-    )
+def test_a_mixed_steps_text_decode_rows_get_their_stop_and_inline_rows_and_no_talker_states(thinker):
+    rids = ["text", "prompt"]
+    inputs = [
+        ARNodeInputs(input_seq_len=1, graph_walk=THINKER_TEXT_DECODE),
+        ARNodeInputs(input_seq_len=2, graph_walk="prefill_text", tensor_inputs={
+            "masks_for_talker": torch.ones(2, 2, dtype=torch.bool),
+        }),
+    ]
+    infos = {
+        "text": _info(THINKER_TEXT_DECODE),
+        "prompt": SimpleNamespace(**{**vars(_info("prefill_text")), "step_metadata": {"audio_output": True}}),
+    }
+    embeds = torch.stack([torch.full((HIDDEN,), float(t)) for t in (EOS, 1, 2)])
+    out = thinker.forward_batched(THINKER_MIXED, _engine_inputs(rids, [EOS, 0]), input_embeds=embeds)
+
+    assert set(out.check_stop_buffers) == {"new_token", "text_inputs"}
+    assert set(out.row_outputs) == {"new_token"}
+    host = HostRows(tuple(rids), {"new_token": torch.tensor([EOS, 2])})
+    assert thinker.check_stop_batched(rids, infos, host) == {"text": {"thinker_decode_loop"}}
+
+    unpacked = thinker.unpack_packed_outputs(out.packed_outputs, rids, [1, 2], inputs, infos)
+    assert set(unpacked) == {"prompt"}, "a text-only row has no Talker to send states to"
+    assert unpacked["prompt"]["thinker_states"][0].shape == (2, 2 * HIDDEN)

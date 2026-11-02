@@ -29,6 +29,7 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
             model_kwargs=args.model_kwargs,
             streaming=stream,
             request_id=request_id,
+            model=req.model,
         )
         if stream:
             # A windowed request delivering each window as it lands: NDJSON

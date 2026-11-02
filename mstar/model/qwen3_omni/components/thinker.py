@@ -31,6 +31,7 @@ from mstar.model.components import (
     MoeParallelConfig,
     MoeParallelMixin,
     RMSNorm,
+    TopKRouter,
     instantiate_moe_block,
 )
 from mstar.model.components.distributed import ParallelGatedMLP
@@ -101,6 +102,10 @@ class Qwen3OmniThinkerLayer(nn.Module):
                 norm_topk_prob=tc.norm_topk_prob,
                 comm_group=comm_group,
                 moe_parallel=moe_parallel,
+                router=TopKRouter(
+                    tc.hidden_size, tc.num_experts, tc.num_experts_per_tok,
+                    norm_topk_prob=tc.norm_topk_prob, fused_softmax_topk=True,
+                ),
             )
         else:
             self.mlp = ParallelGatedMLP(

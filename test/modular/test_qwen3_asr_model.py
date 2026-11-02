@@ -33,7 +33,12 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine, TokenStop  # noqa: E402
+from mstar.model.submodule_base import (  # noqa: E402
+    END_PARTITION,
+    HostRows,
+    ModelInputsFromEngine,
+    NodeInputs,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -323,17 +328,23 @@ def test_encoder_replays_exactly_when_leased():
     assert runner.ran["seq_lens"] == [4, 8] and runner.ran["real_bs"] == 2
 
 
+def test_encoder_packs_a_step_only_up_to_its_largest_capture():
+    """Past the largest captured token count a step runs its clips one by one,
+    so an eager step's activations are one clip's, not the whole batch's."""
+    sub = _encoder_submodule(_tiny_config())
+    top = sub.ENCODE_TOKEN_BUCKETS[-1]
+
+    def rows(*lens):
+        return [NodeInputs(input_seq_len=n) for n in lens]
+
+    assert sub.can_batch(None, rows(top - 100, 100))
+    assert not sub.can_batch(None, rows(top - 100, 101))
+    assert sub.can_batch(None, rows(5 * top))
+
+
 def _llm_submodule(cfg):
-    sub = object.__new__(Qwen3ASRLLMSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states, sub.node_resources = {}, {}
-    sub.config = cfg
-    sub.token_stop = TokenStop(
-        loop=sub.DECODE_LOOP, buffer="new_token", stop_ids=cfg.stop_token_ids, sampler=sub.SAMPLER, walk=DECODE_WALK,
-        prefill_walks=frozenset({PREFILL_WALK}),
-    )
     embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
-    sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
+    sub = Qwen3ASRLLMSubmodule(type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})(), cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     return sub
 

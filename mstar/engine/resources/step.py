@@ -4,6 +4,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, NamedTuple
 
+# The graph walk on a piecewise region's step context: the region declares, plans and
+# commits its own step inside the enclosing forward's (see accelerator_graph_runner).
+PIECEWISE_WALK = "__piecewise__"
+
 
 class Segment(NamedTuple):
     """One step's addition to a request's cache stream.

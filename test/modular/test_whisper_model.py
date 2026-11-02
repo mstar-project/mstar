@@ -18,6 +18,7 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import KVSpec  # noqa: E402
+from mstar.engine.resources.step import Segment  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.components.audio_features import (  # noqa: E402
     LogMelSpectrogram,
@@ -25,13 +26,7 @@ from mstar.model.components.audio_features import (  # noqa: E402
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import (  # noqa: E402
-    ARNodeInputs,
-    HostRows,
-    ModelInputsFromEngine,
-    NodeInputs,
-    TokenStop,
-)
+from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine, NodeInputs  # noqa: E402
 from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402
@@ -50,7 +45,6 @@ from mstar.model.whisper.config import (  # noqa: E402
 )
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule, WhisperEncoderSubmodule  # noqa: E402
 from mstar.model.whisper.whisper_model import WhisperDetokenizer, WhisperModel  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -325,18 +319,7 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
 
 
 def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
-    sub = object.__new__(WhisperDecoderSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states = {}
-    sub.node_resources = {}
-    sub.config = cfg
-    sub.token_stop = TokenStop(
-        loop=sub.DECODE_LOOP, buffer="new_token", stop_ids=frozenset({cfg.eos_token_id}), sampler=sub.SAMPLER,
-    )
-    sub._suppress_ids = sub._begin_suppress_ids = sub._language_mask = None
-    sub._stager = PinnedStager(torch.long)
-    sub._inactive = None
-    return sub
+    return WhisperDecoderSubmodule(None, cfg)
 
 
 def _fwd(rid_handle: int, wire: str = "wire", **step_metadata):
@@ -998,7 +981,10 @@ def test_decoder_align_walk_emits_the_alignment_and_postprocess_times_the_words(
         "encoder_states": [enc],
     })
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 7, 33, EOT]
-    assert sub.declare_step(ALIGN_WALK, ["r"], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
+    # one segment over the rows the projections see, which a LoRA pool lays its rows out from
+    step = sub.declare_step(ALIGN_WALK, ["r"], [row])
+    assert step.segments == [Segment("r", "main", row.input_ids.shape[0])] and not step.steps
+    assert sub.max_batch_size(ALIGN_WALK) == 1
     batch = sub.preprocess(ALIGN_WALK, _engine_inputs(["r"]), [row])
     with torch.no_grad():
         out = sub.forward_batched(ALIGN_WALK, _engine_inputs(["r"]), **batch)
