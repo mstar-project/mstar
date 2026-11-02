@@ -255,6 +255,7 @@ def main():
                 result = {"concurrency": concurrency}
                 for col, name in enumerate(("wall_us", "conductor_cpu_us", "worker_cpu_us")):
                     result[name] = statistics.median(row[col] for row in rows)
+                result["total_cpu_us"] = statistics.median(row[1] + row[2] for row in rows)
                 results["results"].append(result)
                 print(json.dumps(result), flush=True)
             if args.json:
