@@ -368,11 +368,12 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
     ([_attention()], {"kv": {"context_parallel": True}}),
     # a strategy for split steps is a no-op on a node that never splits
     ([_ulysses(heads=3), _attention()], {"kv": {"context_parallel": True}}),
-    ([_shard(), _attention()], {"kv": {"context_parallel": True}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}}),
     ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}}),
     # DCP alone: the node runs copied, as one without a shard
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}}),
     ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}),
-], ids=["heads", "positions_copied", "ulysses_without_a_shard", "split_over_positions", "ring", "none"])
+], ids=["heads", "positions_copied", "ulysses_without_a_shard", "all_gather", "ring", "positions_unset", "none"])
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs

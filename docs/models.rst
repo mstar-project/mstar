@@ -526,10 +526,10 @@ Qwen3-Omni notes
   is stored by position over each SP pair (``context_parallel``). A prefill of
   at least ``min_tokens`` tokens (on the ``thinker_shard`` resource) splits over
   the pair: each rank runs the layers on its half of the tokens, and attention
-  gathers the step's queries, keys and values (``all_gather``, the default
-  exchange over a pool stored by position). Decode and shorter prefills run
-  copied on both ranks, each attending its half of the stored context, and the
-  two partials are merged. A captured prefill decides on its bucket's size.
+  gathers the step's queries, keys and values (``sp_exchange: all_gather`` on
+  ``thinker_attn``; without it the Thinker runs every step copied). Decode and
+  shorter prefills run copied on both ranks, each attending its half of the
+  stored context, and the two partials are merged. A captured prefill decides on its bucket's size.
   ``min_tokens`` is a placeholder until measured. Chunked prefill is off on SP
   ranks, so a prompt prefills in one step.
 

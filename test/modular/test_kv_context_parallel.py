@@ -420,6 +420,7 @@ def _cp_attention(
     spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
     if shard is not None:
         spec.shard_key, spec.sp_exchange = "shard", sp_exchange
+        spec.split_exchange = spec.resolve_exchange({"kv": kv})
     attn = AttentionManager.build(spec, info)
     placement = kv.config.place(joint, "kv")
     # by default the KV resource's one field attention reads
@@ -1418,7 +1419,7 @@ def test_the_fa_work_item_bound_holds_flashinfers_own_count():
 # where the Thinker's KV pool stores its tokens over the SP ranks, and the split steps' exchange
 THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
     pytest.param(False, None, id="by_head-ulysses"),
-    pytest.param(True, None, id="by_position-all_gather"),
+    pytest.param(True, "all_gather", id="by_position-all_gather"),
     pytest.param(True, "ring", id="by_position-ring"),
 ])
 

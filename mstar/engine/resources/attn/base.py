@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend
+from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend, SpExchange
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -66,10 +66,8 @@ class AttentionManager(AttentionResource):
     # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
-    # `AttentionSpec.sp_exchange` as configured, set by `build`; and as resolved where the shard can
-    # split (`bind_dependencies`): ulysses, all_gather, ring or none
-    _sp_exchange: str | None = None
-    _split_exchange: str | None = None
+    # how split steps reach it (`AttentionSpec.split_exchange`), set by `build`
+    _split_exchange: SpExchange = "ulysses"
     # the KV resource, which the ring writes and reads itself (`exchange`)
     _kv = None
 
@@ -103,7 +101,7 @@ class AttentionManager(AttentionResource):
         shard = self._shard = resources[self._shard_key]
         self._kv = kv
         kv.bind_sequence_shard(shard)
-        split = self._split_exchange = self._sp_exchange or ("ulysses" if placement is None else "all_gather")
+        split = self._split_exchange
         if split == "ring":
             self._warm_ring(shard.group)
         logger.info(
@@ -292,7 +290,7 @@ class AttentionManager(AttentionResource):
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         manager = cls._build_backend(spec, info)
         manager._shard_key = spec.shard_key
-        manager._sp_exchange = spec.sp_exchange
+        manager._split_exchange = spec.split_exchange
         return manager
 
     @classmethod

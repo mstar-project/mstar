@@ -443,10 +443,10 @@ sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pa
 factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
 
 With both, a paged attention's ``sp_exchange`` picks how a split step reaches it: unset, it
-follows the pool's storage (``ulysses`` by head, ``all_gather`` by position); ``ring`` (by
-position) bounds the attention phase's memory to this rank's tokens and runs eager only; ``none``
-keeps the node's steps copied (KV capacity alone). A value that doesn't match the storage fails
-at load:
+takes the storage's default, ``ulysses`` by head and ``none`` by position (the node's steps run
+copied, KV capacity alone); by position, ``all_gather`` splits them, and ``ring`` also bounds the
+attention phase's memory to this rank's tokens and runs eager only. A value that doesn't match
+the storage fails at load:
 
 .. code-block:: yaml
 
@@ -454,13 +454,13 @@ at load:
      kv_cache:
        context_parallel: true   # store K/V by position over the SP ranks
      attn:
-       sp_exchange: ring        # none / ulysses (by head) / all_gather / ring (by position)
+       sp_exchange: all_gather  # none / ulysses (by head) / all_gather / ring (by position)
      seq_shard:
        min_tokens: 8192
 
 A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
 so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
-for Qwen3-Omni's Thinker) and sooner for dense models. Chunked prefill stays off on SP ranks.
+for Qwen3-Omni's Thinker, estimated from its geometry and unmeasured). Chunked prefill stays off on SP ranks.
 **Sequence and context parallelism** in :doc:`adding_models` covers what each combination does,
 how to pick, and what is refused.
 

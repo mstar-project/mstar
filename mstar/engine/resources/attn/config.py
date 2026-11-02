@@ -8,7 +8,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args
 
 from mstar.engine.resources.kv.config import KVConfig, KVLayout, PagedKVConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
@@ -77,7 +77,8 @@ class AttentionConfig:
                 raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
-SP_EXCHANGES = ("none", "ulysses", "all_gather", "ring")
+SpExchange = Literal["none", "ulysses", "all_gather", "ring"]
+SP_EXCHANGES: tuple[SpExchange, ...] = get_args(SpExchange)
 
 
 @dataclass
@@ -88,8 +89,10 @@ class AttentionSpec(NodeResourceSpec):
     # how a split step's labels reach this attention: a deployment's choice, set only by its
     # `resources:` block (`apply_yaml_overrides`), never by a model. "ulysses" over KV stored by
     # head, "all_gather" or "ring" over KV stored by position (`context_parallel`), "none" for no
-    # split steps; None derives it from the pool's storage (ulysses by head, all_gather by position)
-    sp_exchange: str | None = field(default=None, init=False, repr=False)
+    # split steps; None takes the storage's default (`resolve_exchange`)
+    sp_exchange: SpExchange | None = field(default=None, init=False, repr=False)
+    # `sp_exchange` resolved against the pool's storage (`derive`)
+    split_exchange: SpExchange = field(default="ulysses", init=False, repr=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
@@ -103,12 +106,21 @@ class AttentionSpec(NodeResourceSpec):
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
         problems = take_shard_edge(self, specs)
+        self.split_exchange = self.resolve_exchange(specs)
         # a deployment's own setting, so refused at every SP size
         by_position = {"ulysses": False, "all_gather": True, "ring": True}.get(self.sp_exchange)
         if by_position is not None and bool(specs[self.config.kv_cache].places_positions) != by_position:
             storage = "by position (context_parallel: true)" if by_position else "by head (context_parallel off)"
             problems.append(f"sp_exchange {self.sp_exchange!r} needs KV {self.config.kv_cache!r} stored {storage}")
         return problems
+
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+        """``sp_exchange``, or where unset its pool's storage's default: ``ulysses`` by head, and
+        ``none`` by position, where splitting a step's tokens is the deployment's to opt into.
+        From raw fields, so the sequence shard's ``derive`` can ask in any order."""
+        if self.sp_exchange is not None:
+            return self.sp_exchange
+        return "none" if specs[self.config.kv_cache].places_positions else "ulysses"
 
     @property
     def attends_split_steps(self) -> bool:
@@ -130,7 +142,7 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
-        sp_exchange: str | None = None,
+        sp_exchange: SpExchange | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here. So is how a

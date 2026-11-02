@@ -75,9 +75,10 @@ class SeqShardSpec(NodeResourceSpec):
     SP rank it plans copied at no cost.
 
     Two fields are derived from the attentions on its nodes as configured (``derive``):
-    ``splits``, whether any of them takes split steps (every one's ``sp_exchange`` ``none`` makes
-    the node run copied, as one without a shard), and ``stripe_pool``, the pool a ring attention
-    reads, by whose stored positions each step is striped."""
+    ``splits``, whether any of them takes split steps (every one's ``sp_exchange`` ``none``, set or
+    the default over KV stored by position, makes the node run copied, as one without a shard), and
+    ``stripe_pool``, the pool a ring attention reads, by whose stored positions each step is
+    striped."""
 
     labels: tuple[str, ...]
     axis: int
@@ -120,10 +121,13 @@ class SeqShardSpec(NodeResourceSpec):
         from mstar.engine.resources.attn.config import AttentionSpec
 
         attentions = [spec for spec in specs.values() if spec.nodes & self.nodes and spec.attends_split_steps]
-        # a kind that takes split steps; a paged one's unset sp_exchange is derived from its pool
-        self.splits = any(spec.sp_exchange != "none" for spec in attentions)
-        rings = [spec for spec in attentions if isinstance(spec, AttentionSpec) and spec.sp_exchange == "ring"]
-        pools = sorted({spec.config.kv_cache for spec in rings})
+        # a kind that takes split steps; a paged one's unset sp_exchange follows its pool's storage
+        exchanges = {
+            spec.resource_key: spec.resolve_exchange(specs) if isinstance(spec, AttentionSpec) else spec.sp_exchange
+            for spec in attentions
+        }
+        self.splits = any(exchange != "none" for exchange in exchanges.values())
+        pools = sorted({spec.config.kv_cache for spec in attentions if exchanges[spec.resource_key] == "ring"})
         self.stripe_pool = pools[0] if len(pools) == 1 else None
         if len(pools) > 1:
             return [f"its ring attentions read KV pools {pools}, whose stored positions would stripe a step two ways"]

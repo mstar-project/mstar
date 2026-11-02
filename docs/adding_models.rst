@@ -2101,8 +2101,9 @@ Each attention resource derives what it does from the two, or from the deploymen
      - heads over TP; with ``sp_exchange``, a head slice
    * - Split
      - Ulysses: one all-to-all from split tokens to split heads, write and attend, one back
-     - all-gather (the default): one gather of every rank's q, k and v, attend as a copied step,
-       keep this rank's rows; or ring (``sp_exchange: ring``), below
+     - by the deployment's ``sp_exchange`` (below): ``all_gather``, one gather of every rank's q,
+       k and v, attend as a copied step, keep this rank's rows; or ``ring``. Unset, the node's
+       steps run copied
      - ``sp_exchange="ulysses"``: Ulysses; without it, refused at plan
    * - Cross, split queries
      - n/a
@@ -2164,10 +2165,11 @@ one label on axis 0 (its padding joins that label). Each attention resource of a
 logs at load how it takes split steps.
 
 **Choosing the exchange.** ``sp_exchange`` on a paged attention's ``resources:`` block picks how
-its split steps' tokens reach it. Unset, it follows the pool's storage, so a config without it runs
-as before. It must match the storage at any SP size, or loading fails; and it only picks the split
-exchange: copied steps keep the storage's own path. Each row assumes the node declares a
-``SeqShardSpec`` and runs on ``sp_size`` above 1:
+its split steps' tokens reach it. Unset, it takes the storage's default: ``ulysses`` by head, and
+``none`` by position, so a node whose pools store KV by position splits its steps only where the
+deployment opts in with ``all_gather`` or ``ring``. It must match the storage at any SP size, or
+loading fails; and it only picks the split exchange: copied steps keep the storage's own path.
+Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` above 1:
 
 .. list-table::
    :header-rows: 1
@@ -2189,21 +2191,22 @@ exchange: copied steps keep the storage's own path. Each row assumes the node de
      - n/a
      - never; use TP
    * - on (by position)
-     - unset / ``all_gather``
+     - unset / ``none``
+     - never: the node runs copied, as one without a shard
+     - partials merged
+     - KV capacity alone (DCP), no token split
+   * - on
+     - ``all_gather``
      - gather q, k and v, attend as copied, keep own rows
      - partials merged
-     - the default; one KV head per TP rank can't split by head (Qwen3-Omni's Thinker on TP4 x SP2)
+     - long prompts where one KV head per TP rank can't split by head (Qwen3-Omni's Thinker on
+       TP4 x SP2)
    * - on
      - ``ring``
      - striped pass-Q ring, eager only
      - partials merged
      - attention is the step's peak memory: past a per-model crossover (below), sooner for dense
        models
-   * - on
-     - ``none``
-     - never: the node runs copied, as one without a shard
-     - partials merged
-     - KV capacity alone (DCP), no token split
    * - cacheless (ragged)
      - ``"ulysses"`` (model)
      - Ulysses
@@ -2215,8 +2218,9 @@ exchange: copied steps keep the storage's own path. Each row assumes the node de
      - heads over TP
      - labels the shard never lists (LTX-2.5's audio)
 
-Every attention of a node set to ``none`` makes it plan every step copied, from the config alone,
-so it takes what a node without a shard takes (expert parallelism, say). A ``none`` attention
+Every attention of a node taking ``none`` (set, or unset over KV stored by position) makes it plan
+every step copied, from the config alone, so it takes what a node without a shard takes (expert
+parallelism, say). A ``none`` attention
 beside others that split refuses a split label at plan, the same on every rank.
 
 **Ring** stripes each split step's tokens over the SP ranks by KV position: a row whose pool
@@ -2247,7 +2251,8 @@ page. Attention runs on each rank's slots and merges the partials across the par
   shards K and V itself must match. Each layer exchanges queries and partials over the TP group.
 - **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone.
   Without a ``SeqShardSpec`` every layer but attention runs copied across SP; prefer TP mode
-  where it applies. With one, long steps split their tokens too (all-gather or ring, above).
+  where it applies. With one, and ``sp_exchange`` ``all_gather`` or ``ring`` on its attention, long
+  steps split their tokens too (above).
   Every paged pool of the node must set the key. Each layer all-gathers the partials of a
   copied step. Chunked prefill stays off on SP ranks, so SP mode prefills a prompt in one step.
 

@@ -319,7 +319,7 @@ def test_above_one_rank_the_cache_opens_only_where_the_serving_config_opts_in():
     )
 
 
-@pytest.mark.parametrize("sp_exchange", [None, "ring"], ids=["all_gather", "ring"])
+@pytest.mark.parametrize("sp_exchange", ["all_gather", "ring"])
 @pytest.mark.parametrize("size", [1, 8])
 def test_the_thinkers_cache_stays_open_under_a_sequence_shard(size, sp_exchange):
     """Qwen3-Omni's Thinker with its pool stored by position and a sequence shard over the node. A
@@ -336,10 +336,9 @@ def test_the_thinkers_cache_stays_open_under_a_sequence_shard(size, sp_exchange)
     specs = model.get_node_resources()
     if not any(isinstance(spec, SeqShardSpec) for spec in specs):
         specs.append(SeqShardSpec("thinker_shard", {"Thinker"}, ("main",), 0))
-    resources = {THINKER_KV: {"context_parallel": True, "prefix_cache_tp": True}}
-    if sp_exchange is not None:
-        resources[THINKER_ATTN] = {"sp_exchange": sp_exchange}
-    apply_yaml_overrides(specs, {"resources": resources})
+    apply_yaml_overrides(specs, {"resources": {
+        THINKER_KV: {"context_parallel": True, "prefix_cache_tp": True}, THINKER_ATTN: {"sp_exchange": sp_exchange},
+    }})
     resolve_spec_dependencies(specs)
     shard, = (spec for spec in specs if isinstance(spec, SeqShardSpec))
     assert shard.depends_on() == ({THINKER_KV} if sp_exchange == "ring" else set())
