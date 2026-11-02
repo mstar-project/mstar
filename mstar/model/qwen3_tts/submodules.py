@@ -98,6 +98,8 @@ from mstar.utils.h2d import PinnedStager
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
+# ``ARNodeInputs.kwargs`` key: what a decode row adds to its recurrent embedding
+TEXT_CONDITION = "text_condition"
 
 
 def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
@@ -171,6 +173,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
         self._prefill_ids: dict[tuple[int, ...], torch.Tensor] = {}
+        self._special_embeds: dict[torch.dtype, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -244,14 +247,18 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _special_text_embeds(
         self, dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project TTS BOS/EOS/PAD once for official sequence construction."""
-        token_ids = self._device_ids((
-            self.config.tts_bos_token_id,
-            self.config.tts_eos_token_id,
-            self.config.tts_pad_token_id,
-        ))
-        bos, eos, pad = self._project_text(token_ids).to(dtype).chunk(3, dim=1)
-        return bos, eos, pad
+        """TTS BOS/EOS/PAD projected once per dtype: no request pays the kernels,
+        and decode rows of the default layout share one PAD tensor
+        (``_add_text_conditions``)."""
+        special = self._special_embeds.get(dtype)
+        if special is None:
+            token_ids = self._device_ids((
+                self.config.tts_bos_token_id,
+                self.config.tts_eos_token_id,
+                self.config.tts_pad_token_id,
+            ))
+            special = self._special_embeds[dtype] = tuple(self._project_text(token_ids).to(dtype).chunk(3, dim=1))
+        return special
 
     def _frame_embeds(self, codes: torch.Tensor) -> torch.Tensor:
         """Sum of the 16 codec embeddings per frame, in the Talker width: ``[frames, D]``."""
@@ -427,6 +434,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         therefore prepare requests before admitting them to a micro-batch.
         """
         del kwargs
+        row_kwargs: dict[str, Any] = {}
         if graph_walk in ("talker_prefill", "talker_prefill_clone"):
             step_metadata = fwd_info.step_metadata
             input_embeds = self._build_prefill(
@@ -454,12 +462,14 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
             # ``talker_input_embeds`` is the recurrent graph edge emitted by
             # the previous frame, not a token ID that needs another lookup.
+            # ``preprocess`` adds the condition, once for the batch: a kernel
+            # launched per row here is host time ahead of every replay.
             input_embeds = inputs["talker_input_embeds"][0].to(
                 device=self.get_device(),
                 dtype=text_condition.dtype,
             ).reshape(1, -1)
-            input_embeds = input_embeds + text_condition
             state.add("generation_step", step + 1)
+            row_kwargs[TEXT_CONDITION] = text_condition
         else:
             raise ValueError(f"Unknown Qwen3-TTS Talker walk: {graph_walk!r}")
 
@@ -467,10 +477,11 @@ class TalkerSubmodule(ARNodeSubmodule):
             int(state.get("generated_frames", 0))
             < self.config.generation.min_new_tokens
         )
+        row_kwargs["suppress_eos"] = suppress_eos
         return ARNodeInputs(
             input_embeds=input_embeds,
             input_seq_len=input_embeds.shape[0],
-            kwargs={"suppress_eos": suppress_eos},
+            kwargs=row_kwargs,
         )
 
     def preprocess(
@@ -497,11 +508,11 @@ class TalkerSubmodule(ARNodeSubmodule):
                 raise ValueError("Qwen3-TTS decode expects one token per request")
             # one token per request, so the indices are a fixed arange and a
             # single-request batch is already packed
-            packed_embeds = (
+            packed_embeds = self._add_text_conditions((
                 input_embeds[0]
                 if len(input_embeds) == 1
                 else torch.cat(input_embeds, dim=0)
-            )
+            ), inputs)
             last_token_indices = self._get_decode_last_token_indices(len(inputs))
         else:
             packed_embeds = torch.cat(input_embeds, dim=0)
@@ -516,6 +527,19 @@ class TalkerSubmodule(ARNodeSubmodule):
             "last_token_indices": last_token_indices,
             "suppress_eos": self._get_batch_suppress_eos(inputs),
         }
+
+    @staticmethod
+    def _add_text_conditions(packed: torch.Tensor, inputs: list[ARNodeInputs]) -> torch.Tensor:
+        """Each decode row's text condition in one add. Padding rows and a
+        capture's template rows carry none; their values are never read."""
+        conditions = [item.kwargs.get(TEXT_CONDITION) for item in inputs]
+        first = conditions[0]
+        if first is None:
+            return packed
+        if all(condition is first or condition is None for condition in conditions):
+            return packed + first
+        zero = torch.zeros_like(first)
+        return packed + torch.stack([zero if condition is None else condition for condition in conditions])
 
     def declare_step(
         self,
