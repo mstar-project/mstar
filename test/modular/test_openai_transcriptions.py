@@ -4,6 +4,7 @@ The router is mounted on a FastAPI app with a stubbed APIServer, like
 ``test_openai_router.py``; the adapters are exercised directly as well.
 """
 
+import functools
 import json
 import re
 import sys
@@ -873,6 +874,12 @@ def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
     decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=True))
+    # a fresh FFmpeg check, so this host's torchcodec and the fake don't answer for each other
+    from mstar.model.components import audio_features
+
+    check = audio_features._ffmpeg_decoder_loads
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", functools.cache(check.__wrapped__))
     data = {"model": "whisper_large", "long_form": "parallel"}
     r = _post(client, data, filename="long.wav", content=_wav_bytes(61))
     assert r.status_code == 400 and "could not decode" in r.text and "torchcodec" not in r.text

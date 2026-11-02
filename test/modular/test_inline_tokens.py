@@ -235,6 +235,10 @@ class _Scheduled:
         self._walks = walks
         # rid -> real walk on a mixed step only, as ScheduledBatch keeps it
         self.request_walks = dict(walks) if len(set(walks.values())) > 1 else {}
+        self.incomplete_node_rids = set()  # no row mid-prefill
+
+    def loop_strides(self, rids):
+        return None
 
     def walk_of(self, rid):
         return self._walks.get(rid, "decode")
@@ -267,30 +271,6 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
         _Engine({"text_inputs": "new_token"}), _Batch(), rows, [9, 7, 8], ["text_inputs", "kv"],
     )
     assert sig == "text_inputs" and vals == [90, 70, 80]
-
-
-def test_a_withheld_output_skips_the_fused_route_and_send():
-    """The fused device-loopback call routes every row's outputs, so a step
-    whose stop check withheld one takes the general path."""
-    class _Fused(_Runtime):
-        supports_route_and_send_inline = True
-
-        def route_and_send_inline(self, **kwargs):
-            raise AssertionError("a withheld row would ride inline")
-
-    class _LoopbackEngine(_Engine):
-        def device_loopback_signals(self, node_name, graph_walk):
-            return ["new_token"]
-
-    w = _worker(_Fused())
-    w.enable_prof, w._device_loopback = False, {}
-    batch = _Batch(withheld={8: ("new_token",)})
-    batch.partition = "p"
-    batch.batch.output_signals, batch.batch.graph_walk = ["new_token"], "decode"
-    batch.node_batch.partition_done_rids = ()
-    rows = HostRows((7, 8), {"new_token": torch.tensor([[70], [80]])})
-    eng = _LoopbackEngine({"new_token": "new_token"})
-    assert w._route_and_send_fast(batch, rows, eng, [7, 8], set()) is False
 
 
 def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
@@ -349,9 +329,41 @@ def test_row_logprobs_follow_the_batch_order():
     assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
 
 
-def test_a_step_with_logprobs_skips_the_fused_route():
-    # the fused route builds no route input, which is where log-probs ride
-    worker = _worker(SimpleNamespace(supports_route_and_send_inline=True))
-    rows = HostRows((7,), {"new_token": torch.tensor([70]), SAMPLED_LOGPROB: torch.tensor([-0.5])})
-    batch_N = SimpleNamespace(batch=SimpleNamespace(output_signals=["text_inputs"]))
-    assert worker._route_and_send_fast(batch_N, rows, None, [7], set()) is False
+def _inline_step(withheld=None):
+    """A one-row device-loopback decode step whose token rides inline, as
+    `_get_postprocess_request` sees it."""
+    w = _worker()
+    w._stop_token_signal, w._device_loopback, w._innermost_loop_by_node = {}, {}, {}
+    w.enable_prof = False
+    engine = SimpleNamespace(
+        device_loopback_signals=lambda node, walk: ("text_inputs",),
+        inline_client_signals=lambda node, walk: {"text_inputs": "new_token"},
+    )
+    batch = _Batch()
+    batch.partition = "p"
+    batch.batch.output_signals = ["text_inputs"]
+    batch.batch.request_to_worker_graph = {7: 0}
+    batch.node_batch = SimpleNamespace(
+        final_stream_rids=(), partition_done_rids=(), withheld_outputs=withheld or {},
+    )
+    batch.batch.rids_by_walk = lambda: {"decode": [7]}
+    return w, engine, batch
+
+
+def test_a_step_with_logprobs_routes_through_the_store():
+    # the in-runtime route builds no log-probs: such a step stores, and STORE
+    # passes them on with the route tensors
+    w, engine, batch = _inline_step()
+    tokens = torch.tensor([70])
+    plain = w._get_postprocess_request(batch, HostRows((7,), {"new_token": tokens}), engine, False, None, None)
+    assert plain.inline is not None and plain.inline.signal == "text_inputs"
+    rows = HostRows((7,), {"new_token": tokens, SAMPLED_LOGPROB: torch.tensor([-0.5])})
+    assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None
+
+
+def test_a_withheld_output_routes_through_the_store():
+    """An inline route carries every row's outputs, so a step whose stop check
+    withheld one stores, and the store leaves the withheld output out."""
+    rows = HostRows((7,), {"new_token": torch.tensor([70])})
+    w, engine, batch = _inline_step(withheld={7: ("text_inputs",)})
+    assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None

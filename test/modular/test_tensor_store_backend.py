@@ -28,10 +28,11 @@ def test_the_default_backend_is_the_rust_one():
 
 def test_the_python_backend_is_the_fallback(monkeypatch):
     """The data worker may run without the extension."""
-    def no_extension():
+    def no_extension(self):
         raise ImportError("No module named 'mstar_rust'")
 
-    monkeypatch.setattr(tensor_store, "RustTensorBookkeeping", no_extension)
+    # The class itself stays: TensorStore checks a bookkeeper against it.
+    monkeypatch.setattr(tensor_store.RustTensorBookkeeping, "__init__", no_extension)
     assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"
 
 
