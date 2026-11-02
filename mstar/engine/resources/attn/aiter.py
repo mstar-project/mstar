@@ -418,6 +418,13 @@ class _UnifiedPlans:
 _DELEGATED = object()
 
 
+# The context a captured decode step's kernel variant is chosen for. The cache's whole
+# context (32768) launches 128 segments a row for keys that rarely fill two. MI325X, 4
+# K/V heads: 1 row 13.2 -> 11.0 us at 200 keys, 19.4 -> 16.2 at 4k, 105 -> 98 at 32k, 16
+# rows 20.5 -> 17.2, 64 rows level, 4 rows at 16k the one loss (177 -> 189).
+DECODE_SEGMENT_PIN = 4096
+
+
 class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
     """Paged attention on AITER's unified attention (see the module docstring).
 
@@ -592,9 +599,13 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             )
         self._check_kind(lease, label, (num_rows, max_q))
         image = self._cg_image(lease, label, _image_numel(num_rows, self._cg_width))
+        # A decode row's pin only picks how many segments split its keys, and the
+        # kernel covers a longer row by widening them, so a row past this still reads
+        # every key.
+        max_k = self._kv_config.max_seq_len
         return stage_plan(
             image, rows, self._cg_width, self._pad_cols,
-            max_q, self._kv_config.max_seq_len,
+            max_q, min(max_k, DECODE_SEGMENT_PIN) if max_q == 1 else max_k,
         )
 
     def _reserve_row_starts(self, rows: int) -> None:
