@@ -50,20 +50,6 @@ def _bagel():
     return model
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_bagel_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_bagel_guidance_sink import _llm
-
-    llm = _llm()
-
-    cap = _bagel().get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 _BAGEL_RUNS = {
     "text chat": (["text"], ["text"], {}, "Hello there"),
     "understanding an image": (["image", "text"], ["text"], {}, "What is this?"),
@@ -295,26 +281,54 @@ _COSMOS3_COMMITS = {
     "kv windows": ("a fox in the snow", ["video"], {"window_mode": "kv", "num_frames": 121}),
     "kv windows without context": ("a fox", ["video"], {"window_mode": "kv", "num_frames": 121, "context_frames": 0}),
 }
+_COSMOS3_LOOPS = {
+    **_COSMOS3_COMMITS,
+    "chained windows": ("a fox in the snow", ["video"], {"window_mode": "chained", "num_frames": 121}),
+    "three steps": ("a fox in the snow", ["image"], {"num_inference_steps": 3}),
+    "one step": ("a fox in the snow", ["video"], {"num_frames": 33, "num_inference_steps": 1}),
+}
 
 
-@pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_COMMITS.values(), ids=_COSMOS3_COMMITS)
-def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs):
+def _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs):
+    """A Cosmos3 request through ``process_prompt``, its plan and the DiT's prefill."""
     from test_cosmos3_edge_model import _model
 
-    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL, Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
 
     model = _model(tmp_path, enable_windowed_video=True)
     model.tokenizer = _Cosmos3Tokenizer()
     dit = Cosmos3DiTSubmodule(None, model.config, scheduler=None)
     dit.get_device = lambda: torch.device("cpu")
-    dit._new_scheduler = lambda *args, **kw: SimpleNamespace(timesteps=torch.arange(4))
+    dit._new_scheduler = lambda steps, *args, **kw: SimpleNamespace(timesteps=torch.arange(steps))
 
     output = model.process_prompt(prompt, ["text"], outputs, tensors={}, **kwargs)
-    prefill = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)[0]
-    walk = prefill.walk
-    info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=1,
-                                  rid_handle="r", step_metadata=dict(prefill.step_metadata))
-    dit.prepare_inputs(walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
+    plan = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)
+    info = CurrentForwardPassInfo(request_id="r", graph_walk=plan[0].walk, fwd_index=0, random_seed=0, max_tokens=1,
+                                  rid_handle="r", step_metadata=dict(plan[0].step_metadata))
+    dit.prepare_inputs(plan[0].walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
+    return model, dit, output, plan
+
+
+@pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_LOOPS.values(), ids=_COSMOS3_LOOPS)
+def test_cosmos3_caps_its_denoise_loop_at_the_iterations_its_dit_runs(tmp_path, prompt, outputs, kwargs):
+    """The cap alone ends the denoise loop: one iteration per scheduler step,
+    every window's for a windowed request, plus a commit per kv window."""
+    from mstar.model.cosmos3.submodules import DENOISE_LOOP_FOR_WALK, IMAGE_GEN_LOOP
+
+    model, dit, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
+
+    state = dit.request_states["r"]
+    iters = state["ar_total_iters"] if "ar_schedule" in state else len(state["scheduler"].timesteps)
+    loop = DENOISE_LOOP_FOR_WALK.get(plan[1].walk, IMAGE_GEN_LOOP)
+    assert model.get_loop_caps(**kwargs, **output.metadata)[loop] == iters
+
+
+@pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_COMMITS.values(), ids=_COSMOS3_COMMITS)
+def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs):
+    from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL
+
+    _, dit, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
+    walk = plan[0].walk
 
     state, layout = dit.request_states["r"], output.metadata["kv_layout"]["kv"]
     for label, static in ((COND_LABEL, state["cond"]), (UNCOND_LABEL, state["uncond"])):
@@ -537,21 +551,6 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     return model
 
 
-@pytest.mark.parametrize("horizon", [2, 40])
-def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
-    from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
-
-    model = _vjepa2()
-    kwargs = {"rollout_horizon": horizon}
-    [step] = model.walk_plan("p0", ["video"], ["video"], {"video_frames": [_pointer(torch.zeros(1))]}, kwargs)
-    step_metadata = step.step_metadata
-
-    assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
-        VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",
-        64, {}, max_tokens=1, step_metadata=step_metadata,
-    ), "the cap and the stop check end the rollout on different iterations"
-
-
 @pytest.mark.parametrize("extrinsics", [False, True])
 def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     from mstar.model.vjepa2.config import KV_CACHE
@@ -582,6 +581,8 @@ def _token_decoder(name: str):
     ``get_loop_caps`` reads nothing but its config."""
     if name == "whisper":
         return _whisper()
+    if name == "bagel":
+        return _bagel()
     if name == "canary":
         from mstar.model.canary.canary_model import CanaryModel
 
@@ -617,8 +618,8 @@ def _token_decoder(name: str):
 @pytest.mark.parametrize(
     "name",
     [
-        "canary", "canary_qwen", "command_a_plus", "cosmos3", "glm52", "higgs", "orpheus", "qwen3_5", "qwen3_asr",
-        "whisper",
+        "bagel", "canary", "canary_qwen", "command_a_plus", "cosmos3", "glm52", "higgs", "orpheus", "qwen3_5",
+        "qwen3_asr", "whisper",
     ],
 )
 @pytest.mark.parametrize("max_tokens", [2, 64])

@@ -273,16 +273,9 @@ class LingBotDitSubmodule(NodeSubmodule):
             text=cfg.text_len,
         )
 
-    def prepare_inputs(self, graph_walk, fwd_info: CurrentForwardPassInfo, inputs, **kwargs) -> NodeInputs | None:
-        state = self.request_state(fwd_info.rid_handle)
-        num_chunks = int(fwd_info.step_metadata["num_chunks"])
-        chunk = int(state.get("chunk", 0))
-        if chunk >= num_chunks:
-            logger.info(
-                "LingBot dit: skipping async-overshoot chunk %d (request %s runs %d chunks)",
-                chunk, fwd_info.request_id, num_chunks,
-            )
-            return None
+    def prepare_inputs(self, graph_walk, fwd_info: CurrentForwardPassInfo, inputs, **kwargs) -> NodeInputs:
+        # the loop's cap is the request's chunk count, so this stays in range
+        chunk = int(fwd_info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
         image = inputs["image_inputs"][0]
         return NodeInputs(
             tensor_inputs={
@@ -314,7 +307,6 @@ class LingBotDitSubmodule(NodeSubmodule):
         generator.manual_seed(seed)
         noise = torch.randn(cfg.out_dim, lat_f, lat_h, lat_w, dtype=torch.float32, generator=generator, device=device)
         state.add_all(
-            chunk=0,
             frame_seqlen=frame_seqlen,
             generator=generator,
             noise=noise,
@@ -335,7 +327,7 @@ class LingBotDitSubmodule(NodeSubmodule):
         image = image.to(device)
         if "kv" not in state:
             self._seed_request(state, info.step_metadata, info.random_seed, image, device)
-        chunk = int(state["chunk"])
+        chunk = int(info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
         frame_seqlen = int(state["frame_seqlen"])
         cs = cfg.chunk_size
         frames = slice(chunk * cs, (chunk + 1) * cs)
@@ -373,7 +365,6 @@ class LingBotDitSubmodule(NodeSubmodule):
             del conditioning
             pixels = self._decode(x0, state, clip_start=chunk == 0)
 
-        state.add("chunk", chunk + 1)
         if self.keep_chunk_outputs:
             state.add_all(chunk_latents=x0.clone(), chunk_pixels=pixels.clone(), chunk_condition=y.clone())
         # quantize from fp32; a bf16 decode's frames round once, here
@@ -429,8 +420,3 @@ class LingBotDitSubmodule(NodeSubmodule):
                 self.vae, z, state["feat_cache"], self._decode_step, clip_start=clip_start, latents_per_call=1,
             )
 
-    def check_stop(self, request_id, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
-        done = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)
-        if done + 1 >= int(request_info.step_metadata.get("num_chunks", 0) or 0):
-            return {ROLLOUT_LOOP_NAME}
-        return set()

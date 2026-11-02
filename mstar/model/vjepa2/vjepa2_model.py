@@ -425,8 +425,8 @@ class VJepa2Model(Model):
         #     Orpheus LLM -> SNAC), which isn't what per-iter client
         #     emit requires.
         # Both walks route to the SAME ``rollout_predictor`` node name
-        # (same submodule, same engine type, same ``check_stop``
-        # semantics) — only the emit topology differs.  Gated per-request
+        # (same submodule, same engine type, same loop cap) — only the
+        # emit topology differs.  Gated per-request
         # via ``model_kwargs["stream_rollout"]`` in ``_initial_walk``.
         rollout_inputs: list[str] = ["encoder_hidden"]
         rollout_loopback_outputs: list[GraphEdge] = [
@@ -456,9 +456,8 @@ class VJepa2Model(Model):
 
         # -- Batched (masked + AC): accumulated_outputs, one message at
         # -- loop completion.  ``max_iters`` is a config-level upper bound
-        # -- baked in at graph-build time; the per-request horizon is
-        # -- enforced inside the submodule via ``check_stop`` when
-        # -- iter_idx + 1 reaches it.
+        # -- baked in at graph-build time; the per-request horizon is the
+        # -- loop's cap (``get_loop_caps``).
         rollout_section_batched = GraphNode(
             name="rollout_predictor",
             input_names=rollout_inputs,
@@ -890,13 +889,7 @@ class VJepa2Model(Model):
         """
         if not input_signals.get("video_frames"):
             raise ValueError("V-JEPA 2 requires a video (video_frames)")
-        walk = self._initial_walk(model_kwargs)
-        step_metadata = {}
-        if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
-            # The rollout predictor's check_stop ends the loop at this horizon;
-            # the Loop itself is built with max_iters=config.max_rollout_horizon.
-            step_metadata["rollout_horizon"] = self._rollout_horizon(model_kwargs)
-        return [WalkStep(walk, step_metadata=step_metadata)]
+        return [WalkStep(self._initial_walk(model_kwargs))]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

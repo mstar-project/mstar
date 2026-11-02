@@ -1721,9 +1721,8 @@ class LLMSubmodule(ARNodeSubmodule):
             md = request_info.step_metadata
             ends = md.get(FINAL_PREFILL, False) and md.get("prefill_stop_ends", False)
             return {END_PARTITION} if hit_eos and ends else set()
-        if hit_eos or request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()
+        # the token budget is the loop's cap (``BagelModel.get_loop_caps``)
+        return {"decode_loop"} if hit_eos else set()
 
 
 class VAEDecoderSubmodule(NodeSubmodule):

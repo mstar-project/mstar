@@ -669,10 +669,9 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
 
         ``can_batch`` guarantees all rids are at the same ``iter_idx`` (else
         we fall to sequential), so the rollout-step math is a single
-        ``[B, N, D]`` forward.  Per-request early-exit (``check_stop``)
-        still fires independently when each rid's ``rollout_horizon`` is
-        reached — individual rids can drop out while others continue, and
-        the scheduler re-batches remaining rids on the next iter.
+        ``[B, N, D]`` forward.  Each rid's loop ends on its own cap (its
+        ``rollout_horizon``), so rids can drop out while others continue,
+        and the scheduler re-batches the remaining rids on the next iter.
         """
         request_ids = engine_inputs.request_ids
         per_request_info = engine_inputs.per_request_info
@@ -702,21 +701,6 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
             for i, rid in enumerate(request_ids)
         }
 
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
-        if horizon > 0 and iter_idx + 1 >= horizon:
-            logger.info(
-                "VJepa2RolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
-                horizon,
-                iter_idx,
-            )
-            return {"rollout_loop"}
-        return set()
 
 
 class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
@@ -889,8 +873,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     forward based on ``iter_idx`` — the tensors themselves don't change.
 
     Shares the sibling rollout submodule's batching contract (``B >= 2``
-    + shape + same-iter homogeneity) and ``check_stop`` early-exit
-    semantics.
+    + shape + same-iter homogeneity) and per-request horizon.
     """
 
     def __init__(
@@ -1280,21 +1263,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             for i, rid in enumerate(request_ids)
         }
 
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        if horizon > 0 and iter_idx + 1 >= horizon:
-            logger.info(
-                "VJepa2ACRolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
-                horizon,
-                iter_idx,
-            )
-            return {"rollout_loop"}
-        return set()
 
 
 # ---------------------------------------------------------------------------

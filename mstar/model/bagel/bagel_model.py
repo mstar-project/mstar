@@ -868,7 +868,7 @@ class BagelModel(Model):
         }}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # The stop check allows max_tokens - 1 iterations, and a loop runs at least one.
+        # the prefill samples the first of max_output_tokens, so decode runs one fewer
         return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def checkpoint_path(self) -> str:

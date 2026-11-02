@@ -84,7 +84,7 @@ def test_gen_params_and_step_metadata() -> None:
     assert (p["width"], p["height"]) == (480, 256)
     assert p["num_frames"] == 1 and p["has_image_condition"] is False
 
-    # The denoise loop stops per-request (check_stop), so a per-request
+    # The denoise loop's cap is per request, so a per-request
     # num_inference_steps is honored, clamped to [1, max_inference_steps];
     # guidance_scale is likewise per request.
     p = model._resolve_gen_params(
@@ -116,56 +116,6 @@ def test_gen_params_and_step_metadata() -> None:
         sm = step.step_metadata
         assert sm["height"] == 256 and sm["width"] == 256
         assert sm["num_inference_steps"] == 7
-
-
-def test_dynamic_loop_check_stop_and_wasted_step() -> None:
-    """The denoise loop stops at each request's own step count, and a step
-    dispatched one past that count is a no-op — so the loop's single speculative
-    extra iteration can't index the scheduler out of range."""
-    import types
-
-    import torch
-
-    from mstar.model.cosmos3.submodules import (
-        ACTION_GEN_LOOP,
-        ACTION_GEN_WALK,
-        IMAGE_GEN_LOOP,
-        IMAGE_GEN_WALK,
-        Cosmos3DiTSubmodule,
-    )
-
-    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
-        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
-
-    n = 4
-    dit.request_state("r").add_all(scheduler=StubSampler(list(range(n))), raw_action_dim=2)
-
-    def info(walk, it):
-        return types.SimpleNamespace(
-            graph_walk=walk,
-            dynamic_loop_iter_counts={IMAGE_GEN_LOOP: it, ACTION_GEN_LOOP: it},
-        )
-
-    # Stops only on the last real step (iter n-1), not before; routes by walk.
-    assert dit.check_stop("r", info(IMAGE_GEN_WALK, n - 2), {}) == set()
-    assert dit.check_stop("r", info(IMAGE_GEN_WALK, n - 1), {}) == {IMAGE_GEN_LOOP}
-    assert dit.check_stop("r", info(ACTION_GEN_WALK, n - 1), {}) == {ACTION_GEN_LOOP}
-    # Unknown request -> no stop.
-    assert dit.check_stop("missing", info(IMAGE_GEN_WALK, 0), {}) == set()
-
-    # A forward one past the step count returns its inputs unchanged without
-    # touching the transformer or cache manager (both None here).
-    lat = torch.zeros(1, 4, 1, 2, 2)
-    solver = {"unipc_last_sample": torch.ones(1)}
-    out = dit._forward_image_gen(None, dit.request_states["r"], n, latents=lat, **solver)
-    assert torch.equal(out["latents"][0], lat) and out["unipc_last_sample"] == [solver["unipc_last_sample"]]
-
-    act = torch.zeros(1, 3, 5)
-    out = dit._forward_action_gen(None, dit.request_states["r"], n, latents=lat, action_latents=act)
-    assert torch.equal(out["latents"][0], lat)
-    # The action latents (the looped self-edge the loop emits on finish) pass
-    # through unchanged on the discarded extra step.
-    assert torch.equal(out["action_latents"][0], act)
 
 
 @pytest.mark.skipif(not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir")
@@ -651,9 +601,7 @@ def test_ingest_cond_latents_routing() -> None:
 def test_postprocess_finishes_captured_step() -> None:
     """The submodule ``postprocess`` finishes a captured denoise step from the
     step's inputs (CFG combine + scheduler step) and passes eager outputs
-    through untouched. Steps past the request's count never reach it:
-    prepare_inputs vetoes the loop's extra dispatched step and the engine
-    prunes vetoed requests before postprocess."""
+    through untouched."""
     import types
 
     import torch

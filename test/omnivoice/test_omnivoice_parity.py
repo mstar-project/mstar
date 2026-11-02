@@ -190,6 +190,23 @@ def test_reveal_schedule_covers_the_canvas():
             assert sum(schedule) == target_len * NUM_CODEBOOK
 
 
+@pytest.mark.parametrize("num_step", [1, 8, 1000])
+def test_the_unmask_loop_ends_on_the_requests_reveal_schedule(num_step):
+    """The loop's cap alone ends it, so it must be the length of the reveal
+    schedule the backbone indexes by iteration (a clamped num_step included)."""
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
+    model = object.__new__(OmniVoiceModel)
+    model.config = OmniVoiceConfig()
+    kwargs = {"num_step": num_step}
+    [step] = model.walk_plan("p", ["text"], ["audio"], {"prefix_ids": [object()]}, kwargs)
+    schedule = build_reveal_schedule(
+        target_len=7, num_codebook=NUM_CODEBOOK,
+        num_step=step.step_metadata["num_step"], t_shift=step.step_metadata["t_shift"],
+    )
+    assert model.get_loop_caps(**kwargs) == {UNMASK_LOOP_NAME: len(schedule)}
+
+
 def test_mask_class_is_never_predicted():
     item = _item("solo", prefix_len=10, target_len=6)
     canvas = build_packed_canvas([item], MASK_ID, torch.device("cpu"))

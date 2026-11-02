@@ -121,9 +121,9 @@ GEN_WALKS = (IMAGE_GEN_WALK, VIDEO_GEN_WALK, VIDEO_GEN_AR_WALK)
 PREFILL_WALKS = (PREFILL_WALK, PREFILL_COND_WALK, PREFILL_COND_VIDEO_WALK)
 
 # Names of the denoise loops in the graph walks. The loops are built with a fixed
-# upper-bound iteration count and each request stops its loop early at its own
-# denoise-step count (see ``check_stop``), so one graph serves any per-request
-# step count.
+# upper-bound iteration count and each request caps its loop at its own
+# denoise-step count (``Cosmos3Model._denoise_cap``), so one graph serves any
+# per-request step count.
 IMAGE_GEN_LOOP = "image_gen_loop"
 VIDEO_GEN_LOOP = "video_gen_loop"
 VIDEO_GEN_AR_LOOP = "video_gen_ar_loop"
@@ -1318,14 +1318,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # The loop counter is global over every window's iterations; the
             # schedule index is the within-window step, and in kv mode the
             # extra per-window iteration is the commit pass.
-            if step_index >= st["ar_total_iters"]:
-                return None
             window_index, local, commit = self._window_step(st, step_index)
             if commit:
                 return self._prepare_commit(st, window_index, latents, solver)
             step_index = local
-        elif step_index >= len(scheduler.timesteps):
-            return None
         tensors = {"latents": latents, **solver}
         # The CUDA-graph capture reads the timestep, rotary tables and the
         # clean/noisy token mask as static buffers (it can't reach the
@@ -1334,12 +1330,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # for a request that could land on a captured graph (two-branch
         # guidance at a captured shape; see ``_capture_key``).
         if st["uncond"] is not None and self._capture_key(graph_walk, st) is not None:
-            # The denoise loop may dispatch one extra (discarded) step past this
-            # request's step count; clamp so materializing the static timestep
-            # buffer can't index past the schedule. ``step_index`` is the
-            # within-window step for a windowed request.
-            n_steps = len(scheduler.timesteps)
-            t = scheduler.timesteps[min(step_index, n_steps - 1)].to(torch.float32)
+            # ``step_index`` is the within-window step for a windowed request
+            t = scheduler.timesteps[step_index].to(torch.float32)
             # Every graph is built with all frames declared noisy, so the
             # timestep buffer spans every generation token.
             tensors["vision_timesteps"] = t.reshape(1).expand(st["cond"]["num_vision_tokens"]).contiguous()
@@ -1396,8 +1388,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             sound_latents = inputs["sound_latents"][0]
             solver = {name: inputs[name][0] for name in self._solver_state}
 
-        if step_index >= len(scheduler.timesteps):
-            return None
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"] + st["num_sound"],
             tensor_inputs={"latents": latents, "sound_latents": sound_latents, **solver},
@@ -1437,8 +1427,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             action_latents = inputs["action_latents"][0]
             solver = {name: inputs[name][0] for name in self._solver_state}
 
-        if step_index >= len(scheduler.timesteps):
-            return None
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"] + st["cond"]["num_action_tokens"],
             tensor_inputs={"latents": latents, "action_latents": action_latents, **solver},
@@ -1757,10 +1745,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         gi = st.get("guidance_interval")
         if gi is None:
             return True
-        timesteps = _host_timesteps(st["scheduler"])
-        if step_index >= len(timesteps):
-            return False
-        t = float(timesteps[step_index])
+        t = float(_host_timesteps(st["scheduler"])[step_index])
         return gi[0] <= t <= gi[1]
 
     def _forward_image_gen(self, attn, st, k, latents, **solver) -> dict:
@@ -1771,16 +1756,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # The loop counter is global; each window runs its own fresh
             # scheduler over ar_steps steps, and in kv mode the extra
             # per-window iteration commits the finished window's K/V.
-            if step_index >= st["ar_total_iters"]:
-                return {"latents": [latents], **self._solver_edges(solver)}
             window_index, local, commit = self._window_step(st, step_index)
             if commit:
                 return self._commit_window(attn, st, latents, window_index)
             step_index = local
-        elif step_index >= len(scheduler.timesteps):
-            # The loop may dispatch one step past this request's own count
-            # before its stop signal lands; that step is a no-op.
-            return {"latents": [latents], **self._solver_edges(solver)}
         t = _host_timesteps(scheduler)[step_index]
         vision_timesteps = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=latents.device)
 
@@ -1854,9 +1833,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_video_sound_gen(self, attn, st, k, latents, sound_latents, **solver) -> dict:
         scheduler = st["scheduler"]
         step_index = k
-        if step_index >= len(scheduler.timesteps):
-            # One-past-the-end dispatch before the stop signal lands: no-op.
-            return {"latents": [latents], "sound_latents": [sound_latents], **self._solver_edges(solver)}
         t = _host_timesteps(scheduler)[step_index]
         vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=latents.device)
         sts = torch.full((st["num_sound"],), t, device=latents.device)
@@ -1953,9 +1929,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _forward_action_gen(self, attn, st, k, latents, action_latents, **solver) -> dict:
         scheduler = st["scheduler"]
         step_index = k
-        if step_index >= len(scheduler.timesteps):
-            # One-past-the-end dispatch before the stop signal lands: no-op.
-            return {"latents": [latents], "action_latents": [action_latents], **self._solver_edges(solver)}
         t = _host_timesteps(scheduler)[step_index]
         device = latents.device
         vts = torch.full((st["cond"]["num_noisy_vision_tokens"],), t, device=device)
@@ -2502,8 +2475,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         latents = inputs.tensor_inputs["latents"]
         solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
         outputs.clear()
-        # step_index is in range here: prepare_inputs vetoes the loop's extra
-        # dispatched step and the engine prunes vetoed requests before postprocess.
+        # in range: the request's step count is the loop's cap (Cosmos3Model._denoise_cap)
         step_index = _loop_step(request_info, request_info.graph_walk)
         windowed = "ar_schedule" in st
         window_index = local = None
@@ -2523,32 +2495,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return
         outputs["latents"] = [new_latents]
         outputs.update(self._solver_edges(solver))
-
-    def check_stop(self, request_id, request_info, outputs) -> set[str]:
-        """Stop this request's denoise loop once it has run its own step count.
-
-        The loop is built with a fixed upper-bound iteration count
-        (``config.max_inference_steps``); each request runs only as many steps as
-        its scheduler holds (e.g. image 50, video 35, action 30, distilled policy
-        ~4), which can differ between concurrent requests. Runs on the worker's
-        slow-postprocess path, so reading the per-request step count is fine. The
-        one extra step the loop dispatches before this stop takes effect is
-        vetoed by prepare_inputs (the forwards also guard it for direct
-        callers, e.g. tests)."""
-        st = self.request_states.get(request_id)
-        if st is None:
-            return set()
-        loop = DENOISE_LOOP_FOR_WALK.get(request_info.graph_walk, IMAGE_GEN_LOOP)
-        iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
-        # Windowed requests run every window's iterations in one loop; others
-        # stop at their scheduler's step count.
-        total = (
-            st["ar_total_iters"] if "ar_schedule" in st
-            else len(st["scheduler"].timesteps)
-        )
-        if iter_idx + 1 >= total:
-            return {loop}
-        return set()
 
 
 class Cosmos3VAEEncoderSubmodule(NodeSubmodule):

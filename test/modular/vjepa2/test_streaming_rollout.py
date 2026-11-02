@@ -282,7 +282,7 @@ def test_the_plan_is_the_routed_walk_and_needs_the_video(model_factory):
         dims=[1], dtype="float32", nbytes=0, address=0, stride=[], uuid=0, source_session_id="", source_entity="",
     )]}
     [step] = m.walk_plan("default", ["video"], ["video"], frames, {"rollout_horizon": 4})
-    assert step.walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT and dict(step.step_metadata) == {"rollout_horizon": 4}
+    assert step.walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT
     [step] = m.walk_plan("default", ["video"], ["video"], frames, {})
     assert step.walk == VJepa2Model.PREFILL_VIDEO and not step.step_metadata and not step.bind
     # every walk starts at the encoder: without frames the request could never finish

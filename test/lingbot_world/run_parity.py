@@ -78,9 +78,7 @@ def frame_stats(ours: torch.Tensor, ref: torch.Tensor) -> dict:
 
 def mismatches(report, path: str = "") -> list[str]:
     """Every point of ``report`` that differs from the reference: every flag
-    must be true, except that the rollout stops on its last chunk only."""
-    if path == ".check_stop_flags":
-        return [] if report == [False] * (len(report) - 1) + [True] else [path]
+    must be true."""
     if isinstance(report, bool):
         return [] if report else [path]
     if isinstance(report, dict):
@@ -117,13 +115,13 @@ def rollout(sub, text_embeds, image, camera_poses, intrinsics, md: dict, rid: in
     inputs = {"text_embeds_pos": [text_embeds], "image_inputs": [image],
               "camera_poses": [camera_poses], "intrinsics": [intrinsics], "clock": []}
     latents, pixels, conditions, frames, times = [], [], [], [], []
-    stops = []
     encode = submodules.encode_condition_chunk
     if condition is not None:
         submodules.encode_condition_chunk = (
             lambda vae, image, cache, first, n, cfg: condition[:, first:first + n].to(image.device))
     try:
-        for k in range(md["num_chunks"]):
+        for k in range(md["num_latent_frames"] // sub.config.chunk_size):
+            info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = k
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             out = drive(sub, "rollout", info, inputs)
@@ -134,17 +132,13 @@ def rollout(sub, text_embeds, image, camera_poses, intrinsics, md: dict, rid: in
             pixels.append(st["chunk_pixels"].cpu())
             conditions.append(st["chunk_condition"].cpu())
             frames.append(out["video_output"][0].cpu())
-            info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = k
-            stops.append(bool(sub.check_stop(info.request_id, info, out)))
-            info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = k + 1
             inputs["clock"] = out["clock"]
     finally:
         submodules.encode_condition_chunk = encode
-    overshoot = sub.prepare_inputs(graph_walk="rollout", fwd_info=info, inputs=inputs)
     handle.remove()
     sub.cleanup_request(rid)
     return {"latents": latents, "pixels": pixels, "conditions": conditions, "frames": frames, "times": times,
-            "calls": calls, "stop_flags": stops, "overshoot_vetoed": overshoot is None}
+            "calls": calls}
 
 
 def main():
@@ -174,7 +168,7 @@ def main():
         camera_poses=poses, intrinsics=intr, num_frames=meta["frame_num_requested"],
     )
     lat_f = int(tensors["camera_poses"][0].shape[0])
-    md = {"guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // cs}
+    md = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
     image = tensors["image_inputs"][0]
     lat_h, lat_w = image.shape[1] // 8, image.shape[2] // 8
 
@@ -238,8 +232,6 @@ def main():
     tf_video = torch.cat(tf["pixels"], dim=2)[0]
     report["teacher_forced_video"] = frame_stats(tf_video, ref_video)
     report["teacher_forced_frames_per_chunk"] = [p.shape[2] for p in tf["pixels"]]
-    report["check_stop_flags"] = tf["stop_flags"]
-    report["overshoot_vetoed"] = tf["overshoot_vetoed"]
 
     # ---- decode only ------------------------------------------------------
     st = dit_sub.request_state(99)

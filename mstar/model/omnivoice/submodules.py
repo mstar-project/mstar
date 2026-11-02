@@ -198,17 +198,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             step_index = torch.zeros(1, dtype=torch.int64, device=device)
         else:
             step_index = inputs["step_index"][0]
-            k = _loop_step(fwd_info, step_index)
-            num_step = int(meta["num_step"])
-            if k >= num_step:
-                # Async scheduling dispatched an iteration past this request's
-                # stop. Veto it — None makes the engine skip the forward.
-                logger.info(
-                    "OmniVoice backbone: skipping async-overshoot iteration %d "
-                    "(request %s runs %d steps)",
-                    k, fwd_info.request_id, num_step,
-                )
-                return None
             tokens = inputs["audio_tokens"][0].to(device)
             target_len = tokens.shape[-1]
 
@@ -407,26 +396,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         rid = engine_inputs.request_ids[0]
         return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
-
-    # -- stop -------------------------------------------------------------
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        """End the loop after exactly this request's ``num_step`` iterations.
-
-        While iteration k is being postprocessed the counter still reads k, so
-        for N steps the stop must fire at ``k == N - 1``.  ``>=`` keeps it
-        firing if async scheduling has already advanced the deferred count.
-        """
-        iter_idx = request_info.dynamic_loop_iter_counts.get(UNMASK_LOOP_NAME, 0)
-        requested = int(request_info.step_metadata.get("num_step", 0) or 0)
-        if requested > 0 and iter_idx + 1 >= requested:
-            return {UNMASK_LOOP_NAME}
-        return set()
 
 
 # ---------------------------------------------------------------------------

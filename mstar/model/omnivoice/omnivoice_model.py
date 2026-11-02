@@ -161,12 +161,9 @@ class OmniVoiceModel(Model):
                     GraphEdge(next_node="backbone", name="audio_tokens"),
                     GraphEdge(next_node="backbone", name="step_index"),
                 ],
-                # Async scheduling may dispatch an iteration past the stop;
-                # OmniVoiceBackboneSubmodule.prepare_inputs vetoes the
-                # overshoot by returning None.
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; the request's own num_step stops the loop early.
+            # Ceiling only; each request's num_step is the loop's cap.
             max_iters=self.config.generation.max_num_step,
             outputs=[
                 # Matched by name against the section's loop-back edges: the
@@ -434,6 +431,13 @@ class OmniVoiceModel(Model):
         self._codec_hop = int(cfg.hop_length)
         return self._codec_hop
 
+    def _num_step(self, model_kwargs: dict) -> int:
+        defaults = self.config.generation
+        return max(1, min(int(model_kwargs.get("num_step", defaults.num_step)), defaults.max_num_step))
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {UNMASK_LOOP_NAME: self._num_step(model_kwargs)}
+
     def walk_plan(
         self,
         partition_name: str,
@@ -458,7 +462,7 @@ class OmniVoiceModel(Model):
 
         defaults = self.config.generation
         requested_steps = int(model_kwargs.get("num_step", defaults.num_step))
-        num_step = max(1, min(requested_steps, defaults.max_num_step))
+        num_step = self._num_step(model_kwargs)
         if num_step != requested_steps:
             logger.info(
                 "Clamped num_step from %d to %d (max_num_step=%d)",

@@ -205,6 +205,14 @@ class LingBotWorldModel(Model):
         lat_f = (num_frames - 1) // cfg.vae_stride[0] + 1
         return lat_f - lat_f % cfg.chunk_size
 
+    def _latent_frames(self, model_kwargs: dict) -> int:
+        num_poses = len(model_kwargs["camera_poses"])
+        return self.num_latent_frames(int(model_kwargs.get("num_frames", num_poses)), num_poses)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # one rollout iteration per chunk of latent frames; process_prompt refused a request without poses
+        return {ROLLOUT_LOOP_NAME: self._latent_frames(model_kwargs) // self.config.chunk_size}
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
@@ -240,7 +248,7 @@ class LingBotWorldModel(Model):
             raise ValueError("LingBot-World camera_poses and intrinsics must be finite numbers.")
 
         num_frames = int(kwargs.get("num_frames", len(poses)))
-        lat_f = self.num_latent_frames(num_frames, len(poses))
+        lat_f = self._latent_frames(kwargs)
         if lat_f < cfg.chunk_size or lat_f > cfg.max_chunks * cfg.chunk_size:
             raise ValueError(f"LingBot-World rollout of {lat_f} latent frames is out of range.")
         num_poses = ((len(poses) - 1) // 4) * 4 + 1
@@ -313,7 +321,7 @@ class LingBotWorldModel(Model):
             if not input_signals.get(name):
                 raise ValueError(f"LingBot-World is missing its {name!r} input; process_prompt emits it.")
         lat_f = int(input_signals["camera_poses"][0].dims[0])
-        request = {"guidance_scale": 1.0, "num_latent_frames": lat_f, "num_chunks": lat_f // self.config.chunk_size}
+        request = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
         return [WalkStep(walk, step_metadata=request) for walk in (ENCODE_TEXT_WALK, ROLLOUT_WALK)]
 
     # ------------------------------------------------------------------

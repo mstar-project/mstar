@@ -99,8 +99,6 @@ class WaypointModel(Model):
     PRIME_WALK = PRIME_WALK
     ROLLOUT_WALK = ROLLOUT_WALK
 
-    # Referenced by ``WaypointDitSubmodule.check_stop`` via
-    # ``request_info.dynamic_loop_iter_counts[...]``.
     ROLLOUT_LOOP_NAME = ROLLOUT_LOOP_NAME
 
     def __init__(
@@ -245,13 +243,10 @@ class WaypointModel(Model):
         ])
 
         # rollout: one frame decoded and emitted per iteration, from a single
-        # node. The "clock" self loop-back carries no data (frame_pos and
-        # rollout_step live in host state); it only makes the dit a same-node
-        # speculation target (GraphNode.is_ready_for_speculation). Under
-        # enable_async_scheduling=True the worker can build iteration N+1
-        # before check_stop(N) registers the loop's finish signal; that
-        # overshoot is vetoed host-side in
-        # WaypointDitSubmodule.prepare_inputs before it can commit into the
+        # node. The "clock" self loop-back carries no data (frame_pos lives in
+        # host state); it only makes the dit a same-node speculation target
+        # (GraphNode.is_ready_for_speculation). The request's num_steps is the
+        # loop's cap, so the worker never speculates a frame past it into the
         # ring, which has no undo.
         rollout = Loop(
             name=ROLLOUT_LOOP_NAME,
@@ -264,8 +259,7 @@ class WaypointModel(Model):
                 ],
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; num_steps stops the loop early via
-            # WaypointDitSubmodule.check_stop.
+            # Ceiling only; each request's num_steps is the loop's cap.
             max_iters=self.config.max_frames,
             outputs=[],
             accumulated_outputs=[],
@@ -521,6 +515,9 @@ class WaypointModel(Model):
             )
         return requested
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {ROLLOUT_LOOP_NAME: self._resolve_num_steps(model_kwargs)}
+
     def walk_plan(
         self,
         partition_name: str,
@@ -531,10 +528,10 @@ class WaypointModel(Model):
     ) -> list[WalkStep]:
         """Prime the world from the seed clip, then roll it out.
 
-        Both walks read the controller streams at the dit. ``num_steps`` is
-        what ``check_stop`` counts the rollout loop against, and ``seed_hw``
-        (from the clip's ``[H, W, 3]`` or ``[T, H, W, 3]`` dims) is what the
-        encoder's ``cg_key_info`` reads; nothing else is per-request.
+        Both walks read the controller streams at the dit. ``seed_hw`` (from
+        the clip's ``[H, W, 3]`` or ``[T, H, W, 3]`` dims) is what the
+        encoder's ``cg_key_info`` reads; nothing else is per-request. The
+        rollout's length is the loop's cap (``get_loop_caps``).
         """
         del partition_name, input_modalities
         if output_modalities != ["video_frame"]:
@@ -552,10 +549,7 @@ class WaypointModel(Model):
         if not input_signals.get("image_inputs"):
             raise ValueError("Waypoint cannot start without its required seed clip.")
         dims = input_signals["image_inputs"][0].dims
-        request = {
-            "num_steps": self._resolve_num_steps(model_kwargs),
-            "seed_hw": (int(dims[-3]), int(dims[-2])),
-        }
+        request = {"seed_hw": (int(dims[-3]), int(dims[-2]))}
         return [WalkStep(walk, step_metadata=request) for walk in (PRIME_WALK, ROLLOUT_WALK)]
 
     # ------------------------------------------------------------------

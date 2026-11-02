@@ -99,6 +99,7 @@ from mstar.model.cosmos3.submodules import (
     ATTN,
     ATTN_GEN,
     COND_LABEL,
+    DENOISE_LOOP_FOR_WALK,
     IMAGE_GEN_LOOP,
     KV_CACHE,
     REASONER_DECODE_LOOP,
@@ -148,6 +149,10 @@ class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("action",)
+    # {denoise loop: iterations}, settled by process_prompt, which alone sees
+    # the output modality that picks the loop and its step count
+    DENOISE_CAP = "denoise_cap"
+    INTERNAL_KWARGS = (DENOISE_CAP,)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -353,7 +358,10 @@ class Cosmos3Model(Model):
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the reasoner's prefill emits the first of max_output_tokens, so its loop runs one fewer
-        return {REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+        return {
+            REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1),
+            **(model_kwargs.get(self.DENOISE_CAP) or {}),
+        }
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
@@ -482,9 +490,9 @@ class Cosmos3Model(Model):
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
         # threads the latents + the scheduler's state back to itself each iteration;
         # on the final iteration the latents route to the decoder. max_iters is an
-        # upper bound — each request stops the loop at its own denoise-step count
-        # (Cosmos3DiTSubmodule.check_stop), so one graph serves image and video
-        # (and any per-request num_inference_steps) without a rebuild.
+        # upper bound — each request caps the loop at its own denoise-step count
+        # (``_denoise_cap``), so one graph serves image and video (and any
+        # per-request num_inference_steps) without a rebuild.
         # image_gen and video_gen are the same denoise loop + VAE decode; they
         # differ only in the emitted modality (one frame vs an encoded clip), so
         # the request's output modality selects between them.
@@ -834,13 +842,15 @@ class Cosmos3Model(Model):
         # empty text field as None.
         if prompt is None:
             prompt = ""
+        p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+        cap = {self.DENOISE_CAP: self._denoise_cap(output_modalities, p)}
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
                 "text_inputs": [
                     torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)
                 ]
-            }, kwargs)
+            }, kwargs, cap)
         # Both the conditional (positive) and unconditional (negative) prompts are
         # tokenized up front; the denoiser reads the second only when guidance is
         # on. Image/video prompts get the chat template + resolution/duration
@@ -848,7 +858,6 @@ class Cosmos3Model(Model):
         from mstar.model.cosmos3.components.packing import tokenize_prompt
 
         negative_prompt = kwargs.get("negative_prompt")
-        p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
         # The chat system prompt and the resolution/duration metadata sentences
         # are opt-in, off by default: the model sees the bare user prompt, which
         # matches the reference serving pipeline (its system-prompt and
@@ -872,7 +881,7 @@ class Cosmos3Model(Model):
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
-        }, kwargs, {"kv_layout": {KV_CACHE: layout}})
+        }, kwargs, {"kv_layout": {KV_CACHE: layout}, **cap})
 
     def _gen_layout(
         self, p: dict, cond_ids: list[int], uncond_ids: list[int], input_modalities: list[str], tensors: dict,
@@ -1245,9 +1254,8 @@ class Cosmos3Model(Model):
             num_frames = int(mk.get("num_frames", default_frames))
         # The cookbook step counts differ per mode (image 50, video 35, action
         # 30 — configs override the action count per checkpoint); default by
-        # mode and let the request override. The denoise loop runs this many
-        # steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
-        # is only bounded above by the loop's static max_iters.
+        # mode and let the request override. The denoise loop's cap is this
+        # many steps (``_denoise_cap``), bounded above by its static max_iters.
         if action_mode is not None:
             default_steps = self.config.num_inference_steps_action
         elif num_frames > 1:
@@ -1599,21 +1607,32 @@ class Cosmos3Model(Model):
             prefill = self.PREFILL_COND_WALK
         else:
             prefill = self.PREFILL_WALK
-        # The denoise walk: forward-dynamics runs the joint denoise but decodes
-        # the predicted video; inverse-dynamics / policy emit the action; image
-        # and video share the loop but differ in what the VAE node emits.
+        denoise = self._denoise_walk(output_modalities, params)
+        return [WalkStep(prefill, step_metadata=params), WalkStep(denoise, step_metadata=params)]
+
+    def _denoise_walk(self, output_modalities: list[str], params: dict) -> str:
+        """Forward-dynamics runs the joint denoise but decodes the predicted
+        video; inverse-dynamics / policy emit the action; image and video share
+        the loop but differ in what the VAE node emits."""
         is_video = "video" in output_modalities
         if params.get("action_mode") == "forward_dynamics":
-            denoise = self.ACTION_VIDEO_GEN_WALK
-        elif "action" in output_modalities:
-            denoise = self.ACTION_GEN_WALK
-        elif is_video and params.get("window_mode"):
-            denoise = self.VIDEO_GEN_AR_WALK
-        elif is_video and params.get("generate_sound"):
-            denoise = self.VIDEO_SOUND_GEN_WALK
-        else:
-            denoise = self.VIDEO_GEN_WALK if is_video else self.IMAGE_GEN_WALK
-        return [WalkStep(prefill, step_metadata=params), WalkStep(denoise, step_metadata=params)]
+            return self.ACTION_VIDEO_GEN_WALK
+        if "action" in output_modalities:
+            return self.ACTION_GEN_WALK
+        if is_video and params.get("window_mode"):
+            return self.VIDEO_GEN_AR_WALK
+        if is_video and params.get("generate_sound"):
+            return self.VIDEO_SOUND_GEN_WALK
+        return self.VIDEO_GEN_WALK if is_video else self.IMAGE_GEN_WALK
+
+    def _denoise_cap(self, output_modalities: list[str], params: dict) -> dict[str, int]:
+        """The request's denoise loop and its iterations: one per scheduler step,
+        and for a windowed request every window's, plus a commit per kv window."""
+        iters = params["num_inference_steps"]
+        if params.get("window_mode") is not None:
+            iters = params["num_windows"] * (iters + 1 if params["window_mode"] == "kv" else iters)
+        walk = self._denoise_walk(output_modalities, params)
+        return {DENOISE_LOOP_FOR_WALK.get(walk, IMAGE_GEN_LOOP): iters}
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

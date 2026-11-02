@@ -80,8 +80,7 @@ class VJepa2Config:
 
     # Rollout.  ``max_rollout_horizon`` caps the Loop's
     # ``max_iters`` at graph-build time; per-request ``rollout_horizon`` is
-    # enforced by early-exit (``check_stop``) from inside the
-    # rollout submodule.
+    # the loop's cap (``VJepa2Model.get_loop_caps``).
     max_rollout_horizon: int = 16
     # AnticipativeWrapper-parity rollout geometry.  Per-request tuning is a
     # later extension — for now these are set once from config and baked

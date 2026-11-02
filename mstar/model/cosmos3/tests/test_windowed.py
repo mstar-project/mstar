@@ -29,7 +29,6 @@ from mstar.model.cosmos3.submodules import (
     COND_LABEL,
     KV_CACHE,
     UNCOND_LABEL,
-    VIDEO_GEN_AR_LOOP,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderARSubmodule,
 )
@@ -151,24 +150,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     assert plain.get_partition_topology().connections == []
 
 
-def test_windowed_check_stop_counts_all_windows() -> None:
-    """The AR loop stops at num_windows x iterations, not at one scheduler's
-    length."""
-    sub = _dit()
-    st = sub.request_state("r")
-    st.add_all(
-        ar_schedule=WindowSchedule(48, 8, overlap_units=1),
-        ar_total_iters=7 * 5,
-        scheduler=SimpleNamespace(timesteps=list(range(5))),
-    )
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 4})
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 33
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 34
-    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
-
-
 def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
     """The last step of a window emits the window's latents on the streaming
     edge, stages the next window (fresh noise, the head built from the
@@ -277,7 +258,7 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
 def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     """A kv request runs steps + 1 loop iterations per window (the +1 is the
     commit pass); the prefill records the pacing, the schedule and the
-    per-unit token stride, and check_stop fires after the final commit."""
+    per-unit token stride."""
     sub = _dit()
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(()))
     md = {
@@ -294,11 +275,6 @@ def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     assert st["ar_tokens_per_unit"] == 4
     assert st["ar_schedule"].context_units == 6
     assert sub._window_step(st, 4) == (0, 4, True) and sub._window_step(st, 7) == (1, 2, False)
-
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 13})
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 14
-    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
 
 
 def test_windowed_kv_statics_absolute_positions() -> None:
@@ -397,9 +373,6 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     assert ni2.input_seq_len == 4 * stride and not ni2.resource_step_info.commit
     step2 = sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni2]).steps[KV_CACHE]
     assert not step2.commit and step2.retention == {}
-    # Past the last iteration the loop's extra dispatch is vetoed.
-    counts["video_gen_ar_loop"] = 15
-    assert sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0]}) is None
 
     # Window 0 commit forward, driven through forward() so the step's
     # resources reach it: the full window appended under the combined label

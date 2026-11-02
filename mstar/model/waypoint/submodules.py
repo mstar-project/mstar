@@ -1,4 +1,3 @@
-import logging
 
 import torch
 
@@ -19,8 +18,6 @@ from mstar.model.waypoint.components.taehv import (
     validate_taehv_architecture,
 )
 from mstar.model.waypoint.config import WaypointConfig
-
-logger = logging.getLogger(__name__)
 
 PRIME_WALK = "prime"
 ROLLOUT_WALK = "rollout"
@@ -179,21 +176,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         # The clock is per request and lives on the host
         state = self.request_state(fwd_info.rid_handle)
 
-        if graph_walk == ROLLOUT_WALK:
-            requested = int(fwd_info.step_metadata.get("num_steps", 0) or 0)
-            rollout_step = int(state.get("rollout_step", 0))
-            if requested and rollout_step >= requested:
-                # Async scheduling can dispatch iteration N+1 before
-                # check_stop(N) registers the loop's finish signal. Veto here,
-                # before any tensor work: None skips the forward, so the
-                # overshoot never commits a frame into the ring.
-                logger.info(
-                    "Waypoint dit: skipping async-overshoot rollout step %d "
-                    "(request %s runs %d steps)",
-                    rollout_step, fwd_info.request_id, requested,
-                )
-                return None
-
         frame_pos = int(state.get("frame_pos", 0))
 
         if graph_walk == PRIME_WALK:
@@ -201,7 +183,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
             # client's action zero.
             mouse, button, scroll = self._idle_controller(device, dtype)
         else:
-            action_index = int(state.get("rollout_step", 0))
+            # the loop's cap (num_steps) ends the rollout, so this stays in range
+            action_index = int(fwd_info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
             mouse, button, scroll = self._controller_slice(
                 inputs, action_index, device, dtype
             )
@@ -569,11 +552,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         same fixed-address tensors ``prepare_inputs`` reads back next call --
         neither syncs.
         """
-        del inputs, kwargs
+        del request_info, inputs, kwargs
         state = self.request_state(request_id)
         state.add("frame_pos", int(state.get("frame_pos", 0)) + 1)
-        if request_info.graph_walk == ROLLOUT_WALK:
-            state.add("rollout_step", int(state.get("rollout_step", 0)) + 1)
         for idx in range(9):
             key = f"{DECODER_HISTORY_PREFIX}{idx}"
             values = outputs.get(key)
@@ -584,28 +565,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
                 state.add(key, values[0].clone())
             else:
                 target.copy_(values[0])
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        """Stop the rollout loop after exactly ``num_steps`` iterations.
-
-        Iteration k (0-based) is still being postprocessed when the loop
-        counter reads k, so N frames means firing at ``k + 1 >= N``. Under
-        async scheduling an overshoot iteration this signal is too late to
-        stop is vetoed instead in ``prepare_inputs``.
-        """
-        del request_id, outputs
-        if request_info.graph_walk != ROLLOUT_WALK:
-            return set()
-        iter_idx = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)
-        requested = int(request_info.step_metadata.get("num_steps", 0) or 0)
-        if requested > 0 and iter_idx + 1 >= requested:
-            return {ROLLOUT_LOOP_NAME}
-        return set()
 
     def cleanup_request(self, request_id: str):
         """Drop the request's clock. The ring itself is released by the
