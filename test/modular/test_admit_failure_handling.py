@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -27,6 +28,7 @@ import torch
 from test_micro_scheduler import MIXED, _combined_scheduler, _Engine, _Manager, _next_batch, _scheduler
 from test_micro_scheduler import NODE as SCHED_NODE
 from test_micro_scheduler import WALK as SCHED_WALK
+from test_micro_scheduler import _batch as _sched_batch
 
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import (
@@ -37,6 +39,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.submodule_base import NodeSubmodule, StepOrder
 from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -211,7 +214,8 @@ class _HoldingWorker:
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.scheduler = SimpleNamespace(
-            hold_requests=lambda rids: None, **_NO_LIMITS,
+            hold_requests=lambda rids: None,
+            **_NO_LIMITS,
         )
         self._hold_logged = {}
         # not a sharded node, so this rank runs its own OOM recovery
@@ -225,9 +229,9 @@ class _HoldingWorker:
     def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
         del in_flight_rids
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
+    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
         # no victim
-        del node_name, batch_ids, affected_resources, inside_only
+        del node_name, graph_walk, batch_ids, affected_resources, inside_only
 
 
 def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
@@ -270,7 +274,10 @@ class _RefusedWorker(_HoldingWorker):
     def __init__(self):
         super().__init__()
         self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend, **_NO_LIMITS)
+        self.scheduler = SimpleNamespace(
+            hold_requests=self.held.extend,
+            **_NO_LIMITS,
+        )
 
 
 @pytest.mark.parametrize(
@@ -464,16 +471,20 @@ def test_a_mixed_step_held_under_its_cap_by_row_caps_is_limited():
 
 
 class _EvictingWorker(_HoldingWorker):
-    """The real victim search, over requests ``holders`` that hold pages."""
+    """The real victim search, over requests ``holders`` that hold pages and
+    ran a step each in that order."""
 
     _try_offload_cold_request = Worker._try_offload_cold_request
     _select_eviction_victim = Worker._select_eviction_victim
 
-    def __init__(self, holders):
+    def __init__(self, holders, sched=None):
         super().__init__()
         self.offloaded: list[str] = []
-        self.eviction_policy = SimpleNamespace(value="lru")
-        self._last_active = {(rid, SCHED_NODE): float(i) for i, rid in enumerate(holders)}
+        self.eviction_policy = SimpleNamespace(value="last_in_line")
+        self.scheduler = sched or _scheduler(_SchedEngine())
+        for rid in holders:
+            self.scheduler.note_arrival(rid)
+            self.scheduler.note_ran(_sched_batch([rid]))
         engine = SimpleNamespace(
             evictable=lambda node: True,
             is_offloaded=lambda node, rid: rid in self.offloaded,
@@ -494,8 +505,7 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
     usable, row = 191, 12
     sched = _scheduler(_SchedEngine(max_bs=16))
     manager = _Manager([f"p{i}" for i in range(48)])
-    worker = _EvictingWorker(holders=[f"d{i}" for i in range(4)])
-    worker.scheduler = sched
+    worker = _EvictingWorker([f"d{i}" for i in range(4)], sched)
     worker._graph_runtime = manager.runtime
     sizes = []
     for _ in range(8):
@@ -530,16 +540,84 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
 def test_a_batch_too_big_alone_still_evicts_its_own_rows():
     """Running requests that outgrow the pool together: evicting one of
     them is what lets the rest step, as before."""
-    # the request outside the batch is the least recently run
-    worker = _EvictingWorker(holders=["outside", "r0", "r1"])
-    worker.scheduler = SimpleNamespace(hold_requests=lambda rids: None, **_NO_LIMITS)
+    # the request outside the batch arrived first, and it isn't asked about
+    worker = _EvictingWorker(["outside", "r0", "r1"])
+    worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
     batch, node_batch = _batches(_sized_refusal("r1", rows_fit=1, rows_fit_alone=1))
     node_batch.failed_resource = "kv"
     batch.node_name = node_batch.node_name = SCHED_NODE
 
     worker._handle_allocation_failure(batch, node_batch)
 
-    assert worker.offloaded == ["r0"], "an outside request was evicted for a batch it cannot help"
+    assert worker.offloaded == ["r1"], "an outside request was evicted for a batch it cannot help"
+
+
+@pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "r3"), (StepOrder.ARRIVAL, "r2")])
+def test_a_refused_step_offloads_the_row_last_in_its_line(order, victim):
+    """A step of r4 is refused, and r0 to r3 hold pages, r0 having run first.
+    While rows take turns r0 runs right after the retry, so offloading it only
+    makes it reload, and r3's next turn is the furthest away. Under ARRIVAL r3
+    holds the step, then r0 to r2 by arrival."""
+    worker = _EvictingWorker([f"r{i}" for i in range(4)], _scheduler(_SchedEngine(order=order)))
+    worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
+    batch = _sched_batch(["r4"])
+    node_batch = SimpleNamespace(node_name=SCHED_NODE, failed_resource="kv", admit_error=_alloc_failed("r4"))
+
+    worker._handle_allocation_failure(batch, node_batch)
+
+    assert worker.offloaded == [victim]
+
+
+@pytest.mark.parametrize("order, victim", [(StepOrder.TURNS, "ran"), (StepOrder.ARRIVAL, "never_ran")])
+def test_a_row_that_never_ran_at_the_key_takes_its_place_in_line(order, victim):
+    """Its pages came some other way (a KV retrieve from another worker):
+    under TURNS it is first in line, and under ARRIVAL behind the row holding
+    the step."""
+    worker = _EvictingWorker(["ran"], _scheduler(_SchedEngine(order=order)))
+    worker.scheduler.note_arrival("never_ran")
+    holders = {"ran", "never_ran"}
+    worker.engine_manager.get_engine(SCHED_NODE).reclaimable = lambda node, rid, resources: rid in holders
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == victim
+
+
+def _decode_waiters(order, ran):
+    """The worker's eviction over ``ran``'s steps: (rid, walk), oldest first,
+    with every rid holding pages. Prefill and decode are separate keys here."""
+    worker = _EvictingWorker([], _scheduler(_SchedEngine(order=order)))
+    holders = list(dict.fromkeys(rid for rid, _ in ran))
+    for rid in holders:
+        worker.scheduler.note_arrival(rid)
+    for rid, walk in ran:
+        worker.scheduler.note_ran(_sched_batch([rid], walk=walk))
+    worker.engine_manager.get_engine(SCHED_NODE).reclaimable = lambda node, rid, resources: rid in holders
+    return worker
+
+
+def test_under_arrival_the_row_that_prefilled_first_is_next_and_not_the_victim():
+    """Two prefilled rows wait for decode. p0's stamp is the oldest here, but
+    it is next in line for decode; p1 waits behind it."""
+    worker = _decode_waiters(StepOrder.ARRIVAL, [("p0", "prefill"), ("p1", "prefill")])
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "p1"
+
+
+def test_under_turns_a_row_new_to_decode_is_first_in_its_line_and_not_the_victim():
+    """p prefilled on its own walk after d0 and d1 decoded, so it has the
+    newest stamp at the node, but it has yet to decode: it leads the decode
+    line, and d1, which decoded last, is furthest from another step."""
+    worker = _decode_waiters(
+        StepOrder.TURNS, [("d0", SCHED_WALK), ("d1", SCHED_WALK), ("p", "prefill")],
+    )
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "d1"
+
+
+def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
+    worker = _EvictingWorker(["outside", "r0", "r1"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "outside"
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
 
 
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
@@ -616,12 +694,16 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
 class _FakeMgmt:
     """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
 
-    def __init__(self, submodule, num_slots: int, next_slot: int, seen: list):
+    def __init__(
+        self, submodule, num_slots: int, next_slot: int, seen: list,
+        slot_raise_at: int | None = None,
+    ):
         self.submodule = submodule
         self.num_slots = num_slots
         self.needs_slot_fence = False
         self._next_slot = next_slot
         self._seen = seen
+        self._slot_raise_at = slot_raise_at
 
     @property
     def next_slot(self) -> int:
@@ -634,6 +716,8 @@ class _FakeMgmt:
 
     def set_piecewise_slot(self, slot: int) -> None:
         self._seen.append(slot)
+        if len(self._seen) == self._slot_raise_at:
+            raise RuntimeError("slot setup failed")
 
 
 class _FakeExecEngine:
@@ -644,9 +728,13 @@ class _FakeExecEngine:
 
     def __init__(
         self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
+        raise_on: str | tuple[str, ...] = (), collect_raise_on: str | None = None,
+        slot_raise_at: int | None = None,
     ):
         self._enable_nvtx = False
         self._fail_on = fail_on
+        self._raise_on = {raise_on} if isinstance(raise_on, str) else set(raise_on)
+        self._collect_raise_on = collect_raise_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
         # which rids were driven with `set_launch` — the real path signals
@@ -658,7 +746,9 @@ class _FakeExecEngine:
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
-        self.mgmt = _FakeMgmt(self, num_slots, next_slot, self.piecewise_slots)
+        self.mgmt = _FakeMgmt(
+            self, num_slots, next_slot, self.piecewise_slots, slot_raise_at=slot_raise_at,
+        )
         self._submodules = {"node": self.mgmt}
 
     # --- submodule surface
@@ -696,12 +786,17 @@ class _FakeExecEngine:
             # stands in for `_forward` releasing `launch_started_event`
             self.launch_signals.append(rid)
             self.events.append(("launch", rid))
-        self.events.append(("run", rid))
         self.run_slots.append(ctx.slot)
+        if rid in self._raise_on:
+            self.events.append(("raise", rid))
+            raise RuntimeError(f"forward failed for {rid}")
+        self.events.append(("run", rid))
         return {rid: {"token": 1}}, step
 
     def _collect_outputs(self, *a, **kw):
         del a
+        if kw["request_ids"][0] == self._collect_raise_on:
+            raise RuntimeError("collect failed")
         return dict(kw["request_ids"] and {kw["request_ids"][0]: {"token": 1}})
 
 
@@ -834,8 +929,7 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
     sched = _scheduler(_SchedEngine(max_bs=16))
     rids_all = [f"r{i}" for i in range(48)]
     manager = _Manager(rids_all)
-    worker = _EvictingWorker(holders=rids_all)
-    worker.scheduler = sched
+    worker = _EvictingWorker(rids_all, sched)
     worker._graph_runtime = manager.runtime
     sizes = []
     for _ in range(8):
@@ -851,3 +945,123 @@ def test_a_batch_too_big_alone_that_evicts_its_own_row_is_capped():
 
     assert sizes == [16, alone], f"batch sizes {sizes}, {len(worker.offloaded)} rows offloaded"
     assert len(worker.offloaded) == 1
+
+
+# --- a forward that raises fails only its own rid --------------------------
+
+
+@pytest.mark.parametrize("engine_kwargs, failed", [
+    ({"collect_raise_on": "b"}, {"b"}),  # past commit, collecting its outputs
+    ({"raise_on": ("a", "b", "c")}, {"a", "b", "c"}),
+], ids=["collect", "every_forward"])
+def test_per_request_fails_only_the_rids_that_raised(engine_kwargs, failed):
+    """The rest of the unbatchable batch still runs, and the plan thread is released."""
+    engine = _FakeExecEngine(**engine_kwargs)
+    batch = _exec_batch(["a", "b", "c"])
+
+    out = engine._exec_per_request(batch)
+
+    assert out.per_rid_outputs == {rid: {} if rid in failed else {"token": 1} for rid in "abc"}
+    assert set(batch.failed_requests) == failed
+    assert batch.commit_done.is_set()
+
+
+class _FakeEvent:
+    """A slot fence event that logs which slot it was recorded after and
+    when it is waited on."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self.slot = None
+
+    def record(self):
+        self.slot = self._engine.piecewise_slots[-1]
+        self._engine.events.append(("record", self.slot))
+
+    def synchronize(self):
+        self._engine.events.append(("sync", self.slot))
+
+
+class _LoggedEvent(threading.Event):
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+
+    def set(self):
+        self._events.append(("commit_done", ""))
+        super().set()
+
+
+def _fenced(monkeypatch, **kwargs) -> _FakeExecEngine:
+    engine = _FakeExecEngine(**kwargs)
+    engine.mgmt.needs_slot_fence = True
+    engine.device_capability = SimpleNamespace(
+        is_accelerator=True, is_capturing=lambda: False,
+    )
+    monkeypatch.setattr(torch, "Event", lambda device=None: _FakeEvent(engine))
+    return engine
+
+
+def test_a_raising_rids_slot_is_still_fenced(monkeypatch):
+    """A raising rid's slot is fenced like a finished rid's: d reuses b's slot
+    only after waiting on it, and ``next_slot`` drains before the plan thread
+    is released."""
+    engine = _fenced(monkeypatch, raise_on="b", num_slots=2, next_slot=1)
+    batch = _exec_batch(["a", "b", "c", "d"], slot=0)
+    batch.commit_done = _LoggedEvent(engine.events)
+
+    engine._exec_per_request(batch)
+
+    assert engine.run_slots == [0, 1, 0, 1]
+    assert [e for e in engine.events if e[0] in ("run", "raise", "record", "sync", "commit_done")] == [
+        ("run", "a"), ("record", 0),
+        ("raise", "b"), ("record", 1),
+        ("sync", 0), ("run", "c"), ("record", 0),
+        ("sync", 1), ("run", "d"), ("record", 1),
+        # the counter ends on slot 0, c's
+        ("sync", 0), ("commit_done", ""),
+    ]
+    assert set(batch.failed_requests) == {"b"}
+
+
+def test_per_request_drains_and_releases_when_the_loop_itself_raises(monkeypatch):
+    """A raise outside the per-rid try (setting b's slot) fails the batch, and
+    still drains ``next_slot`` (a's) before releasing the plan thread."""
+    # two declare-loop calls, then a's slot, then b's raises
+    engine = _fenced(monkeypatch, num_slots=2, next_slot=1, slot_raise_at=4)
+    batch = _exec_batch(["a", "b"], slot=0)
+    batch.commit_done = _LoggedEvent(engine.events)
+
+    with pytest.raises(RuntimeError, match="slot setup failed"):
+        engine._exec_per_request(batch)
+
+    assert [e for e in engine.events if e[0] in ("run", "record", "sync", "commit_done")] == [
+        ("run", "a"), ("record", 0), ("sync", 0), ("commit_done", ""),
+    ]
+    assert not batch.failed_requests  # the worker fails the whole batch
+
+
+class _TailSubmodule:
+    batch_postprocess = NodeSubmodule.batch_postprocess
+
+    def __init__(self):
+        self.postprocessed: list[str] = []
+
+    def postprocess(self, request_id, request_info, outputs, inputs):
+        del request_info, inputs
+        self.postprocessed.append(request_id)
+        outputs["token"]  # an empty output can't be finished
+
+
+def test_postprocess_skips_a_rid_whose_forward_raised():
+    """The tail must not run over a failed rid's empty outputs: it would raise
+    again and replace the forward's error with its own."""
+    submodule = _TailSubmodule()
+    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(submodule=submodule)})
+    batch = _exec_batch(["a", "b"])
+    batch.register_failure("b", ValueError("forward failed for b"))
+
+    Engine._postprocess_batch(engine, batch, {"a": {"token": 1}, "b": {}})
+
+    assert submodule.postprocessed == ["a"]
+    assert batch.failed_requests == {"b": "ValueError: forward failed for b"}

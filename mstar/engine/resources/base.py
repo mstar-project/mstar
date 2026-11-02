@@ -73,6 +73,9 @@ class EngineResourceInfo:
     max_rows_in_combined: "Mapping[str, int | None]" = field(
         default_factory=dict
     )
+    # the prefix caches this engine opens (`opening_prefix_caches`), decided
+    # before any resource is built, for one that sizes itself by its own
+    prefix_caches: frozenset[str] = frozenset()
 
     @property
     def head_shards(self) -> int:
@@ -128,13 +131,14 @@ class Resource(ABC):
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
-        """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened."""
-        return False
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
+        """Open whatever this resource keeps across requests, under ``root``. The
+        engine calls it, before any request, on the caches `opening_prefix_caches` opens."""
+        return
 
     def close_prefix_cache(self) -> None:
-        """Undo `enable_prefix_cache`. Called before any request."""
+        """Keep nothing across requests. The engine calls it, before any
+        request, on every other resource."""
         return
 
     def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
@@ -211,6 +215,17 @@ class Resource(ABC):
         """How many page allocations this resource has made and a hash of their pages in
         order, for a TP follower to check against rank 0's. None where it keeps no trail."""
         return None
+
+    @classmethod
+    def journals_resident_moves(cls) -> bool:
+        """Whether rank 0 decides this resource's state for the other ranks of a lockstep
+        instance outside the step that uses it (eviction, prefix leases, page trails). They
+        replay each decision with the next step of the node it was journaled under, so
+        validation refuses lockstep nodes on one worker sharing such a resource. Asked of
+        the class a spec's ``resource_class`` names, so the hooks live there, not only on
+        a subclass its ``build`` returns."""
+        return any(getattr(cls, hook) is not getattr(Resource, hook)
+                   for hook in ("supports_eviction", "lease_cached_prefix", "page_trail"))
 
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
@@ -301,6 +316,11 @@ class Resource(ABC):
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """record step consumption"""
         return
+
+    def step_host_rows(self) -> dict[str, torch.Tensor]:
+        """Row-addressed tensors of the step just run, copied to the host with
+        the stop buffers. Read right after the forward and not cloned."""
+        return {}
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None

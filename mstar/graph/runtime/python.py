@@ -1,5 +1,7 @@
 import logging
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors, ResultTokens
 from mstar.communication.communicator import BaseCommunicator
@@ -10,6 +12,7 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
+    Loop,
     NodeAndGraphWalk,
     TensorPointerInfo,
 )
@@ -39,6 +42,7 @@ from mstar.graph.special_destinations import (
     SPECIAL_DESTINATIONS,
 )
 from mstar.model.base import WorkerGraph
+from mstar.model.submodule_base import StopLimits, StopPolicy
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -55,6 +59,9 @@ from mstar.worker.node_manager_utils import (
 )
 from mstar.worker.rid_table import RidTable
 
+if TYPE_CHECKING:
+    import torch
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +69,7 @@ logger = logging.getLogger(__name__)
 class GraphRuntimePartitionInfo:
     graph_walk: str
     graph_walk_worker_graph_ids: list[int] = field(default_factory=list) # for this worker
-    stream_partition_done: bool = False  # set True when last chunk pops with is_final
+    partition_done: bool = False  # see GraphRuntime.mark_partition_done
 
 @dataclass
 class _SpecRidPrep:
@@ -90,6 +97,8 @@ class CompletionState:
     nested_loop_indices: dict[int, NestedLoopIndices]
     # (rid, signal, modality, value) of each emit that rides inline
     emit_inline: list[tuple[int, str, str, int]] = field(default_factory=list)
+    # rid -> the log-prob its client emits carry (``RouteInput.logprobs``)
+    logprobs: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -113,6 +122,9 @@ class GraphRuntimeRequestInfo:
     # stream edge -> destination worker -> items sent, local ones included
     pending_stream_items: dict[str, dict[str, int]] = field(default_factory=dict)
     current_output_chunks: list[str] = field(default_factory=list)
+    # (node, walk) -> loop -> this request's limits under its declared stop
+    # policies (``register_stop_limits``)
+    stop_limits: dict[tuple[str, str], dict[str, StopLimits]] = field(default_factory=dict)
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -163,6 +175,8 @@ class PythonGraphRuntime(GraphRuntime):
 
         # Loop stops from this iteration's check_stop; cleared every iteration.
         self._pending_loop_stops: set[PendingLoopStop] = set()
+        # (node, walk) -> its declared stop policies, per loop
+        self._stop_policies: dict[tuple[str, str], dict[str, StopPolicy]] = {}
 
         # Routing parked between complete_and_route_batch and send_outputs.
         self._completions: dict[int, CompletionState] = {}
@@ -370,14 +384,57 @@ class PythonGraphRuntime(GraphRuntime):
         self, request_ids: list[int],
         partition: str,
     ) -> ParallelList[int, dict[str, int]]:
-        values = []
-        for rid in request_ids:
-            iter_counts: dict[str, int] = {}
-            part_info = self._request_info[rid].partition_info[partition]
-            for wg_id in part_info.graph_walk_worker_graph_ids:
-                iter_counts.update(self._queues[wg_id].get_dynamic_loop_iters(rid))
-            values.append(iter_counts)
-        return ParallelList(list(request_ids), values)
+        return ParallelList(
+            list(request_ids), [self._loop_counts(rid, partition) for rid in request_ids],
+        )
+
+    def _loop_counts(self, rid: int, partition: str) -> dict[str, int]:
+        """``rid``'s loop counts in ``partition``; the last worker graph with
+        a loop has its count."""
+        iter_counts: dict[str, int] = {}
+        part_info = self._request_info[rid].partition_info[partition]
+        for wg_id in part_info.graph_walk_worker_graph_ids:
+            iter_counts.update(self._queues[wg_id].get_dynamic_loop_iters(rid))
+        return iter_counts
+
+    def set_stop_policies(
+        self, node_name: str, graph_walk: str, policies: Mapping[str, StopPolicy],
+    ) -> None:
+        self._stop_policies[(node_name, graph_walk)] = dict(policies)
+
+    def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
+        limits = self._request_info[rid].stop_limits
+        for key, policies in self._stop_policies.items():
+            limits[key] = {loop: p.limits(info) for loop, p in policies.items()}
+
+    def check_stops(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int],
+        tokens: "torch.Tensor | None", row_rids: list[int],
+    ) -> dict[int, set[str]] | None:
+        policies = self._stop_policies[(node_name, graph_walk)]
+        stops: dict[int, set[str]] = {}
+        if not policies:
+            return stops
+        values = None if tokens is None else tokens.tolist()
+        row_of = {rid: i for i, rid in enumerate(row_rids)}
+        for rid in rids:
+            info = self._request_info.get(rid)
+            if info is None:
+                continue
+            token = None
+            if values is not None:
+                i = row_of.get(rid)
+                if i is None or i >= len(values):
+                    continue
+                token = values[i]
+            limits = info.stop_limits.get((node_name, graph_walk))
+            if limits is None:
+                return None
+            counts = self._loop_counts(rid, partition)
+            for loop, p in policies.items():
+                if p.stops(counts.get(loop, 0), token, limits[loop]):
+                    stops.setdefault(rid, set()).add(loop)
+        return stops
 
     def get_walk(self, rid: int, partition: str) -> str:
         return self._request_info[rid].partition_info[partition].graph_walk
@@ -450,10 +507,10 @@ class PythonGraphRuntime(GraphRuntime):
         # the caller.
         return FreedTensors.none()
 
-    def mark_stream_partition_done(self, rid: int, partition: str):
+    def mark_partition_done(self, rid: int, partition: str):
         info = self._request_info.get(rid)
         if info is not None and partition in info.partition_info:
-            info.partition_info[partition].stream_partition_done = True
+            info.partition_info[partition].partition_done = True
 
     def get_consumed_edges(
         self, source_node: str, dest_node: str, graph_walk: str,
@@ -688,19 +745,33 @@ class PythonGraphRuntime(GraphRuntime):
     def speculate_node(
         self, node_name: str,
         graph_walks: list[str],
-        sample_rids: list[int],
+        rids: list[int],
+        walk_counts: list[int] | None = None,
+        loop_strides: list[int] | None = None,
     ) -> list[SpeculationOutput]:
-        return [
-            target
-            for walk, rid in zip(graph_walks, sample_rids, strict=True)
-            for target in self._speculate_walk(node_name, walk, rid)
-        ]
+        if walk_counts is None:
+            walk_counts = [1] * len(graph_walks)
+        if len(walk_counts) != len(graph_walks) or sum(walk_counts) != len(rids):
+            raise ValueError(
+                "speculate_node: walk_counts must give each walk's share of rids"
+            )
+        out: list[SpeculationOutput] = []
+        start = 0
+        for walk, count in zip(graph_walks, walk_counts, strict=True):
+            out.extend(self._speculate_walk(
+                node_name, walk, rids[start:start + count],
+                None if loop_strides is None else loop_strides[start:start + count],
+            ))
+            start += count
+        return out
 
     def _speculate_walk(
-        self, node_name: str, graph_walk: str, sample_rid: int,
+        self, node_name: str, graph_walk: str, rids: list[int],
+        loop_strides: list[int] | None,
     ) -> list[SpeculationOutput]:
         wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
-        wgio = self._queues[wg_id].per_request_queues.get(sample_rid)
+        queues = self._queues[wg_id].per_request_queues
+        wgio = queues.get(rids[0]) if rids else None
         if wgio is None:
             return []
         node = wgio.nodes[node_name]
@@ -730,6 +801,15 @@ class PythonGraphRuntime(GraphRuntime):
                     and info.node_name == node_name
                 ):
                     continue
+            if info.is_new_loop_iter and not any(
+                (r_wgio := queues.get(r)) is not None
+                and self._can_continue_loop(
+                    r, r_wgio, info, graph_walk,
+                    1 if loop_strides is None else loop_strides[i],
+                )
+                for i, r in enumerate(rids)
+            ):
+                continue  # every row's loop ends with this iteration
             out.append(SpeculationOutput(
                 node_name=info.node_name, graph_walk=graph_walk,
                 is_new_loop_iter=info.is_new_loop_iter,
@@ -862,12 +942,17 @@ class PythonGraphRuntime(GraphRuntime):
         staged: list["_SpecRidPrep"] = []
         edges = ColumnarEdgeSpecs.empty()
 
+        strides = (
+            dict(zip(input.rids, input.loop_strides, strict=True))
+            if input.loop_strides is not None else None
+        )
         for rid, indexed_edges in per_rid_edges:
             wgio = queue.per_request_queues.get(rid)
             if wgio is None:
                 continue
             if spec_info is not None and not self._can_continue_loop(
-                rid, wgio, spec_info, input.graph_walk
+                rid, wgio, spec_info, input.graph_walk,
+                1 if strides is None else strides[rid],
             ):
                 continue  # loop already finished; no further work to speculate
             if (
@@ -932,17 +1017,18 @@ class PythonGraphRuntime(GraphRuntime):
             self._undo_spec_ingest(staged_node, into_signals, into_next_iter)
 
     def _can_continue_loop(
-        self, rid: int, wgio, spec_info, graph_walk: str,
+        self, rid: int, wgio, spec_info, graph_walk: str, stride: int = 1,
     ) -> bool:
         """False once this rid's loop has ended: a stop is already pending for
-        it, or the next iteration would be past the last one."""
+        it, or the iteration in flight, moving its count ``stride`` on, is the
+        last one."""
         if not spec_info.is_new_loop_iter:
             return True
         if self.has_pending_loop_stop(rid, graph_walk, spec_info.loop_name):
             return False
         loop = wgio.loops.get(spec_info.loop_name)
         if loop is not None and (
-            loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
+            loop.curr_iter + stride >= loop.max_iters or loop._finish_signal
         ):
             return False
         return True
@@ -1196,12 +1282,12 @@ class PythonGraphRuntime(GraphRuntime):
         return node is None or edge.name in node.input_names
 
     def _mark_node_complete(
-        self, rid: int, wg_id: int, node_name: str,
+        self, rid: int, wg_id: int, node_name: str, loop_stride: int = 1,
     ) -> NodeCompletionOutput:
         """Returns ``output_edges`` (static outputs plus any loop terminal
         outputs) and ``filtered_signals`` (loop-back (name, dest) pairs the
         caller must drop from routing)."""
-        return self._queues[wg_id].mark_node_complete(rid, node_name)
+        return self._queues[wg_id].mark_node_complete(rid, node_name, loop_stride)
 
 
     # --------- Postprocess ----------
@@ -1326,6 +1412,37 @@ class PythonGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._pending_loop_stops.clear()
 
+    def _loops_of(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> Iterator[Loop | None]:
+        """Row i's ``loop_names[i]`` in the worker graph that runs
+        ``node_name`` under ``graph_walks[i]``; None for a row not here."""
+        for rid, walk, name in zip(rids, graph_walks, loop_names, strict=True):
+            wg_id = self.get_worker_graph_id_for_node(node_name, walk)
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            yield None if wgio is None else wgio.loops.get(name)
+
+    def set_loop_caps(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str], caps: list[int],
+    ) -> None:
+        for loop, cap in zip(
+            self._loops_of(node_name, rids, graph_walks, loop_names), caps, strict=True,
+        ):
+            if loop is not None:
+                loop.max_iters = cap
+
+    def loop_progress(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> tuple[list[int], list[int]]:
+        counts, caps = [], []
+        for loop in self._loops_of(node_name, rids, graph_walks, loop_names):
+            counts.append(-1 if loop is None else loop.curr_iter)
+            caps.append(-1 if loop is None else loop.max_iters)
+        return counts, caps
+
     def complete_and_route_batch(
         self, input: RouteInput,
     ) -> RouteOutput:
@@ -1349,6 +1466,7 @@ class PythonGraphRuntime(GraphRuntime):
         # no per-request frame. A persisted one keeps the tensor for the conductor.
         inline_on = input.inline_signal is not None and len(input.inline_values) == len(rids)
         emit_inline: list[tuple[int, str, str, int]] = []
+        logprobs = {rid: lp for rid, lp in zip(rids, input.logprobs, strict=False) if lp is not None}
 
         cursor = 0
         for i, (rid, wg_id) in enumerate(zip(rids, wg_ids, strict=True)):
@@ -1377,7 +1495,10 @@ class PythonGraphRuntime(GraphRuntime):
             nested_idxs[rid] = wgio.get_nested_loop_idxs_for_node(
                 input.node_name
             )
-            completion = self._mark_node_complete(rid, wg_id, input.node_name)
+            completion = self._mark_node_complete(
+                rid, wg_id, input.node_name,
+                1 if input.loop_strides is None else input.loop_strides[i],
+            )
             walk = input.graph_walk
             if input.walks is not None:
                 walk = rid_walk[rid] = input.walks[input.rid_walk_idx[i]]
@@ -1389,10 +1510,9 @@ class PythonGraphRuntime(GraphRuntime):
             routing_per_rid[rid] = routing
             if inline_on and routing.emit_to_client:
                 tensor_emits = []
-                value = input.inline_values[i]
                 for edge in routing.emit_to_client:
-                    if value is not None and edge.name == input.inline_signal and not edge.persist:
-                        emit_inline.append((rid, edge.name, edge.output_modality, value))
+                    if edge.name == input.inline_signal and not edge.persist:
+                        emit_inline.append((rid, edge.name, edge.output_modality, input.inline_values[i]))
                     else:
                         tensor_emits.append(edge)
                 routing.emit_to_client = tensor_emits
@@ -1479,6 +1599,7 @@ class PythonGraphRuntime(GraphRuntime):
             nested_loop_indices=nested_idxs,
             rid_walk=rid_walk,
             emit_inline=emit_inline,
+            logprobs=logprobs,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1545,6 +1666,7 @@ class PythonGraphRuntime(GraphRuntime):
                 info.current_output_chunks.extend(
                     edge.name for edge in routing.emit_to_client
                 )
+                logprob = completion.logprobs.get(rid)
                 for edge in routing.emit_to_client:
                     self._communicator.send("api_server", APIServerMessage(
                         message_type="result_tensors",
@@ -1553,7 +1675,7 @@ class PythonGraphRuntime(GraphRuntime):
                             modality=edge.output_modality,
                             graph_edge=edge,
                             loop_indices=nested_idxs.get(rid),
-                            metadata={},
+                            metadata={} if logprob is None else {"logprobs": [logprob]},
                         ),
                     ))
 
@@ -1594,7 +1716,7 @@ class PythonGraphRuntime(GraphRuntime):
                     # A speculatively-scheduled node has not really finished
                     # the partition, so it must not report done.
                     partition_done=(
-                        part is not None and part.stream_partition_done
+                        part is not None and part.partition_done
                         and not speculative
                     ),
                     profiling=profiling.get(rid),
@@ -1617,11 +1739,13 @@ class PythonGraphRuntime(GraphRuntime):
             if frame is None:
                 frame = frames[(signal, modality)] = ResultTokens(
                     request_ids=[], values=[], loop_indices=[],
-                    signal=signal, modality=modality,
+                    signal=signal, modality=modality, logprobs=[] if completion.logprobs else None,
                 )
             frame.request_ids.append(self.get_rid_string(rid))
             frame.values.append(value)
             frame.loop_indices.append(completion.nested_loop_indices.get(rid))
+            if frame.logprobs is not None:
+                frame.logprobs.append(completion.logprobs.get(rid))
         return list(frames.values())
 
     def _send_input_signals(

@@ -62,19 +62,22 @@ class _FakeDist:
         return SimpleNamespace(backend=backend, ranks=members, name=name)
 
 
-def _mesh(tp: int, sp: int, cfg: int = 1) -> GlobalParallelConfig:
-    """One node on one lockstep instance of cfg * sp * tp ranks."""
-    graph = WorkerGraph(
-        section=SimpleNamespace(get_nodes=lambda: {"dit": None}), graph_walks=set(),
-        ranks=list(range(tp * sp * cfg)), tp_size=tp, sp_size=sp, cfg_size=cfg,
-    )
+def _mesh(tp: int, sp: int, cfg: int = 1, nodes: tuple[str, ...] = ("dit",)) -> GlobalParallelConfig:
+    """Each node its own worker graph on the same lockstep instance of cfg * sp * tp ranks."""
+    graphs = {
+        node: WorkerGraph(
+            section=SimpleNamespace(get_nodes=lambda node=node: {node: None}), graph_walks=set(),
+            ranks=list(range(tp * sp * cfg)), tp_size=tp, sp_size=sp, cfg_size=cfg,
+        )
+        for node in nodes
+    }
     return GlobalParallelConfig(
-        worker_graphs={"main": graph}, worker_ids=[f"worker-{r}" for r in graph.ranks],
+        worker_graphs=graphs, worker_ids=[f"worker-{r}" for r in range(tp * sp * cfg)],
     )
 
 
-def _run(monkeypatch, tp: int, sp: int, cfg: int = 1):
-    config = _mesh(tp, sp, cfg)
+def _run(monkeypatch, tp: int, sp: int, cfg: int = 1, nodes: tuple[str, ...] = ("dit",)):
+    config = _mesh(tp, sp, cfg, nodes)
     # these need a real torch.distributed (and rank 0 binds a socket)
     monkeypatch.setattr(communication, "rendezvous_store", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(communication, "default_group_timeout", lambda backend: None, raising=False)
@@ -151,3 +154,15 @@ def test_the_groups_land_on_the_right_comm_groups(monkeypatch):
         instance = view.node_to_instance_comm["dit"]
         assert instance.cpu_group.ranks == (0, 1, 2, 3) and instance.cpu_group.backend == "gloo"
         assert instance.device_group is None
+
+
+@pytest.mark.parametrize(("tp", "sp"), [(2, 2), (2, 1)])
+def test_lockstep_nodes_on_the_same_ranks_share_one_set_of_groups(monkeypatch, tp, sp):
+    # several lockstep nodes on one instance: a rank tuple is split once, not
+    # once per node, so every rank still makes the same calls
+    fakes, views = _run(monkeypatch, tp, sp, nodes=("a", "b"))
+    one_node, _ = _run(monkeypatch, tp, sp)
+    for rank, fake in fakes.items():
+        assert fake.calls == one_node[rank].calls
+        view = views[rank]
+        assert view.axis_groups["tp"]["a"] is view.axis_groups["tp"]["b"]

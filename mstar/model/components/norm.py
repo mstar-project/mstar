@@ -93,7 +93,8 @@ class RMSNorm(nn.Module):
         each add into the next norm needs no first-layer branch. It must be a
         full tensor (e.g. the embeddings), not a TP partial sum, so the start
         reduces nothing. Later calls update the stream in place, so start it
-        from a tensor the caller may overwrite.
+        from a tensor the caller may overwrite (``run_layers`` starts it from
+        a copy).
 
         Keeps add and norm together so inductor fuses them, rather than folding
         the add into the producing GEMM as an ``addmm`` (an extra copy of

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -14,6 +14,12 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
+
+# What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
+# a prefill that sampled a stop token, before its decode loop exists. The
+# request's partition ends when this pass completes, and the conductor starts
+# no further walk.
+END_PARTITION = "__end_partition__"
 
 
 class HostRows(NamedTuple):
@@ -40,11 +46,8 @@ class HostRows(NamedTuple):
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
 
 
-# request-state key: a prefill walk sampled a stop id (``TokenStop.prefill_walks``)
-_ENDED_AT_PREFILL = "ended_at_prefill"
-
-
-class TokenStop(NamedTuple):
+@dataclass(frozen=True)
+class TokenStop:
     """When an AR submodule's sampled token ends its decode loop: on a stop
     id, unless the request's sampler config sets ``ignore_eos``. The token
     budget is the loop's cap (``Model.get_loop_caps``), which the runtime
@@ -62,18 +65,27 @@ class TokenStop(NamedTuple):
     sampler: str
     # the only walk whose rows can stop the loop; None for every walk
     walk: str | None = None
-    # walks that sample the reply's first token before the loop runs. That
-    # token counts toward the budget, so the model's ``get_loop_caps`` gives
-    # the loop ``max_output_tokens - 1`` (GLM-5.2, Command A+). A stop
-    # id sampled there has no loop to stop, so the reply ends at the loop's
-    # first step (``ARNodeSubmodule.ended_at_prefill``), which withholds its
-    # ``buffer``, ``withhold`` and a ``DeviceLoopback``'s signal
-    # (``StopCheck.withheld``), so the loop's client edge must carry one of them
+    # walks that sample the reply's first token before the loop exists. That
+    # token counts toward the budget, so ``get_loop_caps`` gives the loop
+    # ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one
+    # token, ends the partition (``END_PARTITION``)
     prefill_walks: frozenset[str] = frozenset()
+    # for a prompt prefilled over several passes: the ``step_metadata`` flag of
+    # the pass whose token is the reply's (earlier passes' tokens are not)
+    last_prefill_flag: str | None = None
     # outputs left unrouted on a row whose token is a stop id, ``ignore_eos``
     # or not (``StopCheck.withheld``): a frame streamed beside the stop token
     # is loop control, and only the stop check's host copy tells it from data
     withhold: tuple[str, ...] = ()
+    # the graph runtime checks ``walk``'s stop ids itself, without calling
+    # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
+    # check_stop, which can end the partition
+    runtime_check: bool = False
+
+    def __post_init__(self):
+        if self.withhold and self.runtime_check:
+            # the runtime's check never calls check_stop, which is what withholds
+            raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
 
 
 class DeviceLoopback(NamedTuple):
@@ -114,8 +126,9 @@ class StopCheck(NamedTuple):
 
 
 class BatchedStopCheck(NamedTuple):
-    """``StopCheck`` for ``check_stop_batched``: rid -> loops to stop and
-    rid -> withheld outputs, rids with none left out of each."""
+    """``StopCheck`` for ``check_stop_batched``: rid -> what ``check_stop``
+    returns for it (loop names or ``END_PARTITION``) and rid -> withheld
+    outputs, rids with none left out of each."""
 
     stops: dict[str, set[str]]
     withheld: dict[str, tuple[str, ...]]
@@ -126,6 +139,17 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
+
+
+class StepOrder(Enum):
+    """Who runs first when more rows of a node are ready than its step takes
+    (``NodeSubmodule.max_batch_size``)."""
+    # First come, first served to completion: the rows that ran the node's last
+    # step keep it, then the request that arrived first. The default.
+    ARRIVAL = "arrival"
+    # Longest-waiting first: a row that just ran gives way to one that waited.
+    # For a session whose stream has to keep moving while others run.
+    TURNS = "turns"
 
 
 class InputMetadata(NamedTuple):
@@ -143,6 +167,76 @@ class InputMetadata(NamedTuple):
 
 
 EMPTY_INPUT_METADATA = InputMetadata()
+
+
+class StopKind(Enum):
+    """How a loop's stop is decided after each step (``StopPolicy``)."""
+    # the sampled token is one of the policy's EOS ids (unless the request
+    # ignores EOS), or the loop reached the request's iteration limit
+    AR = "ar"
+    # only the iteration limit
+    ITER = "iter"
+    # only the EOS ids: the loop's cap (``Model.get_loop_caps``) is its budget
+    EOS = "eos"
+
+
+class StopLimits(NamedTuple):
+    """One request's limits under a ``StopPolicy``."""
+    # None: no iteration limit (``StopKind.EOS``)
+    max_iters: int | None
+    ignore_eos: bool
+
+
+@dataclass(frozen=True)
+class StopPolicy:
+    """A loop's stop check, declared so the graph runtime can run it without
+    calling ``check_stop`` (``NodeSubmodule.get_stop_policies``).
+
+    A row stops the loop when ``stops`` says so, given the loop's iteration
+    count as of the step (what ``check_stop`` reads as
+    ``dynamic_loop_iter_counts.get(loop, 0)``) and, for ``AR`` and ``EOS``,
+    the row's ``token_signal`` value.
+    """
+    kind: StopKind
+    # AR, EOS: the output signal carrying the sampled token, read off the host
+    # rows; the first value of the row
+    token_signal: str | None = None
+    # any iterable of ids; held as a frozenset
+    eos_tokens: frozenset[int] = frozenset()
+    # AR, EOS: the resource label whose request config carries ``ignore_eos``;
+    # None means EOS is never ignored
+    sampler: str | None = None
+    # the request's iteration limit for this loop; evaluated once per request
+    # and walk, not per step. None is ``info.max_tokens``.
+    max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
+
+    def __post_init__(self):
+        if self.reads_token and self.token_signal is None:
+            raise ValueError(f"a {self.kind.name} StopPolicy needs a token_signal")
+        object.__setattr__(self, "eos_tokens", frozenset(self.eos_tokens))
+
+    @property
+    def reads_token(self) -> bool:
+        return self.kind is not StopKind.ITER
+
+    def limits(self, info: CurrentForwardPassInfo) -> StopLimits:
+        """One request's limits, from its forward-pass info."""
+        max_iters = None
+        if self.kind is not StopKind.EOS:
+            max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
+        ignore_eos = False
+        if self.reads_token and self.sampler is not None:
+            config = info.resource_configs.get(self.sampler)
+            ignore_eos = bool(getattr(config, "ignore_eos", False))
+        return StopLimits(max_iters, ignore_eos)
+
+    def stops(self, count: int, token: int | None, limits: StopLimits) -> bool:
+        """Whether a row with the loop at ``count`` and sampled ``token``
+        stops it: the count plus one reaches the limit, or (``AR``, ``EOS``)
+        the token is an EOS id the request does not ignore."""
+        return (limits.max_iters is not None and count + 1 >= limits.max_iters) or (
+            self.reads_token and not limits.ignore_eos and token in self.eos_tokens
+        )
 
 
 @dataclass
@@ -346,6 +440,16 @@ class NodeInputs:
     # The request's real walk, stamped by the engine; None on capture templates
     graph_walk: str | None = None
 
+    # Set by the engine on a chunk of a split input: where it starts, and the
+    # whole input's length. None means not chunked.
+    chunk_start: int = 0
+    chunk_total: int | None = None
+
+    @property
+    def is_final_chunk(self) -> bool:
+        return self.chunk_total is None or \
+            self.chunk_start + self.input_seq_len >= self.chunk_total
+
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
 
@@ -396,6 +500,89 @@ def _split_pos_ids(
             "cannot be told apart; override `split_inputs`"
         )
     return pos_ids[..., start:end]
+
+
+@dataclass(frozen=True)
+class ChunkingPolicy:
+    """How a walk's prefill may be split across steps; the default is not at all.
+
+    ``walks``: the walks this policy covers. Declared per node on the model
+    (``Model.get_chunking_policies``) rather than on the submodule, because
+    the graph build needs it: a chunkable node is wrapped in a Loop for
+    exactly these walks, and a chunk is one iteration of it.
+
+    ``accumulated_outputs``: output edges a consumer needs every chunk of,
+    gathered on the Loop and handed over as one item per chunk when the
+    prompt finishes. A streamed edge's consumer gets them joined into one item
+    by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here
+    or in ``per_chunk_outputs`` carries the final chunk's tensors alone.
+
+    ``per_chunk_outputs``: streaming output edges sent on every chunk as it
+    runs, each chunk's piece an item of its own, for a consumer that can
+    start on a prefix (``ChunkPolicy.allow_partial_input``, checked at load).
+    Disjoint from ``accumulated_outputs``.
+
+    ``reserve_whole_prefill``: whether a first chunk reserves the KV the
+    whole prefill needs, so a part-done row cannot wedge on a full arena.
+    Counted in tokens, so a walk whose KV grows by something else sets False
+    and reserves per chunk.
+    """
+    walks: tuple[str, ...] = ()
+    # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
+    chunkable: bool = False
+    accumulated_outputs: frozenset[str] = frozenset()
+    per_chunk_outputs: frozenset[str] = frozenset()
+    # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
+    max_batch_tokens: int | None = None
+    # whether a row may start past its cached prefix, asked before prepare; None is always
+    reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
+    reserve_whole_prefill: bool = True
+
+    def __post_init__(self):
+        both = self.accumulated_outputs & self.per_chunk_outputs
+        if both:
+            raise ValueError(
+                f"outputs {sorted(both)} are both gathered and sent per chunk; name each in one"
+            )
+
+
+NO_CHUNKING = ChunkingPolicy()
+
+
+# A chunk Loop's count before its prompt's first chunk sets the real cap (the
+# prompt's length), and the stride of a row that runs whole: it ends the Loop.
+# Within the u32 both runtimes hold loop counters in.
+CHUNK_LOOP_END = 2**31 - 1
+
+
+def chunk_loop_name(node_name: str, graph_walk: str) -> str:
+    """The Loop a chunkable ``(node, walk)``'s prefill runs as.
+
+    Derived rather than declared so the graph build, the engine's stop check
+    and the startup validation all name the same loop without passing it
+    around. Per walk, not per node: a node can chunk under several walks and
+    each has its own loop state.
+    """
+    return f"chunk_loop:{node_name}:{graph_walk}"
+
+
+def chunk_tick_name(node_name: str, graph_walk: str) -> str:
+    """The chunk Loop's loop-back signal, carrying nothing.
+
+    Speculation offers a next-iteration target only for a node that routes an
+    edge back to itself, so without this a chunk-only step is a pipeline
+    bubble. The node declares it as an input too -- an edge it does not read is
+    no loop-back, just an output nobody consumes -- which leaves it unready for
+    its FIRST chunk, so the conductor seeds one with the request's inputs.
+    """
+    return f"{chunk_loop_name(node_name, graph_walk)}.next_chunk"
+
+
+class InputSeqLenInfo(NamedTuple):
+    """A row's token count before ``prepare_inputs``, for admission."""
+    seq_len: int
+    # leading tokens the prefix cache already holds, not counted in ``seq_len``
+    cached_prefix: int = 0
 
 
 @dataclass
@@ -567,9 +754,12 @@ class ModelInputsFromEngine:
     # by the engine, spread in at execute time (like ``cache_manager`` /
     # ``sampler``). Empty when the submodule opts into no piecewise graphs or
     # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
-    # A ``lease_before_step`` region is here only on a step that leased it, so
-    # its forward replays it exactly then and runs it eagerly otherwise.
     piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
+    # label -> the slot this step leased on that region (``lease_before_step``
+    # regions). A forward replays such a region exactly when its label is
+    # here: a bucket that fits is not enough, since ``can_lease`` may have
+    # refused the batch, and the step declared its own attention instead.
+    piecewise_leases: "Mapping[str, SlotLease]" = field(default_factory=dict)
 
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
@@ -648,9 +838,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     # Set True to let cuDNN time its conv algorithms in this node's capture
     # warm-up (once per captured shape, then cached) instead of taking its
-    # heuristic pick. The engine applies it around warm-up and capture; the
-    # capture itself turns it off (``accelerator_graph_runner``), and eager
-    # steps keep the process setting, so a new eager shape never searches.
+    # heuristic pick. The engine applies it around capture sizing, which runs
+    # the warm-up forwards; the capture itself turns it off
+    # (``accelerator_graph_runner``), and eager steps keep the process
+    # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
     def __init__(self):
@@ -706,8 +897,24 @@ class NodeSubmodule(torch.nn.Module, ABC):
         on ``ModelInputsFromEngine``), e.g. for a bucket that follows a stream chunk.
 
         None (the default) means the walk has a single capture.
+
+        On a node whose only capture is a piecewise region, no forward
+        replays by this key: it only groups the scheduler's rows
+        (``split_batches_by_capture_key``) and need not name a bucket.
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
+        return None
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        """This row's token count, read from input shapes alone; None when the
+        walk does not declare one. A chunkable walk's prompts are cut into
+        chunks by it, so it must equal ``prepare_inputs().input_seq_len`` of the
+        whole input (before any cached prefix is removed), or the row fails
+        at its first chunk."""
+        del graph_walk, fwd_info, inputs, kwargs
         return None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
@@ -715,7 +922,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         A batch spanning two groups matches no capture. Opt in when that batch
         runs worse than two captured ones, e.g. per-request eager; leave it off
-        when a batched eager forward handles the mix well.
+        when a batched eager forward handles the mix well. On a node whose only
+        capture is a piecewise region, the key only groups the scheduler's
+        rows (e.g. Qwen3.5's vision node puts a request too large for one
+        replay in a group of its own).
         """
         del graph_walk
         return False
@@ -888,6 +1098,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return False
 
+    def speculative_input_seq_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        prev_seq_len: int,
+    ) -> int | None:
+        """The span of a row continuing from the step in flight, estimated
+        before that step's outputs reach it. ``prev_seq_len`` is its span in
+        that step, or -1 if it ran on another node. The default repeats the
+        last span on this node and has no estimate otherwise; a walk that
+        fixes its span (one token a decode step) should say so. Only an
+        estimate, which sizes the token budget left for the rows merged in
+        beside it."""
+        del graph_walk, fwd_info
+        return prev_seq_len if prev_seq_len >= 0 else None
+
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
         """Loop-back input signals of this walk whose per-row value the node
         keeps on the device itself (a sampler's slot master), so the worker
@@ -976,6 +1200,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         mixed step runs the walk's rows on a path sized to a few of them."""
         del graph_walk
         return None
+
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Which rows go first when more are ready than ``max_batch_size``
+        allows. Override it for a walk whose sessions have to keep moving
+        while others run."""
+        del graph_walk
+        return StepOrder.ARRIVAL
 
     def get_autocast_dtype(self) -> torch.dtype | None:
         """This node's dtype in place of the model's: the engine manager casts
@@ -1149,6 +1380,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         will run for that rid and its output discarded — the standard
         1-wasted-step cost for any stop signal.
 
+        ``END_PARTITION`` ends the request's partition after this pass, so
+        the conductor starts no further walk: e.g. a prefill whose sampled
+        token is a stop token, before its decode loop exists. Return it only
+        from a row outside any loop: from inside one, the request fails with
+        an internal error. Use it only when nothing else must run for the
+        partition (a later walk, a loop's final-only publication); the
+        model's transition still decides those.
+
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
@@ -1157,6 +1396,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return set()
 
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        """The stop check ``check_stop`` amounts to on ``graph_walk``, per
+        loop it can stop, if it is only these, so the graph runtime can run
+        them without calling it.
+
+        None (the default) means ``check_stop`` decides; an empty dict means
+        it never stops a loop on this walk. Asked once per walk, at startup.
+        Every policy must agree with ``check_stop`` for every row.
+        """
+        return None
+
     def check_stop_batched(
         self, request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
@@ -1164,7 +1414,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, set[str]] | BatchedStopCheck | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
-        Optional. Returns rid -> loops to stop (rids with none left out), or a
+        Optional. Returns rid -> what ``check_stop`` returns for it (loop
+        names or ``END_PARTITION``; rids with nothing left out), or a
         ``BatchedStopCheck`` for a submodule whose ``check_stop`` withholds,
         and must agree with ``check_stop`` for every rid. None, or a raise,
         falls back to the per-request path.
@@ -1255,6 +1506,17 @@ class ARNodeSubmodule(NodeSubmodule):
             )
         return out
 
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        stop = self.token_stop
+        if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
+            return super().get_stop_policies(graph_walk)
+        if stop.walk is not None and graph_walk != stop.walk:
+            return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
+        # the budget is the loop's cap, which the runtime enforces
+        return {stop.loop: StopPolicy(
+            StopKind.EOS, token_signal=stop.buffer, eos_tokens=stop.stop_ids, sampler=stop.sampler,
+        )}
+
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -1267,9 +1529,7 @@ class ARNodeSubmodule(NodeSubmodule):
             return set()
         # a row's first element, as ``HostRows.first_values`` reads it
         token = outputs[stop.buffer][0].reshape(-1)[0].item()
-        stops = {stop.loop} if self._token_stops(request_id, token, request_info) else set()
-        if stops and stop.prefill_walks and self.ended_at_prefill(request_id):
-            return StopCheck(stops, withheld=self._closing_withheld())
+        stops = self._stop_names(request_info) if self._token_stops(request_id, token, request_info) else set()
         if stop.withhold and token in stop.stop_ids:
             return StopCheck(stops, withheld=stop.withhold)
         return stops
@@ -1285,54 +1545,48 @@ class ARNodeSubmodule(NodeSubmodule):
         pairs = host_rows.first_values(stop.buffer, request_ids)
         if pairs is None:
             return None
-        verdict = self._token_stops
-        withheld: dict[str, tuple[str, ...]] = {}
+        verdict, names = self._token_stops, self._stop_names
         if not stop.withhold:
-            stops = {rid: {stop.loop} for rid, token in pairs if verdict(rid, token, request_infos[rid])}
-        else:
-            stops = {}
-            for rid, token in pairs:
-                if verdict(rid, token, request_infos[rid]):
-                    stops[rid] = {stop.loop}
-                if token in stop.stop_ids:
-                    withheld[rid] = stop.withhold
-        if stop.prefill_walks:
-            closing = self._closing_withheld()
-            withheld.update({rid: closing for rid in stops if self.ended_at_prefill(rid)})
+            return {
+                rid: names(info) for rid, token in pairs
+                if verdict(rid, token, info := request_infos[rid])
+            }
+        stops: dict[str, set[str]] = {}
+        withheld: dict[str, tuple[str, ...]] = {}
+        for rid, token in pairs:
+            if verdict(rid, token, info := request_infos[rid]):
+                stops[rid] = names(info)
+            if token in stop.stop_ids:
+                withheld[rid] = stop.withhold
         return BatchedStopCheck(stops, withheld) if withheld else stops
-
-    def _closing_withheld(self) -> tuple[str, ...]:
-        """What the step closing a reply that ended at prefill withholds: none
-        of its outputs are the reply's, the client's inline copy of a loop-back
-        token included."""
-        stop, loopback = self.token_stop, self.device_loopback
-        return (stop.buffer, *(() if loopback is None else (loopback.signal,)), *stop.withhold)
-
-    def ended_at_prefill(self, request_id: str) -> bool:
-        """Whether a walk in ``token_stop.prefill_walks`` sampled a stop id for
-        the request, so its next step only closes the loop: that step's token,
-        sampled after the stop id, is withheld from the reply."""
-        # read, never create: the check can run after the state was dropped
-        state = self.request_states.get(request_id)
-        return state is not None and bool(state.get(_ENDED_AT_PREFILL))
 
     def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
         """Both stop checks' verdict on one row: whether its sampled
-        ``token`` ends ``token_stop.loop``."""
+        ``token`` ends the reply."""
         stop = self.token_stop
         prefill_walks = stop.prefill_walks
-        if prefill_walks and self.ended_at_prefill(request_id):
-            return True
-        # the set test first: a stop id is rare, and the config read behind
-        # it goes through the info wrapper
-        if token not in stop.stop_ids or info.resource_configs[stop.sampler].ignore_eos:
-            return False
-        if prefill_walks and info.graph_walk in prefill_walks:
-            # no loop on this walk to stop: the loop's first step will
-            self.request_state(request_id).add(_ENDED_AT_PREFILL, True)
-            return False
-        # only a row of ``walk`` ends the loop
-        return stop.walk is None or info.graph_walk == stop.walk
+        # the set test first: a stop id is rare, and the reads behind it go
+        # through the info wrapper
+        if token in stop.stop_ids and not info.resource_configs[stop.sampler].ignore_eos:
+            walk = info.graph_walk
+            if walk in prefill_walks:
+                return self._is_reply_token(info)
+            # only a row of ``walk`` ends the loop
+            return stop.walk is None or walk == stop.walk
+        # the loop's cap is at least 1, so a one-token budget ends at the prefill
+        return bool(prefill_walks) and info.max_tokens <= 1 and (
+            info.graph_walk in prefill_walks and self._is_reply_token(info)
+        )
+
+    def _is_reply_token(self, info: CurrentForwardPassInfo) -> bool:
+        flag = self.token_stop.last_prefill_flag
+        return flag is None or bool(info.step_metadata.get(flag, False))
+
+    def _stop_names(self, info: CurrentForwardPassInfo) -> set[str]:
+        """What a row whose token stops returns: a ``prefill_walks`` row has
+        no loop yet, so it ends the partition."""
+        stop = self.token_stop
+        return {END_PARTITION} if info.graph_walk in stop.prefill_walks else {stop.loop}
 
     def split_inputs(
         self,

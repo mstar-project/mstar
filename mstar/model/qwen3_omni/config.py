@@ -26,6 +26,9 @@ TALKER_KV = "talker_kv"
 
 THINKER_ATTN = "thinker_attn"
 TALKER_ATTN = "talker_attn"
+# the encoders' cacheless attention (ragged: within each window / frame)
+AUDIO_ATTN = "audio_attn"
+VISION_ATTN = "vision_attn"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
@@ -128,14 +131,35 @@ class ThinkerConfig:
 class VisionEncoderConfig:
     depth: int = 27
     hidden_size: int = 1152
+    intermediate_size: int = 4304
     num_heads: int = 16
+    in_channels: int = 3
+    patch_size: int = 16
+    temporal_patch_size: int = 2
     spatial_merge_size: int = 2
+    num_position_embeddings: int = 2304
     out_hidden_size: int = 3584
+    hidden_act: str = "gelu_pytorch_tanh"
+    rope_theta: float = 10_000.0
     deepstack_visual_indexes: tuple[int, ...] = (8, 16, 24)
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+    @property
+    def num_grid_per_side(self) -> int:
+        """The learned position table is a square grid."""
+        return int(self.num_position_embeddings**0.5)
+
+    @property
+    def merge_unit(self) -> int:
+        return self.spatial_merge_size**2
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> VisionEncoderConfig:
         fnames = {f.name for f in cls.__dataclass_fields__.values()}
+        d = {**d, **d.get("rope_parameters", {})}
         filtered = {k: v for k, v in d.items() if k in fnames}
         # HF may store tuple fields as lists
         if "deepstack_visual_indexes" in filtered and isinstance(

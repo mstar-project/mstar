@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.engine import Engine
 
 
@@ -40,6 +41,7 @@ def _engine(*submodules):
     engine._runner = _Runner(log)
     engine._resources = {}
     engine._loopback_steps = {}
+    engine._chunking = ChunkingManagement({})
     engine._submodules = {
         name: SimpleNamespace(submodule=_Submodule(log, name, raises)) for name, raises in submodules
     }

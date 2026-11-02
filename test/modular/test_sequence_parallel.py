@@ -160,8 +160,7 @@ def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
     gen = torch.Generator().manual_seed(1)
     frames, height, width = grid
     latents = torch.randn(1, 4, frames, height, width, generator=gen)
-    tokens = frames * (height // 2) * (width // 2)
-    timestep = torch.rand(1, tokens, generator=gen) * 1000
+    timestep = torch.rand(1, frames, generator=gen) * 1000
     text = torch.randn(1, 5, 8, generator=gen)
     with torch.no_grad():
         return dit(latents, timestep, text)
@@ -175,8 +174,9 @@ def _wan_dit(rank, world, grid, out_path):
 
 @pytest.mark.parametrize("grid", [(2, 4, 4), (3, 2, 6)], ids=["even", "uneven"])
 def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
-    """Each SP rank keeps its slice of the tokens, their RoPE and per-token
-    timesteps, and the gathered output is the one-rank DiT's (8 and 9
-    tokens: an even and an uneven split over two ranks)."""
+    """Each SP rank keeps its slice of the tokens, their RoPE and their
+    frames' timesteps, and the gathered output is the one-rank DiT's (8 and 9
+    tokens: an even and an uneven split over two ranks, the uneven one cutting
+    a frame)."""
     _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
     torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_forward(grid))

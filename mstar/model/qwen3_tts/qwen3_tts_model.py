@@ -1196,8 +1196,11 @@ class Qwen3TTSModel(Model):
         # CodePredictor is small and depth-wise. It is loaded separately from
         # ``talker.code_predictor.*`` and remains replicated under Talker TP.
         with torch.device("meta"):
+            # the frame's embedding sum rounds to the model dtype after every add, as
+            # this Talker always has (the reference sums in fp32, rounded once)
             code_predictor = ResidualCodePredictor(
                 self.config.code_predictor, self.config.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+                embed_sum_dtype=None,
             )
         if autocast_dtype is not None:
             code_predictor = code_predictor.to(autocast_dtype)

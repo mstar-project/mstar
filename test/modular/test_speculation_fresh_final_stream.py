@@ -3,7 +3,7 @@
 A stream-consuming node in a loop with no stop of its own (nemotron_duplex's
 ``nano_llm``) ends when it consumes its stream's final chunk:
 ``ExecutingBatch.final_stream_rids`` stops the loop in postprocess and
-``stream_partition_done_rids`` reports the partition done. A rid that left the
+``partition_done_rids`` reports the partition done. A rid that left the
 speculation chain (it caught up with its stream, or waited in the backlog) has
 its final chunk ingested by the plain stream poll, and can then join another
 chain's speculative step as a FRESH rid. Its final flag rides on the fresh
@@ -32,7 +32,14 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationPrepOutput,
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler, PopReadyResult, ScheduledBatch  # noqa: E402
+from mstar.worker.batch_builder import StepPick  # noqa: E402
+from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
+from mstar.worker.micro_scheduler import (  # noqa: E402
+    ChainPick,
+    MicroScheduler,
+    PopReadyResult,
+    ScheduledBatch,
+)
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
@@ -83,6 +90,7 @@ def _worker(scheduler, runtime):
             get_fwd_info=lambda rid, partition: fwd[rid],
         ),
         _in_flight_rids=set(),
+        chunk_loops=ChunkLoops(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
     )
@@ -135,8 +143,11 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        room_for_continuing=lambda target: None,
-        get_next_batch=lambda *a, **k: fresh,
+        pick_chain_step=lambda state, target, continuing, mid_prefill=(): ChainPick(target, StepPick(
+            taken=[*continuing, FRESH], continuing=list(continuing), room=None,
+            held_back=set(), ordered=False,
+        ), []),
+        take_chain_step=lambda state, chain, *_: fresh,
     )
     runtime, target = _runtime()
     worker = _worker(scheduler, runtime)
@@ -147,6 +158,7 @@ def _follower_speculation(final: bool):
     head = SimpleNamespace(
         speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
+        chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,
@@ -170,7 +182,7 @@ def test_leader_fresh_rid_final_chunk_ends_its_stream():
 
     assert list(spec.scheduled_batch.request_to_worker_graph) == [CONTINUING, FRESH]
     assert spec.node_batch.final_stream_rids == {FRESH}
-    assert spec.node_batch.stream_partition_done_rids == {FRESH}
+    assert spec.node_batch.partition_done_rids == {FRESH}
 
 
 def test_follower_fresh_rid_final_chunk_ends_its_stream():
@@ -178,7 +190,7 @@ def test_follower_fresh_rid_final_chunk_ends_its_stream():
 
     assert list(spec.scheduled_batch.request_to_worker_graph) == [CONTINUING, FRESH]
     assert spec.node_batch.final_stream_rids == {FRESH}
-    assert spec.node_batch.stream_partition_done_rids == {FRESH}
+    assert spec.node_batch.partition_done_rids == {FRESH}
 
 
 def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
@@ -186,4 +198,4 @@ def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
         spec = build(final=False)
         assert FRESH in spec.scheduled_batch.request_to_worker_graph
         assert not spec.node_batch.final_stream_rids
-        assert not spec.node_batch.stream_partition_done_rids
+        assert not spec.node_batch.partition_done_rids
