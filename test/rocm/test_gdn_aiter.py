@@ -61,6 +61,8 @@ MAX_SLOTS = 12
 # K = V = 128: Qwen3.5's head dims, and the HIP hidden-state stage's only shape
 GQA = DeltaNetGeometry(num_k_heads=4, num_v_heads=8, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)
 MHA = DeltaNetGeometry(num_k_heads=4, num_v_heads=4, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)
+# what one of two ranks holds of Qwen3.5's 16 x 16 heads
+TP2_SHARD = DeltaNetGeometry(num_k_heads=8, num_v_heads=8, head_k_dim=128, head_v_dim=128, conv_kernel_size=4)
 
 # bf16 activations against an fp32 reference
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
@@ -461,18 +463,18 @@ def test_captured_decode_replays_with_slot_reuse(flydsl):
 # --- twin slots: the same decode, read from one slot and written to another -------
 
 
-def _conv_weights(seed=2):
+def _conv_weights(seed=2, geometry=GQA):
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    dim = 2 * GQA.num_k_heads * GQA.head_k_dim + GQA.num_v_heads * GQA.head_v_dim
+    dim = geometry.conv_dim
     weight = (torch.randn(dim, 4, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)
     bias = (torch.randn(dim, generator=gen, device=DEV) * 0.1).to(torch.bfloat16)
     return dim, weight, bias
 
 
-def _layer(manager, pool, x, w, conv):
+def _layer(manager, pool, x, w, conv, geometry=GQA):
     """A delta-net layer's two kernels on one step's rows: conv, then the rule."""
     dim, weight, bias = conv
-    hk, kd, hv, vd = GQA.num_k_heads, GQA.head_k_dim, GQA.num_v_heads, GQA.head_v_dim
+    hk, kd, hv, vd = geometry.num_k_heads, geometry.head_k_dim, geometry.num_v_heads, geometry.head_v_dim
     qkv = torch.cat((x["q"].flatten(1), x["k"].flatten(1), x["v"].flatten(1)), dim=1)
     qkv = manager.run_conv(qkv, conv_layer=pool.block("conv", 0), weight=weight, bias=bias)
     n = qkv.shape[0]
@@ -493,14 +495,15 @@ def _seed_state(pool, rid, seed):
     conv[slot.index] = torch.randn(conv[slot.index].shape, generator=gen, device=DEV).to(conv.dtype)
 
 
+@pytest.mark.parametrize("geometry", [GQA, TP2_SHARD], ids=["one-rank", "tp2-shard"])
 @pytest.mark.parametrize("rows", [1, 3, 8])
-def test_twin_slots_decode_what_in_place_decodes(rows):
+def test_twin_slots_decode_what_in_place_decodes(rows, geometry):
     """Eager, three steps: output, and the state and conv tail in whichever slot now holds them, bit-equal."""
-    plain_pool, plain = build()
-    twin_pool, twin = build(twin_slots=True)
+    plain_pool, plain = build(geometry)
+    twin_pool, twin = build(geometry, twin_slots=True)
     twin.bind_dependencies({POOL: twin_pool})
     rids = [f"r{i}" for i in range(rows)]
-    w, conv = weights(), _conv_weights()
+    w, conv = weights(geometry), _conv_weights(geometry=geometry)
     for step in range(3):
         rstep_p, ctx_p = plan_step(plain_pool, plain, [(r, 1) for r in rids], walk="decode")
         rstep_t, ctx_t = plan_step(twin_pool, twin, [(r, 1) for r in rids], walk="decode")
@@ -509,9 +512,9 @@ def test_twin_slots_decode_what_in_place_decodes(rows):
             for i, rid in enumerate(rids):
                 _seed_state(plain_pool, rid, 100 + i)
                 _seed_state(twin_pool, rid, 100 + i)
-        x = inputs(rows, seed=step)
-        qkv_p, out_p = _layer(plain, plain_pool, x, w, conv)
-        qkv_t, out_t = _layer(twin, twin_pool, x, w, conv)
+        x = inputs(rows, geometry, seed=step)
+        qkv_p, out_p = _layer(plain, plain_pool, x, w, conv, geometry)
+        qkv_t, out_t = _layer(twin, twin_pool, x, w, conv, geometry)
         torch.cuda.synchronize()
         assert torch.equal(qkv_p, qkv_t) and torch.equal(out_p, out_t)
         plain_pool.commit(rstep_p, ctx_p)

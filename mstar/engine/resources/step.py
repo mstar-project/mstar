@@ -80,6 +80,9 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # Which twin slot each row reads, for the ranks of a lockstep instance to
+    # compare (`RecurrentStatePool._slot_parity`); 0 where no pool reports one.
+    slot_parity: int = 0
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

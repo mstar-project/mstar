@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import zlib
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -76,6 +77,8 @@ class SlotState:
     # after each further token of a verify row; with twin slots, the slot a
     # decode step writes, which becomes `index` when the step commits
     extra: tuple[int, ...] = ()
+    # with twin slots, whether the state sits in the twin the request did not start on
+    swapped: bool = False
 
     @property
     def group(self) -> tuple[int, ...]:
@@ -218,6 +221,9 @@ class RecurrentStatePool(Resource):
         # for labels it hasn't taken yet (`slots_per_request` each), and `_kept`
         # their sum.
         self._decides = world_size == 1
+        # Each rank swaps its own twins, so nothing but `StepContext.slot_parity` would show
+        # a rank reading the other twin from the rest.
+        self._reports_parity = world_size > 1 and config.twin_slots
         self._reserved: dict[str, int] = {}
         self._kept = 0
 
@@ -605,6 +611,8 @@ class RecurrentStatePool(Resource):
             self._maybe_apply_forks(step, ctx)
             self._apply_restores(step)
 
+        if self._reports_parity:
+            ctx.slot_parity = self._slot_parity(step)
         twins = self._writes_twins(step, ctx)
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
@@ -615,6 +623,16 @@ class RecurrentStatePool(Resource):
             self._preplanned = True
             self._cached_plan_output = self._current
         return self._current
+
+    def _slot_parity(self, step: RecurrentStep) -> int:
+        """Which twin each row of this step reads, as one number. It depends only on the
+        steps a row has committed, so it is the same on every rank of a lockstep instance
+        for the same step, however far ahead of the others a rank is running."""
+        slots = self._slots
+        return zlib.crc32(bytes(
+            slot.swapped for seg in step.segments or ()
+            if seg.span > 0 and (slot := slots.get(seg.request_id, {}).get(seg.label)) is not None
+        ))
 
     def keep_in_place(self, walks: frozenset[str]) -> None:
         """One-token rows of ``walks`` update their slot in place: a backend that
@@ -661,6 +679,7 @@ class RecurrentStatePool(Resource):
                         # before anything below reads the slot; the next plan
                         # waits for this commit, so it reads what this step wrote
                         slot.index, slot.extra = slot.extra[0], (slot.index,)
+                        slot.swapped = not slot.swapped
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
                     slot.tokens += segment.span
