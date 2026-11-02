@@ -97,6 +97,7 @@ are snapshots, not input fences: arbitrary inputs arriving after a worker's last
 report are outside this guarantee. Client-streaming requests always drain workers
 because inputs can arrive after a completion report;
 abort and failure paths also retain their unconditional drain barrier. A read whose
-transfer status cannot be determined still holds the barrier, and its destination
-buffers remain pinned. The existing ``MSTAR_DRAIN_TTL_S`` timeout can still force
-cleanup if a participant never acknowledges.
+transfer status cannot be determined still holds the barrier, even if it has no
+listed destination buffers. Any retained destination buffers remain pinned. The
+existing ``MSTAR_DRAIN_TTL_S`` timeout can still force cleanup if a participant
+never acknowledges.
