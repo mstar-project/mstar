@@ -205,6 +205,68 @@ def test_twins_refuse_speculation_and_kernels_that_update_in_place():
     assert pool._in_place_walks == {"mixed"}
 
 
+def _rank_pool():
+    blocks = {"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)}
+    return RecurrentStatePool(torch.device("cpu"), RecurrentStateConfig(
+        num_layers=1, blocks=blocks, max_slots=8, twin_slots=True,
+    ), world_size=2)
+
+
+def _parity_of(pool, rows):
+    step, ctx, _ = _step(pool, [(r, 1) for r in rows], preplan=True)
+    pool.clear_preplan()
+    return step, ctx
+
+
+def test_ranks_report_the_same_parity_for_a_step_with_one_of_them_ahead():
+    """"b" joins two steps late and "a" leaves, so the rows' parities differ and move. A rank's teardown lands at its
+    own time, so "c" takes a different slot on each rank, which is fine; which twin it reads is not free to differ."""
+    script = [["a"], ["a"], ["a", "b"], ["a", "b"], ["b", "c"], ["b", "c"]]
+
+    def run(pool, rows, seen):
+        step, ctx = _parity_of(pool, rows)
+        seen.append(ctx.slot_parity)
+        pool.commit(step, ctx)
+
+    ahead, behind = _rank_pool(), _rank_pool()
+    seen_ahead, seen_behind = [], []
+    for i, rows in enumerate(script):
+        if rows == ["b", "c"] and "a" in ahead._slots:
+            ahead.remove_request("a")
+        run(ahead, rows, seen_ahead)
+        if i:
+            run(behind, script[i - 1], seen_behind)
+    behind.remove_request("a")
+    run(behind, script[-1], seen_behind)
+    assert seen_ahead == seen_behind
+    assert len(set(seen_ahead)) > 1
+    assert ahead._slots["c"]["main"].group != behind._slots["c"]["main"].group
+
+
+def test_a_rank_that_plans_before_its_commit_reports_another_parity():
+    good, bad = _rank_pool(), _rank_pool()
+    for pool in (good, bad):
+        step, ctx = _parity_of(pool, ["a"])
+        pool.commit(step, ctx)
+        step, ctx = _parity_of(pool, ["a"])
+        if pool is good:
+            pool.commit(step, ctx)
+    # `bad` plans the next step before committing the one in flight, so it reads the twin that step is still filling
+    assert _parity_of(good, ["a"])[1].slot_parity != _parity_of(bad, ["a"])[1].slot_parity
+
+
+@pytest.mark.parametrize(("twin", "world"), [(True, 1), (False, 2)])
+def test_only_twins_under_lockstep_report_a_parity(twin, world):
+    blocks = {"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)}
+    pool = RecurrentStatePool(torch.device("cpu"), RecurrentStateConfig(
+        num_layers=1, blocks=blocks, max_slots=4, twin_slots=twin,
+    ), world_size=world)
+    step, ctx, _ = _step(pool, [("a", 1)])
+    pool.commit(step, ctx)
+    _, ctx, _ = _step(pool, [("a", 1)])
+    assert ctx.slot_parity == 0
+
+
 def test_the_yaml_override_turns_them_on():
     blocks = {"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)}
     spec = RecurrentStateSpec("gdn_state", {"llm"}, RecurrentStateConfig(num_layers=1, blocks=blocks))

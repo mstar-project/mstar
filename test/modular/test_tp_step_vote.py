@@ -28,11 +28,12 @@ WALK = "decode"
 ROWS = ["a", "b", "c"]
 
 
-def _step(seq=7, rows=ROWS, failed=(), refused=False, raised=False):
+def _step(seq=7, rows=ROWS, failed=(), refused=False, raised=False, parity=0):
     """One rank's view of step N once its GPU thread is done with it: the rows
     its forward ran (wire ids), the rows it failed before or after the forward,
-    and whether the step raised instead."""
-    return {"seq": seq, "rows": list(rows), "failed": list(failed), "refused": refused, "raised": raised}
+    whether the step raised instead, and which twin slots its rows read."""
+    return {"seq": seq, "rows": list(rows), "failed": list(failed), "refused": refused, "raised": raised,
+            "parity": parity}
 
 
 TWO_RANKS = {
@@ -53,6 +54,9 @@ TWO_RANKS = {
     # rank 1's step raised (on the GPU thread, or in the loop after it)
     "raised_one": {0: _step(), 1: _step(raised=True)},
     "raised_all": {"*": _step(raised=True)},
+    # every rank's rows on the same twins, one of them not
+    "parity_same": {"*": _step(parity=1234)},
+    "parity_differs": {0: _step(parity=1234), 1: _step(parity=4321)},
     "after": {"*": _step(seq=9, rows=["b", "c"])},
 }
 GRID = {f"rank{r}": {r: _step(failed=["c"]), "*": _step()} for r in (1, 2, 3)}
@@ -100,6 +104,7 @@ def _rank_main(rank, world, tp, store, cases, out_dir):
             request_ids=[handle[r] for r in mine["rows"]],
             admit_error="kv cache: out of pages" if mine["refused"] else None,
             failed_requests={handle[r]: "boom" for r in mine["failed"]},
+            step_context=SimpleNamespace(slot_parity=mine["parity"]),
         )
         pending = PendingBatch(
             batch=None, node_batch=node_batch, node_name=NODE, partition="p",
@@ -211,6 +216,15 @@ def test_a_step_that_raised_on_every_rank_fails_there_as_before(two):
     """Every rank fails the batch in its error handler, which keeps them in step."""
     got = _same(two, "raised_all")
     assert got["stopped"] is None and got["voted"]
+
+
+def test_ranks_on_the_same_twin_slots_pass(two):
+    assert _same(two, "parity_same") == {"stopped": None, "failed": [], "void": None, "voted": True}
+
+
+def test_a_rank_on_the_other_twin_slot_stops_every_rank(two):
+    """No collective would notice: each rank's state shard goes on, on a different state."""
+    assert "its ranks read different twin slots" in _stops(two, "parity_differs")
 
 
 def test_the_votes_after_a_stop_still_pair(two):
