@@ -1967,9 +1967,9 @@ that a misspelled setting is never silently ignored:
      - ``max_slots``
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**),
-       ``twin_slots`` (a second slot per request: a decode step reads one and writes the
-       other, for twice the state's memory; AITER's FlyDSL decode only, and not with
-       speculative decoding)
+       ``twin_slots`` (a second slot per request, or a second group under speculative
+       decoding: a decode step reads one and writes the other, for twice the state's
+       memory; AITER's FlyDSL decode only)
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``aiter`` / ``dense`` / ``flex`` /
        ``xpu_paged``), ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
