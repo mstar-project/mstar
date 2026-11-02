@@ -101,6 +101,14 @@ class GDNManager(LinearAttnManager):
             self._pool.refuse_snapshots(
                 f"{self._pool_key!r}'s GDN kernels ({type(self._kernels).__name__}) keep no state checkpoints"
             )
+        if self._pool is not None and self._pool.config.twin_slots:
+            if not self._kernels.writes_twin_slots:
+                raise ValueError(
+                    f"{self._pool_key!r} declares twin_slots, but its GDN kernels "
+                    f"({type(self._kernels).__name__}) update a slot in place"
+                )
+            # a split walk's decode kernel takes every row, on buffers of its own
+            self._pool.keep_in_place(frozenset(self._splits))
 
     # Step lifecycle
 
@@ -287,8 +295,12 @@ class GDNManager(LinearAttnManager):
             )
             return wrapper
         wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)
+        write_slots = addressing.write_slot_indices
+        assert write_slots is None or is_decode, (
+            f"gdn: a {walk!r} step writes twin slots but takes the prefill kernel, which updates in place"
+        )
         if is_decode:
-            wrapper.plan(spans, slots)
+            wrapper.plan(spans, slots, None if write_slots is None else write_slots[:num_rows])
         else:
             wrapper.plan(
                 spans, slots, addressing.has_state[:num_rows],

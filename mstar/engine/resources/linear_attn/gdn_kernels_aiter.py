@@ -117,6 +117,7 @@ class AiterGDNKernels(GDNKernels):
         self.qk_l2norm = qk_l2norm
         self.max_captured_prefill_tokens = max_captured_prefill_tokens
         self.flydsl_decode = flydsl_decode
+        self.writes_twin_slots = flydsl_decode
         # dt_bias in the activations' dtype, which FlyDSL's decode takes; see
         # `dt_bias_as`
         self._dt_bias: dict[int, tuple[torch.Tensor, int, torch.Tensor]] = {}
@@ -465,6 +466,7 @@ class FlyDSLDecode(GDNDecodeKernel):
             plan.slots, state, out,
             use_qk_l2norm=self._kernels.qk_l2norm,
             need_shuffle_state=False,
+            write_indices=plan.write_slots,
         )
         return out.view(n, v.shape[1], v.shape[2])
 

@@ -281,6 +281,14 @@ class RecurrentStateConfig:
     # last accepted; speculative windows grow by k (`RecurrentBlockConfig`).
     spec_tokens: int = 0
 
+    # A second slot per request, so a decode step reads one and writes the
+    # other and the two swap at commit. Writing what the same kernel just read
+    # costs far more than the traffic (MI325X, 64 rows of 16 x 128 x 128 fp32:
+    # 45 us a layer in place, 35 us out of place), and the values are the same.
+    # Needs a backend whose decode kernels take both slots; not with speculation,
+    # whose slots already hold a state per token.
+    twin_slots: bool = False
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
@@ -296,12 +304,18 @@ class RecurrentStateConfig:
 
     @property
     def slots_per_request(self) -> int:
-        return self.spec_tokens + 1
+        return (self.spec_tokens + 1) * (2 if self.twin_slots else 1)
 
     @property
     def usable_slots(self) -> int:
         """Slots requests can hold; the sink is not one of them."""
         return self.max_slots - (0 if self.disable_sink_slot else 1)
+
+    @property
+    def allocated_slots(self) -> int:
+        """Slots in the pool's tensors before snapshots: ``max_slots`` counts a
+        request's pair of twins as one."""
+        return self.max_slots + self.usable_slots if self.twin_slots else self.max_slots
 
     def shard(self, num_shards: int) -> None:
         """Narrow every block's sharded axes. Idempotent, so the pool and its
@@ -325,10 +339,11 @@ class RecurrentStateSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
-        prefix_slots: int | None = None,
+        prefix_slots: int | None = None, twin_slots: bool | None = None,
     ):
-        """How many slots this deployment gets, the state's dtype, and how
-        many snapshots it keeps for prefix reuse.
+        """How many slots this deployment gets, the state's dtype, how many
+        snapshots it keeps for prefix reuse, and whether a request holds twin
+        slots (twice the state's memory, for a faster decode step).
 
         Block shapes are the model's and not tunable. The dtype trades
         accumulated precision against bandwidth and decides which kernels the
@@ -336,6 +351,8 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+        if twin_slots is not None:
+            self.config.twin_slots = bool(twin_slots)
         if prefix_slots is not None:
             if prefix_slots < 0:
                 raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")
