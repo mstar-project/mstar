@@ -25,13 +25,7 @@ from mstar.model.components.audio_features import (  # noqa: E402
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import (  # noqa: E402
-    ARNodeInputs,
-    HostRows,
-    ModelInputsFromEngine,
-    NodeInputs,
-    TokenStop,
-)
+from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine, NodeInputs  # noqa: E402
 from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402
@@ -50,7 +44,6 @@ from mstar.model.whisper.config import (  # noqa: E402
 )
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule, WhisperEncoderSubmodule  # noqa: E402
 from mstar.model.whisper.whisper_model import WhisperDetokenizer, WhisperModel  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -325,18 +318,7 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
 
 
 def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
-    sub = object.__new__(WhisperDecoderSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states = {}
-    sub.node_resources = {}
-    sub.config = cfg
-    sub.token_stop = TokenStop(
-        loop=sub.DECODE_LOOP, buffer="new_token", stop_ids=frozenset({cfg.eos_token_id}), sampler=sub.SAMPLER,
-    )
-    sub._suppress_ids = sub._begin_suppress_ids = sub._language_mask = None
-    sub._stager = PinnedStager(torch.long)
-    sub._inactive = None
-    return sub
+    return WhisperDecoderSubmodule(None, cfg)
 
 
 def _fwd(rid_handle: int, wire: str = "wire", **step_metadata):

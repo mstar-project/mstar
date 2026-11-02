@@ -148,7 +148,7 @@ def test_int_keyed_uuid_maps_survive_the_wire():
 
     got = _roundtrip(WorkerMessage(
         message_type=WorkerMessageType.TENSOR_RECEIVED,
-        body=TensorReceived(request_id="r", successful_tensors={u1: 2, u2: 1},
+        body=TensorReceived(successful_tensors={u1: 2, u2: 1},
                             failed_tensor_ids=[u2]),
     )).body
     assert got.successful_tensors == {u1: 2, u2: 1}
