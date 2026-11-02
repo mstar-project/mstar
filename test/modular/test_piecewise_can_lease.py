@@ -124,6 +124,27 @@ def test_one_row_per_step_is_refused_where_it_means_nothing(batched, overrides):
             PiecewisePackedConfig(**{**kwargs, **overrides}, total_tokens=[8])
 
 
+def test_a_one_row_per_step_region_refuses_a_lora_step():
+    """Its replay names the step's first request alone, so a LoRA pool planned in it
+    would give every request's tokens that request's adapter."""
+    from mstar.engine.accelerator_graph_config import PiecewiseCaptureShape
+    from mstar.engine.resources.lora import LoraStep
+    from mstar.engine.resources.step import SubmoduleStep
+
+    runner = PiecewiseAcceleratorGraphRunner.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._config = SimpleNamespace(
+        one_row_per_step=True,
+        get_capture_shapes=lambda sizes: [PiecewiseCaptureShape(bs=1, seq_lens=[8], total_tokens=8)],
+        region_step=lambda rids, seq_lens: SubmoduleStep(steps={"lora": LoraStep()}),
+    )
+    runner._label, runner._node_name, runner._prepared_shapes = "region", "vision", None
+    runner._capture_batch_sizes = [1]
+    runner._dummy_rows = SimpleNamespace(handles=lambda key, n: list(range(n)))
+    runner._dummy_key = lambda shape, slot: "k"
+    with pytest.raises(ValueError, match="one_row_per_step"):
+        runner.prepare_for_capture()
+
+
 @pytest.mark.parametrize("one_row, request_ids, seq_lens, rows", [
     (False, ["a", "b", "pad"], [5, 3, 0], ["a", "b", "pad"]),
     (True, ["a"], [5, 3, 2], ["a", "a", "a"]),
