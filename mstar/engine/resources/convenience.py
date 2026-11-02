@@ -57,7 +57,8 @@ class AttentionCallable:
     @torch.compiler.disable
     def write(self, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write this step's K/V without attending (a second K over the same tokens, say), on SP
-        ranks through the exchange, so it lands on the heads this rank stores."""
+        ranks through the exchange, so it lands on the heads this rank stores. A no-op where the
+        attention writes K/V inside its own run (``requires_kv_write`` False)."""
         self._exchanged(None, k, v)
 
     def _exchanged(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
