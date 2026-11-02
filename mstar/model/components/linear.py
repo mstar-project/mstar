@@ -145,12 +145,15 @@ class BlockScaledLinear(nn.Module):
         self.register_buffer("weight_data", quantized.data)
         self.register_buffer("weight_scale", quantized.scale)
         self.register_buffer("weight_tensor_scale", quantized.tensor_scale)
+        # an activation's NVFP4 block scales are in units of one (``quant_block``)
+        unit = None if quantized.tensor_scale is None else torch.ones_like(quantized.tensor_scale)
+        self.register_buffer("x_tensor_scale", unit)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lead = x.shape[:-1]
         weight = BlockQuant(self.weight_data, self.weight_scale, self.weight_tensor_scale)
-        out = block_scaled_gemm(block_quant(x.reshape(-1, self.in_features), self.fmt), weight, self.fmt)
-        return out.reshape(*lead, self.out_features)
+        quantized = block_quant(x.reshape(-1, self.in_features), self.fmt)._replace(tensor_scale=self.x_tensor_scale)
+        return block_scaled_gemm(quantized, weight, self.fmt).reshape(*lead, self.out_features)
 
 
 @dataclass(frozen=True)
@@ -188,6 +191,8 @@ def apply_linear_precision(
     if not current_platform.has_block_scaled_gemm(selected[0][1].weight.device):
         logger.warning("linear_precision %s needs a block-scaled GEMM, not on this GPU; staying on bf16", precision)
         return []
+    block_quant.resolve()
+    block_scaled_gemm.resolve()
     for name, linear in selected:
         if linear.bias is not None:
             raise ValueError(f"{precision} replaces bias-free linears; {name!r} has a bias")

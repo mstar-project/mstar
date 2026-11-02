@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Hashable
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -46,13 +47,13 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
-from mstar.model.components.linear import LINEAR_PRECISIONS, apply_linear_precision
 from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_LEN,
     Qwen3TextEncoderSubmodule,
 )
+from mstar.model.components.linear import LINEAR_PRECISIONS, apply_linear_precision
 from mstar.model.flux2_klein.components.transformer import LOW_PRECISION_LINEARS
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
@@ -107,6 +108,7 @@ class Flux2KleinModel(Model):
         lora: list | None = None,
         linear_precision: str = "bf16",
         linear_precision_keep: list[str] | None = None,
+        linear_precision_bf16_steps: int = 0,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -150,9 +152,11 @@ class Flux2KleinModel(Model):
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraFile.parse(item) for item in (lora or [])]
         # The transformer's block linears through a block-scaled GEMM (mxfp8, nvfp4), with this deployment's extra
-        # bf16 patterns on top of the model's declaration. Trades image fidelity for speed; see docs/models.rst.
+        # bf16 patterns on top of the model's declaration, and optionally a request's first denoise steps in bf16.
+        # Trades image fidelity for speed; see docs/models.rst.
         self.linear_precision = linear_precision
         self.linear_precision_keep = tuple(linear_precision_keep or ())
+        self.bf16_steps = int(linear_precision_bf16_steps) if linear_precision != "bf16" else 0
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -452,6 +456,8 @@ class Flux2KleinModel(Model):
         for h, w in self.capture_edit_sizes:
             grid = self.config.latent_grid(h, w)
             shapes.append((IMAGE_EDIT_WALK, KleinShape(grid=grid, text_len=text_len, ref_grids=(grid,))))
+        if self.bf16_steps:
+            shapes += [(walk, replace(key, bf16_step=True)) for walk, key in shapes]
         return shapes
 
     def warmup_sizes(self) -> list[tuple[int, int]]:
@@ -495,12 +501,17 @@ class Flux2KleinModel(Model):
             )
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)
+            bf16_transformer = build_transformer(self.config, self.snapshot, device) if self.bf16_steps else None
             if self.loras:
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 
                 apply_transformer_loras(transformer, self.loras)
+                if bf16_transformer is not None:
+                    apply_transformer_loras(bf16_transformer, self.loras)
             # after the adapters: those fold into the bf16 weights this quantizes
-            apply_linear_precision(transformer, self.linear_precision, LOW_PRECISION_LINEARS, self.linear_precision_keep)
+            apply_linear_precision(
+                transformer, self.linear_precision, LOW_PRECISION_LINEARS, self.linear_precision_keep,
+            )
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
@@ -508,6 +519,7 @@ class Flux2KleinModel(Model):
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
+                bf16_transformer=bf16_transformer, bf16_steps=self.bf16_steps,
             )
         logger.warning("FLUX.2 klein has no submodule for node %r; running it dummy", node_name)
         return None

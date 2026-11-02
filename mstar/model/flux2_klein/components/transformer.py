@@ -30,7 +30,6 @@ from mstar.model.components.diffusion.rope import apply_rotary_interleaved
 from mstar.model.components.linear import FusedColumnLinear, LowPrecisionLinears
 from mstar.model.flux2_klein.config import Flux2TransformerConfig
 
-
 # ``linear_precision``: the GEMM-bound block linears may go low precision. The linears that set the modulation and take
 # the latents in and out carry little of the step's FLOPs and all of its conditioning, so they stay bf16.
 LOW_PRECISION_LINEARS = LowPrecisionLinears(

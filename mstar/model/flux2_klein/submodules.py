@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -61,6 +61,7 @@ class KleinShape:
     grid: tuple[int, int]                       # (h, w) latent tokens of the generated image
     text_len: int
     ref_grids: tuple[tuple[int, int], ...] = ()  # per reference image, in order
+    bf16_step: bool = False                     # a leading step under linear_precision_bf16_steps
 
     @property
     def image_tokens(self) -> int:
@@ -148,12 +149,17 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        bf16_transformer: nn.Module | None = None,
+        bf16_steps: int = 0,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
             capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
         )
         self.transformer = transformer
+        # A low-precision transformer's bf16 twin, for the leading steps of a request's loop.
+        self.bf16_transformer = bf16_transformer
+        self._bf16_steps = bf16_steps if bf16_transformer is not None else 0
         self.config = config
         self.rope = MultiAxisRoPE(config.transformer.rope_theta, config.transformer.axes_dims_rope)
         self._compiled_shapes: set[tuple] = set()
@@ -161,13 +167,35 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             # In place, so the module keeps its identity (dtype property, tests' swaps);
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
-            compile_transformer_forward(
-                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
-            )
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_transformer_forward(
+                        module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                    )
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
+
+    def _step_key(self, fwd_info: CurrentForwardPassInfo, key: KleinShape) -> KleinShape:
+        """A step's key: the request's, marked on the leading steps that run bf16. A request's own key stays shape
+        alone, since its schedule and seeds outlive any one step."""
+        return replace(key, bf16_step=True) if self.step_index(fwd_info) < self._bf16_steps else key
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs | None:
+        node_inputs = super().prepare_inputs(graph_walk, fwd_info, inputs, **kwargs)
+        if node_inputs is not None and self._bf16_steps:
+            node_inputs.resource_step_info = self._step_key(fwd_info, node_inputs.resource_step_info)
+        return node_inputs
+
+    def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None, **kwargs):
+        if not self._bf16_steps:
+            return super().cg_key_info(graph_walk, per_request_info, per_request_input_metadata, **kwargs)
+        # Padding rows carry no step metadata (see the base)
+        keys = [
+            self._step_key(info, self.bucket_key_for(info)) for info in per_request_info.values() if info.step_metadata
+        ]
+        return self._uniform_key(keys) if keys else None
 
     def schedule_for(self, fwd_info, bucket_key: KleinShape) -> FlowMatchSchedule:
         return FlowMatchSchedule.build(
@@ -224,7 +252,8 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             if key not in self._compiled_shapes:
                 self._compiled_shapes.add(key)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
-        velocity = self.transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
+        transformer = self.bf16_transformer if bucket_key.bf16_step else self.transformer
+        velocity = transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
         velocity = velocity[:, : latents.shape[1]]
         return euler_step(latents, velocity, sigma, sigma_next)
 

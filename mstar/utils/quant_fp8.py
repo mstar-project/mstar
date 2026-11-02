@@ -142,18 +142,16 @@ def _mxfp8_quant_kernel(
 
 @triton.jit
 def _nvfp4_quant_kernel(
-    y_ptr, q_ptr, s_ptr, rows, k, col_tiles, inverse_tensor_scale,
-    ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
+    y_ptr, q_ptr, s_ptr, rows, k, col_tiles, ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: packed e2m1 data, e4m3 scales rounded up, in units of the
-    tensor scale. One read per value."""
+    """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: packed e2m1 data, e4m3 scales rounded up. One read per
+    value."""
     g = tl.program_id(0).to(tl.int64)
     col_tile = tl.program_id(1).to(tl.int64)
     row = g * ROWS + tl.arange(0, ROWS)
     live = (row < rows)[:, None]
     offs = row[:, None] * k + col_tile * (BLOCKS * BLOCK) + tl.arange(0, BLOCKS * BLOCK)[None, :]
-    y = tl.load(y_ptr + offs, mask=live, other=0.0).to(tl.float32) * inverse_tensor_scale
-    y = tl.reshape(y, [ROWS, BLOCKS, BLOCK])
+    y = tl.reshape(tl.load(y_ptr + offs, mask=live, other=0.0).to(tl.float32), [ROWS, BLOCKS, BLOCK])
     want = tl.max(tl.abs(y), axis=2) / 6.0
     code = want.to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32)
     code = code + (code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) < want).to(tl.int32)
@@ -173,10 +171,11 @@ def _nvfp4_quant_kernel(
 
 
 @torch.compiler.disable
-def quant_block(x: torch.Tensor, fmt: BlockFormat, tensor_scale: float = 1.0) -> BlockQuant:
+def quant_block(x: torch.Tensor, fmt: BlockFormat) -> BlockQuant:
     """Quantize a contiguous bf16 ``[rows, K]`` activation for a block-scaled GEMM; ``fp8_block.quantize_block`` is the
-    host-side reference. NVFP4's block scales are in units of ``tensor_scale``. Rows need not fill a scale tile: the
-    GEMM doesn't read scales past its M. A graph break, like ``per_token_group_quant_fp8``."""
+    host-side reference. NVFP4's block scales are in units of one, with no ``tensor_scale`` returned: an activation
+    needs the range of e4m3 alone, and reading it twice for its maximum costs as much as quantizing it. Rows need not
+    fill a scale tile: the GEMM doesn't read scales past its M. A graph break, like ``per_token_group_quant_fp8``."""
     rows, k = x.shape
     k_blocks = k // fmt.block
     col_tiles = k_blocks // BLOCKS_PER_TILE
@@ -191,8 +190,6 @@ def quant_block(x: torch.Tensor, fmt: BlockFormat, tensor_scale: float = 1.0) ->
         return BlockQuant(data, scale.view(fmt.scale_dtype))
     packed = torch.empty(rows, k // fmt.packing, dtype=torch.uint8, device=x.device)
     _nvfp4_quant_kernel[grid](
-        x, packed, scale, rows, k, col_tiles, 1.0 / tensor_scale,
-        ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=fmt.block,
+        x, packed, scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=fmt.block,
     )
-    tensor = torch.full((1,), tensor_scale, dtype=torch.float32, device=x.device)
-    return BlockQuant(packed.view(fmt.data_dtype), scale.view(fmt.scale_dtype), tensor)
+    return BlockQuant(packed.view(fmt.data_dtype), scale.view(fmt.scale_dtype))

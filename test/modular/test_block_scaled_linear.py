@@ -211,9 +211,8 @@ def test_a_candidate_with_a_bias_is_refused():
 def _klein_names(num_layers=2, num_single_layers=3):
     config = Flux2TransformerConfig(num_layers=num_layers, num_single_layers=num_single_layers)
     with torch.device("meta"):
-        return [
-            name for name, module in Flux2DiT(config).named_modules() if isinstance(module, (nn.Linear, FusedColumnLinear))
-        ]
+        modules = Flux2DiT(config).named_modules()
+    return [name for name, module in modules if isinstance(module, (nn.Linear, FusedColumnLinear))]
 
 
 def test_klein_declaration_classifies_every_linear():
@@ -276,3 +275,4 @@ def test_quant_block_host_contract(monkeypatch, fmt, kernel, block, stored):
     (call,) = rec.calls
     assert call["grid"] == (3, k // block // 4)
     assert call["kwargs"] == {"ROWS": 32, "BLOCKS": 4, "BLOCK": block}
+    assert q.tensor_scale is None
