@@ -23,7 +23,7 @@ from mstar.engine.resources.sampler.utils import (
     FilterOrder,
     SamplerBuffers,
 )
-from mstar.engine.rows import RowSpace, RowState, StepRows
+from mstar.engine.rows import RowBuffer, RowSpace, RowState, StepRows
 
 
 class SamplerRows(RowState):
@@ -105,6 +105,14 @@ class SamplerRows(RowState):
         # every leaving row, removed or not: the slot of a removed request is
         # freed only now, after its check-in was queued
         rows.on_commit(lambda released: bufs.drop_slots(masters))
+
+    def buffer_of(self, view: torch.Tensor) -> RowBuffer:
+        """The loop-back buffer (last token or a declared state) whose dense
+        view ``view`` is."""
+        for buf in (self.last_token, *self.loopback.values()):
+            if buf.device.data_ptr() == view.data_ptr():
+                return buf
+        raise ValueError("not a dense view of the sampler's loop-back rows")
 
     def sampler_for(self, bs: int, slot: int | None) -> AcceleratorGraphableSampler:
         """A sampler over the first ``bs`` rows, cached: the rows never move.

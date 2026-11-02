@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from mstar.engine.rows.batch import PersistentBatch, RowDiff
-from mstar.engine.rows.copy import RowTable, copy_segments, move_rows
+from mstar.engine.rows.copy import RowTable, StagedTables, copy_segments, move_rows
 from mstar.engine.rows.stage import new_stage, step_mirrors
 from mstar.utils.h2d import _H2D, _cuda_memcpy_async
 
@@ -267,12 +267,14 @@ class StepRows:
         have no host state left to update."""
         self._on_commit.append(fn)
 
-    def stage(self) -> None:
+    def stage(self, in_graph: bool = False) -> None:
         """Upload what this step changes, on the current stream. Nothing for a
-        step that changes nothing."""
+        step that changes nothing. ``in_graph``: the step replays a graph
+        captured with ``RowSpace.prologue``, which applies the upload and
+        gathers the rows itself, so ``apply`` and ``gather`` launch nothing."""
         self._check_joins()
         with self.space._ring_lock:
-            self._staged = self.space._stage(self)
+            self._staged = self.space._stage(self, in_graph)
 
     def commit(self, forward: bool = True) -> np.ndarray:
         """The step is launching: its rows become the committed state, with
@@ -287,6 +289,13 @@ class StepRows:
         staged it: after the previous step's replay, before this one's."""
         if self._staged is not None:
             self.space._apply(self._staged)
+
+    def apply_ahead(self) -> None:
+        """Apply an upload staged for the step's graph now, on the current
+        stream, so writes into the rows made before the replay land after it
+        (the replay then applies nothing). For the rare step that writes them."""
+        if self._staged is not None and self._staged.in_graph:
+            self.space._tables.apply()
 
     @property
     def stale(self) -> bool:
@@ -334,12 +343,15 @@ def _tensor_ptr(buf: RowBuffer, t: torch.Tensor) -> int:
 class _Block:
     """One staged step: where its segment tables sit in a device block."""
 
-    __slots__ = ("entry", "phases", "stream")
+    __slots__ = ("entry", "phases", "stream", "in_graph")
 
-    def __init__(self, entry: _RingEntry, phases: list[tuple[int, int, int]], stream: int | None):
+    def __init__(
+        self, entry: _RingEntry, phases: list[tuple[int, int, int]], stream: int | None, in_graph: bool = False,
+    ):
         self.entry = entry
         self.phases = phases  # (table byte offset, segments, longest segment) per phase
         self.stream = stream  # the raw stream it was staged on
+        self.in_graph = in_graph  # staged into the space's StagedTables, for the graph to apply
 
 
 class _RingEntry:
@@ -368,6 +380,7 @@ class RowSpace:
     def __init__(
         self, max_rows: int, device: torch.device, depth: int = 8, block_bytes: int = 16 << 10,
         labels: Mapping[str, tuple[str, ...]] | None = None, capacity: int | None = None,
+        staged_bytes: int = 256 << 10,
     ):
         self.max_rows = max_rows
         self.device = torch.device(device)
@@ -396,6 +409,10 @@ class RowSpace:
         # (stagings it covers, event), oldest first
         self._events: deque[tuple[int, torch.Event]] = deque()
         self._memcpy = _cuda_memcpy_async() if self.device.type == "cuda" else None
+        # where a captured step's upload lands, for its graph to apply; a larger
+        # one is applied eagerly from a ring block before the replay
+        self._staged_bytes = staged_bytes
+        self._tables: StagedTables | None = None
         self._device_index = self.device.index if self.device.index is not None else (
             torch.cuda.current_device() if self._memcpy is not None else -1)
 
@@ -492,6 +509,10 @@ class RowSpace:
             [(b._resident, b._device) for b in moved if not b.mirrored or b.step], self.device,
         )
 
+        if self._memcpy is not None:
+            self._tables = StagedTables(self._staged_bytes, self.device)
+        self._dense_ptrs = frozenset(b._device.data_ptr() for b in self.buffers if b.moved)
+
         self._stepped = [b for b in self.buffers if b.step]
         if self._stepped:
             self._arange = torch.arange(rows, dtype=torch.int32, device=self.device)
@@ -520,12 +541,33 @@ class RowSpace:
                 buf._device.add_(self._active.view(-1, *(1,) * len(buf.shape)), alpha=buf.step)
         move_rows(self._scatter_table, self._scatter_at, self.max_rows, gather=False)
 
+    def prologue(self, n: int) -> None:
+        """What a captured step's graph runs before its forward: the step's
+        staged upload (``StepRows.stage(in_graph=True)``), then the gather of
+        its ``n`` rows."""
+        if self._tables is None:
+            raise RuntimeError("rows staged in a graph need CUDA")
+        self._tables.apply()
+        self.gather(n)
+
+    def owns(self, t: torch.Tensor) -> bool:
+        """Whether ``t`` is (the start of) a dense step view: a captured graph
+        fills it in its prologue, so it can be the graph's input as it is."""
+        self.seal()
+        return t.data_ptr() in self._dense_ptrs
+
     def resync(self) -> None:
         """A step's rows committed but its forward may not have run: the next
         step uploads the mirrors whole, which puts the device rows back."""
         if any(not b.mirrored for b in self._stepped):
             raise RuntimeError("device-only stepped rows can't be resynced from the host")
         self._resync = True
+
+    def drop_staged(self) -> None:
+        """A step staged for its graph may not have replayed: drop its upload,
+        on the current stream, so no later replay applies it."""
+        if self._tables is not None:
+            self._tables.clear()
 
     def _host_view(self, buf: RowBuffer, slab: np.ndarray) -> np.ndarray:
         slots = self.capacity + 2
@@ -577,7 +619,7 @@ class RowSpace:
 
     # staging
 
-    def _stage(self, step: StepRows) -> _Block | None:
+    def _stage(self, step: StepRows, in_graph: bool) -> _Block | None:
         d = step.diff
         stage = step._stage
         if self._resync:
@@ -589,23 +631,29 @@ class RowSpace:
             stage.header(d.idx, self.max_rows, self.pad_slot, self.trash_slot, self._header.data_ptr())
         if stage.is_empty():
             return None
-        return self._upload(stage, step._keep)
+        return self._upload(stage, step._keep, in_graph)
 
-    def _upload(self, stage, keep: list[torch.Tensor]) -> _Block:
-        """The stage's tables and payload to a device block, as one copy."""
+    def _upload(self, stage, keep: list[torch.Tensor], in_graph: bool) -> _Block:
+        """The stage's tables and payload to a device block, as one copy:
+        for a graph's prologue, the space's StagedTables, header first."""
         total = stage.size()
-        entry = self._take(total)
+        tables = self._tables
+        in_graph = in_graph and tables is not None and StagedTables.HEADER + total <= tables.nbytes
+        head = StagedTables.HEADER if in_graph else 0
+        entry = self._take(head + total)
         entry.keep = keep
-        base = entry.device.data_ptr()
-        placed = stage.pack(entry.view, base)
+        base = tables.payload_base if in_graph else entry.device.data_ptr()
+        placed = stage.pack(entry.view[head:], base)
+        if in_graph:
+            entry.view[:head] = tables.header(placed).view(np.uint8)
         stream = None
         if self._memcpy is not None:
             # the raw handle directly: `torch.cuda.current_stream` costs ~20x more
             stream = torch._C._cuda_getCurrentRawStream(self._device_index)
-            self._h2d(base, entry.host.data_ptr(), total, stream)
+            self._h2d(base - head, entry.host.data_ptr(), head + total, stream)
         elif self.device.type != "cpu":
             entry.device[:total].copy_(entry.host[:total], non_blocking=True)
-        return _Block(entry, placed, stream)
+        return _Block(entry, placed, stream, in_graph)
 
     def _h2d(self, dst: int, src: int, nbytes: int, stream: int) -> None:
         err = self._memcpy(dst, src, nbytes, _H2D, stream)
@@ -635,18 +683,22 @@ class RowSpace:
             self._record()
         events[0][1].synchronize()
 
-    def _record(self) -> None:
+    def _record(self, covers: int | None = None) -> None:
         stream = torch.accelerator.current_stream(self.device)
-        self._events.append((self._staged, stream.record_event()))
+        self._events.append((self._staged if covers is None else covers, stream.record_event()))
 
     def _apply(self, block: _Block) -> None:
         entry = block.entry
-        for at, count, longest in block.phases:
-            copy_segments(entry.words, entry.view, at, count, longest, block.stream)
+        # a block staged for a graph is read by its replay, still to come:
+        # an event recorded now covers only the stagings before it
+        covers = self._staged - 1 if block.in_graph else self._staged
+        if not block.in_graph:
+            for at, count, longest in block.phases:
+                copy_segments(entry.words, entry.view, at, count, longest, block.stream)
         if self.device.type != "cpu" and (
-            not self._events or self._staged - self._events[-1][0] >= self._EVENT_EVERY
+            not self._events or covers - self._events[-1][0] >= self._EVENT_EVERY
         ):
-            self._record()
+            self._record(covers)
 
     def _commit(self, step: StepRows, forward: bool) -> np.ndarray:
         with self._lock:

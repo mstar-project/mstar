@@ -479,9 +479,14 @@ class LLMSubmodule(ARNodeSubmodule):
             laps.lap("tokens")
             decode = graph_walk == "decode"
             # rows whose last step ran elsewhere brought their token
-            if not decode or any(
-                inp.input_ids is not None and inp.input_seq_len for inp in inputs
-            ):
+            routed = [
+                i for i, inp in enumerate(inputs) if inp.input_ids is not None and inp.input_seq_len
+            ] if decode else None
+            if decode and sampler.loopback_on_rows:
+                # the step's rows are the ids: the routed tokens go into them
+                if routed:
+                    sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
+            elif not decode or routed:
                 ids = self._splice_row_ids(ids, inputs, decode)
             laps.lap("splice")
             out["input_ids"] = ids

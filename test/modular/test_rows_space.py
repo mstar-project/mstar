@@ -18,8 +18,10 @@ class _Sim:
     """A resource's view of the rows: a length and page table with host truth
     per request, and device-only state checked out of a per-request store."""
 
-    def __init__(self, device, capacity=CAPACITY):
-        self.space = RowSpace(MAX_ROWS, device, depth=2, block_bytes=256, capacity=capacity)
+    def __init__(self, device, capacity=CAPACITY, staged_bytes=256 << 10):
+        self.space = RowSpace(
+            MAX_ROWS, device, depth=2, block_bytes=256, capacity=capacity, staged_bytes=staged_bytes,
+        )
         # a length the forward appends one to, as KV's would be
         self.lens = self.space.buffer("lens", (), torch.int32, pad=0, step=1)
         self.table = self.space.buffer("table", (PAGES,), torch.int32, pad=-1)
@@ -39,7 +41,7 @@ class _Sim:
     def _active_state(self):
         return (torch.arange(MAX_ROWS, device=self.space.device) < self.space.n_active).unsqueeze(1)
 
-    def step(self, rids, rng, commit=True, forward=None):
+    def step(self, rids, rng, commit=True, forward=None, in_graph=False, append=True):
         rows = self.space.propose(rids)
         d = rows.diff
         for rid in d.join_rids:
@@ -55,12 +57,12 @@ class _Sim:
             rows.copy_in(self.state, d.join_slots, self.store, np.array(d.join_rids))
         # a page appended to some staying rows, as KV would at a page crossing
         staying = [rid for rid in d.order if rid not in d.join_rids]
-        appended = [rid for rid in staying if rng.random() < 0.3]
+        appended = [rid for rid in staying if append and rng.random() < 0.3]
         if appended:
             cols = np.array([rng.randrange(PAGES) for _ in appended])
             vals = np.array([rng.randrange(100) for _ in appended], np.int32)
             rows.write_at(self.table, np.array([rows.slot_of(r) for r in appended]), (cols,), vals)
-        rows.stage()
+        rows.stage(in_graph=in_graph)
         if not commit:
             return rows
         if appended:
@@ -252,6 +254,56 @@ def test_a_captured_step_steps_the_rows_active_at_replay():
     torch.cuda.current_stream().wait_stream(stream)
     for _ in range(40):
         sim.step(rng.sample(range(12), rng.randint(1, MAX_ROWS)), rng, forward=graph.replay)
+        sim.check()
+
+
+def _captured_prologue(sim):
+    """A graph of what a captured step runs: the rows' prologue, the forward, ``after_forward``."""
+    sim.space.seal()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph):
+        sim.space.prologue(MAX_ROWS)
+        sim.state.device[:] += sim._active_state()
+        sim.space.after_forward()
+    torch.cuda.current_stream().wait_stream(stream)
+    return graph
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+@pytest.mark.parametrize("staged_bytes", [256 << 10, 64])
+def test_a_replay_applies_the_upload_staged_for_it(staged_bytes):
+    """A step staged for its graph uploads into the block the graph's prologue
+    applies before gathering; one too large for it is applied before the
+    replay instead. A repeated step stages nothing, and its replay applies
+    nothing again."""
+    rng = random.Random(1)
+    sim = _Sim("cuda", staged_bytes=staged_bytes)
+    graph = _captured_prologue(sim)
+    rids = None
+    for _ in range(80):
+        repeat = rids is not None and rng.random() < 0.4
+        if not repeat:
+            rids = rng.sample(range(12), rng.randint(1, MAX_ROWS))
+        sim.step(rids, rng, forward=graph.replay, in_graph=True, append=not repeat)
+        sim.check()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+def test_an_upload_whose_replay_never_ran_is_dropped():
+    rng = random.Random(2)
+    sim = _Sim("cuda")
+    graph = _captured_prologue(sim)
+    rids = [1, 2, 3]
+    sim.step(rids, rng, forward=graph.replay, in_graph=True)
+    for _ in range(5):
+        # pages staged for the replay, then the step fails before it commits
+        while not sim.step(rids, rng, commit=False, in_graph=True)._staged:
+            pass
+        sim.space.drop_staged()
+        # nothing to stage: a replay applying the failed step's pages would show them
+        sim.step(rids, rng, forward=graph.replay, in_graph=True, append=False)
         sim.check()
 
 

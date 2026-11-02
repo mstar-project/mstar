@@ -749,6 +749,11 @@ class AcceleratorGraphRunner:
         # walk -> device work each of its forwards owes before and after it
         # (``add_forward_hooks``)
         self._forward_hooks: dict[str, tuple[Callable[[SlotLease], None], Callable[[], None]]] = {}
+        # walk -> whether a preprocessed tensor is device state the graph's
+        # ``before`` hook fills, used as the graph's input in place
+        self._owned_inputs: dict[str, Callable[[torch.Tensor], bool]] = {}
+        # (config_idx, key) of the inputs that are
+        self._aliased_inputs: set[tuple[int, str]] = set()
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
@@ -1156,8 +1161,11 @@ class AcceleratorGraphRunner:
             static_inputs = prepare()
             # Intern before capture so every bucket of this config records the
             # same GPU addresses; replay writes real values into them.
+            owns = self._owned_inputs.get(walk)
             for key, value in list(static_inputs.items()):
-                if isinstance(value, torch.Tensor):
+                if isinstance(value, torch.Tensor) and owns is not None and owns(value):
+                    self._aliased_inputs.add((spec.config_idx, key))
+                elif isinstance(value, torch.Tensor):
                     seq_dim_override = (
                         config.input_seq_dims.get(key) if config.input_seq_dims else None
                     )
@@ -1390,11 +1398,16 @@ class AcceleratorGraphRunner:
 
     def add_forward_hooks(
         self, graph_walk: str, before: Callable[[SlotLease], None], after: Callable[[], None],
+        owns: Callable[[torch.Tensor], bool] | None = None,
     ) -> None:
         """Run ``before`` (given the captured spec's lease) and ``after``
         around the forward in every graph captured for ``graph_walk`` (not in
-        the warm-up forwards, which run for real)."""
+        the warm-up forwards, which run for real). A preprocessed tensor
+        ``owns`` accepts is one ``before`` fills: the graph reads it in place,
+        and a replay copies nothing into it."""
         self._forward_hooks[graph_walk] = (before, after)
+        if owns is not None:
+            self._owned_inputs[graph_walk] = owns
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.
@@ -1551,6 +1564,14 @@ class AcceleratorGraphRunner:
             if not isinstance(value, torch.Tensor):
                 continue
             static_buf = slot.static_inputs[key]
+            if value.data_ptr() == static_buf.data_ptr():
+                continue
+            if (slot.config_idx, key) in self._aliased_inputs:
+                # the graph refills it before its forward, over anything copied here
+                raise RuntimeError(
+                    f"{key!r} is a graph input the replay fills itself; a step's "
+                    "preprocess must hand it on as it got it"
+                )
             seq_dim = self._static_buffer_seq_dims.get((slot.config_idx, key), 0)
             static_buf.narrow(seq_dim, 0, value.shape[seq_dim]).copy_(value)
 

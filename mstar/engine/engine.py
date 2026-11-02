@@ -873,6 +873,7 @@ class Engine:
                     walk,
                     functools.partial(node_rows.before_forward, walk),
                     node_rows.space(walk).after_forward,
+                    owns=functools.partial(node_rows.owns, walk),
                 )
 
     def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> Sequence[int] | None:
@@ -1590,8 +1591,10 @@ class Engine:
                 self._runner.clear_preplan()
                 batch.preplanned_rids = None
             rows = batch.step_context.rows
-            if rows is not None and rows.committed:
-                rows.space.resync()
+            if rows is not None:
+                rows.space.drop_staged()
+                if rows.committed:
+                    rows.space.resync()
             batch.step_context.rows = None
             raise
         finally:
@@ -2009,11 +2012,13 @@ class Engine:
             t0 = phase_start()
             # after every resource planned, so one upload carries all their
             # writes; committed before the launch releases the main thread,
-            # which may then remove a request this step checked in; gathered
-            # before preprocess, which reads and overwrites the step's rows
-            rows.stage()
+            # which may then remove a request this step checked in. A replay
+            # applies the upload and gathers the rows in its graph's prologue;
+            # an eager step gathers them before preprocess, which reads them
+            rows.stage(in_graph=lease is not None)
             self._rows[batch.node_name].commit(ctx.graph_walk, rows)
-            self._rows[batch.node_name].gather(ctx.graph_walk, len(ctx.padded_request_ids))
+            if lease is None:
+                self._rows[batch.node_name].gather(ctx.graph_walk, len(ctx.padded_request_ids))
             phase_end("engine.rows", t0)
 
         laps = PhaseLaps("engine.")

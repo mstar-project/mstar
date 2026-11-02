@@ -24,7 +24,7 @@ from mstar.engine.resources.sampler.utils import (
     _rng_offset_stride,
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
-from mstar.engine.rows import RowState
+from mstar.engine.rows import RowState, StepRows
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -145,6 +145,8 @@ class SamplerResource(Resource):
         self._fixed_masters = False
         # the rows and row count of the step planned last, if it ran on rows
         self._row_step: tuple[SamplerRows, int] | None = None
+        # the step's rows (None while capturing)
+        self._step_rows: StepRows | None = None
 
     @property
     def _penalty_live(self) -> bool:
@@ -578,6 +580,7 @@ class SamplerResource(Resource):
         self._cg_sampler = rows.sampler_for(bs, ctx.slot_lease.slot if ctx.slot_lease is not None else None)
         self._step_slot = None
         self._row_step = (rows, bs)
+        self._step_rows = ctx.rows
 
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask (and the
@@ -723,6 +726,13 @@ class SamplerResource(Resource):
         loop-back needs. False on an eager-only node or with the knob off."""
         return self._cg_buffers is not None and self._keep_last_token
 
+    @property
+    def loopback_on_rows(self) -> bool:
+        """Whether this step's loop-back reads are its persistent rows: values
+        a row brings of its own go in with ``overwrite_rows``, since a replay
+        refills the views from the rows before its forward."""
+        return self._row_step is not None
+
     def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
         """The last sampled token of each row of this step, as its input ids,
         read on the device. Under a slot lease the planned slot's index row
@@ -783,7 +793,24 @@ class SamplerResource(Resource):
             return
         if self._row_stager is None:
             self._row_stager = PinnedStager(torch.long, numel=64)
-        index = torch.empty(len(rows), dtype=torch.long, device=updates[0][0].device)
-        self._row_stager.copy_(index, rows)
+        n = len(rows)
+        if self._row_step is None:
+            index = torch.empty(n, dtype=torch.long, device=updates[0][0].device)
+            self._row_stager.copy_(index, rows)
+            for dst, src in updates:
+                dst.index_copy_(0, index, src.to(dst.dtype))
+            return
+        # on persistent rows the slots take them too: a replay gathers its
+        # rows from them in its graph, over the dense view written here, once
+        # the step's upload (a joining row's check-out) has landed
+        row_state, _ = self._row_step
+        step_rows = self._step_rows
+        if step_rows is None:
+            raise RuntimeError("a captured step's rows bring no values of their own")
+        step_rows.apply_ahead()
+        index = torch.empty(2 * n, dtype=torch.long, device=updates[0][0].device)
+        self._row_stager.copy_(index, [*rows, *step_rows.diff.idx[rows].tolist()])
         for dst, src in updates:
-            dst.index_copy_(0, index, src.to(dst.dtype))
+            src = src.to(dst.dtype)
+            dst.index_copy_(0, index[:n], src)
+            row_state.buffer_of(dst).resident.index_copy_(0, index[n:], src)

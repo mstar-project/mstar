@@ -213,10 +213,9 @@ class _Harness:
         padded = tuple(order) + tuple(-1 - i for i in range(BUCKET - len(order)))
         ctx.set_padded_rids(padded)
         step = self._plan(ctx, padded)
-        ctx.rows.stage()
+        # the replay applies the upload and gathers the rows in its prologue
+        ctx.rows.stage(in_graph=True)
         self.node_rows.commit(WALK, ctx.rows)
-        ctx.rows.apply()
-        self.node_rows.gather(WALK, BUCKET)
         for t in (self.q, self.k, self.v):
             t.normal_()
         graph, out = self.graphs[slot]

@@ -199,10 +199,16 @@ class NodeRows:
 
     def before_forward(self, walk: str, lease: SlotLease) -> None:
         """Before the forward of the graph captured for ``walk`` on ``lease``:
-        every state's ``before_forward``, which builds from the step's
-        gathered rows."""
-        for state in self._walks[walk].states:
+        the rows' prologue (the step's upload applied, its rows gathered),
+        then every state's ``before_forward``, which builds from them."""
+        w = self._walks[walk]
+        w.space.prologue(lease.bucket.bs)
+        for state in w.states:
             state.before_forward(lease)
+
+    def owns(self, walk: str, t: torch.Tensor) -> bool:
+        """Whether ``t`` is a dense view of ``walk``'s rows (``RowSpace.owns``)."""
+        return self._walks[walk].space.owns(t)
 
     def gather(self, walk: str, n: int) -> None:
         """A step of ``walk`` over ``n`` rows, once its rows are applied: see ``RowSpace.gather``."""

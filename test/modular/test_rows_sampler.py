@@ -20,6 +20,7 @@ if not torch.cuda.is_available():
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.base import CachedPrefix  # noqa: E402
@@ -114,7 +115,57 @@ class _Toy(NodeSubmodule):
         return out
 
 
-def _engine(penalty: bool = False, max_live: int | None = None, logprobs: bool = False) -> Engine:
+class _Captured(_Toy):
+    """The rows walk replayed from a graph: preprocess hands the loop-back
+    views on as the forward's inputs, which each replay fills from the rows
+    before its forward. A graph can't index by request, so every handle draws
+    from one distribution, and requests differ by their sampler state."""
+
+    def __init__(self, penalty: bool = False):
+        super().__init__(penalty)
+        self.logits[:] = self.logits[0]
+        # set: preprocess hands on a copy of the ids instead of the view
+        self.copy_ids = False
+
+    def get_accelerator_graph_configs(self, device, tp_world_size=1):
+        return [BatchedAcceleratorGraphConfig(
+            capture_graph_walk=ROWS_WALK,
+            single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+            capture_batch_sizes=[MAX_ROWS], compile=False,
+        )]
+
+    def preprocess(self, graph_walk, engine_inputs, inputs):
+        if graph_walk != ROWS_WALK:
+            return super().preprocess(graph_walk, engine_inputs, inputs)
+        rids = list(engine_inputs.request_ids)
+        sampler = engine_inputs.resources["sampler"]
+        ids, acc = sampler.loopback_tokens(rids), sampler.loopback_state(ACC, rids)
+        routed = [i for i, rid in enumerate(rids) if rid in self.routed]
+        if routed:
+            sampler.overwrite_rows(
+                routed,
+                (ids, torch.tensor([self.routed[rids[i]][0] for i in routed], device="cuda")),
+                (acc, torch.tensor([self.routed[rids[i]][1] for i in routed], device="cuda")),
+            )
+        self.routed = {}
+        return {"ids": ids.clone() if self.copy_ids else ids, "acc": acc}
+
+    def forward_batched(self, graph_walk, engine_inputs, ids=None, acc=None, **kwargs):
+        if graph_walk != ROWS_WALK:
+            return super().forward_batched(graph_walk, engine_inputs, **kwargs)
+        rids = list(engine_inputs.request_ids)
+        sampler = engine_inputs.resources["sampler"]
+        prev, acc = ids.clone(), acc.clone()
+        tokens = sampler.sample(rids, self.logits[:len(rids)])
+        sampler.store_loopback_state(ACC, rids, acc + 1)
+        return BatchedModelOutput(
+            row_outputs={"token": tokens, "prev": prev, "acc": acc}, check_stop_buffers={"token": tokens},
+        )
+
+
+def _engine(
+    penalty: bool = False, max_live: int | None = None, logprobs: bool = False, captured: bool = False,
+) -> Engine:
     spec = SamplerSpec(
         resource_key="sampler", nodes={NODE}, vocab_size=VOCAB, enable_repetion_penalty=penalty,
         enable_logprobs=logprobs,
@@ -122,9 +173,10 @@ def _engine(penalty: bool = False, max_live: int | None = None, logprobs: bool =
     )
     engine = Engine(None, autocast_dtype=None, max_concurrent_requests=max_live)
     engine.load_model(
-        submodules={NODE: _Toy(penalty)}, specs=[spec],
+        submodules={NODE: (_Captured if captured else _Toy)(penalty)}, specs=[spec],
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
-        device=torch.device("cuda"), transfer_engine_info=None,
+        # capture sizes its graphs on an indexed device
+        device=torch.device("cuda", 0) if captured else torch.device("cuda"), transfer_engine_info=None,
     )
     engine.warmup()
     return engine
@@ -208,10 +260,11 @@ def _step(engine, walk, rids):
     }
 
 
+@pytest.mark.parametrize("captured", [False, True])
 @pytest.mark.parametrize("seed", range(3))
-def test_each_request_draws_from_its_own_state_across_rows_and_removals(seed):
+def test_each_request_draws_from_its_own_state_across_rows_and_removals(seed, captured):
     rng = random.Random(seed)
-    engine = _engine()
+    engine = _engine(captured=captured)
     space = engine._rows[NODE].space(ROWS_WALK)
     gen = [0] * HANDLES
     # rid -> (config, draws so far, last token drawn)
@@ -252,18 +305,20 @@ def test_each_request_draws_from_its_own_state_across_rows_and_removals(seed):
     # every slot a removed request held came back
     bufs = engine._resources["sampler"]._cg_buffers
     assert not bufs._orphaned
-    assert len(bufs._rid_to_slot) == len(live)
+    # (a capture's padding rows keep theirs: negative handles, also on main)
+    assert len([rid for rid in bufs._rid_to_slot if rid >= 0]) == len(live)
 
 
+@pytest.mark.parametrize("captured", [False, True])
 @pytest.mark.parametrize("max_live", [None, 16])
 @pytest.mark.parametrize("seed", range(3))
-def test_a_value_routed_in_preprocess_is_what_the_forward_reads(seed, max_live):
+def test_a_value_routed_in_preprocess_is_what_the_forward_reads(seed, max_live, captured):
     """A row whose token and loop-back state come routed (a request's first
     decode step) has them overwritten in preprocess (``overwrite_rows``); the
     forward fills the step's rows from their slots first, and must still read
     the routed values, and the next step what this one stored."""
     rng = random.Random(seed)
-    engine = _engine(max_live=max_live)
+    engine = _engine(max_live=max_live, captured=captured)
     toy = engine._submodules[NODE].submodule
     gen = [0] * HANDLES
     # rid -> (token, state) its next step reads, once known
@@ -417,3 +472,14 @@ def test_requests_past_the_fixed_masters_wait_for_a_row(monkeypatch, ingraph_sca
     queued = [engine.check_ready(NODE, rid, _info(rid, ROWS_WALK)).queued for rid in range(MAX_ROWS + 2)]
     assert queued == [False] * MAX_ROWS + [True] * 2
     _step(engine, ROWS_WALK, list(range(MAX_ROWS)))
+
+
+def test_a_replay_refuses_a_rows_input_its_preprocess_replaced():
+    """The replay refills its rows inputs before the forward, so a copy
+    preprocess made of one would be overwritten unread."""
+    engine = _engine(captured=True)
+    engine.add_request(1, {"sampler": _config(1, 1)})
+    _step(engine, ROWS_WALK, [1])
+    engine._submodules[NODE].submodule.copy_ids = True
+    with pytest.raises(RuntimeError, match="fills itself"):
+        _step(engine, ROWS_WALK, [1])
