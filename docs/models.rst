@@ -279,7 +279,7 @@ OmniVoice notes
 - The backbone is not autoregressive: it fills a fixed canvas of eight codebook
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
-- The backbone's layer stack replays CUDA graphs per (requests, packed-token
+- The backbone's layer stack replays accelerator graphs per (requests, packed-token
   bucket up to 4096 tokens) with attention through a ragged attention resource;
   larger steps are GPU-bound and run eagerly. The layer loop is mstar's own over
   the reference's fused weights: q/k norms read the fused QKV output in place
@@ -301,8 +301,8 @@ Higgs Audio notes
 - The audio tower runs outside ``torch.compile`` (a clip's chunk count changes
   its shape, and every new shape recompiled on the serving path). Requests
   whose 4 s chunks share a mel width are encoded together, and full-width
-  chunks replay a CUDA graph per chunk count; a clip under one chunk is padded
-  to the full width and masked (``HiggsAudioTower``'s ``valid_frames``) so it
+  chunks replay an accelerator graph per chunk count; a clip under one chunk is
+  padded to the full width and masked (``HiggsAudioTower``'s ``valid_frames``) so it
   replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
   tower eagerly.
 - One prefill step per request: the ChatML text around the audio and the audio
@@ -638,7 +638,7 @@ Qwen3-Omni notes
   video frame group), FlashInfer by default, so no ``flash-attn`` install is
   needed. A deployment can pick the kernel under ``resources:`` in its YAML,
   e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
-  is captured as a CUDA graph per token-count bucket; a request past the
+  is captured as an accelerator graph per token-count bucket; a request past the
   largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
 - The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
   log-mel features: a step's clips (up to 8 requests) go through one packed
@@ -876,7 +876,7 @@ VoxCPM2 notes
   ``ref_audio`` clip (cloning) or ``ref_audio`` with its transcript in
   ``ref_text`` (continuation). Output is 48 kHz.
 - The Talker's decode step (both LMs, the local DiT solve, the stop head) is
-  ``torch.compile``'d and captured as CUDA graphs at start-up, so a first
+  ``torch.compile``'d and captured as accelerator graphs at start-up, so a first
   start-up with a cold Inductor cache takes 10 to 30 minutes (591 s on a
   B200, 1,723 s on an H100), and about two minutes once the cache is warm.
   ``model_kwargs: {compile_talker: false}``
