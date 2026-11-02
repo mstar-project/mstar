@@ -1,6 +1,7 @@
 """Test-support helpers for the GLM-5.2 fp8-block path and its CPU resources."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 
 import torch
@@ -108,8 +109,11 @@ class ReferenceAttentionResource(AttentionResource):
         self.reset_default_cursors()
         self._views = ctx.plan_results[self._kv_name]["main"].views
 
-    def qo_indptr_buf(self, label: str = "main"):
-        return None
+    # the plan's host views, read outside dynamo as FlashInfer reads its plan
+    @torch.compiler.disable
+    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
+        last = torch.tensor([view.to_compute for view in self._views]).cumsum(0) - 1
+        return hidden.index_select(0, last)
 
     @torch.compiler.disable
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
@@ -145,6 +149,23 @@ class GreedySampler(Resource):
     def sample(self, request_ids, logits, **kwargs):
         del request_ids, kwargs
         return logits.argmax(dim=-1)
+
+
+@contextlib.contextmanager
+def recorded_logits(sampler: Resource):
+    """The logits each forward hands ``sampler``, in call order."""
+    seen: list[torch.Tensor] = []
+    sample = sampler.sample
+
+    def record(request_ids, logits, **kwargs):
+        seen.append(logits)
+        return sample(request_ids, logits=logits, **kwargs)
+
+    sampler.sample = record
+    try:
+        yield seen
+    finally:
+        del sampler.sample
 
 
 class _StubTransferManager:

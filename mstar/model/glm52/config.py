@@ -5,21 +5,24 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.position.config import PositionConfig
+from mstar.model import keys
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 # Engine resource labels for the one LLM node: the paged (latent) KV cache,
 # the attention resource planned over it, the token positions over it, the
-# sampler. Layers bind the first two by these names (``bind_resources``); the
-# model declares all four in ``get_node_resources``.
+# sampler. Layers bind the first three by these names (``bind_resources``); the
+# model declares all four in ``get_node_resources``. The sampler takes `keys`'
+# name, which `SampledTokenDecoder` declares its step on; the node's ``POS_KEY``
+# names the positions.
 KV_RESOURCE = "kv"
 ATTN_RESOURCE = "attn"
 POS_RESOURCE = "pos"
-SAMPLER_RESOURCE = "sampler"
+SAMPLER_RESOURCE = keys.SAMPLER
 # dsa_long_context: the DSA resource (mstar/engine/resources/dsa)
 DSA_RESOURCE = "dsa"
 
 # config.json keys read by Glm52ModelConfig.from_hf_config under the same
-# name (eos_token_id becomes eos_token_ids).
+# name (eos_token_id becomes stop_token_ids).
 _HF_REQUIRED_KEYS = (
     "vocab_size", "hidden_size", "num_hidden_layers", "num_attention_heads",
     "rms_norm_eps", "hidden_act",
@@ -114,10 +117,10 @@ class Glm52ModelConfig:
     num_nextn_predict_layers: int = 1
 
     # --- tokens / generation defaults ---
-    eos_token_ids: tuple[int, ...] = (154820, 154827, 154829)
+    stop_token_ids: frozenset[int] = frozenset({154820, 154827, 154829})
     pad_token_id: int = 154820
     # None: a request that names no max_tokens may run to the end of the window,
-    # as in vLLM; the submodule caps each request at what its prompt leaves.
+    # as in vLLM; the conductor cuts each request's loop cap to what its prompt leaves.
     max_output_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 0.95
@@ -227,7 +230,7 @@ class Glm52ModelConfig:
             **{k: hf_config[k] for k in _HF_REQUIRED_KEYS if k != "eos_token_id"},
             **{k: hf_config[k] for k in _HF_OPTIONAL_KEYS if k in hf_config},
             rope_theta=float(rope_theta),
-            eos_token_ids=tuple(eos) if isinstance(eos, list) else (eos,),
+            stop_token_ids=frozenset(eos if isinstance(eos, list) else (eos,)),
             max_seq_len=hf_config["index_topk"],
             quantization_config=Fp8BlockQuantConfig.from_hf_config_dict(
                 hf_config.get("quantization_config")),
@@ -283,7 +286,7 @@ class Glm52ModelConfig:
             num_experts_per_tok=2,
             max_position_embeddings=512,
             max_seq_len=512,
-            eos_token_ids=(250, 251, 252),
+            stop_token_ids=frozenset({250, 251, 252}),
             pad_token_id=250,
             prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],

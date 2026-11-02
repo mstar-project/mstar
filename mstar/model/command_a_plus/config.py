@@ -2,14 +2,16 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-# Resource names shared by the text components and the LLM node.
-KV_CACHE = "kv_cache"
+from mstar.model import keys
+
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
+# one attention resource per window over the one cache: the sliding layers
+# and the global (NoPE) layers plan different FlashInfer kernels
 LOCAL_ATTN = "local_attn"
 GLOBAL_ATTN = "global_attn"
-ROPE = "rope"
-SAMPLER = "sampler"
-
-PREFILL_WALKS = ("prefill", "prefill_image")
+ROPE = keys.ROPE
+SAMPLER = keys.SAMPLER
 
 
 @dataclass
@@ -42,6 +44,10 @@ class CommandAPlusTextConfig:
     def shared_intermediate_size(self) -> int:
         """Width of the shared MLP, derived from the expert dimensions."""
         return self.intermediate_size * self.num_shared_experts
+
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset({self.eos_token_id})
 
 
     @classmethod

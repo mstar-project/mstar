@@ -88,7 +88,7 @@ def _load(tmp_path, monkeypatch, fp8: bool, **model_kwargs):
             if name.endswith("e_score_correction_bias"):
                 param.data = param.data.float()
         process_weights_after_loading(ref, DEVICE)
-        submodule = Glm52LLMSubmodule(language_model=ref, config=cfg)
+        submodule = Glm52LLMSubmodule(ref, cfg)
     submodule.requires_grad_(False)
     return model, submodule
 
@@ -201,7 +201,8 @@ class _Node:
             streams[rid].append(int(out["new_token"][0].item()))
             texts[rid] = out["text_inputs"][0].clone()
         live = list(self.prompts)
-        for it in range(MAX_TOKENS + 2):
+        # the request's loop cap ends decode, as the graph runtime does
+        for _ in range(self.model.get_loop_caps(max_output_tokens=MAX_TOKENS)["decode_loop"]):
             if not live:
                 break
             for rid in live:
@@ -212,7 +213,6 @@ class _Node:
                 self.sub.postprocess(rid, infos[rid], out)
                 streams[rid].append(int(out["new_token"][0].item()))
                 texts[rid] = out["text_inputs"][0].clone()
-                infos[rid].dynamic_loop_iter_counts["decode_loop"] = it
                 if self.sub.check_stop(rid, infos[rid], out):
                     live.remove(rid)
         return streams
@@ -225,11 +225,13 @@ class _Node:
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_capture_at_real_latent_dims_matches_eager(tmp_path, monkeypatch, fp8):
-    monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    from mstar.model.glm52.submodules import Glm52LLMSubmodule
+
+    monkeypatch.setattr(Glm52LLMSubmodule, "DECODE_CAPTURE_BATCH_SIZES", [1, 2, 4])
     model, submodule = _load(tmp_path, monkeypatch, fp8)
     assert model.config.kv_lora_rank == 512 and model.config.mla_absorb
     if fp8:
-        moe = submodule.language_model.model.layers[1].mlp
+        moe = submodule.model.model.layers[1].mlp
         assert moe.fp8_experts and moe._use_fused
 
     prompts = BUCKET_PROMPTS if fp8 else PROMPTS

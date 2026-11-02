@@ -255,11 +255,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget lives in check_stop,
-            # which sees the request's real max_tokens. Sized to the most
-            # decode steps any prompt can take before the context guard, not
-            # to the default budget: at the default, every request asking for
-            # more was cut short at 1025 tokens with no error.
+            # The window every request's loop cap (get_loop_caps) must fit: the
+            # most decode steps a one-token prompt can take before the context guard.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -310,8 +307,8 @@ class Glm52Model(Model):
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
         elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
+            # The decode Loop ended at a stop id or at the request's loop cap;
+            # either way the request is finished.
             request_done = True
             metadata.kwargs["decode_finished"] = True
 
@@ -520,7 +517,7 @@ class Glm52Model(Model):
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model, self.config)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:

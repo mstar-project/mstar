@@ -275,21 +275,6 @@ class _Cosmos3Tokenizer:
         return 2
 
 
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
-    from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-
-    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0), image_token_id=1)
-
-    cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
-
-    assert cap["decode_loop"] == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
@@ -440,23 +425,6 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     # every prompt carries the clip: no text walk, mixed step or prefix keys
     assert "prefill_text" not in model.get_graph_walk_graphs() and model.get_combined_graph_walks() == {}
     assert model.kv_labels()[KV_CACHE]["main"].keys is None
-
-
-@pytest.mark.parametrize("max_tokens", [1, 2, 64])
-def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.glm52.glm52_model import Glm52Model
-    from mstar.model.glm52.submodules import Glm52LLMSubmodule
-
-    model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
-    llm = object.__new__(Glm52LLMSubmodule)
-    llm.config = model.config
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
 
 
 def _omni_submodule():
@@ -624,6 +592,10 @@ def _token_decoder(name: str):
         model = object.__new__(CanaryModel)
         model.config = SimpleNamespace(max_position_embeddings=1024)
         return model
+    if name == "glm52":
+        from mstar.model.glm52.glm52_model import Glm52Model
+
+        return Glm52Model(model_path_hf="", tokenizer_mode="byte")
     if name == "qwen3_asr":
         from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
         from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
@@ -632,16 +604,19 @@ def _token_decoder(name: str):
         model.config = Qwen3ASRModelConfig()
         return model
     from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
     from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
     from mstar.model.orpheus.orpheus_model import OrpheusModel
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
-    classes = {"canary_qwen": CanaryQwenModel, "higgs": HiggsAudioModel, "orpheus": OrpheusModel,
-               "qwen3_5": Qwen3_5DenseModel}
+    classes = {"canary_qwen": CanaryQwenModel, "command_a_plus": CommandAPlusModel, "higgs": HiggsAudioModel,
+               "orpheus": OrpheusModel, "qwen3_5": Qwen3_5DenseModel}
     return object.__new__(classes[name])
 
 
-@pytest.mark.parametrize("name", ["canary", "canary_qwen", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"])
+@pytest.mark.parametrize(
+    "name", ["canary", "canary_qwen", "command_a_plus", "glm52", "higgs", "orpheus", "qwen3_5", "qwen3_asr", "whisper"],
+)
 @pytest.mark.parametrize("max_tokens", [2, 64])
 def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
     """The prefill samples the first token and the decode loop's cap runs the

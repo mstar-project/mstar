@@ -183,19 +183,13 @@ def test_batch_of_two_matches_single_streams(mla_absorb):
         out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
         emitted[rid].append(out["new_token"][0])
         texts[rid] = out["text_inputs"][0]
-    live = set(prompts)
-    steps = dict.fromkeys(prompts, 0)
-    for _ in range(20):
-        if not live:
-            break
-        outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in sorted(live)})
-        for rid in sorted(live):
+    # ignore_eos: the loop cap, the request's budget, ends both
+    cap = Glm52Model(model_path_hf="", tokenizer_mode="byte").get_loop_caps(max_output_tokens=14)["decode_loop"]
+    for _ in range(cap):
+        outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in prompts})
+        for rid in prompts:
             emitted[rid].append(outs[rid]["new_token"][0])
             texts[rid] = outs[rid]["text_inputs"][0]
-            infos[rid].dynamic_loop_iter_counts["decode_loop"] = steps[rid]
-            steps[rid] += 1
-            if sub.check_stop(rid, infos[rid], outs[rid]):
-                live.discard(rid)
     for rid in prompts:
         got = torch.cat(emitted[rid])
         assert torch.equal(got, singles[rid]), f"{rid}: {got.tolist()} vs {singles[rid].tolist()}"
@@ -208,24 +202,6 @@ def test_declare_step_shapes():
     step = sub.declare_step("prefill", ["r0"], inputs)
     assert set(step.keys()) == {"kv", "attn", "pos", "sampler"}
     assert step.segments[0].span == 3
-
-
-def test_last_rows_slices_padded_prefill_to_real_requests():
-    # A captured prefill plan pads qo_indptr to the bucket and tail-fills it
-    # with the last real offset. _last_rows must return one row per real
-    # request, not one per bucket slot: a padded slot duplicates the final
-    # request's row and hands the sampler more logit rows than it has
-    # per-request params (an out-of-bounds read on the eager sampler).
-    cfg = _cfg(mla_absorb=True)
-    sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    # three real requests (lengths 5, 7, 3) captured in a bucket of four
-    qo_indptr = torch.tensor([0, 5, 12, 15, 15])
-    hidden = torch.randn(15, cfg.hidden_size)
-    sub._attn = lambda _ei: SimpleNamespace(qo_indptr_buf=lambda _slot: qo_indptr)
-    engine_inputs = SimpleNamespace(request_ids=["a", "b", "c"])
-    rows = sub._last_rows(engine_inputs, hidden, {})
-    assert rows.shape[0] == 3
-    assert torch.equal(rows, hidden[[4, 11, 14]])
 
 
 # ── the context limit ────────────────────────────────────────────────────
@@ -263,7 +239,7 @@ def test_a_prompt_without_room_fails_alone():
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     fits, full = torch.arange(14) + 3, torch.arange(15) + 3
     sub.prepare_inputs("prefill", _fwd_info("a", 8, True), {"text_inputs": [fits]})
-    with pytest.raises(RuntimeError, match="exceeds the 14 served"):
+    with pytest.raises(ValueError, match="exceeds the 14 served"):
         sub.prepare_inputs("prefill", _fwd_info("b", 8, True), {"text_inputs": [full]})
 
 
@@ -288,7 +264,7 @@ def _errors(caplog) -> list[str]:
 def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
     # the prefill walk has no decode_loop to stop: its stop ends the partition
     cfg = _cfg(True)
-    eos = cfg.eos_token_ids[0]
+    eos = min(cfg.stop_token_ids)
     driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
     sampler = driver.resources[SAMPLER_RESOURCE]
     greedy = sampler.sample
