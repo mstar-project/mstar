@@ -5,6 +5,7 @@ writes, and a captured replay that writes the next step's slots."""
 import pytest
 import torch
 
+from mstar.engine.resources.attn import aiter as _aiter_attention  # noqa: F401  registers the op
 from mstar.engine.resources.attn import prologue
 from mstar.platforms import current_platform
 
@@ -69,3 +70,32 @@ def test_a_captured_call_writes_the_slots_it_is_replayed_with():
     want, want_cache = _run(prologue._reference, qkv, qw, kw, cos, sin, positions,
                             torch.zeros_like(cache), fresh, heads, kv_heads)
     torch.testing.assert_close(cache.float(), want_cache.float(), rtol=1.6e-2, atol=1.6e-2)
+
+
+@pytest.mark.parametrize("keys", [40, 300, 5000, 20000])
+@pytest.mark.parametrize("rows", [1, 4, 64])
+def test_the_decode_segment_pin_reads_every_key(rows, keys):
+    """A row past the pin is covered by wider segments, not cut: the same answer as the cache's whole context."""
+    from mstar.engine.resources.attn.aiter import DECODE_SEGMENT_PIN
+
+    if rows * keys > 400000:
+        pytest.skip("more KV than this test needs")
+    g = torch.Generator(device=DEV).manual_seed(rows + keys)
+    pages = rows * (keys // PAGE + 1) + 2
+    cache = torch.randn(pages, 2, PAGE, 4, 256, device=DEV, generator=g).to(torch.bfloat16)
+    q = torch.randn(rows, 8, 256, device=DEV, generator=g).to(torch.bfloat16)
+    lens = torch.full((rows,), keys, dtype=torch.int32, device=DEV)
+    table = torch.zeros(rows, pages + 2, dtype=torch.int32, device=DEV)
+    for r in range(rows):
+        n = keys // PAGE + 1
+        table[r, :n] = torch.arange(1 + r * n, 1 + (r + 1) * n, dtype=torch.int32, device=DEV)
+    qptr = torch.arange(rows + 1, dtype=torch.int32, device=DEV)
+    outs = []
+    for pin in (32768, DECODE_SEGMENT_PIN):
+        out = torch.empty_like(q)
+        torch.ops.mstar.aiter_unified_attention(
+            q, cache[:, 0], cache[:, 1], out, qptr, lens, table, 1, pin, 256 ** -0.5,
+        )
+        outs.append(out.float())
+    torch.cuda.synchronize()
+    torch.testing.assert_close(outs[1], outs[0], rtol=1e-2, atol=1e-2)
