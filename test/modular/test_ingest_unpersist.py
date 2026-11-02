@@ -325,6 +325,37 @@ def _stream_consumer(consumer_active=True):
     ]
 
 
+def _held_for_a_later_step():
+    """The reference clip a chunk step reads is still held for the producer's
+    later step: each later chunk's pass carries a signal-only edge, so the
+    clip is counted once per step that read it."""
+    walks = {
+        "a0": GraphNode(name="na", input_names=["text_inputs"], outputs=[
+            StreamingGraphEdge(next_node="nb", name="tok", target_partition="B"),
+        ]),
+        "a1": GraphNode(name="na", input_names=["ref"], outputs=[]),
+        "b": GraphNode(name="nb", input_names=["tok", "ref"], outputs=[
+            GraphEdge(next_node=EMIT_TO_CLIENT, name="audio", output_modality="audio"),
+        ]),
+    }
+    model = _ToyModel(walks, {"A": [WalkStep("a0"), WalkStep("a1")], "B": [WalkStep("b")]},
+                      {"A": ["a0", "a1"], "B": ["b"]},
+                      connections=[Connection("A", "B", "tok", lambda: FixedChunkPolicy(chunk_size=1))])
+    return model, {"text_inputs": [PROMPT], "ref": [_info(REF)]}, {}, [
+        ("B", "b", {}, False), ("B", "b", {}, False), ("A", "a0", {}, False), ("A", "a1", {}, False),
+        ("B", "b", {}, True),
+    ], [
+        ("NEW_REQUEST", "A", "a0", {("na", "text_inputs"): [PROMPT]}, False),
+        ("NEW_REQUEST", "B", "b", {("nb", "ref"): [REF]}, False),
+        ("UNPERSIST_TENSORS", PREPROCESS, {PROMPT: 1}),
+        ("INPUT_SIGNALS", "B", "b", {("nb", "ref"): []}, False),
+        ("INPUT_SIGNALS", "B", "b", {("nb", "ref"): []}, False),
+        ("INPUT_SIGNALS", "A", "a1", {("na", "ref"): [REF]}, False),
+        ("UNPERSIST_TENSORS", PREPROCESS, {REF: 2}),
+        ("INPUT_SIGNALS", "B", "b", {}, False),  # producer_done
+    ]
+
+
 def _stream_moved_walks():
     """Qwen3-Omni's Talker: the stream moves it through its prefill walks; the
     conductor sends only the decode seed, after the last prefill reports."""
@@ -444,6 +475,7 @@ _PLANS = {
     "a loop fed ahead of it": _fed_loop,
     "stream consumer re-sends": _stream_consumer,
     "inactive consumer": lambda: _stream_consumer(consumer_active=False),
+    "a chunk step's input held for a later step": _held_for_a_later_step,
     "walks the stream moves": _stream_moved_walks,
 }
 

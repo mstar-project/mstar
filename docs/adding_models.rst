@@ -168,7 +168,8 @@ You must implement these abstract methods:
    ``mstar.conductor.request_info``) in its step metadata; ``media_prefill_step`` does
    this for a ``MultimodalDecoderModel``.
    A step whose walk a stream feeds and that is a bare node runs once per chunk until the
-   worker reports the stream's final chunk; any other step advances when its walk
+   worker reports the stream's final chunk, its inputs' tensors sent with the first chunk
+   only; any other step advances when its walk
    reports, and the partition is done after its last step. A ``ValueError`` here refuses
    the request with a 400, and so does a plan of ``[]`` for every partition (nothing would
    ever run). A plan the conductor can't run is a model bug, refused with a 500: a step

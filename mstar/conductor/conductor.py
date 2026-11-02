@@ -2000,12 +2000,15 @@ class Conductor:
         # Request done when ALL partitions are done
         return all(ps.is_done for ps in request_data.partition_states.values())
 
-    def _plan_step(self, request_data: RequestData, pstate: PartitionState, k: int) -> ForwardPassArgs:
+    def _plan_step(
+        self, request_data: RequestData, pstate: PartitionState, k: int, with_tensors: bool = True,
+    ) -> ForwardPassArgs:
         """Enter step ``k`` of the partition's plan: each input of its walk gets
         the persisted signal its ``bind`` names, or its own name's, or an
-        empty edge (an empty loop-back seed, a chunk tick)."""
+        empty edge (an empty loop-back seed, a chunk tick). Without
+        ``with_tensors`` every edge is empty."""
         step = pstate.plan[k]
-        held = request_data.persist_signals
+        held = request_data.persist_signals if with_tensors else {}
         inputs = [
             GraphEdge(next_node=node, name=name, tensor_info=list(held.get(step.bind.get(name, name), ())))
             for name, node in self._walk_inputs[step.walk]
@@ -2040,8 +2043,9 @@ class Conductor:
             if k + 1 < len(plan) and not self._walk_inputs[plan[k + 1].walk]:
                 return stay
         elif walk in self._repeating_walks:
-            # what it read on entry is already released or still held for a later step
-            return self._plan_step(request_data, pstate, k)
+            # each chunk's pass gets the step's edges, so its node is ready; the
+            # tensors went with the first, and a later step may still hold them
+            return self._plan_step(request_data, pstate, k, with_tensors=False)
         if k + 1 >= len(plan):
             stay.request_done = True
             return stay

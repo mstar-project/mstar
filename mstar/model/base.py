@@ -874,7 +874,8 @@ class Model(ABC):
         that samples the reply's first token sets `FINAL_PREFILL` in its
         ``step_metadata``. A step whose
         walk a stream feeds, and that is a bare node (or its chunk loop), runs
-        once per chunk until the worker reports the stream's final chunk. A
+        once per chunk until the worker reports the stream's final chunk, its
+        inputs' tensors sent with the first chunk only. A
         ``ValueError`` refuses the request with a 400, and so does a plan of
         ``[]`` for every partition. A plan the conductor can't run is a model
         bug, refused with a 500: a step whose walk is not the partition's, a
