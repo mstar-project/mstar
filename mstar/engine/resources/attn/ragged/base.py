@@ -362,6 +362,10 @@ class _RaggedManagerBase:
         self._preplanned = ctx.is_preplan
 
     def clear_preplan(self):
+        # The dropped plan's H2Ds went on the plan stream, and the step that runs
+        # instead waits on no event from it, so it must stage its layout itself.
+        for wrapper in self._preplan_states.values():
+            wrapper.forget_plan()
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}

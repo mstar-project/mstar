@@ -454,7 +454,17 @@ A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on
 0.8B, H200). Greedy output can differ from earlier releases at near-tie
-tokens; prefill and eager steps are unchanged.
+tokens; prefill and eager steps are unchanged (``knobs: {ingraph_decode_rope: true}``
+does the same for captured text prefill and mixed steps).
+
+The prefill, mixed and vision captures compile in Inductor's deterministic mode
+whatever ``-O`` says: autotuning them bought no GPU time and took about a fifth of
+the cold start. The decode capture keeps the ``-O`` level's tuned kernels. ``knobs:
+{compile_deterministic: true}`` compiles it deterministically too: greedy output then
+reproduces across server processes and the cold start more than halves. One-row
+decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
+at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
+c=4 up it makes no difference.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
@@ -465,8 +475,11 @@ With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
 token's raw log-prob in its chunk's ``metadata`` (``{"logprobs": [...]}``, one per
 token, as ``token_ids``). Qwen3.5 reports them; other models refuse the request
-with a 400. Top alternatives and OpenAI's ``logprobs`` are not supported yet. On
-any deployment,
+with a 400. Add ``enable_processed_logprobs: true`` and ``"logprobs_mode":
+"processed"`` for the log-prob under the distribution it was actually drawn from
+(penalties and top-k/top-p applied); greedy requests want ``"raw"``, as a greedy
+token scores 0 there. Top alternatives and OpenAI's ``logprobs`` are not
+supported yet. On any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.
@@ -1495,11 +1508,14 @@ first use. The first DiT call after startup is traced twice (a guard on the
 rotary table), so a server compiles at most two graphs per listed shape plus
 one.
 
-**UniPC runs inline, inside the DiT node.** Unlike cosmos3, the scheduler is not
-a separate stage: the solver state (the order-2 history buffer and the
-corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
-travels with the request rather than living in a scheduler object on one rank.
-Requests are therefore independent and the loop is resumable across ranks.
+**UniPC runs inline, inside the DiT node.** The scheduler is the DiT scaffold's
+(``components/diffusion/unipc.py``, which cosmos3 runs too), not a separate
+stage: the solver state (the order-2 history buffer and the corrector's
+``last_sample``) is carried on the denoise loop's own edges, so it travels with
+the request rather than living in a scheduler object on one rank. Requests are
+therefore independent and the loop is resumable across ranks. ``dit_max_batch_size``
+(default 1) lets requests at one latent grid and guidance scale share a forward,
+each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention

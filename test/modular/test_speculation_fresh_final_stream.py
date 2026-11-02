@@ -33,6 +33,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
+from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import (  # noqa: E402
     ChainPick,
     MicroScheduler,
@@ -89,6 +90,7 @@ def _worker(scheduler, runtime):
             get_fwd_info=lambda rid, partition: fwd[rid],
         ),
         _in_flight_rids=set(),
+        chunk_loops=ChunkLoops(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
     )
@@ -141,11 +143,11 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        pick_chain_step=lambda state, target, continuing: ChainPick(target, StepPick(
+        pick_chain_step=lambda state, target, continuing, mid_prefill=(): ChainPick(target, StepPick(
             taken=[*continuing, FRESH], continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
-        take_chain_step=lambda state, chain: fresh,
+        take_chain_step=lambda state, chain, *_: fresh,
     )
     runtime, target = _runtime()
     worker = _worker(scheduler, runtime)
@@ -156,6 +158,7 @@ def _follower_speculation(final: bool):
     head = SimpleNamespace(
         speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
+        chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,

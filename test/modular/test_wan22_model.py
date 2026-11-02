@@ -132,9 +132,13 @@ def test_wan22_submodules_route_through_forward_batched():
         Wan22VaeDecoderSubmodule,
     ):
         assert cls.forward_batched is not NodeSubmodule.forward_batched, cls.__name__
-        # ...and each caps the batch at one, which is what keeps that
-        # delegation honest (the scheduler reads this).
+    # ...and the encoders and the decoder cap the batch at one, which is what keeps
+    # their delegation honest (the scheduler reads this). The dit batches for real.
+    for cls in (Wan22TextEncoderSubmodule, Wan22VaeEncoderSubmodule, Wan22VaeDecoderSubmodule):
         assert cls.max_batch_size(cls, Wan22Model.VIDEO_GEN_WALK) == 1, cls.__name__
+    assert Wan22DitSubmodule(transformer=None, config=Wan22Config()).max_batch_size(Wan22Model.VIDEO_GEN_WALK) == 1
+    dit = Wan22DitSubmodule(transformer=None, config=Wan22Config(dit_max_batch_size=2))
+    assert dit.max_batch_size(Wan22Model.VIDEO_GEN_WALK) == 2
 
 
 def test_wan22_forward_batched_delegates_to_forward():
@@ -440,9 +444,17 @@ def _fwd_info(requested_steps: int, iter_count: int) -> CurrentForwardPassInfo:
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
-        step_metadata={"num_inference_steps": requested_steps},
+        step_metadata={
+            "num_inference_steps": requested_steps, "guidance_scale": 5.0, "height": 32, "width": 32, "num_frames": 5,
+        },
         dynamic_loop_iter_counts={DENOISE_LOOP_NAME: iter_count},
     )
+
+
+def _dit() -> Wan22DitSubmodule:
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule.get_device = lambda: torch.device("cpu")
+    return submodule
 
 
 # iter_count reads k while 0-based iteration k is being postprocessed, so
@@ -458,19 +470,17 @@ def _fwd_info(requested_steps: int, iter_count: int) -> CurrentForwardPassInfo:
     (100, 99, True),  # request at the ceiling stops on the loop's last iter
 ])
 def test_wan22_check_stop_boundary(requested_steps, iter_count, expect_stop):
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
+    submodule.request_state("r0").add("num_steps", requested_steps)
     stops = submodule.check_stop("r0", _fwd_info(requested_steps, iter_count), outputs={})
     assert (DENOISE_LOOP_NAME in stops) == expect_stop
     if not expect_stop:
         assert stops == set()
 
 
-def test_wan22_check_stop_without_step_metadata_never_stops():
+def test_wan22_check_stop_without_a_schedule_never_stops():
     # A missing step count must not stop the loop; max_iters still bounds it.
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
-    info = _fwd_info(requested_steps=0, iter_count=99)
-    info.step_metadata = {}
-    assert submodule.check_stop("r0", info, outputs={}) == set()
+    assert _dit().check_stop("r0", _fwd_info(requested_steps=0, iter_count=99), outputs={}) == set()
 
 
 # ----------------------------------------------------------------------
@@ -494,7 +504,7 @@ def _dit_loop_inputs() -> dict:
 def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
     # Async scheduling can dispatch iteration N after check_stop fired at
     # N - 1; prepare_inputs returns None so the engine skips that forward.
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
     result = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=2),
@@ -504,14 +514,14 @@ def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
 
 
 def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=1),
         inputs=_dit_loop_inputs(),
     )
     assert node_inputs is not None
-    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
+    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg", "timestep"} | LOOP_BACK_NAMES
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [
@@ -993,29 +1003,21 @@ def _dit_info(guidance: float) -> CurrentForwardPassInfo:
 
 
 @pytest.mark.parametrize("world_size,guidance,branches", [
-    (None, 5.0, 2),  # one GPU: both guidance branches in one batch-2 forward
+    (None, 5.0, 2),  # one GPU: both guidance branches in one forward
     (None, 1.0, 1),  # guidance off: the conditional branch alone
     (2, 5.0, 1),     # two ranks split the branches
     (2, 1.0, 1),     # nothing to split: both ranks run the one branch
     (3, 5.0, None),  # two branches do not split over three ranks: refused
 ])
-def test_wan22_dit_branches_per_rank(world_size, guidance, branches):
+def test_wan22_dit_attends_one_segment_per_branch_on_its_rank(world_size, guidance, branches):
     group = _FakeSPGroup(world_size) if world_size else None
     submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), sp_group=group)
-
-    def prepare():
-        return submodule.prepare_inputs(
-            graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(guidance), inputs=_dit_loop_inputs(),
-        )
+    key = submodule.bucket_key_for(_dit_info(guidance))
     if branches is None:
         with pytest.raises(ValueError, match="evenly"):
-            prepare()
+            submodule.attention_segments(key)
         return
-    node_inputs = prepare()
-    layout = node_inputs.resource_step_info
-    # latents [1, 4, 2, 2, 2] patchify (1, 2, 2) to 2 * 1 * 1 tokens
-    assert layout.video_tokens == 2 and node_inputs.input_seq_len == 2
-    assert layout.branches == branches
+    assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
 
 
 class _BranchEcho(torch.nn.Module):
@@ -1029,27 +1031,29 @@ class _BranchEcho(torch.nn.Module):
 class _TwoRankGroup(_FakeSPGroup):
     """One rank of a two-rank instance. The all-gather checks this rank's rows
     and returns both ranks' rows, as each rank's forward computes them."""
-    def __init__(self, rank: int, full: torch.Tensor):
+    def __init__(self, rank: int, full: torch.Tensor, rows: int):
         super().__init__(world_size=2, rank=rank)
-        self.full, self.gathers = full, 0
+        self.full, self.rows, self.gathers = full, rows, 0
 
     def all_gather(self, x, dim):
-        assert dim == 0 and torch.equal(x, self.full[self.rank:self.rank + 1])
+        assert dim == 0 and torch.equal(x, self.full[self.rank * self.rows:(self.rank + 1) * self.rows])
         self.gathers += 1
         return self.full
 
 
+@pytest.mark.parametrize("rows", [1, 2])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("guidance", [5.0, 1.0])
-def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rank, guidance):
-    """Each rank of the CFG-parallel pair forwards its own branch, gathers once
-    and only when guided, and the combine matches the one-GPU batch-2 forward."""
-    latents, ts = torch.zeros(1, 4, 2, 2, 2), torch.zeros(2)
-    pos, neg = torch.full((1, 8, 16), 3.0), torch.full((1, 8, 16), 1.0)
+def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rows, rank, guidance):
+    """Each rank of the CFG-parallel pair forwards its own branch of every row,
+    gathers once and only when guided, and the combine matches the one-GPU forward."""
+    latents, ts = torch.zeros(rows, 4, 2, 2, 2), torch.zeros(rows, 2)
+    pos = torch.arange(3.0, 3.0 + rows)[:, None, None].expand(rows, 8, 16)
+    neg = -torch.arange(1.0, 1.0 + rows)[:, None, None].expand(rows, 8, 16)
     one_gpu = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False))
     expected = one_gpu._noise_prediction(latents, ts, pos, neg, guidance)
     full = _BranchEcho()(latents.repeat(2, 1, 1, 1, 1), None, torch.cat([pos, neg]), None)
-    group = _TwoRankGroup(rank, full)
+    group = _TwoRankGroup(rank, full, rows)
     pair = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False), sp_group=group)
     assert torch.equal(pair._noise_prediction(latents, ts, pos, neg, guidance), expected)
     assert group.gathers == (1 if guidance > 1.0 else 0)
@@ -1072,12 +1076,14 @@ def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(sp_size, ok):
 
 
 def test_wan22_dit_declares_one_segment_per_branch():
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
+    info = _dit_info(5.0)
     node_inputs = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=info, inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
-    self_step = step.get(Wan22DitSubmodule.SELF_ATTN)
-    assert [(s.label, s.span) for s in self_step.segments] == [("video", 2), ("video", 2)]
+    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
+    span = submodule.num_tokens(submodule.bucket_key_for(info))
+    assert [(s.label, s.span) for s in step.segments] == [(submodule.MAIN_SPAN, span)] * 2
     sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
     assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None
