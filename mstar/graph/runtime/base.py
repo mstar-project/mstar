@@ -691,8 +691,8 @@ class PhasedPostprocess:
     over a runtime's three phases: the stops (``check_stops``, then
     ``stop_loops_batched``), the route (``complete_and_route_batch``) and the
     send (``send_outputs``). It stops for the worker where a phase needs
-    Python (``PostprocessNeed``). The Python runtime's postprocess, and the
-    reference the Rust runtime's own follows."""
+    Python (``PostprocessNeed``). The reference the Rust runtime's native
+    postprocess (``rust/src/graph/runtime/postprocess.rs``) follows."""
 
     _postprocess: _Postprocess | None = None
 

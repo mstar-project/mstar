@@ -6,7 +6,7 @@ and the Rust crossings a worker's main thread pays per step (the
 ``worker.postprocess.store_tensors`` and ``cleanup_inputs`` phases), with the
 GIL held throughout.
 
-Two stores over the same Rust bookkeeper (the ``MSTAR_RUST_GRAPH=1`` setup):
+Two stores over the same Rust bookkeeper, so only the store differs:
 
 - ``py-store``: the Python ``TensorStore`` -- tensors and ownership in Python
   dicts, every collectable uuid reported back and torn down per uuid in

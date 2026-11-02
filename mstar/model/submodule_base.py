@@ -517,7 +517,7 @@ NO_CHUNKING = ChunkingPolicy()
 
 # A chunk Loop's count before its prompt's first chunk sets the real cap (the
 # prompt's length), and the stride of a row that runs whole: it ends the Loop.
-# Within the u32 both runtimes hold loop counters in.
+# Within the u32 the runtime holds loop counters in.
 CHUNK_LOOP_END = 2**31 - 1
 
 

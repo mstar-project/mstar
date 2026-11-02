@@ -109,9 +109,8 @@ def _wrap_node_in_loop(
         ])
     if isinstance(section, Loop):
         # A chunkable node inside an existing Loop nests one loop in another,
-        # where the two runtimes order the completion cascade differently
-        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
-        # rather than ship a shape only one runtime gets right.
+        # whose completion cascades into the parent's (rust/src/graph/state.rs).
+        # Chunking does not handle that, so refuse it.
         if node_name in section.section.get_nodes():
             raise ValueError(
                 f"node {node_name!r} is chunkable and already inside Loop "
