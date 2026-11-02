@@ -700,8 +700,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_vision":
             cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
         if graph_walk != "prefill_text":
-            cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
-            cut.tensor_inputs["text_token_ids"] = tensors["text_token_ids"]
+            # a row cut here was prepared whole, so it advances by its whole
+            # span once; a row that declared no advance moves by its token count
+            cut.tensor_inputs["mrope_pos_advance"] = tensors.get("mrope_pos_advance", inputs.input_seq_len)
+            if "text_token_ids" in tensors:
+                cut.tensor_inputs["text_token_ids"] = tensors["text_token_ids"]
         return cut
 
     def declare_step(
