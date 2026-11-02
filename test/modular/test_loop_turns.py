@@ -40,6 +40,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
 from mstar.model.submodule_base import StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
+from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import ChainPick, MicroScheduler, ScheduledBatch  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
@@ -86,6 +87,7 @@ class _Runtime:
 def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, SimpleNamespace]:
     engine = SimpleNamespace(
         get_max_batch_size=lambda node, walk: 1,
+        get_max_batch_tokens=lambda node, walk: None,
         get_max_rows_in_combined=lambda node, walk: None,
         get_step_order=lambda node, walk: order,
         splits_by_capture_key=lambda node, walk: False,
@@ -412,14 +414,15 @@ def _worker(chain: ChainPick, prep, taken=None) -> SimpleNamespace:
         worker_id="w0",
         scheduler=SimpleNamespace(
             backlog_splits_from=lambda *a: False,
-            pick_chain_step=lambda state, target, continuing: chain,
-            take_chain_step=lambda state, chain: taken,
+            pick_chain_step=lambda state, target, continuing, mid_prefill=(): chain,
+            take_chain_step=lambda state, chain, *_: taken,
         ),
         _spec_preparer=SimpleNamespace(prepare=prep),
         tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
         request_state=SimpleNamespace(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
+        chunk_loops=ChunkLoops(),
         _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
             scheduled_batch=batch, gave_way=gave_way,
         ),
@@ -444,7 +447,7 @@ def test_prep_gets_the_chains_rows_in_line_and_the_room():
     line."""
     seen = {}
 
-    def prep(batch_N, node, walk, candidates, room, laps):
+    def prep(batch_N, node, walk, candidates, room, laps, loop_strides=None):
         seen["rids"], seen["room"] = list(candidates), room
         return SimpleNamespace(ready_rids=[])
 

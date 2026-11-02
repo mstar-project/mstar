@@ -537,8 +537,9 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             return (bool(new) and max(n[i] for i in new) == 1 and layers_runner is not None
                     and layers_runner.can_run(len(new)))
 
-        if step_runner is not None and all(steady):
-            # leased, with every stream steady: declare_step left every resource to the region
+        if engine_inputs.step is None:
+            # declare_step left every resource to the region, which its lease says can replay the batch
+            assert all(steady), "an encoder step declared nothing but is not all steady"
             steady = list(range(len(rids)))
         else:
             # This step's KV plan writes every stream's new frames, so the region (which

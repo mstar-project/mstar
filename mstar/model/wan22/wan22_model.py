@@ -86,6 +86,7 @@ class Wan22Model(Model):
         cache_dir: str | None = None,
         variant: str = WAN22_VARIANT_TI2V_5B,
         compile_dit_sizes: tuple[str, ...] | None = None,
+        dit_max_batch_size: int = Wan22Config.dit_max_batch_size,
         max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
@@ -102,6 +103,7 @@ class Wan22Model(Model):
         self.cache_dir = cache_dir
         self.config = Wan22Config(
             variant=variant, compile_dit_sizes=compile_dit_sizes,
+            dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
             attention_backend=attention_backend,
@@ -780,7 +782,7 @@ class Wan22Model(Model):
         """
         from diffusers import UniPCMultistepScheduler
 
-        from mstar.model.wan22.components.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
+        from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
 
         scheduler_config = UniPCMultistepScheduler.load_config(
             self.model_path_hf, subfolder="scheduler", cache_dir=self.cache_dir,

@@ -131,7 +131,7 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
@@ -1083,6 +1083,20 @@ class BagelModel(Model):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.bagel.submodules import LLMSubmodule, _unguided
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(
+                walks=("prefill_text",), chunkable=True, max_batch_tokens=budget,
+                # a guided row's cfg streams hold context the cache never keyed
+                reuses_cached_prefix=_unguided,
+            ),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(MIXED_TEXT,), max_batch_tokens=budget),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

@@ -298,6 +298,36 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
 
 
+def test_encoder_replays_exactly_when_leased():
+    """The forward replays when its step leased the region and runs eagerly
+    otherwise, whatever the runner's buckets allow: ``can_lease`` may have
+    refused a batch that fits one."""
+    from types import SimpleNamespace
+
+    from mstar.model.components.aut_submodule import AUT_ENCODE
+
+    class Runner:
+        def can_run(self, batch_size, total_tokens):
+            return True
+
+        def run(self, **kwargs):
+            self.ran = kwargs
+            return {"embeds": "replayed"}
+
+    sub, runner = object.__new__(Qwen3ASREncoderSubmodule), Runner()
+
+    def replay(leases):
+        engine_inputs = SimpleNamespace(
+            piecewise_runners={AUT_ENCODE: runner}, piecewise_leases=leases, request_ids=["a", "b"],
+        )
+        return sub._replay_encode(engine_inputs, torch.zeros(12, 8), [4, 8])
+
+    assert replay({}) is None
+    assert not hasattr(runner, "ran")
+    assert replay({AUT_ENCODE: object()}) == "replayed"
+    assert runner.ran["seq_lens"] == [4, 8] and runner.ran["real_bs"] == 2
+
+
 def test_encoder_packs_a_step_only_up_to_its_largest_capture():
     """Past the largest captured token count a step runs its clips one by one,
     so an eager step's activations are one clip's, not the whole batch's."""

@@ -188,6 +188,7 @@ class AttentionManager(AttentionResource):
                 max_rows_in_combined=info.max_rows_in_combined,
                 decode_tensor_cores=spec.config.decode_tensor_cores,
                 sliding_window=spec.config.sliding_window,
+                decode_fmha=spec.config.decode_fmha,
                 layers=spec.config.layers,
             )
 
@@ -246,8 +247,9 @@ class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
     between steps the re-plan is skippable."""
     q_seq_lens: tuple
-    page_indices: tuple
-    last_page_lens: tuple
+    # the int32 arrays' bytes
+    page_indices: bytes
+    last_page_lens: bytes
 
 
 class EagerSlotKey(NamedTuple):

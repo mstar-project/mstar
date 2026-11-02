@@ -130,9 +130,13 @@ def test_wan22_submodules_route_through_forward_batched():
         Wan22VaeDecoderSubmodule,
     ):
         assert cls.forward_batched is not NodeSubmodule.forward_batched, cls.__name__
-        # ...and each caps the batch at one, which is what keeps that
-        # delegation honest (the scheduler reads this).
+    # ...and the encoders and the decoder cap the batch at one, which is what keeps
+    # their delegation honest (the scheduler reads this). The dit batches for real.
+    for cls in (Wan22TextEncoderSubmodule, Wan22VaeEncoderSubmodule, Wan22VaeDecoderSubmodule):
         assert cls.max_batch_size(cls, Wan22Model.VIDEO_GEN_WALK) == 1, cls.__name__
+    assert Wan22DitSubmodule(transformer=None, config=Wan22Config()).max_batch_size(Wan22Model.VIDEO_GEN_WALK) == 1
+    dit = Wan22DitSubmodule(transformer=None, config=Wan22Config(dit_max_batch_size=2))
+    assert dit.max_batch_size(Wan22Model.VIDEO_GEN_WALK) == 2
 
 
 def test_wan22_forward_batched_delegates_to_forward():
@@ -438,9 +442,17 @@ def _fwd_info(requested_steps: int, iter_count: int) -> CurrentForwardPassInfo:
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
-        step_metadata={"num_inference_steps": requested_steps},
+        step_metadata={
+            "num_inference_steps": requested_steps, "guidance_scale": 5.0, "height": 32, "width": 32, "num_frames": 5,
+        },
         dynamic_loop_iter_counts={DENOISE_LOOP_NAME: iter_count},
     )
+
+
+def _dit() -> Wan22DitSubmodule:
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule.get_device = lambda: torch.device("cpu")
+    return submodule
 
 
 # iter_count reads k while 0-based iteration k is being postprocessed, so
@@ -456,19 +468,17 @@ def _fwd_info(requested_steps: int, iter_count: int) -> CurrentForwardPassInfo:
     (100, 99, True),  # request at the ceiling stops on the loop's last iter
 ])
 def test_wan22_check_stop_boundary(requested_steps, iter_count, expect_stop):
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
+    submodule.request_state("r0").add("num_steps", requested_steps)
     stops = submodule.check_stop("r0", _fwd_info(requested_steps, iter_count), outputs={})
     assert (DENOISE_LOOP_NAME in stops) == expect_stop
     if not expect_stop:
         assert stops == set()
 
 
-def test_wan22_check_stop_without_step_metadata_never_stops():
+def test_wan22_check_stop_without_a_schedule_never_stops():
     # A missing step count must not stop the loop; max_iters still bounds it.
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
-    info = _fwd_info(requested_steps=0, iter_count=99)
-    info.step_metadata = {}
-    assert submodule.check_stop("r0", info, outputs={}) == set()
+    assert _dit().check_stop("r0", _fwd_info(requested_steps=0, iter_count=99), outputs={}) == set()
 
 
 # ----------------------------------------------------------------------
@@ -492,7 +502,7 @@ def _dit_loop_inputs() -> dict:
 def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
     # Async scheduling can dispatch iteration N after check_stop fired at
     # N - 1; prepare_inputs returns None so the engine skips that forward.
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
     result = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=2),
@@ -502,14 +512,14 @@ def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
 
 
 def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    submodule = _dit()
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
         fwd_info=_fwd_info(requested_steps=2, iter_count=1),
         inputs=_dit_loop_inputs(),
     )
     assert node_inputs is not None
-    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg"} | LOOP_BACK_NAMES
+    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg", "timestep"} | LOOP_BACK_NAMES
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [
@@ -985,27 +995,21 @@ def _dit_info(guidance: float) -> CurrentForwardPassInfo:
 
 
 @pytest.mark.parametrize("guidance,branches", [
-    (5.0, 2),  # both guidance branches in one batch-2 forward
+    (5.0, 2),  # both guidance branches in one forward
     (1.0, 1),  # guidance off: the conditional branch alone
 ])
-def test_wan22_dit_branches(guidance, branches):
+def test_wan22_dit_attends_one_segment_per_branch(guidance, branches):
     submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
-    node_inputs = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(guidance), inputs=_dit_loop_inputs(),
-    )
-    layout = node_inputs.resource_step_info
-    # latents [1, 4, 2, 2, 2] patchify (1, 2, 2) to 2 * 1 * 1 tokens
-    assert layout.video_tokens == 2 and node_inputs.input_seq_len == 2
-    assert layout.branches == branches
+    key = submodule.bucket_key_for(_dit_info(guidance))
+    assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
 
 
-def test_wan22_dit_declares_one_segment_per_branch():
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
+    submodule = _dit()
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
-    self_step = step.get(Wan22DitSubmodule.SELF_ATTN)
-    assert [(s.label, s.span) for s in self_step.segments] == [("video", 2), ("video", 2)]
+    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
     sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
     assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None
