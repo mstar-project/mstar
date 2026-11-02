@@ -119,3 +119,8 @@ QKV_NORM_ROPE_CACHE = KernelOp(
     # fp32 norm and rotation, one rounding (or two: the kernel rounds the normalised q before rotating)
     tolerance=Tolerance.accumulated(rtol=1.6e-2, atol_scale=1e-2),
 )
+
+
+def available() -> bool:
+    """Whether this platform runs the fused prologue (its implementation loads)."""
+    return QKV_NORM_ROPE_CACHE.unavailable_reason() is None

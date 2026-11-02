@@ -206,9 +206,11 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
 
     class _Inner:
         embed_tokens = _Embed()
+        packed_prologue = False
 
-        def __call__(self, embeds, label, cos_sin):
-            calls["cos"] = cos_sin[0]
+        def __call__(self, embeds, label, cos_sin, positions=None):
+            calls["cos"] = None if cos_sin is None else cos_sin[0]
+            calls["positions"] = positions
             return embeds
 
         def build_cos_sin(self, pos, dtype):
@@ -243,6 +245,12 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
     # no lease (an eager step): the knob does not apply, the inputs are used
     c = run(None)
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
+    # layers on the packed prologue take the planned positions, no tables
+    _Inner.packed_prologue = True
+    c = run(object())
+    assert c["positions"].tolist() == [10, 20] and c["cos"] is None and "built" not in c
+    c = run(None)
+    assert c["positions"] is None and c["cos"] is static_cos
 
 
 def test_sampler_keeps_slot_masters_only_for_a_node_that_reads_them(monkeypatch):
