@@ -71,6 +71,8 @@ class LinearEmbed(nn.Module):
 class RelPositionAttention(nn.Module):
     """Transformer-XL style multi-head attention with learned position biases."""
 
+    lora_unservable = {"linear_pos": "projects position encodings, not the step's tokens"}
+
     def __init__(self, n_head: int, n_feat: int):
         super().__init__()
         self.h = n_head

@@ -50,7 +50,7 @@ import torch
 
 sys.path.insert(0, ".")
 
-from mstar.model.loader.base import _apply_stacked, load_weights_into
+from mstar.model.loader.base import apply_stacked, load_weights_into
 from mstar.model.waypoint.components.dit import WaypointDiT
 from mstar.model.waypoint.config import WaypointConfig
 from mstar.model.waypoint.weight_loader import (
@@ -537,7 +537,7 @@ def test_remap_checkpoint_key(key, expected):
     ],
 )
 def test_stacked_rules_route_the_two_fusions(mapped, target, shard):
-    assert _apply_stacked(mapped, WAYPOINT_STACKED_PARAMS) == (target, shard)
+    assert apply_stacked(mapped, WAYPOINT_STACKED_PARAMS) == (target, shard)
 
 
 # ---------------------------------------------------------------------------
