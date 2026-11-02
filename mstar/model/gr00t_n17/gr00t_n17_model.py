@@ -65,8 +65,7 @@ VISION_ENCODER, LLM, STATE_ENCODER, VL_BRIDGE, DENOISE_STEP = (
 
 # The Loop's name, which is **not** the walk's. The engine keys a loop's iteration
 # counter on `Loop.name` (a fresh uuid4 unless set) and the scaffold reads it back
-# by `loop_name`. If the two differ the counter reads 0 at every iteration and all
-# four steps denoise step 0 from fresh noise, silently, as `max_iters` still stops the loop.
+# by `loop_name`, so the two must match: a mismatch raises `KeyError` at the first step.
 DENOISE_LOOP = "denoise_loop"
 
 # Pillow's names for the formats that return the pixels they were given, among those
@@ -92,7 +91,7 @@ class Gr00tN17Model(Model):
 
     # `process_prompt` turns these into tensor edges, so the conductor drops them;
     # `postprocess` reads both back from the data worker's copy
-    # (`PreprocessWorkerThread._process_input`) to unnormalise the actions. `walk` is
+    # (`PreprocessWorkerThread._finish_input`) to unnormalise the actions. `walk` is
     # **not** here: the conductor picks the schedule (`Conductor._do_ingest_request`) after the strip.
     PREPROCESS_ONLY_KWARGS = ("state", "embodiment_tag")
 
@@ -429,12 +428,10 @@ class Gr00tN17Model(Model):
                 f"compression is a silent error. Use one of "
                 f"{sorted(_LOSSLESS_IMAGE_FORMATS)}"
             )
-        # the engine's own reader, so this inherits its decode limits and its
-        # RGB coercion (an RGBA or CMYK frame has no placeable channel axis)
-        try:
-            img = read_image(filepath, rgb=True)  # uint8 CxHxW
-        except (RuntimeError, OSError) as exc:  # the base loader's mapping: a 400, not a 500
-            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        # the engine's own reader, so this inherits its decode limits, its RGB coercion
+        # (an RGBA or CMYK frame has no placeable channel axis) and its 400 for a file
+        # that does not decode
+        img = read_image(filepath, rgb=True)  # uint8 CxHxW
         return TensorAndMetadata(img.permute(1, 2, 0).contiguous().to(device))
 
     def warmup_preprocess(self) -> None:
