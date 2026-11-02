@@ -1188,8 +1188,9 @@ placed exactly as weights are.
   node's does, from its own segments (an ``attn_key`` region's: one per row), planned
   per replay and handing the enclosing step's plan back at its commit. A region
   replayed as one row per step (``one_row_per_step``) addresses every row to the first
-  request's adapter, so the engine leases it only for a step none of whose rows runs an
-  adapter; a step with one runs the region eagerly under the node's step.
+  request's adapter, so the engine captures it base-only (``LoraBaseOnly``) and leases it
+  only for a step none of whose rows runs an adapter; a step with one runs the region
+  eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 

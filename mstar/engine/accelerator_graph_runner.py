@@ -1776,11 +1776,16 @@ class PiecewiseAcceleratorGraphRunner:
         return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
 
     def _bucket(self, shape: PiecewiseCaptureShape) -> BucketKey:
+        """A ``one_row_per_step`` region on a LoRA node replays only base-only steps
+        (``can_lease``), so it is captured under ``LoraBaseOnly``, recording no LoRA kernel."""
+        key = self._label
+        if self._config.one_row_per_step and self._lora_keys:
+            key = LoraBaseOnly(key)
         return BucketKey(
             graph_walk=PIECEWISE_WALK,
             bs=shape.bs,
             num_tokens=shape.total_tokens,
-            cg_key_info=self._label,
+            cg_key_info=key,
         )
 
     # ── Capture ─────────────────────────────────────────────────────────

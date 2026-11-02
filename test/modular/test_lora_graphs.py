@@ -397,9 +397,12 @@ def _region_runner(pool, **config):
         capture_fn=lambda inp: inp.static_inputs["x"], make_static_inputs=lambda shape: {},
         attn_key="attn", total_tokens=[8], **config,
     )
+    # records the buckets the region claims buffers for, which it captures under
+    step_runner = SimpleNamespace(built=[])
+    step_runner.build_accelerator_graph_buffers = lambda specs, **kwargs: step_runner.built.extend(specs)
     return PiecewiseAcceleratorGraphRunner(
         label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
-        step_runner=SimpleNamespace(build_accelerator_graph_buffers=lambda *args, **kwargs: None),
+        step_runner=step_runner,
         device=CPU, autocast_dtype=None, num_slots=2, node_name="N", lora_keys=("lora",),
     )
 
@@ -407,8 +410,9 @@ def _region_runner(pool, **config):
 def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_base_rows(adapters):
     """A region's step carries the node's LoRA rows, laid out from its segments as the
     node's are. A region replayed as one row per step, which addresses every row to the
-    first request's adapter, is captured too, but leased only for a step none of whose
-    rows runs one; a step with one runs the region eagerly under the node's step."""
+    first request's adapter, is captured base-only, recording no LoRA kernel, and leased
+    only for a step none of whose rows runs one; a step with one runs the region eagerly
+    under the node's step."""
     pool = P.make_pool(adapters[1])
     runner = _region_runner(pool, capture_batch_sizes=[2])
     bucket = BucketKey(PIECEWISE_WALK, 2, 8, "N_region")
@@ -420,6 +424,8 @@ def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_bas
         P.ingest(pool, rid, adapter)
     one_row = _region_runner(pool, capture_batch_sizes=[1], lease_before_step=True, one_row_per_step=True)
     assert one_row.prepare_for_capture() and not one_row.dropped_shapes
+    assert {spec.bucket.cg_key_info for spec in runner._step_runner.built} == {"N_region"}
+    assert {spec.bucket.cg_key_info for spec in one_row._step_runner.built} == {LoraBaseOnly("N_region")}
     assert one_row.can_lease([], ["b0", "b1"]) and not one_row.can_lease([], ["b0", "r1"])
     assert runner.can_lease([], ["b0", "r1"])
 
