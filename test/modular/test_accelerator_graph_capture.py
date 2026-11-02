@@ -481,7 +481,7 @@ def test_piecewise_replay_refuses_an_input_its_buffer_may_round(value_dtype, buf
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
     runner._label, runner._current_slot = "region", 0
     replays = []
-    runner._config = SimpleNamespace(get_config_type=lambda: PiecewiseConfigType.BATCHED)
+    runner._config = SimpleNamespace(get_config_type=lambda: PiecewiseConfigType.BATCHED, one_row_per_step=False)
     runner._dummy_rows = SimpleNamespace(reset=lambda rids: None)
     buffer = torch.zeros(2, dtype=buffer_dtype)
     runner._resolve = lambda bs, total_tokens: PiecewiseGraphData(

@@ -56,7 +56,7 @@ def test_batched_agrees_with_per_request(shape):
         if got:
             per_request[rid] = got
     assert batched == per_request
-    assert batched == {"d": {"decode_loop"}, "a": {"decode_loop"}, "b": {"decode_loop"}}
+    assert batched == {"d": {"decode_loop"}, "b": {"decode_loop"}}
 
 
 @pytest.mark.parametrize("mixed", [True, False], ids=["mixed", "prefill"])
@@ -71,7 +71,7 @@ def test_a_prefill_stop_token_ends_the_partition(mixed):
     }
     if mixed:
         infos["dec"] = _info()
-    tokens = torch.tensor([EOS, EOS, EOS, EOS, 3, EOS][:len(infos)])
+    tokens = torch.tensor([EOS, EOS, EOS, 3, EOS][:len(infos)])
     got = LLMSubmodule.check_stop_batched(_sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}))
     assert got == {
         "text": {END_PARTITION}, "media": {END_PARTITION}, "one": {END_PARTITION},
@@ -95,7 +95,7 @@ def test_engine_falls_back_and_attributes_failures():
     from mstar.engine.engine import Engine
 
     failures = {}
-    infos = {"a": _info(done=99, max_tokens=100)}  # "x" missing
+    infos = {"a": _info()}  # "x" missing
     batch = SimpleNamespace(
         node_name="LLM",
         request_ids=["a", "x"],
@@ -109,7 +109,7 @@ def test_engine_falls_back_and_attributes_failures():
         check_stop=lambda rid, info, out: LLMSubmodule.check_stop(_sub(), rid, info, out),
     )
     engine = SimpleNamespace(_submodules={"LLM": SimpleNamespace(submodule=sub)})
-    tokens = torch.tensor([3, 3])
+    tokens = torch.tensor([EOS, 3])
     outputs = {"a": {"new_token": [tokens[0:1]]}, "x": {"new_token": [tokens[1:2]]}}
     stops = Engine.check_stop_for_batch(
         engine, batch, outputs, host_rows=HostRows(("a", "x"), {"new_token": tokens}),

@@ -67,7 +67,7 @@ class StandInRagged:
     def plan(self, step):
         self.spans = [s.span for s in step.segments]
 
-    def run(self, q, k, v):
+    def run(self, q, k, v, label=None):
         self.calls += 1
         assert sum(self.spans) == q.shape[0], "the forward's rows are not the planned segments"
         out, start = torch.empty_like(q), 0
