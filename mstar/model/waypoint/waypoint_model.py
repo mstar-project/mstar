@@ -671,9 +671,9 @@ class WaypointModel(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
-        # autocast_dtype/tp_group/sp_group exist for interface parity only:
+        # autocast_dtype/tp_group exist for interface parity only:
         # weights load in the checkpoint's own dtypes and nothing shards yet.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]

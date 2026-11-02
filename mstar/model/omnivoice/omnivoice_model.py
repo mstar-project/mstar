@@ -650,9 +650,8 @@ class OmniVoiceModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        # tp_group / sp_group / autocast_dtype exist for interface parity:
+        # tp_group / autocast_dtype exist for interface parity:
         # OmniVoice declares no sharded nodes, and the weights load in the
         # checkpoint's own dtypes.
         if node_name in self._submodule_cache:

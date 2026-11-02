@@ -193,7 +193,6 @@ def sharding_args(config: ShardingConfig) -> dict:
         ],
         "shard_dim": list(config.shard_dim.items()),
         "tp_enabled_nodes": sorted(config.tp_enabled_nodes),
-        "sp_enabled_nodes": sorted(config.sp_enabled_nodes),
     }
 
 
