@@ -21,7 +21,7 @@ import torch
 from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
-from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.communicator import CommProtocol, make_communicator, requested_transport
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import (
     LocalTransferEngine,
@@ -57,8 +57,7 @@ from mstar.graph.runtime.base import (
     SpeculationOutput,
     SpeculationPrepInput,
 )
-from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
+from mstar.graph.runtime.utils import require_rust_extension
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import (
     END_PARTITION,
@@ -166,20 +165,19 @@ def _make_graph_runtime(
     tensor_manager,
     **kwargs,
 ) -> GraphRuntime:
-    """The runtime ``MSTAR_RUST_GRAPH`` selects (see
-    ``resolve_graph_runtime_type``).
+    """The Rust graph runtime.
 
-    Rust requires the Rust communicator and the Rust bookkeeper: it sends
+    It requires the Rust communicator and the Rust bookkeeper: it sends
     WORKER_GRAPHS_DONE and INPUT_SIGNALS itself on an Arc to the same
     transport, and settles refcounts on a share of the same bookkeeper, rather
     than hopping back into Python for either. A Python one of either has no
-    such object to share, so asking for Rust with one raises.
+    such object to share, so this raises on one.
     """
-    if resolve_graph_runtime_type(log=True) == GraphRuntimeType.PYTHON:
-        return PythonGraphRuntime(
-            communicator=communicator,
-            tensor_manager=tensor_manager,
-            **kwargs,
+    require_rust_extension()
+    if requested_transport() == "0":
+        raise ValueError(
+            "MSTAR_RUST_ZMQ=0 pins the pyzmq communicator, which the graph "
+            "runtime cannot run on. Set MSTAR_RUST_ZMQ to 1 or AUTO."
         )
 
     from mstar.communication.rust_communicator import RustZMQCommunicator
@@ -187,19 +185,19 @@ def _make_graph_runtime(
 
     if not isinstance(communicator, RustZMQCommunicator):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
+            "The graph runtime needs the Rust communicator, but this worker "
             f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
         )
     if not issubclass(communicator.codec, WireCodec):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the msgpack codec, but this worker "
+            "The graph runtime needs the msgpack codec, but this worker "
             f"built a {communicator.codec.__name__}. Set "
             "MSTAR_WIRE_CODEC=msgpack."
         )
     bookkeeping = tensor_manager.tensor_store.bookkeeping
     if not hasattr(bookkeeping, "_rust"):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust TensorBookkeeping: the runtime "
+            "The graph runtime needs the Rust TensorBookkeeping: it "
             "holds a share of it, so a Python one cannot be handed over. "
             f"Got {type(bookkeeping).__name__}."
         )
@@ -767,8 +765,7 @@ class Worker:
         # (graph_walk, node) -> innermost enclosing loop, for ending a
         # stream-terminated loop and refusing an END_PARTITION from inside a
         # loop in _postprocess_batch. Structural, so it is derived from the
-        # model here rather than asked of the graph runtime per step -- which
-        # also keeps it identical under both runtimes.
+        # model here rather than asked of the graph runtime per step.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
         if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(

@@ -20,7 +20,7 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 | Models | `mstar/model/` | computation graph, tokenization, resource *declarations*, submodules |
 | Graph | `mstar/graph/` | M* graph primitives and logic |
 | Communication | `mstar/communication/` | ZMQ control mesh, tensor transport (RDMA/TCP/SHM) |
-| Rust | `rust/` | vendored transport, graph runtime logic, SHM arena, and API server, selected at runtime |
+| Rust | `rust/` | the graph runtime, vendored transport, SHM arena, and API server |
 
 Background: [docs/architecture.rst](docs/architecture.rst). Model authoring, end to end: [docs/adding_models.rst](docs/adding_models.rst).
 
@@ -75,9 +75,9 @@ If working on engine-level changes, don't assume all models have the same shape.
 
 If a change is globally beneficial, it should be extensively tested on other models in the system and independently defensible, ideally as another PR that your model work is stacked on top of. Otherwise, scope it to your node or your resource declaration instead.
 
-### 5. For worker-level changes, Python and Rust implementations must not drift
+### 5. There is one graph runtime, and it is in `rust/`
 
-`MSTAR_RUST_GRAPH` and `MSTAR_RUST_ZMQ` select between the Python runtime/transport and the vendored Rust ones under `rust/`; `MSTAR_WIRE_CODEC` selects the encoding. `AUTO` means production may run either. A behavior change to the graph runtime, the wire format, or edge semantics must land on both sides or be explicitly gated, and the CI `rust-transport` job must cover it.
+A behavior change to the graph runtime, the wire format, or edge semantics lands in `rust/` with a `test/rust` case, which the CI `rust-transport` job runs. `mstar/graph/runtime/rust.py` is the wrapper; `mstar/graph/runtime/base.py` is the interface.
 
 ### 6. Be careful about CPU overhead
 
@@ -194,7 +194,9 @@ pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
-The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`, `mstar_rust`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+The CPU suites build a graph runtime, so they need the Rust extension: `maturin develop --release -m rust/Cargo.toml` once in a checkout.
+
+The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 CI has no GPU. A PR whose change runs on the GPU says which GPU tests it ran, on what hardware and torch/CUDA build. Real-weights tests skip when the checkpoint isn't cached, so a passing CPU run of them shows only that they import: rerun them on CUDA on the commit being pushed, and report them as run, not skipped.
 

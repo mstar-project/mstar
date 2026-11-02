@@ -78,8 +78,7 @@ class _Queue:
 class _Runtime:
     """Graph-level ready scan, over the manager's queues.
 
-    The real PythonGraphRuntime owns the queues and RequestStateManager shares
-    the same dict; this mirrors that by reading the manager's.
+    The real runtime owns the queues; this stand-in reads the manager's.
     """
 
     def __init__(self, manager: _Manager):

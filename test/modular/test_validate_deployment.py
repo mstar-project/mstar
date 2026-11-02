@@ -106,11 +106,10 @@ def _a_then_b():
 
 
 @pytest.mark.parametrize("env,pattern", [
-    ({"MSTAR_RUST_GRAPH": "2"}, r"MSTAR_RUST_GRAPH must be 0, 1, or AUTO; got '2'"),
     ({"MSTAR_RUST_ZMQ": "yes"}, r"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got 'YES'"),
     ({"MSTAR_WIRE_CODEC": "pickle"}, r"MSTAR_WIRE_CODEC must be msgpack; got 'pickle'"),
-    ({"MSTAR_RUST_GRAPH": "1", "MSTAR_RUST_ZMQ": "0"}, r"MSTAR_RUST_GRAPH=1 needs the Rust communicator"),
-], ids=["graph_runtime", "transport", "codec", "rust_graph_on_pyzmq"])
+    ({"MSTAR_RUST_ZMQ": "0"}, r"MSTAR_RUST_ZMQ=0 pins the pyzmq communicator"),
+], ids=["transport", "codec", "pyzmq"])
 def test_bad_runtime_knob_is_refused_in_the_conductor(env, pattern, tmp_path, monkeypatch):
     """Each worker read these as it started and raised there, once per rank."""
     for key, value in env.items():
@@ -558,7 +557,7 @@ def test_client_stream_settings_are_reported_with_the_rest(tmp_path):
 def test_problems_from_every_stage_are_reported_together(tmp_path, monkeypatch):
     """A knob, a YAML key, the model's hook, placement and a resource override
     come back in one error, and no worker is started."""
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "on")
+    monkeypatch.setenv("MSTAR_RUST_ZMQ", "on")
     launched = []
 
     def launch(conductor):
@@ -573,14 +572,14 @@ def test_problems_from_every_stage_are_reported_together(tmp_path, monkeypatch):
     with pytest.raises(DeploymentError) as refusal:
         Conductor(model, str(cfg), socket_path_prefix=str(tmp_path / "s"))
     assert refusal.value.problems == [
-        "MSTAR_RUST_GRAPH must be 0, 1, or AUTO; got 'on'",
+        "MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got 'ON'",
         "the config must define `max_seq_len`",
         "no admit queue",
         "node 'llm' of graph walk 'decode' is placed by no node_groups entry; place it in exactly "
         "one node_groups entry for that walk (use graph_walks to give one node different ranks per walk).",
         "serving config overrides unknown resource(s) ['vk']; this model declares ['kv']",
     ]
-    assert str(refusal.value).startswith(f"{cfg}: 5 problems; no worker was started:\n  - MSTAR_RUST_GRAPH")
+    assert str(refusal.value).startswith(f"{cfg}: 5 problems; no worker was started:\n  - MSTAR_RUST_ZMQ")
     assert not launched
 
 

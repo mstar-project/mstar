@@ -1,6 +1,6 @@
 """The Rust runtime wrapper hands ``SendInput.failed_rids`` to Rust, which
 then builds no frame for those rids (no WORKER_GRAPHS_DONE among them); the
-Python runtime's side is in test/modular/test_send_registration_failure.py."""
+worker's side is in test/modular/test_send_registration_failure.py."""
 import pytest
 import torch
 

@@ -88,7 +88,7 @@ echo 'Mac checks; full x86 CPU suite not run.' >> "$reports/summary.txt"
 
 for job in "${jobs[@]}"; do
     target=python
-    if [[ "$job" == rust ]]; then
+    if [[ "$job" == rust || "$job" == cpu-smoke ]]; then
         target=rust
     fi
     image="mstar-local-ci-${target}:${architecture}"
@@ -112,7 +112,7 @@ for job in "${jobs[@]}"; do
         --mount "type=bind,source=$job_reports,target=/reports"
         --mount "type=volume,source=mstar-ci-${architecture}-py312-pip,target=/root/.cache/pip"
     )
-    if [[ "$job" == rust ]]; then
+    if [[ "$job" == rust || "$job" == cpu-smoke ]]; then
         mounts+=(
             --mount "type=volume,source=mstar-ci-${architecture}-cargo-registry,target=/opt/cargo/registry"
             --mount "type=volume,source=mstar-ci-${architecture}-cargo-git,target=/opt/cargo/git"

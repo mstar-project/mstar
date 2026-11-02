@@ -1,21 +1,52 @@
 """Finished loops exchange cache ownership for routed readers exactly once.
 
-Real Python runtime, SHM tensor store and cleanup; synthetic producer tensors.
+Real runtime, SHM tensor store and cleanup; synthetic producer tensors.
 Client releases model completed reads/ACKs, not actual network transport.
 """
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 import torch
+from rust_runtime import Inboxes, build_runtime
 
 from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
-from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
+
+
+class _Sent(NamedTuple):
+    """What one completion sent: one uuid list per edge."""
+    persist: list[list[int]]
+    emit_to_client: list[list[int]]
+    to_workers: dict[str, list[list[int]]]
+
+
+def _uuids(edge):
+    return [i.uuid for i in edge.tensor_info]
+
+
+def _send(runtime, inboxes, rid, result) -> _Sent:
+    """Send a completion's frames and read them off the inboxes."""
+    runtime.send_outputs(SendInput(
+        completion_id=result.completion_id, per_request_info=ParallelList([rid], [None]),
+        new_token_counts=ParallelList([rid], [{}]),
+    ))
+    sent = _Sent([], [], {})
+    for peer, message in inboxes.take():
+        if peer == "conductor":
+            sent.persist.extend(
+                [i.uuid for i in infos] for infos in message.body.persist_signals.values()
+            )
+        elif peer == "api_server":
+            sent.emit_to_client.append(_uuids(message.body.graph_edge))
+        else:
+            sent.to_workers[peer] = [_uuids(e) for e in message.body.inputs]
+    return sent
 
 
 def _runtime(
@@ -57,7 +88,12 @@ def _runtime(
     if remote:
         walks[1], nodes[1], loops[1] = {"walk"}, {"consumer"}, set()
         mapping = ParallelList([0, 1], [["worker0"], ["worker1", "worker2"]])
-    runtime = PythonGraphRuntime(
+    inboxes = Inboxes(
+        "worker0", tmp_path,
+        peers=("conductor", "api_server", "worker1", "worker2") if remote else ("conductor", "api_server"),
+    )
+    runtime = build_runtime(
+        bookkeeping=manager.tensor_store.bookkeeping, inboxes=inboxes,
         my_worker_id="worker0", my_worker_graphs=[graph],
         all_wg_ids_to_graph_walks=walks, all_wg_ids_to_nodes=nodes,
         all_wg_ids_to_dyn_loops=loops,
@@ -66,7 +102,6 @@ def _runtime(
             groups=[ShardingGroup(nodes={"consumer"}, tp_size=2)] if remote else [],
             tp_enabled_nodes={"consumer"} if remote else set(), shard_dim={},
         ),
-        tensor_manager=manager,
     )
     caps = {name: loop.max_iters for name, loop in section.get_loops().items()}
     rid = runtime.add_request("request", "default", "walk", [0], mapping, caps)
@@ -74,20 +109,29 @@ def _runtime(
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
     assert runtime.ingest_inputs_batch(block) == []
-    return runtime, manager, rid
+    return runtime, manager, rid, inboxes
 
 
-def _step(runtime, manager, rid, value):
-    runtime.cleanup_consumed_inputs("producer", [rid], [0])
+def _release_inputs(runtime, manager, rid, node="producer"):
+    manager.cleanup_collectable(*runtime.cleanup_consumed_inputs(node, [rid], [0]))
+
+
+def _route(runtime, manager, rid, inboxes, node, signals, stored):
+    result = runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="walk", node_name=node, output_signals=signals,
+        wg_ids=ParallelList([rid], [0]), tensors=stored, num_tensors=[1] * len(signals),
+    ))
+    manager.cleanup_collectable(*result.freed_inputs)
+    return _send(runtime, inboxes, rid, result)
+
+
+def _step(runtime, manager, rid, inboxes, value):
+    _release_inputs(runtime, manager, rid)
     stored = manager.store_and_return_tensor_info_batch(
         [rid], {rid: {"token": [torch.tensor([value])]}}, ["token"],
     )
     manager.increment_ref_batch_uniform(stored.flat_uuids)
-    result = runtime.complete_and_route_batch(RouteInput(
-        partition="default", graph_walk="walk", node_name="producer", output_signals=["token"],
-        wg_ids=ParallelList([rid], [0]), tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
-    ))
-    return runtime._peek_completion(result.completion_id).routing[rid]
+    return _route(runtime, manager, rid, inboxes, "producer", ["token"], stored.flat_uuids)
 
 
 @pytest.mark.parametrize("accumulated", [False, True])
@@ -95,7 +139,7 @@ def _step(runtime, manager, rid, value):
 @pytest.mark.parametrize("readers,persist", [(1, False), (2, False), (0, True)])
 @pytest.mark.parametrize("explicit_stop", [False, True])
 def test_loop_completion_transfers_cache_holds(tmp_path, accumulated, nested, readers, persist, explicit_stop):
-    runtime, manager, rid = _runtime(
+    runtime, manager, rid, inboxes = _runtime(
         tmp_path, accumulated=accumulated, nested=nested, readers=readers,
         persist=persist, limit=100 if explicit_stop else 2,
     )
@@ -105,16 +149,15 @@ def test_loop_completion_transfers_cache_holds(tmp_path, accumulated, nested, re
             if explicit_stop and frame == steps - 1:
                 runtime.stop_loops_batched("default", "walk", "producer",
                                           ParallelList([rid], [["outer"]]))
-            routing = _step(runtime, manager, rid, frame)
-        edges = routing.persist if persist else routing.emit_to_client
+            sent = _step(runtime, manager, rid, inboxes, frame)
+        edges = sent.persist if persist else sent.emit_to_client
         expected = ([1, 3] if nested else [0, 1]) if accumulated else [steps - 1]
         assert len(edges) == (1 if persist else readers)
         for edge in edges:
-            assert [manager.get_tensor(i.uuid).item() for i in edge.tensor_info] == expected
-        uuids = [i.uuid for i in edges[0].tensor_info]
+            assert [manager.get_tensor(u).item() for u in edge] == expected
+        uuids = edges[0]
         assert set(manager.tensor_store.get_all_uuids(rid)) == set(uuids)
-        records = manager.tensor_store.bookkeeping._ref_info
-        assert [records[u].ref_cnt for u in uuids] == [readers] * len(uuids)
+        book = manager.tensor_store.bookkeeping
         if persist:
             manager.cleanup_request(rid)
             assert set(manager.tensor_store.get_all_uuids(rid)) == set(uuids)
@@ -123,7 +166,8 @@ def test_loop_completion_transfers_cache_holds(tmp_path, accumulated, nested, re
             manager.cleanup_request(rid)
         else:
             for index, edge in enumerate(edges):
-                manager.dereference_batch_uniform([i.uuid for i in edge.tensor_info])
+                assert not any(book.can_gc(u) for u in uuids), "each reader holds a reference"
+                manager.dereference_batch_uniform(edge)
                 if index + 1 < readers:
                     assert [manager.get_tensor(u).item() for u in uuids] == expected
         assert manager.tensor_store.get_all_uuids(rid) == []
@@ -134,10 +178,10 @@ def test_loop_completion_transfers_cache_holds(tmp_path, accumulated, nested, re
 
 @pytest.mark.parametrize("nested", [False, True])
 def test_abandoned_loop_hard_cleanup_reclaims_cached_outputs(tmp_path, nested):
-    runtime, manager, rid = _runtime(tmp_path, accumulated=True, nested=nested,
-                                    readers=1, persist=False, limit=100)
+    runtime, manager, rid, inboxes = _runtime(tmp_path, accumulated=True, nested=nested,
+                                              readers=1, persist=False, limit=100)
     for frame in range(3):
-        _step(runtime, manager, rid, frame)
+        _step(runtime, manager, rid, inboxes, frame)
     assert manager.tensor_store.get_all_uuids(rid)
     runtime.remove_request(rid)
     manager.force_cleanup_request(rid)
@@ -147,33 +191,25 @@ def test_abandoned_loop_hard_cleanup_reclaims_cached_outputs(tmp_path, nested):
 @pytest.mark.parametrize("accumulated", [False, True])
 @pytest.mark.parametrize("persist", [False, True])
 def test_loop_finished_by_node_without_outputs_settles_older_holds(tmp_path, accumulated, persist):
-    runtime, manager, rid = _runtime(tmp_path, accumulated=accumulated, nested=False,
-                                    readers=1, persist=persist, limit=2, tail=True)
+    runtime, manager, rid, inboxes = _runtime(tmp_path, accumulated=accumulated, nested=False,
+                                              readers=1, persist=persist, limit=2, tail=True)
     try:
         for frame in range(2):
-            runtime.cleanup_consumed_inputs("producer", [rid], [0])
+            _release_inputs(runtime, manager, rid)
             stored = manager.store_and_return_tensor_info_batch(
                 [rid], {rid: {"token": [torch.tensor([frame])], "tick": [torch.tensor([0])]}},
                 ["token", "tick"],
             )
             manager.increment_ref_batch_uniform(stored.flat_uuids)
-            runtime.complete_and_route_batch(RouteInput(
-                partition="default", graph_walk="walk", node_name="producer",
-                output_signals=["token", "tick"], wg_ids=ParallelList([rid], [0]),
-                tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
-            ))
-            runtime.cleanup_consumed_inputs("tail", [rid], [0])
-            result = runtime.complete_and_route_batch(RouteInput(
-                partition="default", graph_walk="walk", node_name="tail",
-                output_signals=[], wg_ids=ParallelList([rid], [0]), tensors=[], num_tensors=[],
-            ))
-        routing = runtime._peek_completion(result.completion_id).routing[rid]
-        edges = routing.persist if persist else routing.emit_to_client
+            _route(runtime, manager, rid, inboxes, "producer", ["token", "tick"], stored.flat_uuids)
+            _release_inputs(runtime, manager, rid, "tail")
+            sent = _route(runtime, manager, rid, inboxes, "tail", [], [])
+        edges = sent.persist if persist else sent.emit_to_client
         assert len(edges) == 1
-        uuids = [i.uuid for i in edges[0].tensor_info]
+        uuids = edges[0]
         assert [manager.get_tensor(u).item() for u in uuids] == ([0, 1] if accumulated else [1])
-        records = manager.tensor_store.bookkeeping._ref_info
-        assert [records[u].ref_cnt for u in uuids] == [int(not persist)] * len(uuids)
+        book = manager.tensor_store.bookkeeping
+        assert not any(book.can_gc(u) for u in uuids), "held by its reader, or by the persist mark"
         if persist:
             for uuid in uuids:
                 manager.tensor_store.set_metadata(uuid, persist=False)
@@ -189,18 +225,16 @@ def test_loop_finished_by_node_without_outputs_settles_older_holds(tmp_path, acc
 @pytest.mark.parametrize("accumulated", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
 def test_loop_output_remote_fanout_waits_for_each_reader(tmp_path, accumulated, nested):
-    runtime, manager, rid = _runtime(tmp_path, accumulated=accumulated, nested=nested,
-                                    readers=2, persist=False, limit=2, remote=True)
+    runtime, manager, rid, inboxes = _runtime(tmp_path, accumulated=accumulated, nested=nested,
+                                              readers=2, persist=False, limit=2, remote=True)
     try:
         for frame in range(4 if nested else 2):
-            routing = _step(runtime, manager, rid, frame)
-        assert set(routing.to_workers) == {"worker1", "worker2"}
-        edges = [routing.to_workers[w][0] for w in ("worker1", "worker2")]
-        uuids = [i.uuid for i in edges[0].tensor_info]
-        assert [i.uuid for i in edges[1].tensor_info] == uuids
+            sent = _step(runtime, manager, rid, inboxes, frame)
+        assert set(sent.to_workers) == {"worker1", "worker2"}
+        uuids, others = (sent.to_workers[w][0] for w in ("worker1", "worker2"))
+        assert others == uuids
         expected = ([1, 3] if nested else [0, 1]) if accumulated else [3 if nested else 1]
         assert [manager.get_tensor(u).item() for u in uuids] == expected
-        assert [manager.tensor_store.bookkeeping._ref_info[u].ref_cnt for u in uuids] == [2] * len(uuids)
         # One remote ACK must not reclaim the other reader's tensors.
         manager.dereference_batch_uniform(uuids)
         assert [manager.get_tensor(u).item() for u in uuids] == expected
@@ -213,28 +247,25 @@ def test_loop_output_remote_fanout_waits_for_each_reader(tmp_path, accumulated, 
 
 @pytest.mark.parametrize("readers", [1, 2])
 def test_finishing_parent_does_not_release_child_accumulation_before_routing(tmp_path, readers):
-    runtime, manager, rid = _runtime(tmp_path, accumulated=False, nested=True,
-                                    readers=readers, persist=False, limit=2, inner_accumulated=True)
+    runtime, manager, rid, inboxes = _runtime(tmp_path, accumulated=False, nested=True,
+                                              readers=readers, persist=False, limit=2, inner_accumulated=True)
     try:
         emitted = []
         for frame in range(4):
-            runtime.cleanup_consumed_inputs("producer", [rid], [0])
+            _release_inputs(runtime, manager, rid)
             stored = manager.store_and_return_tensor_info_batch(
                 [rid], {rid: {"token": [torch.tensor([frame])], "frame": [torch.tensor([frame])]}},
                 ["token", "frame"],
             )
             manager.increment_ref_batch_uniform(stored.flat_uuids)
-            result = runtime.complete_and_route_batch(RouteInput(
-                partition="default", graph_walk="walk", node_name="producer",
-                output_signals=["token", "frame"], wg_ids=ParallelList([rid], [0]),
-                tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
-            ))
-            edges = runtime._peek_completion(result.completion_id).routing[rid].emit_to_client
+            edges = _route(
+                runtime, manager, rid, inboxes, "producer", ["token", "frame"], stored.flat_uuids,
+            ).emit_to_client
             if frame % 2:
                 assert len(edges) == readers
                 for edge in edges:
-                    assert [manager.get_tensor(i.uuid).item() for i in edge.tensor_info] == [frame - 1, frame]
-                    manager.dereference_batch_uniform([i.uuid for i in edge.tensor_info])
+                    assert [manager.get_tensor(u).item() for u in edge] == [frame - 1, frame]
+                    manager.dereference_batch_uniform(edge)
                 emitted.extend([frame - 1, frame])
         assert emitted == [0, 1, 2, 3]
         assert manager.tensor_store.get_all_uuids(rid) == []

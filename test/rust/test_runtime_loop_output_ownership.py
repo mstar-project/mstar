@@ -1,4 +1,4 @@
-"""Both runtimes release transferred loop-cache holds after the final reader.
+"""The runtime releases transferred loop-cache holds after the final reader.
 
 Synthetic tensors, real runtime/bookkeeping; no GPU or transport execution.
 """
@@ -27,11 +27,10 @@ def _caps(section):
     return {name: loop.max_iters for name, loop in section.get_loops().items()}
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("accumulated", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("readers,persist", [(1, False), (2, False), (0, True)])
-def test_finished_loop_ownership(backend, accumulated, nested, readers, persist):
+def test_finished_loop_ownership(accumulated, nested, readers, persist):
     section = GraphNode(name="producer", input_names=["token"],
                         outputs=[GraphEdge(name="token", next_node="producer")])
     if nested:
@@ -41,7 +40,7 @@ def test_finished_loop_ownership(backend, accumulated, nested, readers, persist)
              [GraphEdge(name="token", next_node=EMIT_TO_CLIENT) for _ in range(readers)])
     section = Loop(name="outer", section=section, max_iters=2,
                    outputs=[] if accumulated else edges, accumulated_outputs=edges if accumulated else [])
-    runtime, book, store = _build(backend, section)
+    runtime, book, store = _build(section)
     rid = runtime.add_request("ownership", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(section))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
@@ -81,9 +80,8 @@ def test_finished_loop_ownership(backend, accumulated, nested, readers, persist)
     runtime.remove_request(rid)
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("readers", [1, 2])
-def test_child_accumulation_survives_parent_finish(backend, readers):
+def test_child_accumulation_survives_parent_finish(readers):
     node = GraphNode(name="producer", input_names=["token"], outputs=[
         GraphEdge(name="token", next_node="producer"), GraphEdge(name="frame", next_node=EMPTY_DESTINATION),
     ])
@@ -91,7 +89,7 @@ def test_child_accumulation_survives_parent_finish(backend, readers):
                  outputs=[GraphEdge(name="token", next_node="producer")],
                  accumulated_outputs=[GraphEdge(name="frame", next_node=EMIT_TO_CLIENT) for _ in range(readers)])
     outer = Loop(name="outer", section=inner, max_iters=2, outputs=[])
-    runtime, book, store = _build(backend, outer)
+    runtime, book, store = _build(outer)
     rid = runtime.add_request("child", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(outer))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
@@ -117,10 +115,9 @@ def test_child_accumulation_survives_parent_finish(backend, readers):
     runtime.remove_request(rid)
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("accumulated", [False, True])
 @pytest.mark.parametrize("persist", [False, True])
-def test_loop_finished_by_node_without_outputs_settles_older_holds(backend, accumulated, persist):
+def test_loop_finished_by_node_without_outputs_settles_older_holds(accumulated, persist):
     """The node that finishes the loop produces nothing, so only handed-over loop holds are settled."""
     producer = GraphNode(name="producer", input_names=["token"], outputs=[
         GraphEdge(name="token", next_node="producer"), GraphEdge(name="tick", next_node="tail"),
@@ -130,7 +127,7 @@ def test_loop_finished_by_node_without_outputs_settles_older_holds(backend, accu
              [GraphEdge(name="token", next_node=EMIT_TO_CLIENT)])
     loop = Loop(name="outer", section=body, max_iters=2,
                 outputs=[] if accumulated else edges, accumulated_outputs=edges if accumulated else [])
-    runtime, book, store = _build(backend, loop)
+    runtime, book, store = _build(loop)
     rid = runtime.add_request("tail", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(loop))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))
@@ -167,9 +164,8 @@ def test_loop_finished_by_node_without_outputs_settles_older_holds(backend, accu
     runtime.remove_request(rid)
 
 
-@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("nested", [False, True])
-def test_abandoned_loop_keeps_its_holds_until_hard_cleanup(backend, nested):
+def test_abandoned_loop_keeps_its_holds_until_hard_cleanup(nested):
     """Removing a request mid-loop releases nothing early or twice; hard cleanup then reclaims everything."""
     section = GraphNode(name="producer", input_names=["token"],
                         outputs=[GraphEdge(name="token", next_node="producer")])
@@ -178,7 +174,7 @@ def test_abandoned_loop_keeps_its_holds_until_hard_cleanup(backend, nested):
                        outputs=[GraphEdge(name="token", next_node="producer")])
     loop = Loop(name="outer", section=section, max_iters=100, outputs=[],
                 accumulated_outputs=[GraphEdge(name="token", next_node=EMIT_TO_CLIENT)])
-    runtime, book, store = _build(backend, loop)
+    runtime, book, store = _build(loop)
     rid = runtime.add_request("abandoned", "default", "decode", [0], ParallelList([0], [[WORKER]]), _caps(loop))
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="token", next_node="producer"))

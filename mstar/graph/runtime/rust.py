@@ -14,7 +14,8 @@ construction, Rust owns the compiled form.
 Rust never sees a tensor. It holds a share of the same ``TensorBookkeeping``
 Python gave ``TensorStore``, so descriptors and refcounts stay in one place.
 
-Build: ``maturin develop --release`` in ``rust/`` (see ``docs/installation.rst``).
+Build: ``maturin develop --release -m rust/Cargo.toml`` (see
+``docs/installation.rst``).
 """
 from __future__ import annotations
 
@@ -277,7 +278,7 @@ class RustGraphRuntime(GraphRuntime):
             # A share of the same transport, so the frames Rust decides on can
             # be sent from there rather than handed back one at a time. None
             # under the pyzmq communicator, which has no shareable object --
-            # the worker's flag gate refuses that pairing anyway.
+            # the worker's guard refuses that pairing anyway.
             communicator=getattr(communicator, "_inner", None),
             combined_walks=(
                 [node for node, _ in combined_walk_of],
@@ -670,8 +671,7 @@ class RustGraphRuntime(GraphRuntime):
             register_rids=out.register_rids,
             new_token_output_idxs=out.new_token_output_idxs,
             # Rust hands the groups over as three parallel columns, one entry
-            # per stream; the dict is rebuilt here so both runtimes return the
-            # same shape.
+            # per stream; the dict is rebuilt here for the contract's type.
             local_streaming_by_signal={
                 name: ParallelList(rids, uuids)
                 for name, rids, uuids in zip(

@@ -969,9 +969,8 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 ``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
 which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. The
-Python and Rust runtimes and communicators (``MSTAR_RUST_GRAPH``, ``MSTAR_RUST_ZMQ``)
-report the same series. A tensor already on the reader (one it made, or one it read once
+``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. A
+tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
 replicated, so an edge two ranks read is two reads. Like the data worker, the workers

@@ -34,6 +34,7 @@ USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         ffmpeg \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
@@ -79,6 +80,17 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all,dynamo]" \
 # Qwen3-TTS's speech tokenizer is not in [all]: --no-deps keeps its
 # transformers==4.57.3 pin out of the environment (docs/installation.rst).
 RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
+
+# The graph runtime is Rust, and an editable install does not compile it. The
+# toolchain rust-toolchain.toml pins goes away again once the extension is in
+# the venv.
+RUN export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo PATH=/tmp/cargo/bin:$PATH \
+    && curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && rustup toolchain install \
+    && rustup default "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+    && uv pip install --python /opt/mstar/venv/bin/python ./rust \
+    && rm -rf /tmp/rustup /tmp/cargo rust/target
 
 # Mooncake's default wheel is built for CUDA 12 (it links libcudart.so.12), so
 # a CUDA 13 image swaps it for the -cuda13 build of the version the extras

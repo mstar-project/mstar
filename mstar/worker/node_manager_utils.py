@@ -1,181 +1,11 @@
 import logging
-import pickle
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.engine.resources import PublishedInfo
-from mstar.graph.base import (
-    GraphEdge,
-    GraphNode,
-    NodeCompletionOutput,
-)
-from mstar.graph.graph_io import WorkerGraphIO
-from mstar.model.base import WorkerGraph
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
 logger = logging.getLogger(__name__)
-
-
-#: Renders a rid handle as its wire id. Installed by whoever owns the rid
-#: table -- the graph runtime; ``None`` where there is none (tests). Anything
-#: that puts a rid in TEXT goes through this: handles are worker-internal and
-#: RECYCLED, so a raw one in a message that leaves the process -- a
-#: FAIL_REQUESTS body becomes the client's HTTP error detail -- names whatever
-#: request holds that handle by the time someone reads it.
-RidStr = Callable[[int], str]
-
-
-def _rid_name(rid_str: RidStr | None, handle: int) -> str:
-    """Never raises. Every caller is reporting a rid that could not be found,
-    and the rid table drops a handle's name on release -- so the lookup that
-    renders it is exactly as likely to fail as the one that got here."""
-    if rid_str is None:
-        return f"<unresolved rid handle {handle}>"
-    try:
-        return rid_str(handle)
-    except (KeyError, IndexError):
-        return f"<released rid handle {handle}>"
-
-
-@dataclass
-class NodeOutputRouting:
-    routed_to_this_worker_graph: list[GraphEdge]
-    is_first_tp_rank: bool
-    persist: list[GraphEdge] # outputs that are going back to the conductor
-    to_workers: dict[str, list[GraphEdge]] # worker id to signals
-    emit_to_client: list[GraphEdge] = field(default_factory=list)
-    new_token_outputs: list[GraphEdge] = field(default_factory=list)
-    completed_worker_graph_ids: list[int] = field(default_factory=list)
-    streaming_to_workers: dict[str, list[GraphEdge]] = field(default_factory=dict)  # streaming edges to other workers
-    streaming_local: list[GraphEdge] = field(default_factory=list)  # streaming edges staying on this worker
-
-
-@dataclass
-class WorkerGraphQueues:
-    """
-    For a single worker graph, keeps track of which nodes are waiting on which
-    inputs for each request, and which nodes are ready to run per request.
-    """
-    worker_graph_id: int
-    graph_walks: set[str] # e.g., this worker graph is active during decode and image_gen
-                          # but not the prefill graph walk
-    worker_graph: WorkerGraph
-    per_request_queues: dict[int, WorkerGraphIO]
-    tensor_manager: TensorCommunicationManager
-    rid_str: RidStr | None = None
-
-    def __post_init__(self):
-        self.nodes = set(self.worker_graph.section.get_nodes().keys())
-        self.loops = set(self.worker_graph.section.get_loops().keys())
-        # Copied per request by unpickling, several times cheaper than deepcopy.
-        self._section_blob = pickle.dumps(
-            self.worker_graph.section, protocol=pickle.HIGHEST_PROTOCOL
-        )
-
-    def process_new_inputs(
-        self, request_id: int, inputs: list[GraphEdge],
-        can_buffer: bool=True
-    ) -> list[GraphEdge]:
-        """Ingest inputs into this worker graph's per-request io.
-
-        Returns the edges that were NOT routed here (because their next_node
-        is not a node in this worker graph) so the caller can try the next
-        worker graph. Works for both normal and streaming inputs — the per-
-        node io routes by name and lets ``ReadySignals.is_ready_for_streaming``
-        light up the streaming readiness set on its own.
-        """
-        assert request_id in self.per_request_queues, \
-            f"Tried to process new inputs for unknown request ID {_rid_name(self.rid_str, request_id)}"
-        queue = self.per_request_queues[request_id]
-        not_ingested: list[GraphEdge] = []
-        for inp in inputs:
-            if not queue.ingest_input(inp, can_buffer):
-                not_ingested.append(inp)
-        return not_ingested
-
-    def is_done(self, request_id) -> bool:
-        assert request_id in self.per_request_queues, \
-            f"Tried to check queue done state for unknown request ID {_rid_name(self.rid_str, request_id)}"
-        queue = self.per_request_queues[request_id]
-        return queue.wg_state_registry.is_done
-
-    def add_request(self, request_id: int, loop_caps: dict[str, int]):
-        """
-        Initialize queues for a new request
-        """
-        section_copy = pickle.loads(self._section_blob)
-        queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
-        for name, cap in loop_caps.items():
-            loop = queue.loops.get(name)
-            if loop is not None:
-                loop.max_iters = min(loop.max_iters, cap)
-        queue.register_communication_info(
-            self.tensor_manager, request_id
-        )
-        self.per_request_queues[request_id] = queue
-
-    def remove_request(self, request_id: int):
-        """
-        Delete queues for a completed/removed request (saw EOS)
-        """
-        self.per_request_queues.pop(request_id, None)
-
-    def get_ready_node_names(self) -> dict[int, set[str]]:
-        """
-        Returns mapping of request id to ready node names for that request
-        """
-        return {
-            request_id: q.ready_node_names \
-                for (request_id, q) in self.per_request_queues.items()
-        }
-
-    def pop_ready_nodes(
-        self, request_id: int, node_names: list[str]
-    ) -> list[GraphNode]:
-        """
-        Remove the given node names from the ready queue for the request and
-        return the corresponding GraphNode objects.
-        """
-        nodes = []
-        if request_id in self.per_request_queues:
-            q = self.per_request_queues[request_id]
-            for name in node_names:
-                q.ready_node_names.discard(name)
-                nodes.append(q.nodes[name])
-        return nodes
-
-    def reset(self, request_id):
-        """
-        At the end of a worker graph, reset the queues for a request so it can
-        be used for the next full model forward pass.
-        """
-        self.per_request_queues[request_id].clear()
-
-    def stop_loops(self, request_id: int, loop_names: set[str]):
-        """Register a finish signal for each named loop this worker graph
-        carries."""
-        assert request_id in self.per_request_queues, \
-            f"Tried to stop loops for unknown request ID {_rid_name(self.rid_str, request_id)}"
-        queue = self.per_request_queues[request_id]
-        for name in loop_names:
-            queue.register_loop_finish_signal(name)
-
-    def mark_node_complete(
-        self, request_id: int, node_name: str, loop_stride: int = 1,
-    ) -> NodeCompletionOutput:
-        """Complete a node in this worker graph's per-request io and return
-        the registry's NodeCompletionOutput (output_edges + filtered_signals)."""
-        assert request_id in self.per_request_queues, \
-            f"Tried to complete node {node_name!r} for unknown request ID {_rid_name(self.rid_str, request_id)}"
-        return self.per_request_queues[request_id].mark_node_complete(node_name, loop_stride)
-
-    def get_dynamic_loop_iters(self, request_id: int) -> dict[str, int]:
-        assert request_id in self.per_request_queues, \
-            f"Tried to get dynamic loop iters for unknown request ID {_rid_name(self.rid_str, request_id)}"
-        queue = self.per_request_queues[request_id]
-        return queue.get_loop_indices()
 
 
 @dataclass
@@ -193,7 +23,7 @@ class PerRequestInfo:
     """What the worker still owns for a request.
 
     Everything graph-shaped -- node/loop routing, the sharding config, the
-    worker graph ids, the live queues -- belongs to PythonGraphRuntime. What
+    worker graph ids, the live queues -- belongs to the graph runtime. What
     is left is the forward-pass info (a wire object) and the stream buffers.
     """
     # edge_name -> StreamBuffer
@@ -209,10 +39,9 @@ class PerRequestInfo:
 class RequestStateManager:
     """Per-request forward-pass info and stream buffers.
 
-    Was WorkerGraphsManager, which owned the worker graphs too; those moved to
-    PythonGraphRuntime one method at a time. What remains is request state the
-    runtime deliberately does not take: CurrentForwardPassInfo is a wire object
-    it treats as opaque, and a StreamBuffer holds tensors.
+    What remains here is request state the graph runtime deliberately does not
+    take: CurrentForwardPassInfo is a wire object it treats as opaque, and a
+    StreamBuffer holds tensors.
     """
     per_request_info: dict[int, PerRequestInfo] = field(default_factory=dict)
 

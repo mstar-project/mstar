@@ -8,7 +8,7 @@ consumer then used to emit an empty final chunk and end its partition, and
 the real last item came after as a second final chunk.
 
 These run the whole chain through the real code: a producer graph runtime
-(both of them) routes and sends a streamed item, the conductor processes the
+routes and sends a streamed item, the conductor processes the
 WORKER_GRAPHS_DONE and sends ``producer_done``, and a consumer worker takes
 the two messages in a chosen order. Only transport reads are stubbed.
 """
@@ -16,10 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from rust_runtime import Inboxes, build_runtime
 
-import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
-from mstar.communication.tensors import TensorCommunicationManager
 from mstar.communication.wire import decode
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
@@ -32,7 +30,6 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import ForwardPassArgs, WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -50,31 +47,6 @@ PRODUCER = "worker_0"
 CONSUMER = "worker_1"
 EDGE = "new_token"
 RID = "r1"
-
-
-class _StubTensorManager:
-    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
-    set_persist = TensorCommunicationManager.set_persist
-    dereference = TensorCommunicationManager.dereference
-    dereference_batch = TensorCommunicationManager.dereference_batch
-    dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
-    cleanup_collectable = TensorCommunicationManager.cleanup_collectable
-    stamps_shm_placement = False
-
-    def __init__(self, bookkeeping):
-        self.tensor_store = TensorStore(bookkeeping=bookkeeping)
-
-    def increment_ref(self, uuid, n=1):
-        self.tensor_store.increment_ref(uuid, n=n)
-
-    def refresh_shm_placement(self, edges):
-        pass
-
-    def _cleanup_by_uuid(self, uuid, registered=None):
-        if self.tensor_store.check_uuid_presence(uuid):
-            self.tensor_store.remove_tensor(uuid)
-        elif registered is None:
-            self.tensor_store.bookkeeping.forget_tensor(uuid)
 
 
 class _Capture:
@@ -96,7 +68,7 @@ class _Producer:
     """``LLM`` on worker_0 streams ``new_token`` into ``snac_decoder`` on
     worker_1, each in its own walk and partition, as Orpheus splits them."""
 
-    def __init__(self, kind, tmp_path):
+    def __init__(self, tmp_path):
         llm = WorkerGraph(
             section=GraphNode(
                 name="LLM", input_names={"text_inputs"},
@@ -105,7 +77,9 @@ class _Producer:
             ),
             graph_walks={"decode"}, ranks=[0], worker_graph_id=0,
         )
-        common = dict(
+        self.inboxes = Inboxes(PRODUCER, tmp_path, peers=("conductor", "api_server", CONSUMER))
+        self.rt = build_runtime(
+            inboxes=self.inboxes,
             my_worker_id=PRODUCER, my_worker_graphs=[llm],
             all_wg_ids_to_graph_walks={0: {"decode"}, 1: {"snac_chunk"}},
             all_wg_ids_to_dyn_loops={0: set(), 1: set()},
@@ -113,31 +87,7 @@ class _Producer:
             node_to_partition={"LLM": "LLM", "snac_decoder": "SNAC"},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         )
-        self.kind = kind
-        if kind == "python":
-            self.book = PythonTensorBookkeeping()
-            self.capture = _Capture()
-            self.rt = PythonGraphRuntime(
-                tensor_manager=_StubTensorManager(self.book),
-                communicator=self.capture, **common,
-            )
-        else:
-            pytest.importorskip("mstar_rust")
-            from mstar_rust import ZmqCommunicator
-
-            from mstar.communication.tensor_store import RustTensorBookkeeping
-            from mstar.graph.runtime.rust import RustGraphRuntime
-
-            self.book = RustTensorBookkeeping()
-            comm = ZmqCommunicator(PRODUCER, str(tmp_path))
-            self.inboxes = {
-                peer: ZmqCommunicator(peer, str(tmp_path))
-                for peer in ("conductor", "api_server", CONSUMER)
-            }
-            self.rt = RustGraphRuntime(
-                bookkeeping=self.book,
-                communicator=SimpleNamespace(_inner=comm), **common,
-            )
+        self.book = self.rt.tensor_store.bookkeeping
         self.rid = self.rt.add_request(
             request_id=RID, partition="LLM", graph_walk="decode",
             partition_worker_graph_ids=[0],
@@ -165,32 +115,12 @@ class _Producer:
         self.rt.send_outputs(SendInput(
             out.completion_id, ParallelList([self.rid], [fwd]), ParallelList([], []),
         ))
-        return self._take()
-
-    def _take(self):
-        if self.kind == "python":
-            got, self.capture.messages = self.capture.messages, []
-        else:
-            got = [
-                (peer, m) for peer in ("conductor", CONSUMER)
-                for m in _collect(self.inboxes[peer])
-            ]
+        got = self.inboxes.take()
         to_consumer = [m.body for d, m in got if d == CONSUMER]
         to_conductor = [m.body for d, m in got if d == "conductor"]
         assert len(to_consumer) == 1 and len(to_conductor) == 1
         assert isinstance(to_conductor[0], WorkerGraphsDone)
         return to_consumer[0], to_conductor[0]
-
-
-def _collect(box):
-    out = []
-    first = box.recv_timeout(1000)
-    if first is None:
-        return out
-    out.append(decode(first))
-    while (more := box.recv_timeout(50)) is not None:
-        out.append(decode(more))
-    return out
 
 
 class _EndsLLM:
@@ -306,13 +236,8 @@ def _chunks(w, buf):
     return out
 
 
-@pytest.fixture(params=["python", "rust"])
-def kind(request):
-    return request.param
-
-
-def test_done_before_the_last_item_waits_for_it(kind, tmp_path):
-    producer = _Producer(kind, tmp_path)
+def test_done_before_the_last_item_waits_for_it(tmp_path):
+    producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
 
@@ -325,9 +250,9 @@ def test_done_before_the_last_item_waits_for_it(kind, tmp_path):
     assert _chunks(w, buf) == []
 
 
-def test_done_before_the_last_of_several_passes(kind, tmp_path):
+def test_done_before_the_last_of_several_passes(tmp_path):
     """The count spans every pass's report, not just the one that ended it."""
-    producer = _Producer(kind, tmp_path)
+    producer = _Producer(tmp_path)
     first, wgd1 = producer.step(uuid=11)
     second, wgd2 = producer.step(uuid=12)
     done = _conduct(_conductor(passes=2), [wgd1, wgd2])
@@ -342,12 +267,12 @@ def test_done_before_the_last_of_several_passes(kind, tmp_path):
 
 
 @pytest.mark.parametrize("flush", ["one_per_tick", "all_at_once"])
-def test_a_send_backlog_that_drains_after_done(kind, tmp_path, flush):
+def test_a_send_backlog_that_drains_after_done(tmp_path, flush):
     """With non-blocking sends and a per-peer backlog (#217), descriptors for a
     backed-up consumer wait on the producer while its completions reach an idle
     conductor at once. Every pass's descriptor then lands after
     ``producer_done``, in order, and the stream ends with the last one."""
-    producer = _Producer(kind, tmp_path)
+    producer = _Producer(tmp_path)
     backlog, wgds = [], []
     for uuid in (11, 12, 13):
         descriptor, wgd = producer.step(uuid=uuid)
@@ -376,8 +301,8 @@ def test_a_send_backlog_that_drains_after_done(kind, tmp_path, flush):
     assert done.producer_done_items == {EDGE: 3}
 
 
-def test_items_before_done_end_the_stream_as_before(kind, tmp_path):
-    producer = _Producer(kind, tmp_path)
+def test_items_before_done_end_the_stream_as_before(tmp_path):
+    producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
 
@@ -401,7 +326,7 @@ def test_a_stream_that_sent_nothing_ends_at_once():
 def test_a_continuing_stream_waits_for_its_last_item_too(tmp_path):
     """Qwen3-Omni's Thinker to Talker: empty chunks keep the consumer going
     after the producer ends, and one must not stand in for the last item."""
-    producer = _Producer("python", tmp_path)
+    producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
 

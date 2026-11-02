@@ -60,8 +60,8 @@ def _ar_loop_graph(max_iters: int = 5):
 
 
 def _per_rid_wgios(num_rids: int) -> list[WorkerGraphIO]:
-    """Mirror ``WorkerGraphQueues.add_request`` — deepcopy the section per rid
-    so each gets independent state."""
+    """One WorkerGraphIO per rid, each over its own deepcopy of the section,
+    so no two rids share state."""
     section_template = _ar_loop_graph()
     return [WorkerGraphIO(deepcopy(section_template)) for _ in range(num_rids)]
 

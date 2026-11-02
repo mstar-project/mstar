@@ -1,20 +1,19 @@
-"""Tests for ``RequestStateManager``.
+"""The graph runtime's contract, driven the way the worker drives it.
 
 Covers:
-- Inverted ``walk_node_to_worker_graph_id`` index built in __post_init__
-- ``get_worker_graph_id_for_node`` uses the index (O(1) lookup, no scan)
-- ``mark_node_complete`` returns the registry's ``NodeCompletionOutput``
-- ``process_new_inputs`` returns leftover edges that no wg claimed
-- ``stop_loops`` returns the loop-back ``set[(name, dest)]``
+- ``get_worker_graph_id_for_node`` over the walk/node index
+- what a completed node routes, and what a finished worker graph reports
+- ``ingest_inputs_batch`` returning the edges no worker graph claimed
+- loop stops, local and from a peer
+- ``RequestStateManager``'s publication buffer
 """
 
 from types import SimpleNamespace
 
 import pytest
+from rust_runtime import Inboxes, build_runtime
 
-from mstar.communication.tensor_store import TensorStore
 from mstar.communication.tensor_uuid import TensorUuidMinter
-from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
@@ -25,13 +24,11 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     EdgeSpec,
-    PendingLoopStop,
     RequestWalks,
     RouteInput,
     SendInput,
     SpeculationPrepInput,
 )
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
@@ -40,50 +37,7 @@ from mstar.worker.node_manager_utils import (
     RequestStateManager,
 )
 
-# --- minimal stubs for tensor manager + fwd info -----------------------------
-
-class StubTensorManager:
-    """Records ref/deref calls so we can assert reference balance.
-
-    Carries a real TensorStore: the runtime resolves uuids to descriptors
-    through it when rebuilding an ingested edge.
-    """
-
-    def __init__(self):
-        self.refs: dict[tuple[str, str], int] = {}
-        self.tensor_store = TensorStore()
-
-    def increment_ref(self, request_id: str, uuid: str, n: int = 1):
-        key = (request_id, uuid)
-        self.refs[key] = self.refs.get(key, 0) + n
-
-    def dereference(self, request_id: str, uuid: str, n: int = 1):
-        key = (request_id, uuid)
-        self.refs[key] = self.refs.get(key, 0) - n
-
-    def dereference_batch_uniform(self, uuids: list[str], n: int = 1):
-        """What ``ReadySignals.clear`` and the loop caches call now: the
-        whole set in one crossing, with no request id."""
-        for uuid in uuids:
-            key = ("", uuid)
-            self.refs[key] = self.refs.get(key, 0) - n
-
-    # Routing settles output refcounts through the manager, as production
-    # does; these go straight to the real store underneath.
-    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
-
-    # The runtime refreshes arena placement on every outgoing edge. The real
-    # implementation, so the early-return this stub takes is the one under
-    # test: no arena here, so nothing to copy back.
-    stamps_shm_placement = False
-    refresh_shm_placement = TensorCommunicationManager.refresh_shm_placement
-
-    def set_persist(self, uuid: int, persist: bool):
-        self.tensor_store.set_metadata(uuid, persist=persist)
-
-    def dereference_batch(self, uuids: list[int], counts: list[int]):
-        self.tensor_store.dereference_batch(uuids, counts)
-
+# --- minimal stubs for fwd info -----------------------------------------------
 
 def _fwd_info(graph_walk: str, partition: str = "default", fwd_index: int = 0):
     return CurrentForwardPassInfo(
@@ -103,18 +57,20 @@ def _sharding_config():
 
 # --- fixtures ----------------------------------------------------------------
 
-def _make_ar_walk_graph():
+def _make_ar_walk_graph(no_async=None):
     """Single-worker, single-walk AR-shaped graph: prefill → ar_loop(ar_decode).
 
     The loop body's "token" output drives the loop-back AND (by name match in
     ``Loop.__post_init__``) the loop's terminal output to ``post_processor``
     on done. ``Loop.outputs`` entries whose names don't match a section-
-    produced name are filtered out at construction.
+    produced name are filtered out at construction. ``no_async`` names a node
+    that opts out of async scheduling.
     """
     return Sequential(sections=[
         GraphNode(
             name="prefill",
             input_names={"prompt"},
+            enable_async_scheduling=no_async != "prefill",
             outputs=[
                 GraphEdge(name="token", next_node="ar_decode"),
                 GraphEdge(name="kv_cache", next_node="ar_decode"),
@@ -125,6 +81,7 @@ def _make_ar_walk_graph():
             section=GraphNode(
                 name="ar_decode",
                 input_names={"token", "kv_cache"},
+                enable_async_scheduling=no_async != "ar_decode",
                 outputs=[
                     GraphEdge(name="token", next_node="ar_decode"),
                     GraphEdge(name="kv_cache", next_node="ar_decode"),
@@ -136,12 +93,8 @@ def _make_ar_walk_graph():
     ])
 
 
-def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
-    """Wire a runtime + manager the way Worker does, and admit one request.
-
-    The runtime owns the per-request queue lifecycle and the manager is handed
-    the SAME queues dict, so both see one copy of the state.
-    """
+def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0", inboxes=None):
+    """Wire a runtime + manager the way Worker does, and admit one request."""
     worker_graph = WorkerGraph(
         section=section, graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
     )
@@ -150,7 +103,8 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
     all_loops = {wg_id: set(loops)}
     node_to_partition = dict.fromkeys(nodes, "default")
 
-    runtime = PythonGraphRuntime(
+    runtime = build_runtime(
+        inboxes=inboxes,
         my_worker_id=worker_id,
         my_worker_graphs=[worker_graph],
         all_wg_ids_to_graph_walks=all_walks,
@@ -158,7 +112,6 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         all_wg_ids_to_nodes=all_nodes,
         node_to_partition=node_to_partition,
         sharding_config=_sharding_config(),
-        tensor_manager=StubTensorManager(),
     )
     mgr = RequestStateManager(node_to_partition=node_to_partition)
     fwd_info = _fwd_info(walk)
@@ -180,6 +133,31 @@ def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"}, worker_id=worker_id,
     )
     return mgr, wg_id, graph_walk, runtime, rid
+
+
+def _finish_node(runtime, rid, node, wg_id=0, walk="decode"):
+    """Pop ``node`` and complete it with one fresh tensor per output signal.
+    Returns ``({signal: [uuid]}, RouteOutput)``."""
+    import torch
+
+    runtime.pop_rids(node, walk, [rid])
+    signals = runtime.get_output_signals(node, walk)
+    uuids = _store_outputs(runtime.tensor_store, _MINTER, rid, {s: [torch.ones(2)] for s in signals})
+    return uuids, runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=walk, node_name=node, output_signals=signals,
+        wg_ids=ParallelList([rid], [wg_id]), tensors=[uuids[s][0] for s in signals],
+        num_tensors=[1] * len(signals),
+    ))
+
+
+def _finished_worker_graphs(runtime, out) -> list[int]:
+    """The worker graphs a completion finished. Consumes the completion."""
+    plan = runtime._rust.take_send_plan(out.completion_id)
+    return [wg for _rid, wgs, *_ in plan.completed for wg in wgs]
+
+
+def _ready(runtime):
+    return sorted((r.node_name, sorted(r.rids)) for r in runtime.get_ready_nodes(set()))
 
 
 # --- tests -------------------------------------------------------------------
@@ -211,10 +189,11 @@ def test_publication_buffer_keeps_only_local_metadata():
 def test_inverted_index_populated_at_init():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     # Both nodes should be indexed under the walk.
-    assert runtime._walk_node_to_wg_id[(walk, "prefill")] == wg_id
-    assert runtime._walk_node_to_wg_id[(walk, "ar_decode")] == wg_id
+    assert runtime.get_worker_graph_id_for_node("prefill", walk) == wg_id
+    assert runtime.get_worker_graph_id_for_node("ar_decode", walk) == wg_id
     # Unknown (walk, node) pairs should not be in the index.
-    assert ("other_walk", "prefill") not in runtime._walk_node_to_wg_id
+    with pytest.raises(ValueError, match="Could not find worker graph"):
+        runtime.get_worker_graph_id_for_node("prefill", "other_walk")
 
 
 def test_get_worker_graph_id_uses_inverted_index():
@@ -227,7 +206,7 @@ def test_get_worker_graph_id_raises_for_unknown_node():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     # What matters is that an unknown (walk, node) raises rather than silently
     # returning some other worker graph.
-    with pytest.raises(RuntimeError, match="Could not find worker graph"):
+    with pytest.raises(ValueError, match="Could not find worker graph"):
         runtime.get_worker_graph_id_for_node("mystery_node", walk)
 
 
@@ -239,12 +218,11 @@ def test_mark_node_complete_returns_node_completion_output():
     ])
     assert uningested == []  # prefill is in this wg, edge claimed
 
-    completion = runtime._mark_node_complete(rid, wg_id, "prefill")
-    # Top-level GraphNode completion returns its outputs (token + kv_cache → ar_decode)
-    # with no filtered signals (prefill isn't loop-managed).
-    names = sorted((e.name, e.next_node) for e in completion.output_edges)
-    assert names == [("kv_cache", "ar_decode"), ("token", "ar_decode")]
-    assert completion.filtered_signals == set()
+    uuids, _ = _finish_node(runtime, rid, "prefill", wg_id, walk)
+    # A top-level GraphNode's completion routes its outputs (token + kv_cache →
+    # ar_decode) and filters none (prefill isn't loop-managed).
+    popped = runtime.pop_rids("ar_decode", walk, [rid], check_ready=True)
+    assert {e.signal: e.uuids for e in popped.input_edges.edge_tuples()} == uuids
 
 
 def test_ingest_reports_the_index_of_an_unclaimed_signal():
@@ -262,11 +240,12 @@ def test_ingest_reports_the_index_of_an_unclaimed_signal():
 def test_stop_loops_snapshots_loop_stop_times_for_the_last_node_run():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._mark_node_complete(rid, wg_id, "prefill")
+    _finish_node(runtime, rid, "prefill", wg_id, walk)
     fwd_info = mgr.get_fwd_info(rid, "default")
 
-    runtime._stop_loops_for_rid(
-        rid, "default", {"ar_loop"}, last_node_run="ar_decode",
+    runtime.stop_loops_batched(
+        partition="default", graph_walk=walk, last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["ar_loop"]]),
     )
     # The snapshot lives on the runtime now, not on the wire-forwarded fwd_info.
     snapshot = runtime._loop_stop_times(rid).get("ar_loop")
@@ -277,32 +256,23 @@ def test_stop_loops_snapshots_loop_stop_times_for_the_last_node_run():
 
 def test_loop_done_drops_loop_back_and_keeps_terminal_outputs():
     """Drive prefill and two ar_decode iterations, requesting loop termination
-    before the second completes. The final completion should report loop-back
-    signals in ``filtered_signals`` and return only the terminal outputs."""
+    before the second completes. The final completion should drop the loop-back
+    signals and stage only the terminal output."""
     mgr, wg_id, walk, runtime, rid = _make_manager()
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._mark_node_complete(rid, wg_id, "prefill")
-    # Route prefill's outputs back in.
-    _ingest(runtime, rid, [
-        GraphEdge(name="token", next_node="ar_decode"),
-        GraphEdge(name="kv_cache", next_node="ar_decode"),
-    ])
-    runtime._mark_node_complete(rid, wg_id, "ar_decode")  # advance: iter 0 done
+    _finish_node(runtime, rid, "prefill", wg_id, walk)  # routes its outputs back in
+    _finish_node(runtime, rid, "ar_decode", wg_id, walk)  # advance: iter 0 done
+    assert _ready(runtime) == [("ar_decode", [rid])]
 
     # Now request a stop on ar_loop, then complete the next iter.
-    _ingest(runtime, rid, [
-        GraphEdge(name="token", next_node="ar_decode"),
-        GraphEdge(name="kv_cache", next_node="ar_decode"),
-    ])
-    runtime._stop_loops_for_rid(rid, "default", {"ar_loop"}, None)
-    completion = runtime._mark_node_complete(rid, wg_id, "ar_decode")
+    runtime.stop_loops_batched(
+        partition="default", graph_walk=walk, last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["ar_loop"]]),
+    )
+    uuids, out = _finish_node(runtime, rid, "ar_decode", wg_id, walk)
 
-    assert sorted(completion.filtered_signals) == [
-        ("kv_cache", "ar_decode"), ("token", "ar_decode"),
-    ]
-    assert [(e.name, e.next_node) for e in completion.output_edges] == [
-        ("token", "post_processor"),
-    ]
+    assert _ready(runtime) == [], "the loop-back signals must be dropped"
+    assert out.register_uuids == uuids["token"], "only the terminal output leaves"
 
 
 def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
@@ -323,10 +293,11 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         empty_outputs_graph, wg_id, "prefill_text", nodes={"prefill_text"},
     )
     _ingest(runtime, rid, [GraphEdge(name="text_inputs", next_node="prefill_text")])
-    assert not runtime._queues[wg_id].is_done(rid)  # not done before complete
-    runtime._mark_node_complete(rid, wg_id, "prefill_text")
-    assert runtime._queues[wg_id].is_done(rid), \
-        "mark_node_complete on a no-output node must flip is_done"
+    assert not runtime.is_partition_idle(rid, "default")  # not done before complete
+    _, out = _finish_node(runtime, rid, "prefill_text", wg_id, "prefill_text")
+    assert _finished_worker_graphs(runtime, out) == [wg_id], \
+        "completing a no-output node must finish its worker graph"
+    assert runtime.is_partition_idle(rid, "default")
 
 
 def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
@@ -353,60 +324,72 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
         single_node_graph, wg_id, "prefill", nodes={"prefill"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._mark_node_complete(rid, wg_id, "prefill")
+    _, out = _finish_node(runtime, rid, "prefill", wg_id, "prefill")
 
-    routing = runtime._process_node_outputs(
-        rid,
-        node_name="prefill",
-        outputs=list(runtime._queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
-        graph_walk="prefill",
-    )
-    assert wg_id in routing.completed_worker_graph_ids, \
+    assert wg_id in _finished_worker_graphs(runtime, out), \
         "prefill wg with only EMPTY_DESTINATION outputs must still report done"
 
 
 # --- loop stops on the runtime ------------------------------------------------
+
+def _in_a_fresh_loop(runtime, rid, wg_id=0, walk="decode"):
+    """A new pass, with ar_decode's next iteration on offer to speculation."""
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    _finish_node(runtime, rid, "prefill", wg_id, walk)
+
+
+def _loop_is_stopped(runtime, rid):
+    """A stopped loop has no further iteration to speculate."""
+    return _prep(runtime, [rid], curr="ar_decode", spec="ar_decode").ready_rids == []
+
+
+def _end_the_stopped_loop(runtime, rid, wg_id=0, walk="decode"):
+    """Run the iteration a stop let through; the graph resets for the next pass."""
+    _finish_node(runtime, rid, "ar_decode", wg_id, walk)
+    assert runtime.is_partition_idle(rid, "default")
+
 
 def test_peer_loop_stop_is_applied_only_when_newer():
     """A peer's STOP_LOOPS stops the loop only if its observation is newer than
     what this rank already has. Re-applying an older one must be a no-op, or a
     late duplicate would re-stop a loop that has since restarted."""
     _mgr, _wg_id, _walk, runtime, rid = _make_manager()
-    mgr, wg_id = _mgr, _wg_id
-    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._mark_node_complete(rid, wg_id, "prefill")
-    wgio = runtime._queues[wg_id].per_request_queues[rid]
+    _in_a_fresh_loop(runtime, rid)
 
     newer = NestedLoopIndices(
         loop_name_order=["ar_loop"], loop_indices={"ar_loop": 5},
         wg_fwd_pass_idx=1,
     )
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": newer})
-    assert wgio.loops["ar_loop"]._finish_signal is True
-    assert runtime._loop_stop_times(rid)["ar_loop"] is newer
+    assert _loop_is_stopped(runtime, rid)
+    assert runtime._loop_stop_times(rid)["ar_loop"] == newer
 
-    # An older observation for the same loop is recorded but stops nothing new.
-    wgio.loops["ar_loop"]._finish_signal = False
+    # The loop restarts, and an older observation of it arrives late.
+    _end_the_stopped_loop(runtime, rid)
+    _in_a_fresh_loop(runtime, rid)
+    assert not _loop_is_stopped(runtime, rid)
     older = NestedLoopIndices(
         loop_name_order=["ar_loop"], loop_indices={"ar_loop": 1},
         wg_fwd_pass_idx=0,
     )
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": older})
-    assert wgio.loops["ar_loop"]._finish_signal is False, \
+    assert not _loop_is_stopped(runtime, rid), \
         "an older peer stop must not re-stop the loop"
 
 
 def test_peer_loop_stop_for_an_unknown_partition_is_dropped():
     _mgr, _wg_id, _walk, runtime, rid = _make_manager()
-    runtime.apply_peer_loop_stops(rid, "no_such_partition", {"ar_loop": None})
+    runtime.apply_peer_loop_stops(rid, "no_such_partition", {"ar_loop": NestedLoopIndices(
+        loop_name_order=["ar_loop"], loop_indices={"ar_loop": 1}, wg_fwd_pass_idx=1,
+    )})
     assert runtime._loop_stop_times(rid) == {}
 
 
 def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     _mgr, _wg_id, walk, runtime, rid = _make_manager()
-    mgr, wg_id = _mgr, _wg_id
+    wg_id = _wg_id
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._mark_node_complete(rid, wg_id, "prefill")
+    _finish_node(runtime, rid, "prefill", wg_id, walk)
 
     stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=walk, last_node_run="ar_decode",
@@ -439,10 +422,6 @@ def test_peer_loop_stop_compares_enclosing_loop_indices():
     the indices of the loops ENCLOSING the target. The previous assertions all
     differ in wg_fwd_pass_idx, which short-circuits before that point."""
     _mgr, _wg_id, _walk, runtime, rid = _make_manager()
-    mgr, wg_id = _mgr, _wg_id
-    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._mark_node_complete(rid, wg_id, "prefill")
-    wgio = runtime._queues[wg_id].per_request_queues[rid]
 
     def _at(outer_idx):
         return NestedLoopIndices(
@@ -451,17 +430,20 @@ def test_peer_loop_stop_compares_enclosing_loop_indices():
             wg_fwd_pass_idx=3,
         )
 
+    _in_a_fresh_loop(runtime, rid)
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(1)})
-    assert wgio.loops["ar_loop"]._finish_signal is True
+    assert _loop_is_stopped(runtime, rid)
 
-    wgio.loops["ar_loop"]._finish_signal = False
+    _end_the_stopped_loop(runtime, rid)
+    _in_a_fresh_loop(runtime, rid)
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(2)})
-    assert wgio.loops["ar_loop"]._finish_signal is True, \
+    assert _loop_is_stopped(runtime, rid), \
         "a later enclosing iteration is a newer stop"
 
-    wgio.loops["ar_loop"]._finish_signal = False
+    _end_the_stopped_loop(runtime, rid)
+    _in_a_fresh_loop(runtime, rid)
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(2)})
-    assert wgio.loops["ar_loop"]._finish_signal is False, \
+    assert not _loop_is_stopped(runtime, rid), \
         "the same observation twice must not re-stop"
 
 
@@ -473,6 +455,9 @@ def _ingest(runtime, rid, edges):
     for edge in edges:
         block.add_edge(rid, edge)
     return runtime.ingest_inputs_batch(block, can_buffer=True)
+
+
+_MINTER = TensorUuidMinter("worker_0")
 
 
 def _store_outputs(store, minter, rid, tensors):
@@ -516,9 +501,9 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")]
         )
 
-    # The runtime resolves uuids through its own store now, so stage into
-    # that one rather than a second store nothing else can see.
-    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    # Stage into the store over the runtime's own bookkeeper, not a second one
+    # nothing else can see.
+    store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
     # Two signals with asymmetric counts: with one signal, or with matching
     # counts, a rid-major and a signal-major read give the SAME answer and the
     # test proves nothing.
@@ -547,15 +532,12 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
             num_tensors=num_tensors,
         ),
     )
-    completion = runtime._peek_completion(out.completion_id)
+    assert out.completion_id
 
     # Each rid's edges carry exactly its own uuids, per signal.
     for rid, own in ((rid_a, a), (rid_b, b)):
-        by_signal: dict[str, list[int]] = {}
-        for edge in completion.routing[rid].routed_to_this_worker_graph:
-            by_signal.setdefault(edge.name, []).extend(
-                i.uuid for i in edge.tensor_info
-            )
+        popped = runtime.pop_rids("ar_decode", "decode", [rid], check_ready=True)
+        by_signal = {e.signal: e.uuids for e in popped.input_edges.edge_tuples()}
         assert by_signal == own, f"{rid} got the wrong slice of the flat list"
 
 
@@ -567,9 +549,9 @@ def test_route_batch_parks_routing_under_a_fresh_completion_id():
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    # The runtime resolves uuids through its own store now, so stage into
-    # that one rather than a second store nothing else can see.
-    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    # Stage into the store over the runtime's own bookkeeper, not a second one
+    # nothing else can see.
+    store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
     uuids = _store_outputs(store, minter, rid, {"token": [torch.ones(2)]})["token"]
 
     out = runtime.complete_and_route_batch(
@@ -581,22 +563,15 @@ def test_route_batch_parks_routing_under_a_fresh_completion_id():
         ),
     )
     assert out.completion_id not in (0,), "ids start above the unset sentinel"
-    state = runtime._peek_completion(out.completion_id)
-    assert state.node_name == "prefill" and state.graph_walk == "decode"
-    # peek does not consume; send_outputs is what pops the entry, so peeking
+    # Routing parks it; the send is what pops the entry, so reading the count
     # twice has to keep working.
-    assert runtime._peek_completion(out.completion_id) is state
+    assert runtime._rust.num_parked_completions() == 1
+    assert runtime._rust.num_parked_completions() == 1
+    assert runtime._rust.take_send_plan(out.completion_id).partition == "default"
+    assert runtime._rust.num_parked_completions() == 0
 
 
 # --- send_outputs -------------------------------------------------------------
-
-class _RecordingCommunicator:
-    def __init__(self):
-        self.sent: list[tuple[str, object]] = []
-
-    def send(self, entity_id, msg=None, **kwargs):
-        self.sent.append((entity_id, msg if msg is not None else kwargs))
-
 
 def _route_one(runtime, mgr, rid, store, minter, signal="token"):
     import torch
@@ -621,31 +596,31 @@ def _send_input(runtime, rid, completion_id, fwd_info):
     )
 
 
-def test_send_outputs_consumes_the_completion():
+def test_send_outputs_consumes_the_completion(tmp_path):
     """complete_and_route_batch parks the routing and send_outputs is what
-    frees it. The worker peeks in between, so a double-pop here would only
+    frees it. The worker reads in between, so a double-pop here would only
     show up on the live path."""
     mgr, runtime, rid = _build(
         _make_ar_walk_graph(), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+        inboxes=Inboxes("worker0", tmp_path),
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    runtime._communicator = _RecordingCommunicator()
-    # The runtime resolves uuids through its own store now, so stage into
-    # that one rather than a second store nothing else can see.
-    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    # Stage into the store over the runtime's own bookkeeper, not a second one
+    # nothing else can see.
+    store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
 
     out, _ = _route_one(runtime, mgr, rid, store, minter)
-    # Peeking must not consume.
-    runtime._peek_completion(out.completion_id)
-    runtime._peek_completion(out.completion_id)
+    assert runtime._rust.num_parked_completions() == 1
 
-    runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
-    with pytest.raises(KeyError):
-        runtime._peek_completion(out.completion_id)
+    send = _send_input(runtime, rid, out.completion_id, _fwd_info("decode"))
+    runtime.send_outputs(send)
+    assert runtime._rust.num_parked_completions() == 0
+    with pytest.raises(ValueError, match="unknown completion"):
+        runtime.send_outputs(send)
 
 
-def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
+def test_persist_signals_are_buffered_until_a_worker_graph_finishes(tmp_path):
     """They ride WORKER_GRAPHS_DONE rather than going out on their own, so a
     persist cannot race the message announcing it."""
     single = GraphNode(
@@ -653,13 +628,12 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
         outputs=[GraphEdge(name="token", next_node=EMPTY_DESTINATION,
                            persist=True)],
     )
-    mgr, runtime, rid = _build(single, 0, "decode", nodes={"prefill"})
+    comm = Inboxes("worker0", tmp_path)
+    mgr, runtime, rid = _build(single, 0, "decode", nodes={"prefill"}, inboxes=comm)
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    comm = _RecordingCommunicator()
-    runtime._communicator = comm
-    # The runtime resolves uuids through its own store now, so stage into
-    # that one rather than a second store nothing else can see.
-    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    # Stage into the store over the runtime's own bookkeeper, not a second one
+    # nothing else can see.
+    store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
 
     out, uuids = _route_one(runtime, mgr, rid, store, minter)
     runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
@@ -672,40 +646,52 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
     assert len(wgd) == 1, "the finished worker graph must report exactly once"
     assert wgd[0].body.persist_signals["token"][0].uuid == uuids[0]
     # Flushed, so a second pass does not resend them.
-    assert runtime._request_info[rid].pending_persist_signals == []
+    assert runtime._rust.pending_persist_signals(rid) == []
 
 
-def test_worker_graphs_done_carries_every_persisted_tensor_of_a_name():
+def test_worker_graphs_done_carries_every_persisted_tensor_of_a_name(tmp_path):
     """A loop persists a name once per iteration before its worker graph
     finishes, so the conductor needs all of them, oldest first."""
-    single = GraphNode(
-        name="prefill", input_names={"prompt"},
-        outputs=[GraphEdge(name="token", next_node=EMPTY_DESTINATION,
-                           persist=True)],
+    import torch
+
+    # One output, two edges: each iteration's tensor is persisted twice.
+    section = Loop(
+        name="lp", max_iters=2, outputs=[],
+        section=GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[
+                GraphEdge(name="prompt", next_node="prefill"),
+                GraphEdge(name="token", next_node=EMPTY_DESTINATION, persist=True),
+                GraphEdge(name="token", next_node=EMPTY_DESTINATION, persist=True),
+            ],
+        ),
     )
-    mgr, runtime, rid = _build(single, 0, "decode", nodes={"prefill"})
+    comm = Inboxes("worker0", tmp_path)
+    mgr, runtime, rid = _build(section, 0, "decode", nodes={"prefill"}, loops={"lp"}, inboxes=comm)
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    comm = _RecordingCommunicator()
-    runtime._communicator = comm
-    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
 
-    # An earlier iteration's tensor, persisted twice (one output, two edges).
-    earlier = GraphEdge(name="token", next_node=EMPTY_DESTINATION, persist=True)
-    earlier.tensor_info = [SimpleNamespace(uuid=-1)]
-    runtime._request_info[rid].pending_persist_signals.extend([earlier, earlier])
-
-    out, uuids = _route_one(runtime, mgr, rid, store, minter)
-    runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
+    persisted = []
+    for _ in range(2):
+        runtime.pop_rids("prefill", "decode", [rid])
+        out = _store_outputs(store, minter, rid, {"prompt": [torch.ones(2)], "token": [torch.ones(2)]})
+        persisted += out["token"]
+        route = runtime.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk="decode", node_name="prefill",
+            output_signals=["prompt", "token"], wg_ids=ParallelList([rid], [0]),
+            tensors=out["prompt"] + out["token"], num_tensors=[1, 1],
+        ))
+        runtime.send_outputs(_send_input(runtime, rid, route.completion_id, _fwd_info("decode")))
 
     [wgd] = [
         m for e, m in comm.sent
         if e == "conductor"
         and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
     ]
-    assert [i.uuid for i in wgd.body.persist_signals["token"]] == [-1, uuids[0]]
+    assert [i.uuid for i in wgd.body.persist_signals["token"]] == persisted
 
 
-def test_worker_graphs_done_names_each_rows_own_walk():
+def test_worker_graphs_done_names_each_rows_own_walk(tmp_path):
     """A mixed step routes rows of two walks under one combined label. The
     conductor follows a producer-triggered partition's walk off each
     WORKER_GRAPHS_DONE, so it must name the row's own walk."""
@@ -719,17 +705,17 @@ def test_worker_graphs_done_names_each_rows_own_walk():
             ),
             graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
         )
-    runtime = PythonGraphRuntime(
+    comm = Inboxes("worker0", tmp_path)
+    runtime = build_runtime(
+        inboxes=comm,
         my_worker_id="worker0", my_worker_graphs=[wg(0, "prefill"), wg(1, "decode")],
         all_wg_ids_to_graph_walks={0: {"prefill"}, 1: {"decode"}},
         all_wg_ids_to_dyn_loops={0: set(), 1: set()},
         all_wg_ids_to_nodes={0: {"only"}, 1: {"only"}},
         node_to_partition={"only": "default"},
-        sharding_config=_sharding_config(), tensor_manager=StubTensorManager(),
+        sharding_config=_sharding_config(),
     )
-    comm = _RecordingCommunicator()
-    runtime._communicator = comm
-    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
     rids = [
         runtime.add_request(
             request_id=f"r_{walk}", partition="default", graph_walk=walk,
@@ -794,15 +780,12 @@ def test_an_unread_loop_back_is_not_routed():
         section, 0, "decode", nodes={"prefill", "decode"}, loops={"decode_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    completion = runtime._mark_node_complete(rid, 0, "prefill")
-    runtime._process_node_outputs(rid, "prefill", completion.output_edges, "decode")
+    _finish_node(runtime, rid, "prefill")
 
-    completion = runtime._mark_node_complete(rid, 0, "decode")
-    routing = runtime._process_node_outputs(
-        rid, "decode", completion.output_edges, "decode",
-    )
-    assert routing.to_workers == {}
-    assert [e.name for e in routing.persist] == ["new_token"]
+    _, out = _finish_node(runtime, rid, "decode")
+    assert out.rids_needing_request_info == frozenset(), "nothing goes to a worker"
+    plan = runtime._rust.take_send_plan(out.completion_id)
+    assert [signal for _rid, signal, _uuids in plan.persist] == ["new_token"]
 
 
 def _spec_targets(runtime, node, walk, rid):
@@ -827,12 +810,10 @@ def test_speculate_node_finds_the_downstream_target():
 
 def test_speculate_node_skips_a_target_that_opted_out_of_async():
     mgr, runtime, rid = _build(
-        _make_ar_walk_graph(), 0, "decode",
+        _make_ar_walk_graph(no_async="ar_decode"), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    wgio = runtime._queues[0].per_request_queues[rid]
-    wgio.nodes["ar_decode"].enable_async_scheduling = False
 
     assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
@@ -840,12 +821,10 @@ def test_speculate_node_skips_a_target_that_opted_out_of_async():
 def test_speculate_node_skips_a_walk_whose_source_opted_out_of_async():
     """Checked per walk, so a mixed batch can still speculate its other walks."""
     mgr, runtime, rid = _build(
-        _make_ar_walk_graph(), 0, "decode",
+        _make_ar_walk_graph(no_async="prefill"), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    wgio = runtime._queues[0].per_request_queues[rid]
-    wgio.nodes["prefill"].enable_async_scheduling = False
 
     assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
@@ -949,12 +928,15 @@ def _in_loop_runtime():
     is a loop-BACK. The loop filters only apply to a new loop iteration, which
     a transition into the loop (prefill -> ar_decode) is not."""
     mgr, runtime, rid = _spec_ready_runtime()
-    runtime._mark_node_complete(rid, 0, "prefill")
-    _ingest(runtime, rid, [
-        GraphEdge(name="token", next_node="ar_decode"),
-        GraphEdge(name="kv_cache", next_node="ar_decode"),
-    ])
+    _finish_node(runtime, rid, "prefill")
     return mgr, runtime, rid
+
+
+def _stop_loop(runtime, rid):
+    runtime.stop_loops_batched(
+        partition="default", graph_walk="decode", last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["ar_loop"]]),
+    )
 
 
 def test_prep_skips_a_rid_whose_loop_already_has_a_pending_stop():
@@ -965,7 +947,8 @@ def test_prep_skips_a_rid_whose_loop_already_has_a_pending_stop():
         runtime, [rid], curr="ar_decode", spec="ar_decode"
     ).ready_rids == [rid]
 
-    runtime._pending_loop_stops.add(PendingLoopStop(rid, "decode", "ar_loop"))
+    _stop_loop(runtime, rid)
+    assert runtime.has_pending_loop_stop(rid, "decode", "ar_loop")
     assert _prep(
         runtime, [rid], curr="ar_decode", spec="ar_decode"
     ).ready_rids == [], \
@@ -978,9 +961,11 @@ def test_prep_skips_a_rid_on_its_loops_final_iteration():
         runtime, [rid], curr="ar_decode", spec="ar_decode"
     ).ready_rids == [rid]
 
-    runtime._queues[0].per_request_queues[rid].loops[
-        "ar_loop"
-    ]._finish_signal = True
+    # A peer's stop finishes the loop with no pending stop recorded here.
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": NestedLoopIndices(
+        loop_name_order=["ar_loop"], loop_indices={"ar_loop": 0}, wg_fwd_pass_idx=0,
+    )})
+    assert not runtime.has_pending_loop_stop(rid, "decode", "ar_loop")
     assert _prep(
         runtime, [rid], curr="ar_decode", spec="ar_decode"
     ).ready_rids == []
@@ -990,7 +975,8 @@ def test_prep_does_not_apply_the_loop_filter_to_a_transition_into_the_loop():
     """prefill -> ar_decode enters the loop, so it is not a new iteration and
     a pending stop must not suppress it."""
     _mgr, runtime, rid = _spec_ready_runtime()
-    runtime._pending_loop_stops.add(PendingLoopStop(rid, "decode", "ar_loop"))
+    _stop_loop(runtime, rid)
+    assert runtime.has_pending_loop_stop(rid, "decode", "ar_loop")
     assert _prep(runtime, [rid]).ready_rids == [rid]
 
 
@@ -999,18 +985,16 @@ def test_prep_rolls_back_the_streaming_ingest_when_the_node_is_not_ready():
     If the ingest were left in place, the chunk would be stranded in a slot
     of a node that never ran."""
     _mgr, runtime, rid = _spec_ready_runtime()
-    wgio = runtime._queues[0].per_request_queues[rid]
-    node = wgio.nodes["ar_decode"]
 
     # Force not-ready: ar_decode needs token AND kv_cache, so offer only a
     # signal it does not take, which cannot complete it.
-    before_ready = set(node.ready_signals.ready_names)
+    before_ready = _ready(runtime)
     out = _prep(runtime, [rid], streaming=[(
         rid, EdgeSpec(signal="token", next_node="ar_decode", uuids=[]),
     )])
 
     if not out.ready_rids:
-        assert set(node.ready_signals.ready_names) == before_ready, \
+        assert _ready(runtime) == before_ready, \
             "a failed prep must leave no streaming chunk behind"
         assert out.consumed_streaming_edge_idxs == [], \
             "nothing was consumed, so the caller returns every chunk"
@@ -1030,9 +1014,13 @@ def test_prep_reports_consumed_streaming_edges_by_index():
 
 # --- routing settles refcounts through the tensor manager -------------------
 
-def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
+def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset(), inboxes=None, stream_consumer=None):
     """A runtime over a real (file-SHM, CPU) tensor manager, so refcount
-    changes run the manager's teardown rather than a stub's bookkeeping."""
+    changes run the manager's teardown rather than a stub's bookkeeping.
+
+    ``stream_consumer`` is a node on this worker in a sibling worker graph of
+    its own walk, as Orpheus's vocoder is, for a stream to land on.
+    """
     from mstar.communication.tensors import SharedMemoryCommunicationManager
 
     tm = SharedMemoryCommunicationManager(
@@ -1040,23 +1028,33 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
         communicator=SimpleNamespace(send=lambda *a, **k: None),
         shm_dir=str(tmp_path),
     )
-    worker_graph = WorkerGraph(
+    worker_graphs = [WorkerGraph(
         section=section, graph_walks={"w"}, ranks=[0], worker_graph_id=0,
-    )
-    runtime = PythonGraphRuntime(
+    )]
+    walks, wg_loops, wg_nodes = {0: {"w"}}, {0: set(loops)}, {0: set(nodes)}
+    node_to_partition = dict.fromkeys(nodes, "default")
+    if stream_consumer:
+        worker_graphs.append(WorkerGraph(
+            section=GraphNode(name=stream_consumer, input_names={"pred"}, outputs=[]),
+            graph_walks={"chunk"}, ranks=[0], worker_graph_id=1,
+        ))
+        walks[1], wg_loops[1], wg_nodes[1] = {"chunk"}, set(), {stream_consumer}
+        node_to_partition[stream_consumer] = "C"
+    runtime = build_runtime(
+        bookkeeping=tm.tensor_store.bookkeeping,
+        inboxes=inboxes,
         my_worker_id="worker_0",
-        my_worker_graphs=[worker_graph],
-        all_wg_ids_to_graph_walks={0: {"w"}},
-        all_wg_ids_to_dyn_loops={0: set(loops)},
-        all_wg_ids_to_nodes={0: set(nodes)},
-        node_to_partition=dict.fromkeys(nodes, "default"),
+        my_worker_graphs=worker_graphs,
+        all_wg_ids_to_graph_walks=walks,
+        all_wg_ids_to_dyn_loops=wg_loops,
+        all_wg_ids_to_nodes=wg_nodes,
+        node_to_partition=node_to_partition,
         sharding_config=_sharding_config(),
-        tensor_manager=tm,
     )
     rid = runtime.add_request(
         request_id="r", partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
-        worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        worker_graph_to_workers=ParallelList(list(walks), [["worker_0"]] * len(walks)),
         loop_caps={},
     )
     tm.register_request(rid, runtime.get_sharding_config(rid))
@@ -1077,6 +1075,7 @@ def _complete(tm, runtime, rid, node, outputs, signals):
             tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
         ),
     )
+    tm.cleanup_collectable(*out.freed_inputs)
     return stored, out
 
 
@@ -1133,11 +1132,8 @@ def test_a_new_token_signal_on_two_edges_is_counted_once(tmp_path):
 # new_token_output_idxs stays index-based on purpose; the test below pins
 # that down rather than leaving it looking like the same oversight.
 
-def _rollout_runtime(tmp_path, accumulated_edge, max_iters=2, extra_nodes=()):
+def _rollout_runtime(tmp_path, accumulated_edge, max_iters=2, stream_consumer=None):
     """encode -> loop(step) with ``pred`` accumulated across iterations.
-
-    ``extra_nodes`` are on this worker but outside the section, which is how a
-    streaming consumer gets a sharding group to fan out to.
 
     Returns the per-iteration uuids (one per ``step`` completion, oldest
     first) and the RouteOutput of the completion that finished the loop.
@@ -1161,7 +1157,7 @@ def _rollout_runtime(tmp_path, accumulated_edge, max_iters=2, extra_nodes=()):
         ),
     ])
     tm, runtime, rid = _build_on_real_manager(
-        section, {"encode", "step", *extra_nodes}, tmp_path, loops={"roll"},
+        section, {"encode", "step"}, tmp_path, loops={"roll"}, stream_consumer=stream_consumer,
     )
     _ingest(runtime, rid, [GraphEdge(name="video", next_node="encode")])
     _complete(tm, runtime, rid, "encode", {"pred": [torch.ones(2)]}, ["pred"])
@@ -1223,7 +1219,7 @@ def test_accumulated_local_streaming_carries_every_iteration(tmp_path):
     _tm, _runtime, rid, per_iter, out = _rollout_runtime(
         tmp_path,
         GraphEdge(name="pred", next_node="vocoder", is_streaming=True),
-        extra_nodes=("vocoder",),
+        stream_consumer="vocoder",
     )
     assert list(out.local_streaming_by_signal) == ["pred"], (
         "one key per stream is what keeps the edge name off the per-chunk path"
@@ -1269,18 +1265,18 @@ def test_results_report_the_loop_context_from_before_the_completion(tmp_path):
         outputs=[],
         max_iters=10,
     )
-    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path)
-    comm = _RecordingCommunicator()
-    runtime._communicator = comm
+    comm = Inboxes("worker_0", tmp_path)
+    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path, inboxes=comm)
     _ingest(runtime, rid, [GraphEdge(name="tok", next_node="gen")])
-    wgio = runtime._queues[0].per_request_queues[rid]
-    before = wgio.get_nested_loop_idxs_for_node("gen")
+    before = NestedLoopIndices(
+        loop_name_order=["gen_loop"], loop_indices={"gen_loop": 0}, wg_fwd_pass_idx=0,
+    )
 
     _, out = _complete(
         tm, runtime, rid, "gen",
         {"tok": [torch.ones(1)], "out": [torch.ones(1)]}, ["out", "tok"],
     )
-    assert wgio.get_nested_loop_idxs_for_node("gen") != before, (
+    assert runtime.get_dynamic_loop_iters([rid], "default").values == [{"gen_loop": 1}], (
         "the completion should have advanced the loop, or this proves nothing"
     )
     runtime.send_outputs(SendInput(
@@ -1302,8 +1298,7 @@ def test_cleanup_takes_the_consumed_node_out_of_the_ready_set():
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    wgio = runtime._queues[0].per_request_queues[rid]
-    assert "prefill" in wgio.ready_node_names
+    assert _ready(runtime) == [("prefill", [rid])]
 
     runtime.cleanup_consumed_inputs("prefill", [rid], [0])
-    assert "prefill" not in wgio.ready_node_names
+    assert _ready(runtime) == []
