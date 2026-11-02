@@ -197,11 +197,12 @@ class VJepa2Model(Model):
         "actions", "states", "extrinsics", "context_mask", "target_mask", "goal_hidden",
     )
     LENGTH_KWARGS = ("max_output_tokens", "rollout_horizon")
-    # A request's video decode is most of its wall time and holds no GIL, so 8
-    # preprocess at once. 16 intra-op threads were chosen against torch's
-    # one-per-core pool, before default_preprocess_threads() (at most 4, what
-    # None now gives) existed: at least 4x that default, and not compared to it.
-    PREPROCESS_WORKERS = 8
+    # A request's video decode is most of its wall time and holds no GIL, so
+    # requests preprocess at once (configs/vjepa2*.yaml size the pool). 16
+    # intra-op threads were chosen against torch's one-per-core pool, before
+    # default_preprocess_threads() (at most 4, what None now gives) existed: at
+    # least 4x that default, and not compared to it.
+    PREPROCESS_PARALLEL = True
     PREPROCESS_TORCH_THREADS = 16
 
     PREFILL_VIDEO = "prefill_video"
@@ -1156,10 +1157,9 @@ class VJepa2ACModel(VJepa2Model):
         "mlp_ratio": 48 / 11,
     }
     # a rollout decodes 8 frames: ViT-L's 8 workers x 16 threads measured
-    # 2-5% slower here than 4 workers on torch's one-per-core pool, which None
-    # meant then; None now gives default_preprocess_threads() (at most 4),
-    # not re-measured
-    PREPROCESS_WORKERS = 4
+    # 2-5% slower here than 4 workers (configs/vjepa2_ac.yaml) on torch's
+    # one-per-core pool, which None meant then; None now gives
+    # default_preprocess_threads() (at most 4), not re-measured
     PREPROCESS_TORCH_THREADS = None
 
     def __init__(

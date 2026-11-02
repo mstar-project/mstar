@@ -41,7 +41,7 @@ from mstar.api_server.auth import (
     warn_if_no_api_key,
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
-from mstar.api_server.data_worker import PreprocessWorker, _positive_int, unlink_files
+from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -1792,6 +1792,12 @@ class WarmupMedia:
                 f"cannot determine modality for warmup file {path!r}; set 'modality'"
             )
         return cls(path=path, modality=modality)
+
+
+def _positive_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
 
 
 @dataclass

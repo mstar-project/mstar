@@ -1,5 +1,8 @@
 model: "vjepa2"
 max_seq_len: 8192
+# Requests the data worker prepares at once (VJepa2Model.PREPROCESS_PARALLEL):
+# a request's video decode is most of its wall time and holds no GIL.
+preprocess_workers: 8
 
 # Default checkpoint is facebook/vjepa2-vitl-fpc64-256 (~300M), set in
 # HF_MODELS["vjepa2"] in mstar/model/registry.py.  To swap to vith / vitg /

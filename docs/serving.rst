@@ -375,21 +375,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
-   * - ``preprocess_workers``
-     - *(optional)* Requests whose media load and ``process_prompt`` the API server
-       runs at once, on a thread pool: a positive integer, default
-       ``Model.PREPROCESS_WORKERS`` (8 for V-JEPA2 and 4 for V-JEPA2-AC, which this
-       setting may raise or lower; 1 otherwise). A model class sets that above 1 only
-       when its ``load_*`` and ``process_prompt`` are thread-safe, so a value above 1 for a
-       class that leaves it at 1 fails at startup, as does a value that is not a
-       positive integer. 1 prepares one request at a time on the data-worker thread.
-       The pool takes at most the CPUs left after ``step_thread_core``'s pins;
-       each prepare's own FFmpeg threads are not counted against it. Requests
-       are still handed to the conductor in arrival order.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``
        (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
+   * - ``preprocess_workers``
+     - *(optional)* Requests the data worker prepares at once, for a model that
+       declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
+       beside the API server's intra-op threads (``preprocess_torch_threads``),
+       at most 8; ``1`` prepares inline. See :doc:`adding_models`.
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
@@ -1045,10 +1039,10 @@ work.
   route and long transcriptions send WAV files they write from the decoded audio, so
   those count the WAV sizes. Requests refused before they were submitted (an oversized
   body, a bad form) are not counted.
-- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, inputs
-  (requests and client-stream appends) waiting in the data worker: submitted, and
-  neither being prepared nor handed on to the conductor yet. One whose client went away
-  still counts until its turn comes and it is dropped.
+- ``mstar_data_worker_queue_depth{model_name}``: gauge, read at scrape time, requests
+  submitted and not yet taken up by the data worker (the one it is working on is not
+  counted). A request whose client went away still counts until the data worker takes
+  it up.
 
 .. code-block:: bash
 
