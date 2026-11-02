@@ -154,8 +154,9 @@ class WhisperDecoderModel(nn.Module):
         ``(layer, head)`` pairs: ``(len(heads), len(tokens), enc_len)``.
 
         The served decoder's own projections, called as modules so a LoRA
-        delta bound to one is never skipped, applied with plain causal
-        self-attention and an explicit softmax over the encoder positions.
+        delta bound to one adds to the align step's rows (its one segment),
+        applied with plain causal self-attention and an explicit softmax over
+        the encoder positions.
         That is the alignment signal word-level timestamps are read from
         (:mod:`.alignment`); one request at a time, so it stays eager.
         """
