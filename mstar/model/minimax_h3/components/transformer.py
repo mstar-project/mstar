@@ -33,6 +33,7 @@ from mstar.model.components.distributed.sequence_parallel import (
     sp_seq_split,
     ulysses_attention,
 )
+from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
 from mstar.model.minimax_h3.config import NUM_MODALITIES, H3TransformerConfig
 
 # (q, k, v) -> out over [B, S, H, D]
@@ -128,12 +129,19 @@ class H3Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, attend: Attend, rope: RopeTable | None = None, sp=None) -> torch.Tensor:
         local = self.local_heads * self.head_dim
-        q, k, v = self.qkv_proj(x).split([local, local, local], dim=-1)
-        q = self.q_norm(q.unflatten(-1, (self.local_heads, self.head_dim)))
-        k = self.k_norm(k.unflatten(-1, (self.local_heads, self.head_dim)))
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([local, local, local], dim=-1)
         v = v.unflatten(-1, (self.local_heads, self.head_dim))
-        if rope is not None:
-            q, k = apply_rope(q, rope), apply_rope(k, rope)
+        if rope is not None and qkv.shape[0] == 1 and torch.compiler.is_compiling():
+            # one kernel for both norms and the rope (qk_norm_rope.py); eager keeps the torch ops
+            weights = torch.stack([self.q_norm.weight, self.k_norm.weight])
+            qk = qk_norm_rope(qkv[0], weights, rope.cos, rope.sin, self.q_norm.eps, self.local_heads, rope.rotary_dim)
+            q, k = qk[None].split(self.local_heads, dim=2)
+        else:
+            q = self.q_norm(q.unflatten(-1, (self.local_heads, self.head_dim)))
+            k = self.k_norm(k.unflatten(-1, (self.local_heads, self.head_dim)))
+            if rope is not None:
+                q, k = apply_rope(q, rope), apply_rope(k, rope)
         out = attend(q, k, v) if sp is None else sp.attend(q, k, v, attend)
         return self.out_proj(out.flatten(2, 3).type_as(q))
 
