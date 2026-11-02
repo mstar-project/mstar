@@ -556,6 +556,8 @@ def test_postprocess(voices_dir):
     assert model.postprocess(torch.zeros(0), "audio") == b""
     full_scale = torch.tensor([32767], dtype=torch.int16).numpy().tobytes()
     assert model.postprocess(torch.ones(1, dtype=torch.bfloat16), "audio") == full_scale  # no bf16 wrap
+    with pytest.raises(ValueError, match="'image'"):
+        model.postprocess(pcm, "image")
     assert model.get_output_sample_rate() == model.config.sample_rate == 24000
     assert model.get_voices() == ["af_heart", "af_sky", "am_adam"] and model.get_default_voice() == "af_heart"
 

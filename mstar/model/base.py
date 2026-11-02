@@ -1009,8 +1009,9 @@ class Model(ABC):
     ) -> bytes:
         """
         Given an output of a certain modality, encode and return as bytes.
-        Text follows ``text_output`` when the model declares it; any other
-        modality will likely need model-specific behavior.
+        Text follows ``text_output`` when the model declares it, and audio is
+        encoded below; the default refuses any other modality, which needs
+        model-specific behavior.
         ``request_kwargs`` is the request's model_kwargs, so encoders can honor
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
@@ -1038,7 +1039,7 @@ class Model(ABC):
                 # in fp32: bf16 and fp16 round 32767 up to 32768, which wraps
                 pcm = pcm.float().clamp(-1, 1) * 32767
             return pcm.to(torch.int16).numpy().tobytes()
-        return output.cpu().numpy().tobytes()
+        raise ValueError(f"{type(self).__name__} has no {modality!r} output")
 
     def postprocess_inline(
         self,
