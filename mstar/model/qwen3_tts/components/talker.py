@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.convenience import PackedAttentionCallable
 from mstar.model.components import RMSNorm
 from mstar.model.components.depth_decoder import DepthDecoder
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
@@ -51,6 +52,49 @@ class Qwen3TTSResizeMLP(nn.Module):
         return self.linear_fc2(F.silu(self.linear_fc1(hidden_states)))
 
 
+class PackedStep:
+    """What a decode step's attention layers rotate from when they take the
+    packed prologue (``Qwen3TTSTalkerAttention``): the step's positions and the
+    cos/sin tables over all positions. Empty on any other step."""
+
+    def __init__(self) -> None:
+        self.positions: torch.Tensor | None = None
+        self.tables: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+class Qwen3TTSTalkerAttention(ParallelAttention):
+    """``ParallelAttention`` that takes the packed prologue on a decode replay:
+    split, q/k norm, rotation and the cache write in one kernel (``attn.prologue``)."""
+
+    def __init__(self, *, packed_step: PackedStep, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._packed_step = packed_step
+        self._prologue_gammas: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def bind_resources(self, resources: dict) -> None:
+        super().bind_resources(resources)
+        self.attend = PackedAttentionCallable(kv=self.kv, attn=self.attn)
+
+    def prologue_gammas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The kernel scales a norm by ``1 + w``; these norms scale by ``w``. Kept
+        in fp32, where ``1 + (w - 1)`` is the checkpoint's weight."""
+        if self._prologue_gammas is None:
+            self._prologue_gammas = tuple(norm.weight.detach().float() - 1.0 for norm in (self.q_norm, self.k_norm))
+        return self._prologue_gammas
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        step = self._packed_step
+        if step.positions is None:
+            return super().forward(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        cos, sin = step.tables
+        out, _ = self.attend.attend_packed(
+            qkv, *self.prologue_gammas(), cos, sin, step.positions,
+            self.num_heads, self.num_kv_heads, self.head_dim, self.q_norm.variance_epsilon, False,
+        )
+        return self.o_proj(out.reshape(hidden_states.shape[0], self.num_heads * self.head_dim))
+
+
 class Qwen3TTSTalkerLayer(nn.Module):
     """One pre-norm Talker block backed by M* tensor-parallel layers."""
 
@@ -58,10 +102,12 @@ class Qwen3TTSTalkerLayer(nn.Module):
         self,
         config: Qwen3TTSTalkerConfig,
         comm_group: CommGroup | None = None,
+        packed_step: PackedStep | None = None,
     ) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = ParallelAttention(
+        self.self_attn = Qwen3TTSTalkerAttention(
+            packed_step=packed_step if packed_step is not None else PackedStep(),
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -110,8 +156,13 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
+        self.config = config
+        self.comm_group = comm_group if comm_group is not None else CommGroup.trivial()
+        self._packed_step = PackedStep()
+        self._packed: bool | None = None
+        self._rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None
         self.layers = nn.ModuleList([
-            Qwen3TTSTalkerLayer(config, comm_group=comm_group)
+            Qwen3TTSTalkerLayer(config, comm_group=comm_group, packed_step=self._packed_step)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -120,13 +171,44 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
             config.text_vocab_size, config.text_hidden_size
         )
 
+    @property
+    def packed_prologue(self) -> bool:
+        """Whether a decode replay's layers take the packed prologue, which asks
+        the KV cache for flat write slots. One rank only: under TP the K/V heads
+        can replicate past their count, which the kernel's layout does not hold.
+        Settled on first read, once the layers are bound."""
+        if self._packed is None:
+            if not hasattr(self.layers[0].self_attn, "attend"):
+                return False  # not bound yet
+            attn = [layer.self_attn for layer in self.layers]
+            self._packed = self.comm_group.world_size == 1 and all(a.attend.enable() for a in attn)
+        return self._packed
+
+    def rope_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin over every position, ``[positions, head_dim // 2]``, in fp32:
+        the frequencies are too close together at this theta for bf16."""
+        if self._rope_tables is None:
+            config = self.config
+            device = self.norm.weight.device
+            steps = torch.arange(0, config.head_dim, 2, device=device, dtype=torch.float64)
+            inv_freq = config.rope_theta ** (-steps / config.head_dim)
+            pos = torch.arange(config.max_position_embeddings, device=device, dtype=torch.float64)
+            angle = (pos[:, None] * inv_freq[None, :]).to(torch.float32)
+            self._rope_tables = (angle.cos(), angle.sin())
+        return self._rope_tables
+
     def forward(
         self,
         input_embeds: torch.Tensor,
         *,
         label: str,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``positions`` (one per token) sends the layers down the packed
+        prologue: only a decode replay whose layers all take it passes them."""
         hidden_states = input_embeds
+        self._packed_step.positions = positions
+        self._packed_step.tables = self.rope_tables() if positions is not None else None
         # Which of the node's KV streams the layers write (`label`) and which
         # layer of it are cursors on the shared resources: bind the label once,
         # advance the index per layer. Passing them as arguments instead would
@@ -167,8 +249,9 @@ class Qwen3TTSTalkerModel(nn.Module):
         input_embeds: torch.Tensor,
         *,
         label: str,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_embeds, label=label)
+        return self.model(input_embeds, label=label, positions=positions)
 
 
 # ---------------------------------------------------------------------------

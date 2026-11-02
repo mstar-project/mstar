@@ -7,7 +7,9 @@ import torch
 
 from mstar.engine.resources.attn import aiter as _aiter_attention  # noqa: F401  registers the op
 from mstar.engine.resources.attn import prologue
+from mstar.engine.resources.rms_norm import run_rms_norm
 from mstar.platforms import current_platform
+from mstar.utils.attention import apply_rope_pos_ids
 
 pytestmark = pytest.mark.skipif(not current_platform.is_rocm(), reason="needs an AMD GPU")
 
@@ -49,6 +51,39 @@ def test_matches_the_reference(tokens, heads, kv_heads):
     untouched = torch.ones(cache.shape[0] * PAGE, dtype=torch.bool, device=DEV)
     untouched[slots] = False
     assert got_cache.permute(0, 2, 1, 3, 4).reshape(-1, 2, kv_heads, 256)[untouched].abs().max() == 0
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 64])
+def test_the_qwen3_tts_talkers_layout_and_fp32_tables(tokens):
+    """No gate, a whole-head rotation, and fp32 norm gammas and tables."""
+    heads, kv_heads, head_dim, half = 16, 8, 128, 64
+    g = torch.Generator(device=DEV).manual_seed(1)
+    qkv = torch.randn(tokens, (heads + 2 * kv_heads) * head_dim, device=DEV, generator=g).to(torch.bfloat16)
+    qw = torch.randn(head_dim, device=DEV, generator=g) * 0.1
+    kw = torch.randn(head_dim, device=DEV, generator=g) * 0.1
+    inv = 1e6 ** (-torch.arange(0, head_dim, 2, device=DEV, dtype=torch.float64) / head_dim)
+    angle = (torch.arange(32768, device=DEV, dtype=torch.float64)[:, None] * inv[None, :]).float()
+    cos, sin = angle.cos(), angle.sin()
+    positions = torch.randint(0, 32768, (tokens,), device=DEV, generator=g)
+    pages = 64
+    slots = torch.randperm(pages * PAGE, device=DEV, generator=g)[:tokens]
+    args = (qkv, qw, kw, cos, sin, positions)
+    tail = (slots, heads, kv_heads, head_dim, 1e-6, False)
+    got_cache = torch.zeros(pages, 2, PAGE, kv_heads, head_dim, device=DEV, dtype=torch.bfloat16)
+    want_cache = got_cache.clone()
+    got = prologue.QKV_NORM_ROPE_CACHE.implementation()(*args, got_cache[:, 0], got_cache[:, 1], *tail)
+    want = prologue._reference(*args, want_cache[:, 0], want_cache[:, 1], *tail)
+    assert got[1].numel() == 0 and want[1].numel() == 0
+    for name, a, b in (("q", got[0], want[0]), ("k", got[2], want[2]), ("v", got[3], want[3])):
+        torch.testing.assert_close(a.float(), b.float(), rtol=1.6e-2, atol=1.6e-2, msg=name)
+    torch.testing.assert_close(got_cache.float(), want_cache.float(), rtol=1.6e-2, atol=1.6e-2)
+    # what the layer's own norm and rope kernels give, within their roundings
+    q, k = qkv[:, :heads * head_dim], qkv[:, heads * head_dim:(heads + kv_heads) * head_dim]
+    q = run_rms_norm(q.reshape(-1, head_dim), (qw + 1.0).to(qkv.dtype), 1e-6).reshape(tokens, heads, head_dim)
+    k = run_rms_norm(k.reshape(-1, head_dim), (kw + 1.0).to(qkv.dtype), 1e-6).reshape(tokens, kv_heads, head_dim)
+    q, k = apply_rope_pos_ids(q, k, positions.to(torch.int32), 1e6)
+    torch.testing.assert_close(got[0].float(), q.float(), rtol=2.5e-2, atol=2.5e-2, msg="q against the layer's kernels")
+    torch.testing.assert_close(got[2].float(), k.float(), rtol=2.5e-2, atol=2.5e-2, msg="k against the layer's kernels")
 
 
 def test_a_captured_call_writes_the_slots_it_is_replayed_with():
