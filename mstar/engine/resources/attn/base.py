@@ -55,12 +55,9 @@ class AttentionManager(AttentionResource):
     # (`ContextParallelWrapper`'s ``check``)
     _plan_check = None
     # the sequence shard over its node (`AttentionSpec.derive`), set by `build`; and the shard
-    # itself where it can split (`bind_dependencies`)
+    # itself where it can split (`bind_dependencies`), which sends `AttentionCallable` through `exchange`
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
-    # whether `AttentionCallable` reaches `run` through `exchange`: fixed at bind, so a node that
-    # never splits keeps its call path
-    uses_exchange = False
 
     # Remains abstract except for build; will build based
     # on the attention backend
@@ -84,7 +81,6 @@ class AttentionManager(AttentionResource):
         # heads over every TP and SP rank (a pool stored by position is refused on a splitting node
         # at load): a split step's tokens trade for heads, a copied step's heads are sliced
         shard = self._shard = resources[self._shard_key]
-        self.uses_exchange = True
         kv.bind_sequence_shard(shard)
         logger.info(
             "attention over KV %r takes split steps over %d SP ranks: split labels by Ulysses, copied ones by "
