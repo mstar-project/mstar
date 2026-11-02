@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import torch
 
+from mstar.distributed.utils import kv_head_replicas
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
@@ -231,8 +232,8 @@ class LoraTarget:
             return 0, rows
         units = rows if self.slice_units is None else self.slice_units[slice_idx]
         if units < world_size:
-            # replicated: each group of `world_size // units` ranks holds one unit
-            replicas = _divide(world_size, units)
+            # replicated: each group of consecutive ranks holds one unit, as the base loads it
+            _, replicas = kv_head_replicas(units, world_size)
             size = rows // units
             return (rank // replicas) * size, size
         size = _divide(rows, world_size)
