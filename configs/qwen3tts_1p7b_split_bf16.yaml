@@ -14,6 +14,8 @@ platform_overrides:
     model_kwargs:
       codec_dtype: bfloat16
       talker_max_batch: 64
+      # a padded row costs the conv stack what a real one does
+      codec_capture_batch_sizes: [1, 2, 4, 8, 12, 16, 24, 32]
 resources:
   talker_attn:
     flashinfer_backend: fa2
