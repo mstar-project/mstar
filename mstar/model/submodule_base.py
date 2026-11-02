@@ -1454,12 +1454,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
     """``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare
-    itself, its rows the step's segments. A step without segments gets none: an adapted
-    module it runs refuses for want of a plan (``LoraLayerDelta``)."""
+    itself, its rows the step's segments, as a new step (a declaration reused across
+    calls keeps its own). A step without segments gets none: an adapted module it runs
+    refuses for want of a plan (``LoraLayerDelta``)."""
     if lora_keys and step is not None and step.segments is not None:
         segments = tuple(step.segments)
-        for key in lora_keys:
-            step.steps.setdefault(key, LoraStep(segments=segments))
+        added = {key: LoraStep(segments=segments) for key in lora_keys if key not in step.steps}
+        if added:
+            step = replace(step, steps={**step.steps, **added})
     return step
 
 

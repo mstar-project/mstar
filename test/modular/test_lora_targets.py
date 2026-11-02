@@ -504,6 +504,7 @@ def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
         return engine_step(node, graph_walk=walk, request_ids=["r0", "r1"], inputs=[])
 
     assert declared("packed").steps["lora"].segments == tuple(segments)
+    assert "lora" not in node.steps["packed"].steps  # a reused declaration is left as declared
     assert declared("own").steps["lora"] is own
     assert declared("none") is None
     assert set(declared("unsegmented").steps) == {"attn"}
