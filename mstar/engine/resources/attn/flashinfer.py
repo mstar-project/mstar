@@ -199,6 +199,7 @@ class FlashInferManager(AttentionManager):
             batch_size=num_rows,
             max_seq_len=config.max_seq_len,
             device=self._device,
+            sm_scale=self._sm_scale,
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 

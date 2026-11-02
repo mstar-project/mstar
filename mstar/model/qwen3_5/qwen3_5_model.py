@@ -349,7 +349,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         # uint8, HWC: the processor rescales by default, so floats would be
         # rescaled twice and the model would see a near-black image
         out = self.image_processor(
-            images=[as_uint8_chw(image).permute(1, 2, 0).numpy()], return_tensors="pt",
+            images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
         )
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])

@@ -278,9 +278,10 @@ def check_plan(plan: list[PromptPart], spans: list[MediaSpan], n_text: int) -> N
         )
 
 
-def as_uint8_chw(image) -> torch.Tensor:
+def as_uint8_chw(image, truncate: bool = False) -> torch.Tensor:
     """``(3, H, W)`` uint8 RGB on the CPU from what the data worker sends: a
-    ``(C, H, W)`` tensor, float in [0, 1] (rounded to the nearest level) or
+    ``(C, H, W)`` tensor, float in [0, 1] (rounded to the nearest level, or
+    floored with ``truncate``, as the Qwen3-VL ports were measured with) or
     uint8; or a PIL image or ``(H, W[, C])`` numpy array. A tensor's layout is
     taken as given, not guessed from its shape. Alpha is dropped, gray
     repeated."""
@@ -294,7 +295,8 @@ def as_uint8_chw(image) -> torch.Tensor:
             image = image[..., None]
         image = image.permute(2, 0, 1)
     if image.dtype.is_floating_point:
-        image = (image * 255.0).round().clamp(0, 255).to(torch.uint8)
+        levels = image * 255.0
+        image = (levels if truncate else levels.round()).clamp(0, 255).to(torch.uint8)
     image = image.cpu()
     if image.shape[0] == 1:
         image = image.expand(3, -1, -1)

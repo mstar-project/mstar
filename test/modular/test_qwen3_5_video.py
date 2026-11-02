@@ -263,7 +263,7 @@ def run_both(model, processor, layout: str):
     )
     ref = processor(
         text=[text],
-        images=[as_uint8_chw(i).permute(1, 2, 0).numpy() for i in images] or None,
+        images=[as_uint8_chw(i, truncate=True).permute(1, 2, 0).numpy() for i in images] or None,
         videos=[v for v, _ in videos] or None,
         video_metadata=[{"total_num_frames": v.shape[0], "fps": fps} for v, fps in videos] or None,
         return_tensors="pt",
@@ -533,9 +533,6 @@ def test_vision_block_loop_replays_exactly_when_leased():
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 
     class Runner:
-        def can_run(self, batch_size, total_tokens):
-            return True
-
         def run(self, **kwargs):
             self.ran = kwargs
             return SimpleNamespace(get_view=lambda name: "replayed")

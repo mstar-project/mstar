@@ -47,6 +47,15 @@ def test_prefill_buckets_hold_a_mixed_step_and_near_power_of_two_batches(monkeyp
     assert {256, 512, 1024, 2048, 4096, 8192} <= set(buckets)
 
 
+def test_a_ladder_with_no_mixed_bucket_captures_no_mixed_step(monkeypatch):
+    m = _reload(monkeypatch, "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "3000,6000")
+    assert m.LLMSubmodule.MIXED_TOKEN_BUCKETS == []
+    submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
+    configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
+    (mixed,) = [c for c in configs if c.capture_graph_walk == "mixed"]
+    assert mixed.capture_token_lengths == []
+
+
 def test_default_ladders_stay_inside_dynamos_recompile_limit(monkeypatch):
     monkeypatch.delenv("MSTAR_QWEN35_DECODE_BUCKETS", raising=False)
     monkeypatch.delenv("MSTAR_DECODE_BUCKETS", raising=False)

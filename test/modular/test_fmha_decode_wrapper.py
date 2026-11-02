@@ -120,7 +120,8 @@ class _Recorder:
         return self._has
 
 
-def _manager(monkeypatch, decode_fmha, has_kernel=True, applies=True, dtype=torch.bfloat16, window=None):
+def _manager(monkeypatch, decode_fmha, has_kernel=True, applies=True, dtype=torch.bfloat16, window=None,
+             sm_scale=None):
     built = {}
 
     def decode(**kwargs):
@@ -139,6 +140,7 @@ def _manager(monkeypatch, decode_fmha, has_kernel=True, applies=True, dtype=torc
         ),
         decode_fmha=decode_fmha,
         sliding_window=window,
+        sm_scale=sm_scale,
     )
     monkeypatch.setattr(manager, "_workspaces", SimpleNamespace(get=lambda *a: torch.zeros(1)))
     return manager, built
@@ -156,6 +158,24 @@ def test_captured_decode_takes_fmha_when_asked(monkeypatch):
     # a config that leaves page_size to the pool still hands the wrapper the pool's page
     assert wrapper.kwargs["page_size"] == manager._kv_config.tokens_per_page
     assert not built
+
+
+@pytest.mark.parametrize("sm_scale, scale", [(None, 256 ** -0.5), (0.5, 0.5)])
+def test_fmha_attends_at_the_resources_softmax_scale(monkeypatch, sm_scale, scale):
+    """A model's own scale (Muse Glimmer's) reaches the captured fmha kernel, as
+    it does the paged one."""
+    pytest.importorskip("flashinfer")
+    import flashinfer.utils as fi_utils
+
+    monkeypatch.setattr(fi_utils, "get_device_sm_count", lambda device: 100)
+    monkeypatch.setattr(
+        fi_utils, "_get_trtllm_gen_multi_ctas_kv_counter_buffer", lambda *args: torch.zeros(4, dtype=torch.uint8),
+    )
+    manager, _ = _manager(monkeypatch, decode_fmha=True, sm_scale=sm_scale)
+    monkeypatch.setattr(fi_mod, "FmhaDecodeWrapper", FmhaDecodeWrapper)
+    monkeypatch.setattr(FmhaDecodeWrapper, "has_kernel", lambda self, head_dim, num_qo_heads: True)
+    wrapper = manager._cg_wrapper(_decode_lease(), "main", 16, False)
+    assert wrapper._scale == scale
 
 
 @pytest.mark.parametrize(

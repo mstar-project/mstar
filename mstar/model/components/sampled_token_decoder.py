@@ -138,6 +138,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
             sampler=self.SAMPLER, walk=self.DECODE_WALK,
             prefill_walks=self._media_walks | {"prefill_text"},
+            # the graph runtime checks a decode row's stop ids itself, without
+            # calling check_stop (measured on Qwen3.5; see TokenStop.runtime_check)
+            runtime_check=True,
         )
 
     # ------------------------------------------------------------------
@@ -211,7 +214,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=MIXED,
-                capture_token_lengths=self.MIXED_TOKEN_BUCKETS or self.PREFILL_TOKEN_BUCKETS,
+                capture_token_lengths=(
+                    self.PREFILL_TOKEN_BUCKETS if self.MIXED_TOKEN_BUCKETS is None else self.MIXED_TOKEN_BUCKETS
+                ),
                 make_node_input=ids,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(MIXED),

@@ -1223,7 +1223,7 @@ class Qwen3OmniModel(Model):
 
         # HF processors expect uint8 (H, W, C): their default do_rescale=True
         # would rescale the data worker's [0, 1] floats a second time.
-        pil_images = [as_uint8_chw(img).permute(1, 2, 0).numpy() for img in raw_image_inputs]
+        pil_images = [as_uint8_chw(img, truncate=True).permute(1, 2, 0).numpy() for img in raw_image_inputs]
 
         np_audios: list = []
         for waveform in raw_audio_inputs:

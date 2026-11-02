@@ -104,9 +104,6 @@ class LLMSubmodule(SampledTokenDecoder):
         encoders: tuple[MediaEncoder, ...] = (),
     ):
         super().__init__(model, config, encoders)
-        # the graph runtime checks a decode row's stop ids itself, without
-        # calling check_stop (measured on this model; see TokenStop.runtime_check)
-        self.token_stop = self.token_stop._replace(runtime_check=True)
         # patches per merged token along each axis, for the MRoPE grids
         self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
 

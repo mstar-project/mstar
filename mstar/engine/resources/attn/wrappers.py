@@ -651,6 +651,7 @@ class FmhaDecodeWrapper:
         batch_size: int,
         max_seq_len: int,
         device: torch.device,
+        sm_scale: float | None = None,
     ):
         from flashinfer.utils import (
             _get_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -663,7 +664,7 @@ class FmhaDecodeWrapper:
         self._workspace = workspace_buffer
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
-        self._scale = head_dim ** -0.5
+        self._scale = head_dim ** -0.5 if sm_scale is None else sm_scale
         self._window_left = -1
         # a row's pages sit at [row, 0..], stride the widest row a request can reach
         self._max_seq_len = -(-max_seq_len // page_size) * page_size

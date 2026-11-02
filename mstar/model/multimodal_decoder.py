@@ -64,6 +64,7 @@ from mstar.model.utils import TextOutput, load_generation_defaults
 SAMPLING_KEYS = (
     "temperature", "top_p", "top_k", "min_p",
     "repetition_penalty", "penalize_prompt", "ignore_eos",
+    "return_logprobs", "logprobs_mode",
 )
 
 # A mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take

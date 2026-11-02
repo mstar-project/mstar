@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from mstar.model.multimodal import vision_encoder
+from mstar.model.muse.submodules import LLMSubmodule as GlimmerLLMSubmodule
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 
@@ -26,6 +27,11 @@ MODELS = {
                 LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
                              encoders=(vision_encoder((5,)),)).token_stop),
     "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"), None),
+    # the shared VLM decoder's stop, as Muse Glimmer serves it
+    "muse_glimmer": (GlimmerLLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                     ("decode", "prefill_text", "prefill_vision"),
+                     GlimmerLLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                                         (vision_encoder((5,)),)).token_stop),
 }
 
 

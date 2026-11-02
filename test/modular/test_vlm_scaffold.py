@@ -155,6 +155,40 @@ def test_the_walks_run_the_prefill_then_decode_then_finish():
     assert next_prefill_args(meta, {}).request_done
 
 
+@pytest.mark.parametrize("knobs", [
+    {"return_logprobs": True}, {"logprobs_mode": "processed"}, {"temperature": 0.5, "min_p": 0.1},
+])
+def test_a_request_sets_its_sampling_knobs(knobs):
+    """Log-probs (#914) reach the sampler's config like every other knob."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.sampling_defaults = {}
+    config = model.get_request_resource_configs({}, knobs)[SAMPLER]
+    assert {k: getattr(config, k) for k in knobs} == knobs
+
+
+def test_qwen3_5_floors_a_float_images_levels():
+    """Qwen3.5 (and Qwen3-Omni) hand the processor floored levels, as their
+    parity was measured with; the shared helper rounds by default."""
+    from mstar.model.multimodal import as_uint8_chw
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    half = torch.full((3, 2, 2), 0.5)  # 127.5 levels
+    assert as_uint8_chw(half).max() == 128 and as_uint8_chw(half, truncate=True).max() == 127
+    model = object.__new__(Qwen3_5DenseModel)
+    model.vision_config = SimpleNamespace(spatial_merge_size=2)
+    seen = []
+
+    def processor(images, return_tensors):
+        seen.extend(images)
+        return {"pixel_values": torch.zeros(4, 8), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+
+    model._image_processor = processor
+    model._image_intake(half, {})
+    assert int(seen[0].max()) == 127
+
+
 def test_a_media_walk_carries_its_layout_in_step_metadata():
     signals = _signals(text_inputs=1, pixel_values=1)
     layout = {"offset": [1], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
