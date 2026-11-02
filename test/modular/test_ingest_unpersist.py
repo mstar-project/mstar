@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from fastapi import HTTPException
 
 torch = pytest.importorskip("torch")
 
@@ -94,7 +95,10 @@ class _ToyModel(Model):
         return PartitionTopology(partitions=[p.name for p in self._partitions], connections=self._connections)
 
     def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
-        return list(self._plans[partition_name])
+        plan = self._plans[partition_name]
+        if isinstance(plan, Exception):
+            raise plan
+        return list(plan)
 
     def process_prompt(self, *a, **k):
         return {}
@@ -534,6 +538,9 @@ _REFUSED = {
                                     "not one of its walks"),
     "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None, (), 500,
                                          "not inputs of that walk"),
+    # a status the model chose, with the text it meant the client to see
+    "a model's own refusal": ({"default": HTTPException(status_code=409, detail="adapter busy")}, None, (), 409,
+                              "adapter busy"),
     # nothing tells B's worker its walk changed
     "a later step only a stream feeds": ({"A": [WalkStep("a")], "B": [WalkStep("b"), WalkStep("c")]}, _STREAMED,
                                          _tok_stream(), 500, "takes no input the conductor sends"),
@@ -543,7 +550,8 @@ _REFUSED = {
 @pytest.mark.parametrize("case", list(_REFUSED))
 def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog, case):
     """Before any worker hears of the request: a 400 when the request leads
-    there, a 500 whose text only the log has when the model's plan is wrong.
+    there, a 500 whose text only the log has when the model's plan is wrong,
+    and the status and text of an ``HTTPException`` below 500.
     With ``connections``, A's walk streams ``tok`` to B's walk ``c``, a bare
     node run once per chunk."""
     plans, groups, connections, status, message = _REFUSED[case]
@@ -560,5 +568,5 @@ def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog,
 
     failed = [m.body for _, m in c.comm.sent if getattr(m, "message_type", None) == "request_failed"]
     assert [(f.request_id, f.status) for f in failed] == [("r", status)]
-    assert message in (failed[0].error_message if status == 400 else caplog.text)
+    assert message in (failed[0].error_message if status < 500 else caplog.text)
     assert not _sends(c, ("NEW_REQUEST",)) and "r" not in c.requests

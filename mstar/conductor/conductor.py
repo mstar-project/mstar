@@ -1224,9 +1224,10 @@ class Conductor:
         """Dispatch ``body``; if that raises, fail the request instead of dropping it.
 
         An exception here would otherwise reach the run loop, which only logs
-        it, and the client would wait for its timeout. A ``ValueError`` raised
-        before any worker heard of the request is the client's fault: a 400.
-        An ``HTTPException`` keeps its status; anything else is a 500.
+        it, and the client would wait for its timeout. Before any worker heard
+        of the request, a ``ValueError`` is the client's fault, a 400; an
+        ``HTTPException`` keeps its status, and below 500 its detail too;
+        anything else is a 500.
         """
         try:
             self._do_ingest_request(body)
@@ -1237,6 +1238,9 @@ class Conductor:
                 self._drop_request(body.request_id)
                 if isinstance(exc, ValueError):
                     self._reject_request(body.request_id, scrub_paths(str(exc)), status=400)
+                    return
+                if isinstance(exc, HTTPException) and exc.status_code < 500:
+                    self._reject_request(body.request_id, scrub_paths(str(exc.detail)), status=exc.status_code)
                     return
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,
