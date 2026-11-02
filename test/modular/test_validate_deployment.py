@@ -319,7 +319,7 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
 
 @pytest.mark.parametrize("specs, group, resources, pattern", [
     ([_shard()], dict(sp_size=2), {},
-     r"node_groups\[0\]: node 'llm' splits tokens \(SeqShardSpec 'shard'\) but declares no attention"),
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and no attention there takes split steps"),
     ([_shard(), _attention()], dict(sp_size=4), {},
      r"node_groups\[0\]: node 'llm' splits tokens over 4 SP ranks, and KV 'kv' stores 4 query and 2 KV heads by "
      r"head, which don't split 4 ways per TP rank"),
@@ -338,7 +338,7 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
      r"resources.attn: sp_exchange must be one of none, ulysses, all_gather, ring; got 'zigzag'"),
     # every attention none over KV stored by head: its SP ranks would only share heads
     ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "none"}},
-     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and every attention there has sp_exchange none"),
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and no attention there takes split steps"),
     # a paged pool serves every label a step declares, so a split one would reach the attention
     # taking none (unset over position storage)
     ([_shard(), _attention(), AttentionSpec("attn2", {"llm"}, AttentionConfig(kv_cache="kv"))], dict(sp_size=2),
@@ -379,7 +379,10 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
     # DCP alone: the node runs copied, as one without a shard
     ([_shard(), _attention()], {"kv": {"context_parallel": True}}),
     ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}),
-], ids=["heads", "positions_copied", "ulysses_without_a_shard", "all_gather", "ring", "positions_unset", "none"])
+    # a model's shard over a node with no attention that takes split steps is a no-op too
+    ([_shard()], {"kv": {"context_parallel": True}}),
+], ids=["heads", "positions_copied", "ulysses_without_a_shard", "all_gather", "ring", "positions_unset", "none",
+        "shard_without_an_attention"])
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs

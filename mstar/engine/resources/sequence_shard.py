@@ -618,20 +618,17 @@ def sequence_parallel_refusals(
     except ValueError as e:
         return [str(e)]
     shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
-    if shard is not None and not any(spec.attends_split_steps for spec in specs):
-        return [
-            f"node {node!r} splits tokens (SeqShardSpec {shard.resource_key!r}) but declares no attention that "
-            "can take them: a paged AttentionSpec, or a RaggedAttentionSpec with sp_exchange"
-        ]
     if shard is None or not shard.splits:
-        # as a node without a shard: its steps run copied (`SeqShardSpec.splits`)
+        # as a node without a shard: its steps run copied (`SeqShardSpec.splits`), so a model's
+        # shard is a no-op where no attention takes split steps
         if placed:
             return []
         if shard is not None:
             return [
-                f"node {node!r} runs on {sp} SP ranks, and every attention there has sp_exchange none, so its "
-                "steps never split and its SP ranks would only share heads: store its KV by position "
-                "(context_parallel) or run it on TP ranks"
+                f"node {node!r} runs on {sp} SP ranks, and no attention there takes split steps (a paged one "
+                "with sp_exchange none, a ragged one without sp_exchange 'ulysses'), so its steps never split "
+                "and its SP ranks would only share heads: store its KV by position (context_parallel) or run "
+                "it on TP ranks"
             ]
         return [
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "

@@ -2154,8 +2154,8 @@ Splitting is declared in four places:
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
 the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
 sampler); recurrent state doesn't, so a splitting node can't own any. The engine and the conductor
-also refuse, before a worker starts: a node on SP ranks that neither declares a ``SeqShardSpec``
-nor places its pools by position; a shard with no attention that can take split tokens; a
+also refuse, before a worker starts: a node on SP ranks that neither splits its steps (a
+``SeqShardSpec`` with an attention that takes split steps) nor places its pools by position; a
 shard on axis 1 over a pool stored by position; a head-stored pool whose query and KV heads per
 TP rank don't divide by ``sp_size``; a ragged ``sp_exchange`` whose heads don't divide by
 ``tp * sp``, or beside a ring; a paged attention taking ``none`` beside attentions that split; a
