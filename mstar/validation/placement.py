@@ -9,6 +9,7 @@ from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.context_parallel import positions_over_sp
+from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -521,6 +522,8 @@ def _sequence_parallel(
 ) -> Iterator[str]:
     """What a node group's SP ranks do (`positions_over_sp`, which the engine manager checks
     again at load), and whether each KV pool placed over a group's ranks can stripe over them.
+    No resource may span nodes that split heads different ways, nor put LoRA on a node running
+    its own SP: the engine and `LoraAdapterPool.build` refuse both at load.
     Without ``specs`` (the model's resources failed to resolve, which is reported apart) there is
     nothing to check this against."""
     enabled = model.get_default_sharding_config().sp_enabled_nodes
@@ -539,8 +542,26 @@ def _sequence_parallel(
                     yield f"node_groups[{i}]: {e}"
         if sp == 1:
             continue
+        over = {}
         for node in sorted(nodes):
             try:
-                positions_over_sp(specs, node, sp, enabled)
+                over[node] = positions_over_sp(specs, node, sp, enabled)
             except ValueError as e:
                 yield f"node_groups[{i}]: {e}"
+        mixed = []
+        for spec in specs:
+            own_sp = sorted(node for node in spec.nodes if over.get(node) is False)
+            if isinstance(spec, LoraSpec) and own_sp:
+                yield (
+                    f"node_groups[{i}]: LoRA resource {spec.resource_key!r} serves {own_sp}, which run "
+                    "their own sequence parallelism: LoRA lays its rows out per request, while each SP "
+                    "rank holds a shard of the tokens"
+                )
+            if len({over[node] for node in spec.nodes & over.keys()}) > 1:
+                mixed.append(spec.resource_key)
+        if mixed:
+            yield (
+                f"node_groups[{i}]: {sorted(n for n, o in over.items() if o)} place their KV positions over "
+                f"the SP ranks and {sorted(n for n, o in over.items() if not o)} run their own sequence "
+                f"parallelism, so they split heads different ways, yet share resources {sorted(mixed)}"
+            )

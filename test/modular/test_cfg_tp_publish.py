@@ -43,7 +43,7 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     partition = PartitionState(
         partition_name="default",
         metadata=CurrentForwardConductorMetadata(
-            graph_walk="image_gen_cfg",
+            graph_walk="image_gen_cfg2",
             is_prefill=False,
         ),
         current_worker_graph_ids={"wg"},
@@ -144,7 +144,7 @@ def test_tp2_kv_managers_transfer_each_published_rank_shard(tmp_path):
             outcome = consumer.admit_retrieve(
                 request_id,
                 node_name="LLM",
-                graph_walk="image_gen_cfg",
+                graph_walk="image_gen_cfg2",
                 published=rank_shards,
             )
             assert outcome.ok and outcome.ready

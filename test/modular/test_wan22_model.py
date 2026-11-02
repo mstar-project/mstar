@@ -108,9 +108,14 @@ def test_wan22_declares_expected_nodes():
     assert walk_nodes == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
 
 
-def test_wan22_declares_no_engine_resources():
-    """Nothing here is cached across steps, so the engine builds nothing."""
+def test_wan22_declares_only_dit_attention_resources():
+    """Nothing here is cached across steps: the only resource is the dit's
+    cacheless self-attention, and the sdpa backend declares none."""
     model = _make_model()
+    specs = model.get_node_resources()
+    assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SELF_ATTN]
+    assert all(spec.nodes == {"dit"} for spec in specs)
+    model.config = Wan22Config(attention_backend="sdpa")
     assert model.get_node_resources() == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
 
@@ -976,3 +981,35 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "decode=auto" in line
     assert "banana" not in line
+
+
+# ----------------------------------------------------------------------
+# dit attention layout
+# ----------------------------------------------------------------------
+
+
+def _dit_info(guidance: float) -> CurrentForwardPassInfo:
+    info = _fwd_info(requested_steps=2, iter_count=1)
+    info.step_metadata["guidance_scale"] = guidance
+    return info
+
+
+@pytest.mark.parametrize("guidance,branches", [
+    (5.0, 2),  # both guidance branches in one forward
+    (1.0, 1),  # guidance off: the conditional branch alone
+])
+def test_wan22_dit_attends_one_segment_per_branch(guidance, branches):
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    key = submodule.bucket_key_for(_dit_info(guidance))
+    assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
+
+
+def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
+    submodule = _dit()
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
+    )
+    step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
+    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
+    sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
+    assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None

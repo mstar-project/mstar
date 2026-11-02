@@ -1,8 +1,8 @@
 """VAE decode for the DiT scaffold: the compiled decode and the batch splitting
 that keeps it on shapes it was warmed with.
 
-``VAE_DECODE_BATCH_SIZES`` is the scaffold's default ladder; a model may pass its
-own to the decoder submodule.
+A compiled decoder warms ``geometric_batch_sizes`` up to its max batch, capped at
+``VAE_MAX_DECODE_BATCH``, and splits a larger batch into those sizes.
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
-VAE_DECODE_BATCH_SIZES = (1, 2, 4, 8)
+# each compiled size costs ~30-60 s of autotuning at a cold start (the dit, by
+# contrast, captures every batch size up to the maximum)
+VAE_MAX_DECODE_BATCH = 8
 
 
 def compile_vae_decode(vae: nn.Module):
