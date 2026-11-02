@@ -51,6 +51,9 @@ class _StubAPIServer:
         self.aborted = []
         # APIServer.metrics: None until --enable-metrics turns them on.
         self.metrics = None
+        self.texts = {}
+        # rid -> (sink, tag), from relay_chunks_to
+        self.sinks = {}
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
@@ -58,6 +61,7 @@ class _StubAPIServer:
                        request_id=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
+        self.texts[request_id] = text
         self.submitted.append({
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
@@ -67,8 +71,19 @@ class _StubAPIServer:
         return request_id
 
     async def iter_result_chunks(self, request_id):
+        if "relay" in (self.texts.get(request_id) or ""):
+            # as the message thread does: some chunks reach the sink in one
+            # batch, the handler yields the rest. "é" and "🙂" are split
+            # across chunks, as byte-level BPE tokens split them.
+            sink, tag = self.sinks[request_id]
+            sink.relay([tag, tag, tag], [_Chunk("text", b) for b in (b"caf\xc3", b"\xa9 ", b"\xf0\x9f")])
+            yield _Chunk("text", b"\x99\x82")
+            return
         yield _Chunk("text", b"Hello ")
         yield _Chunk("text", b"world")
+
+    def relay_chunks_to(self, key, sink, tag):
+        self.sinks[key] = (sink, tag)
 
     def abort_request(self, request_id):
         self.aborted.append(request_id)
@@ -147,6 +162,48 @@ def test_chat_roundtrip(stack):
     (sub,) = stub.submitted
     assert "Say hello." in sub["text"]
     assert sub["out"] == ["text"]
+
+
+def test_batched_chunks_and_split_characters_reach_the_client(stack):
+    """Chunks the API server relays in one ``chunks`` message arrive in
+    order with the handler's own, and a character split across chunks
+    arrives whole, streamed or not."""
+    port, _stub, _bridge, _proc = stack
+    assert _chat(port, "relay")["choices"][0]["message"]["content"] == "café 🙂"
+    body = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "relay"}]}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        lines = r.read().decode().splitlines()
+    deltas = [json.loads(ln[6:])["choices"][0]["delta"] for ln in lines if ln.startswith("data: {")]
+    assert "".join(d.get("content", "") for d in deltas) == "café 🙂"
+
+
+def test_only_a_frontend_that_accepts_chunks_messages_gets_them():
+    """An older mstar-server binary never says ``accepts_chunks``: its
+    submissions keep one ``chunk`` message per chunk."""
+    import asyncio
+
+    stub = _StubAPIServer()
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.server, bridge._keys, bridge.loop = stub, {}, None
+    sent = []
+    bridge._send = sent.append
+
+    async def run():
+        for sub, accepts in ((1, None), (2, True)):
+            msg = {"t": "submit", "rid": f"r{sub}", "sub": sub, "text": "hi",
+                   "output_modalities": ["text"]}
+            if accepts is not None:
+                msg["accepts_chunks"] = accepts
+            bridge._submit(msg)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert set(stub.sinks) == {"r2"}
+    assert [m["t"] for m in sent if m["sub"] == 1] == ["chunk", "chunk", "done"]
 
 
 def test_a_chats_roles_reach_the_bridge(stack):

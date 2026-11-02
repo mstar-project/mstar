@@ -30,6 +30,7 @@ from torch import nn
 
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components import RMSNorm
+from mstar.model.components.masking import length_mask
 from mstar.model.components.mlp import GatedMLP
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
 from mstar.model.nemotron_duplex.config import TALKER_ATTN, TALKER_KV, TALKER_POS, EarTTSConfig
@@ -142,12 +143,18 @@ def subword_to_char_ids(tokenizer, char_vocab: dict[str, int]) -> tuple[dict[int
     return s2c, pad_idx
 
 
+# a LoRA delta's refusal reason for the linears these modules run as F.linear
+_RUN_FUNCTIONALLY = "run as F.linear over its weight, never its own forward"
+
+
 class _Attn(nn.Module):
     """q/k/v/o projections (no bias); optional Gemma3 per-head QK-norm.
 
     All dims (hidden size, head count/dim, query scaling, norm eps) come from
     ``EarTTSConfig``.
     """
+
+    lora_unservable = dict.fromkeys(("q_proj", "k_proj", "v_proj", "o_proj"), _RUN_FUNCTIONALLY)
 
     def __init__(self, config: EarTTSConfig, qk_norm: bool):
         super().__init__()
@@ -407,7 +414,7 @@ class EmbedSubword(nn.Module):
         mean-pool over valid chars, and project. ``char_ids`` [N, Lc],
         ``char_lengths`` [N] -> ``[N, H]``."""
         n, lc = char_ids.shape
-        char_mask = torch.arange(lc, device=char_ids.device)[None, :] < char_lengths[:, None]  # [N, Lc]
+        char_mask = length_mask(char_lengths, lc)  # [N, Lc]
         char_embeds = self.embed_tokens(char_ids)  # [N, Lc, H]
 
         cos, sin = _rope_cos_sin(
@@ -462,6 +469,8 @@ class EmbedSubword(nn.Module):
 
 
 class GatedFusion(nn.Module):
+    lora_unservable = dict.fromkeys(("audio_proj", "text_proj"), _RUN_FUNCTIONALLY)
+
     def __init__(self, config: EarTTSConfig):
         super().__init__()
         h = config.hidden_size
@@ -506,6 +515,8 @@ class MogHead(nn.Module):
     ``mlp_stack`` is ``mog_num_layers`` gated-MLP blocks followed by a bare
     scale vector (final index, ``mlp_stack.<n>.weight`` [H]).
     """
+
+    lora_unservable = dict.fromkeys(("proj_else", "proj_logits", "proj_logs", "proj_mus"), _RUN_FUNCTIONALLY)
 
     def __init__(self, config: EarTTSConfig):
         super().__init__()

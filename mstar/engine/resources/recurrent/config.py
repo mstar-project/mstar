@@ -245,6 +245,10 @@ class RecurrentStateConfig:
     # label, so this bounds concurrent requests times labels.
     max_slots: int = 256
 
+    # The labels a request's steps address or fork into. Admission reserves a
+    # slot for each, and a step that opens any other label fails its request.
+    labels: tuple[str, ...] = ("main",)
+
     # Whether padding rows address a real sink slot or a -1 sentinel. Kernels
     # disagree on -1: FlashInfer's fp32 GDN decode skips it, its bf16 path
     # writes slot 0, and SM90 prefill masks it itself (`GDNPrefillWrapper.run`).
@@ -261,6 +265,8 @@ class RecurrentStateConfig:
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
+        if not self.labels:
+            raise ValueError("a recurrent state pool must declare a label")
         if not self.disable_sink_slot and self.max_slots < 2:
             raise ValueError(
                 f"max_slots={self.max_slots} leaves nothing to hand out: the "
@@ -291,6 +297,14 @@ class RecurrentStateSpec(NodeResourceSpec):
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache} if self.config.kv_cache else set()
+
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        # snapshots are keyed by `kv_cache`'s pages, and kept at one rank only
+        return bool(self.config.prefix_slots) and self.config.kv_cache is not None and world_size == 1
+
+    @property
+    def restores_prefix(self) -> bool:
+        return True
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
@@ -340,3 +354,5 @@ class RecurrentStep(ResourceStep):
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # the rows the forks apply to; None is every row (as KVStep.fork_rids)
+    fork_rids: frozenset | None = None

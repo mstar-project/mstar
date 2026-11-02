@@ -7,7 +7,8 @@ slots — registering a partial one would hand both to the same buffers, and
 under a lower index than the one it captured under.
 
 Capture failure is also a per-rank event, so the barrier count must not depend
-on whether a capture succeeded.
+on whether a capture succeeded. The batch sizes a bucket list is built from
+(``geometric_batch_sizes``) are checked here too.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from torch.distributed import ReduceOp
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType, geometric_batch_sizes
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
@@ -455,3 +456,27 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [1.0] * 4
+
+
+@pytest.mark.parametrize(
+    "max_batch_size, expected",
+    [
+        (1, [1]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (6, [1, 2, 4, 6]),
+        (8, [1, 2, 4, 8]),
+        (16, [1, 2, 4, 8, 16]),
+    ],
+)
+def test_geometric_batch_sizes(max_batch_size, expected):
+    """Powers of two below B, then B itself -- so startup grows with log B, not
+    B. B that is itself a power of two ends on it once (no duplicate); a B that
+    is not appends the odd top bucket the padding path rounds up to."""
+    assert geometric_batch_sizes(max_batch_size) == expected
+
+
+def test_geometric_batch_sizes_refuses_a_max_under_one():
+    with pytest.raises(ValueError, match="at least 1"):
+        geometric_batch_sizes(0)

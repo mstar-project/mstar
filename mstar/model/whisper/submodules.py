@@ -33,11 +33,11 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
+    DeviceLoopback,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    device_loopback_enabled,
+    TokenStop,
 )
 from mstar.model.whisper.components import alignment
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
@@ -253,8 +253,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
     Not an ``EncoderDecoderNode`` like Canary's decoder: that node writes the
     context inside the prefill forward and captures only decode, while this
     one writes it eagerly in ``preprocess`` so the prefill walk can replay a
-    graph sized by the prompt alone. The token feedback, batch caps and
-    base stop condition are ``TokenStepNode``'s.
+    graph sized by the prompt alone. The token feedback and batch caps are
+    ``TokenStepNode``'s; the base stop condition is its ``token_stop``.
     """
 
     SAMPLER = SAMPLER
@@ -275,16 +275,21 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
     # (a 1-2 s stall each, RTFx 158 at c=32 before the fix). Decode and
     # prefill steps are graph replays; the walks they don't cover run eagerly.
     disable_torch_compile = True
-    # The decode walk reads its last token off the sampler's slot masters and
-    # its timestamp rule state from the sampler's declared loop-back state
-    # beside it (`device_loopback_signals`).
-    reads_device_loopback = True
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        self.stop_token_ids = frozenset({config.eos_token_id})
+        self.token_stop = TokenStop(
+            loop=self.DECODE_LOOP, buffer="new_token",
+            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+        )
+        # The decode walk reads its last token off the sampler's slot masters and
+        # its timestamp rule state from the sampler's declared loop-back state
+        # beside it (`device_loopback_signals`).
+        self.device_loopback = DeviceLoopback(
+            walk=DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
+        )
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
         self._language_mask: torch.Tensor | None = None
@@ -386,9 +391,9 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
-        if graph_walk == DECODE_WALK and kwargs.get("has_loopback") and self._device_loopback():
+        if (row := self.uniform_row_inputs(graph_walk, kwargs.get("has_loopback", False))) is not None:
             # the token and its rule state are read by slot in `preprocess`
-            return ARNodeInputs(input_seq_len=1)
+            return row
         device = self.get_device()
         if graph_walk == ALIGN_WALK:
             return self._prepare_alignment(fwd_info, inputs)
@@ -496,7 +501,15 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         if graph_walk == ALIGN_WALK:
-            return None  # eager pass over its own inputs; touches no cache
+            # an eager pass over its own inputs that touches no cache; its segment is
+            # the rows the decoder's projections see, for a LoRA pool's rows
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                    for rid, inp in zip(request_ids, inputs, strict=True)
+                ],
+                steps={},
+            )
         context_segments = tuple(
             Segment(
                 request_id=rid,
@@ -559,7 +572,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 "audio_frames": inp.kwargs["audio_frames"],
             }
         if graph_walk == DECODE_WALK and any(inp.input_ids is None for inp in inputs):
-            return self._loopback_inputs(engine_inputs, inputs)
+            # the token and its rule state, read by slot
+            return self.loopback_inputs(engine_inputs, inputs, (TS_RULES,))
         rows = [self._row_ids(inp) for inp in inputs]
         device = rows[0].device
         rules = torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs])
@@ -589,42 +603,10 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
 
     # -- device loop-back --------------------------------------------------
 
-    def _device_loopback(self) -> bool:
-        return device_loopback_enabled() and self.node_resources[SAMPLER].has_slot_masters
-
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        if graph_walk == DECODE_WALK and self._device_loopback():
-            return frozenset({"text_inputs", "ts_rules"})
-        return frozenset()
-
-    def uniform_row_inputs(self, graph_walk: str, has_loopback: bool = False) -> ARNodeInputs | None:
-        if graph_walk == DECODE_WALK and has_loopback and self._device_loopback():
-            return ARNodeInputs(input_seq_len=1)
-        return None
-
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        # the decode loop's client edge carries the token the stop check
-        # already has on the host; the prefill's new_token edge is persisted
-        return {"text_inputs": "new_token"} if graph_walk == DECODE_WALK else {}
-
-    def _loopback_inputs(
-        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor]:
-        """A decode step's token and rule state for every row, read by sampler
-        slot (padding rows read the trash row); a row whose last step did not
-        keep them on the device (the first decode step, after the prefill)
-        brings them routed and they override its slot's."""
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        rules = sampler.loopback_state(TS_RULES, engine_inputs.request_ids)
-        routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
-        if routed:
-            sampler.overwrite_rows(
-                routed,
-                (ids, torch.cat([inputs[i].input_ids for i in routed])),
-                (rules, torch.stack([inputs[i].tensor_inputs["ts_rules"] for i in routed])),
-            )
-        return {"input_ids": ids, "ts_rules": rules}
+        # the token's rule state rides beside it
+        signals = super().device_loopback_signals(graph_walk)
+        return signals | {"ts_rules"} if signals else signals
 
     def _write_context(self, encoder_states: torch.Tensor) -> None:
         self.decoder.write_cross_kv(encoder_states)
@@ -742,7 +724,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         # persisted first token.
         if graph_walk == DECODE_WALK:
             rows = {"text_inputs": new_tokens}
-            if next_rules is not None and self._device_loopback():
+            if next_rules is not None and self._reads_loopback(graph_walk):
                 engine_inputs.resources[SAMPLER].store_loopback_state(
                     TS_RULES, engine_inputs.request_ids, next_rules,
                 )
@@ -752,18 +734,18 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             rows["ts_rules"] = next_rules
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
-    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """The shared stop condition (EOS or the token cap) on a decode step's
-        token; a prompt walk's token never stops the loop. Either way the token
+    def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
+        """The shared stop condition (EOS) on a decode row's token; a prompt
+        walk's token never stops the loop. Either way the token
         is kept for the align walk first."""
-        if request_info.graph_walk != DECODE_WALK:
-            self._record_prompt_token(request_info, token)
+        if info.graph_walk != DECODE_WALK:
+            self._record_prompt_token(info, token)
             return False
-        self._record(request_info, token)
-        if super()._stops(token, request_info):
-            self.request_state(request_info.rid_handle).add("stopped", True)
-            return True
-        return False
+        self._record(info, token)
+        if not super()._token_stops(request_id, token, info):
+            return False
+        self.request_state(info.rid_handle).add("stopped", True)
+        return True
 
     def _record_prompt_token(self, info: CurrentForwardPassInfo, token: int) -> None:
         """For a word-timestamp request, keep what the align walk needs off a
@@ -795,21 +777,3 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         ):
             decoded.append(token)
 
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != DECODE_WALK:
-            # as check_stop: a prompt walk's token never stops the loop, and
-            # only a word-timestamp request keeps it
-            request_ids = [rid for rid in request_ids if request_infos[rid].step_metadata.get("word_timestamps")]
-            if not request_ids:
-                return {}
-        pairs = host_rows.first_values("new_token", request_ids)
-        if pairs is None:
-            return None
-        return {rid: {DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}

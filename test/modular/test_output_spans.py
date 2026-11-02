@@ -27,6 +27,7 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop  # noqa: E402
+from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans  # noqa: E402
@@ -141,6 +142,10 @@ def _batch(samples: dict[int, torch.Tensor]) -> ExecutingBatch:
     )
 
 
+class _Runtime(SimpleNamespace, PhasedPostprocess):
+    """Stubbed phase methods under the reference begin / resume."""
+
+
 def _worker(engine: Engine) -> tuple[Worker, dict]:
     stored: dict = {}
 
@@ -153,8 +158,7 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
     worker.enable_nvtx = False
     worker.enable_prof = False
     worker.device = torch.device("cpu")
-    worker._last_active = {}
-    worker._graph_runtime = SimpleNamespace(
+    worker._graph_runtime = _Runtime(
         cleanup_consumed_inputs=lambda node, rids, wgs: ([], []),
         clear_pending_loop_stops=lambda: None,
         stop_loops_batched=lambda **kwargs: [],
@@ -166,6 +170,7 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
     )
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     worker._innermost_loop_by_node = {}
+    worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
     worker.request_state = SimpleNamespace(buffer_publish_info=lambda *args: None)
     worker.scheduler = SimpleNamespace(failed_rids=set())
     return worker, stored

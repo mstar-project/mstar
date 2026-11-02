@@ -279,10 +279,11 @@ def test_an_empty_yaml_block_is_not_an_override():
 
 def test_a_real_override_still_raises_through_the_yaml_entry_point():
     """The counterweight to the above, on the same path: a block that does
-    carry a key must still be refused where a deployment would hit it."""
+    carry a key must still be refused where a deployment would hit it, as the
+    ValueError a bad config is, naming the block."""
     spec = KVSpec(resource_key="kv", nodes={"dit"}, config=_ring_config())
 
-    with pytest.raises(TypeError, match="checkpoint fact"):
+    with pytest.raises(ValueError, match=r"resources\.kv: .*checkpoint fact"):
         apply_yaml_overrides([spec], {"resources": {"kv": {"tokens_per_frame": 256}}})
 
 

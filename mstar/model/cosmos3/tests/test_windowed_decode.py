@@ -76,10 +76,14 @@ def _windows(stream: torch.Tensor, start: int = 0):
 
 
 def _run(sub, rid, windows, frames, **md):
+    """Each window's emitted ``[T, C, H, W]`` frames, as ``[1, C, T, H, W]`` pixels
+    to compare with ``_decode_pixels``."""
     md = {"num_windows": len(windows), "overlap_latent_units": OVERLAP, "num_frames": frames,
           "stream_video": True, **md}
     infos = SimpleNamespace(request_ids=[rid], per_request_info={rid: SimpleNamespace(step_metadata=md)})
-    return [sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w)["video_output"][0] for w in windows]
+    emitted = [sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w)["video_output"][0] for w in windows]
+    assert all(f.is_contiguous() for f in emitted)
+    return [f.transpose(0, 1)[None] for f in emitted]
 
 
 def _u8_close(a: torch.Tensor, b: torch.Tensor, tol: int = 1) -> None:
@@ -159,7 +163,7 @@ def test_a_failed_window_drops_the_cache(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae)
     _run(sub, "r", windows[:1], 77, num_windows=3)
     st = sub.request_state("r")
-    decoder, calls = sub._step._decoder, []
+    decoder, calls = sub._stream.step._decoder, []
 
     def fail_third(x, **kw):
         calls.append(x.shape[2])
@@ -167,11 +171,11 @@ def test_a_failed_window_drops_the_cache(monkeypatch, vae) -> None:
             raise RuntimeError("injected")
         return decoder(x, **kw)
 
-    sub._step._decoder = fail_third
+    sub._stream.step._decoder = fail_third
     with pytest.raises(RuntimeError, match="injected"):
         _run(sub, "r", windows[1:2], 77, num_windows=3)
     assert "ar_feat_cache" not in st and st["ar_chunks"] == 1
-    sub._step._decoder = decoder
+    sub._stream.step._decoder = decoder
     retried = _run(sub, "r", windows[1:2], 77, num_windows=3)
     assert "ar_feat_cache" in st
     ref = _run(_decoder(monkeypatch, vae, warm=False), "r", windows, 77)
@@ -224,9 +228,7 @@ def test_channels_last_decoder(monkeypatch) -> None:
     sub = _decoder(monkeypatch, _tiny_vae(), channels_last=True)
     assert is_channels_last(sub.vae)
     assert sub._vae_input(stream).is_contiguous(memory_format=torch.channels_last_3d)
-    chunks = _run(sub, "r", _windows(stream), 77)
-    video = torch.cat(chunks, dim=2)
-    assert all(c.is_contiguous() for c in chunks)
+    video = torch.cat(_run(sub, "r", _windows(stream), 77), dim=2)
     _u8_close(video, sub._decode_pixels(stream))
     plain = _decoder(monkeypatch, _tiny_vae())._decode_pixels(stream)
     assert (video.int() - plain.int()).abs().max() <= 1
@@ -234,8 +236,8 @@ def test_channels_last_decoder(monkeypatch) -> None:
 
 def _record_calls(sub) -> list:
     calls = []
-    decoder = sub._step._decoder
-    sub._step._decoder = lambda x, **kw: calls.append(x.shape[2]) or decoder(x, **kw)
+    decoder = sub._stream.step._decoder
+    sub._stream.step._decoder = lambda x, **kw: calls.append(x.shape[2]) or decoder(x, **kw)
     return calls
 
 
@@ -278,7 +280,7 @@ def test_resumed_first_window_is_not_grouped(monkeypatch, vae) -> None:
 def test_warm_cache_switch_off_keeps_no_cache(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae, warm=False)
     _run(sub, "r", _windows(_stream(14))[:1], 53, num_windows=2)
-    assert "ar_feat_cache" not in sub.request_state("r") and sub._step is None
+    assert "ar_feat_cache" not in sub.request_state("r") and sub._stream is None
 
 
 def _warm(sub) -> set:
