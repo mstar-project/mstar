@@ -736,6 +736,22 @@ def test_children_run_other_than_through_their_forward_are_refused(name):
     assert refused == children and not any(p.removeprefix("m.") in children for p in spec.module_map.bindings)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="gelu_tanh_ffn fuses linear_in only compiled on CUDA")
+def test_compiled_gelu_tanh_ffn_runs_a_bound_linear_in_through_its_forward():
+    """Compiled on CUDA, gelu_tanh_ffn runs linear_in as an addmm over its weight; a
+    LoRA-bound one runs its forward instead, which adds the delta."""
+    from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
+    from mstar.model.components.lora.capable import make_lora_capable
+    from mstar.model.components.mlp import MLP
+
+    mlp = MLP(HIDDEN, 16, activation="gelu_tanh").cuda()
+    make_lora_capable(mlp.linear_in).lora_delta = lambda x, y: y + 1.0
+    x = torch.randn(3, HIDDEN, device="cuda")
+    torch._dynamo.reset()
+    out = torch.compile(gelu_tanh_ffn, backend="eager", fullgraph=True)(x, mlp)
+    torch.testing.assert_close(out, mlp(x), rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("absorb", [False, True])
 def test_absorbed_mla_refuses_the_projections_it_folds_at_load(absorb):
     from mstar.model.components.mla import MLAAttention
