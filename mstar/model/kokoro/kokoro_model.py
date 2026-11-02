@@ -245,18 +245,6 @@ class KokoroModel(Model):
     def get_autocast_dtype(self):
         return torch.float32
 
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Emitted PCM16 tensor -> little-endian bytes."""
-        del request_kwargs
-        if modality != "audio":
-            raise ValueError(f"Unsupported Kokoro output modality: {modality!r}")
-        if output.numel() == 0:
-            return b""
-        pcm = output.detach().cpu()
-        if pcm.is_floating_point():
-            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
-        return pcm.contiguous().numpy().tobytes()
-
     # -- worker-side construction ------------------------------------------
 
     def get_submodule(

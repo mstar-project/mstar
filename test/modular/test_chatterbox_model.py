@@ -700,16 +700,6 @@ def test_t3_dtype_switch():
     ).get_autocast_dtype() == torch.float16
 
 
-def test_postprocess_encodes_pcm16():
-    model = _make_model()
-    assert model.postprocess(torch.tensor([-1.0, 0.0, 1.0]), "audio") == \
-        torch.tensor([-32767, 0, 32767], dtype=torch.int16).numpy().tobytes()
-    assert model.postprocess(torch.zeros(0), "audio") == b""
-    assert model.get_output_sample_rate() == 24000
-    with pytest.raises(ValueError):
-        model.postprocess(torch.zeros(1), "text")
-
-
 # ---------------------------------------------------------------------------
 # T3 submodule: step declaration, packing, batching, captures (no weights)
 # ---------------------------------------------------------------------------

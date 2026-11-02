@@ -43,7 +43,7 @@ from mstar.model.parakeet.config import (
     check_detected_language,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import SentencePieceDetokenizer
+from mstar.model.utils import SentencePieceDetokenizer, TextOutput
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -227,10 +227,8 @@ class ParakeetModel(Model):
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
-        raise ValueError(f"Unsupported modality for {type(self).__name__}: {modality!r}")
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # submodules

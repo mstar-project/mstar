@@ -647,12 +647,6 @@ def test_a_client_cannot_set_the_stream_lead(model, ref_text, lead):
     assert vae.stream_lead_items == ({STREAM_EDGE: lead} if lead else {})
 
 
-def test_postprocess_encodes_pcm16(model):
-    pcm = model.postprocess(torch.tensor([0.0, 0.5, -2.0]), "audio")
-    assert torch.frombuffer(bytearray(pcm), dtype=torch.int16).tolist() == [0, 16383, -32767]
-    assert model.get_output_sample_rate() == 48000
-
-
 def test_load_audio_resamples_to_16k_and_bounds_duration(model, tmp_path):
     soundfile = pytest.importorskip("soundfile")
     pytest.importorskip("soxr")
