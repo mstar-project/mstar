@@ -358,7 +358,7 @@ def test_ignore_eos_keeps_every_end_token(model):
 
 
 def test_schedule_matches_the_spans(model):
-    """As many text walks as spans, one media walk per attachment, in order."""
+    """One media walk per attachment, in order, and every span in one of them."""
     mods = ["image", "text", "image"]
     spans = _new_text_inputs(model, "Between.", mods)
     signals = {
@@ -367,11 +367,8 @@ def test_schedule_matches_the_spans(model):
         "image_grid_thw": ["g0", "g1"],
     }
     schedule = model._build_thinker_prefill_schedule(mods, signals)
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text",
-    ]
-    assert sum(1 for w, _ in schedule if w == "prefill_text") == len(spans)
+    assert [walk for walk, _ in schedule] == ["prefill_vision", "prefill_vision"]
+    assert [text for _, entry in schedule for text in entry["text_inputs"]] == signals["text_inputs"]
 
 
 @pytest.mark.skipif(

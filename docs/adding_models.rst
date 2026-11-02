@@ -449,7 +449,10 @@ overrides** in :doc:`serving`.
      request that re-sends the reply matches it too.
 
    The keys cover the label's first ``keyed_spans`` spans. An ids span is keyed by its
-   token ids, a digest span by its file.
+   token ids, a digest span by its file. Consecutive spans of one walk are one row of one
+   step: a match cuts the row, and the row keeps placing its own positions, so its walk
+   declares the advance of the whole row whatever the cut left (Qwen3-Omni's prefill of text
+   around an attachment).
 
    BAGEL keys its text and ViT walks and the decode that follows them:
 

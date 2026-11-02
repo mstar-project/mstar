@@ -27,7 +27,8 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.engine.resources import StepContext
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
+from mstar.engine.resources.kv.manager import KVManager, SpanCursor
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
@@ -164,6 +165,65 @@ def test_each_walk_the_cache_serves_moves_the_counter_by_its_advance_before_the_
         "a walk after a served one read the counter at the start of what was "
         "served, or an image moved it by its slots rather than its one position"
     )
+
+
+def _one_row(parts: list = PARTS) -> tuple[_Node, int]:
+    """A request whose text and image spans are one row of one step, after an
+    earlier request wrote them the same way."""
+    node = _Node.__new__(_Node)
+    _TextNode.__init__(node)
+    node.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((IMAGE_WALK,), ("decode",))})
+    node.runner.ingest_request("seed", {"kv": _config(parts, text_walk=IMAGE_WALK)})
+    length = sum(slots for _, slots in _walks(parts))
+    node.step("seed", length, IMAGE_WALK)
+    node.runner.ingest_request(RID, {"kv": _config(parts, text_walk=IMAGE_WALK)})
+    return node, length
+
+
+def test_one_step_writing_several_spans_is_served_past_their_whole_pages():
+    node, length = _one_row()
+
+    tokens = node.walk(IMAGE_WALK, length)
+
+    assert tokens == 4 * PAGE_SIZE, "the row should run from the lease's end"
+    assert node.stream.stored_len == length
+    assert node.stream.span_cursor.done == len(PARTS), "the step did not pass every span it wrote"
+
+
+def test_a_partly_served_row_leaves_the_counter_where_its_own_positions_start():
+    node, length = _one_row()
+
+    prefix = node.probe(IMAGE_WALK, length)
+
+    assert prefix.tokens == 4 * PAGE_SIZE and prefix.position == 0, (
+        "a row places its own positions, so prepared again it has to read the counter it was prepared at"
+    )
+
+
+def test_a_whole_row_the_cache_holds_moves_the_counter_past_its_spans():
+    # the prompt's last token always runs, so a whole row is one a later walk follows
+    spans = (PrefixSpan(10, 10, IMAGE_WALK), PrefixSpan(22, 1, IMAGE_WALK, digest=DIGEST), PrefixSpan(5, 5, TEXT_WALK))
+    cursor = SpanCursor(spans)
+    step = cursor.next_step(IMAGE_WALK)
+
+    served = KVManager._answer("main", cursor, step, 32)
+
+    assert (len(step), served.tokens, served.position) == (2, 32, 11), "an item moves it by its advance, not its slots"
+    assert KVManager._answer("main", cursor, step, 16).position == 0
+
+
+def test_a_row_the_layout_does_not_add_up_to_ends_the_chain():
+    node, length = _one_row()
+
+    assert node.probe(IMAGE_WALK, length + 1) is None
+    assert node.stream.chain is None
+
+
+def test_a_row_may_place_its_own_positions_though_it_opens_with_text():
+    node, length = _one_row()
+    row = ARNodeInputs(input_seq_len=length, custom_pos_ids=torch.zeros(3, length))
+
+    assert node.runner.resolve_cached_prefix(RID, NODE, IMAGE_WALK, row).tokens == 4 * PAGE_SIZE
 
 
 _DISAGREEING = {

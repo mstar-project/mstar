@@ -164,6 +164,14 @@ class SpanCursor:
     consumed: int = 0
     probed: int | None = None
 
+    def next_step(self, walk: str) -> tuple[PrefixSpan, ...]:
+        """The spans from ``done`` on that one step of ``walk`` writes: a row can
+        hold several, text around an attachment, in layout order."""
+        end = self.done
+        while end < len(self.spans) and self.spans[end].walk == walk:
+            end += 1
+        return self.spans[self.done:end]
+
     def advance(self, start: int, end: int) -> list[tuple[int, int]]:
         """Return ``(index, end)`` for each span a write over ``[start, end)`` touched. A span
         before ``start`` that a probe served or a retrieve read in is passed, not touched."""
@@ -784,30 +792,31 @@ class KVManager(AttentionResource):
             chain, cursor = stream.chain, stream.span_cursor
             if chain is None or cursor.done >= len(chain.spans):
                 return None
-            span = chain.spans[cursor.done]
-            self._check_positions(span, graph_walk, inputs)
-            if span.walk != graph_walk or span.length != inputs.input_seq_len:
+            step = cursor.next_step(graph_walk)
+            self._check_positions(step, chain.spans[cursor.done], graph_walk, inputs)
+            if sum(span.length for span in step) != inputs.input_seq_len:
                 self._drop_layout(rid, label, stream, (
                     f"{graph_walk} writes {inputs.input_seq_len} slots where its "
-                    f"layout's span {cursor.done} has {span.walk} write {span.length}"
+                    f"layout's span {cursor.done} has {chain.spans[cursor.done].walk} "
+                    f"write {sum(span.length for span in step)}"
                 ))
                 return None
             if stream.converted:
-                return self._answer(label, cursor, stream.stored_len)
+                return self._answer(label, cursor, step, stream.stored_len)
             if stream.lease is not None:
-                return self._answer(label, cursor, stream.lease_len)
+                return self._answer(label, cursor, step, stream.lease_len)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
             if self._world_size > 1:
                 # Above one rank, use only the lease taken when rank 0 sent the step. A lookup now
                 # would also see this rank's later commits.
-                return self._answer(label, cursor, 0)
+                return self._answer(label, cursor, step, 0)
         if not self._lease(rid, node_name, label, stream, chain):
             return None
         with self._lock:
             if stream.lease is None:
                 return None
-            return self._answer(label, cursor, stream.lease_len)
+            return self._answer(label, cursor, step, stream.lease_len)
 
     def _lease(self, rid: str, node_name: str, label: str, stream: CacheStream, chain: PrefixChain) -> bool:
         """Lease what the index holds of the stream's prompt, unless the stream holds a lease already.
@@ -951,24 +960,29 @@ class KVManager(AttentionResource):
         with self._lock:
             return self._arena.trail
 
-    def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
-        assert span.digest is not None or inputs.custom_pos_ids is None, (
+    def _check_positions(
+        self, step: tuple[PrefixSpan, ...], span: PrefixSpan, graph_walk: str, inputs,
+    ) -> None:
+        # a step of several spans places its own positions and is only moved past whole
+        assert len(step) > 1 or span.digest is not None or inputs.custom_pos_ids is None, (
             f"KV {self.name}: {graph_walk} places positions of its own, but "
             "the layout keys it by ids, whose positions are their count"
         )
 
     @staticmethod
-    def _answer(label: str, cursor: SpanCursor, present: int) -> CachedPrefix:
+    def _answer(
+        label: str, cursor: SpanCursor, step: tuple[PrefixSpan, ...], present: int,
+    ) -> CachedPrefix:
         """This walk's share of the ``present`` tokens the stream holds, with the
         position past that share. Records the span as the one the probe answered for."""
-        span = cursor.spans[cursor.done]
-        tokens = min(max(present - cursor.consumed, 0), span.length)
+        length = sum(span.length for span in step)
+        tokens = min(max(present - cursor.consumed, 0), length)
         position = sum(earlier.advance for earlier in cursor.spans[:cursor.done])
-        if span.digest is None:
+        if len(step) == 1 and step[0].digest is None:
             position += tokens
-        elif tokens == span.length:
+        elif tokens == length:
             # A partly held item doesn't move the position. Its walk still runs and advances it.
-            position += span.advance
+            position += sum(span.advance for span in step)
         cursor.probed = cursor.done
         return CachedPrefix(label, tokens, position)
 
@@ -1021,7 +1035,9 @@ class KVManager(AttentionResource):
                 stream = self._ensure_label(rid, label)
                 chain, cursor = stream.chain, stream.span_cursor
                 if chain is not None and cursor.done < len(chain.spans):
-                    self._check_positions(chain.spans[cursor.done], graph_walk, inputs)
+                    self._check_positions(
+                        cursor.next_step(graph_walk), chain.spans[cursor.done], graph_walk, inputs,
+                    )
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
@@ -1029,7 +1045,7 @@ class KVManager(AttentionResource):
                 self._drop_layout(rid, label, stream, f"{graph_walk} writes unprobed")
                 return
             cursor = stream.span_cursor
-            if prefix.tokens == cursor.spans[cursor.done].length:
+            if prefix.tokens == sum(span.length for span in cursor.next_step(graph_walk)):
                 return
             held = cursor.consumed + prefix.tokens
             if held < stream.lease_len:
@@ -1048,8 +1064,9 @@ class KVManager(AttentionResource):
             if stream is None or stream.chain is None:
                 return
             cursor = stream.span_cursor
-            cursor.consumed += cursor.spans[cursor.done].length
-            cursor.done += 1
+            step = cursor.next_step(graph_walk)
+            cursor.consumed += sum(span.length for span in step)
+            cursor.done += len(step)
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
