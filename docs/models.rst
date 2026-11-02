@@ -648,7 +648,9 @@ Qwen3-TTS notes
   audio s/s with TTFA p50: 10.0 / 50.3 / 113.7 / 126.2 at c=1 / 8 / 32 / 64
   (24 / 41 / 144 / 333 ms), against 9.0 / 39.6 / 74.6 / 75.8 (23 / 65 / 148 / 188 ms)
   for ``configs/qwen3tts_1p7b.yaml``; Whisper WER 1.1-1.5% against the
-  reference's 0.9%.
+  reference's 0.9%. It raises ``model_kwargs: {talker_max_batch: 64}`` on AMD
+  GPUs: above the Talker's default 32 rows decode splits into half-batches
+  that take turns, and a step costs most of its time whatever its rows.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
