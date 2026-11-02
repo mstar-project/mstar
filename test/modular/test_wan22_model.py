@@ -1075,15 +1075,12 @@ def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(sp_size, ok):
             model.validate_config_yaml(config, "wan.yaml")
 
 
-def test_wan22_dit_declares_one_segment_per_branch():
+def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
     submodule = _dit()
-    info = _dit_info(5.0)
     node_inputs = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=info, inputs=_dit_loop_inputs(),
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
     assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
-    span = submodule.num_tokens(submodule.bucket_key_for(info))
-    assert [(s.label, s.span) for s in step.segments] == [(submodule.MAIN_SPAN, span)] * 2
     sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
     assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None

@@ -1,7 +1,7 @@
 model: "wan22"
 
 # See wan22.yaml. CFG-parallel on two GPUs, latency-oriented: the dit runs on
-# both, each rank computing one classifier-free-guidance branch at batch 1, and
+# both, each rank computing one classifier-free-guidance branch over the batch's rows, and
 # the two noise predictions are all-gathered every step, so a guided denoise
 # step costs one branch's forward. The text encoder and both VAE passes run on
 # rank 0.
