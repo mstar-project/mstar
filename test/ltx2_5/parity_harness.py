@@ -160,7 +160,7 @@ def check_decode(device="cuda:1"):
     video_dec = model.get_submodule("vae_decoder", device)
     audio_dec = model.get_submodule("audio_decoder", device)
     frames = video_dec.run_batch(latents=load("latents_007").to(device), shape=shape)["video_output"][0]
-    ref = load("video").permute(3, 0, 1, 2)  # [F, H, W, 3] -> [3, F, H, W]
+    ref = load("video")  # [F, H, W, 3], the node's layout
     diff = (frames.cpu().float() - ref.float())
     mse = diff.pow(2).mean()
     print(f"video frames  max_abs={diff.abs().max():.0f} psnr={10 * torch.log10(255 ** 2 / mse):.2f} dB "

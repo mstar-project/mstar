@@ -60,6 +60,9 @@ def _lora_spec() -> LoraSpec:
 class _Model:
     """Declares one id-keyed label and a LoRA spec."""
 
+    # names a checkpoint, so its prefix cache opens without a salt
+    checkpoint_path = "stub"
+
     def kv_labels(self):
         return {"kv": {"main": KVLabel(keys=PrefixKeys(TENSOR, (WALK,)))}}
 
@@ -104,7 +107,7 @@ def _deployment(adapters: dict[str, str] | None) -> dict:
     resources = {"kv": {"page_size": PAGE_SIZE}}
     if adapters is not None:
         resources[LORA_RESOURCE_KEY] = {"adapters": dict(adapters)}
-    return {"model": "stub", "resources": resources}
+    return {"model": "stub", "resources": resources, "node_groups": [{"ranks": [0], "node_names": [NODE]}]}
 
 
 def _worker(model, config: dict, roots: AdapterPrefixRoots | None = None) -> PreprocessWorkerThread:

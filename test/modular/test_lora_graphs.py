@@ -253,7 +253,7 @@ def test_the_declaration_check_still_compares_the_nodes_own_key():
     declare_step disagrees with its cg_key_info still fails under a base-only lease."""
     from mstar.engine.engine import Engine
 
-    def plan(step):
+    def plan(step, phase):
         raise NotImplementedError("reached plan")
 
     engine = object.__new__(Engine)

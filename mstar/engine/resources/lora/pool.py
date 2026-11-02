@@ -63,7 +63,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -91,6 +91,7 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +392,7 @@ class LoraAdapterPool(Resource):
         self._changes = 0
         # Reads into the host tier run on one background thread: a host-tier miss and
         # a runtime load never read a file on the GPU thread or under the lock.
-        self._reader: ThreadPoolExecutor | None = None
+        self._reader: ThreadPool | None = None
         self._reads: dict[str, tuple[Future, _Served]] = {}  # adapter -> read in flight
         # adapter -> why its last background read failed; a new request on it retries
         self._read_errors: dict[str, str] = {}
@@ -814,9 +815,10 @@ class LoraAdapterPool(Resource):
 
     # Host tier
 
-    def _executor(self) -> ThreadPoolExecutor:
+    def _executor(self) -> ThreadPool:
         if self._reader is None:
-            self._reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lora-read")
+            # on the process mask: with core pinning, reads stay off the step threads' cores
+            self._reader = ThreadPool(max_workers=1, thread_name_prefix="lora-read")
         return self._reader
 
     def _hold(self, name: str) -> None:

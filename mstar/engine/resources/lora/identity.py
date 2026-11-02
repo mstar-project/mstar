@@ -67,8 +67,8 @@ class AdapterPrefixRoots:
     A name that is not registered has no root, and a request on it must not be keyed
     at all: keyed under the base model's empty root, its pages would serve base
     requests. ``register`` and ``unregister`` are the hooks for loading and unloading
-    an adapter at runtime; reads happen on the preprocess thread, writes on whichever
-    thread registers.
+    an adapter at runtime; reads happen on the request-preparation threads (the
+    prepare pool, or the preprocess thread inline), writes on whichever thread registers.
     """
 
     def __init__(self, roots: dict[str, bytes] | None = None):

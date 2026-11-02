@@ -478,13 +478,13 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
         reclaimable=lambda *a, **k: asked.append(a) or 0, is_offloaded=lambda *a: False,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    w._last_active = {(1, "LLM"): 0.0}
+    w.scheduler = SimpleNamespace(arrival={1: 0})
     with caplog.at_level(logging.WARNING):
-        assert w._try_offload_cold_request("LLM", {1}, affected_resources={"lora"}) is None
+        assert w._try_offload_cold_request("LLM", "decode", {1}, affected_resources={"lora"}) is None
     assert asked == [] and "No eviction candidate" not in caplog.text
     # control: a KV refusal with nothing reclaimable looks for a victim and warns
     with caplog.at_level(logging.WARNING):
-        assert w._try_offload_cold_request("LLM", {1}, affected_resources={"kv"}) is None
+        assert w._try_offload_cold_request("LLM", "decode", {1}, affected_resources={"kv"}) is None
     assert asked and "No eviction candidate" in caplog.text
 
 
@@ -526,6 +526,40 @@ def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
     del block["targets"]
     (llm,) = [s for s in serving_resources(model, config) if isinstance(s, LoraSpec)]
     assert set(llm.targets) == {"qkv", "o"}
+
+
+def test_a_lora_deployment_still_has_its_kv_pools_checked_against_its_cap(adapters):
+    """The `lora:` block is the LoRA specs' own, so the KV-fit check (which reads the
+    specs as a server builds them) still refuses a cap the cache cannot hold."""
+    import logging
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+    from mstar.model.utils import check_kv_pools_fit
+
+    _, paths = adapters
+    kv = KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=16,
+    ))
+    model = SimpleNamespace(get_node_resources=lambda: [kv], get_lora_specs=lambda: [make_spec({})])
+    config = {"max_concurrent_requests": 8, "resources": {"lora": {"adapters": {"a3": paths["a3"]}}}}
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__))
+
+
+def test_a_bad_key_in_the_lora_block_is_a_config_error_on_every_lora_spec():
+    """The block sizes a second LoRA spec before the other overrides apply, so a key no
+    spec takes is reported there as the overrides report one: a ValueError, which the
+    checks that read the serving specs leave to validation."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from mstar.model.base import serving_resources
+
+    vit = replace(make_spec({}), resource_key="lora_vit", nodes={"ViT"})
+    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({}), vit])
+    with pytest.raises(ValueError, match="resources.lora"):
+        serving_resources(model, {"resources": {"lora": {"max_slot": 2}}})
 
 
 # --- admission: a full pool is backpressure, not a refused step ----------------------------------
