@@ -9,7 +9,7 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 class AttentionCallable:
     """A convenience wrapper around kv and attn that wraps the KV write and
     attention call in one pure-tensor function, with helper methods for
-    setting layer and label information. ``q=None`` writes the K/V alone.
+    setting layer and label information. ``write(k, v)`` writes the K/V alone.
 
     On a node whose steps split over its SP ranks, the call goes through the
     attention resource's exchange (`AttentionManager.exchange`), which hands the
@@ -51,9 +51,16 @@ class AttentionCallable:
         self.kv.set_default_layer_idx(layer_idx)
 
     @torch.compiler.disable
-    def __call__(
-        self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor,
-    ) -> torch.Tensor | None:
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self._exchanged(q, k, v)
+
+    @torch.compiler.disable
+    def write(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write this step's K/V without attending (a second K over the same tokens, say), on SP
+        ranks through the exchange, so it lands on the heads this rank stores."""
+        self._exchanged(None, k, v)
+
+    def _exchanged(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
         # a stand-in attention (Cosmos3's warmup's, the tests' fakes) is no AttentionManager; a node
         # that never splits keeps the direct call
         if isinstance(self.attn, AttentionManager) and self.attn._shard is not None:
@@ -61,6 +68,7 @@ class AttentionCallable:
         return self._attend(q, k, v)
 
     def _attend(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+        # q None: the write alone, as the exchanges hand it on
         if self.attn.requires_kv_write:
             self.kv.write_kv(k, v)
         if q is None:

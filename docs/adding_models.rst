@@ -2137,9 +2137,9 @@ Splitting is declared in four places:
   brackets the generation layer stack after its whole-sequence prologue
   (``mstar/model/cosmos3/components/transformer.py``).
 - The attention is reached through the resource: a paged attention through ``AttentionCallable``
-  (``q=None`` writes K/V alone), a ragged one through its ``run``. A layer that writes through
-  ``write_target`` or calls ``attn.run`` itself on a split label raises, since it would treat this
-  rank's share as the whole step. A cacheless self-attention that may see split tokens declares
+  (``attend.write(k, v)`` writes K/V alone), a ragged one through its ``run``. A layer that
+  writes through ``write_target`` or calls ``attn.run`` itself on a split label raises, since it
+  would treat this rank's share as the whole step. A cacheless self-attention that may see split tokens declares
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")``; it is a no-op on a node with no
   ``SeqShardSpec``, so one declaration serves every deployment shape.
 

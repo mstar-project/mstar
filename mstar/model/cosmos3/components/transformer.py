@@ -362,8 +362,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         k = self._apply_rope(k, cos, sin)
         out = attend(q, k, v).reshape(-1, H * D)
         if cache_gen_k and self.k_norm_und_for_gen is not None:
-            # a write alone, through the callable so it lands on this rank's heads
-            attend(None, self._apply_rope(self.k_norm_und_for_gen(k_raw), cos, sin), v)
+            attend.write(self._apply_rope(self.k_norm_und_for_gen(k_raw), cos, sin), v)
         return self.to_out(out)
 
     def forward_gen(
