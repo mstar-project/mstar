@@ -324,11 +324,12 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
      r"node_groups\[0\]: node 'llm' splits tokens over 4 SP ranks, and KV 'kv' stores 4 query and 2 KV heads by "
      r"head, which don't split 4 ways per TP rank"),
     # each row split over KV stored by position
-    ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}},
+    ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention()], dict(sp_size=2),
+     {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}},
      r"node_groups\[0\]: node 'llm' splits each row of its steps \(axis 1\) over 2 SP ranks, and KV 'kv' stores "
      r"them by position"),
-    # sp_exchange against the pool's storage, at any SP size
-    ([_shard(), _attention()], dict(sp_size=1), {"attn": {"sp_exchange": "ring"}},
+    # sp_exchange against the pool's storage (at one SP rank any setting is refused, below)
+    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "ring"}},
      r"resources.attn: sp_exchange 'ring' needs KV 'kv' stored by position \(context_parallel: true\)"),
     ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "all_gather"}},
      r"resources.attn: sp_exchange 'all_gather' needs KV 'kv' stored by position"),
