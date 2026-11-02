@@ -1,7 +1,8 @@
 """Qwen3Attention's fused q/k RMSNorm + RoPE (``mstar::qk_norm_rope_inplace``) matches an fp64 reference, is no
 less accurate in bf16 than the unfused path it replaces (RMSNorm, then FlashInfer's non-interleaved RoPE from
 position ids), and works in place on q/k sliced out of one qkv projection, eagerly, under torch.compile and in a
-CUDA graph, on the shapes Qwen3-ASR's language model runs; and the table-driven variant, for a multimodal RoPE."""
+CUDA graph, on the shapes Qwen3-ASR's language model runs; and the table-driven variant Qwen3-Omni's Thinker uses
+for its multimodal RoPE."""
 import pytest
 import torch
 

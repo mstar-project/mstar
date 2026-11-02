@@ -615,6 +615,31 @@ Kokoro notes
 Qwen3-Omni notes
 ----------------
 
+- The default ``configs/qwen3omni_2gpu.yaml`` holds 1,024 GPU pages (128k tokens)
+  of Thinker KV plus 1,024 host pages it offloads to. On H200-class GPUs, when
+  concurrent requests hold more than 128k tokens of Thinker KV, serve
+  ``configs/qwen3omni_2gpu_large_kv.yaml``, which keeps 2,048 pages (256k tokens)
+  on the GPU and no host pages; it should fit beside its captures on an H200 (not
+  run since its prefill ladder grew to 8192 tokens). On 80 GB GPUs such as the
+  H100, serve ``configs/qwen3omni_2gpu_h100.yaml``. Its 512-page Thinker pool (64k
+  tokens) was sized on an H100 when the encoders shared the Thinker's GPU and its
+  text ladder ran to 8192: beside 1,024 pages 27 Thinker captures, all among those
+  of 4096 tokens and more (text and vision), ran eagerly, and 640 pages still left
+  two vision buckets out. Chunked prefill now caps a Thinker step at 1,024
+  tokens, so those large buckets no longer replay, but they are still captured
+  and still take that memory; whether 1,024 pages fit with today's ladders and
+  encoder placement is unmeasured. The config runs the audio and vision encoders on the Talker's GPU,
+  so an encoder step doesn't wait behind a Thinker step.
+- None of the three configs sets ``max_concurrent_requests``. With the Thinker's
+  prefix cache on, a decode step that finds the GPU pool full offloads a running
+  request to the host pages. Only when that frees nothing does it hold requests
+  until they time out: with no host pages (``large_kv``), with the host pages full,
+  or when the running requests' pages are mostly a prefix they share (see the
+  prefix cache under "Config files" in :doc:`serving`). Where one of those can
+  happen and concurrent requests can together hold more Thinker KV than the GPU
+  pool, set the cap to the GPU pages divided by the pages of the longest request
+  served, prompt and output together, at 128 tokens a page: at the full 32k
+  context, 8 for ``large_kv``, 4 for the default and 2 for the H100 config.
 - The audio and vision encoders attend through ragged attention resources
   (``audio_attn`` within each 8 s window, ``vision_attn`` within each image or
   video frame group), FlashInfer by default, so no ``flash-attn`` install is
@@ -642,20 +667,26 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
-- Numerics: the code predictor's residual adds fold into the next RMSNorm
-  (FlashInfer's fused add + norm) and its attention is a Triton kernel
-  (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
+- Numerics: the Thinker's q/k RMSNorm and multimodal RoPE run in one kernel
+  with the KV write, in fp32 throughout and rounded once, where the unfused ops
+  (and Hugging Face) round to bf16 after the norm and after each step of the
+  rotation: no less accurate, but not bit-exact. The code predictor's residual
+  adds fold into the next RMSNorm (FlashInfer's fused add + norm) and its
+  attention is a Triton kernel (``cp_attention``), neither bit-exact with the
+  unfused ops. Its 15 depth
   steps feed each sampled code into the next, so small differences can change
   later codes at near-ties.
 - The Thinker's text and audio prefill replay captured graphs on the ladder
   ``128 ... 2048`` tokens, and a longer step runs eagerly.
   ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
   ladder; ``configs/qwen3omni_2gpu_large_kv.yaml`` runs it to 8192 (with 4096
-  and 6144) on H200-class GPUs, so a burst of new prompts that batches into one
-  step of a few thousand tokens still replays (measured on 2xH200: the first
-  t2t c=32 burst's TTFT p99 3.5 s -> 0.45 s). Each bucket adds captures, graph
-  memory and startup time. ``configs/qwen3omni_2gpu.yaml``, sized for 80 GB
-  GPUs, keeps the default ladder.
+  and 6144) on H200-class GPUs. Before chunked prefill capped a Thinker step at
+  1,024 tokens, that let a burst of new prompts batched into one step of a few
+  thousand tokens replay (2xH200: the first t2t c=32 burst's TTFT p99
+  3.5 s -> 0.45 s). Such steps no longer form, so the buckets past 1024 only
+  add captures, graph memory and startup time.
+  ``configs/qwen3omni_2gpu.yaml`` and ``configs/qwen3omni_2gpu_h100.yaml``
+  keep the default ladder.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another.

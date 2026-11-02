@@ -1,12 +1,17 @@
 model: "qwen3_omni"
 max_seq_len: 32768
-# The 2-GPU placement for H200-class GPUs (qwen3omni_2gpu.yaml is sized for 80 GB).
-# The Thinker's captured prefill ladder runs past the default 2048: a burst of new
-# prompts batches into one prefill step (5101 tokens for 32 ShareGPT prompts),
-# which otherwise ran eagerly and recompiled on the request path.
+# The 2-GPU placement for H200-class GPUs: qwen3omni_2gpu.yaml with the Thinker's KV
+# pool at its default 2,048 pages (256k tokens, 24 GiB at 12 MiB a page) and no host
+# pages, for workloads whose concurrent requests hold more than 128k tokens of Thinker
+# KV; see the Qwen3-Omni notes in docs/models.rst for its caveats. On 80 GB GPUs, serve
+# qwen3omni_2gpu_h100.yaml.
+# The Thinker's captured prefill ladder runs past the default 2048 for a burst of new
+# prompts batched into one prefill step (5101 tokens for 32 ShareGPT prompts), which
+# ran eagerly before chunked prefill capped a Thinker step at 1,024 tokens. Such steps
+# no longer form, so the buckets past 1024 no longer replay, but they are still
+# captured and still take graph memory.
 model_kwargs:
   prefill_token_buckets: [128, 256, 512, 1024, 2048, 4096, 6144, 8192]
-# The Thinker's KV pool at its default 2,048 pages, 24 GiB at 12 MiB a page.
 node_groups:
   - node_names: [audio_encoder, vision_encoder]
     ranks: [1]
