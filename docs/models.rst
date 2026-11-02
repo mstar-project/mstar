@@ -1690,12 +1690,17 @@ to end through ``/v1/videos/generations``:
      - 90.5
    * - ``compile``
      - 81.4
-   * - ``compile``, ``vae_parallel: 4`` (``configs/minimax_h3.yaml``)
+   * - ``compile``, ``vae_parallel: 4``
      - 77.4
+   * - ``compile``, ``vae_decoder`` in the DiT's SP group, ``vae_compile``
+       (``configs/minimax_h3.yaml``)
+     - 75.3
 
-The DiT's 49 steps are ~75 s of a clip (~1.53 s each), and the GPUs run at their power
-cap throughout. With the other four GPUs busy, the shipped settings plus ``vae_compile``
-measured 82.9 s (median of 3). Async scheduling for the DiT (``tp_async_sched: [dit]``)
+The DiT's 49 steps are ~73 s of a clip (~1.50 s each), and the GPUs run at their power
+cap throughout. On the same four GPUs SGLang 0.5.21 (Ulysses 4, ``--performance-mode
+speed``) takes 76.0 s, and with two requests at a time finishes 47.5 clips an hour to
+M*'s 48.2 (the last row with #1118's packed Ulysses exchange). Busy neighbours on the
+node's other GPUs cost ~8%. Async scheduling for the DiT (``tp_async_sched: [dit]``)
 measured within noise and is left off. Not done: CUDA-graph capture, more than one request
 per step, tensor parallelism, an SP8 run, and the ``Ref2VA`` checkpoint.
 
