@@ -142,10 +142,15 @@ class _Captured(_Toy):
         ids, acc = sampler.loopback_tokens(rids), sampler.loopback_state(ACC, rids)
         routed = [i for i, rid in enumerate(rids) if rid in self.routed]
         if routed:
+            values = [self.routed[rids[i]] for i in routed]
+            # a padding row's inputs are a real row's, so it brings that row's values too
+            padding = [i for i, rid in enumerate(rids) if rid < 0]
+            routed += padding
+            values += values[:1] * len(padding)
             sampler.overwrite_rows(
                 routed,
-                (ids, torch.tensor([self.routed[rids[i]][0] for i in routed], device="cuda")),
-                (acc, torch.tensor([self.routed[rids[i]][1] for i in routed], device="cuda")),
+                (ids, torch.tensor([v[0] for v in values], device="cuda")),
+                (acc, torch.tensor([v[1] for v in values], device="cuda")),
             )
         self.routed = {}
         return {"ids": ids.clone() if self.copy_ids else ids, "acc": acc}

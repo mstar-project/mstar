@@ -1,5 +1,6 @@
 
 
+import bisect
 from collections.abc import Mapping
 from dataclasses import asdict
 
@@ -785,9 +786,9 @@ class SamplerResource(Resource):
             bufs.write_loopback(name, request_ids, values)
 
     def overwrite_rows(self, rows: list[int], *updates: tuple[torch.Tensor, torch.Tensor]) -> None:
-        """``dst[rows] = src`` for each ``(dst, src)``: the rows of a
-        loop-back read whose last step routed their value as a tensor instead
-        (a request's first decode step). The row index goes up in one
+        """``dst[rows] = src`` for each ``(dst, src)``, ``rows`` ascending: the
+        rows of a loop-back read whose last step routed their value as a tensor
+        instead (a request's first decode step). The row index goes up in one
         non-blocking copy from a pinned buffer the stager holds until it lands."""
         if not rows:
             return
@@ -807,6 +808,13 @@ class SamplerResource(Resource):
         step_rows = self._step_rows
         if step_rows is None:
             raise RuntimeError("a captured step's rows bring no values of their own")
+        # a padding row (a copy of a real row's inputs) reads the pad slot, whatever it brought
+        if rows[-1] >= step_rows.n_active:
+            n = bisect.bisect_left(rows, step_rows.n_active)
+            if not n:
+                return
+            rows = rows[:n]
+            updates = tuple((dst, src[:n]) for dst, src in updates)
         step_rows.apply_ahead()
         index = torch.empty(2 * n, dtype=torch.long, device=updates[0][0].device)
         self._row_stager.copy_(index, [*rows, *step_rows.diff.idx[rows].tolist()])
