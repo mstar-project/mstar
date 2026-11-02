@@ -141,8 +141,16 @@ class ContextParallel(NamedTuple):
             # every rank of the group is a partner (MLA's always are): the same block goes to each
             q = self.group.all_gather(q.contiguous(), dim=0)
         else:
-            q = self.group.to_partners(q.expand(self.size, *q.shape[1:]), self.partners)
+            q = self._to_partners(q.expand(self.size, *q.shape[1:]))
         return q.transpose(0, 1).flatten(1, 2).split([part.shape[-1] for part in queries], dim=-1)
+
+    def _to_partners(self, blocks: torch.Tensor) -> torch.Tensor:
+        """``blocks[j]`` to partner ``j``, and back the block each partner sent this rank, in
+        partner order, over the whole group with nothing to or from the ranks outside the block."""
+        rows = [0] * self.group.world_size
+        for partner in self.partners:
+            rows[partner] = 1
+        return self.group.all_to_all_rows(blocks, rows, rows)
 
     def exchange_partials(
         self, out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor,
@@ -154,7 +162,7 @@ class ContextParallel(NamedTuple):
         out, lse = _masked(out, lse, valid)
         heads = out.shape[1] // self.size
         blocks = _pack(out, lse).unflatten(1, (self.size, heads)).transpose(0, 1)
-        return _unpack(self.group.to_partners(blocks, self.partners), out.dtype)
+        return _unpack(self._to_partners(blocks), out.dtype)
 
 
 def _masked(out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
