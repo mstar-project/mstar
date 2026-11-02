@@ -182,12 +182,17 @@ class H3Block(nn.Module):
     ) -> torch.Tensor:
         """``x`` ``[B, S, hidden]``; ``row_index`` ``[S]`` selects each row's table entry
         (``timestep * 3 + tag``)."""
-        mods = self.modulation(temb, x.shape[0]).index_select(1, row_index)  # [B, S, 6, hidden]
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods.unbind(dim=2)
-        h = self.norm1(x) * (1.0 + scale_msa) + shift_msa
-        x = x + gate_msa * self.attn(h, attend, rope, sp)
-        h = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
-        return x + gate_mlp * self.mlp(h)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.modulation(temb, x.shape[0]).unbind(2)
+
+        def rows(term: torch.Tensor) -> torch.Tensor:
+            # [B, n * 3, hidden] -> [B, S, hidden] where it is used, so a compiled block carries
+            # the small table across its break at the attention, not a gathered row per term
+            return term.index_select(1, row_index)
+
+        h = self.norm1(x) * (1.0 + rows(scale_msa)) + rows(shift_msa)
+        x = x + rows(gate_msa) * self.attn(h, attend, rope, sp)
+        h = self.norm2(x) * (1.0 + rows(scale_mlp)) + rows(shift_mlp)
+        return x + rows(gate_mlp) * self.mlp(h)
 
 
 class H3RefinerBlock(nn.Module):
