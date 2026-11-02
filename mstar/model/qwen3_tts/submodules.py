@@ -996,8 +996,13 @@ class CodecSubmodule(ARNodeSubmodule):
         decoder: torch.nn.Module,
         config: Qwen3TTSModelConfig,
         watermarker: AudioSealWatermarker | None = None,
+        capture_batch_sizes: Sequence[int] | None = None,
     ):
         super().__init__()
+        # A padded row costs the conv stack what a real one does, so a deployment
+        # can capture sizes between the powers of two (``codec_capture_batch_sizes``).
+        if capture_batch_sizes:
+            self.CAPTURE_BATCH_SIZES = sorted(capture_batch_sizes)
         self.decoder = decoder
         self.config = config
         # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
