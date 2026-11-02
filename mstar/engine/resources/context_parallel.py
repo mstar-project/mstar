@@ -214,7 +214,7 @@ class RingAttentionWrapper:
     whose K/V it writes into its own slots. In round ``i`` a rank attends partner ``(r - i) % P``'s
     queries over its slots, the stored context and the step's own tokens together, with one call
     (``_ring_rows``); the partial goes back to that partner, which merges it into its running
-    result (``merge``).
+    result (``_merged``).
 
     One causal call is exact because a partner's queries in a row sit at KV positions ``p0 + aP``,
     and this rank's keys at or below ``p`` number ``(p - r) // P + 1``: one more per query, so the
@@ -287,7 +287,8 @@ class RingAttentionWrapper:
         """Every ``plan`` plans every kernel, so there is nothing to forget."""
 
     def attend(
-        self, queries: tuple[torch.Tensor], kv_cache_layer: torch.Tensor, new_keys: tuple[torch.Tensor | None, ...],
+        self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
+        new_keys: tuple[torch.Tensor | None, ...],
     ) -> torch.Tensor:
         """This rank's queries' attention over the whole pool, in their dtype, as
         ``ContextParallelWrapper.attend`` takes them; the step's own tokens are already written,

@@ -72,7 +72,7 @@ class AttentionCallable:
         self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         # q None: the write alone. `tokens`: which of the step's tokens k and v are, named only by
-        # the ring's exchange (`sequence_shard.ring`), so a stand-in KV (the tests') needn't take it
+        # the ring's exchange (`sequence_shard.ring`), so a stand-in KV needn't take it
         if self.attn.requires_kv_write:
             if tokens is None:
                 self.kv.write_kv(k, v)
