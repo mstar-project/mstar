@@ -14,10 +14,11 @@ arrival, chunk_started, cached_prefix} (purged by clear_rid),
 Worker.{_pending_removes, _pending_loop_stops, streaming_buffers,
 _lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine's and
-tensor manager's per-request state (including ChunkingManagement.prepared),
-RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,
-_unkeyed, _admit_restores, _admit_snaps} (purged by remove_request), and
-WorkerProfileInfo.
+tensor manager's per-request state (including ChunkingManagement.prepared, and
+the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
+RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
+_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
+_admit_snaps} (purged by remove_request), and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

@@ -19,6 +19,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -132,6 +133,9 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.lora.config import LoraSpec
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -537,6 +541,52 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
+def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment's YAML turns on, before its ``resources:``
+    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
+    (``mstar.engine.resources.lora.serving``)."""
+    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+
+    specs = list(model.get_node_resources() or [])
+    lora = declared_lora_specs(model, model_config)
+    size_lora_specs(lora, model_config)
+    return specs + lora
+
+
+def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
+    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
+    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
+    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
+
+    return drop_lora_specs_without_targets(specs)
+
+
+def parse_autocast_dtype(value) -> torch.dtype | None:
+    """The serving YAML's ``autocast_dtype``, spelled as a string (``float16``). ``null``
+    stays None, as the serving config passed it before dtypes were parsed."""
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
+    return dtype
+
+
+def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
+    ``resources:`` overrides applied, as ``built_resources``.
+
+    Every process that reads specs resolves them here, so the conductor validates
+    requests against what the workers built. ``validate_deployment`` takes the same
+    steps, reporting every problem rather than the first.
+    """
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return built_resources(specs)
+
+
 class Model(ABC):
     def __init_subclass__(cls, **kwargs):
         # A chunkable node runs inside its chunk Loop wherever the walk graphs
@@ -561,7 +611,7 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids")
+    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -569,6 +619,14 @@ class Model(ABC):
     # the model's config.yaml overrides either. See
     # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
+    # ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt``
+    # may run for several requests at once. The data worker then prepares
+    # requests on a pool (``CpuPlan.prepare_workers`` at this process's intra-op
+    # thread count; ``preprocess_workers`` in the model's config.yaml overrides
+    # it) and still hands them to the
+    # conductor in arrival order. Declare it only once those calls are checked
+    # for shared state, and for the GIL: work that holds it gains nothing here.
+    PREPROCESS_PARALLEL: bool = False
 
     def _get_worker_graphs_for_graph_walk(
         self,
@@ -699,6 +757,20 @@ class Model(ABC):
         hands each node the subset naming it.
         """
         pass
+
+    def get_lora_specs(self) -> list["LoraSpec"]:
+        """The per-request LoRA adapters this model can serve: a spec per node they
+        reach (none for a model that serves none), the first keyed
+        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
+        and the conductor opens a request with the same adapter on each.
+
+        Built only when the deployment's YAML has a ``resources: lora:`` block (see
+        ``serving_resources``): a deployment without one builds exactly what it did
+        before. Usually by ``module_lora_spec`` from each node's weights root, whose
+        LoRA-capable modules the node then binds itself. The conductor opens each
+        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
+        """
+        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -885,7 +957,7 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features``, ``audio_seqlens`` from the
+        ``image_grid_thw``, ``audio_features`` from the
         raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
@@ -939,11 +1011,7 @@ class Model(ABC):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
-        try:
-            img = read_image(filepath, rgb=True)
-        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
-            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
-        img = img.to(device).float().div_(255.0)  # CxHxW
+        img = read_image(filepath, rgb=True).to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 

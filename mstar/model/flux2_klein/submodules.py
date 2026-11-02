@@ -1,6 +1,6 @@
 """FLUX.2 [klein] node submodules (four nodes, one optional engine resource).
 
-    text_encoder -> KleinTextEncoderSubmodule  native Qwen3 taps; batches every request (fixed 512 tokens)
+    text_encoder -> Qwen3TextEncoderSubmodule  native Qwen3 taps over all 512 padded positions (shared node)
     vae_encoder  -> KleinVaeEncoderSubmodule   reference images -> normalized packed latent tokens (edits)
     dit          -> KleinDenoiseSubmodule      DenoiseLoopSubmodule + the klein transformer + Euler step
     vae_decoder  -> KleinVaeDecoderSubmodule   packed tokens -> uint8 image; batches equal shapes
@@ -22,10 +22,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import geometric_batch_sizes
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
-    VAE_DECODE_BATCH_SIZES,
+    VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
     decode_in_chunks,
 )
@@ -41,6 +42,7 @@ from mstar.model.components.diffusion.image_io import (
     unpack_latents,
     unpatchify_latents,
 )
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
 from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
@@ -48,7 +50,6 @@ from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 logger = logging.getLogger(__name__)
 
 # Edge names shared with the model file.
-TEXT_INPUTS, TEXT_MASK, TEXT_EMBEDS = "text_inputs", "text_mask", "text_embeds"
 IMAGE_INPUTS, REF_LATENTS, IMAGE_OUTPUT = "image_inputs", "ref_latents", "image_output"
 
 
@@ -80,53 +81,6 @@ def shape_from_metadata(config: Flux2KleinConfig, step_metadata: dict) -> KleinS
         text_len=config.text_encoder.max_sequence_length,
         ref_grids=tuple(tuple(g) for g in step_metadata.get("ref_grids", ())),
     )
-
-
-# ---------------------------------------------------------------------------
-# text_encoder
-# ---------------------------------------------------------------------------
-
-class KleinTextEncoderSubmodule(BatchedRows, NodeSubmodule):
-    """Qwen3 hidden-state taps over the chat-templated, 512-token right-padded prompt.
-
-    Every request has the same token count, so the node batches unconditionally:
-    ``text_inputs`` / ``text_mask`` rows stack into ``[B, 512]`` and each request gets
-    its ``[1, 512, joint_dim]`` slice of the output. All 512 positions (pad tokens
-    included) are emitted, as the reference feeds them all to the DiT.
-    """
-
-    disable_torch_compile = True
-    output_keys = (TEXT_EMBEDS,)
-    keep_batch_dim = True
-
-    def __init__(self, encoder: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 16):
-        super().__init__()
-        self.encoder = encoder
-        self.config = config
-        self._max_batch_size = max_batch_size
-
-    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
-        return NodeInputs(
-            tensor_inputs={TEXT_INPUTS: inputs[TEXT_INPUTS][0], TEXT_MASK: inputs[TEXT_MASK][0]},
-            input_seq_len=self.config.text_encoder.max_sequence_length,
-        )
-
-    def can_batch(self, batch, model_inputs) -> bool:
-        return len(model_inputs) > 1
-
-    def max_batch_size(self, graph_walk: str):
-        return self._max_batch_size
-
-    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
-        return {
-            TEXT_INPUTS: torch.stack([inp.tensor_inputs[TEXT_INPUTS] for inp in inputs]),
-            TEXT_MASK: torch.stack([inp.tensor_inputs[TEXT_MASK] for inp in inputs]),
-        }
-
-    def run_batch(self, text_inputs: torch.Tensor, text_mask: torch.Tensor, **kwargs):
-        device = self.get_device()
-        embeds = self.encoder(text_inputs.to(device=device, dtype=torch.long), text_mask.to(device=device))
-        return {TEXT_EMBEDS: embeds.to(self.encoder.dtype)}
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +248,7 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
 
     def __init__(
         self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8, compile_decode: bool = False,
-        warmup_grids: Sequence[tuple[int, int]] = (), decode_batch_sizes: Sequence[int] = VAE_DECODE_BATCH_SIZES,
+        warmup_grids: Sequence[tuple[int, int]] = (),
     ):
         super().__init__()
         self.vae = vae
@@ -307,7 +261,9 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         self._compiled = bool(compile_decode)
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         # compiled: only these batch sizes are ever decoded (larger batches are split into them)
-        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
+        self._decode_batch_sizes = (
+            tuple(geometric_batch_sizes(min(max_batch_size, VAE_MAX_DECODE_BATCH))) if compile_decode else ()
+        )
         # latent shapes (batch, H, W) the compiled decode was warmed with; any other shape decodes eager:
         # a fresh max-autotune compile inside a request cost 40-100 s (measured on 1024x768 / 512^2 edits)
         self._warmed: set[tuple[int, int, int]] = set()

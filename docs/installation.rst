@@ -390,6 +390,9 @@ default. That backend needs the **flash-attn-4** package, which provides
 FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
 PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
 
+Install it after ``flash-attn`` (FA2): the FA2 package ships an older
+``flash_attn/cute`` that overwrites flash-attn-4's.
+
 FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
 block-sparse block size, and capture fails with ``Block sparse tensors ...
 require explicit sparse_block_size[0]``. Note this rules out the flash-attn

@@ -868,10 +868,9 @@ def test_a_peer_stop_applies_only_when_newer(runtime):
     kept = runtime._loop_stop_times(rid)["ar_loop"]
     assert kept.wg_fwd_pass_idx == 3
 
-    # An older observation is recorded but must not re-stop a loop that has
-    # since restarted.
+    # An older observation is dropped, not recorded over the newer one.
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": at(1)})
-    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 1
+    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 3
 
 
 def test_a_peer_stop_for_an_unknown_partition_is_dropped(runtime):
