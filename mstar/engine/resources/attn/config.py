@@ -6,7 +6,7 @@ without pulling FlashInfer in behind it.
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -80,11 +80,26 @@ class AttentionConfig:
 @dataclass
 class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
+    # the sequence shard over its nodes, if any (`derive`)
+    shard_key: str | None = field(default=None, init=False, repr=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
         # be the same KVConfig the KV resource holds
-        return {self.config.kv_cache}
+        keys = {self.config.kv_cache}
+        if self.shard_key is not None:
+            keys.add(self.shard_key)
+        return keys
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
+
+    @property
+    def attends_split_steps(self) -> bool:
+        # its exchange follows from its pool's storage
+        return True
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits

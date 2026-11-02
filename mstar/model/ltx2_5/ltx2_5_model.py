@@ -45,6 +45,7 @@ from mstar.engine.resources import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
+    SeqShardSpec,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -75,6 +76,8 @@ from mstar.model.ltx2_5.submodules import (
     TEXT_VIDEO,
     VIDEO_ATTN,
     VIDEO_OUTPUT,
+    VIDEO_SHARD,
+    VIDEO_SPAN,
     VIDEO_XATTN,
     LTXAudioDecoderSubmodule,
     LTXDenoiseSubmodule,
@@ -198,14 +201,14 @@ class LTX25Model(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The dit's ragged attentions, one resource per (kind, head geometry): self-
         and cross-attention over the video stream's heads, and over the audio stream's
-        (which both cross-modal attentions use). Under sequence parallelism only the video
-        self-attention exchanges tokens for heads; the rest run whole on each rank (see
-        ``LTX2Block``), so keep all their heads. Nothing here is cached; ``"sdpa"``
-        declares nothing."""
+        (which both cross-modal attentions use); and its sequence shard, which on SP ranks
+        splits each row's video tokens: the video self-attention exchanges them for heads,
+        and the cross-attentions attend a rank's share of them. Nothing here is cached;
+        ``"sdpa"`` declares nothing, so it can't run on SP ranks."""
         if self.attention_backend != "flashinfer":
             return []
         cfg = self.config.transformer
-        return [
+        attention = [
             spec_cls(
                 resource_key=key, nodes={DIT_NODE},
                 config=RaggedAttentionConfig(
@@ -213,11 +216,11 @@ class LTX25Model(Model):
                     # one span per label (or per pair) per request
                     max_segments_per_request=1,
                     dtype=torch.bfloat16,
-                    shard_over_sp=key == VIDEO_ATTN,
                     # six labels x two slots: at the 512 MB default, 6 GB the split-KV
                     # partials of these shapes never come near
                     workspace_mb=128,
                 ),
+                **({"sp_exchange": "ulysses"} if key == VIDEO_ATTN else {}),
             )
             for spec_cls, key, heads, head_dim in (
                 (RaggedAttentionSpec, VIDEO_ATTN, cfg.num_attention_heads, cfg.attention_head_dim),
@@ -227,6 +230,7 @@ class LTX25Model(Model):
                  cfg.audio_attention_head_dim),
             )
         ]
+        return [SeqShardSpec(resource_key=VIDEO_SHARD, nodes={DIT_NODE}, labels=(VIDEO_SPAN,), axis=1), *attention]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
@@ -552,20 +556,20 @@ class LTX25Model(Model):
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's linears and qk-norms shard by head (tensor parallelism), and its video
-        # tokens by rank (Ulysses sequence parallelism); what crosses node edges stays
-        # replicated, so nothing needs a shard_dim.
-        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}, sp_enabled_nodes={DIT_NODE})
+        # tokens by rank (the sequence shard); what crosses node edges stays replicated, so
+        # nothing needs a shard_dim.
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={})
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("loaded LTX-2.5 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device, tp_group=None, sp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device, tp_group=None) -> NodeSubmodule | None:
         if self.skip_weight_loading:
             return None
         from mstar.model.ltx2_5 import weight_loader
@@ -579,7 +583,7 @@ class LTX25Model(Model):
             )
         if node_name == DIT_NODE:
             return LTXDenoiseSubmodule(
-                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
+                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group),
                 self.config,
                 loop_name=DENOISE_LOOP, use_ragged_attention=self.attention_backend == "flashinfer",
                 refine_walks=frozenset(REFINE_WALKS.values()),
@@ -591,7 +595,6 @@ class LTX25Model(Model):
                 replay_walks={
                     GENERATE_AV_WALK: [GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK, STAGE1_WALK, *REFINE_WALKS.values()],
                 },
-                sp_group=sp_group,
             )
         if node_name == VAE_DECODER_NODE:
             from diffusers import AutoencoderKLLTX2Video

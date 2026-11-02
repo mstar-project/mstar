@@ -320,7 +320,7 @@ def _cosmos3(monkeypatch=None, capture=False):
     config = Cosmos3Config(compile_denoise=False)
     transformer = SimpleNamespace(
         proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
-        sp_group=SimpleNamespace(world_size=1), comm_group=SimpleNamespace(world_size=1),
+        comm_group=SimpleNamespace(world_size=1),
         _rotary=stand_in_rotary(config),
     )
     sub = Cosmos3DiTSubmodule(

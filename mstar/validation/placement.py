@@ -3,15 +3,18 @@ they divide into, the parallel groups each worker is handed, and the weights
 that pick a request's replica among them."""
 
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
-from mstar.engine.resources.context_parallel import positions_over_sp
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
 # readiness in a u64 mask. Checked for both runtimes, since AUTO may pick either.
@@ -110,11 +113,13 @@ def check_worker_graphs(
     worker_graphs: Sequence[WorkerGraph],
     sharding_config: ShardingConfig,
     specs: Sequence[NodeResourceSpec] | None,
+    moe_parallel: "Mapping[str, MoeParallelConfig] | None" = None,
 ) -> list[str]:
     """Problems with the worker graphs ``model.get_worker_graphs`` built, and
     with the parallel groups the conductor would hand each worker. With no
     ``specs`` (the model could not declare them) the checks on resource
-    placement, and on what a node's SP ranks do, are skipped."""
+    placement, and on what a node's SP ranks do, are skipped. ``moe_parallel``
+    is each node's ``ep_config``."""
     walk_to_wgs: dict[str, list[WorkerGraph]] = {}
     for wg in worker_graphs:
         for walk in sorted(wg.graph_walks):
@@ -125,7 +130,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
-        *_sequence_parallel(model, worker_graphs, specs),
+        *_sequence_parallel(worker_graphs, specs, moe_parallel or {}),
     ]
 
 
@@ -517,13 +522,13 @@ def _worker_parallelism(
 
 
 def _sequence_parallel(
-    model: Model, worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec] | None,
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec] | None,
+    moe_parallel: "Mapping[str, MoeParallelConfig]",
 ) -> Iterator[str]:
-    """What a node group's SP ranks do (`positions_over_sp`, which the engine manager checks
-    again at load), and whether each KV pool placed over a group's ranks can stripe over them.
-    Without ``specs`` (the model's resources failed to resolve, which is reported apart) there is
-    nothing to check this against."""
-    enabled = model.get_default_sharding_config().sp_enabled_nodes
+    """What a node group's SP ranks can't run (`sequence_parallel_refusals`, which the engine
+    checks again at load), and whether each KV pool placed over a group's ranks can stripe over
+    them. Without ``specs`` (the model's resources failed to resolve, which is reported apart)
+    there is nothing to check this against."""
     if specs is None:
         return
     groups: dict[int, tuple[int, int, set[str]]] = {}
@@ -537,10 +542,6 @@ def _sequence_parallel(
                     spec.config.context_parallel_size(spec.resource_key, tp, sp)
                 except ValueError as e:
                     yield f"node_groups[{i}]: {e}"
-        if sp == 1:
-            continue
         for node in sorted(nodes):
-            try:
-                positions_over_sp(specs, node, sp, enabled)
-            except ValueError as e:
-                yield f"node_groups[{i}]: {e}"
+            for refusal in sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node)):
+                yield f"node_groups[{i}]: {refusal}"

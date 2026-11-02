@@ -9,17 +9,13 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 class AttentionCallable:
     """A convenience wrapper around kv and attn that wraps the KV write and
     attention call in one pure-tensor function, with helper methods for
-    setting layer and label information.
+    setting layer and label information. ``q=None`` writes the K/V alone.
 
-    Must be used for  ``ulysses_attention``, which expects such a pure tensor
-    callable. Recommended to use instance per transformer, *not* one per layer,
-    as Dynamo specializes ``ulysses_attention`` on the identity of its
-    `run_attention` argument, so a per-layer callable retraces that frame once
-    per layer and blows the recompile limit.
-
-    That sharing is why the label is one cursor for the whole stack. No model
-    varies its label per layer today; one that needs to should thread the label
-    explicitly rather than use this.
+    On a node whose steps split over its SP ranks, the call goes through the
+    attention resource's exchange (`AttentionManager.exchange`), which hands the
+    write and the attention the tokens and heads its pool's storage needs. One
+    instance can drive a whole stack, so the label is one cursor for it; a
+    model that varies its label per layer threads it explicitly instead.
 
     A cacheless (ragged) attention needs no callable: call the resource's
     ``run(q, k, v, label=...)`` with the span's label bound.
@@ -56,10 +52,18 @@ class AttentionCallable:
 
     @torch.compiler.disable
     def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    ) -> torch.Tensor:
+        self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor | None:
+        # getattr: a stand-in attention (Cosmos3's warmup's, the tests' fakes) declares only what it serves
+        if getattr(self.attn, "uses_exchange", False):
+            return self.attn.exchange(self._attend, q, k, v)
+        return self._attend(q, k, v)
+
+    def _attend(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
         if self.attn.requires_kv_write:
             self.kv.write_kv(k, v)
+        if q is None:
+            return None
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
 

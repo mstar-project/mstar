@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 class FlashInferManager(AttentionManager):
     supports_context_parallel = True
+    supports_split_steps = True
 
     def __init__(
         self,
@@ -311,6 +312,7 @@ class FlashInferManager(AttentionManager):
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
+        self._check_sequence_shard(plan_outputs, ctx)
         if self._group_idx:
             plan_outputs = plan_outputs.groups[self._group_idx]
 
@@ -404,6 +406,8 @@ class FlashInferManager(AttentionManager):
     def _attend(
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
+        if self._shard is not None:
+            self._shard.check_bypass(label, "attention run")
         if self._layers is not None:
             # an explicit layer over the cursor, checked as the cursor is
             if layer_idx is not None:

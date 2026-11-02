@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.sequence_shard import SequenceShard, check_covered, check_shard_plan, head_slice, ulysses
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -53,6 +54,13 @@ class AttentionManager(AttentionResource):
     # a backend's refusal of a placed plan its planner may refuse on one rank alone
     # (`ContextParallelWrapper`'s ``check``)
     _plan_check = None
+    # the sequence shard over its node (`AttentionSpec.derive`), set by `build`; and the shard
+    # itself where it can split (`bind_dependencies`)
+    _shard_key: str | None = None
+    _shard: SequenceShard | None = None
+    # whether `AttentionCallable` reaches `run` through `exchange`: fixed at bind, so a node that
+    # never splits keeps its call path
+    uses_exchange = False
 
     # Remains abstract except for build; will build based
     # on the attention backend
@@ -60,13 +68,60 @@ class AttentionManager(AttentionResource):
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
 
     def depends_on(self):
-        return {self._kv_cache_name}
+        keys = {self._kv_cache_name}
+        if self._shard_key is not None:
+            keys.add(self._shard_key)
+        return keys
 
     def bind_dependencies(self, resources) -> None:
-        placement = resources[self._kv_cache_name].placement
+        kv = resources[self._kv_cache_name]
+        placement = kv.placement
         if placement is not None:
             self._placement = placement
             self._bind_placement(placement)
+        if self._shard_key is None or not resources[self._shard_key].can_split:
+            return
+        # heads over every TP and SP rank (a pool stored by position is refused on a splitting node
+        # at load): a split step's tokens trade for heads, a copied step's heads are sliced
+        shard = self._shard = resources[self._shard_key]
+        self.uses_exchange = True
+        kv.bind_sequence_shard(shard)
+        self.sp_strategy = (
+            f"over KV {self._kv_cache_name!r} stored by head: split labels ulysses, copied labels head slice"
+        )
+
+    @torch.compiler.disable
+    def exchange(self, run, q, k, v, label: str | None = None):
+        """``run(q, k, v)`` (a K/V write and the attention, ``q=None`` the write alone) for this
+        step's ``label`` through the exchange its pool takes: of a split label's tokens, or of a
+        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`)."""
+        label = self._default_label if label is None else label
+        shard = self._shard
+        r = shard.split_range(label)
+        # the paged run and K/V writes refuse a split label reached without it (`check_bypass`)
+        shard.exchanging = True
+        try:
+            if r is not None:
+                shard.check_scattered(label)
+                return ulysses(run, q, k, v, r)
+            return head_slice(run, q, k, v, shard.group)
+        finally:
+            shard.exchanging = False
+
+    def _check_sequence_shard(self, plan_outputs, ctx) -> None:
+        """At plan: the step declares the node's sequence shard, and on a split step every plan
+        label holding split tokens has its range."""
+        if self._shard_key is None:
+            return
+        owner = f"attention over KV {self._kv_cache_name!r}"
+        plan = check_shard_plan(owner, self._shard_key, ctx)
+        if self._shard is None or not plan.split:
+            return
+        for label, kv_out in plan_outputs.items():
+            if label not in plan.ranges:
+                rows = kv_out.rows
+                sources = {row[1] for row in rows} if rows is not None else {view.label for view in kv_out.views}
+                check_covered(owner, label, sources, self._shard, plan)
 
     def _bind_placement(self, placement: "ContextParallel") -> None:
         """This rank's share of a context-parallel pool. Reached only for a backend that supports
@@ -159,6 +214,12 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        manager = cls._build_backend(spec, info)
+        manager._shard_key = spec.shard_key
+        return manager
+
+    @classmethod
+    def _build_backend(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
         if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
             raise ValueError(

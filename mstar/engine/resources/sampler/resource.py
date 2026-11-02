@@ -31,6 +31,8 @@ from mstar.utils.profiler import PhaseLaps
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+    # samples the global step, after the layer stack gathered it
+    supports_split_steps = True
 
     def can_capture(self) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None

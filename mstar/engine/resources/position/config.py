@@ -4,7 +4,8 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -68,9 +69,19 @@ class PositionConfig:
 @dataclass
 class PositionSpec(NodeResourceSpec):
     config: PositionConfig
+    # the sequence shard over its nodes, if any (`derive`): a split label's positions are its range's
+    shard_key: str | None = field(default=None, init=False, repr=False)
 
     def depends_on(self) -> set[str]:
-        return {self.config.kv_cache}
+        keys = {self.config.kv_cache}
+        if self.shard_key is not None:
+            keys.add(self.shard_key)
+        return keys
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
 
     @property
     def resource_class(self) -> "type[Resource]":

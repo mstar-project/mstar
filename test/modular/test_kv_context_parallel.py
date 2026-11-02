@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from flashinfer_reference import reference_attention, reference_flashinfer
 from packaging.version import Version
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT
 from test_kv_prefix_lease import _StubTransfer
@@ -31,7 +32,7 @@ from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.context_parallel import ContextParallel, ZigzagWrapper, merge, zigzag_rows, zigzag_share
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
@@ -39,7 +40,12 @@ from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVSt
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
-from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides
+from mstar.engine.resources.position.config import PositionConfig, PositionStep
+from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec, SeqShardStep, SequenceShard
+from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import (
     AdmitRuntimeError,
     AllocationFailed,
@@ -278,6 +284,20 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
         )
 
 
+def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp_path, monkeypatch):
+    """Qwen3.5's recurrent state holds no split strategy: a node splitting its steps over SP ranks
+    can't own one."""
+    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
+    groups.add_sp(NODE, _group(0, P))
+    specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
+    apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
+    specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
+    with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
+        Engine(graph_runtime=None).load_model(
+            {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
+        )
+
+
 # --- attention over a placed pool -------------------------------------------------------------
 
 HEAD_DIM, Q_HEADS, CP_PAGE = 64, 4, 4
@@ -289,102 +309,6 @@ LATENT = CKV + KPE
 PREFILL_ROWS = ((0, 5), (1, 3), (5, 2), (6, 1))
 # decode, after the write: lengths 1 (rank 1 holds nothing), 5 (a last page rank 1 lacks), 7
 DECODE_ROWS = ((0, 1), (4, 1), (6, 1))
-
-
-def _reference(q, k, v, causal=True):
-    """Attention of ``q`` ``[T, Hq, D]`` over ``k``/``v`` ``[L, Hkv, D]``, the queries the last ``T``
-    positions when causal; fp32 ``(out, lse)``, lse natural-log ``[T, Hq]``."""
-    group = q.shape[1] // k.shape[1]
-    k, v = (t.float().repeat_interleave(group, dim=1) for t in (k, v))
-    scores = torch.einsum("thd,lhd->htl", q.float(), k) * q.shape[-1] ** -0.5
-    if causal:
-        t, length = q.shape[0], k.shape[0]
-        seen = torch.arange(length)[None, :] <= torch.arange(t)[:, None] + (length - t)
-        scores = scores.masked_fill(~seen.to(scores.device), -math.inf)
-    return torch.einsum("htl,lhd->thd", torch.softmax(scores, dim=-1), v), torch.logsumexp(scores, -1).T
-
-
-def _reference_flashinfer() -> types.ModuleType:
-    """FlashInfer's paged prefill/decode and ragged wrappers as dense torch math on CPU, with
-    their lse bases. A paged plan refuses a row FlashInfer's split-KV planner would miscount: no
-    pages, or a last page holding no slot (see ``ContextParallel.local_indptrs``). The ragged one
-    reads keys past its plan as FA3 does."""
-    fi = types.ModuleType("flashinfer")
-
-    class Paged:
-        base = "log2"
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def plan(self, qo_indptr=None, paged_kv_indptr=None, paged_kv_indices=None,
-                 paged_kv_last_page_len=None, *, page_size, seq_lens, causal=False, indptr=None,
-                 indices=None, last_page_len=None, **kwargs):
-            kvp = (paged_kv_indptr if indptr is None else indptr).tolist()
-            self.indices = (paged_kv_indices if indices is None else indices).tolist()
-            last = (paged_kv_last_page_len if last_page_len is None else last_page_len).tolist()
-            self.rows = [(kvp[b], kvp[b + 1], int(seq_lens[b])) for b in range(len(last))]
-            for (start, end, length), tail in zip(self.rows, last, strict=True):
-                assert end > start and 1 <= tail <= page_size and length == (end - start - 1) * page_size + tail
-            self.qo = qo_indptr.tolist() if qo_indptr is not None else list(range(len(last) + 1))
-            self.causal = causal
-
-        def run(self, q, kv, return_lse=False, lse_base=None):
-            outs, lses = [], []
-            # a layer [pages, 2, slots, H, D], or its K and V apart
-            caches = kv if isinstance(kv, tuple) else kv.unbind(1)
-            for b, (start, end, length) in enumerate(self.rows):
-                k, v = (cache[self.indices[start:end]].flatten(0, 1)[:length] for cache in caches)
-                out, lse = _reference(q[self.qo[b]:self.qo[b + 1]], k, v, self.causal)
-                outs.append(out)
-                lses.append(lse)
-            out, lse = torch.cat(outs).to(q.dtype), torch.cat(lses)
-            if (lse_base or self.base) == "log2":
-                lse = lse / math.log(2)
-            return (out, lse) if return_lse else out
-
-    class Decode(Paged):
-        def __init__(self, *args, use_tensor_cores=False, **kwargs):
-            self.use_tensor_cores = use_tensor_cores
-
-        def plan(self, **kwargs):
-            super().plan(**kwargs)
-            self.causal = False
-
-    class Ragged:
-        def __init__(self, *args, qo_indptr_buf=None, kv_indptr_buf=None, **kwargs):
-            self.bufs = (qo_indptr_buf, kv_indptr_buf)
-
-        def plan(self, qo_indptr, kv_indptr, *args, causal=False, **kwargs):
-            self.qo, self.causal = qo_indptr.tolist(), causal
-            # graph mode: the layouts into the caller's buffers
-            for buf, indptr in zip(self.bufs, (qo_indptr, kv_indptr), strict=True):
-                if buf is not None:
-                    buf.copy_(indptr)
-
-        def run(self, q, k, v, out=None, lse=None, return_lse=False, lse_base="log2"):
-            parts = [_reference(q[a:b], k[a:b], v[a:b], self.causal) for a, b in itertools.pairwise(self.qo)]
-            # FA3 reads the keys past the last row to its 128-key tile and masks them additively:
-            # nothing from a finite key, NaN in the last rows from a NaN one
-            end = self.qo[-1]
-            over = slice(end, min(k.shape[0], -(-end // 128) * 128))
-            poison = (k[over].float().sum() + v[over].float().sum()) * 0
-            parts[-1] = (parts[-1][0] + poison, parts[-1][1] + poison)
-            o, got = torch.cat([p[0] for p in parts]).to(q.dtype), torch.cat([p[1] for p in parts])
-            got = got if lse_base == "ln" else got / math.log(2)
-            # the planned rows alone, into the caller's buffers or q-sized ones of its own (FlashInfer's
-            # torch.empty; NaN here)
-            if out is None:
-                out = torch.full((q.shape[0], *o.shape[1:]), math.nan, dtype=o.dtype, device=q.device)
-            if lse is None:
-                lse = torch.full((q.shape[0], *got.shape[1:]), math.nan, dtype=got.dtype, device=q.device)
-            out[:len(o)], lse[:len(got)] = o, got
-            return (out, lse) if return_lse else out
-
-    fi.BatchPrefillWithPagedKVCacheWrapper = Paged
-    fi.BatchDecodeWithPagedKVCacheWrapper = Decode
-    fi.BatchPrefillWithRaggedKVCacheWrapper = Ragged
-    return fi
 
 
 @dataclass
@@ -467,7 +391,7 @@ class _Case:
         qo = 0
         for kv, (_, new) in zip(self.keys, self.rows, strict=True):
             k, v = (kv[:, None], kv[:, None]) if self.mla else (kv[:, 0], kv[:, 1])
-            out = _reference(self.q[qo:qo + new], k, v, causal)[0]
+            out = reference_attention(self.q[qo:qo + new], k, v, causal)[0]
             outs.append(out[..., :CKV] if self.mla else out)
             qo += new
         return torch.cat(outs)
@@ -521,7 +445,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
     if cuda:
         torch.cuda.set_device(device)
     else:
-        sys.modules["flashinfer"] = _reference_flashinfer()
+        sys.modules["flashinfer"] = reference_flashinfer()
     calls = []
     for name in ("all_to_all_single", "all_gather_into_tensor"):
         def record(*args, _name=name, _call=getattr(dist, name), **kwargs):
@@ -548,12 +472,12 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
         # a q of another length than its plan; a replay runs none)
         full = _Case.build((*rows[:-1], (rows[-1][0], rows[-1][1] + pad)), device, dtype, mla) if pad else case
         _plan(attn, full, bucket=bucket, causal=causal)
+        tol = {"atol": 2e-2, "rtol": 2e-2} if cuda else {}
         # a one-token-a-row step attends the pages alone, so a fused KV-write kernel can serve it
         assert attn.reads_step_kv() == (rows == PREFILL_ROWS)
         if rows == PREFILL_ROWS:
             with pytest.raises(ValueError, match="got none"):
                 full.runner(attn, placement, heads, keys=False)()
-        tol = {"atol": 2e-2, "rtol": 2e-2} if cuda else {}
         inputs = full.inputs(placement, heads)
         run = full.runner(attn, placement, inputs=inputs)
         out = run()
@@ -628,7 +552,7 @@ class _OneSlotPrefill:
     def run(self, q, kv, return_lse):
         k, v = (pages.flatten(0, 1) for pages in kv)
         parts = [
-            _reference(q[a:b], k[self.indices[c:d]], v[self.indices[c:d]], self.causal)
+            reference_attention(q[a:b], k[self.indices[c:d]], v[self.indices[c:d]], self.causal)
             for (a, b), (c, d) in zip(itertools.pairwise(self.qo), itertools.pairwise(self.kv), strict=True)
         ]
         return torch.cat([out for out, _ in parts]), torch.cat([lse for _, lse in parts])
@@ -667,7 +591,9 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
         assert [(w._gather.data_ptr(), w._scatter.data_ptr()) for w in wrappers] == addresses
         got = merge(torch.stack([out for out, _ in shares]), torch.stack([lse for _, lse in shares]))
         assert torch.isfinite(got).all() and not got[int(qo[-1]):].any()
-        want = torch.cat([_reference(q[a:b], k[a:b], v[a:b], causal)[0] for a, b in itertools.pairwise(qo.tolist())])
+        want = torch.cat([
+            reference_attention(q[a:b], k[a:b], v[a:b], causal)[0] for a, b in itertools.pairwise(qo.tolist())
+        ])
         torch.testing.assert_close(got[: int(qo[-1])], want)
 
 
@@ -730,6 +656,254 @@ def test_two_ranks_attend_a_placed_pool_like_one_rank_with_the_same_collectives(
     mp.spawn(_over_ranks, args=(P, "gloo", str(tmp_path / "store"), over_sp, rows, mla, False, causal), nprocs=P)
 
 
+def test_a_split_label_reached_outside_an_exchange_is_refused():
+    """A layer that writes its K/V itself (``write_target``) or calls ``run`` directly would treat
+    this rank's range as the whole step; it raises on every rank at the first split step."""
+    shard = SequenceShard(("main",), 0, None, 0, _group(0, P))
+    kv = _manager(0, PagedKVConfig(
+        num_layers=2, num_kv_heads=2, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4, page_size=8,
+    ))
+    kv.bind_sequence_shard(shard)
+    ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
+    shard.plan(SeqShardStep(segments=(Segment("r0", "main", 6),)), ctx)
+    k = torch.zeros(3, 1, 2)
+    for write in (lambda: kv.write_kv(k, k, label="main"), lambda: kv.write_slots("main"),
+                  lambda: kv.write_target(label="main")):
+        with pytest.raises(ValueError, match="outside an exchange"):
+            write()
+    # through an exchange the guard lets it by (to the plan this test never made)
+    shard.exchanging = True
+    with pytest.raises(KeyError):
+        kv.write_slots("main")
+
+
+def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monkeypatch):
+    """A layer that ropes through the position resource holds its range of a split label, and so
+    do the positions it rotates at; an explicit ``pos_ids`` of another length is refused."""
+    shard = SequenceShard(("main",), 0, None, 0, _group(1, P))
+    pos = RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU, max_seq_len=64, head_dim=8)
+    pos._shard_key = "shard"
+    pos.bind_dependencies({"shard": shard})
+    rows = [(f"r{i}", "main", new) for i, (_, new) in enumerate(PREFILL_ROWS)]
+    ctx = StepContext(request_ids=tuple(rid for rid, _, _ in rows), graph_walk="w", slot=0, capture=False)
+    ctx.plan_results["kv"] = KVPlanOutputs({"main": KVPlanOutput(None, rows=rows)})
+    segments = tuple(Segment(*row) for row in rows)
+    ctx.plan_results["shard"] = shard.plan(SeqShardStep(segments=segments), ctx)
+    pos.plan(PositionStep(segments=segments), ctx)
+    rotated = []
+    monkeypatch.setattr(torch.ops.mstar, "rope_apply_qk_inplace", lambda q, k, ids, *a, **kw: rotated.append(ids))
+    # rank 1 of 2 holds the step's last 5 of 11 tokens
+    q = torch.zeros(5, 2, 8, dtype=torch.bfloat16)
+    pos.apply_qk(q, q.clone(), label="main")
+    assert rotated[0].tolist() == [1, 2, 0, 1, 0]
+    assert pos.pos_ids("main").shape[0] == 11
+    with pytest.raises(ValueError, match="this rank's range's positions"):
+        pos.apply_qk(q, q.clone(), label="main", pos_ids=torch.arange(11))
+
+
+# --- Cosmos3's DiT, its steps split over its SP ranks ------------------------------------------
+
+
+def _cosmos3(reasoner: bool = False):
+    """A toy Cosmos3 (Edge's backbone family, paged attention alone), and its DiT submodule over a
+    seeded tower."""
+    from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.tests.test_edge import _init_all, _tiny_edge_config
+
+    cfg = _tiny_edge_config(enable_reasoner=reasoner, attention_backend="flashinfer", compile_denoise=False)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    model.config = cfg
+    tower = Cosmos3OmniTransformer(cfg).eval()
+    _init_all(tower)
+    sub = Cosmos3DiTSubmodule(tower, cfg, scheduler=None)
+    sub.get_device = lambda: CPU
+    return model, sub
+
+
+def _cosmos3_resources(model, joint: JointGroups) -> dict:
+    """The model's own declaration, built and bound as the engine does, small."""
+    from mstar.model.cosmos3.submodules import KV_CACHE as C3_KV
+
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, {"resources": {C3_KV: {"max_num_pages": 16, "page_size": 16, "max_seq_len": 256}}})
+    by_key = resolve_spec_dependencies(specs)
+    res = {
+        key: build_resource(spec, EngineResourceInfo(
+            device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, nodes=frozenset(spec.nodes),
+            dependencies={dep: by_key[dep] for dep in spec.depends_on()},
+        ))
+        for key, spec in by_key.items()
+    }
+    for key, spec in by_key.items():
+        res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
+    return res
+
+
+def _run_step(runner, step, walk, rids=("r0",)):
+    step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False))
+    assert runner.admit(step).ok
+    runner.plan(step)
+
+
+def _gen_input(static):
+    """A two-branch eager denoise step's inputs, as ``prepare_inputs`` makes them."""
+    from mstar.model.cosmos3.submodules import GenStepInfo
+    from mstar.model.submodule_base import ARNodeInputs
+
+    return ARNodeInputs(
+        input_seq_len=static["num_vision_tokens"],
+        resource_step_info=GenStepInfo(cfg=True, cfg_active=True, capture_key=None),
+    )
+
+
+def _cosmos3_steps(sub, resources, statics, latents, timesteps) -> tuple[list[torch.Tensor], StepRunner]:
+    """One request through the DiT: its two-branch text prefill (copied: the prefill walk splits
+    nothing), then a denoise step three ways: both branches as one combined label (the compiled
+    step's pack, and the cross-request step's eager bracket), and each branch on its own label (the
+    sequential path). Returns every velocity, and the runner, the request still on it."""
+    from mstar.model.cosmos3 import constants as C
+    from mstar.model.cosmos3.submodules import ATTN, CFG_BATCHED_LABEL, COND_LABEL, UNCOND_LABEL
+
+    tower = sub.transformer
+    sub.bind_node_resources(resources)
+    runner = StepRunner(resources)
+    runner.ingest_request("r0", {"kv": KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL])})
+    cond, uncond = statics
+    prefill = sub._get_prefill_node_inputs(cond, uncond)
+    step = sub.declare_step(C.PREFILL_WALK, ["r0"], [prefill])
+    _run_step(runner, step, C.PREFILL_WALK)
+    labels = (COND_LABEL, UNCOND_LABEL)
+    tower.prefill_und(
+        torch.cat([prefill.tensor_inputs[f"input_ids_{label}"] for label in labels]),
+        torch.cat([prefill.tensor_inputs[f"text_mrope_ids_{label}"] for label in labels], dim=1),
+        CFG_BATCHED_LABEL,
+    )
+    runner.commit(step)
+
+    gen = _gen_input(cond)
+    layout = (cond["vision_token_shapes"], cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"])
+    attn = resources[ATTN]
+    out = []
+    for batched_cfg in (True, False):
+        sub.batched_cfg = batched_cfg
+        for run in range(2 if batched_cfg else 1):
+            step = sub.declare_step(C.IMAGE_GEN_WALK, ["r0"], [gen])
+            _run_step(runner, step, C.IMAGE_GEN_WALK)
+            if not batched_cfg:
+                out += [tower.denoise_step(latents, timesteps, s["rotary"], *layout, label, attn)
+                        for s, label in zip(statics, labels, strict=True)]
+            elif run == 0:
+                out += tower.denoise_step_batched_cfg(
+                    latents, timesteps, cond["rotary"], uncond["rotary"], *layout, CFG_BATCHED_LABEL, attn,
+                )
+            else:
+                row = tower.denoise_step_row(cond, latents, timesteps, cond["rotary"], uncond["rotary"])
+                out += tower.denoise_step_batched([row], CFG_BATCHED_LABEL, attn)[0]
+            runner.commit(step)
+    return out, runner
+
+
+def _cosmos3_over_ranks(rank, world, store):
+    """Two SP ranks against one rank over a stand-in attention (SDPA over stored K/V): the copied
+    prefill writes each rank's heads (a head slice, the Edge K re-written through the callable),
+    the denoise steps split their tokens and attend by Ulysses. After them, outside a step, the
+    bracket is the identity, as the startup warmup compile (after the captures) runs it. Then a
+    compiled denoise step splits and copies at two sizes without recompiling a size it saw."""
+    from torch._dynamo.utils import counters
+
+    from mstar.model.cosmos3 import constants as C
+    from mstar.model.cosmos3.submodules import ATTN, CFG_BATCHED_LABEL, SEQ_SHARD, _WarmupAttention
+    from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    torch.set_num_threads(1)
+    sys.modules["flashinfer"] = reference_flashinfer()
+    manager_mod.KVTransferManager = _StubTransfer
+    group = CommGroup(rank, rank, list(range(world)))
+    group.device_group, group.initialized = dist.group.WORLD, True
+    try:
+        model, sub = _cosmos3()
+        tower = sub.transformer
+
+        def inputs(height, width):
+            statics = [sub._build_static(list(range(n)), height, width, 1, 24.0, False, CPU) for n in (5, 3)]
+            g = torch.Generator().manual_seed(height * width)
+            latents = torch.randn(sub._latent_shape(height, width, 1), generator=g)
+            return statics, latents, torch.full((statics[0]["num_noisy_vision_tokens"],), 500.0)
+
+        statics, latents, timesteps = inputs(32, 64)
+        with torch.no_grad():
+            want, _ = _cosmos3_steps(sub, _SdpaResources().as_dict(), statics, latents, timesteps)
+            res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=group))
+            got, runner = _cosmos3_steps(sub, res, statics, latents, timesteps)
+            row = tower.denoise_step_row(statics[0], latents, timesteps, statics[0]["rotary"], statics[0]["rotary"])
+            warm = tower.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
+            assert [v.shape for branches in warm for v in branches] == [latents.shape] * 4
+        assert len(got) == len(want) == 6
+        for g, w in zip(got, want, strict=True):
+            torch.testing.assert_close(g, w, rtol=1e-4, atol=1e-4)
+
+        torch._dynamo.reset()
+        counters.clear()
+        cfg_step = torch.compile(tower.denoise_step_batched_cfg, backend="eager", dynamic=False)
+        graphs = []
+        sub.batched_cfg = True
+        with torch.no_grad():
+            for (height, width), min_tokens in [((32, 64), 0), ((64, 64), 0), ((32, 64), 1 << 20)]:
+                (cond, uncond), latents, timesteps = inputs(height, width)
+                res[SEQ_SHARD].min_tokens = min_tokens
+                for _ in range(2):
+                    step = sub.declare_step(C.IMAGE_GEN_WALK, ["r0"], [_gen_input(cond)])
+                    _run_step(runner, step, C.IMAGE_GEN_WALK)
+                    assert (res[SEQ_SHARD].split_range(CFG_BATCHED_LABEL) is None) == bool(min_tokens)
+                    cfg_step(
+                        latents, timesteps, cond["rotary"], uncond["rotary"], cond["vision_token_shapes"],
+                        cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"], CFG_BATCHED_LABEL, res[ATTN],
+                    )
+                    runner.commit(step)
+                    graphs.append(counters["stats"]["unique_graphs"])
+        # a second step of a size and split it compiled for compiles nothing
+        assert graphs[0] > 0 and graphs[0::2] == graphs[1::2], graphs
+    finally:
+        group.device_group = None
+        dist.destroy_process_group()
+
+
+def test_two_sp_ranks_run_cosmos3s_dit_like_one_rank(tmp_path):
+    mp.spawn(_cosmos3_over_ranks, args=(P, str(tmp_path / "store")), nprocs=P)
+
+
+def test_cosmos3s_reasoner_shares_the_dits_sequence_shard_and_declares_it(monkeypatch):
+    """Edge's reasoner attends the DiT's pool through the same attention, so the sequence shard
+    spans both nodes (one over the DiT alone is refused), and the reasoner's steps declare it: one
+    runs through the runner on one rank, where the attention refuses a step without it."""
+    from dataclasses import replace as replaced
+
+    from mstar.model.cosmos3 import constants as C
+    from mstar.model.cosmos3.cosmos3_model import DIT_NODE, REASONER_NODE
+    from mstar.model.cosmos3.submodules import REASONER_LABEL, SAMPLER, SEQ_SHARD, Cosmos3ReasonerSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
+    model, sub = _cosmos3(reasoner=True)
+    specs = model.get_node_resources()
+    shard, = (spec for spec in specs if spec.resource_key == SEQ_SHARD)
+    assert shard.nodes == {DIT_NODE, REASONER_NODE}
+    with pytest.raises(ValueError, match=r"spans nodes \['reasoner'\] without the sequence shard"):
+        resolve_spec_dependencies([replaced(spec, nodes={DIT_NODE}) if spec is shard else spec for spec in specs])
+
+    res = _cosmos3_resources(model, JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial()))
+    runner = StepRunner(res)
+    runner.ingest_request("t", {"kv": KVReqConfig(needed_labels=[REASONER_LABEL]), SAMPLER: SamplingReqConfig()})
+    reasoner = Cosmos3ReasonerSubmodule(sub.transformer, model.config)
+    step = reasoner.declare_step(C.REASONER_PREFILL_WALK, ["t"], [ARNodeInputs(input_ids=torch.arange(6),
+                                                                                input_seq_len=6)])
+    _run_step(runner, step, C.REASONER_PREFILL_WALK, rids=("t",))
+    assert not runner.resources[SEQ_SHARD].can_split
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @LAYOUTS
 @pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
@@ -746,7 +920,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     the rest in ``plan`` keeps the padding finite (``_over_ranks`` captures this on GPU). The
     padding's keys are whatever the model's layers left in those rows, NaN included, and the kernel
     reads past the plan (FA3), so only zeroing them keeps the real rows right."""
-    monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
+    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
     own = FlashInferRaggedPrefillWrapper(
         torch.empty(8, dtype=torch.uint8), Q_HEADS, 1, HEAD_DIM, max_num_segments=2, max_total_tokens=16,
         device=CPU, accelerator_graph=True, q_data_type=torch.float32, owns_padding=True,
@@ -761,7 +935,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     context = (torch.zeros_like(out), torch.full_like(lse, -math.inf))
     merged = merge(torch.stack([context[0], out]), torch.stack([context[1], lse]))
     assert torch.isfinite(merged).all() and not merged[5:].any()
-    want = torch.cat([_reference(q[a:b], k[a:b], v[a:b])[0] for a, b in ((0, 3), (3, 5))])
+    want = torch.cat([reference_attention(q[a:b], k[a:b], v[a:b])[0] for a, b in ((0, 3), (3, 5))])
     torch.testing.assert_close(merged[:5], want)
 
 
@@ -770,7 +944,7 @@ def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeyp
     staging went on the plan stream, which the step planned instead never waits on, so that step
     plans its own tokens again."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
-    fi = _reference_flashinfer()
+    fi = reference_flashinfer()
     plans = []
     ragged_plan = fi.BatchPrefillWithRaggedKVCacheWrapper.plan
 
@@ -812,7 +986,7 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
     """A rank attends every partner's query heads over one KV head, a GQA group FlashInfer's
     CUDA-core decode has no kernel for unless it is one of a few sizes."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
-    monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
+    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, _ = _cp_attention(joint, CPU, torch.float32, decode_tensor_cores=False)
     _plan(attn, _Case.build(DECODE_ROWS, CPU, torch.float32))

@@ -1,6 +1,9 @@
-"""Ulysses sequence parallelism for LTX-2.5's DiT, on two CPU processes over gloo: a
-toy-size DiT sharded across two ranks against the same DiT on one. The exchange itself
-is tested in ``test_sequence_parallel.py``.
+"""Sequence parallelism for LTX-2.5's DiT, on two CPU processes over gloo: the denoise step over
+the model's own resources (its sequence shard and ragged attentions, FlashInfer's kernels as CPU
+math), split over two ranks, against the same step on one rank attending through SDPA. Every
+attention the shard reaches runs: the video self-attention's Ulysses exchange, the
+cross-attentions cut to a rank's video tokens, and the audio queries over the video merged across
+the ranks. The exchanges themselves are tested in ``test_sequence_parallel.py``.
 """
 
 from __future__ import annotations
@@ -12,15 +15,22 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from flashinfer_reference import reference_flashinfer
 
 sys.path.insert(0, ".")
 
-from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.model.components.diffusion.attention import sdpa_attention  # noqa: E402
-from mstar.model.ltx2_5.components.transformer import LTX2Attends, LTX2DiT, build_rope  # noqa: E402
-from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
+from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split  # noqa: E402
+from mstar.engine.resources import RaggedAttentionConfig, StepContext, StepRunner  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
+from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
+from mstar.model.ltx2_5.components.transformer import LTX2DiT  # noqa: E402
+from mstar.model.ltx2_5.config import DENOISE_LOOP, LTX25Config  # noqa: E402
+from mstar.model.ltx2_5.ltx2_5_model import LTX25Model  # noqa: E402
+from mstar.model.ltx2_5.submodules import VIDEO_SHARD, LTXDenoiseSubmodule, LTXShape  # noqa: E402
+from mstar.model.submodule_base import NodeInputs  # noqa: E402
 
 WORLD = 2
+CPU = torch.device("cpu")
 
 
 def _group(rank: int) -> CommGroup:
@@ -43,40 +53,68 @@ def _entry(rank, fn, store_path, args):
         dist.destroy_process_group()
 
 
-def _toy_config():
+def _toy_config() -> LTX25Config:
+    # head dims FlashInfer has kernels for, so the CPU kernel attends them unpadded
     cfg = LTX25Config()
-    return dataclasses.replace(
-        cfg.transformer, num_layers=2, num_attention_heads=4, attention_head_dim=16,
-        audio_num_attention_heads=4, audio_attention_head_dim=8, cross_attention_dim=64,
-        audio_cross_attention_dim=32, in_channels=8, out_channels=8, audio_in_channels=8, audio_out_channels=8,
+    toy = dataclasses.replace(
+        cfg.transformer, num_layers=2, num_attention_heads=4, attention_head_dim=64,
+        audio_num_attention_heads=4, audio_attention_head_dim=64, cross_attention_dim=256,
+        audio_cross_attention_dim=256, in_channels=8, out_channels=8, audio_in_channels=8, audio_out_channels=8,
     )
+    return dataclasses.replace(cfg, transformer=toy)
+
+
+def _resources(cfg: LTX25Config, joint: JointGroups) -> dict:
+    """The dit's resources from the model's own declaration, built and bound as the engine does."""
+    model = LTX25Model(model_path_hf="test/ltx2_5", skip_weight_loading=True)
+    model.set_config(cfg)
+    specs = resolve_spec_dependencies(model.get_node_resources())
+    for spec in specs.values():
+        if isinstance(getattr(spec, "config", None), RaggedAttentionConfig):
+            spec.config.dtype, spec.config.workspace_mb = torch.float32, 1
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32)
+    res = {key: build_resource(spec, info) for key, spec in specs.items()}
+    for key, spec in specs.items():
+        res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
+    return res
 
 
 @torch.inference_mode()
-def _dit(rank, frames, height, width):
+def _denoise(rank, frames, height, width):
+    sys.modules["flashinfer"] = reference_flashinfer()
     cfg = _toy_config()
     torch.manual_seed(0)
-    single = LTX2DiT(cfg)
-    for p in single.parameters():
+    dit = LTX2DiT(cfg.transformer)
+    for p in dit.parameters():
         torch.nn.init.normal_(p, std=0.05)
-    sharded = LTX2DiT(cfg, sp_group=_group(rank))
-    sharded.load_state_dict(single.state_dict())
+    shape = LTXShape(frames=frames, height=height, width=width, audio_frames=5, fps=24.0, text_len=7)
+    # one rank: no resources, so every attention runs SDPA
+    whole = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True)
+    split = LTXDenoiseSubmodule(dit, cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True)
+    split.bind_node_resources(_resources(cfg, JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank))))
+    rids = ["r0", "r1"]
+    step = split.declare_step("generate_av", rids, [NodeInputs(resource_step_info=shape)] * len(rids))
+    step.set_ctx(StepContext(request_ids=rids, graph_walk="generate_av", slot=0, capture=False))
+    StepRunner(split.node_resources).plan(step)
     tokens = frames * height * width
-    rope = build_rope(cfg, frames, height, width, 24.0, 5, "cpu")
-    attends = LTX2Attends(*([sdpa_attention] * 6))
+    assert split.node_resources[VIDEO_SHARD].split_range("video").counts == tuple(sp_seq_split(tokens, WORLD))
+
+    t = cfg.transformer
     g = torch.Generator().manual_seed(1)
-    inputs = (
-        torch.randn(2, tokens, 8, generator=g), torch.randn(2, 5, 8, generator=g),
-        torch.randn(2, 7, 64, generator=g), torch.randn(2, 7, 32, generator=g),
-        torch.tensor([1000.0, 500.0]), rope, attends,
+    sigma = torch.tensor([0.9, 0.5]).view(-1, 1, 1)
+    inputs = dict(
+        latents=torch.randn(2, tokens, t.in_channels, generator=g), timestep=sigma.flatten() * 1000,
+        sigma=sigma, sigma_next=sigma * 0.5, audio_latents=torch.randn(2, 5, t.audio_in_channels, generator=g),
+        text_video=torch.randn(2, 7, t.cross_attention_dim, generator=g),
+        text_audio=torch.randn(2, 7, t.audio_cross_attention_dim, generator=g),
     )
-    want_video, want_audio = single(*inputs)
-    video, audio = sharded(*inputs)
-    assert video.shape == want_video.shape and audio.shape == want_audio.shape
-    torch.testing.assert_close(video, want_video, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(audio, want_audio, rtol=1e-5, atol=1e-5)
+    want = whole.denoise(None, shape, **inputs)
+    got = split.denoise(None, shape, **inputs)
+    for key in want:
+        assert got[key].shape == want[key].shape, key
+        torch.testing.assert_close(got[key], want[key], rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("shape", [(2, 2, 3), (3, 1, 5)], ids=["even", "uneven"])
-def test_sequence_parallel_dit_matches_one_rank(tmp_path, shape):
-    _run(_dit, tmp_path / "store", *shape)
+def test_sequence_parallel_denoise_step_matches_one_rank(tmp_path, shape):
+    _run(_denoise, tmp_path / "store", *shape)

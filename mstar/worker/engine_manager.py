@@ -10,7 +10,6 @@ from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
-from mstar.engine.resources.context_parallel import positions_over_sp
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs
@@ -167,18 +166,9 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # A node on SP ranks gets the SP group for its own sequence
-            # parallelism, unless it places its KV pools' positions over them
-            # and runs replicated across them (`positions_over_sp`, which
-            # validate_deployment checks before spawn; here it is loud where
-            # that was skipped). A node off SP ranks keeps its existing
-            # get_submodule call. Likewise ``moe_parallel``, only for a node
-            # group's ``ep_config``.
+            # ``moe_parallel`` only for a node group's ``ep_config``, so every other node keeps
+            # its existing get_submodule call
             extra = {}
-            node_sp_group = parallel_groups.get_sp_config_for_node(name)
-            sp = node_sp_group.world_size
-            if sp > 1 and not positions_over_sp(specs, name, sp, model.get_default_sharding_config().sp_enabled_nodes):
-                extra["sp_group"] = node_sp_group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
@@ -212,6 +202,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            moe_parallel=moe_parallel,
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
