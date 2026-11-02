@@ -21,6 +21,12 @@ DEVICE = "cuda"
 LIMITS = {"mxfp8": 0.05, "nvfp4": 0.25}
 
 
+def _activation_quant(x, fmt):
+    """``quant_block`` plus the unit tensor scale ``BlockScaledLinear`` holds for NVFP4."""
+    unit = torch.ones(1, device=x.device) if fmt is NVFP4 else None
+    return quant_block(x, fmt)._replace(tensor_scale=unit)
+
+
 def _matrix(rows, k, seed=0, std=1.0):
     g = torch.Generator(DEVICE).manual_seed(seed)
     return (torch.randn(rows, k, device=DEVICE, generator=g) * std).to(torch.bfloat16)
@@ -39,7 +45,7 @@ def test_mxfp8_quant_matches_the_host_reference_bytes(rows, k):
 @pytest.mark.parametrize(("rows", "k"), [(4096, 3072), (512, 9216), (70, 3072), (32, 128), (4608, 12288)])
 def test_nvfp4_quant_matches_the_host_reference_within_fp32_ties(rows, k):
     x = _matrix(rows, k, seed=rows)
-    q, ref = quant_block(x, NVFP4), quantize_block(x, NVFP4, tensor_scale=1.0)
+    q, ref = _activation_quant(x, NVFP4), quantize_block(x, NVFP4, tensor_scale=1.0)
     live = _live_scale_mask(rows, k // 16, ref.scale.numel())
     assert torch.equal(q.scale.view(torch.uint8)[live], ref.scale.view(torch.uint8)[live])
     # the device's fp32 division isn't correctly rounded, so a value right on a bin edge can land in the other bin
@@ -60,7 +66,7 @@ def _live_scale_mask(rows, blocks, numel):
 def test_gemm_against_fp32(name, m, n, k):
     fmt = BLOCK_FORMATS[name]
     x, w = _matrix(m, k, seed=1), _matrix(n, k, seed=2, std=0.03)
-    out = block_scaled_gemm(quant_block(x, fmt), quantize_block(w, fmt), fmt)
+    out = block_scaled_gemm(_activation_quant(x, fmt), quantize_block(w, fmt), fmt)
     assert out.dtype == torch.bfloat16 and out.shape == (m, n)
     torch.backends.cuda.matmul.allow_tf32 = False
     ref = x.float() @ w.float().t()
