@@ -149,6 +149,7 @@ class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("action",)
+    DECODE_LOOP = REASONER_DECODE_LOOP
     # {denoise loop: iterations}, settled by process_prompt, which alone sees
     # the output modality that picks the loop and its step count
     DENOISE_CAP = "denoise_cap"
@@ -357,11 +358,7 @@ class Cosmos3Model(Model):
         return {KV_CACHE: {COND_LABEL: main, UNCOND_LABEL: uncond}}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the reasoner's prefill emits the first of max_output_tokens, so its loop runs one fewer
-        return {
-            REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1),
-            **(model_kwargs.get(self.DENOISE_CAP) or {}),
-        }
+        return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,

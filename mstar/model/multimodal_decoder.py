@@ -107,6 +107,8 @@ class MediaPrompt(NamedTuple):
 
 
 class MultimodalDecoderModel(Model):
+    DECODE_LOOP = "decode_loop"
+
     # Image preprocessing is a few small ops per request, and a thread per
     # core only slows them: each op waits on whichever thread a co-tenant
     # descheduled. At 64 threads c=1 TTFT p95 was 152 ms (some preprocesses
@@ -180,10 +182,6 @@ class MultimodalDecoderModel(Model):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
         return media_walks(self.config.max_position_embeddings, self.encoders, text=self.TEXT_PROMPTS)
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -----------------------------------------------------------------------
     # KV layout

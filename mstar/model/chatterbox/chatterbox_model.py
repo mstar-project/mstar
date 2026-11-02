@@ -126,6 +126,8 @@ class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
     per-partition walk plans. No GPU compute lives here."""
 
+    DECODE_LOOP = "decode_loop"
+
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def __init__(
@@ -420,10 +422,6 @@ class ChatterboxModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         return self.resolve_generation_kwargs(model_kwargs)["max_new_tokens"]
-
-    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # The stop check counts the prefill's token, so it allows max_new_tokens - 1 iterations.
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         t3 = KVLabel(growth=(("decode", "decode_loop"),))

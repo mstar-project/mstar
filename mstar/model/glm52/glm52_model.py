@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
+    DECODE_LOOP = "decode_loop"
+
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
 
@@ -372,11 +374,6 @@ class Glm52Model(Model):
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
         return self.context_limit() if budget is None else budget
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer: the
-        # whole window is max_iters, and the conductor refuses a cap past it
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

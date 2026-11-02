@@ -45,6 +45,8 @@ VISION_WEIGHTS = ("model.vision_tower.", "model.multi_modal_projector.")
 
 
 class CommandAPlusModel(Model):
+    DECODE_LOOP = "decode_loop"
+
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
         max_seq_len: int | None = None, checkpoint_dir: str | None = None, **kwargs,
@@ -136,10 +138,6 @@ class CommandAPlusModel(Model):
                         repetition_penalty=1.04, ignore_eos=False)
         supplied = model_kwargs or {}
         return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
-
-    def get_loop_caps(self, **model_kwargs):
-        # Prefill samples the first token, so decode runs one fewer.
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self):
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}

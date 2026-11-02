@@ -385,6 +385,8 @@ class Qwen3TTSModel(Model):
     prompt processing, configuration, and output encoding.
     """
 
+    DECODE_LOOP = "talker_decode_loop"
+
     def __init__(
         self,
         model_path_hf: str,
@@ -950,10 +952,6 @@ class Qwen3TTSModel(Model):
             "max_output_tokens",
             model_kwargs.get("max_new_tokens", self.config.generation.max_new_tokens),
         )
-
-    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
-        return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {TALKER_KV: {"main": KVLabel(growth=(("talker_decode", "talker_decode_loop"),))}}

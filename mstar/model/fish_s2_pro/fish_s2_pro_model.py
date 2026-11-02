@@ -109,6 +109,8 @@ LICENSE_NOTICE = (
 class FishS2ProModel(Model):
     """Fish Audio S2-Pro model contract (plain TTS and voice cloning)."""
 
+    DECODE_LOOP = "ar_decode_loop"
+
     # API tensors the AR prefill consumes; the clone prefill adds ``ref_codes``.
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
@@ -428,10 +430,6 @@ class FishS2ProModel(Model):
                 f"Fish S2-Pro max_new_tokens must be in 1..{self.config.codec.max_frames}, got {requested}"
             )
         return requested
-
-    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
-        return {"ar_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {AR_KV: {"main": KVLabel(

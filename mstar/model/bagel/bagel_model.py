@@ -274,6 +274,8 @@ class BagelModel(Model):
     interleaved text and image inputs.
     """
 
+    DECODE_LOOP = "decode_loop"
+
     # the prompt lists whose entries each prefill in a walk of their own
     SPANS = ("text_inputs", "image_inputs")
 
@@ -866,10 +868,6 @@ class BagelModel(Model):
             "cfg_text": KVLabel(),
             "cfg_img": KVLabel(growth=decode),
         }}
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill samples the first of max_output_tokens, so decode runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(

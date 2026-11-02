@@ -1102,14 +1102,22 @@ class Model(ABC):
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
+    # The AR decode loop the token budget caps. Its prefill samples the reply's
+    # first token, so the default ``get_loop_caps`` runs it one fewer than
+    # ``get_max_output_tokens``.
+    DECODE_LOOP: str | None = None
+
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         """The iterations each named loop may run for this request, each at least 1.
 
         A loop runs the smaller of its graph ``max_iters`` and its cap. A model
-        whose stop check ends a loop at a count sets the cap to that count, so the
-        loop ends on the same iteration and never speculates past it.
+        whose request knows a loop's count sets the cap to that count, so the
+        loop ends on that iteration and never speculates past it. Default:
+        ``DECODE_LOOP``'s token budget, if the model declares one.
         """
-        return {}
+        if self.DECODE_LOOP is None:
+            return {}
+        return {self.DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an

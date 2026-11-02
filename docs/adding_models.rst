@@ -420,11 +420,15 @@ BAGEL lays out its prompt:
    the default ``max_output_tokens`` cut to the context its prompt leaves, and
    ``request_info.max_tokens`` carries the cut. A model that reads a length from another key
    lists it in ``LENGTH_KWARGS``. Speculation never runs past a cap, so the cap is the
-   loop's budget: a token decoder (``TokenStepNode``) returns ``max_output_tokens - 1`` for
-   its decode loop, the prefill having sampled the first token, and its stop check counts
-   nothing. A model whose own stop check also ends a loop at a count returns that count, so
-   the two end the loop on the same iteration; ``test/modular/test_model_kv_layouts.py``
-   checks this per model. Growth on an uncapped loop is counted to its graph ``max_iters``.
+   loop's budget. A model with an AR decode loop names it in the class attribute
+   ``DECODE_LOOP``, and the default ``get_loop_caps`` caps it at ``max_output_tokens - 1``,
+   the prefill having sampled the first token; its stop check counts nothing. A model with
+   other loops whose count each request knows up front (denoise steps, rollout frames)
+   overrides ``get_loop_caps`` to add them, calling ``super()`` for the decode loop, and its
+   stop check counts nothing either. A model whose own stop check still ends a loop at a
+   count returns that count, so the two end the loop on the same iteration;
+   ``test/modular/test_model_kv_layouts.py`` checks caps per model. Growth on an uncapped
+   loop is counted to its graph ``max_iters``.
 
 Where ``process_prompt`` computes a length that a walk computes another way, such as a
 media item's rows, the walk asserts the two agree: BAGEL's ViT walk against

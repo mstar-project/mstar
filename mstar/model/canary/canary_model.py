@@ -74,6 +74,8 @@ class CanaryModel(Model):
     """Canary speech recognition / translation: FastConformer encoder +
     autoregressive Transformer decoder."""
 
+    DECODE_LOOP = "decode_loop"
+
     # the route's 40 s window, plus slack for containers that decode longer than
     # their header said; still the largest encoder graph and 4 context pages
     MAX_AUDIO_SECONDS = 40.96
@@ -176,10 +178,6 @@ class CanaryModel(Model):
 
     def get_max_output_tokens_limit(self) -> int:
         return self.get_max_output_tokens()
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([

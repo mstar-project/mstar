@@ -145,6 +145,8 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
 class WhisperModel(Model):
     """Whisper ASR: native batched encoder + native AR decoder."""
 
+    DECODE_LOOP = DECODE_LOOP
+
     # A requested length is cut to the room the prompt leaves in the position
     # table rather than refused, as a length past the table is clamped below:
     # long-form windows carry the transcript so far as <|startofprev|> context.
@@ -541,10 +543,6 @@ class WhisperModel(Model):
             # mel frames that carry audio, word timestamps align within them
             "audio_frames": self.log_mel.num_frames(window.numel()),
         })
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {
