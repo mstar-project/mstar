@@ -632,7 +632,8 @@ class Engine:
             # This Engine constructs only the local instance, whose consumers
             # validate_deployment checked share one parallel group.
             first_node = min(relevant_nodes)
-            # one resource is sized by one head-shard count
+            # one resource is sized by one head-shard count (validate_deployment checks this
+            # first); conservative for a resource that never reads it
             if len({shards[node] for node in relevant_nodes}) > 1:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "

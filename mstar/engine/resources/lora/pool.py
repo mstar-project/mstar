@@ -291,9 +291,8 @@ class LoraAdapterPool(Resource):
                     f"LoRA resource {spec.resource_key!r} serves a node that runs sequence "
                     f"parallelism (SP={joint.sp_group.world_size}), which LoRA does not "
                     "support: its rows are laid out per request, while each SP rank holds "
-                    "a shard of the tokens. Serve this node without SP, set context_parallel "
-                    "on its paged KV pools to place positions over the SP ranks instead, or "
-                    "drop the 'lora:' block"
+                    "a shard of the tokens. Serve this node without SP, or drop the "
+                    "'lora:' block"
                 )
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size

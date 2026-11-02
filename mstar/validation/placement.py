@@ -539,8 +539,18 @@ def _sequence_parallel(
                     yield f"node_groups[{i}]: {e}"
         if sp == 1:
             continue
+        over = {}
         for node in sorted(nodes):
             try:
-                positions_over_sp(specs, node, sp, enabled)
+                over[node] = positions_over_sp(specs, node, sp, enabled)
             except ValueError as e:
                 yield f"node_groups[{i}]: {e}"
+        # a resource is sized by one head-shard count, which Engine.load_model checks again
+        for spec in specs:
+            split = {node: over[node] for node in sorted(spec.nodes & over.keys())}
+            if len(set(split.values())) > 1:
+                yield (
+                    f"node_groups[{i}]: resource {spec.resource_key!r} serves nodes that split heads "
+                    f"different ways: {[n for n, o in split.items() if o]} place their KV positions over "
+                    f"the SP ranks, {[n for n, o in split.items() if not o]} run their own sequence parallelism"
+                )

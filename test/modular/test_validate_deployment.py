@@ -301,6 +301,20 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     _refused(_paged_llm(**model), cfg, pattern)
 
 
+def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path):
+    """Engine.load_model raised this on the worker, after loading the weights: 'a' places its
+    positions over the SP ranks (heads over TP), 'b' runs its own SP (heads over TP x SP)."""
+    kv = KVSpec(resource_key="kv", nodes={"a"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
+    ))
+    model = _Model(_a_then_b, specs=[kv, _Spec("shared", {"a", "b"})], kv_labels={"kv": {"main": KVLabel()}},
+                   sp_enabled_nodes=["b"])
+    cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], "ranks": [0, 1], "sp_size": 2}],
+               resources={"kv": {"context_parallel": True}})
+    _refused(model, cfg, r"node_groups\[0\]: resource 'shared' serves nodes that split heads different ways: "
+                         r"\['a'\] place .* \['b'\] run their own")
+
+
 def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
     config = yaml.safe_load((ROOT / "configs/qwen3_5_27b_tp4.yaml").read_text())
     llm, = (group for group in config["node_groups"] if group["node_names"] == ["LLM"])
