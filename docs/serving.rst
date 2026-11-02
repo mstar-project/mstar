@@ -380,6 +380,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Async scheduling for the parallel nodes: ``true``
        (default), ``false`` or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
+   * - ``preprocess_workers``
+     - *(optional)* Requests the data worker prepares at once, for a model that
+       declares ``PREPROCESS_PARALLEL``. Default: as many as fit the CPUs left
+       beside the API server's intra-op threads (``preprocess_torch_threads``),
+       at most 8; ``1`` prepares inline. See :doc:`adding_models`.
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
