@@ -6,10 +6,11 @@ Starts the API server on a LingBot config (``--max-concurrent`` sets its
 
   * every concurrent rollout's frames are byte-identical to the solo one: a
     session's rolling K/V never reach another's
-  * with fewer slots than sessions, the extra rollouts wait for a slot (their
-    first chunk arrives after an earlier rollout's last) and still finish,
-    instead of running the GPU out of memory
-  * with a slot per session, the rollouts' chunks interleave
+  * when the pool or ``max_concurrent_requests`` has room for fewer rollouts
+    than sessions, the extra rollouts wait (their first chunk arrives after an
+    earlier rollout's last) and still finish, instead of running the GPU out of
+    memory
+  * with room for every session, the rollouts' chunks interleave
 
 The trajectory is synthetic and the image one of Cosmos3-Edge's assets, as in
 ``run_served_numerics.py``.
@@ -144,7 +145,7 @@ def main() -> int:
         spans = sorted((r["arrivals"][0], r["arrivals"][-1]) for r in results.values())
         report["first_last_chunk_s"] = spans
         # waited: a rollout's first chunk came after an earlier one's last
-        report["waited_for_a_slot"] = sum(1 for a, b in zip(spans, spans[1:], strict=False) if b[0] > a[1])
+        report["waited"] = sum(1 for a, b in zip(spans, spans[1:], strict=False) if b[0] > a[1])
         arrivals = solo["arrivals"]
         report["solo_chunk_gaps_s"] = [round(b - a, 3) for a, b in zip(arrivals, arrivals[1:], strict=False)]
     finally:
@@ -158,7 +159,7 @@ def main() -> int:
     print(json.dumps(report, indent=2, default=str))
     ok = not report.get("errors") and all(report.get("identical_to_solo", {0: False}).values()) \
         and len(report.get("chunks_each", {})) == args.sessions
-    if ok and report["waited_for_a_slot"] < expected_waits:
+    if ok and report["waited"] < expected_waits:
         ok = False
     print("concurrent rollouts", "OK" if ok else "FAILED")
     return 0 if ok else 1
