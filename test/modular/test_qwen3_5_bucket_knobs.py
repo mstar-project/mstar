@@ -101,9 +101,8 @@ def test_every_shipped_prefill_ladder_reaches_its_model(config):
     if model == "qwen3_omni":
         from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
         node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
-        ladders = {c.capture_graph_walk: c.capture_token_lengths
-                   for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
-        assert ladders["prefill_text"] == sorted(buckets)
+        configs = {c.capture_graph_walk: c for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
+        assert configs["prefill_text"].capture_token_lengths == sorted(buckets)
     else:
         assert model.startswith("qwen3_5"), f"a {model} config sets prefill_token_buckets, which no test checks"
 
