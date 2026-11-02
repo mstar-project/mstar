@@ -136,6 +136,15 @@ def first_pages(
     return indptr, indices
 
 
+def token_runs(starts: np.ndarray, lens: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(indptr, ids)`` for runs of consecutive token ids, ``arange(start, start + len)`` each,
+    end to end: a query block's keys as pages of one token each, the page lists the paged kernel
+    takes."""
+    indptr = np.zeros(len(lens) + 1, dtype=np.int64)
+    np.cumsum(lens, out=indptr[1:])
+    return indptr, np.repeat(starts - indptr[:-1], lens) + np.arange(indptr[-1])
+
+
 def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,
