@@ -737,20 +737,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         queued = False
         try:
             if nbytes:
-                host = torch.frombuffer(
+                flat = torch.frombuffer(
                     self._seg_views[seg][off:off + nbytes],
                     dtype=torch.uint8,
-                ).view(t.dtype).reshape(t.shape)
+                )
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
                 if t.is_cuda:
-                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    flat.view(t.dtype).reshape(t.shape).copy_(
+                        t, non_blocking=self._d2h_stream is not None)
                     queued = True
+                elif t.device.type == "cpu":
+                    # A stored host copy: one memcpy, nothing for the stream
+                    # sync to wait on. numpy, not Tensor.copy_: torch splits a
+                    # CPU copy of more than 32K elements over its intra-op
+                    # OpenMP pool, whose threads then spin on the cores the
+                    # worker's own threads need.
+                    np.copyto(flat.numpy(),
+                              t.reshape(-1).view(torch.uint8).numpy())
                 else:
-                    # a stored host copy: a memcpy, nothing for the stream
-                    # sync to wait on
-                    host.copy_(t)
+                    flat.view(t.dtype).reshape(t.shape).copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:
