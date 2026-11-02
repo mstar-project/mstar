@@ -20,6 +20,7 @@ Build: ``maturin develop --release -m rust/Cargo.toml`` (see
 from __future__ import annotations
 
 import time as _time
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, get_args
 
@@ -38,15 +39,17 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     FreedTensors,
     GraphRuntime,
-    InlineRoute,
-    InlineRouteStatus,
     ParallelList,
     PopRidsOutput,
+    PostprocessNeed,
+    PostprocessRequest,
+    PostprocessStep,
     Profiling,
     ReadyNodeSpec,
     RequestWalks,
     RouteInput,
     RouteOutput,
+    RouteTensors,
     SendInput,
     SpecRows,
     SpeculationOutput,
@@ -54,6 +57,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
+from mstar.model.submodule_base import StopPolicy
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 if TYPE_CHECKING:
@@ -212,6 +216,14 @@ def _columns(out) -> ColumnarEdgeSpecs:
     )
 
 
+def _column(t: torch.Tensor | None) -> tuple[int, int, int, str]:
+    """A 1-D host view as Rust reads it in place: pointer, rows, stride and
+    dtype; a null pointer for none."""
+    if t is None:
+        return 0, 0, 0, ""
+    return t.data_ptr(), t.shape[0], t.stride(0), _dtype_name(t.dtype)
+
+
 class RustGraphRuntime(GraphRuntime):
     """Delegates to ``mstar_rust.GraphRuntime``.
 
@@ -241,6 +253,11 @@ class RustGraphRuntime(GraphRuntime):
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         combined_walk_of = combined_walk_of or {}
+        # (node, walk) -> its declared stop policies, per loop, in the order
+        # the Rust rules index them
+        self._stop_policies: dict[tuple[str, str], dict[str, StopPolicy]] = {}
+        self._postprocess_request: PostprocessRequest | None = None
+        self._postprocess_nogil_ns = 0
         self._rust = _RustGraphRuntime(
             worker_graphs=[worker_graph_args(wg) for wg in my_worker_graphs],
             remote_worker_graphs=[
@@ -401,6 +418,18 @@ class RustGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
 
+    def set_loop_caps(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str], caps: list[int],
+    ) -> None:
+        self._rust.set_loop_caps(node_name, rids, graph_walks, loop_names, caps)
+
+    def loop_progress(
+        self, node_name: str, rids: list[int], graph_walks: list[str],
+        loop_names: list[str],
+    ) -> tuple[list[int], list[int]]:
+        return self._rust.loop_progress(node_name, rids, graph_walks, loop_names)
+
     # --------- Inputs ----------
 
     def ingest_inputs_batch(
@@ -508,7 +537,9 @@ class RustGraphRuntime(GraphRuntime):
     # --------- Speculation ----------
 
     def speculate_node(
-        self, node_name: str, graph_walks: list[str], sample_rids: list[int],
+        self, node_name: str, graph_walks: list[str], rids: list[int],
+        walk_counts: list[int] | None = None,
+        loop_strides: list[int] | None = None,
     ) -> list[SpeculationOutput]:
         return [
             SpeculationOutput(
@@ -517,7 +548,7 @@ class RustGraphRuntime(GraphRuntime):
                 output_signals=tuple(signals),
             )
             for n, w, new_iter, loop_name, signals in self._rust.speculate_node(
-                node_name, graph_walks, sample_rids,
+                node_name, graph_walks, rids, walk_counts, loop_strides,
             )
         ]
 
@@ -554,6 +585,7 @@ class RustGraphRuntime(GraphRuntime):
                 } for e in input.streaming_edges
             ],
             "streaming_edges_per_rid": list(input.streaming_edges_per_rid),
+            "loop_strides": input.loop_strides,
         }
 
     @staticmethod
@@ -586,10 +618,12 @@ class RustGraphRuntime(GraphRuntime):
     def prep_spec_rows(
         self, spec_node_name: str, curr_node_name: str, graph_walk: str,
         rids: list[int], room_for_continuing: int | None = None,
+        loop_strides: list[int] | None = None,
     ) -> SpecRows:
         out = self._rust.prep_spec_rows(
             spec_node_name=spec_node_name, curr_node_name=curr_node_name,
             graph_walk=graph_walk, rids=rids, room_for_continuing=room_for_continuing,
+            loop_strides=loop_strides,
         )
         edge_rids = out.edge_rids
         return SpecRows(
@@ -625,6 +659,7 @@ class RustGraphRuntime(GraphRuntime):
             "logprobs": list(input.logprobs),
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
+            "loop_strides": input.loop_strides,
         })
         return self._route_output(out)
 
@@ -652,34 +687,113 @@ class RustGraphRuntime(GraphRuntime):
             ),
         )
 
-    supports_route_and_send_inline = True
-
-    def route_and_send_inline(
-        self, partition: str, graph_walk: str, node_name: str,
-        output_signals: list[str], rids: list[int],
-        inline_signal: str, inline_column: torch.Tensor,
-        row_rids: list[int],
-    ) -> InlineRoute:
-        """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
-        step, one crossing with the GIL released (see the Rust side).
-
-        ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
-        caller keeps alive; Rust reads it in place.
-        """
-        out = self._rust.route_and_send_inline(
-            partition=partition, graph_walk=graph_walk, node_name=node_name,
-            output_signals=list(output_signals), rids=rids, inline_signal=inline_signal,
-            inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
-            inline_stride=inline_column.stride(0),
-            inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
+    def set_stop_policies(
+        self, node_name: str, graph_walk: str, policies: Mapping[str, StopPolicy],
+    ) -> None:
+        self._stop_policies[(node_name, graph_walk)] = dict(policies)
+        self._rust.set_stop_rules(
+            node_name, graph_walk, list(policies),
+            [p.reads_token for p in policies.values()],
+            [sorted(p.eos_tokens) for p in policies.values()],
         )
-        status = InlineRouteStatus(out.status)
-        route = None
-        if status is InlineRouteStatus.ROUTED:
-            route = self._route_output(out.take_route())
-        if PHASE_PERIOD:
-            phase_record("rust.route_and_send_inline.nogil", out.nogil_ns * 1e-9)
-        return InlineRoute(status, out.completion_id, out.sent_rids, route)
+
+    def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
+        cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
+        for (node, walk), policies in self._stop_policies.items():
+            if not policies:
+                continue
+            limits = [p.limits(info) for p in policies.values()]
+            self._rust.set_stop_limits(
+                node, walk, [rid],
+                [[cap if lim.max_iters is None else min(lim.max_iters, cap)] for lim in limits],
+                [[lim.ignore_eos] for lim in limits],
+            )
+
+    def check_stops(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int],
+        tokens: torch.Tensor | None, row_rids: list[int],
+    ) -> dict[int, set[str]] | None:
+        policies = self._stop_policies[(node_name, graph_walk)]
+        if not policies:
+            return {}
+        ptr, rows, stride, dtype = _column(tokens)
+        stop_rids, stop_rules, missing = self._rust.check_stops_inline(
+            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
+        )
+        if missing:
+            return None
+        loops = list(policies)
+        stops: dict[int, set[str]] = {}
+        for rid, k in zip(stop_rids, stop_rules, strict=True):
+            stops.setdefault(rid, set()).add(loops[k])
+        return stops
+
+    def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
+        """Natively (``postprocess.rs``)."""
+        self._postprocess_request = request
+        self._postprocess_nogil_ns = 0
+        stops = request.stops or {}
+        inline = request.inline
+        ptr, rows, stride, dtype = _column(request.tokens)
+        iptr, irows, istride, idtype = _column(None if inline is None else inline.column)
+        out = self._rust.begin_postprocess(
+            partition=request.partition, node_name=request.node_name,
+            graph_walk=request.graph_walk, output_signals=list(request.output_signals),
+            rids=request.wg_ids.keys, walks=request.walks, rid_walk_idx=request.rid_walk_idx,
+            stop_rids=list(stops), stop_loops=[sorted(v) for v in stops.values()],
+            runtime_stops=request.runtime_stops,
+            token_ptr=ptr, token_rows=rows, token_stride=stride, token_dtype=dtype,
+            row_rids=list(request.row_rids),
+            inline_signal=None if inline is None else inline.signal,
+            inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
+            partition_done=list(request.partition_done), python_send=request.python_send,
+            loop_strides=request.loop_strides,
+        )
+        return self._postprocess_step(out)
+
+    def resume_postprocess(
+        self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),
+        stored: RouteTensors | None = None, send: SendInput | None = None,
+    ) -> PostprocessStep:
+        if stops is not None:
+            out = self._rust.resume_postprocess_stops(
+                list(stops), [sorted(v) for v in stops.values()], list(dropped),
+            )
+        elif stored is not None:
+            out = self._rust.resume_postprocess_store(
+                tensors=list(stored.tensors), num_tensors=list(stored.num_tensors),
+                inline_signal=stored.inline_signal, inline_values=list(stored.inline_values),
+                logprobs=list(stored.logprobs),
+            )
+        elif send is not None:
+            # The parked step's own route output carries the completion id.
+            args = self._send_args(send)
+            del args["completion_id"]
+            out = self._rust.resume_postprocess_send(**args)
+        else:
+            raise ValueError("resume_postprocess: nothing to resume with")
+        return self._postprocess_step(out)
+
+    def _postprocess_step(self, out) -> PostprocessStep:
+        self._postprocess_nogil_ns += out.nogil_ns
+        need = PostprocessNeed(out.need)
+        if need is PostprocessNeed.DONE:
+            if PHASE_PERIOD:  # per step
+                phase_record("rust.postprocess.nogil", self._postprocess_nogil_ns * 1e-9)
+            self._postprocess_nogil_ns = 0
+            self._postprocess_request = None
+            return PostprocessStep(need, stopped_rids=out.stopped_rids,
+                                   completed_rids=out.completed_rids)
+        if need is PostprocessNeed.STOPS:
+            return PostprocessStep(need)
+        wg_ids = self._postprocess_request.wg_ids
+        wg_of = dict(zip(wg_ids.keys, wg_ids.values, strict=True))
+        rids = out.rids
+        route = out.take_route()
+        return PostprocessStep(
+            need, ParallelList(rids, [wg_of[r] for r in rids]), out.rid_walk_idx,
+            out.stopped_rids, None if route is None else self._route_output(route),
+        )
 
     def stop_loops_batched(
         self, partition: str, graph_walk: str, last_node_run: str,
@@ -737,12 +851,24 @@ class RustGraphRuntime(GraphRuntime):
         """
         # The wrapper's own per-rid rebuilding, timed apart from the crossing.
         _t0 = _time.perf_counter() if PHASE_PERIOD else 0.0
+        args = self._send_args(input)
+        if PHASE_PERIOD:
+            _t1 = _time.perf_counter()
+            phase_record("rust.send_outputs.marshal", _t1 - _t0)
+            sent_rids = self._rust.send_outputs(**args)
+            phase_record("rust.send_outputs.call", _time.perf_counter() - _t1)
+            return sent_rids
+        return self._rust.send_outputs(**args)
+
+    @staticmethod
+    def _send_args(input: SendInput) -> dict:
+        """``send_outputs``' arguments as Rust takes them."""
         # Straight through as struct-of-arrays. `ParallelList` already holds
         # keys and values as two flat lists -- which is the whole reason it
         # exists -- so zipping them into tuples here only to have Rust unzip
         # them is a per-rid interpreted loop per argument, per forward pass.
         # The count dicts go over as dicts; PyO3 extracts them.
-        args = dict(
+        return dict(
             completion_id=input.completion_id,
             info_rids=input.per_request_info.keys,
             request_infos=[
@@ -782,11 +908,3 @@ class RustGraphRuntime(GraphRuntime):
             ),
             skip_rids=list(input.failed_rids),
         )
-        if PHASE_PERIOD:
-            _t1 = _time.perf_counter()
-            phase_record("rust.send_outputs.marshal", _t1 - _t0)
-            sent_rids = self._rust.send_outputs(**args)
-            phase_record("rust.send_outputs.call", _time.perf_counter() - _t1)
-            return sent_rids
-        else:
-            return self._rust.send_outputs(**args)

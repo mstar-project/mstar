@@ -15,8 +15,10 @@ from mstar.engine.resources.spec import (
     spec_dependency_problems,
     unknown_overrides_message,
 )
-from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
+from mstar.graph.base import GraphEdge, GraphSection
+from mstar.graph.special_destinations import EMPTY_DESTINATION, SPECIAL_DESTINATIONS
 from mstar.model.base import Model, keyed_labels
+from mstar.model.submodule_base import chunk_loop_name
 from mstar.streaming.topology import StreamingGraphEdge
 
 
@@ -226,7 +228,7 @@ def _unservable_walks(specs: Sequence[NodeResourceSpec], model: Model) -> Iterat
                 for name in ran:
                     fed = sorted(
                         {
-                            edge.next_node for edge in nodes[name].outputs
+                            edge.next_node for edge in _node_outputs(graphs[walk], name, walk)
                             if not isinstance(edge, StreamingGraphEdge)
                             or edge.target_partition == partition_of[walk]
                         }
@@ -254,7 +256,20 @@ def streamed_partitions(specs: Sequence[NodeResourceSpec], model: Model) -> froz
         for key, by_label in keyed_labels(model).items()
         for kv_label in by_label.values() if len(kv_label.keys.walks) > 1
         for walk in kv_label.keys.walks
-        for name, node in graphs[walk].get_nodes().items() if name in nodes_of[key]
-        for edge in node.outputs
+        for name in graphs[walk].get_nodes() if name in nodes_of[key]
+        for edge in _node_outputs(graphs[walk], name, walk)
         if isinstance(edge, StreamingGraphEdge) and edge.target_partition != partition_of[walk]
     )
+
+
+def _node_outputs(graph: GraphSection, name: str, walk: str) -> list[GraphEdge]:
+    """The edges ``name``'s outputs leave the node on in ``walk``. A chunked
+    node's real edges are on its chunk Loop, but for the ``per_chunk_outputs``
+    its body still routes; the rest of the body's go to ``EMPTY_DESTINATION``
+    or back to itself (the tick)."""
+    node = graph.get_nodes()[name]
+    loop = graph.get_loops().get(chunk_loop_name(name, walk))
+    if loop is None:
+        return node.outputs
+    per_chunk = [e for e in node.outputs if e.next_node not in (EMPTY_DESTINATION, name)]
+    return loop.outputs + loop.accumulated_outputs + per_chunk

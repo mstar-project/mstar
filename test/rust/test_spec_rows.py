@@ -53,6 +53,7 @@ class _StubTM:
     dereference = TensorCommunicationManager.dereference
     dereference_batch = TensorCommunicationManager.dereference_batch
     dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
+    increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
 
     def __init__(self, bookkeeping):
@@ -63,6 +64,9 @@ class _StubTM:
 
     def get_tensor(self, uuid):
         return self.tensor_store.get_tensor(uuid)
+
+    def get_tensors(self, uuids):
+        return self.tensor_store.get_tensors(uuids)
 
     def _cleanup_by_uuid(self, uuid, registered=None):
         if self.tensor_store.check_uuid_presence(uuid):
@@ -82,7 +86,7 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, state, target, continuing):
+    def pick_chain_step(self, state, target, continuing, mid_prefill=()):
         # the chain keeps its rows up to the cap; the fresh rows come from the take
         rows = list(continuing)
         return ChainPick(target, StepPick(
@@ -90,7 +94,7 @@ class _Scheduler:
             held_back=set(), ordered=False,
         ), [])
 
-    def take_chain_step(self, state, chain):
+    def take_chain_step(self, state, chain, pre_existing_batch_size=0, pre_existing_seq_lens=None):
         return self.get_next_batch()
 
     def _check_ready(self, node_name, rid, fwd_info):

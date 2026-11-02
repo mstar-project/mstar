@@ -302,10 +302,37 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
        chain on it merges ready rows of the other walks of its combined walk, so
-       decode steps take in new prompts as they arrive. Off (the default), a chain
+       decode steps take in new prompts, and their chunks, as they arrive. Off, a chain
        keeps to its own walk and yields to the others, and a step mixes walks only
-       when the scheduler builds one fresh. Naming a node with no combined walk, or a
+       when the scheduler builds one fresh. Defaults to on where the combined walk
+       has a token budget (``max_batch_tokens``), and off where it has none, since a
+       merged prompt then runs whole. Naming a node with no combined walk, or a
        walk outside its combined walks, fails loading.
+   * - ``max_batch_tokens``
+     - *(optional)* Per node, one token budget for every walk the model budgets, or a
+       mapping of walk -> budget; null turns a walk's chunking off. Overrides the
+       model's defaults. See *Chunked prefill budgets* below.
+   * - ``can_override_mixed_max_tokens``
+     - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
+       of its own under the step's. See *Chunked prefill budgets* below.
+   * - ``speculate_mid_prefill``
+     - *(optional, default true)* Per node, ``true``/``false`` for every walk it chunks,
+       or a mapping of walk -> ``true``/``false``. On, a prompt mid-prefill takes its
+       next chunk in the step speculated during the current one, so a lone long prompt
+       pays no scheduling gap between chunks; other ready work still goes first after
+       every prompt step. Off, the next chunk waits for the current one to land. Naming
+       a node or walk the model does not chunk fails loading.
+   * - ``batch_builder``
+     - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
+       budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
+       a prompt mid-prefill takes the budget before a newer one, so it finishes first,
+       and prompts short enough for an equal share still go in whole. ``fair_share``
+       splits the budget max-min fair over every waiting prompt, so each advances every
+       step and all finish late together.
+   * - ``min_chunk_tokens``
+     - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
+       in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
+       chunked walk. See *Chunked prefill budgets* below.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -354,9 +381,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan`` and ``step_thread_core``
-       (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
+       ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
+       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -378,7 +406,7 @@ them by that name:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
 
@@ -417,6 +445,74 @@ It doesn't replace the cap. With a host pool and the prefix cache on, a cached p
 copied to the host once no request holds it, and a later request whose prefix the device
 evicted copies it back from there. So the host pool should hold more pages than the device's
 prefix cache.
+
+**Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
+budget per step, and a longer prompt is split across steps. Each model sets its own
+budgets:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Model
+     - Node
+     - Chunked walks
+     - Default budget
+   * - Qwen3.5
+     - ``LLM``
+     - ``prefill_text`` (in ``mixed``)
+     - 2048
+   * - Qwen3-Omni
+     - ``Thinker``
+     - ``prefill_text``, ``prefill_audio``, ``prefill_vision`` (in ``thinker_mixed``)
+     - 1024
+   * - BAGEL
+     - ``LLM``
+     - ``prefill_text`` (in ``mixed_text``)
+     - 1024
+   * - Orpheus
+     - ``LLM``
+     - ``prefill`` (in ``mixed``)
+     - 512
+
+A deployment can override them per node, either with one budget for every walk
+the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
+that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
+budget if that is smaller. When less than that is left of a step's budget, the prompt waits
+for the next step rather than running the step over its budget.
+
+Most chunked walks run inside a combined walk, which batches a node's prompts and its
+decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
+BAGEL's, ``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined
+walk's budget, so that is the one to set, by naming the node or the combined walk:
+
+.. code-block:: yaml
+
+   max_batch_tokens:
+     LLM: 512                    # every budgeted walk of LLM, its combined walk's too
+     Thinker:
+       thinker_mixed: 1024       # the budget of a Thinker step
+
+A walk inside a combined walk takes a budget of its own only on a node listed in
+``can_override_mixed_max_tokens``. There the walk's budget, its own or the model's, caps
+that walk's rows within each step, under the step's budget, and null keeps its prompts
+whole:
+
+.. code-block:: yaml
+
+   can_override_mixed_max_tokens: {Thinker: true}
+   max_batch_tokens:
+     Thinker:
+       prefill_vision: 512       # vision rows take at most 512 of a step's tokens
+       prefill_audio: null       # audio prompts run whole
+
+Loading fails if a node is not in any node group, if a walk is one the model never runs, if
+the model sets no budget for that walk, or if the walk is inside a combined walk and its
+node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
+
+Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same
+ones. Chunked prefill is not supported under sequence parallelism yet: a node with an SP
+degree above one runs its prefills whole, whatever the model and these budgets say, and
+logs a warning at load.
 
 **Data-parallel routing.** A node group whose ``ranks`` hold several lockstep instances
 (``tp_size * sp_size`` ranks each, or one rank) runs each request on one of them, its
