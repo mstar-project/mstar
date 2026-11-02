@@ -28,10 +28,8 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.components.diffusion.attention import RaggedAttentionMixin
-from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.components.unipc import (
     SOLVER_ORDER,
@@ -329,7 +327,7 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
 
 class Wan22AttnLayout(NamedTuple):
     """One step's self-attention spans for a request: each of the ``branches``
-    guidance branches this rank computes attends within its video tokens."""
+    guidance branches the forward computes attends within its video tokens."""
 
     video_tokens: int
     branches: int
@@ -339,9 +337,8 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
     """Dense 5B video DiT with the UniPC step run inline.
 
     One loop iteration is one batch-2 transformer forward (the positive and
-    negative prompt embeddings stacked on the batch axis; CFG-parallel on a
-    two-rank instance, one branch per rank) plus one UniPC predictor/corrector update
-    from ``components/unipc.py``.
+    negative prompt embeddings stacked on the batch axis) plus one UniPC
+    predictor/corrector update from ``components/unipc.py``.
 
     Loop-carried edges, all float32 over the latent grid:
 
@@ -380,19 +377,10 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
     # leaving the solver, CFG combine, and everything touching sigma eager.
     disable_torch_compile = True
 
-    def __init__(self, transformer: nn.Module, config: Wan22Config, sp_group=None):
+    def __init__(self, transformer: nn.Module, config: Wan22Config):
         super().__init__()
         self.transformer = transformer
         self.config = config
-        # CFG parallelism: the node's lockstep group arrives as its sp group
-        # (not passed on one GPU, so trivial here; Wan22Model.validate_config_yaml
-        # refuses any size but 2), but nothing splits the sequence. The ranks
-        # split the batch-2 CFG stack (my_rows, then an all-gather), each running
-        # one branch at batch 1, so the step costs one branch's forward plus a
-        # latent-sized gather. Every rank then runs the same combine and UniPC
-        # step on replicated latents. Without guidance both ranks compute the
-        # whole step, correct but no faster.
-        self.sp_group = sp_group or CommGroup.trivial()
         self._record_fp32_islands()
         # Compile the inner DiT region only (tensors in, tensor out; nothing
         # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
@@ -468,24 +456,11 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
         guidance_scale = float(fwd_info.step_metadata.get("guidance_scale", self.config.guidance_scale))
         layout = Wan22AttnLayout(
             video_tokens=(t_lat // p_t) * (h_lat // p_h) * (w_lat // p_w),
-            branches=self._branches(guidance_scale),
+            branches=2 if guidance_scale > 1.0 else 1,
         )
         return NodeInputs(
             tensor_inputs=tensor_inputs, resource_step_info=layout, input_seq_len=layout.video_tokens,
         )
-
-    def _branch_rows(self, guidance_scale: float) -> slice:
-        """This rank's rows of the [cond, uncond] stack; the unguided step is
-        the one conditional row, which every rank runs.
-
-        ``guidance_scale`` is request metadata, identical on every rank of the
-        instance, so all ranks agree on whether the forward's gather runs."""
-        return my_rows(self.sp_group, 2) if guidance_scale > 1.0 else slice(0, 1)
-
-    def _branches(self, guidance_scale: float) -> int:
-        """Guidance branches this rank's forward computes."""
-        rows = self._branch_rows(guidance_scale)
-        return rows.stop - rows.start
 
     # attention ------------------------------------------------------------
     def declare_step(
@@ -585,8 +560,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
         reference's two sequential forwards. The combine runs in the
         transformer's output dtype (bf16), like the reference."""
         do_cfg = guidance_scale > 1.0
-        rows = self._branch_rows(guidance_scale)
-        batch = rows.stop - rows.start
+        batch = 2 if do_cfg else 1
         hidden_states = model_input.repeat(batch, 1, 1, 1, 1)
         timestep = temp_ts.unsqueeze(0).expand(batch, -1)
         # dynamic=False keys the compiled trace on the full input shape (batch
@@ -603,23 +577,20 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
                     "this resolution now (one-time pause); later requests reuse it.",
                     shape_key,
                 )
-        if do_cfg:
-            # this rank's branches of the CFG stack, gathered back after the forward
-            encoder_hidden_states = torch.cat([text_embeds_pos, text_embeds_neg], dim=0)[rows]
-        else:
-            encoder_hidden_states = text_embeds_pos
+        encoder_hidden_states = (
+            torch.cat([text_embeds_pos, text_embeds_neg], dim=0) if do_cfg else text_embeds_pos
+        ).to(self.transformer.dtype)
         transformer = self.transformer
         if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
             transformer = self._eager_forward[1]
         out = transformer(
             hidden_states=hidden_states,
             timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
+            encoder_hidden_states=encoder_hidden_states,
             self_attn_fn=self.ragged_for(self.VIDEO_SPAN),
         )
         if not do_cfg:
             return out
-        out = self.sp_group.all_gather(out.contiguous(), dim=0)
         noise_cond, noise_uncond = out[0:1], out[1:2]
         return noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 

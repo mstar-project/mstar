@@ -1527,18 +1527,9 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
-**Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
-the dit as a two-rank lockstep instance (``sp_size: 2``, though nothing splits
-the sequence) that splits the classifier-free guidance batch: each rank runs one
-branch at batch 1 and the two noise predictions are all-gathered
-every step, so a guided step costs one branch's forward (502 vs 1000 ms at
-1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps;
-measured on that earlier version). The
-text encoder and VAE run on rank 0. Without guidance both ranks compute the same
-step, correct but no faster. For throughput under concurrency,
-``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
-at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
-decode; measured on that earlier version), while one request takes the 1-GPU time.
+**Two GPUs.** ``configs/wan22_dp2.yaml`` serves a whole replica per GPU: 5.2
+videos/min at 4 concurrent on H200s (measured on an earlier version), while one
+request takes the 1-GPU time.
 
 LTX-2.5 (``ltx2_5``)
 --------------------
