@@ -1,14 +1,12 @@
 """The fused GDN prefill stage: its guard, how a wrapper picks it, and on a GPU its
 values against the eager path it stands in for, alone and through the chunked kernel."""
 
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from mstar.engine.resources.linear_attn import gdn_stage, wrappers
+from mstar.engine.resources.linear_attn import gdn_cpu, gdn_stage, wrappers
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies, stage_gdn_prefill_inputs
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
@@ -103,11 +101,8 @@ def test_run_goes_through_the_stage_with_the_plan_mask(monkeypatch):
         return kw["v"], torch.zeros_like(kw["initial_state"])
 
     monkeypatch.setattr(wrappers, "stage_gdn_prefill_inputs", stage)
-    # the wrapper imports the kernel lazily; a fake module serves it whether or not flashinfer is installed
-    gdn_prefill = types.ModuleType("flashinfer.gdn_prefill")
-    gdn_prefill.chunk_gated_delta_rule = chunk
-    monkeypatch.setitem(sys.modules, "flashinfer", sys.modules.get("flashinfer") or types.ModuleType("flashinfer"))
-    monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", gdn_prefill)
+    # the wrapper imports the kernel lazily, a CPU tensor's from the torch stand-in
+    monkeypatch.setattr(gdn_cpu, "chunk_gated_delta_rule", chunk)
     q = torch.zeros(32, 16, 128)
     v = torch.zeros(32, 32, 128)
     a = torch.full((32, 32), 3.0)

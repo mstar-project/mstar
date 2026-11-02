@@ -22,6 +22,7 @@ from mstar.engine.resources.base import (
     CGSlotSpec,
     EngineResourceInfo,
     Resource,
+    head_shards,
 )
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.manager import _DEBUG_ASSERTS
@@ -132,16 +133,18 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
-    # it reads the KV pool only to key prefix snapshots, which are off above one rank; over a
-    # pool placed over SP ranks `head_shards` is TP's, so every SP partner holds the same state
+    # it reads the KV pool only to key prefix snapshots, which are off above one rank. Its heads
+    # shard over TP alone, so every SP replica of a slot holds the same state, which a split step
+    # leaves alike on every one (`linear_attn.base`)
     supports_context_parallel = True
+    supports_split_steps = True
 
     @classmethod
     def build(
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
     ) -> "RecurrentStatePool":
         config = spec.config
-        config.shard(info.head_shards)
+        config.shard(head_shards(info.joint_comm_group, places_positions=True))
         world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
         # no snapshot slots where the engine keeps them from serving a hit
         if spec.resource_key not in info.prefix_caches:

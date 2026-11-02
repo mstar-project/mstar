@@ -286,18 +286,27 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
         )
 
 
-def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp_path, monkeypatch):
-    """Qwen3.5's recurrent state holds no split strategy: a node splitting its steps over SP ranks
-    can't own one."""
+def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what_cant_split(tmp_path, monkeypatch):
+    """Qwen3.5's recurrent state and layers take split steps, their heads over TP alone (the pool
+    is copied over SP ranks) where its KV's are over TP x SP; a resource holding no split strategy
+    is refused."""
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
     specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
     specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
-    with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
+    pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
+    heads = pool.config.blocks["state"].shape[0]
+
+    def load(specs):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
         )
+
+    load(specs)
+    assert pool.config.blocks["state"].shape[0] == heads
+    with pytest.raises(ValueError, match="'dependent'.*does not support steps split over SP ranks"):
+        load([*specs, _DependentSpec(resource_key="dependent", nodes={NODE}, supports=True)])
 
 
 @dataclass

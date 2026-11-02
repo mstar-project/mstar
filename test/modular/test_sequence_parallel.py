@@ -28,6 +28,12 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.position.manager import PositionManager
+from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
+    Mamba2Geometry,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+)
 from mstar.engine.resources.sequence_shard import (
     SeqRange,
     SeqShardSpec,
@@ -42,6 +48,7 @@ from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepConte
 from mstar.model.components.diffusion.attention import sdpa_attention
 
 HEADS = 6
+CPU = torch.device("cpu")
 
 
 def _group(rank: int, world: int) -> CommGroup:
@@ -535,6 +542,192 @@ def test_a_node_whose_attentions_all_take_no_split_steps_plans_every_step_copied
         assert (spec.splits, shard.can_split, _split(shard, [("r0", "main", 10)]) is not None) == (splits,) * 3
 
 
+# --- the recurrent resources on a split step -----------------------------------------------------
+
+LINEAR_SLOTS = 12
+LINEAR_GEOMETRIES = {
+    # heads that split two and three ways; equal key and value dims, as a middle piece's hand-off needs
+    "gdn": DeltaNetGeometry(num_k_heads=6, num_v_heads=6, head_k_dim=2, head_v_dim=2, conv_kernel_size=4),
+    # FlashInfer's kernels' head dim, for the GPU case
+    "gdn-128": DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128, conv_kernel_size=4),
+    # one B/C group, fewer than the SP ranks
+    "mamba2": Mamba2Geometry(num_heads=6, head_dim=2, state_size=3, n_groups=1, conv_kernel_size=4),
+}
+
+
+def _linear(variant, world_rank=None, exchange="ulysses", sink=True, device=CPU):
+    """A linear-attention resource, its pool's two layers (seeded alike on every rank), and with
+    ``world_rank`` the sequence shard it splits over: the resource as the engine builds it."""
+    from mstar.engine.resources.linear_attn.base import LinearAttnManager
+    from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+    from mstar.engine.resources.sequence_shard import SequenceShard
+    from mstar.engine.resources.spec import CombinedSplit
+
+    geometry = LINEAR_GEOMETRIES[variant]
+    if isinstance(geometry, DeltaNetGeometry):
+        config = LinearAttnConfig("state", LinearAttnVariant.GDN, splits=(CombinedSplit("mixed", ("prefill",)),))
+    else:
+        config = LinearAttnConfig("state", LinearAttnVariant.MAMBA2)
+    pool = RecurrentStateSpec("state", {"n"}, RecurrentStateConfig(
+        num_layers=1, blocks=geometry.to_blocks(conv_dtype=torch.float32), max_slots=LINEAR_SLOTS,
+        disable_sink_slot=not sink,
+    ))
+    manager = LinearAttnManager.build(
+        LinearAttnSpec("linear", {"n"}, config), EngineResourceInfo(device=device, dependencies={"state": pool}),
+    )
+    gen = torch.Generator().manual_seed(3)
+    layers = {
+        name: (torch.randn(LINEAR_SLOTS, *block.shape, generator=gen) * 0.3).to(device)
+        for name, block in pool.config.blocks.items()
+    }
+    shard = None
+    if world_rank is not None:
+        shard = SequenceShard(("main",), 0, None, 0, _group(*world_rank))
+        manager._shard_key, manager._split_exchange = "shard", exchange
+        manager.bind_dependencies({"state": None, "shard": shard})
+    return manager, layers, shard
+
+
+def _linear_inputs(variant, n, device=CPU, dtype=torch.float32):
+    geometry = LINEAR_GEOMETRIES[variant]
+    gen = torch.Generator().manual_seed(4)
+    if isinstance(geometry, DeltaNetGeometry):
+        heads, gate_rows, names = geometry.num_v_heads, 2, ("a_log", "dt_bias")
+    else:
+        heads, gate_rows, names = geometry.num_heads, 1, ("a_log", "d", "dt_bias")
+    params = {name: (torch.randn(heads, generator=gen) * 0.1).to(device) for name in names}
+    x = torch.randn(n, geometry.conv_dim, generator=gen)
+    weight = torch.randn(geometry.conv_dim, geometry.conv_kernel_size, generator=gen) * 0.5
+    gates = torch.randn(n, gate_rows, heads, generator=gen)
+    return x.to(device, dtype), weight.to(device, dtype), gates.to(device, dtype), params
+
+
+def _linear_step(manager, layers, variant, layout, walk, x, weight, gates, params, shard=None):
+    """Plan ``layout`` ((span, slot, has_state) a row) and run the layer: the conv, then the
+    recurrence, on this rank's tokens when ``shard`` splits the step."""
+    from mstar.engine.resources.linear_attn.config import LinearAttnStep
+    from mstar.engine.resources.recurrent.pool import RecurrentAddressing
+
+    spans, slots, has = (list(col) for col in zip(*layout, strict=True))
+    rids = [f"r{i}" for i in range(len(layout))]
+    segments = tuple(Segment(rid, "main", span) for rid, span in zip(rids, spans, strict=True))
+    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False)
+    ctx.plan_results["state"] = {"main": RecurrentAddressing(
+        torch.tensor(slots, dtype=torch.int32, device=x.device), torch.tensor(has, device=x.device), len(layout),
+        tuple(slots), tuple(has),
+    )}
+    if shard is not None:
+        ctx.plan_results["shard"] = shard.plan(SeqShardStep(segments=segments), ctx)
+        x, gates = shard.scatter("main", x, gates)
+    manager.plan(LinearAttnStep(segments=segments), ctx)
+    manager.set_default_label("main")
+    x = manager.run_conv(x, layers["conv"], weight, None)
+    n, g = x.shape[0], LINEAR_GEOMETRIES[variant]
+    if isinstance(g, DeltaNetGeometry):
+        keys, values = g.num_k_heads * g.head_k_dim, g.num_v_heads * g.head_v_dim
+        q, k, v = x.split([keys, keys, values], dim=-1)
+        out = manager.run(
+            q.reshape(n, g.num_k_heads, g.head_k_dim), k.reshape(n, g.num_k_heads, g.head_k_dim),
+            v.reshape(n, g.num_v_heads, g.head_v_dim), gates[:, 0], gates[:, 1],
+            layers["state"], params["a_log"], params["dt_bias"],
+        )
+    else:
+        groups = g.n_groups * g.state_size
+        xs, b, c = x.split([g.d_inner, groups, groups], dim=-1)
+        out = manager.run(
+            xs.reshape(n, g.num_heads, g.head_dim), gates[:, 0], b.reshape(n, g.n_groups, g.state_size),
+            c.reshape(n, g.n_groups, g.state_size), layers["ssm"], params["a_log"], params["d"], params["dt_bias"],
+        )
+    if shard is not None:
+        shard.commit(SeqShardStep(), ctx)
+    return x, out
+
+
+def _linear_split(rank, world, variant, exchange, layout, walk, sink, gpu=False):
+    """The resource on this rank's share of a split step against the same resource running it
+    whole on one rank: the conv and recurrence outputs (exact for ulysses on CPU, within tolerance
+    for state_passing and the GPU's bf16), and the pool's state and conv windows, alike bit for
+    bit on every rank."""
+    device = torch.device("cuda", rank) if gpu else CPU
+    n = sum(span for span, _, _ in layout)
+    x, weight, gates, params = _linear_inputs(variant, n, device, torch.bfloat16 if gpu else torch.float32)
+    ref, ref_layers, _ = _linear(variant, sink=sink, device=device)
+    # a clone: the one-token conv update writes its output over its input
+    want_conv, want = _linear_step(ref, ref_layers, variant, layout, walk, x.clone(), weight, gates, params)
+    manager, layers, shard = _linear(variant, (rank, world), exchange, sink, device)
+    got_conv, got = _linear_step(manager, layers, variant, layout, walk, x, weight, gates, params, shard)
+    r = SeqRange(shard.group, tuple(sp_seq_split(n, world)), None)
+    tol = dict(rtol=2e-2, atol=2e-2) if gpu else {} if exchange == "ulysses" else dict(rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(got_conv, r.local(want_conv), **(tol if gpu else {}))
+    torch.testing.assert_close(got, r.local(want), **tol)
+    for name, layer in layers.items():
+        torch.testing.assert_close(layer, ref_layers[name], **tol)
+        everyone = shard.group.all_gather(layer[None].contiguous(), dim=0)
+        assert all(torch.equal(other, layer) for other in everyone), f"{name} replicas differ"
+
+
+# (span, slot, has_state) a row
+_FRESH_AND_CONTINUING = [(7, 3, False), (1, 5, True), (2, 6, True), (9, 7, True)]
+_MIXED = [(1, 2, True), (1, 4, True), (6, 5, True), (1, 8, False), (5, 9, False)]
+
+
+@pytest.mark.parametrize("exchange", ["ulysses", "state_passing"])
+@pytest.mark.parametrize("variant, world, layout, walk, sink", [
+    ("gdn", 2, _FRESH_AND_CONTINUING, "prefill", True),
+    # a row wholly on rank 0, pieces shorter than the conv window, a rank holding a middle piece
+    ("gdn", 3, _FRESH_AND_CONTINUING, "prefill", True),
+    ("gdn", 3, [(2, 3, True), (12, 4, True), (2, 5, False)], "prefill", True),
+    # the decode run runs copied, the prompt rows split; the sink off, slot 0 a request's
+    ("gdn", 2, _MIXED, "mixed", True),
+    ("gdn", 3, [(1, 0, True), (1, 4, True), (9, 5, True), (4, 9, False)], "mixed", False),
+    # one B/C group under three ranks
+    ("mamba2", 3, _FRESH_AND_CONTINUING, "prefill", True),
+    ("mamba2", 3, [(2, 3, True), (12, 4, True), (2, 5, False)], "prefill", False),
+], ids=["gdn-2", "gdn-3", "gdn-3-middle-piece", "gdn-2-mixed", "gdn-3-mixed-sink-off", "mamba2-3",
+        "mamba2-3-middle-piece-sink-off"])
+def test_a_recurrent_layer_on_a_split_step_matches_one_rank(tmp_path, variant, world, layout, walk, sink, exchange):
+    _run(_linear_split, world, tmp_path / "store", variant, exchange, layout, walk, sink)
+
+
+def _nccl_entry(rank, fn, world, store_path, args):
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=f"file://{store_path}", rank=rank, world_size=world)
+    try:
+        fn(rank, world, *args)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("exchange", ["ulysses", "state_passing"])
+@pytest.mark.parametrize("layout, walk", [(_FRESH_AND_CONTINUING, "prefill"), (_MIXED, "mixed")],
+                         ids=["prefill", "mixed"])
+def test_two_gpus_run_a_gdn_layer_on_a_split_step_like_one(tmp_path, layout, walk, exchange):
+    """The CPU cases above on FlashInfer's GDN kernels and the Triton conv, over NCCL."""
+    pytest.importorskip("flashinfer")
+    mp.spawn(_nccl_entry, args=(_linear_split, 2, str(tmp_path / "store"),
+                                ("gdn-128", exchange, layout, walk, True, True)), nprocs=2)
+
+
+def test_a_recurrent_layer_plans_after_its_nodes_shard_and_refuses_a_step_without_it():
+    """At one SP rank too: the runner plans the shard first (the resource depends on it), and a
+    step that doesn't declare it raises rather than planning copied."""
+    from mstar.engine.resources.linear_attn.config import LinearAttnStep
+    from mstar.engine.resources.recurrent.pool import RecurrentAddressing
+    from mstar.engine.resources.runner import topo_sort
+
+    manager, _, _ = _linear("gdn")
+    manager._shard_key = "llm_shard"
+    order = topo_sort({"linear_attn": manager, "llm_shard": _shard(world=1), "state": _shard(world=1)})
+    assert order.index("llm_shard") < order.index("linear_attn")
+    ctx = StepContext(request_ids=("r0",), graph_walk="prefill", slot=0, capture=False)
+    ctx.plan_results["state"] = {"main": RecurrentAddressing(
+        torch.tensor([3], dtype=torch.int32), torch.tensor([False]), 1, (3,), (False,),
+    )}
+    with pytest.raises(ValueError, match="doesn't declare"):
+        manager.plan(LinearAttnStep(segments=(Segment("r0", "main", 4),)), ctx)
+
+
 @pytest.mark.parametrize("placed, choice, want", [
     (True, None, (False, False, None, "none")),
     (True, "all_gather", (True, True, None, "ulysses")),
@@ -549,7 +742,6 @@ def test_the_shard_reads_the_same_split_from_its_nodes_specs_in_any_order(placed
     import itertools
 
     from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
-    from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 
     blocks = DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=8, head_v_dim=8, conv_kernel_size=4).to_blocks()
     for order in itertools.permutations(range(5)):

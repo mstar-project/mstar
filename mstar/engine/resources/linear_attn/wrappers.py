@@ -395,7 +395,10 @@ class GDNPrefillWrapper(GDNWrapper):
         conv_layer.index_copy_(0, index[2], x[window].transpose(1, 2).to(conv_layer.dtype))
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        if q.device.type == "cpu":
+            from mstar.engine.resources.linear_attn.gdn_cpu import chunk_gated_delta_rule
+        else:
+            from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
         slots = self._plan_state.slots.to(torch.int64)
 
@@ -567,7 +570,10 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):
-        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+        if q.device.type == "cpu":
+            from mstar.engine.resources.linear_attn.gdn_cpu import gated_delta_rule_decode_pretranspose
+        else:
+            from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
         # Uninitialized output: the kernel writes every row, except one whose
         # slot is -1 (only with the sink off), which it would leave as found.
@@ -709,6 +715,13 @@ class GDNMixedWrapper(GDNWrapper):
         self._num_seqs = 0
         # where the chunked half's tokens start: past the decode run eagerly
         self._front = 0
+
+    @property
+    def halves(self) -> tuple[GDNDecodeWrapper, GDNPrefillWrapper, int]:
+        """The decode half, the chunked half, and the step's token the chunked half starts at
+        (past the decode run eagerly), which a step split over SP ranks runs apart
+        (`GDNManager.run`)."""
+        return self._decode, self._prefill, self._front
 
     def _buf(self, name: str, n: int, dtype: torch.dtype) -> torch.Tensor:
         """A device index buffer, sized once to the bucket under capture."""

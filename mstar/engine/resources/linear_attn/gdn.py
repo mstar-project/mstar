@@ -12,10 +12,18 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 
+import numpy as np
 import torch
 
+from mstar.distributed.communication import gather_sequence
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
-from mstar.engine.resources.linear_attn.base import LinearAttnManager
+from mstar.engine.resources.linear_attn.base import (
+    LinearAttnManager,
+    SplitRows,
+    finals_by_rank,
+    gather_rows,
+    scatter_rows,
+)
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
@@ -32,9 +40,11 @@ from mstar.engine.resources.recurrent.pool import (
     RecurrentStatePool,
     checkpoint_rows,
 )
+from mstar.engine.resources.sequence_shard import state_passing
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +62,8 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 
 class GDNManager(LinearAttnManager):
+    supports_split_steps = True
+
     def __init__(
         self,
         config: LinearAttnConfig,
@@ -100,11 +112,13 @@ class GDNManager(LinearAttnManager):
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
 
         self._current: dict[str, GDNWrapper] = {}
+        # label -> this rank's share of it, for a label the step splits over SP ranks
+        self._split_rows: dict[str, SplitRows] = {}
 
         # Pre-planning mutates no live state, so staging is just caching the
         # result.
         self._preplanned = False
-        self._cached_plan_output: dict[str, GDNWrapper] | None = None
+        self._cached_plan_output: tuple[dict[str, GDNWrapper], dict[str, SplitRows]] | None = None
 
     @staticmethod
     def _check_state_dtype(
@@ -139,11 +153,8 @@ class GDNManager(LinearAttnManager):
                 "them. Unset RecurrentStateConfig.disable_sink_slot."
             )
 
-    def depends_on(self) -> set[str]:
-        # the pool plans first; its addressing arrives via `ctx.plan_results`
-        return {self._pool_key}
-
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        super().bind_dependencies(resources)
         self._pool = resources.get(self._pool_key)
 
     # Step lifecycle
@@ -159,20 +170,27 @@ class GDNManager(LinearAttnManager):
         )
         self.reset_default_cursors()
         if self._preplanned:
-            self._current = self._cached_plan_output
+            self._current, self._split_rows = self._cached_plan_output
             self.clear_preplan()
             return self._current
 
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
 
-        self._current = {}
+        self._current, self._split_rows = {}, {}
         for label, segments in self._group_by_label(step.segments or ()).items():
-            self._current[label] = self._build_plan(
+            wrapper = self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
+            # an eager split walk's step runs its leading decode rows apart (`GDNMixedWrapper`)
+            run = wrapper.halves[2] if isinstance(wrapper, GDNMixedWrapper) else 0
+            split = self._plan_split(label, [seg.span for seg in segments], addressing[label], ctx, run)
+            if split is not None:
+                # a leased step plans copied where a linear layer splits (`captures_split_steps`)
+                assert ctx.slot_lease is None, "a leased step split for a linear attention"
+                self._split_rows[label] = split
         if ctx.is_preplan:
             self._preplanned = True
-            self._cached_plan_output = self._current
+            self._cached_plan_output = self._current, self._split_rows
         return self._current
 
     def clear_preplan(self):
@@ -352,7 +370,10 @@ class GDNManager(LinearAttnManager):
         it (see `GDNWrapper.qk_l2norm_in_kernel`).
         """
         plan = self.current_plan(label)
-        if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
+        split = self._split_rows.get(self._default_label if label is None else label)
+        # a split step's hand-off runs the chunked kernel itself, which normalizes nothing
+        in_kernel = plan.qk_l2norm_in_kernel and (split is None or self._split_exchange == "ulysses")
+        if self.config.qk_l2norm and not in_kernel:
             q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
             k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
         # a split projection gives column views; copy only for a kernel that
@@ -361,8 +382,111 @@ class GDNManager(LinearAttnManager):
             v = v.contiguous()
             a = a.contiguous()
             b = b.contiguous()
+        if split is None:
+            return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
+        decode, prefill, _ = plan.halves if isinstance(plan, GDNMixedWrapper) else (None, plan, 0)
+        if split.run:
+            # the decode run, copied: every rank runs it on every head, in place on its replica
+            decode = decode.run(*self._decode_slab(split, q, k, v, a, b), state_layer, a_log, dt_bias)
+        else:
+            decode = None
+        exchange = self._ulysses if self._split_exchange == "ulysses" else self._state_passing
+        out = exchange(prefill, split, q, k, v, a, b, state_layer, a_log, dt_bias)
+        if decode is not None:
+            # this rank's tokens of the run lead its share
+            rank, counts = split.range.group.rank, split.decode_tokens
+            start = sum(counts[:rank])
+            out[: counts[rank]] = decode[start:start + counts[rank]].to(out.dtype)
+        return out
 
-        return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
+    def _ulysses(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
+        """A split step's prompt rows by head: every token of a block of heads, the chunked half
+        run on it over the replica's head block, the block's final states gathered into every
+        replica, and the output back by token. The decode run's tokens ride the exchange; the
+        chunked half (planned eagerly past the run) doesn't read them."""
+        r = split.range
+        group, world = r.group, r.group.world_size
+        heads = state_layer.shape[1] // world
+        lo, hi = group.rank * heads, (group.rank + 1) * heads
+        q, k, v, a, b = group.all_to_all([q, k, v, a, b], scatter_dim=1, gather_dim=0, gather_sizes=list(r.counts))
+        front = split.run
+        block = state_layer[:, lo:hi]
+        out = prefill.run(
+            q[front:], k[front:], v[front:], a[front:], b[front:], block, a_log[lo:hi], dt_bias[lo:hi],
+        )
+        slots = prefill._plan_state.slots
+        scatter_rows(state_layer, slots, group.all_gather(block.index_select(0, slots.long().clamp_min(0)), dim=1))
+        if front:
+            out = torch.cat([out.new_zeros(front, *out.shape[1:]), out])
+        return group.all_to_all(out, scatter_dim=0, gather_dim=1, scatter_sizes=list(r.counts))
+
+    def _state_passing(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
+        """A split step's prompt rows by token (``sequence_shard.state_passing``): each rank runs
+        the rows starting on it from their slots, hands off the row it passes on (its final, or for
+        a middle piece the piece's transition from the identity with no values and its offset from
+        zeros, which needs equal key and value dims), runs a row continuing into it from the state
+        it gets, and every row's final state is gathered into every replica."""
+        group, rank = split.range.group, split.range.group.rank
+        pieces, run = split.pieces, split.run
+        mine = pieces[rank]
+        offsets = np.cumsum(mine) - mine
+        rows = [i for i in range(run, len(mine)) if mine[i]]
+        starts = {i: not pieces[:rank, i].any() for i in rows}
+        ends = {i: not pieces[rank + 1:, i].any() for i in rows}
+        alpha = torch.exp(-torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float()))
+        beta = torch.sigmoid(b.float())
+        heads, dim_v, dim_k = state_layer.shape[1:]
+        out = v.new_zeros(v.shape[0], heads, dim_v)
+        finals: dict[int, torch.Tensor] = {}
+
+        def chunked(chosen: list[int], initial: torch.Tensor, zero_values: bool = False) -> torch.Tensor:
+            # the chunked kernel over `chosen` rows' pieces here, a sequence each (twice over with
+            # `zero_values`: the second time with no values); never on an empty set, on which the
+            # kernel deadlocks while the other ranks wait in the hand-off
+            index = np.concatenate([np.arange(offsets[i], offsets[i] + mine[i]) for i in chosen])
+            spans = [mine[i] for i in chosen]
+            if zero_values:
+                index, spans = np.concatenate([index, index]), spans * 2
+            index_t = to_device_nonblocking(index, q.device, torch.int64)
+            values = v.index_select(0, index_t)
+            if zero_values:
+                values[len(index) // 2:] = 0
+            cu = to_device_nonblocking(np.concatenate([[0], np.cumsum(spans)]), q.device, torch.int64)
+            got, final = _chunked_kernel(q.device)(
+                q=q.index_select(0, index_t), k=k.index_select(0, index_t), v=values,
+                g=alpha.index_select(0, index_t), beta=beta.index_select(0, index_t), scale=self.config.sm_scale,
+                initial_state=initial.to(self._prefill_dtype), output_final_state=True, cu_seqlens=cu,
+                use_qk_l2norm_in_kernel=False,
+            )
+            if not zero_values:
+                for i, start in zip(chosen, np.cumsum([0, *spans[:-1]]), strict=True):
+                    out[offsets[i]:offsets[i] + mine[i]] = got[start:start + mine[i]].to(out.dtype)
+                    finals[i] = final[chosen.index(i)].float()
+            return final.float()
+
+        fresh = [i for i in rows if starts[i]]
+        if fresh:
+            index = to_device_nonblocking(fresh, q.device, torch.int64)
+            chunked(fresh, gather_rows(state_layer, split.slots[index], split.has_state[index]))
+        identity = torch.eye(dim_k, device=q.device).expand(heads, dim_k, dim_k)
+        transition, offset = identity, state_layer.new_zeros(heads, dim_v, dim_k, dtype=torch.float32)
+        if rows and not ends[rows[-1]]:
+            last = rows[-1]
+            if starts[last]:
+                transition, offset = torch.zeros_like(identity), finals[last]
+            else:
+                # a middle piece: its offset from zeros, its transition from the identity with no values
+                offset, transition = chunked([last], torch.stack([torch.zeros_like(identity), identity]), True)
+        entering = state_passing(group, transition, offset, torch.matmul)
+        if rows and not starts[rows[0]]:
+            chunked([rows[0]], entering[None])
+        # every prompt row's final state, gathered from the rank it ends on
+        ended, counts = finals_by_rank(pieces, run)
+        local = [finals[i] for i in rows if ends[i]]
+        mine_finals = torch.stack(local) if local else offset.new_zeros(0, heads, dim_v, dim_k)
+        slots = split.slots.index_select(0, to_device_nonblocking(ended, q.device, torch.int64))
+        scatter_rows(state_layer, slots, gather_sequence(group, mine_finals, counts))
+        return out
 
     @torch.compiler.disable
     def run_conv(
@@ -382,6 +506,9 @@ class GDNManager(LinearAttnManager):
         in place. Padding rows carry the pool's null slot, which both conv
         kernels skip.
         """
+        label = self._default_label if label is None else label
+        if label in self._split_rows:
+            return self._conv_split(label, x, conv_layer, weight, bias, activation)
         return self.current_plan(label).run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
             activation=activation,
@@ -402,4 +529,14 @@ class GDNManager(LinearAttnManager):
         self._cg_wrappers.clear()
         self._eager_wrappers.clear()
         self._current.clear()
+        self._split_rows.clear()
         self._checkpoints = None
+
+
+def _chunked_kernel(device: torch.device):
+    """FlashInfer's chunked GDN prefill, or its torch stand-in on a CPU tensor."""
+    if device.type == "cpu":
+        from mstar.engine.resources.linear_attn.gdn_cpu import chunk_gated_delta_rule
+    else:
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    return chunk_gated_delta_rule
