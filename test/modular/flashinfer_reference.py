@@ -28,8 +28,9 @@ def reference_attention(q, k, v, causal=True):
 def reference_flashinfer() -> types.ModuleType:
     """FlashInfer's paged prefill/decode and ragged wrappers, with their lse bases. A paged plan
     refuses a row FlashInfer's split-KV planner would miscount: no pages, or a last page holding no
-    slot (see ``ContextParallel.local_indptrs``). The ragged one attends each row's queries over its
-    own keys (``kv_indptr``), and reads keys past its plan as FA3 does."""
+    slot (see ``ContextParallel.local_indptrs``); and a causal row with more queries than keys,
+    whose first queries FlashInfer's bottom-right mask leaves none. The ragged one attends each
+    row's queries over its own keys (``kv_indptr``), and reads keys past its plan as FA3 does."""
     fi = types.ModuleType("flashinfer")
 
     class Paged:
@@ -49,6 +50,9 @@ def reference_flashinfer() -> types.ModuleType:
                 assert end > start and 1 <= tail <= page_size and length == (end - start - 1) * page_size + tail
             self.qo = qo_indptr.tolist() if qo_indptr is not None else list(range(len(last) + 1))
             self.causal = causal
+            assert not causal or all(
+                b - a <= length for (a, b), (_, _, length) in zip(itertools.pairwise(self.qo), self.rows, strict=True)
+            ), "a causal row with more queries than keys"
 
         def run(self, q, kv, return_lse=False, lse_base=None):
             outs, lses = [], []

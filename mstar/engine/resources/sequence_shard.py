@@ -2,10 +2,11 @@
 reaches the tokens it needs when they do.
 
 A node's SP ranks share each step one of two ways. Its tokens are **split** (each rank runs the
-token-local layers on its contiguous share) or **copied** (every rank runs them all). The sequence
-shard resource (``SeqShardSpec``) decides which, per step, from the step the model declares, and
-gives each listed label its per-rank ranges. A model brackets its layer stack with
-``scatter`` / ``gather`` on that resource; nothing else in model code changes.
+token-local layers on its share) or **copied** (every rank runs them all). The sequence shard
+resource (``SeqShardSpec``) decides which, per step, from the step the model declares, and gives
+each listed label its per-rank ranges (``SeqRange``): contiguous, or on a node whose attention
+runs the ring, striped by KV position. A model brackets its layer stack with ``scatter`` /
+``gather`` on that resource; nothing else in model code changes.
 
 The attention resources over the node depend on it (``shard_key``, taken in their specs'
 ``derive``) and pick an exchange per label from its plan: what their storage needs to attend a
@@ -13,12 +14,16 @@ split label's tokens, or a copied label's at the node's head geometry. The excha
 functions at the bottom of this module, each wrapped around the resource's own ``run``:
 
 - ``ulysses``: one all-to-all from tokens to heads, ``run``, and one back (head-stored KV, or a
-  cacheless attention declaring ``sp_exchange="ulysses"``); a splitting node can't yet store KV
-  by position (``context_parallel``);
+  cacheless attention declaring ``sp_exchange="ulysses"``);
+- ``all_gather``: every rank's q, k and v gathered, ``run`` as on a copied step, this rank's share
+  of the output (KV stored by position, ``context_parallel``);
 - ``head_slice``: a copied step at a ``tp * sp`` head geometry: this rank's heads, ``run``, gather
   the heads;
 - ``sharded_key_merge``: copied queries over split keys (cacheless cross-attention): each rank's
   partial with its log-sum-exp, merged.
+
+The ring over KV stored by position (``sp_exchange: ring``) isn't one of them: it writes and
+attends through the KV resource itself (``AttentionManager.exchange``, ``RingAttentionWrapper``).
 
 ``sequence_parallel_refusals`` is what a node on SP ranks may not declare; the engine and
 ``validate_deployment`` both run it.
@@ -26,17 +31,20 @@ functions at the bottom of this module, each wrapped around the resource's own `
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.distributed.communication import CommGroup, gather_sequence, sp_seq_split
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.context_parallel import gather_merge, position_pools
+from mstar.engine.resources.context_parallel import gather_merge, position_pools, stripe_owners
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, StepContext
+from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -64,12 +72,19 @@ class SeqShardSpec(NodeResourceSpec):
 
     The attention and position resources on the node take this as a dependency in their own
     ``derive``, so every ``declare_step`` branch of the node declares a ``SeqShardStep``; at one
-    SP rank it plans copied at no cost."""
+    SP rank it plans copied at no cost.
+
+    Two fields are derived from the attentions on its nodes as configured (``derive``):
+    ``splits``, whether any of them takes split steps (every one's ``sp_exchange`` ``none`` makes
+    the node run copied, as one without a shard), and ``stripe_pool``, the pool a ring attention
+    reads, by whose stored positions each step is striped."""
 
     labels: tuple[str, ...]
     axis: int
     walks: Collection[str] | None = None
     min_tokens: int = field(default=0, kw_only=True)
+    splits: bool = field(default=True, init=False, repr=False)
+    stripe_pool: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -92,7 +107,27 @@ class SeqShardSpec(NodeResourceSpec):
 
     @property
     def splits_steps(self) -> bool:
-        return True
+        return self.splits
+
+    def depends_on(self) -> set[str]:
+        # a striped step plans from each row's stored length, which the pool's plan holds. A
+        # dependency of the shard, not of the pool, so the pool's prefix cache stays open
+        # (`opening_prefix_caches` reads a cache keeper's own dependencies alone)
+        return set() if self.stripe_pool is None else {self.stripe_pool}
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        # from raw fields alone, so it doesn't matter which spec derives first
+        from mstar.engine.resources.attn.config import AttentionSpec
+
+        attentions = [spec for spec in specs.values() if spec.nodes & self.nodes and spec.attends_split_steps]
+        # a kind that takes split steps; a paged one's unset sp_exchange is derived from its pool
+        self.splits = any(spec.sp_exchange != "none" for spec in attentions)
+        rings = [spec for spec in attentions if isinstance(spec, AttentionSpec) and spec.sp_exchange == "ring"]
+        pools = sorted({spec.config.kv_cache for spec in rings})
+        self.stripe_pool = pools[0] if len(pools) == 1 else None
+        if len(pools) > 1:
+            return [f"its ring attentions read KV pools {pools}, whose stored positions would stripe a step two ways"]
+        return []
 
     def apply_yaml_overrides(self, min_tokens: int | None = None):
         """The step size below which a node runs copied: a deployment's trade between the
@@ -106,7 +141,7 @@ def take_shard_edge(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec
     """Set ``spec.shard_key`` to the ``SeqShardSpec`` over its nodes, if any (a ``derive``).
     A shard sharing only some of ``spec``'s nodes is a problem: the spec would split on some of
     its nodes and not others."""
-    shards = [other for other in specs.values() if other.splits_steps and other.nodes & spec.nodes]
+    shards = [other for other in specs.values() if isinstance(other, SeqShardSpec) and other.nodes & spec.nodes]
     spec.shard_key = None
     if not shards:
         return []
@@ -127,16 +162,15 @@ def take_shard_edge(spec: NodeResourceSpec, specs: Mapping[str, NodeResourceSpec
 
 class SeqRange(NamedTuple):
     """One label's split over the SP ranks: each rank's count of its tokens (of each row's, for a
-    ``[B, S, ...]`` layout), contiguous in rank order."""
+    ``[B, S, ...]`` layout), and which they are: contiguous in rank order, or ``order``."""
 
     group: CommGroup
     counts: tuple[int, ...]
     # B of a [B, S, ...] layout split along S (axis 1); None for a packed label (axis 0)
     rows: int | None
-
-    @property
-    def start(self) -> int:
-        return sum(self.counts[: self.group.rank])
+    # striped (`SeqShardSpec.stripe_pool`): the step's token indices, rank 0's then rank 1's and
+    # on, each rank's in step order, on the device; None for contiguous ranges
+    order: torch.Tensor | None = None
 
     @property
     def count(self) -> int:
@@ -146,6 +180,26 @@ class SeqRange(NamedTuple):
     def local_tokens(self) -> int:
         """The tokens this rank holds of the label, as a packed tensor's first dim."""
         return self.count * (self.rows or 1)
+
+    @property
+    def index(self) -> torch.Tensor:
+        """Striped: this rank's tokens' indices in the step."""
+        start = sum(self.counts[: self.group.rank])
+        return self.order[start:start + self.count]
+
+    def local(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        """This rank's share of ``x`` (the whole label) along ``dim``: a view of a contiguous range,
+        which a captured graph reads in place; a copy of a striped one, as a kernel takes it."""
+        if self.order is None:
+            return x.narrow(dim, sum(self.counts[: self.group.rank]), self.count)
+        return x.index_select(dim, self.index)
+
+    def whole(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        """``local``'s inverse: every rank's share of ``x`` gathered, in step order."""
+        out = gather_sequence(self.group, x, self.counts, dim)
+        if self.order is None:
+            return out
+        return torch.empty_like(out).index_copy_(dim, self.order, out)
 
 
 class SeqShardPlan(NamedTuple):
@@ -161,17 +215,21 @@ COPIED = SeqShardPlan(False, {})
 class SequenceShard(Resource):
     """Plans each step split or copied (``SeqShardSpec``) and brackets the layer stack with
     ``scatter`` / ``gather``. Holds no per-request state and no device buffers: its plan is
-    host-only, from the declared step and the lease, the same on every rank. Off its defaults:
+    from the declared step, the lease and (striped) the pool's plan, the same on every rank; a
+    striped step's ``order`` is copied to the device with it. Off its defaults:
     ``prefix_skip_safe`` (it plans from the step a prefix hit already trimmed), ``supports_preplan``
-    (its dependents pre-plan); it keeps ``supports_context_parallel`` False (it depends on no pool),
-    ``can_capture`` True and ``force_double_buffer`` False (nothing staged)."""
+    (its dependents pre-plan), ``supports_context_parallel`` (a striped shard reads a placed pool's
+    plan); it keeps ``can_capture`` True and ``force_double_buffer`` False (a leased step, the
+    only kind a pre-plan stages, never stripes)."""
 
     prefix_skip_safe = True
     supports_split_steps = True
+    supports_context_parallel = True
 
     def __init__(
         self, labels: tuple[str, ...], axis: int, walks: frozenset[str] | None, min_tokens: int,
-        group: CommGroup,
+        group: CommGroup, splits: bool = True, stripe_pool: str | None = None,
+        device: torch.device = torch.device("cpu"),
     ):
         self.labels = labels
         self.axis = axis
@@ -179,8 +237,12 @@ class SequenceShard(Resource):
         self.walks = walks
         self.min_tokens = min_tokens
         self.group = group
-        # fixed at bind, so a compiled frame at one SP rank traces the bracket straight through
-        self.can_split = group.world_size > 1
+        # `SeqShardSpec.stripe_pool`
+        self.stripe_pool = stripe_pool
+        self._device = device
+        # fixed at bind, so a compiled frame at one SP rank (or on a node whose attentions take no
+        # split steps) traces the bracket straight through
+        self.can_split = group.world_size > 1 and splits
         self._current: SeqShardPlan | None = None
         self._pending: SeqShardPlan | None = None
         self._preplanned = False
@@ -194,7 +256,12 @@ class SequenceShard(Resource):
         joint = info.joint_comm_group
         group = joint.sp_group if joint is not None else CommGroup.trivial()
         walks = None if spec.walks is None else frozenset(spec.walks)
-        return cls(spec.labels, spec.axis, walks, spec.min_tokens, group)
+        return cls(
+            spec.labels, spec.axis, walks, spec.min_tokens, group, spec.splits, spec.stripe_pool, info.device,
+        )
+
+    def depends_on(self) -> set[str]:
+        return set() if self.stripe_pool is None else {self.stripe_pool}
 
     @property
     def supports_preplan(self):
@@ -270,6 +337,10 @@ class SequenceShard(Resource):
         if bucket is not None and not ctx.force_prefill and bucket.bs == bucket.num_tokens:
             # a batched decode replay, which declares its bucket: copied in O(1)
             return COPIED
+        if bucket is not None and self.stripe_pool is not None:
+            # the ring runs eager only; the lease is the instance's capture decision, so every
+            # rank plans the step copied alike
+            return COPIED
         sp = self.group.world_size
         segments = step.segments or ()
         tokens = sum(segment.span for segment in segments)
@@ -304,6 +375,8 @@ class SequenceShard(Resource):
                 )
             if (min(label_spans) if self.axis == 1 else sum(label_spans)) < sp:
                 return COPIED
+        if self.stripe_pool is not None:
+            return self._striped(spans, step, ctx)
         ranges = {label: self._range(label_spans) for label, label_spans in spans.items()}
         for sources, plan_label in step.combined_labels.items():
             listed = [source in self.labels for source in sources]
@@ -320,6 +393,42 @@ class SequenceShard(Resource):
                 if self.axis == 1 and len(set(combined)) > 1:
                     raise ValueError(f"combined label {plan_label!r}'s rows must be one length; got {combined}")
                 ranges[plan_label] = self._range(combined)
+        return SeqShardPlan(True, ranges)
+
+    def _striped(self, spans: Mapping[str, list[int]], step: SeqShardStep, ctx: StepContext) -> SeqShardPlan:
+        """Each listed label's tokens to the rank storing their KV position (`stripe_owners`), from
+        each row's stored length in the pool's plan; copied if a rank would get none of a label.
+        Every input is the instance's own (the step and the pool's plan), so every rank decides
+        alike."""
+        if any(source in self.labels for sources in step.combined_labels for source in sources):
+            raise ValueError(
+                f"sequence shard {self.labels} stripes by KV {self.stripe_pool!r}'s stored positions, which a "
+                f"combined label's rows ({sorted(step.combined_labels.values())}) don't have"
+            )
+        pool = ctx.plan_results.get(self.stripe_pool) or {}
+        world = self.group.world_size
+        ranges = {}
+        for label, label_spans in spans.items():
+            plan = pool.get(label)
+            if plan is None:
+                raise ValueError(
+                    f"sequence shard {self.labels} stripes {label!r} by KV {self.stripe_pool!r}'s stored positions, "
+                    "and this step plans no such label there"
+                )
+            indptrs = plan.cpu_indptrs
+            qo = indptrs.qo_indptr.numpy()
+            lens = np.diff(qo)
+            if lens.tolist() != label_spans:
+                raise ValueError(
+                    f"label {label!r}'s rows are {label_spans} in the step and {lens.tolist()} in KV "
+                    f"{self.stripe_pool!r}'s plan"
+                )
+            owners = stripe_owners(qo, indptrs.kv_lens.numpy() - lens, world)
+            counts = np.bincount(owners, minlength=world)
+            if not counts.all():
+                return COPIED
+            order = to_device_nonblocking(np.argsort(owners, kind="stable"), self._device, torch.int64)
+            ranges[label] = SeqRange(self.group, tuple(counts.tolist()), None, order)
         return SeqShardPlan(True, ranges)
 
     def _range(self, spans: list[int]) -> SeqRange:
@@ -339,7 +448,8 @@ class SequenceShard(Resource):
 
     def scatter(self, label: str, *xs: torch.Tensor | None, dim: int | None = None):
         """This rank's share of each of ``xs`` (whole on every rank) along ``dim`` (the spec's
-        axis by default), a view, when this step splits ``label``; the inputs unchanged otherwise.
+        axis by default), when this step splits ``label`` (``SeqRange.local``); the inputs
+        unchanged otherwise.
         One tensor in, one out; several in, a tuple out. None passes through."""
         if not self.can_split:
             return xs[0] if len(xs) == 1 else xs
@@ -366,10 +476,10 @@ class SequenceShard(Resource):
         dim = self.axis if dim is None else dim
         if scatter:
             self._scattered.add(label)
-            out = tuple(None if x is None else x.narrow(dim, r.start, r.count) for x in xs)
+            out = tuple(None if x is None else r.local(x, dim) for x in xs)
         else:
             self._scattered.discard(label)
-            out = tuple(None if x is None else gather_sequence(self.group, x, r.counts, dim) for x in xs)
+            out = tuple(None if x is None else r.whole(x, dim) for x in xs)
         return out[0] if len(out) == 1 else out
 
     def check_scattered(self, label: str) -> None:
@@ -447,6 +557,20 @@ def ulysses(run: Callable, q, k, v, r: SeqRange):
     return _packed(out, r)
 
 
+def all_gather(run: Callable, q, k, v, r: SeqRange):
+    """Every rank's q, k and v gathered whole in one collective, in the step's order whatever the
+    label's layout, ``run`` on them as on a copied step, then this rank's share of the output."""
+    _check_entry(r, q, k, v)
+    assert r.rows is None and len({q.dtype, k.dtype, v.dtype}) == 1, (
+        "all_gather takes a packed label's q, k and v of one dtype"
+    )
+    parts = (q, k, v)
+    whole = r.whole(torch.cat([x.flatten(1) for x in parts], dim=-1))
+    pieces = whole.split([math.prod(x.shape[1:]) for x in parts], dim=-1)
+    gathered = [piece.unflatten(-1, x.shape[1:]).contiguous() for piece, x in zip(pieces, parts, strict=True)]
+    return r.local(run(*gathered))
+
+
 def head_slice(run: Callable, q, k, v, group: CommGroup):
     """A copied step at a ``tp * sp`` head geometry: this rank's block of q, k and v's heads (the
     block an all-to-all routes it), ``run``, and every rank's heads of the output gathered."""
@@ -489,20 +613,27 @@ def sequence_parallel_refusals(
         placed = any(position_pools(specs, node).values())
     except ValueError as e:
         return [str(e)]
-    shard = next((spec for spec in specs if spec.splits_steps), None)
-    if shard is None:
+    shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
+    if shard is not None and not any(spec.attends_split_steps for spec in specs):
+        return [
+            f"node {node!r} splits tokens (SeqShardSpec {shard.resource_key!r}) but declares no attention that "
+            "can take them: a paged AttentionSpec, or a RaggedAttentionSpec with sp_exchange"
+        ]
+    if shard is None or not shard.splits:
+        # as a node without a shard: its steps run copied (`SeqShardSpec.splits`)
         if placed:
             return []
+        if shard is not None:
+            return [
+                f"node {node!r} runs on {sp} SP ranks, and every attention there has sp_exchange none, so its "
+                "steps never split and its SP ranks would only share heads: store its KV by position "
+                "(context_parallel) or run it on TP ranks"
+            ]
         return [
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "
             "KV by position (context_parallel on its paged KV pools)"
         ]
     refusals = []
-    if not any(spec.attends_split_steps for spec in specs):
-        refusals.append(
-            f"node {node!r} splits tokens (SeqShardSpec {shard.resource_key!r}) but declares no attention that "
-            "can take them: a paged AttentionSpec, or a RaggedAttentionSpec with sp_exchange"
-        )
     for spec in specs:
         refusals += spec.split_step_refusals(node, shard, tp, sp)
     if moe_parallel is not None and moe_parallel.parallel == "ep":

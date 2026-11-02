@@ -312,7 +312,7 @@ class FlashInferManager(AttentionManager):
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
-        self._check_sequence_shard(ctx)
+        shard_plan = self._check_sequence_shard(ctx)
         if self._group_idx:
             plan_outputs = plan_outputs.groups[self._group_idx]
 
@@ -324,6 +324,13 @@ class FlashInferManager(AttentionManager):
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
+            r = self._split_range(shard_plan, label)
+            if r is not None and self._split_exchange == "ring":
+                assert lease is None, "a striped sequence shard plans a leased step copied"
+                wrapper = self._ring_wrapper(label, ctx.slot)
+                wrapper.plan(kv_out, r.counts)
+                plan_states[label] = wrapper
+                continue
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)

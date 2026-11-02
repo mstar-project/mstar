@@ -36,7 +36,7 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, WorkerGraph
@@ -323,10 +323,27 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     ([_shard(), _attention()], dict(sp_size=4), {},
      r"node_groups\[0\]: node 'llm' splits tokens over 4 SP ranks, and KV 'kv' stores 4 query and 2 KV heads by "
      r"head, which don't split 4 ways per TP rank"),
-    # split tokens over KV stored by position: not yet
-    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}},
-     r"node_groups\[0\]: node 'llm' splits tokens over 2 SP ranks, and KV 'kv' stores them by position "
-     r"\(context_parallel\), which split steps don't support yet"),
+    # each row split over KV stored by position
+    ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}},
+     r"node_groups\[0\]: node 'llm' splits each row of its steps \(axis 1\) over 2 SP ranks, and KV 'kv' stores "
+     r"them by position"),
+    # sp_exchange against the pool's storage, at any SP size
+    ([_shard(), _attention()], dict(sp_size=1), {"attn": {"sp_exchange": "ring"}},
+     r"resources.attn: sp_exchange 'ring' needs KV 'kv' stored by position \(context_parallel: true\)"),
+    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "all_gather"}},
+     r"resources.attn: sp_exchange 'all_gather' needs KV 'kv' stored by position"),
+    ([_shard(), _attention()], dict(sp_size=2), {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ulysses"}},
+     r"resources.attn: sp_exchange 'ulysses' needs KV 'kv' stored by head \(context_parallel off\)"),
+    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "zigzag"}},
+     r"resources.attn: sp_exchange must be one of none, ulysses, all_gather, ring; got 'zigzag'"),
+    # every attention none over KV stored by head: its SP ranks would only share heads
+    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "none"}},
+     r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and every attention there has sp_exchange none"),
+    # a ring stripes steps by stored position, which Ulysses' ragged plan doesn't read
+    ([_shard(), _attention(), _ulysses(heads=2)], dict(sp_size=2),
+     {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}},
+     r"node_groups\[0\]: ragged attention 'ragged' declares sp_exchange 'ulysses', whose plan reads a split "
+     r"label's tokens in step order, and node 'llm''s sequence shard stripes them by KV 'kv''s positions"),
     ([_shard(), _ulysses(heads=3)], dict(sp_size=2), {},
      r"node_groups\[0\]: ragged attention 'ragged' declares sp_exchange 'ulysses', and its 3 query and 3 KV heads "
      r"don't split over 1 TP x 2 SP ranks"),
@@ -337,8 +354,9 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # the attention spans a node the shard doesn't, so it would split on one and not the other: at any SP size
     ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
      r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
-], ids=["no_attention", "heads_by_head", "split_over_positions", "ulysses_heads", "axis0_cross",
-        "shard_misses_a_node"])
+], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
+        "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
+        "axis0_cross", "shard_misses_a_node"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)
@@ -350,7 +368,11 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
     ([_attention()], {"kv": {"context_parallel": True}}),
     # a strategy for split steps is a no-op on a node that never splits
     ([_ulysses(heads=3), _attention()], {"kv": {"context_parallel": True}}),
-], ids=["heads", "positions_copied", "ulysses_without_a_shard"])
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}}),
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}}),
+    # DCP alone: the node runs copied, as one without a shard
+    ([_shard(), _attention()], {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}),
+], ids=["heads", "positions_copied", "ulysses_without_a_shard", "split_over_positions", "ring", "none"])
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
@@ -362,6 +384,10 @@ def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
         "node 'llm' splits tokens over SP ranks, which expert parallelism (ep_config) can't",
     ]
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig()) == []
+    # a node whose attentions take no split steps runs copied, so it takes what one without a shard does
+    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}})
+    resolve_spec_dependencies(specs)
+    assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == []
 
 
 def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):

@@ -77,11 +77,19 @@ class AttentionConfig:
                 raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
+SP_EXCHANGES = ("none", "ulysses", "all_gather", "ring")
+
+
 @dataclass
 class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
     # the sequence shard over its nodes, if any (`derive`)
     shard_key: str | None = field(default=None, init=False, repr=False)
+    # how a split step's labels reach this attention: a deployment's choice, set only by its
+    # `resources:` block (`apply_yaml_overrides`), never by a model. "ulysses" over KV stored by
+    # head, "all_gather" or "ring" over KV stored by position (`context_parallel`), "none" for no
+    # split steps; None derives it from the pool's storage (ulysses by head, all_gather by position)
+    sp_exchange: str | None = field(default=None, init=False, repr=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
@@ -94,11 +102,17 @@ class AttentionSpec(NodeResourceSpec):
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
-        return take_shard_edge(self, specs)
+        problems = take_shard_edge(self, specs)
+        # a deployment's own setting, so refused at every SP size
+        by_position = {"ulysses": False, "all_gather": True, "ring": True}.get(self.sp_exchange)
+        if by_position is not None and bool(specs[self.config.kv_cache].places_positions) != by_position:
+            storage = "by position (context_parallel: true)" if by_position else "by head (context_parallel off)"
+            problems.append(f"sp_exchange {self.sp_exchange!r} needs KV {self.config.kv_cache!r} stored {storage}")
+        return problems
 
     @property
     def attends_split_steps(self) -> bool:
-        # its exchange follows from its pool's storage
+        # a kind that can; `sp_exchange` none turns it off (`SeqShardSpec.derive`)
         return True
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
@@ -116,13 +130,19 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
+        sp_exchange: str | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
-        model's — an image that cannot build FA3 pins FA2 here.
+        model's — an image that cannot build FA3 pins FA2 here. So is how a
+        split step reaches it over SP ranks (``sp_exchange``).
 
         Cache geometry is not repeated here: it belongs to the KV resource
         this spec depends on, and is tuned under that resource's own block.
         """
+        if sp_exchange is not None:
+            if sp_exchange not in SP_EXCHANGES:
+                raise ValueError(f"sp_exchange must be one of {', '.join(SP_EXCHANGES)}; got {sp_exchange!r}")
+            self.sp_exchange = sp_exchange
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:

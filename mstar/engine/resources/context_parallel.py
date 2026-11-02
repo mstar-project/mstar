@@ -8,6 +8,10 @@ partner ``s % P`` and sits at its physical slot ``s // P``, so each rank stores
 
 Attention over such a pool runs on each rank over its own slots and returns the partial with
 its log-sum-exp; the partners exchange partials and ``merge`` them, exactly.
+
+A step split over SP partners by stored position (``stripe_owners``) attends by passing queries
+round the partners instead (``RingAttentionWrapper``): each rank attends every partner's queries
+over its own slots, causally, and the partials go back to their queries' rank.
 """
 
 import math
@@ -163,6 +167,114 @@ class ContextParallel(NamedTuple):
         heads = out.shape[1] // self.size
         blocks = _pack(out, lse).unflatten(1, (self.size, heads)).transpose(0, 1)
         return _unpack(self._to_partners(blocks), out.dtype)
+
+
+def stripe_owners(qo_indptr: np.ndarray, stored: np.ndarray, size: int) -> np.ndarray:
+    """Which of ``size`` partners stores each of a step's tokens: a row's token ``t`` goes to KV
+    position ``stored + t`` (``stored`` per row, the row's KV before the step), whose slot partner
+    ``(stored + t) % size`` holds, as ``size`` divides the page."""
+    lens = np.diff(qo_indptr).astype(np.int64)
+    row = np.repeat(np.arange(len(lens)), lens)
+    return (stored.astype(np.int64)[row] + np.arange(int(qo_indptr[-1])) - qo_indptr[:-1].astype(np.int64)[row]) % size
+
+
+class RingAttentionWrapper:
+    """A split step's attention over an SP-placed pool by striped pass-Q. The step's tokens are
+    striped over the partners by KV position (``stripe_owners``), so each rank holds the queries
+    whose K/V it writes into its own slots. In round ``i`` a rank attends partner ``(r - i) % P``'s
+    queries over its slots, the stored context and the step's own tokens together, with one causal
+    call; the partial goes back to that partner, which merges it in place (``merge_into``).
+
+    One causal call is exact because a partner's queries in a row sit at KV positions ``p0 + aP``,
+    and this rank's keys at or below ``p`` number ``(p - r) // P + 1``: one more per query, so the
+    kernel's bottom-right causal mask over the local length to the row's last query is the right
+    one. Only a row's first query can see no key here (``p0 < r``); it plans as a row of its own
+    over one sink slot, masked out of the merge (``_masked``), and its own rank always holds a key
+    of it. A row this partner holds no query of is left out of its plan.
+
+    ``paged`` is one eager wrapper over this rank's slots per partner, all planned per step.
+    Eager only: a striped shard plans a leased step copied."""
+
+    # the step attends its own tokens from the pages, which it writes first (`AttentionManager.exchange`)
+    reads_step_kv = True
+
+    def __init__(
+        self, placement: ContextParallel, page_size: int, dtype: torch.dtype, paged: list, device: torch.device,
+    ):
+        assert placement.over_sp and len(paged) == placement.size
+        self._placement, self._page_size, self._dtype, self._device = placement, page_size, dtype, device
+        self._paged = paged
+        # per partner, whether each of its queries' rows holds any of this rank's slots
+        self._valid: list[torch.Tensor] = []
+        self._counts: tuple[int, ...] = ()
+        # the step's global layout, for `FlashInferManager.select_last_hidden`
+        self._qo_indptr_buf = None
+
+    @torch.compiler.disable
+    def plan(self, kv_out, counts: tuple[int, ...]) -> None:
+        """``kv_out``: the step's logical ``KVPlanOutput`` for the label; ``counts``: each partner's
+        queries, as the sequence shard striped them (``SeqRange.counts``), which this checks
+        against the pool's plan."""
+        p, r = self._placement.size, self._placement.index
+        indptrs = kv_out.cpu_indptrs
+        qo = indptrs.qo_indptr.numpy().astype(np.int64)
+        lens = np.diff(qo)
+        stored = indptrs.kv_lens.numpy().astype(np.int64) - lens
+        assert tuple(np.bincount(stripe_owners(qo, stored, p), minlength=p).tolist()) == tuple(counts), (
+            f"the sequence shard striped {counts} queries over the partners, and KV's plan stripes otherwise"
+        )
+        kvp = indptrs.paged_kv_indptr.numpy().astype(np.int64)
+        indices = indptrs.paged_kv_indices.numpy()
+        self._valid = []
+        for j in range(p):
+            # partner j's first query in each row, at KV position p0, and how many it holds
+            first = (j - stored) % p
+            n = np.maximum(0, -(-(lens - first) // p))
+            p0 = stored + first
+            sink = (n > 0) & ((p0 - r) // p < 0)
+            # per row, the sink row of its first query (if it sees no key here), then the rest
+            queries = np.stack([sink, n - sink], 1).ravel()
+            ends = np.stack([p0 + 1, p0 + (n - 1) * p + 1], 1).ravel()
+            keep = queries > 0
+            queries, ends, rows = queries[keep], ends[keep], np.repeat(np.arange(len(lens)), 2)[keep]
+            pages = -(-ends // self._page_size)
+            kv_indptr, ids = token_runs(kvp[rows], pages)
+            logical = PagedIndptrs(
+                qo_indptr=torch.from_numpy(np.concatenate([[0], np.cumsum(queries)]).astype(np.int32)),
+                paged_kv_indptr=torch.from_numpy(kv_indptr.astype(np.int32)),
+                paged_kv_indices=torch.from_numpy(indices[ids].astype(np.int32)),
+                paged_kv_last_page_len=torch.from_numpy((ends - (pages - 1) * self._page_size).astype(np.int32)),
+            )
+            local, valid_rows = self._placement.local_indptrs(logical, self._page_size)
+            assert ((local.kv_lens.numpy() >= queries) | ~valid_rows).all(), "a causal row with more queries than keys"
+            self._paged[j].plan(causal=True, dtype=self._dtype, **local.to_kwargs_dict())
+            self._valid.append(to_device_nonblocking(np.repeat(valid_rows, queries), self._device, torch.bool))
+        self._counts = tuple(counts)
+        self._qo_indptr_buf = to_device_nonblocking(qo.astype(np.int32), self._device, torch.int32)
+
+    def forget_plan(self) -> None:
+        """Every ``plan`` plans every kernel, so there is nothing to forget."""
+
+    def attend(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+        """This rank's queries' attention over the whole pool, in ``q``'s dtype; the step's own
+        tokens already written. ``2(P - 1)`` exchanges, the same on every rank, each awaited
+        before its result is read."""
+        p, r, group = self._placement.size, self._placement.index, self._placement.group
+        counts = self._counts
+        out = lse = None
+        for i in range(p):
+            j = (r - i) % p
+            to, back = [0] * p, [0] * p
+            to[(r + i) % p], back[j] = counts[r], counts[j]
+            queries = group.all_to_all_rows(q, to, back) if i else q
+            part = _masked(*self._paged[j].run(queries, kv_cache_layer, return_lse=True), self._valid[j])
+            if i:
+                part = _unpack(group.all_to_all_rows(_pack(*part), back, to), q.dtype)
+            if out is None:
+                out, lse = part[0].float(), part[1]
+            else:
+                merge_into(out, lse, *part)
+        return out.to(q.dtype)
 
 
 def _masked(out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -533,6 +645,18 @@ def _merged(
         out.addcmul_(weight.unsqueeze(-1), part)
     out.div_(total.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1))
     return out, total.log_().add_(top) if with_lse else None
+
+
+def merge_into(out: torch.Tensor, lse: torch.Tensor, part: torch.Tensor, part_lse: torch.Tensor) -> None:
+    """``merge`` one partial at a time, in place: ``out`` (fp32 ``[..., D]``) and ``lse`` (fp32
+    natural-log ``[...]``) become the attention over their keys and ``part``'s. A row neither
+    has a key for stays 0, -inf."""
+    top = torch.maximum(lse, part_lse).clamp_min_(torch.finfo(torch.float32).min)
+    mine, theirs = (lse - top).exp_(), (part_lse - top).exp_()
+    total = mine + theirs
+    scale = total.clamp_min(torch.finfo(torch.float32).tiny)
+    out.mul_((mine / scale).unsqueeze(-1)).addcmul_((theirs / scale).unsqueeze(-1), part)
+    lse.copy_(total.log_().add_(top))
 
 
 @torch.compiler.disable

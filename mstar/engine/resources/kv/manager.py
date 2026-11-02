@@ -497,7 +497,8 @@ class _DecodePlanCache:
 
 class KVManager(AttentionResource):
     prefix_skip_safe = True
-    # written through an exchange, which hands it the step's every token (`sequence_shard`)
+    # written through an exchange (`sequence_shard`): the step's every token, or a ring's own ones
+    # (`write_kv(tokens=)`)
     supports_split_steps = True
     # the node's sequence shard, which refuses a write of a split label outside an exchange
     # (`bind_sequence_shard`)
@@ -4524,10 +4525,11 @@ class KVManager(AttentionResource):
     @torch.compiler.disable
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor | None = None,
-        layer_idx: int=None, label: str=None,
+        layer_idx: int=None, label: str=None, tokens: torch.Tensor | None = None,
     ) -> None:
         """Write K, V into this step's planned slots (under MLA: the per-token
-        latent as ``k`` and ``v=None``)."""
+        latent as ``k`` and ``v=None``). ``tokens``: which of the step's tokens
+        ``k`` and ``v`` hold, by index (a ring's own share); by default its first."""
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         if label is None:
@@ -4537,6 +4539,12 @@ class KVManager(AttentionResource):
         plan_state = self._current_plan_states[label, self._layer_group[layer_idx]]
         if plan_state.ready is not None:
             torch.cuda.current_stream(k.device).wait_event(plan_state.ready)
+        if tokens is not None:
+            self.kv_cache.write_tokens(
+                layer_idx=layer_idx, k=k, v=v,
+                page_idx=plan_state.token_to_page[tokens], cache_idx=plan_state.token_to_cache[tokens],
+            )
+            return
         # an eager write may carry only the real rows; the padding rows' tokens
         # come last in the plan (on SINK_PAGE) and are skipped
         n = min(plan_state.total_tokens, k.shape[0])

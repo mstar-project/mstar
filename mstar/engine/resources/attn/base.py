@@ -20,7 +20,15 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.sequence_shard import SequenceShard, check_shard_plan, head_slice, ulysses
+from mstar.engine.resources.sequence_shard import (
+    SeqRange,
+    SeqShardPlan,
+    SequenceShard,
+    all_gather,
+    check_shard_plan,
+    head_slice,
+    ulysses,
+)
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -58,6 +66,12 @@ class AttentionManager(AttentionResource):
     # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
+    # `AttentionSpec.sp_exchange` as configured, set by `build`; and as resolved where the shard can
+    # split (`bind_dependencies`): ulysses, all_gather, ring or none
+    _sp_exchange: str | None = None
+    _split_exchange: str | None = None
+    # the KV resource, which the ring writes and reads itself (`exchange`)
+    _kv = None
 
     @property
     def splits(self) -> bool:
@@ -83,37 +97,86 @@ class AttentionManager(AttentionResource):
             self._bind_placement(placement)
         if self._shard_key is None or not resources[self._shard_key].can_split:
             return
-        # heads over every TP and SP rank (a pool stored by position is refused on a splitting node
-        # at load): a split step's tokens trade for heads, a copied step's heads are sliced
+        # stored by head, heads over every TP and SP rank: a split step's tokens trade for heads, a
+        # copied step's heads are sliced. Stored by position, heads over TP: every rank attends a
+        # copied step, and a split step's tokens are gathered or passed round (`exchange`)
         shard = self._shard = resources[self._shard_key]
+        self._kv = kv
         kv.bind_sequence_shard(shard)
+        split = self._split_exchange = self._sp_exchange or ("ulysses" if placement is None else "all_gather")
+        if split == "ring":
+            self._warm_ring(shard.group)
         logger.info(
-            "attention over KV %r takes split steps over %d SP ranks: split labels by Ulysses, copied ones by "
-            "head slice", self._kv_cache_name, shard.group.world_size,
+            "attention over KV %r takes split steps over %d SP ranks: split labels by %s, copied ones %s",
+            self._kv_cache_name, shard.group.world_size, "none (refused)" if split == "none" else split,
+            "by head slice" if placement is None else "over the placed pool",
         )
+
+    def _warm_ring(self, group) -> None:
+        """One one-element hop per ring offset, at bind: NCCL connects a pair of ranks on its first
+        exchange, which here comes before warmup and the capture plan read free memory, and a
+        routing fault hangs at startup rather than in a request. Every rank binds the same
+        resources in the same order."""
+        p = group.world_size
+        one = torch.zeros(1, device=self._device)
+        for i in range(1, p):
+            to, back = [0] * p, [0] * p
+            to[(group.rank + i) % p] = back[(group.rank - i) % p] = 1
+            group.all_to_all_rows(one, to, back)
 
     @torch.compiler.disable
     def exchange(self, run, q, k, v, label: str | None = None):
         """``run(q, k, v)`` (a K/V write and the attention, ``q=None`` the write alone) for this
         step's ``label`` through the exchange its pool takes: of a split label's tokens, or of a
-        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`)."""
+        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`). The ring writes and
+        attends through the KV resource itself, not ``run``."""
         label = self._default_label if label is None else label
         shard = self._shard
         r = shard.split_range(label)
         # the paged run and K/V writes refuse a split label reached without it (`check_bypass`)
         shard.exchanging = True
         try:
-            if r is not None:
-                shard.check_scattered(label)
+            if r is None:
+                return head_slice(run, q, k, v, shard.group) if self._placement is None else run(q, k, v)
+            shard.check_scattered(label)
+            if self._placement is None:
                 return ulysses(run, q, k, v, r)
-            return head_slice(run, q, k, v, shard.group)
+            if q is None:
+                raise ValueError(
+                    f"a K/V write without attention of label {label!r}, which this step splits over SP ranks above "
+                    f"KV {self._kv_cache_name!r} stored by position: attend it, or store the KV by head"
+                )
+            if self._split_exchange == "ring":
+                return self._ring(label, q, k, v, r)
+            return all_gather(run, q, k, v, r)
         finally:
             shard.exchanging = False
 
-    def _check_sequence_shard(self, ctx) -> None:
-        """At plan: the step declares the node's sequence shard."""
-        if self._shard_key is not None:
-            check_shard_plan(f"attention over KV {self._kv_cache_name!r}", self._shard_key, ctx)
+    def _ring(self, label: str, q, k, v, r: SeqRange) -> torch.Tensor:
+        """This rank's tokens' K/V into the slots it stores them in (all of them, as the step is
+        striped by stored position), then the ring (`RingAttentionWrapper`), at the KV resource's
+        layer cursor (`AttentionCallable.set_layer_idx`)."""
+        self._kv.write_kv(k, v, label=label, tokens=r.index)
+        return self._current_plan_states[label].attend(q, self._kv.layer_view())
+
+    def _check_sequence_shard(self, ctx) -> SeqShardPlan | None:
+        """At plan: the step declares the node's sequence shard, whose plan this returns where the
+        shard can split."""
+        if self._shard_key is None:
+            return None
+        plan = check_shard_plan(f"attention over KV {self._kv_cache_name!r}", self._shard_key, ctx)
+        return plan if self._shard is not None else None
+
+    def _split_range(self, shard_plan: SeqShardPlan | None, label: str) -> SeqRange | None:
+        """``label``'s split this step, None when copied; refused for an attention configured to
+        take none (``sp_exchange`` none), alike on every rank, as the shard's plan is."""
+        r = None if shard_plan is None else shard_plan.ranges.get(label)
+        if r is not None and self._split_exchange == "none":
+            raise ValueError(
+                f"attention over KV {self._kv_cache_name!r} has sp_exchange none, and this step splits its label "
+                f"{label!r} over SP ranks: pick an sp_exchange for it, or set none on the node's other attentions too"
+            )
+        return r
 
     def _bind_placement(self, placement: "ContextParallel") -> None:
         """This rank's share of a context-parallel pool. Reached only for a backend that supports
@@ -169,6 +232,25 @@ class AttentionManager(AttentionResource):
             kwargs.get("batch_size"), max_total_tokens, check=self._plan_check,
         )
 
+    def _ring_wrapper(self, label: str, slot: int):
+        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under
+        ``sp_exchange`` ring: one context wrapper per partner, over the label's workspace (they run
+        one after another on one stream)."""
+        from mstar.engine.resources.context_parallel import RingAttentionWrapper
+
+        key = EagerSlotKey(label=label, slot=slot, ring=True)
+        wrapper = self._eager_plan_states.get(key)
+        if wrapper is None:
+            workspace = self._workspaces.get(label, slot)
+            paged = [
+                self._context_wrapper(workspace, False, dict(self._wrapper_kv_kwargs), None)
+                for _ in range(self._placement.size)
+            ]
+            wrapper = self._eager_plan_states[key] = RingAttentionWrapper(
+                self._placement, self._kv_config.tokens_per_page, self._dtype, paged, self._device,
+            )
+        return wrapper
+
     @torch.compiler.disable
     def _attend_placed(
         self, label: str, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
@@ -176,6 +258,8 @@ class AttentionManager(AttentionResource):
     ) -> torch.Tensor:
         """``run`` over a placed pool, ``queries`` and ``new_keys`` as this backend's ``run`` takes
         them (``ContextParallelWrapper.attend``)."""
+        if self._shard is not None:
+            self._shard.check_bypass(label, "attention run")
         return self._current_plan_states[label].attend(queries, kv_cache_layer, new_keys)
 
     def fingerprint(self) -> bytes:
@@ -208,6 +292,7 @@ class AttentionManager(AttentionResource):
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         manager = cls._build_backend(spec, info)
         manager._shard_key = spec.shard_key
+        manager._sp_exchange = spec.sp_exchange
         return manager
 
     @classmethod
@@ -422,6 +507,8 @@ class EagerSlotKey(NamedTuple):
     slot: int
     # decode and prefill take different wrapper classes
     is_decode: bool = False
+    # a ring step's (`RingAttentionWrapper`), beside the label's copied one
+    ring: bool = False
 
 
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
