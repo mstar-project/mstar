@@ -404,11 +404,11 @@ def _region_runner(pool, **config):
     )
 
 
-def test_a_piecewise_region_plans_its_own_lora_rows_or_is_not_captured(adapters):
+def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_base_rows(adapters):
     """A region's step carries the node's LoRA rows, laid out from its segments as the
-    node's are; a region replayed as one row per step, which would give every request
-    the first one's adapter, is dropped from capture, so it runs eagerly in the node's
-    step."""
+    node's are. A region replayed as one row per step, which addresses every row to the
+    first request's adapter, is captured too, but leased only for a step none of whose
+    rows runs one; a step with one runs the region eagerly under the node's step."""
     pool = P.make_pool(adapters[1])
     runner = _region_runner(pool, capture_batch_sizes=[2])
     bucket = BucketKey(PIECEWISE_WALK, 2, 8, "N_region")
@@ -416,8 +416,12 @@ def test_a_piecewise_region_plans_its_own_lora_rows_or_is_not_captured(adapters)
     assert step.steps["lora"].segments == (Segment("r0", "main", 5), Segment(-5, "main", 3))
     assert runner.prepare_for_capture() and not runner.dropped_shapes
 
+    for rid, adapter in (("b0", None), ("b1", None), ("r1", "a1")):
+        P.ingest(pool, rid, adapter)
     one_row = _region_runner(pool, capture_batch_sizes=[1], lease_before_step=True, one_row_per_step=True)
-    assert one_row.prepare_for_capture() == [] and one_row.dropped_shapes == [(1, 8)]
+    assert one_row.prepare_for_capture() and not one_row.dropped_shapes
+    assert one_row.can_lease([], ["b0", "b1"]) and not one_row.can_lease([], ["b0", "r1"])
+    assert runner.can_lease([], ["b0", "r1"])
 
 
 def test_the_base_only_choice_is_the_same_on_every_rank(adapters):

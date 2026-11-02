@@ -1187,9 +1187,9 @@ placed exactly as weights are.
   an adapter row compiles its own. A piecewise region's step takes its rows as the
   node's does, from its own segments (an ``attn_key`` region's: one per row), planned
   per replay and handing the enclosing step's plan back at its commit. A region
-  replayed as one row per step (``one_row_per_step``) would give every request the first
-  one's adapter, so on a node serving adapters it is not captured, and runs eagerly
-  under the node's step.
+  replayed as one row per step (``one_row_per_step``) addresses every row to the first
+  request's adapter, so the engine leases it only for a step none of whose rows runs an
+  adapter; a step with one runs the region eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
@@ -2131,8 +2131,9 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   ``declare_step`` then receives ``[first_rid]`` with every request's ``seq_lens``, so the
   whole step's segments count against one replay's plan: size its attention resource with
   ``max_segments_per_step``, and pair it with a ``can_lease`` that refuses a step with
-  more. Such a region cannot declare a LoRA step, which would address every
-  request's tokens to the first request's adapter; capture refuses it.
+  more. On a node serving LoRA adapters it is leased only for a step whose rows run
+  none, since its replay would address every request's tokens to the first request's
+  adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is

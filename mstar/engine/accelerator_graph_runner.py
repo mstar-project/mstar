@@ -5,7 +5,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
 from functools import cache, partial
-from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
+from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 from torch.distributed import ReduceOp
@@ -1704,7 +1704,7 @@ class PiecewiseAcceleratorGraphRunner:
     ):
         self._label = label
         self._config = config
-        # the node's LoRA pools (`_region_step`)
+        # the node's LoRA pools (`_region_step`, `can_lease`)
         self._lora_keys = lora_keys
         self._resources = resources
         self._step_runner = step_runner
@@ -1789,16 +1789,6 @@ class PiecewiseAcceleratorGraphRunner:
         """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
-            if shapes and self._config.one_row_per_step and self._lora_keys:
-                # its replay names only the step's first request, whose adapter every
-                # request's rows would take; eager, it runs under the node's own step
-                logger.error(
-                    "Dropping piecewise accelerator graph config %s: it replays one row "
-                    "per step (one_row_per_step), and LoRA %s addresses each request's "
-                    "rows", self._label, self._lora_keys,
-                )
-                self.dropped_shapes = [(s.bs, s.total_tokens) for s in shapes]
-                shapes = []
             if shapes:
                 shape = shapes[0]
                 step = self._region_step(
@@ -2212,8 +2202,15 @@ class PiecewiseAcceleratorGraphRunner:
         """Whether this region takes its slot ahead of the declaration."""
         return self._config.lease_before_step
 
-    def can_lease(self, inputs: list[NodeInputs]) -> bool:
-        """The config's ``can_lease`` for this batch; True when it sets none."""
+    def can_lease(self, inputs: list[NodeInputs], request_ids: Sequence) -> bool:
+        """The config's ``can_lease`` for this batch; True when it sets none. A
+        ``one_row_per_step`` replay addresses every row to the first request's LoRA
+        adapter, so it is refused a batch any of whose rows runs one (the pool's answer
+        is the same on every rank), which runs the region eagerly under the node's step."""
+        if self._config.one_row_per_step and any(
+            self._resources[key].runs_adapters(request_ids) for key in self._lora_keys
+        ):
+            return False
         return self._config.can_lease is None or self._config.can_lease(inputs)
 
     def lease_slot(
