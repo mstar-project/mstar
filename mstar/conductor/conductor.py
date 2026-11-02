@@ -372,6 +372,9 @@ class RequestData:
     routing: RoutingHandle | None = None
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
     dispatched: bool = False
+    # persisted name -> the (partition, pass) whose reports wrote what is held
+    # under it; an initial signal has none
+    persist_writers: dict[str, tuple[str, int]] = field(default_factory=dict)
     # set once request_complete goes out; after that the client must never get
     # request_failed
     completion_sent: bool = False
@@ -1861,10 +1864,20 @@ class Conductor:
             pstate.worker_reported_done = True
 
         # Persist signals: every rank contributes its shard (different uuid +
-        # source_tp_rank); accumulate across ranks, do not dedup.
+        # source_tp_rank); accumulate across ranks, do not dedup. What an
+        # earlier pass left held under the name is replaced: the tensors sent
+        # are released at their reader counts, and one never sent stays with
+        # its producer until the request ends.
         if body.persist_signals:
+            held, writer = request_data.persist_signals, (partition_name, pstate.fwd_pass_number)
             for name, infos in body.persist_signals.items():
-                request_data.persist_signals.setdefault(name, []).extend(infos)
+                if request_data.persist_writers.get(name) != writer:
+                    request_data.persist_writers[name] = writer
+                    self._un_persist_tensors(body.request_id, [
+                        info for info in held.get(name, ()) if info.uuid in request_data.persist_signal_ref_cnt
+                    ])
+                    held[name] = []
+                held[name].extend(infos)
 
         # Resource publish info is rank-sharded. Every TP rank contributes its
         # own KV pages and transfer descriptor, and PublishedKVInfo.update()

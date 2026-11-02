@@ -408,12 +408,37 @@ def _another_partitions_persist():
     ]
 
 
+def _persisted_again_while_held():
+    """Whisper's ``ts_rules`` with the language detected: ``x`` is held from
+    the start, a step that doesn't read it runs, then one whose walk persists
+    ``x`` afresh, and the last reads it. That one gets the new value alone."""
+    walks = {
+        "w0": GraphNode(name="n", input_names=["y"], outputs=[]),
+        "w1": GraphNode(name="n", input_names=["y"], outputs=[
+            GraphEdge(next_node=EMPTY_DESTINATION, name="x", persist=True),
+        ]),
+        "w2": GraphNode(name="n", input_names=["x"], outputs=[]),
+    }
+    model = _ToyModel(walks, {"default": [WalkStep(w) for w in walks]}, {"default": list(walks)})
+    return model, {"x": [REF], "y": [TAIL]}, {}, [
+        ("default", "w0", {}, False), ("default", "w1", {"x": EMB}, False), ("default", "w2", {}, False),
+    ], [
+        ("NEW_REQUEST", "default", "w0", {("n", "y"): [TAIL]}, False),
+        ("INPUT_SIGNALS", "default", "w1", {("n", "y"): [TAIL]}, False),
+        ("UNPERSIST_TENSORS", PREPROCESS, {TAIL: 2}),
+        # the initial x was never sent, so it has no reader count to release
+        ("INPUT_SIGNALS", "default", "w2", {("n", "x"): [EMB]}, False),
+        ("UNPERSIST_TENSORS", "worker_0", {EMB: 1}),
+    ]
+
+
 _PLANS = {
     "every partition's reads": _every_partitions_reads,
     "another partition's persist keeps it": _another_partitions_persist,
     "prefill then decode": _p2,
     "chunked prefill seeds its tick": _chunked_prefill,
     "a re-persisted name": _rebound_name,
+    "a name persisted again while held": _persisted_again_while_held,
     "diffusion's empty seed": _diffusion,
     "a later reader keeps it": lambda: _diffusion(refine=True),
     "a loop fed ahead of it": _fed_loop,
