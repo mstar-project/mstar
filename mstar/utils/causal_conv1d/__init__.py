@@ -7,8 +7,9 @@ matching the ``RecurrentStatePool`` layout.
 """
 from mstar.utils.causal_conv1d.kernels import (
     PAD_SLOT_ID,
+    causal_conv1d_decode,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 
-__all__ = ["PAD_SLOT_ID", "causal_conv1d_fn", "causal_conv1d_update"]
+__all__ = ["PAD_SLOT_ID", "causal_conv1d_decode", "causal_conv1d_fn", "causal_conv1d_update"]
