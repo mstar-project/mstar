@@ -224,11 +224,6 @@ class Wan22DiTBlock(nn.Module):
     residual stays bf16. All three follow the reference exactly.
     """
 
-    lora_unservable = {
-        "ffn.linear_in": "run as an addmm over its weight when compiled on CUDA (gelu_tanh_ffn); "
-        "refused on every device so the spec does not depend on it",
-    }
-
     def __init__(self, dim: int, ffn_dim: int, num_heads: int, eps: float):
         super().__init__()
         self.norm1 = WanFP32LayerNorm(dim, eps, elementwise_affine=False)
