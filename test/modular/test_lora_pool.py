@@ -549,6 +549,21 @@ def test_a_lora_deployment_still_has_its_kv_pools_checked_against_its_cap(adapte
         check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__))
 
 
+def test_a_bad_key_in_the_lora_block_is_a_config_error_on_every_lora_spec():
+    """The block sizes a second LoRA spec before the other overrides apply, so a key no
+    spec takes is reported there as the overrides report one: a ValueError, which the
+    checks that read the serving specs leave to validation."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from mstar.model.base import serving_resources
+
+    vit = replace(make_spec({}), resource_key="lora_vit", nodes={"ViT"})
+    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({}), vit])
+    with pytest.raises(ValueError, match="resources.lora"):
+        serving_resources(model, {"resources": {"lora": {"max_slot": 2}}})
+
+
 # --- admission: a full pool is backpressure, not a refused step ----------------------------------
 
 class _Sim:

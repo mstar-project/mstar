@@ -140,7 +140,7 @@ def validate_deployment(
             }
         else:
             # the override step refuses the same block on the `lora` spec, with the rest
-            with contextlib.suppress(TypeError, ValueError):
+            with contextlib.suppress(ValueError):
                 size_lora_specs(lora, config)
             specs += lora
     if specs is not None:

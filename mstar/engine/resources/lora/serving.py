@@ -50,7 +50,11 @@ def declared_lora_specs(model: Model, model_config: Mapping[str, Any]) -> list[L
 def size_lora_specs(lora: list[LoraSpec], model_config: Mapping[str, Any]) -> None:
     """Apply the YAML's ``lora:`` block to the LoRA specs keyed apart from ``lora``."""
     for spec in lora[1:]:
-        spec.apply_yaml_overrides(**model_config["resources"][LORA_RESOURCE_KEY])
+        try:
+            spec.apply_yaml_overrides(**model_config["resources"][LORA_RESOURCE_KEY])
+        except TypeError as e:
+            # a key the spec doesn't take: a bad config, as `apply_yaml_overrides` reports it
+            raise ValueError(f"resources.{LORA_RESOURCE_KEY}: {e}") from e
 
 
 def drop_lora_specs_without_targets(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
