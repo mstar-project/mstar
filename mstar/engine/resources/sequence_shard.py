@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -205,10 +205,6 @@ class SequenceShard(Resource):
     def clear_preplan(self):
         self._pending = None
         self._preplanned = False
-
-    def describe(self) -> str:
-        walks = "every walk" if self.walks is None else f"walks {sorted(self.walks)}"
-        return f"splits {list(self.labels)} on axis {self.axis} over {walks}, from {self.min_tokens} tokens"
 
     def check_captures(self, node: str, configs, piecewise: Mapping) -> None:
         """Refuse captures this node can't replay when it splits: a piecewise region (its inner
@@ -525,15 +521,3 @@ def sequence_parallel_refusals(
         refusals.append(f"node {node!r} splits tokens over SP ranks, which expert parallelism (ep_config) can't")
     return refusals
 
-
-def strategy_line(node: str, resources: Mapping[str, Any]) -> str | None:
-    """The load log's line for a node that can split: its shard's rule, each pool's storage, and
-    each attention resource's exchanges, as they resolved."""
-    shard = next((res for res in resources.values() if isinstance(res, SequenceShard)), None)
-    if shard is None or not shard.can_split:
-        return None
-    parts = [shard.describe()]
-    for key, res in sorted(resources.items()):
-        if res.sp_strategy is not None:
-            parts.append(f"{key}: {res.sp_strategy}")
-    return f"sequence parallelism on {node!r}: " + "; ".join(parts)

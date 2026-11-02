@@ -2155,7 +2155,7 @@ head-stored pool whose query and KV heads per TP rank don't divide by ``sp_size`
 axis 0 (a packed split can leave a rank none of a row); expert
 parallelism; piecewise captures; a capture replayed under listed and unlisted walks; and a packed
 capture of a listed walk unless the shard lists one label on axis 0 (its padding joins that
-label). The load log prints each splitting node's resolved strategies.
+label). Each attention resource of a splitting node logs at load how it takes split steps.
 
 **Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
 over the ranks that would otherwise store the same KV heads: slot ``s`` lives on partner

@@ -86,8 +86,9 @@ class AttentionManager(AttentionResource):
         shard = self._shard = resources[self._shard_key]
         self.uses_exchange = True
         kv.bind_sequence_shard(shard)
-        self.sp_strategy = (
-            f"over KV {self._kv_cache_name!r} stored by head: split labels ulysses, copied labels head slice"
+        logger.info(
+            "attention over KV %r takes split steps over %d SP ranks: split labels by Ulysses, copied ones by "
+            "head slice", self._kv_cache_name, shard.group.world_size,
         )
 
     @torch.compiler.disable

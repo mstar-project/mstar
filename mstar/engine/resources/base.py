@@ -144,9 +144,6 @@ class Resource(ABC):
     # stays correct on a node whose steps split over its SP ranks (`SeqShardSpec`); the engine
     # refuses to load it on one otherwise
     supports_split_steps: bool = False
-    # what it does on a splitting node's steps, as it resolved at bind, for the load log
-    # (`sequence_shard.strategy_line`); None where it never sees a split step
-    sp_strategy: str | None = None
 
     @property
     def placement(self) -> "ContextParallel | None":

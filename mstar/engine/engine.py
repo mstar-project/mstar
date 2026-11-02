@@ -43,7 +43,7 @@ from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.sequence_shard import sequence_parallel_refusals, strategy_line
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -665,10 +665,6 @@ class Engine:
         )
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
-        for node in sorted(splitting):
-            line = strategy_line(node, {key: self._resources[key] for key in node_to_resources.get(node, [])})
-            if line is not None:
-                logger.info("%s", line)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and

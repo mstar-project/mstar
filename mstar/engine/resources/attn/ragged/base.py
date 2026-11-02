@@ -9,6 +9,7 @@ and nothing to carry between steps: the resource holds only planned wrappers.
 
 import functools
 import itertools
+import logging
 import weakref
 from collections.abc import Callable, Iterable
 
@@ -37,6 +38,8 @@ from mstar.engine.resources.sequence_shard import (
     ulysses,
 )
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_ragged_attn_backend(
@@ -262,10 +265,10 @@ class _RaggedManagerBase:
         if self._shard_key is None or not resources[self._shard_key].can_split:
             return
         self._shard = resources[self._shard_key]
-        self.sp_strategy = self._describe_strategy()
-
-    def _describe_strategy(self) -> str:
-        raise NotImplementedError
+        logger.info(
+            "%s %r takes split steps over %d SP ranks%s", type(self).__name__, self._key,
+            self._shard.group.world_size, " (sp_exchange ulysses)" if self._ulysses else "",
+        )
 
     @property
     def max_segments_per_request(self) -> int:
@@ -489,11 +492,6 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
         refuse_context_only(step, type(self).__name__)
         super().plan(step, ctx)
 
-    def _describe_strategy(self) -> str:
-        if self._ulysses:
-            return "split labels: ulysses, copied labels: head slice"
-        return "copied labels only (sp_exchange None)"
-
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states, shard_plan, exchanges) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
             wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
@@ -520,9 +518,6 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
     run under ``cross_label(q_label, kv_label)``."""
 
     supports_split_steps = True
-
-    def _describe_strategy(self) -> str:
-        return "split queries: local, split keys: sharded-key merge"
 
     def _plan_layouts(
         self, step: RaggedCrossAttentionStep, ctx: StepContext, plan_states, shard_plan, exchanges,
