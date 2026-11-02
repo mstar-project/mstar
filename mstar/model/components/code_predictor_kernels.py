@@ -269,6 +269,8 @@ class ResidualCodePredictor(nn.Module):
     two shared this predictor.
     """
 
+    lora_unservable = {"lm_head": "stacked into lm_head_weight at load, which the depth loop indexes"}
+
     def __init__(
         self, cp: Any, talker_width: int, max_batch_size: int, *, embed_sum_dtype: torch.dtype | None,
     ) -> None:
