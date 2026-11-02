@@ -153,7 +153,8 @@ class WhisperDecoderModel(nn.Module):
         resources, returning the cross-attention probabilities of the given
         ``(layer, head)`` pairs: ``(len(heads), len(tokens), enc_len)``.
 
-        The same weights as the served decoder, applied with plain causal
+        The served decoder's own projections, called as modules so a LoRA
+        delta bound to one is never skipped, applied with plain causal
         self-attention and an explicit softmax over the encoder positions.
         That is the alignment signal word-level timestamps are read from
         (:mod:`.alignment`); one request at a time, so it stays eager.
@@ -174,7 +175,7 @@ class WhisperDecoderModel(nn.Module):
                 raise NotImplementedError("word timestamps need the decoder unsharded (TP=1)")
             heads_n, head_dim = attn.num_heads, attn.head_dim
             h = layer.self_attn_layer_norm(hidden)
-            qkv = F.linear(h, attn.qkv_proj.weight, attn.qkv_proj.bias)
+            qkv = attn.qkv_proj(h)
             kv_size = attn.num_kv_heads * head_dim
             q, k, v = qkv.split([heads_n * head_dim, kv_size, kv_size], dim=-1)
             q = q.view(num_tokens, heads_n, head_dim).transpose(0, 1)
@@ -182,11 +183,11 @@ class WhisperDecoderModel(nn.Module):
             v = v.view(num_tokens, attn.num_kv_heads, head_dim).transpose(0, 1)
             a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             a = a.transpose(0, 1).reshape(num_tokens, heads_n * head_dim)
-            hidden = hidden + F.linear(a, attn.o_proj.weight, attn.o_proj.bias)
+            hidden = hidden + attn.o_proj(a)
 
             cross = layer.encoder_attn
             h = layer.encoder_attn_layer_norm(hidden)
-            q = F.linear(h, cross.q_proj.weight, cross.q_proj.bias).view(num_tokens, heads_n, head_dim).transpose(0, 1)
+            q = cross.q_proj(h).view(num_tokens, heads_n, head_dim).transpose(0, 1)
             k, v = cross.compute_kv(encoder_states)  # (enc_len, heads, head_dim)
             k = k.transpose(0, 1)
             v = v.transpose(0, 1)
@@ -195,7 +196,7 @@ class WhisperDecoderModel(nn.Module):
             for head_idx in wanted.get(layer_idx, []):
                 out.append(probs[head_idx])
             a = torch.matmul(probs.to(v.dtype), v).transpose(0, 1).reshape(num_tokens, heads_n * head_dim)
-            hidden = hidden + F.linear(a, cross.out_proj.weight, cross.out_proj.bias)
+            hidden = hidden + cross.out_proj(a)
 
             h = layer.final_layer_norm(hidden)
             hidden = hidden + layer.fc2(F.gelu(layer.fc1(h)))

@@ -658,6 +658,74 @@ def test_a_module_declaring_a_child_it_does_not_have_unservable_is_refused():
                          resource_key="lora", nodes={"N"}, root_path="")
 
 
+def _code_predictor() -> nn.Module:
+    pytest.importorskip("triton")
+    from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+
+    cp = SimpleNamespace(num_code_groups=3, num_hidden_layers=1, num_key_value_heads=1, head_dim=4, hidden_size=8,
+                         num_attention_heads=2, rope_theta=1e4, rms_norm_eps=1e-6, intermediate_size=16, vocab_size=8)
+    return ResidualCodePredictor(cp, HIDDEN, 2, embed_sum_dtype=None)
+
+
+def _fastconformer(part: str) -> nn.Module:
+    from mstar.model.components import fastconformer as fc
+
+    config = fc.FastConformerConfig(hidden_size=HIDDEN, num_heads=2, num_mel_bins=16, subsampling_channels=4)
+    return fc.RelPositionAttention(config) if part == "attention" else fc._Subsampling(config)
+
+
+def _chatterbox_attention() -> nn.Module:
+    from mstar.model.chatterbox.components.s3gen_flow import RelPositionAttention
+
+    return RelPositionAttention(2, HIDDEN)
+
+
+def _bagel_patch_embed() -> nn.Module:
+    from mstar.model.bagel.components.vit_encoder import BagelVisionEmbeddings
+    from mstar.model.bagel.config import BagelViTConfig
+
+    return BagelVisionEmbeddings(BagelViTConfig(hidden_size=HIDDEN, image_size=4, patch_size=2))
+
+
+def _omnivoice() -> nn.Module:
+    from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
+
+    def linears(names):
+        return _with(nn.Module(), lambda m: [setattr(m, n, nn.Linear(HIDDEN, HIDDEN)) for n in names])
+
+    layer = nn.Module()
+    layer.self_attn = linears(("q_proj", "k_proj", "v_proj", "o_proj"))
+    layer.mlp = linears(("gate_proj", "up_proj", "down_proj"))
+    reference = nn.Module()
+    reference.llm = _with(nn.Module(), lambda m: setattr(m, "layers", nn.ModuleList([layer])))
+    return OmniVoiceBackbone(reference)
+
+
+# a module that runs these children other than through their forward over the step's
+# tokens, by its own `lora_unservable`
+ANNOTATED = {
+    "code_predictor_heads": (_code_predictor, {"lm_head.0", "lm_head.1"}),
+    "fastconformer_positions": (lambda: _fastconformer("attention"), {"relative_k_proj"}),
+    "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
+    "chatterbox_positions": (_chatterbox_attention, {"linear_pos"}),
+    "bagel_converted_patch_embed": (_bagel_patch_embed, {"patch_embedding"}),
+    "omnivoice_fused": (_omnivoice, {f"model.llm.layers.0.{p}" for p in (
+        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj")}),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ANNOTATED))
+def test_children_run_other_than_through_their_forward_are_refused(name):
+    build, children = ANNOTATED[name]
+    with torch.device("meta"):
+        root = nn.Module()
+        root.m, root.fc = build(), nn.Linear(HIDDEN, HIDDEN)
+    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    declared = {r for m in root.modules() for r in getattr(m, "lora_unservable", {}).values()}
+    refused = {p.removeprefix("m.") for p, r in spec.module_map.unservable.items() if r in declared}
+    assert refused == children and not any(p.removeprefix("m.") in children for p in spec.module_map.bindings)
+
+
 @pytest.mark.parametrize("absorb", [False, True])
 def test_absorbed_mla_refuses_the_projections_it_folds_at_load(absorb):
     from mstar.model.components.mla import MLAAttention
