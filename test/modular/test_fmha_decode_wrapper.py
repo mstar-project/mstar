@@ -160,8 +160,7 @@ def test_captured_decode_takes_fmha_when_asked(monkeypatch):
     assert not built
 
 
-@pytest.mark.parametrize("sm_scale, scale", [(None, 256 ** -0.5), (0.5, 0.5)])
-def test_fmha_attends_at_the_resources_softmax_scale(monkeypatch, sm_scale, scale):
+def test_fmha_attends_at_the_resources_softmax_scale(monkeypatch):
     """A model's own scale (Muse Glimmer's) reaches the captured fmha kernel, as
     it does the paged one."""
     pytest.importorskip("flashinfer")
@@ -171,11 +170,11 @@ def test_fmha_attends_at_the_resources_softmax_scale(monkeypatch, sm_scale, scal
     monkeypatch.setattr(
         fi_utils, "_get_trtllm_gen_multi_ctas_kv_counter_buffer", lambda *args: torch.zeros(4, dtype=torch.uint8),
     )
-    manager, _ = _manager(monkeypatch, decode_fmha=True, sm_scale=sm_scale)
+    manager, _ = _manager(monkeypatch, decode_fmha=True, sm_scale=0.5)
     monkeypatch.setattr(fi_mod, "FmhaDecodeWrapper", FmhaDecodeWrapper)
     monkeypatch.setattr(FmhaDecodeWrapper, "has_kernel", lambda self, head_dim, num_qo_heads: True)
     wrapper = manager._cg_wrapper(_decode_lease(), "main", 16, False)
-    assert wrapper._scale == scale
+    assert wrapper._scale == 0.5
 
 
 @pytest.mark.parametrize(

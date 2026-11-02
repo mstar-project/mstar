@@ -14,6 +14,8 @@ projections but don't need TP.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -64,6 +66,15 @@ class FusedColumnLinear(nn.Module):
         self.weight.weight_loader = self.weight_loader
         if self.bias is not None:
             self.bias.weight_loader = self.weight_loader
+
+    def reset_parameters(self) -> None:
+        """``nn.Linear``'s initialisation, for a caller that runs before (or
+        without) a checkpoint; the weights are otherwise left uninitialised."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.weight.shape[1]
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)

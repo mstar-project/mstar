@@ -474,9 +474,10 @@ def test_every_vision_parameter_has_a_checkpoint_tensor():
     assert vision_name_remapper("model.language_model.norm.weight") is None
 
 
-def test_a_checkpoint_tensor_with_no_parameter_here_is_refused(tmp_path):
-    """A weighted norm or a bias this port lacks would otherwise be dropped,
-    and the tower would run without it."""
+def test_the_vision_checkpoint_loads_and_refuses_a_tensor_with_no_parameter(tmp_path):
+    """The checkpoint's split q/k/v land in the shared block's fused rows, and
+    its MLP under the shared names. A weighted norm or a bias this port lacks
+    would otherwise be dropped, and the tower would run without it."""
     from safetensors.torch import save_file
 
     from mstar.model.muse.components.vision import MuseGlimmerVisionModel
@@ -494,9 +495,19 @@ def test_a_checkpoint_tensor_with_no_parameter_here_is_refused(tmp_path):
                 return theirs + ours[len(prefix):]
         return "model.vision_tower." + ours
 
-    tensors = {checkpoint_name(n): p.detach().clone() for n, p in tower.named_parameters()}
+    # as the checkpoint stores them: q, k and v apart, the MLP as fc1/fc2
+    tensors = {}
+    for name, param in tower.named_parameters():
+        name = checkpoint_name(name).replace(".mlp.linear_fc", ".mlp.fc")
+        if ".attn.qkv." in name:
+            for shard, part in zip("qkv", torch.randn_like(param).chunk(3), strict=True):
+                tensors[name.replace(".attn.qkv.", f".attn.{shard}_proj.")] = part.contiguous()
+        else:
+            tensors[name] = param.detach().clone()
     save_file(tensors, str(tmp_path / "model.safetensors"))
     load_vision_weights(tower, tmp_path)
+    split = [tensors[f"model.vision_tower.layers.0.attn.{s}_proj.weight"] for s in "qkv"]
+    assert torch.equal(tower.layers[0].attn.qkv.weight, torch.cat(split))
     tensors["model.vision_tower.layers.0.attn.q_norm.weight"] = torch.ones(8)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     with pytest.raises(ValueError, match="no parameter here"):

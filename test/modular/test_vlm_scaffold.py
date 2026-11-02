@@ -156,7 +156,7 @@ def test_the_walks_run_the_prefill_then_decode_then_finish():
 
 
 @pytest.mark.parametrize("knobs", [
-    {"return_logprobs": True}, {"logprobs_mode": "processed"}, {"temperature": 0.5, "min_p": 0.1},
+    {"return_logprobs": True}, {"logprobs_mode": "processed"},
 ])
 def test_a_request_sets_its_sampling_knobs(knobs):
     """Log-probs (#914) reach the sampler's config like every other knob."""

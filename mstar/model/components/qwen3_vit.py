@@ -248,7 +248,7 @@ class VisionMLP(nn.Module):
             config.intermediate_size, config.hidden_size, bias=True,
         )
         if config.hidden_act not in self._GELU:
-            raise NotImplementedError(
+            raise ValueError(
                 f"vision activation {config.hidden_act!r} is not wired up"
             )
         self.act_fn = nn.GELU(approximate=self._GELU[config.hidden_act])
@@ -279,7 +279,7 @@ class VisionAttention(nn.Module):
         self.head_dim = config.head_dim
         self.qkv = FusedColumnLinear(hidden, {"q": hidden, "k": hidden, "v": hidden}, bias=True)
         # initialised as the nn.Linear it replaces (a checkpoint overwrites it)
-        nn.Linear.reset_parameters(self.qkv)
+        self.qkv.reset_parameters()
         self.proj = nn.Linear(hidden, hidden)
         self.attn_key = attn_key
         self.label = label
