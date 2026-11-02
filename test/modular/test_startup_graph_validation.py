@@ -864,9 +864,12 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
-    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
-    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
+    config = Qwen3ASRModelConfig()
+    pad = config.audio_token_id
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):

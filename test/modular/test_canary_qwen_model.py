@@ -1,7 +1,8 @@
 """Canary-Qwen's loading on fake inputs: the NeMo encoder names, the LLM from
 the checkpoint's PEFT names with its LoRA merged, the config read from NeMo's
-and the base LLM's ``config.json``, the prompt, the splice and the OpenAI
-adapter. The LLM's forward is ``test_qwen3_lm.py``'s, against HF's."""
+and the base LLM's ``config.json``, the prompt and the OpenAI adapter. The
+LLM's forward is ``test_qwen3_lm.py``'s, against HF's, and its splice the
+shared ``SampledTokenDecoder``'s."""
 
 import json
 import re
@@ -12,10 +13,10 @@ import torch
 
 from mstar.api_server.openai.adapters import CanaryQwenAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
-from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel, merge_lora
+from mstar.model.canary_qwen.canary_qwen_model import PREFILL_WALK, CanaryQwenModel, audio_encoder, merge_lora
 from mstar.model.canary_qwen.config import CanaryQwenModelConfig
-from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder, nemo_to_hf_name
+from mstar.model.multimodal import MEDIA_LAYOUT
 
 
 def test_merge_lora():
@@ -193,19 +194,20 @@ def _model_with_word_tokenizer() -> CanaryQwenModel:
     model.config = SimpleNamespace(audio_locator_tag="<|audio|>")
     model.tokenizer = SimpleNamespace(encode=encode)
     model.audio_token_id = encode("<|audio|>")[0]
+    model.audio_encoder = audio_encoder(model.audio_token_id)
     return model
 
 
 def test_prompt_ids():
     model = _model_with_word_tokenizer()
-    ids = model.prompt_ids(3)
+    ids = model.prompt_ids().tolist()
     at = ids.index(model.audio_token_id)
-    assert ids[at:at + 3] == [model.audio_token_id] * 3 and ids.count(model.audio_token_id) == 3
+    assert ids.count(model.audio_token_id) == 1
     assert model.tokenizer.encode("<|im_start|>user\nTranscribe the following: ") == ids[:at]
-    assert model.tokenizer.encode("<|im_end|>\n<|im_start|>assistant\n") == ids[at + 3:]
+    assert model.tokenizer.encode("<|im_end|>\n<|im_start|>assistant\n") == ids[at + 1:]
     for bad in ("say <|audio|> twice", "word " * CanaryQwenModel.MAX_TEXT_TOKENS):
         with pytest.raises(ValueError):
-            model.prompt_ids(3, bad)
+            model.prompt_ids(bad)
     # /generate's text (the ASR harnesses send a generic one) leaves the
     # trained instruction alone; model_kwargs' ``instruction`` replaces it
     model.config.encoder = SimpleNamespace(output_lengths=lambda n: 3)
@@ -214,13 +216,25 @@ def test_prompt_ids():
 
     def ids(**kwargs):
         out = model.process_prompt(generic, ["audio", "text"], ["text"], tensors=tensors, **kwargs)
+        row = out.new_input_tensors["text_inputs"][0].tolist()
         # the prompt holds the clip's frames, so it's laid out as rows (never keyed for prefix reuse)
         span, = out.metadata["kv_layout"]["kv_cache"]["main"].spans
-        assert span.kind == "rows" and span.length == len(out.new_input_tensors["text_inputs"][0])
-        return out.new_input_tensors["text_inputs"][0]
+        assert (span.kind, span.walk, span.length) == ("rows", PREFILL_WALK, len(row))
+        # where the encoder's frames go, for the LLM's splice
+        layout = out.metadata[MEDIA_LAYOUT]
+        assert (layout["offset"], layout["tokens"], layout["output"]) == (
+            [row.index(model.audio_token_id)], [3], ["encoder_states"],
+        )
+        return row
 
-    assert ids().tolist() == model.prompt_ids(3)
-    assert ids(instruction="Write down what is said:").tolist() == model.prompt_ids(3, "Write down what is said:")
+    def expanded(template: list[int]) -> list[int]:
+        # the placeholder repeated once per audio frame, as before the scaffold
+        at = template.index(model.audio_token_id)
+        return template[:at] + [model.audio_token_id] * 3 + template[at + 1:]
+
+    assert ids() == expanded(model.prompt_ids().tolist())
+    instruction = "Write down what is said:"
+    assert ids(instruction=instruction) == expanded(model.prompt_ids(instruction).tolist())
 
 
 def test_output_and_request_limits():
@@ -236,39 +250,6 @@ def test_output_and_request_limits():
     model.validate_config_yaml({"max_concurrent_requests": 64}, "canary_qwen.yaml")
     with pytest.raises(ValueError, match=r"resources\.kv_cache"):
         model.validate_config_yaml({"max_concurrent_requests": 65}, "canary_qwen.yaml")
-
-
-def test_splice_puts_frame_k_on_placeholder_k():
-    node = object.__new__(CanaryQwenLLMSubmodule)
-    torch.nn.Module.__init__(node)
-    node.model = SimpleNamespace(embed=torch.nn.Embedding(10, 4))
-    node.audio_token_id = 99
-    ids = torch.tensor([1, 2, 99, 99, 99, 3])
-    audio = torch.randn(3, 4)
-    with torch.no_grad():
-        out = node.splice_audio(ids, audio)
-        text = node.model.embed(torch.tensor([1, 2, 3]))
-    assert torch.equal(out[2:5], audio)
-    assert torch.equal(out[[0, 1, 5]], text)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync detection needs a GPU")
-def test_splice_does_not_sync_the_gpu_thread():
-    """It runs in prepare_inputs, on the GPU thread, ahead of the step in
-    flight: a host read there stalls the pipeline."""
-    node = object.__new__(CanaryQwenLLMSubmodule)
-    torch.nn.Module.__init__(node)
-    node.model = SimpleNamespace(embed=torch.nn.Embedding(10, 4).cuda())
-    node.audio_token_id = 99
-    ids = torch.tensor([1, 2, 99, 99, 99, 3], device="cuda")
-    audio = torch.randn(3, 4, device="cuda")
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        with torch.no_grad():
-            out = node.splice_audio(ids, audio)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-    assert torch.equal(out[2:5], audio)
 
 
 def test_llm_loads_from_the_checkpoints_names(tmp_path):
@@ -312,9 +293,9 @@ def test_llm_loads_from_the_checkpoints_names(tmp_path):
 
 
 def test_llm_node_caps_captures_and_names():
-    """What the shared TokenStepNode gives the LLM node: prefill batches
-    capped, decode bounded by its captures, both stop tokens, and the walk,
-    loop and sampler names of Canary-Qwen's graph."""
+    """What the shared SampledTokenDecoder gives the LLM node: prefill batches
+    capped, only decode captured, both stop tokens, and the walk, loop and
+    sampler names of Canary-Qwen's graph."""
     from mstar.model.canary_qwen.config import SAMPLER
     from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
     from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
@@ -322,8 +303,9 @@ def test_llm_node_caps_captures_and_names():
     config = Qwen3LMConfig.from_hf(dict(hidden_size=16, num_hidden_layers=1, num_attention_heads=2,
                                         num_key_value_heads=1, head_dim=8, intermediate_size=32, vocab_size=20))
     llm = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
-    node = CanaryQwenLLMSubmodule(llm, audio_token_id=19, stop_token_ids={11, 12})
-    assert node.max_batch_size("prefill") == 16 and node.max_batch_size("decode") is None
+    stops = SimpleNamespace(stop_token_ids=frozenset({11, 12}))
+    node = CanaryQwenLLMSubmodule(llm, stops, (audio_encoder(19),), text_prompts=False)
+    assert node.max_batch_size(PREFILL_WALK) == 16 and node.max_batch_size("decode") is None
     (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
     info = SimpleNamespace(
@@ -335,3 +317,7 @@ def test_llm_node_caps_captures_and_names():
     ]
     walks = object.__new__(CanaryQwenModel).get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
+    # the walk names configs and metrics read; the node splices the audio only
+    # on a walk it knows as its encoder's
+    assert set(walks) == {PREFILL_WALK, node.DECODE_WALK} == {"prefill", "decode"}
+    assert node._is_prefill_walk(PREFILL_WALK)

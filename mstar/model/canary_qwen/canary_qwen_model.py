@@ -10,10 +10,12 @@ projections is merged into them at load.
 
 Architecture (2 nodes, single partition):
     audio_encoder — log-mel + FastConformer + projection, one-shot at prefill
-    llm           — Qwen3 with a paged KV cache
+                    (a `MediaEncoder`)
+    llm           — Qwen3 with a paged KV cache (a `SampledTokenDecoder`)
 
 Graph walks:
-    prefill — audio_encoder -> llm (the prompt with the audio spliced in)
+    prefill — audio_encoder -> llm (the whole prompt as one row, the audio
+              spliced in at its placeholders)
     decode  — llm loop
 """
 
@@ -46,12 +48,12 @@ from mstar.model.canary_qwen.config import (
     DECODE_LOOP,
     DECODE_WALK,
     KV_CACHE,
-    PREFILL_WALK,
     ROPE,
     SAMPLER,
     CanaryQwenModelConfig,
 )
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, expand_media_pads, media_layout, media_walk_name
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import check_kv_pools_fit, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -83,6 +85,16 @@ def merge_lora(
             del pending[(layer, proj)]
     if pending:
         raise KeyError(f"incomplete LoRA weights for {sorted(pending)[:3]}")
+
+
+def audio_encoder(pad_id: int) -> MediaEncoder:
+    """The ``audio_encoder`` node: a clip's samples in, one LLM-space row per
+    audio placeholder out, on the ``prefill`` walk (configs and metrics read walk names)."""
+    return MediaEncoder("audio", "audio_encoder", ("audio",), "encoder_states", (pad_id,), walk="prefill")
+
+
+# the media walk the LLM node knows its prompts by, named from the encoder
+PREFILL_WALK = media_walk_name([audio_encoder(0)])
 
 
 class CanaryQwenModel(Model):
@@ -118,7 +130,15 @@ class CanaryQwenModel(Model):
         # NeMo registers the placeholder as a special token at load, as here
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.config.audio_locator_tag]})
         self.audio_token_id = self.tokenizer.convert_tokens_to_ids(self.config.audio_locator_tag)
-        self.stop_token_ids = {self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")}
+        # the LLM embeds every prompt id, placeholders too, before the audio replaces them
+        if self.audio_token_id >= self.config.llm.vocab_size:
+            raise ValueError(
+                f"the audio placeholder {self.audio_token_id} is past the LLM's {self.config.llm.vocab_size} embeddings"
+            )
+        self.config.stop_token_ids = frozenset(
+            self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")
+        )
+        self.audio_encoder = audio_encoder(self.audio_token_id)
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -238,7 +258,8 @@ class CanaryQwenModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
+            # where the LLM splices the encoder's frames in
+            step_metadata={"is_prefill": True, MEDIA_LAYOUT: (model_kwargs or {}).get(MEDIA_LAYOUT)},
         )
 
     def get_partition_forward_pass_args(
@@ -268,9 +289,10 @@ class CanaryQwenModel(Model):
     # prompt / output
     # -------------------------------------------------------------------
 
-    def prompt_ids(self, num_audio_frames: int, instruction: str = DEFAULT_INSTRUCTION) -> list[int]:
+    def prompt_ids(self, instruction: str = DEFAULT_INSTRUCTION) -> torch.Tensor:
         """NeMo's ``qwen`` prompt format for one user turn and the assistant
-        prefix, the placeholder repeated once per audio frame."""
+        prefix, with the one audio placeholder ``process_prompt`` expands to a
+        pad per audio frame."""
         text = (
             f"<|im_start|>user\n{instruction} {self.config.audio_locator_tag}<|im_end|>\n"
             "<|im_start|>assistant\n"
@@ -280,8 +302,7 @@ class CanaryQwenModel(Model):
             raise ValueError("the instruction must not contain the audio placeholder")
         if len(ids) > self.MAX_TEXT_TOKENS:
             raise ValueError(f"the prompt is {len(ids)} tokens with its template; the limit is {self.MAX_TEXT_TOKENS}")
-        at = ids.index(self.audio_token_id)
-        return ids[:at] + [self.audio_token_id] * num_audio_frames + ids[at + 1:]
+        return torch.tensor(ids, dtype=torch.long)
 
     def process_prompt(
         self,
@@ -300,15 +321,18 @@ class CanaryQwenModel(Model):
         if not isinstance(instruction, str):
             raise ValueError(f"instruction must be a string; got {instruction!r}")
         frames = self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH)
-        ids = self.prompt_ids(frames, instruction.strip() or DEFAULT_INSTRUCTION)
+        pads = expand_media_pads(
+            self.prompt_ids(instruction.strip() or DEFAULT_INSTRUCTION), {self.audio_token_id: [frames]},
+        )
+        length = int(pads.ids.numel())
         # rows, not ids: the audio placeholders are the same for every clip of a length
         kv_layout = {KV_CACHE: {"main": LabelLayout(
-            spans=(Span("rows", PREFILL_WALK, len(ids), len(ids), "text_inputs"),),
+            spans=(Span("rows", PREFILL_WALK, length, length, "text_inputs"),),
             growth=((DECODE_LOOP, 1),),
         )}}
+        layout = media_layout(pads, {self.audio_token_id: self.audio_encoder.output})
         return ProcessPromptOutput(
-            {"audio": [samples], "text_inputs": [torch.tensor(ids, dtype=torch.long)]},
-            {"kv_layout": kv_layout},
+            {"audio": [samples], "text_inputs": [pads.ids]}, {MEDIA_LAYOUT: layout, "kv_layout": kv_layout},
         )
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
@@ -369,5 +393,5 @@ class CanaryQwenModel(Model):
                 llm = llm.to(autocast_dtype)
             llm = llm.to_empty(device=device)
             llm.load_weights(self._llm_weights(device))
-            return CanaryQwenLLMSubmodule(llm.eval(), self.audio_token_id, self.stop_token_ids)
+            return CanaryQwenLLMSubmodule(llm.eval(), self.config, (self.audio_encoder,), text_prompts=False)
         return None

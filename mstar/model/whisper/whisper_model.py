@@ -27,8 +27,10 @@ Graph walks:
                        ``postprocess`` turns into word timings
 
 Request state machine (``[-> align]`` for word timestamps):
-    language given:  prefill -> decode [-> align] -> done
-    language absent: detect_language -> prefill_prompt -> decode [-> align] -> done
+    language given:  prefill [-> decode] [-> align] -> done
+    language absent: detect_language -> prefill_prompt [-> decode] [-> align] -> done
+The prompt walk samples the first of ``max_output_tokens``, so a budget of one
+runs no decode; a stop id sampled there ends the request.
 
 The transcript is streamed token by token as Whisper's own token stream
 rendered to text: spoken words as bytes, plus the language token (``<|en|>``)
@@ -460,6 +462,10 @@ class WhisperModel(Model):
                 # as ``process_prompt`` reads it: any truthy value (True,
                 # "word", "segment") means the prompt omits <|notimestamps|>
                 "timestamps": bool(kwargs.get("timestamps", False)),
+                # one token leaves decode nothing to do. The conductor's fit to
+                # the caches never cuts a budget to one: a request with no room
+                # for a decode step is refused.
+                "max_output_tokens": self.get_max_output_tokens(**kwargs),
             },
         )
         inputs = [
@@ -481,7 +487,7 @@ class WhisperModel(Model):
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         """Single-partition state machine:
-        ``[detect_language -> prefill_prompt | prefill] -> decode -> [align] -> done``."""
+        ``[detect_language -> prefill_prompt | prefill] -> [decode] -> [align] -> done``."""
         metadata = partition_metadata
         new_token = persist_signals.get("new_token", [])
         ts_rules = persist_signals.get("ts_rules", [])
@@ -504,10 +510,24 @@ class WhisperModel(Model):
                     step_metadata=self._prefill_step_metadata(metadata.kwargs),
                 )
             metadata.is_prefill = False
-            metadata.graph_walk = DECODE_WALK
-        elif metadata.graph_walk == DECODE_WALK and word_timestamps:
-            # The loop is done. Align the transcript (recorded on the decoder)
-            # against the persisted encoder output.
+            # the prompt walk sampled the budget's first token
+            if metadata.kwargs["max_output_tokens"] > 1:
+                metadata.graph_walk = DECODE_WALK
+                inputs = [
+                    self._edge(DECODER_NODE, "text_inputs", new_token),
+                    self._edge(DECODER_NODE, "ts_rules", ts_rules),
+                ]
+                return ForwardPassArgs(
+                    full_metadata=metadata,
+                    inputs=inputs,
+                    unpersist_tensors=list(new_token) + list(ts_rules),
+                    step_metadata={"is_prefill": False},
+                )
+        # The transcript is complete: the decode loop returned to the conductor
+        # (a stop id or its cap), or the prompt walk's token was the whole budget.
+        if word_timestamps and metadata.graph_walk != ALIGN_WALK:
+            # Align the transcript (recorded on the decoder) against the
+            # persisted encoder output.
             metadata.graph_walk = ALIGN_WALK
             inputs = [
                 self._edge(DECODER_NODE, "encoder_states", persist_signals.get("encoder_states", [])),
@@ -526,25 +546,11 @@ class WhisperModel(Model):
                     "audio_frames": kwargs.get("audio_frames"),
                 },
             )
-        elif metadata.graph_walk in (DECODE_WALK, ALIGN_WALK):
-            # The decode dynamic loop returned to the conductor (EOS or max
-            # tokens), or the alignment after it ran: the request is complete.
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        inputs = [
-            self._edge(DECODER_NODE, "text_inputs", new_token),
-            self._edge(DECODER_NODE, "ts_rules", ts_rules),
-        ]
         return ForwardPassArgs(
             full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=list(new_token) + list(ts_rules),
-            step_metadata={"is_prefill": False},
+            inputs=[],
+            unpersist_tensors=[],
+            request_done=True,
         )
 
     # -------------------------------------------------------------------

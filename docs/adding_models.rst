@@ -2355,11 +2355,13 @@ overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model wit
 can call the same way.
 
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
-Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``);
-Whisper's declares its own, since it writes the context eagerly and captures prefill. The
-context segments have a non-zero span in the prefill step that writes them, and a span of
-0 in every later step. The ``commit`` in the prefill step converts the reservation into
-resident pages that the later steps read.
+Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``),
+a ``SampledTokenDecoder`` that adds only the cross-attention part: the context segments,
+and the encoder output on the prefill row, which its decoder writes into the context
+before its layers read it. Whisper's declares its own, since it writes the context eagerly
+and captures prefill. The context segments have a non-zero span in the prefill step that
+writes them, and a span of 0 in every later step. The ``commit`` in the prefill step
+converts the reservation into resident pages that the later steps read.
 
 Worked example: an image DiT on the diffusion scaffold
 ------------------------------------------------------
@@ -2555,8 +2557,13 @@ A tower builds on the pieces in ``mstar/model/components/vit.py``:
 ``AxialVisionRope`` and ``RaggedVisionAttention`` (attention over the packed patches
 through the ragged resource, rope in fp32), which a tower subclasses with its q/k/v
 projections. An encoder of another medium need only send its ``MediaEncoder.output``,
-a row per pad in prompt order: Higgs-Audio's audio tower is a plain ``NodeSubmodule``
-on the ``prefill_audio`` walk.
+a row per pad in prompt order: Higgs-Audio's audio tower and Qwen3-ASR's packed AuT
+encoder are plain ``NodeSubmodule`` s on the audio walk. That walk is ``prefill_audio``
+unless the lone encoder's ``MediaEncoder.walk`` names it: Qwen3-ASR's keeps ``prefill``,
+the name its configs and metrics read. A model whose graph is not
+``MultimodalDecoderModel``'s (Canary-Qwen's LLM node is ``llm``) writes its own walks and
+hands its LLM node its ``MediaEncoder`` s and ``text_prompts`` itself, with
+``MEDIA_LAYOUT`` on the prefill step.
 
 Advanced: async partitions and streaming
 ----------------------------------------

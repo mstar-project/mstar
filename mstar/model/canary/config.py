@@ -9,13 +9,14 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mstar.model import keys
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.utils import GRANARY_LANGUAGES, base_language
 
-# decoder node resources
+# decoder node resources; the shared decoder reads `keys`' sampler
 KV_CACHE = "kv_cache"
 ATTN = "attn"
-SAMPLER = "sampler"
+SAMPLER = keys.SAMPLER
 # no RoPE: declared for the position counter that drives the sinusoid lookup
 POS = "positions"
 # the encoder output, written once at prefill, in a cache of its own so the
@@ -63,6 +64,10 @@ class CanaryModelConfig:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_heads
+
+    @property
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset({self.eos_token_id})
 
     @classmethod
     def from_pretrained(cls, local_dir: str | Path) -> CanaryModelConfig:

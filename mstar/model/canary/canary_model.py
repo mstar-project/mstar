@@ -355,7 +355,7 @@ class CanaryModel(Model):
                 name_remapper=CanaryDecoderModel.remap,
             )
             check_loaded(decoder, loaded, "Canary decoder")
-            return CanaryDecoderSubmodule(decoder=decoder.eval(), config=self.config)
+            return CanaryDecoderSubmodule(decoder.eval(), self.config)
         return None
 
 
