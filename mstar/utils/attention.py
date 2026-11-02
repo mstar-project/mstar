@@ -3,152 +3,16 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 16},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_N": 32},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_N": 64},  num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_N": 128},  num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_N": 256},  num_warps=8,  num_stages=2),
-    ],
-    key=["cache_len", "TOKENS"],
-)
 @triton.jit
-def _decode_attn_nhd_kernel(
-    Q_ptr,          # (B * T, H_q, D)    - query, T tokens per batch row
-    K_ptr,          # (B, S, H_kv, D)    - NHD layout
-    V_ptr,          # (B, S, H_kv, D)    - NHD layout
-    O_ptr,          # (B * T, H_q, D)    - output
-    cache_len,      # int: filled length; the last token attends [0, cache_len)
-    sm_scale,       # float: 1/sqrt(D) typically
-    # Q strides
-    sq_b, sq_h, sq_d,
-    # K strides (NHD)
-    sk_b, sk_n, sk_h, sk_d,
-    # V strides (NHD)
-    sv_b, sv_n, sv_h, sv_d,
-    # O strides
-    so_b, so_h, so_d,
-    H_q: tl.constexpr,
-    H_kv: tl.constexpr,
-    GROUP: tl.constexpr,        # H_q // H_kv
-    D: tl.constexpr,            # head dim, power of 2
-    TOKENS: tl.constexpr,       # T, the query tokens per batch row
-    BLOCK_N: tl.constexpr,      # KV chunk size along sequence
-):
-    # One program per (token, q_head).
-    pid_t = tl.program_id(0)
-    pid_hq = tl.program_id(1)
-    pid_hkv = pid_hq // GROUP
-    pid_b = pid_t // TOKENS
-    # causal: a token sees the cache up to and including itself
-    token_len = cache_len - (TOKENS - 1 - pid_t % TOKENS)
-
-    offs_d = tl.arange(0, D)
-
-    # Load query vector: (D,)
-    q = tl.load(Q_ptr + pid_t * sq_b + pid_hq * sq_h + offs_d * sq_d).to(tl.float32)
-    q = q * sm_scale
-
-    # Online softmax accumulators
-    m_i = -float("inf")                       # running max
-    l_i = 0.0                                  # running sum of exp
-    acc = tl.zeros((D,), dtype=tl.float32)     # running weighted sum of V
-
-    # Base pointers for this batch + kv head
-    K_base = K_ptr + pid_b * sk_b + pid_hkv * sk_h
-    V_base = V_ptr + pid_b * sv_b + pid_hkv * sv_h
-
-    # Iterate over the KV sequence in chunks of BLOCK_N
-    for start_n in range(0, token_len, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < token_len
-
-        # Load K block: (BLOCK_N, D)
-        k_ptrs = K_base + offs_n[:, None] * sk_n + offs_d[None, :] * sk_d
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
-
-        # qk: (BLOCK_N,)  =  k @ q
-        qk = tl.sum(k * q[None, :], axis=1)
-        qk = tl.where(mask_n, qk, -float("inf"))
-
-        # Online softmax update
-        m_new = tl.maximum(m_i, tl.max(qk, axis=0))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(qk - m_new)                 # (BLOCK_N,)
-
-        # Load V block: (BLOCK_N, D)
-        v_ptrs = V_base + offs_n[:, None] * sv_n + offs_d[None, :] * sv_d
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0).to(tl.float32)
-
-        # Update accumulator
-        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
-        l_i = l_i * alpha + tl.sum(p, axis=0)
-        m_i = m_new
-
-    # Finalize and store
-    out = acc / l_i
-    o_ptrs = O_ptr + pid_t * so_b + pid_hq * so_h + offs_d * so_d
-    tl.store(o_ptrs, out.to(O_ptr.dtype.element_ty))
-
-
-@torch.compiler.disable
-def decode_attn_nhd(q, k_cache, v_cache, cache_len, sm_scale=None):
-    """
-    Decode-only SDPA for NHD-format KV cache.
-
-    q:        (B, T, H_q, D)  or  (B, H_q, D)        - fp32
-    k_cache:  (B, S_max, H_kv, D)                    - fp32
-    v_cache:  (B, S_max, H_kv, D)                    - fp32
-    cache_len: int, number of valid KV positions
-
-    The T tokens of a row hold the last T valid positions, so each attends
-    causally: token t of T over ``[0, cache_len - T + t + 1)``.
-
-    returns: the same dimensions as q
-    """
-    query_shape = q.shape
-    tokens = query_shape[1] if q.dim() == 4 else 1
-    if q.dim() == 4:
-        q = q.flatten(0, 1)
-
-    B, H_q, D = q.shape
-    _, _, H_kv, _ = k_cache.shape
-    assert H_q % H_kv == 0, "H_q must be divisible by H_kv"
-    assert D in (16, 32, 64, 128, 256), f"head_dim {D} should be a power of 2"
-    assert cache_len >= tokens > 0, "Attention not well-define with empty KV"
-    assert q.is_contiguous() or q.stride(-1) == 1
-
-    if sm_scale is None:
-        sm_scale = 1.0 / (D ** 0.5)
-
-    out = torch.empty_like(q)
-
-    GROUP = H_q // H_kv
-
-    grid = (B, H_q)
-    _decode_attn_nhd_kernel[grid](
-        q, k_cache, v_cache, out,
-        cache_len, sm_scale,
-        q.stride(0), q.stride(1), q.stride(2),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
-        out.stride(0), out.stride(1), out.stride(2),
-        H_q=H_q, H_kv=H_kv, GROUP=GROUP, D=D, TOKENS=tokens,
-    )
-
-    return out.view(query_shape)
-
-
-@triton.jit
-def _rms_norm_rope(
+def rms_norm_rope(
     x_first, x_second, w_ptr, pos, eps, rope_theta,
     D: tl.constexpr,
     HALF_D: tl.constexpr,
 ):
     """One head, given as its two halves in fp32: RMSNorm by the weight at
     ``w_ptr``, then rotate-half RoPE at position ``pos`` over the full head
-    dim. Returns the two rotated halves."""
+    dim. Returns the two rotated halves. Shared by the kernels here and the
+    code predictors' (``model/components/code_predictor_kernels.py``)."""
     offs_half = tl.arange(0, HALF_D)
     sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
     inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
@@ -159,55 +23,6 @@ def _rms_norm_rope(
     cos = tl.cos(angle)
     sin = tl.sin(angle)
     return x_first * cos - x_second * sin, x_second * cos + x_first * sin
-
-
-@triton.jit
-def _qk_norm_rope_kernel(
-    X_ptr, W_norm_ptr, Pos_ptr,
-    eps, rope_theta,
-    sx_m, sx_h, sx_d,
-    D: tl.constexpr,
-    HALF_D: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    base = X_ptr + pid_m * sx_m + pid_h * sx_h
-
-    offs_half = tl.arange(0, HALF_D)
-
-    # Load both halves — the compiler will coalesce these into one transaction
-    # since they're contiguous in the inner dim.
-    x_first  = tl.load(base + offs_half * sx_d).to(tl.float32)
-    x_second = tl.load(base + (offs_half + HALF_D) * sx_d).to(tl.float32)
-
-    pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = _rms_norm_rope(
-        x_first, x_second, W_norm_ptr, pos, eps, rope_theta, D, HALF_D,
-    )
-
-    tl.store(base + offs_half * sx_d,             out_first.to(X_ptr.dtype.element_ty))
-    tl.store(base + (offs_half + HALF_D) * sx_d,  out_second.to(X_ptr.dtype.element_ty))
-
-
-def fused_qk_norm_rope(x, w_norm, pos, eps, rope_theta):
-    """
-    x:      (M, H, D)  fp32 — modified in place
-    w_norm: (D,)       fp32
-    pos:    (M,)       int32 positions
-    """
-    M, H, D = x.shape
-    assert D % 2 == 0
-    assert x.is_contiguous() or x.stride(-1) == 1
-
-    grid = (M, H)
-    _qk_norm_rope_kernel[grid](
-        x, w_norm, pos.to(torch.int32),
-        eps, rope_theta,
-        x.stride(0), x.stride(1), x.stride(2),
-        D=D, HALF_D=D // 2,
-        num_warps=4, num_stages=1,
-    )
-    return x
 
 
 # ============================================================================
@@ -241,7 +56,7 @@ def _qk_pair_norm_rope_kernel(
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = _rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
+    out_first, out_second = rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
     tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
     tl.store(base + offs_half + HALF_D, out_second.to(Q_ptr.dtype.element_ty))
 
@@ -315,7 +130,7 @@ def _qk_norm_rope_kv_kernel(
     x_first = tl.load(base + offs_half).to(tl.float32)
     x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
     pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
-    out_first, out_second = _rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
+    out_first, out_second = rms_norm_rope(x_first, x_second, w_ptr, pos, eps, rope_theta, D, HALF_D)
 
     if pid_h < H_Q:
         tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
@@ -361,21 +176,6 @@ def qk_norm_rope_kv_write(
 def _qk_norm_rope_kv_write_fake(q, k, v, q_weight, k_weight, pos_ids, cache_layer, page_idx, slot_idx,
                                 n_write, q_eps, k_eps, rope_theta) -> None:
     return None
-
-
-def qk_norm_rope_kv_write_applies(q: torch.Tensor, cache_layer: torch.Tensor) -> bool:
-    """Whether ``qk_norm_rope_kv_write`` can stand in for the separate q/k norm,
-    RoPE and KV write on these tensors: a GPU, a power-of-two head dim
-    ``tl.arange`` can load whole, a float dtype shared with the cache, and heads
-    contiguous in both."""
-    head_dim = q.shape[-1]
-    return (
-        q.device.type == "cuda"
-        and q.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and cache_layer.dtype == q.dtype
-        and head_dim >= 2 and head_dim & (head_dim - 1) == 0
-        and q.stride(-1) == 1 and cache_layer.stride(-1) == 1
-    )
 
 
 # ============================================================================

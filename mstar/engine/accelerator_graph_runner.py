@@ -27,6 +27,8 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.lora.config import LoraBaseOnly, LoraStep
+from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
@@ -431,15 +433,25 @@ def _capture_thrown_away(
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
-    taken = None if graph is None else sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
-    )
+    taken = None if graph is None else _pool_bytes(pool.handle)
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
+
+
+def _pool_bytes(pool_id) -> int:
+    """The bytes the caching allocator holds for graph pool ``pool_id``, read off the whole
+    snapshot: ``memory_snapshot(pool_id)`` drops a reference to each item of the id (torch
+    2.9-2.13), which past 256 pools frees the id while the pool's handle still holds it.
+    """
+    pool_id = tuple(pool_id)
+    return sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot()
+        if tuple(segment.get("segment_pool_id", ())) == pool_id
+    )
 
 
 def _graph_nodes(graph) -> int:
@@ -762,21 +774,28 @@ class AcceleratorGraphRunner:
     def _get_slot_specs(self) -> list[CGSlotSpec]:
         specs = []
         for config_idx, config in enumerate(self._capture_configs):
+            keys = [config.additional_key_info]
+            if getattr(self._submodule, "lora_keys", ()):
+                # a node serving adapters also captures each bucket for steps with no
+                # adapter row, recording no LoRA kernel (see `LoraBaseOnly`); the two
+                # share the config's compiled forward, static buffers and padding rows
+                keys.append(LoraBaseOnly(config.additional_key_info))
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):
-                    bucket = BucketKey(
-                        graph_walk=config.capture_graph_walk,
-                        cg_key_info=config.additional_key_info,
-                        bs=bs,
-                        num_tokens=num_tokens,
-                    )
-                    for slot in range(self._num_slots):
-                        specs.append(CGSlotSpec(
-                            bucket=bucket,
-                            slot=slot,
-                            config=config,
-                            config_idx=config_idx,
-                        ))
+                    for key in keys:
+                        bucket = BucketKey(
+                            graph_walk=config.capture_graph_walk,
+                            cg_key_info=key,
+                            bs=bs,
+                            num_tokens=num_tokens,
+                        )
+                        for slot in range(self._num_slots):
+                            specs.append(CGSlotSpec(
+                                bucket=bucket,
+                                slot=slot,
+                                config=config,
+                                config_idx=config_idx,
+                            ))
         return specs
 
     def _get_addtl_slot_specs(self, spec: CGSlotSpec) -> list[CGSlotSpec]:
@@ -1569,8 +1588,8 @@ class AcceleratorGraphRunner:
 # Piecewise buckets share the resources' (bucket, slot, label) buffer space
 # with the full-forward captures. They never coexist on one node — a forward
 # either replays whole or runs eager around captured regions — so the walk name
-# below plus the region's label is enough to keep the keys apart.
-PIECEWISE_WALK = "__piecewise__"
+# (`PIECEWISE_WALK`, defined beside `StepContext`) plus the region's label is
+# enough to keep the keys apart.
 
 
 @dataclass
@@ -1716,12 +1735,12 @@ class PiecewiseAcceleratorGraphRunner:
         """A region has no pre-plan path, so a second slot buys nothing unless a
         resource its step touches stages into a reused host buffer behind an
         async H2D (see ``Resource.force_double_buffer``)."""
-        if self._max_slots <= 1 or self._config.declare_step is None:
+        if self._max_slots <= 1:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
             # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
-            step = self._config.declare_step(
+            step = self._config.region_step(
                 self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
@@ -1758,12 +1777,22 @@ class PiecewiseAcceleratorGraphRunner:
         """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
-            if shapes and self._config.declare_step is not None:
+            if shapes:
                 shape = shapes[0]
-                step = self._config.declare_step(
+                step = self._config.region_step(
                     self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                     list(shape.seq_lens),
                 )
+                if self._config.one_row_per_step and step is not None and any(
+                    isinstance(work, LoraStep) for work in step.steps.values()
+                ):
+                    # its replay names only the step's first request
+                    raise ValueError(
+                        f"piecewise region {self._label!r} of node {self._node_name!r} "
+                        "declares a LoRA step but replays one row per step "
+                        "(one_row_per_step): every request's tokens would take the "
+                        "first request's adapter"
+                    )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
                     logger.error(
@@ -2079,9 +2108,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        if self._config.declare_step is None:
-            return None
-        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        step = self._config.region_step(list(request_ids), list(seq_lens))
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2137,9 +2164,10 @@ class PiecewiseAcceleratorGraphRunner:
         """The captured bucket serving this call, or None for eager.
 
         BATCHED buckets are fixed by the padded batch size; PACKED ones take
-        the smallest captured token bucket that fits.
+        the smallest captured token bucket that fits. A ``one_row_per_step``
+        region resolves every batch as one row.
         """
-        padded_bs = self._padded_bs(batch_size)
+        padded_bs = self._padded_bs(1 if self._config.one_row_per_step else batch_size)
         if padded_bs is None:
             return None
         if self._config.get_config_type() == PiecewiseConfigType.BATCHED:
@@ -2200,7 +2228,14 @@ class PiecewiseAcceleratorGraphRunner:
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
+
+        A ``one_row_per_step`` region replays the step as one row named by its
+        first request, however many requests or segments it is passed.
         """
+        if self._config.one_row_per_step:
+            real_bs = 1
+            if request_ids is not None:
+                request_ids = request_ids[:1]
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)

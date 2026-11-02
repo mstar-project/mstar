@@ -12,6 +12,7 @@ CPU-only head-dimension validation lives in ``test_ragged_attention_cpu.py``.
 
 from __future__ import annotations
 
+import functools
 import sys
 
 sys.path.insert(0, ".")
@@ -49,7 +50,6 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedPrefillWrapper,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ragged attention requires CUDA"
@@ -324,6 +324,69 @@ def test_shards_head_counts_at_build():
     assert mgr._kwargs["num_qo_heads"] == HEADS // 2
     # head_dim never shards
     assert mgr._kwargs["head_dim"] == HEAD_DIM
+
+
+@pytest.mark.parametrize("compile_op", [True, False])
+def test_compiled_caller_keeps_attention_in_its_graph(compile_op):
+    """With ``compile_op``, the resource's ``run`` traces as one custom op: the region
+    keeps one graph around it and computes what eager does. Without it (the default)
+    the region breaks at the attention."""
+    mgr = manager(compile_op=compile_op)
+    spans = [128, 96]
+    mgr.plan(step(*spans), ctx(["r0", "r1"]))
+    q, k, v = qkv(sum(spans))
+    fn = functools.partial(mgr.run, label="main")
+
+    def region(q, k, v):
+        return fn(q * 1.0, k, v) + 1.0
+
+    torch._dynamo.reset()
+    explain = torch._dynamo.explain(region)(q, k, v)
+    assert (explain.graph_break_count == 0) is compile_op
+    close(torch.compile(region)(q, k, v), region(q, k, v))
+
+
+def test_callable_built_inside_a_compiled_region():
+    """A node that builds its callables lazily on first forward does so inside
+    the compiled region; later calls still reach the resource."""
+    mgr = manager(compile_op=True)
+    spans = [128, 96]
+    mgr.plan(step(*spans), ctx(["r0", "r1"]))
+    q, k, v = qkv(sum(spans))
+    fns: dict[int, functools.partial] = {}
+
+    def region(q, k, v):
+        fn = fns.get(id(mgr))
+        if fn is None:
+            fn = fns[id(mgr)] = functools.partial(mgr.run, label="main")
+        return fn(q, k, v) + 1.0
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region)
+    expected = mgr.run(q, k, v, label="main") + 1.0
+    for _ in range(2):
+        close(compiled(q, k, v), expected)
+
+
+def test_a_compiled_region_attends_through_a_rebuilt_resource():
+    """Each manager's op key is its resource key plus a number unique in the process.
+    A region compiled against one manager, then called with a manager rebuilt under the
+    same resource key, attends through the rebuilt one's plan, not the old one's, though
+    the old one is still registered under its own op key."""
+    q, k, v = qkv(224)
+
+    def region(fn, q, k, v):
+        return fn(q, k, v) + 1.0
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region)
+    old = manager(compile_op=True)
+    old.plan(step(128, 96), ctx(["r0", "r1"]))
+    close(compiled(functools.partial(old.run, label="main"), q, k, v), ref(q, k, v, cu([128, 96])) + 1.0)
+
+    rebuilt = manager(compile_op=True)
+    rebuilt.plan(step(64, 160), ctx(["r0", "r1"]))
+    close(compiled(functools.partial(rebuilt.run, label="main"), q, k, v), ref(q, k, v, cu([64, 160])) + 1.0)
 
 
 def test_plan_then_run_matches_reference():
@@ -819,13 +882,13 @@ def test_graph_cross_replay_returns_the_lse():
     close_lse(lse[:total], lse_ref(q, k, cu(q_lens), cu(kv_lens)))
 
 
-def test_callable_hands_back_the_lse():
+def test_label_bound_run_hands_back_the_lse():
     mgr = cross_manager()
     step_ = RaggedCrossAttentionStep(segments=av_segments([96, 64], [32, 32], [16, 8]), pairs=(("audio", "video"),))
     mgr.plan(step_, ctx(["r0", "r1"]))
     q = qkv(24, seed=5)[0]
     _, k, v = qkv(160, seed=6)
-    attend = RaggedAttentionCallable(mgr, cross_label("audio", "video"))
+    attend = functools.partial(mgr.run, label=cross_label("audio", "video"))
     out, lse = attend(q, k, v, return_lse=True)
     close(out, attend(q, k, v))
     close_lse(lse, lse_ref(q, k, cu([16, 8]), cu([96, 64])))

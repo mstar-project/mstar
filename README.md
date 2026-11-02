@@ -70,7 +70,7 @@ The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the sa
 and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`.
 Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/installation.rst`).
 
-To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
+To enable flash-attn support (recommended for BAGEL),
 ```bash
 # torch 2.10 built for CUDA 13.x (cu13); on a cu12 torch, build from source (docs/installation.rst)
 uv pip install \
