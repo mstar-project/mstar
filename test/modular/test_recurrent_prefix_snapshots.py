@@ -443,7 +443,8 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
                 transfer_engine_info=None, device=torch.device("cpu"),
             )
         elif isinstance(spec, RecurrentStateSpec):
-            group = type("Group", (), {"world_size": size})() if size > 1 else None
+            tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
+            group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if size > 1 else None
             engine._resources[spec.resource_key] = RecurrentStatePool.build(spec, EngineResourceInfo(
                 device=torch.device("cpu"), joint_comm_group=group,
                 dependencies={dep: by_key[dep] for dep in spec.depends_on()},
