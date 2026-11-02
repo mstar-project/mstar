@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
@@ -526,9 +527,10 @@ def _sequence_parallel(
     moe_parallel: "Mapping[str, MoeParallelConfig]",
 ) -> Iterator[str]:
     """What a node group's SP ranks can't run (`sequence_parallel_refusals`, which the engine
-    checks again at load), and whether each KV pool placed over a group's ranks can stripe over
-    them. Without ``specs`` (the model's resources failed to resolve, which is reported apart)
-    there is nothing to check this against."""
+    checks again at load), whether each KV pool placed over a group's ranks can stripe over
+    them, and that no resource spans nodes that split heads different ways (the engine refuses
+    it at load too). Without ``specs`` (the model's resources failed to resolve, which is
+    reported apart) there is nothing to check this against."""
     if specs is None:
         return
     groups: dict[int, tuple[int, int, set[str]]] = {}
@@ -542,6 +544,21 @@ def _sequence_parallel(
                     spec.config.context_parallel_size(spec.resource_key, tp, sp)
                 except ValueError as e:
                     yield f"node_groups[{i}]: {e}"
+        # node -> whether it places its KV positions over its SP ranks (heads over TP alone)
+        # rather than splitting its steps (heads over TP x SP)
+        placed = {}
         for node in sorted(nodes):
-            for refusal in sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node)):
+            refusals = sequence_parallel_refusals(specs, node, tp, sp, moe_parallel.get(node))
+            for refusal in refusals:
                 yield f"node_groups[{i}]: {refusal}"
+            if sp > 1 and not refusals:
+                placed[node] = any(position_pools(specs, node).values())
+        mixed = sorted(
+            spec.resource_key for spec in specs if len({placed[node] for node in spec.nodes & placed.keys()}) > 1
+        )
+        if mixed:
+            yield (
+                f"node_groups[{i}]: {sorted(n for n, p in placed.items() if p)} place their KV positions over "
+                f"the SP ranks and {sorted(n for n, p in placed.items() if not p)} split their steps over them, "
+                f"so they split heads different ways, yet share resources {mixed}"
+            )

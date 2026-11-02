@@ -1,5 +1,5 @@
 """``load_weights_into`` routes names through an indexed rule matcher; it
-must pick exactly the rule the first-win linear scan (``_apply_stacked``)
+must pick exactly the rule the first-win linear scan (``apply_stacked``)
 picks, for every name."""
 import itertools
 import random
@@ -8,8 +8,8 @@ from mstar.model.loader.base import (
     LLAMA_STACKED_PARAMS,
     WHISPER_STACKED_PARAMS,
     StackedParamRule,
-    _apply_stacked,
     _StackedMatcher,
+    apply_stacked,
 )
 
 
@@ -45,7 +45,7 @@ def test_matcher_agrees_with_linear_scan():
     for rules in (_expert_rules(12), LLAMA_STACKED_PARAMS, WHISPER_STACKED_PARAMS, []):
         match = _StackedMatcher(rules)
         for name in _names(12):
-            assert match(name) == _apply_stacked(name, rules), name
+            assert match(name) == apply_stacked(name, rules), name
 
 
 def test_matcher_keeps_first_win_across_overlapping_rules():
@@ -61,4 +61,4 @@ def test_matcher_keeps_first_win_across_overlapping_rules():
         match = _StackedMatcher(rules)
         for _ in range(20):
             name = ".".join(rng.choices(pieces, k=rng.randint(1, 5)))
-            assert match(name) == _apply_stacked(name, rules), (name, rules)
+            assert match(name) == apply_stacked(name, rules), (name, rules)

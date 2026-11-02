@@ -8,6 +8,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from mstar.engine.resources import AttentionStep, RaggedAttentionConfig, Segment, StepContext
+from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
+from mstar.engine.resources.attn.ragged.dense_wrappers import DenseRaggedPrefillWrapper
 from mstar.engine.resources.attn.ragged.wrappers import (
     SUPPORTED_HEAD_DIMS,
     FlashInferRaggedPrefillWrapper,
@@ -144,3 +147,31 @@ def test_a_dropped_manager_leaves_the_op_registry():
     del mgr
     gc.collect()
     assert key not in _MANAGERS
+
+
+def test_a_ragged_wrapper_does_not_replan_an_unchanged_layout(monkeypatch):
+    """A denoise loop declares the same segments every step: the wrapper keeps
+    its last schedule, so only a changed layout, causal flag or another slot's
+    wrapper plans the kernel again."""
+    planned = []
+    real_plan = DenseRaggedPrefillWrapper._plan_kernel
+    monkeypatch.setattr(
+        DenseRaggedPrefillWrapper, "_plan_kernel", lambda self, *a: planned.append(self) or real_plan(self, *a),
+    )
+    manager = DenseRaggedManager(
+        torch.device("cpu"), torch.bfloat16, RaggedAttentionConfig(num_qo_heads=2, num_kv_heads=2, head_dim=64), "x",
+    )
+
+    def plan(*spans, causal=False, slot=0):
+        segments = tuple(Segment(request_id=f"r{i}", label="main", span=n) for i, n in enumerate(spans))
+        ctx = StepContext(request_ids=[s.request_id for s in segments], graph_walk="w", slot=slot, capture=False)
+        manager.plan(AttentionStep(segments=segments, causal=causal), ctx)
+
+    plan(64, 32)
+    plan(64, 32)
+    assert len(planned) == 1 and manager.num_segments() == 2
+    plan(64, 32, slot=1)
+    assert len(planned) == 2 and planned[1] is not planned[0]
+    plan(64, 32, causal=True)
+    plan(64, 33)
+    assert len(planned) == 4

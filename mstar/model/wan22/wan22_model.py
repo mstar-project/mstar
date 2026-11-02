@@ -1,6 +1,6 @@
 """Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
 
-Architecture (4 nodes, no engine resources — nothing here is cached):
+Architecture (4 nodes; nothing here is cached, the dit's self-attention is a ragged resource):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
     dit          - dense 5B video DiT; CFG as one batch-2 forward,
@@ -40,6 +40,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -90,6 +91,7 @@ class Wan22Model(Model):
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
+        attention_backend: str = "flashinfer",
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -104,6 +106,7 @@ class Wan22Model(Model):
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
+            attention_backend=attention_backend,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         # Dummy mode: get_submodule returns None for every node, so engines run
@@ -125,7 +128,8 @@ class Wan22Model(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No engine-built resources: every node here is stateless.
+        """The DiT's self-attention as a cacheless ragged resource (with
+        ``attention_backend: flashinfer``); nothing here keeps state.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
@@ -133,7 +137,28 @@ class Wan22Model(Model):
         the only state that crosses a step is the UniPC solver's, which
         rides the loop-back edges as ordinary tensors rather than a cache.
         """
-        return []
+        if self.config.attention_backend != "flashinfer":
+            return []
+        cfg = self.config
+        # Self-attention only: the cross-attention over the 512 text tokens runs
+        # SDPA (cuDNN), which measured faster than FlashInfer's ragged kernel at
+        # that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
+        # FA3 beats it on the self-attention (12.4 vs 14.8 ms).
+        return [
+            RaggedAttentionSpec(
+                resource_key=Wan22DitSubmodule.SELF_ATTN, nodes={"dit"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=cfg.num_attention_heads,
+                    num_kv_heads=cfg.num_attention_heads,
+                    head_dim=cfg.attention_head_dim,
+                    # one segment per guidance branch
+                    max_segments_per_request=2,
+                    # the DiT is compiled, not captured: keep attention in its graph
+                    compile_op=True,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the

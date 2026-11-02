@@ -122,7 +122,10 @@ class FishS2ProModel(Model):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Server-init knob: decode the codec with TF32 off (the reference's fp32).
-        self.codec_exact_fp32 = bool(kwargs.get("codec_exact_fp32", True))
+        # Off by default: in exact fp32 the codec's conv stack is most of the GPU
+        # time once requests overlap, TF32 halves it, and the audio stays within
+        # ~60 dB SNR of the exact decode.
+        self.codec_exact_fp32 = bool(kwargs.get("codec_exact_fp32", False))
         self.local_dir = _resolve_snapshot(model_path_hf, cache_dir, list(METADATA_FILES))
         logger.info(LICENSE_NOTICE)
         self.config = FishS2ProConfig.from_pretrained(

@@ -180,6 +180,8 @@ class ParallelCrossAttention(nn.Module):
     combines their contributions with an all-reduce.
     """
 
+    lora_unservable = dict.fromkeys(("k_proj", "v_proj"), "projects the encoder context, not the step's tokens")
+
     def __init__(
         self,
         *,

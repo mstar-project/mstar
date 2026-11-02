@@ -26,6 +26,7 @@ from test_kv_prefix_tp import WALKS, _ctx, _follow, _ingest, _send, _step, _toke
 from test_startup_graph_validation import _qwen3_5
 
 from mstar.distributed.communication import CommGroup, JointGroups, WorkerParallelGroups
+from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn import flashinfer_mla as fm
@@ -295,6 +296,28 @@ def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp
     with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
+        )
+
+
+@dataclass
+class _SharedSpec(_DependentSpec):
+    def depends_on(self):
+        return set()
+
+
+def test_a_resource_over_nodes_that_split_heads_differently_is_refused(monkeypatch):
+    """A resource is sized by one head-shard count, so it can't serve a node that places its
+    positions over its SP ranks (heads over TP) beside one splitting its steps (heads over TP x SP)."""
+    other = "other"
+    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
+    for node in (NODE, other):
+        groups.add_sp(node, _group(0, P))
+    monkeypatch.setattr(engine_mod, "sequence_parallel_refusals", lambda *args: [])
+    monkeypatch.setattr(engine_mod, "position_pools", lambda specs, node: {"kv": node == NODE})
+    with pytest.raises(ValueError, match="'shared' serves nodes that split heads different ways"):
+        Engine(graph_runtime=None).load_model(
+            {NODE: _Submodule(), other: _Submodule()}, specs=[_SharedSpec(resource_key="shared", nodes={NODE, other})],
+            parallel_groups=groups, device=CPU, transfer_engine_info=None,
         )
 
 
