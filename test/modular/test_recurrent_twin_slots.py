@@ -67,10 +67,10 @@ def test_decode_reads_one_writes_the_other_and_commit_swaps():
     reads, writes = _reads_writes(addressing)
     slots = pool._slots
     assert reads == [slots["a"]["main"].index, slots["b"]["main"].index]
-    assert writes == [slots["a"]["main"].extra[0], slots["b"]["main"].extra[0]]
+    assert writes == [slots["a"]["main"].twin[0], slots["b"]["main"].twin[0]]
     assert len({*reads, *writes}) == 4
     pool.commit(step, ctx)
-    assert (slots["a"]["main"].index, slots["a"]["main"].extra) == (writes[0], (reads[0],))
+    assert (slots["a"]["main"].index, slots["a"]["main"].twin) == (writes[0], (reads[0],))
     step, ctx, addressing = _step(pool, [("a", 1), ("b", 1)])
     assert _reads_writes(addressing) == (writes, reads)
     pool.commit(step, ctx)
@@ -112,7 +112,7 @@ def test_a_pool_without_twins_is_todays():
     step, ctx, addressing = _step(pool, [("a", 1)])
     assert addressing.write_slot_indices is None
     index = pool._slots["a"]["main"].index
-    assert pool._slots["a"]["main"].extra == ()
+    assert pool._slots["a"]["main"].twin == ()
     pool.commit(step, ctx)
     assert pool._slots["a"]["main"].index == index
 
@@ -150,7 +150,7 @@ def test_rollback_and_release_hand_back_both_slots_zeroed():
     free = pool.num_free_slots
     step, ctx, _ = _step(pool, [("a", 1)])
     slot = pool._slots["a"]["main"]
-    pool.block("state", 0)[[slot.index, slot.extra[0]]] = 1.0
+    pool.block("state", 0)[[slot.index, slot.twin[0]]] = 1.0
     pool.rollback_admit(step, ctx)
     assert pool.num_free_slots == free
     assert pool.block("state", 0).abs().sum() == 0
@@ -158,7 +158,7 @@ def test_rollback_and_release_hand_back_both_slots_zeroed():
     step, ctx, _ = _step(pool, [("a", 1)])
     pool.commit(step, ctx)
     slot = pool._slots["a"]["main"]
-    pool.block("state", 0)[[slot.index, slot.extra[0]]] = 1.0
+    pool.block("state", 0)[[slot.index, slot.twin[0]]] = 1.0
     pool.remove_request("a")
     assert pool.num_free_slots == free
     assert pool.block("state", 0).abs().sum() == 0
@@ -190,12 +190,10 @@ def test_a_fork_copies_from_the_slot_the_state_is_in():
     assert pool.block("state", 0)[pool._slots["a"]["side"].index].tolist() == [3.0, 3.0]
 
 
-def test_twins_refuse_speculation_and_kernels_that_update_in_place():
-    with pytest.raises(ValueError, match="twin_slots"):
-        _pool(spec_tokens=2)
+def test_twins_refuse_kernels_that_update_in_place():
     manager = GDNManager.__new__(GDNManager)
     pool = _pool()
-    manager._pool_key, manager._splits = "gdn_state", {}
+    manager._pool_key, manager._spec_key, manager._splits = "gdn_state", None, {}
     manager._kernels = SimpleNamespace(writes_snapshots=True, writes_twin_slots=False)
     with pytest.raises(ValueError, match="twin_slots"):
         manager.bind_dependencies({"gdn_state": pool})

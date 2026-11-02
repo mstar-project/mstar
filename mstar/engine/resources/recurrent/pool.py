@@ -74,15 +74,21 @@ class SlotState:
     # tokens the state has taken in, which places its page boundaries
     tokens: int = 0
     # under speculative decoding, the slots after `index` that hold the state
-    # after each further token of a verify row; with twin slots, the slot a
-    # decode step writes, which becomes `index` when the step commits
+    # after each further token of a verify row
     extra: tuple[int, ...] = ()
-    # with twin slots, whether the state sits in the twin the request did not start on
+    # with twin slots, what a decode step writes: one slot per slot of `group`,
+    # which takes the group's place when the step commits
+    twin: tuple[int, ...] = ()
+    # with twin slots, whether the state sits in the twins the request did not start on
     swapped: bool = False
 
     @property
     def group(self) -> tuple[int, ...]:
         return (self.index, *self.extra)
+
+    @property
+    def held(self) -> tuple[int, ...]:
+        return (self.index, *self.extra, *self.twin)
 
 
 class SnapshotLease(NamedTuple):
@@ -144,6 +150,8 @@ class RecurrentAddressing:
     # Under speculative decoding, each row's slots in token order (its
     # `slot_indices` entry first), `pad_index` throughout for a row with none
     host_slot_groups: Sequence[tuple[int, ...]] | None = None
+    # Under a speculative step with twin slots, the slots each row's tokens write
+    host_twin_groups: Sequence[tuple[int, ...]] | None = None
     # Under a decode step with twin slots, where each row writes: `slot_indices`
     # is what it reads. None where rows update their slot in place.
     write_slot_indices: torch.Tensor | None = None
@@ -179,8 +187,6 @@ class RecurrentStatePool(Resource):
                 "prefix_slots needs the sink slot: a captured step's padding "
                 "rows write their snapshots there"
             )
-        if config.twin_slots and config.spec_tokens:
-            raise ValueError("twin_slots and speculative decoding each keep their own slots; pick one")
         self._device = device
         self.config = config
         # the resource key, for errors
@@ -392,7 +398,7 @@ class RecurrentStatePool(Resource):
             if not labels:
                 return
             for slot in labels.values():
-                for index in slot.group:
+                for index in slot.held:
                     self._zero_slot(index)
                     if free:
                         self._free.append(index)
@@ -428,8 +434,9 @@ class RecurrentStatePool(Resource):
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             index = self._free.pop()
-            extra = tuple(self._free.pop() for _ in range(need - 1))
-            slot = labels[label] = SlotState(index=index, extra=extra)
+            extra = tuple(self._free.pop() for _ in range(self.config.spec_tokens))
+            twin = tuple(self._free.pop() for _ in range(need - len(extra) - 1))
+            slot = labels[label] = SlotState(index=index, extra=extra, twin=twin)
             self._admit_taken[(rid, label)] = (slot.index, bool(kept))
             return slot
 
@@ -525,7 +532,7 @@ class RecurrentStatePool(Resource):
                 if slot is None or slot.index != index:
                     continue  # reset or removed under us; the slot went with it
                 del labels[label]
-                for taken_index in slot.group:
+                for taken_index in slot.held:
                     self._zero_slot(taken_index)
                     self._free.append(taken_index)
                 if reserved:
@@ -642,9 +649,12 @@ class RecurrentStatePool(Resource):
     def _writes_twins(self, step: RecurrentStep, ctx: StepContext) -> bool:
         """Whether this step's rows read one twin and write the other, the same
         answer at capture, plan and commit: a replay runs what its capture
-        recorded, and commit must swap what the kernels wrote and nothing else."""
+        recorded, and commit must swap what the kernels wrote and nothing else.
+        A speculative step swaps once however many tokens its rows carry."""
         if not self.config.twin_slots or ctx.force_prefill:
             return False
+        if self.config.spec_tokens:
+            return step.verify
         walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
         if walk in self._in_place_walks:
             return False
@@ -678,7 +688,7 @@ class RecurrentStatePool(Resource):
                     if twins:
                         # before anything below reads the slot; the next plan
                         # waits for this commit, so it reads what this step wrote
-                        slot.index, slot.extra = slot.extra[0], (slot.index,)
+                        slot.index, slot.extra, slot.twin = slot.twin[0], slot.twin[1:], slot.group
                         slot.swapped = not slot.swapped
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
@@ -1053,7 +1063,8 @@ class RecurrentStatePool(Resource):
         writes = []
         spec = self.config.spec_tokens > 0
         groups = [] if spec else None
-        pad_group = (pad,) * self.config.slots_per_request
+        twin_groups = [] if spec and twins else None
+        pad_group = (pad,) * (self.config.spec_tokens + 1)
         for seg in segments:
             slot = (
                 None if ctx.capture or ctx.is_padding_row(seg.request_id)
@@ -1066,7 +1077,9 @@ class RecurrentStatePool(Resource):
                 has_state.append(False)
                 if spec:
                     groups.append(pad_group)
-                if twins:
+                    if twins:
+                        twin_groups.append(pad_group)
+                elif twins:
                     writes.append(pad)
             else:
                 indices.append(slot.index)
@@ -1075,8 +1088,10 @@ class RecurrentStatePool(Resource):
                 )
                 if spec:
                     groups.append(slot.group)
-                if twins:
-                    writes.append(slot.extra[0])
+                    if twins:
+                        twin_groups.append(slot.twin)
+                elif twins:
+                    writes.append(slot.twin[0])
 
         snapshots = ()
         if self._snap_writes and not ctx.capture:
@@ -1102,7 +1117,7 @@ class RecurrentStatePool(Resource):
         self._state_stager.copy_(
             target.has_state, has_state, pad_value=False, mirror=mirrors[1],
         )
-        if twins:
+        if twins and not spec:
             # the slots swap every step, but a step alternates between two
             # captured buffers too, so at a steady batch these stay skipped
             self._index_stager.copy_(
@@ -1122,7 +1137,8 @@ class RecurrentStatePool(Resource):
                 else self._kv.config.page_size if self._kv is not None else 0
             ),
             host_slot_groups=groups,
-            write_slot_indices=target.write_slot_indices if twins else None,
+            host_twin_groups=twin_groups,
+            write_slot_indices=target.write_slot_indices if twins and not spec else None,
         )
 
     def _addressing_buffers(
@@ -1161,7 +1177,7 @@ class RecurrentStatePool(Resource):
             num_rows=0,
             write_slot_indices=(
                 torch.full((size,), self.pad_index, dtype=torch.int32, device=self._device)
-                if self.config.twin_slots else None
+                if self.config.twin_slots and not self.config.spec_tokens else None
             ),
         )
 

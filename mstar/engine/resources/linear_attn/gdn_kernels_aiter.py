@@ -530,7 +530,8 @@ class FlyDSLVerify(GDNPrefillKernel):
             q.unflatten(0, chain), k.unflatten(0, chain), v.unflatten(0, chain),
             a.unflatten(0, chain), b.unflatten(0, chain),
             self._kernels.dt_bias_as(dt_bias, q.dtype), a_log, state, out,
-            plan.slot_map, plan.num_accepted,
+            # the kernel reads a row's start at this count's column, so a wider map moves it
+            plan.slot_map, plan.read_columns,
             use_qk_l2norm=self._kernels.qk_l2norm,
         )
         return out.flatten(0, 1)

@@ -109,6 +109,9 @@ class GDNManager(LinearAttnManager):
                 )
             # a split walk's decode kernel takes every row, on buffers of its own
             self._pool.keep_in_place(frozenset(self._splits))
+            spec = resources.get(self._spec_key)
+            if spec is not None:
+                spec.read_columns_past(self._pool.config.spec_tokens + 1)
 
     # Step lifecycle
 
@@ -192,8 +195,11 @@ class GDNManager(LinearAttnManager):
                 accelerator_graph=lease is not None,
                 null_slot_id=SINK_SLOT if self._has_sink else NO_SLOT,
                 kernels=self._kernels,
+                twin_slots=addressing.host_twin_groups is not None,
             )
-        wrapper.plan(groups[: addressing.num_rows], verify.num_accepted)
+        rows = addressing.num_rows
+        twins = addressing.host_twin_groups
+        wrapper.plan(groups[:rows], verify.num_accepted, None if twins is None else twins[:rows], verify.read_columns)
         return wrapper
 
     def _get_wrapper(

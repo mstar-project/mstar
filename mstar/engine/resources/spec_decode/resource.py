@@ -107,6 +107,7 @@ class _StepImage(NamedTuple):
     params: torch.Tensor
     seeds: torch.Tensor          # seed steps: each request's sampling seed, int64
     num_accepted: torch.Tensor   # verify steps: the row's last accepted count, for the recurrent kernels
+    read_columns: torch.Tensor   # verify steps: the count as the state kernel reads it, see `read_columns_past`
     # What an argmax through the unfiltered draw reads, [rows * (k + 1)]:
     # temperature 0, and offsets it stores back unchanged. Never read for a token.
     zero_temperature: torch.Tensor
@@ -131,6 +132,11 @@ class SpecDecodePlan(NamedTuple):
         """Each row's accepted count from its previous verify (1 after a seed),
         filled by ``verify_inputs`` before the layers run."""
         return self.image.num_accepted[: self.num_rows]
+
+    @property
+    def read_columns(self) -> torch.Tensor:
+        """``num_accepted`` past the columns of a recurrent slot map's writes."""
+        return self.image.read_columns[: self.num_rows]
 
 
 class SpecDecodeResource(Resource):
@@ -191,6 +197,7 @@ class SpecDecodeResource(Resource):
         self._seed = torch.zeros(rows, dtype=torch.long, device=device)
         self._rng_offset = torch.zeros(rows, dtype=torch.long, device=device)
         self._rng_stride = sampled.words_per_step(num_draft_tokens)
+        self._column_offset = 0
         # per request and draft: the distribution the next verify judges it by
         self._draft_ids = self._draft_probs = None
         if sampling:
@@ -261,6 +268,11 @@ class SpecDecodeResource(Resource):
             self._retract.pop(rid, None)
             if row is not None:
                 self._free.append(row)
+
+    def read_columns_past(self, columns: int) -> None:
+        """The recurrent pool's verify slot map starts with ``columns`` it only
+        writes (twin slots), so a row's start is that far along its accepted count."""
+        self._column_offset = columns
 
     # Host bookkeeping
 
@@ -418,12 +430,14 @@ class SpecDecodeResource(Resource):
         image = torch.zeros(len(_FIELDS) * rows, dtype=torch.int32, device=self._device)
         views = image.view(len(_FIELDS), rows)
         tokens = rows * self.tokens_per_row
+        num_accepted = torch.ones(rows, dtype=torch.int32, device=self._device)
         return _StepImage(
             image=image, rows=views[0], real=views[1], base=views[2],
             budget=views[3], stop_on=views[4], top_k=views[5],
             params=torch.ones(2 * rows, dtype=torch.float32, device=self._device),
             seeds=torch.zeros(rows, dtype=torch.long, device=self._device),
-            num_accepted=torch.ones(rows, dtype=torch.int32, device=self._device),
+            num_accepted=num_accepted,
+            read_columns=num_accepted.clone() if self._column_offset else num_accepted,
             zero_temperature=torch.zeros(tokens, dtype=torch.float32, device=self._device),
             zero_seed=torch.zeros(tokens, dtype=torch.long, device=self._device),
             zero_offset=torch.zeros(tokens, dtype=torch.long, device=self._device),
@@ -504,6 +518,7 @@ class SpecDecodeResource(Resource):
             image.rows[:b], image.real[:b], self._seq_len, self._num_acc, self._tokens,
             plan.block_table, self._page_size, self._ids, self._positions, self._slots,
             plan.write_pages, plan.write_offsets, plan.kv_lens, plan.num_accepted,
+            plan.read_columns, self._column_offset,
         )
         return self._ids, self._positions
 

@@ -90,9 +90,9 @@ def reference(q, k, v, a, b, a_log, dt_bias, h0, scale):
     return torch.stack(outs), torch.stack(states)
 
 
-def build(k: int, rows: int):
+def build(k: int, rows: int, twin_slots: bool = False):
     spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
-        num_layers=1, blocks=GEO.to_blocks(), max_slots=1 + rows * (k + 1), spec_tokens=k,
+        num_layers=1, blocks=GEO.to_blocks(), max_slots=1 + rows * (k + 1), spec_tokens=k, twin_slots=twin_slots,
     ))
     pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=DEV))
     manager = LinearAttnManager.build(
@@ -115,17 +115,20 @@ def inputs(tokens: int, seed: int):
                 b=randn(tokens, GEO.num_v_heads))
 
 
-def step(pool, manager, rids, span, num_accepted=None):
+def step(pool, manager, rids, span, num_accepted=None, read_columns=None):
     segs = tuple(Segment(r, "main", span) for r in rids)
     ctx = StepContext(request_ids=rids, graph_walk="decode" if num_accepted is not None else "prefill",
                       slot=0, capture=False)
     for r in rids:
         pool.ingest_request(r)
-    rstep = RecurrentStep(segments=segs)
+    rstep = RecurrentStep(segments=segs, verify=num_accepted is not None)
     assert pool.admit(rstep, ctx).ok
     ctx.plan_results[POOL] = pool.plan(rstep, ctx)
     if num_accepted is not None:
-        ctx.plan_results[SPEC] = SimpleNamespace(phase=SpecPhase.VERIFY, num_accepted=num_accepted)
+        ctx.plan_results[SPEC] = SimpleNamespace(
+            phase=SpecPhase.VERIFY, num_accepted=num_accepted,
+            read_columns=num_accepted if read_columns is None else read_columns,
+        )
     manager.plan(LinearAttnStep(segments=segs), ctx)
     pool.commit(rstep, ctx)
 
@@ -174,17 +177,18 @@ def test_verify_rows_resume_from_the_accepted_slot(k):
         starts = next_starts
 
 
-def test_the_verify_kernel_replays_in_a_graph():
+@pytest.mark.parametrize("twin", [False, True], ids=["in-place", "twin"])
+def test_the_verify_kernel_replays_in_a_graph(twin):
     """FlyDSL's chain kernel from a captured graph: a real row as in eager, a
     padding row (slot -1) skipped, its pool slots and output left alone."""
     k, rows, t = 2, 2, 3
-    pool, manager = build(k, rows)
+    pool, manager = build(k, rows, twin_slots=twin)
     rids = list(range(rows))
     w = (torch.zeros(GEO.num_v_heads, device=DEV), torch.zeros(GEO.num_v_heads, device=DEV))
     step(pool, manager, rids, 5)
     run(manager, pool, inputs(rows * 5, seed=1), w)
     accepted = torch.ones(rows, dtype=torch.int32, device=DEV)
-    step(pool, manager, rids, t, num_accepted=accepted)
+    step(pool, manager, rids, t, num_accepted=accepted, read_columns=accepted + t if twin else None)
     state = pool.block("state", 0)
     x = inputs(rows * t, seed=2)
     # the second row is a padding row from here on
@@ -207,6 +211,57 @@ def test_the_verify_kernel_replays_in_a_graph():
     torch.testing.assert_close(state[groups[0]], after, rtol=0, atol=0)
     assert torch.equal(state[groups[1]], before[groups[1]])
     assert torch.isfinite(out[t:].float()).all()
+
+
+@pytest.mark.parametrize("k", [2, 3])
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_twin_groups_verify_what_in_place_verifies(k, rows):
+    """Four steps with rows rejecting drafts: output, every token's state and the conv window, in whichever slots now
+    hold them, bit-equal, and nothing written to the group the step read."""
+    t = k + 1
+    plain_pool, plain = build(k, rows)
+    twin_pool, twin = build(k, rows, twin_slots=True)
+    rids = list(range(rows))
+    gen = torch.Generator(device=DEV).manual_seed(11)
+    w = (torch.randn(GEO.num_v_heads, generator=gen, device=DEV) * 0.5,
+         torch.randn(GEO.num_v_heads, generator=gen, device=DEV).to(torch.bfloat16).float())
+    conv_w = (torch.randn(GEO.conv_dim, 4, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)
+
+    xp = inputs(rows * 5, seed=3)
+    for pool, manager in ((plain_pool, plain), (twin_pool, twin)):
+        step(pool, manager, rids, 5)
+        run(manager, pool, xp, w)
+        conv = pool.block("conv", 0)
+        fill = torch.Generator(device=DEV).manual_seed(12)
+        for r in rids:
+            conv[pool._slots[r]["main"].index] = torch.randn(
+                conv.shape[1:], generator=fill, device=DEV,
+            ).to(conv.dtype)
+    torch.cuda.synchronize()
+
+    state, conv = twin_pool.block("state", 0), twin_pool.block("conv", 0)
+    accepted = torch.ones(rows, dtype=torch.int32, device=DEV)
+    for round_ in range(4):
+        x = inputs(rows * t, seed=20 + round_)
+        conv_x = torch.randn(rows * t, GEO.conv_dim, generator=gen, device=DEV).to(torch.bfloat16)
+        step(plain_pool, plain, rids, t, num_accepted=accepted)
+        step(twin_pool, twin, rids, t, num_accepted=accepted, read_columns=accepted + t)
+        # committed by `step`, so `twin` is now the group this step reads
+        reads = [s for r in rids for s in twin_pool._slots[r]["main"].twin]
+        before_state, before_conv = state[reads].clone(), conv[reads].clone()
+        conv_p = plain.run_conv(conv_x.clone(), conv_layer=plain_pool.block("conv", 0), weight=conv_w)
+        conv_t = twin.run_conv(conv_x.clone(), conv_layer=conv, weight=conv_w)
+        out_p = run(plain, plain_pool, x, w)
+        out_t = run(twin, twin_pool, x, w)
+        torch.cuda.synchronize()
+        assert torch.equal(conv_p, conv_t) and torch.equal(out_p, out_t)
+        assert torch.equal(state[reads], before_state) and torch.equal(conv[reads], before_conv)
+        for r in rids:
+            a, b = plain_pool._slots[r]["main"].group, twin_pool._slots[r]["main"].group
+            assert torch.equal(plain_pool.block("state", 0)[list(a)], state[list(b)]), (round_, r)
+            # the window is one slot wide; the others of a group hold none
+            assert torch.equal(plain_pool.block("conv", 0)[a[0]], conv[b[0]]), (round_, r)
+        accepted = torch.tensor([(r + round_) % t + 1 for r in rids], dtype=torch.int32, device=DEV)
 
 
 def _attention(rows: int, width: int, table: torch.Tensor) -> AiterPagedAttentionManager:
