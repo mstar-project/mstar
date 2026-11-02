@@ -481,7 +481,7 @@ def _placement(groups, node: str) -> str:
     """``node``'s ranks on each mesh axis on a worker, leaving out an axis of one rank."""
     axes = ((axis, groups.axis_groups[axis].get(node)) for axis in PARALLEL_AXES)
     return f"{node} on " + ", ".join(
-        f"{axis} ranks {group.group_members}" for axis, group in axes
+        f"{axis.upper()} ranks {group.group_members}" for axis, group in axes
         if group is not None and group.world_size > 1
     )
 

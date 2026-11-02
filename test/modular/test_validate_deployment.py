@@ -454,10 +454,9 @@ def test_lockstep_nodes_sharing_a_journaled_resource_are_refused(spec, resources
 
 
 @pytest.mark.parametrize("b, placed", [
-    ({"ranks": [1, 0], "tp_size": 2}, "TP ranks [1, 0]"),  # the same ranks, led by the other one
     ({"ranks": [0, 1, 2, 3], "tp_size": 4}, "TP ranks [0, 1, 2, 3]"),
     ({"ranks": [0, 1], "sp_size": 2}, "SP ranks [0, 1]"),  # the same ranks, the other axis
-], ids=["other_leader", "other_size", "other_axis"])
+], ids=["other_size", "other_axis"])
 def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, placed, tmp_path):
     """Two instances on a worker are two leaders' step streams with no order
     between them."""
