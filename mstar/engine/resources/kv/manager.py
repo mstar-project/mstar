@@ -2128,6 +2128,7 @@ class KVManager(AttentionResource):
         since, the tail can no longer be safely removed.
         """
         self._touch_plan_cache()
+        self._drop_resident_stage()
         with self._lock:
             # No owner check: every rollback finishes before `commit_done` is
             # released, and the only pre-admit (`Worker._preplan_spec`) waits on
@@ -2495,6 +2496,12 @@ class KVManager(AttentionResource):
             self._plan_epoch += 1
         if row and rid is not None and self._resident is not None:
             self._resident.planner.mark_stale(rid)
+
+    def _drop_resident_stage(self) -> None:
+        """Pages a staged step reserved go back: the resident stage that names
+        them goes too, as the runner's own does."""
+        if self._resident is not None:
+            self._resident.planner.drop_stage()
 
     def _split_padding(self, step: KVStep, ctx: StepContext):
         """``(n_real, (n_pad, span))`` of a step whose real segments come
@@ -2974,6 +2981,7 @@ class KVManager(AttentionResource):
     def clear_preplan(self, promoted: bool = False):
         if not promoted:
             self._touch_plan_cache()
+            self._drop_resident_stage()
         # the staged step is not going to run, so undo what it did to live
         # state. the pre-forks need no rewinding — staging only read them —
         # but admit's reservations are real pages and real streams

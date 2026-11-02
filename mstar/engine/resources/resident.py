@@ -346,6 +346,14 @@ class ResidentPlanner:
         if ctx.is_preplan:
             self._staged = plan
 
+    def drop_stage(self) -> None:
+        """The pages a pre-plan's stage names were given back (a refused admit,
+        an abandoned pre-plan): a retry over the same rows reserves its own, so
+        it plans afresh instead of promoting cells that name the old ones."""
+        staged, self._staged = self._staged, None
+        if staged is not None:
+            self._restore(staged)
+
     def _restore(self, plan: ResidentPlan) -> None:
         """Hand back the rows of a plan that won't run: it wrote nothing."""
         with self._lock:

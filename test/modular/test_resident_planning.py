@@ -476,6 +476,29 @@ def test_an_abandoned_preplan_writes_nothing_and_gives_its_rows_back():
     _assert_row(planner, live, 1)
 
 
+def test_a_refused_admit_drops_the_stage_naming_its_pages():
+    """The unwind gives back the page a pre-plan staged a crossing into. With no
+    commit in between, a retry over the same rows reserves another page, and it
+    must not promote the stage's cell naming the old one."""
+    live, ref, planner = _setup({1: 3, 2: 4})
+    for res, p in ((live, planner), (ref, None)):
+        _captured_step(res, p, [1], slot=0, bs=1)
+        # row 1 holds 4 tokens: the next one opens a page, which the pre-plan stages
+        s = _captured_step(res, p, [1], slot=1, bs=1, preplan=True, run=False)
+        # refused, as `StepRunner.admit` unwinds it
+        res["pool"].rollback_admit(s.pool, s.ctx)
+        res["kv"].rollback_admit(s.kv, s.ctx)
+        for key in ("kv", "pool", "rope"):
+            res[key].clear_preplan()
+        # a teardown frees pages before the retry, so its admit draws another
+        for key in ("kv", "pool", "rope"):
+            res[key].remove_request(2)
+    a = _captured_step(live, planner, [1], slot=1, bs=1)
+    b = _captured_step(ref, None, [1], slot=1, bs=1)
+    _same(a, b, 1)
+    _assert_row(planner, live, 1)
+
+
 def test_a_new_row_abandoned_before_its_first_step_is_still_written():
     live, ref, planner = _setup({1: 6})
     staged = _captured_step(live, planner, [1], slot=0, bs=1, preplan=True, run=False)
