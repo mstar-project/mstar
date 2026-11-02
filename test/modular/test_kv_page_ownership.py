@@ -21,8 +21,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.arena import PageArena
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.arena import RustPageArena, new_page_arena
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
@@ -101,7 +100,7 @@ def test_acquire_takes_pages_at_one_owner():
 
     pages = kv._arena.acquire(3)
 
-    assert [kv._arena.num_owners[page] for page in pages] == [1, 1, 1]
+    assert [kv._arena.owners(page) for page in pages] == [1, 1, 1]
 
 
 def test_retain_adds_an_owner():
@@ -110,7 +109,7 @@ def test_retain_adds_an_owner():
 
     kv._arena.retain(pages)
 
-    assert [kv._arena.num_owners[page] for page in pages] == [2, 2]
+    assert [kv._arena.owners(page) for page in pages] == [2, 2]
 
 
 def test_a_page_with_an_owner_left_stays_off_the_free_list():
@@ -121,7 +120,7 @@ def test_a_page_with_an_owner_left_stays_off_the_free_list():
 
     kv._arena.release(pages)
 
-    assert kv._arena.num_owners[pages[0]] == 1
+    assert kv._arena.owners(pages[0]) == 1
     assert kv._arena.num_free == free - 1, "a page a second owner still reads was freed"
 
 
@@ -134,7 +133,7 @@ def test_a_page_released_to_zero_is_back_on_the_free_list():
 
     kv._arena.release(pages)
 
-    assert kv._arena.num_owners[pages[0]] == 0
+    assert kv._arena.owners(pages[0]) == 0
     assert kv._arena.num_free == free, "the last owner let go and the page stayed out"
 
 
@@ -142,7 +141,7 @@ def test_the_sink_page_keeps_its_one_owner():
     """It is acquired once at construction and never released."""
     kv = _manager()
 
-    assert kv._arena.num_owners[SINK_PAGE] == 1
+    assert kv._arena.owners(SINK_PAGE) == 1
 
 
 @pytest.mark.parametrize(
@@ -150,17 +149,14 @@ def test_the_sink_page_keeps_its_one_owner():
     [(0, 4), (1, 7), (20260920, 11), (20261017, 17)],
     ids=["seed-0-pool-4", "seed-1-pool-7", "seed-20260920-pool-11", "seed-20261017-pool-17"],
 )
-def test_random_ownership_matches_logical_owners(seed: int, capacity: int):
+@pytest.mark.parametrize(
+    "backend",
+    ["python", pytest.param("rust", marks=pytest.mark.skipif(RustPageArena is None, reason="needs mstar_rust"))],
+)
+def test_random_ownership_matches_logical_owners(seed: int, capacity: int, backend: str):
     """Random acquire, seal, retain and release on a bare arena, checked after
     each against a model of who owns which page, never the arena's own counts."""
-    cfg = PagedKVConfig(
-        num_layers=1, num_kv_heads=1, head_dim=2, max_seq_len=64,
-        max_num_pages=capacity, page_size=4, cpu_offload_pages=0,
-    )
-    arena = PageArena(
-        kv_cache=KVCache(cfg, torch.device("cpu"), torch.float32),
-        allocator=PageAllocator(capacity),
-    )
+    arena = new_page_arena(capacity, backend)
     rng = random.Random(seed)
     all_pages = set(range(capacity))
     owners: dict[int, set[int]] = {}
@@ -174,14 +170,14 @@ def test_random_ownership_matches_logical_owners(seed: int, capacity: int):
 
     def check():
         expected = references()
-        free = list(arena.allocator.free_pages.queue)
+        free = arena.free_pages()
         assert len(free) == len(set(free)), f"duplicate free pages: {free}"
         assert set(free) == all_pages - expected.keys(), "free page membership differs"
         assert arena.num_free == capacity - len(expected), "free page count differs"
-        assert arena.num_owners == [expected[page] for page in range(capacity)], (
+        assert arena.owners_of(range(capacity)) == [expected[page] for page in range(capacity)], (
             "reference counts differ from logical owners"
         )
-        assert arena.sealed == [page in sealed for page in range(capacity)], (
+        assert [arena.is_sealed(page) for page in range(capacity)] == [page in sealed for page in range(capacity)], (
             "sealed pages differ from the model"
         )
         assert arena.any_sealed([]) is False
@@ -204,12 +200,12 @@ def test_random_ownership_matches_logical_owners(seed: int, capacity: int):
             if operation == "acquire":
                 assert owner not in owners
                 free_before = all_pages - references().keys()
-                queue_before = list(arena.allocator.free_pages.queue)
+                queue_before = arena.free_pages()
                 got = arena.acquire(count)
                 history[-1] += f" -> {got}"
                 if count > len(free_before):
                     assert got is None, "an over-capacity allocation succeeded"
-                    assert list(arena.allocator.free_pages.queue) == queue_before, (
+                    assert arena.free_pages() == queue_before, (
                         "a failed allocation changed the free queue"
                     )
                 else:
@@ -239,7 +235,7 @@ def test_random_ownership_matches_logical_owners(seed: int, capacity: int):
             check()
         except Exception as exc:
             exc.add_note(
-                f"PageArena seed={seed}, capacity={capacity}, operation={operation_index}\n"
+                f"PageArena {backend} seed={seed}, capacity={capacity}, operation={operation_index}\n"
                 "Last operations (recorded before execution):\n" + "\n".join(history)
             )
             raise
@@ -301,7 +297,7 @@ def test_an_admitted_request_owns_each_of_its_pages_once():
     _grow(kv, "r0", 100)
 
     pages = kv._streams["r0"]["main"].page_indices
-    assert [kv._arena.num_owners[page] for page in pages] == [1] * len(pages), (
+    assert [kv._arena.owners(page) for page in pages] == [1] * len(pages), (
         "nothing calls retain yet, so a request is the only owner of its pages"
     )
 

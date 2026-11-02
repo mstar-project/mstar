@@ -21,8 +21,8 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.arena import PageArena
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
+from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import (
     KVSpec,
     KVStep,
@@ -85,7 +85,7 @@ def _assert_coherent(stream) -> None:
 
 
 def _assert_pages_conserved(mgr: KVManager) -> None:
-    free = list(mgr._arena.allocator.free_pages.queue)
+    free = mgr._arena.free_pages()
     held = [p for streams in mgr._streams.values() for s in streams.values() for p in s.page_indices]
     owned = free + held + [SINK_PAGE]
     duplicated = {p for p in owned if owned.count(p) > 1}
@@ -217,7 +217,7 @@ def test_remove_request_returns_every_page() -> None:
 
 class _FakePool(CPUPagePool):
     def __init__(self, max_cpu_pages: int = 64):
-        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(max_cpu_pages))
+        self.arena = new_page_arena(max_cpu_pages)
         self.index = PrefixIndex(self.arena)
         self.offloaded = {}
         self._refused_logged_at = None
