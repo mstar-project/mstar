@@ -172,7 +172,7 @@ You must implement these abstract methods:
    only; any other step advances when its walk
    reports, and the partition is done after its last step. A ``ValueError`` here refuses
    the request with a 400, and so does a plan of ``[]`` for every partition (nothing would
-   ever run). A plan the conductor can't run is a model bug, refused with a 500: a step
+   ever run); an ``HTTPException`` below 500 refuses it with its own status and detail. A plan the conductor can't run is a model bug, refused with a 500: a step
    whose walk is not one of its partition's, a ``bind`` key that is not an input of
    the step's walk, or a later step whose walk takes no input the conductor sends (it moves
    a worker onto a step only by sending it inputs). In a partition a stream moves
