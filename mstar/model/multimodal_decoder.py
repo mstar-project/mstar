@@ -32,7 +32,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
-from mstar.model.keys import KV_CACHE, MIXED, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     TEXT,
@@ -63,7 +63,7 @@ SAMPLING_KEYS = (
 # A mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
 # the prefill kernels, its decode rows the decode ones; for the ``splits`` of
 # the LLM's attention resources.
-MIXED_SPLIT = CombinedSplit(MIXED, prefill_walks=("prefill_text",))
+MIXED_SPLIT = CombinedSplit(MIXED, prefill_walks=(PREFILL_TEXT,))
 
 
 class PreparedMedia(NamedTuple):
@@ -126,8 +126,9 @@ class MultimodalDecoderModel(Model):
     media: tuple[MediaIntake, ...] = ()
     # False for a model every prompt of which carries media (an audio-only
     # STT checkpoint): no text-only prefill walk, no mixed step, no prefix keys
-    # (only a text span is keyed), and its LLM node captures neither. The
-    # model's intake must refuse a text-only request itself.
+    # (only a text span is keyed), and its LLM node, given this as its
+    # ``text_prompts``, captures neither. The walk plan refuses a text-only
+    # request.
     TEXT_PROMPTS = True
     # the checkpoint's sampling defaults, under whatever a request sets (set
     # by `__init__`; a model built without it reads none)
@@ -195,7 +196,7 @@ class MultimodalDecoderModel(Model):
             return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
         return {KV_CACHE: {"main": KVLabel(
             growth=(("decode", "decode_loop"),),
-            keys=PrefixKeys("text_inputs", ("prefill_text",), growth=True),
+            keys=PrefixKeys("text_inputs", (PREFILL_TEXT,), growth=True),
         )}}
 
     def checkpoint_path(self) -> str:
@@ -209,7 +210,7 @@ class MultimodalDecoderModel(Model):
         present = media_encoders(self.encoders, layout)
         span = Span(
             "rows" if present else "ids",
-            media_walk_name(present) if present else "prefill_text",
+            media_walk_name(present) if present else PREFILL_TEXT,
             length, length if advance is None else advance, "text_inputs",
         )
         return {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
@@ -374,7 +375,7 @@ class MultimodalDecoderModel(Model):
         self, signals: dict[str, list[TensorPointerInfo]], layout: dict | None = None,
     ) -> WalkStep:
         """`media_prefill_step`, carrying `process_prompt`'s media layout."""
-        return media_prefill_step(signals, self.encoders, layout, model_name=self.NAME)
+        return media_prefill_step(signals, self.encoders, layout, model_name=self.NAME, text=self.TEXT_PROMPTS)
 
     def walk_plan(
         self,

@@ -27,7 +27,7 @@ import torch
 from mstar.conductor.request_info import FINAL_PREFILL, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.keys import MIXED
+from mstar.model.keys import MIXED, PREFILL_TEXT
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import NameToTensorList
@@ -533,7 +533,7 @@ def media_walks(
 
     walks: dict[str, GraphSection] = {}
     if text:
-        walks["prefill_text"] = GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()])
+        walks[PREFILL_TEXT] = GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()])
     for mask in range(1, 1 << len(encoders)):
         present = [e for i, e in enumerate(encoders) if mask >> i & 1]
         nodes = [
@@ -569,7 +569,7 @@ def media_walks(
 
 def text_combined_walks() -> dict[str, dict[str, set[str]]]:
     """Text prefill and decode rows of the ``LLM`` node share a step."""
-    return {"LLM": {MIXED: {"prefill_text", "decode"}}}
+    return {"LLM": {MIXED: {PREFILL_TEXT, "decode"}}}
 
 
 def media_prefill_step(
@@ -578,11 +578,13 @@ def media_prefill_step(
     layout: dict | None = None,
     *,
     model_name: str,
+    text: bool = True,
 ) -> WalkStep:
     """The one prefill walk a request runs over its whole prompt
     (``text_inputs``, one tensor), marked `FINAL_PREFILL`: with media in its
     ``layout``, the walk over the encoders it runs (`media_encoders`), which
-    carries the layout; without, ``prefill_text``."""
+    carries the layout; without, ``prefill_text``, which a graph built with
+    ``text`` False (`media_walks`) does not have."""
     texts = signals.get("text_inputs", [])
     if not texts:
         # the conductor answers this with a 400
@@ -599,5 +601,8 @@ def media_prefill_step(
         if sent:
             # a text prefill would drop them
             raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
-        return WalkStep("prefill_text", step_metadata={FINAL_PREFILL: True})
+        if not text:
+            needs = " or ".join(e.name for e in encoders)
+            raise ValueError(f"{model_name} needs {needs}; it takes no text-only prompt")
+        return WalkStep(PREFILL_TEXT, step_metadata={FINAL_PREFILL: True})
     return WalkStep(media_walk_name(present), step_metadata={MEDIA_LAYOUT: layout or {}, FINAL_PREFILL: True})

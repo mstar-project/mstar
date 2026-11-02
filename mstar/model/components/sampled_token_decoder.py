@@ -63,7 +63,7 @@ from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
-from mstar.model.keys import MIXED, ROPE, SAMPLER
+from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -80,8 +80,8 @@ from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     SAMPLER = SAMPLER
     # the text-only prompt's walk; a model whose own graph names it otherwise
-    # sets this (a MultimodalDecoderModel's graph names it prefill_text)
-    PREFILL_WALK = "prefill_text"
+    # sets this
+    PREFILL_WALK = PREFILL_TEXT
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
 
@@ -128,6 +128,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # set by `__init__`; class defaults keep a text-only node's walks working
     _encoders: tuple[MediaEncoder, ...] = ()
     _media_walks: frozenset[str] = frozenset()
+    _text_prompts = True
 
     def __init__(
         self,
@@ -141,15 +142,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         `MultimodalDecoderModel.TEXT_PROMPTS`: without it there is no text-only
         prefill walk, so nothing captures one or a mixed step."""
         super().__init__()
-        if not text_prompts:
-            self.PREFILL_WALK = None
+        self._text_prompts = text_prompts
         self.model = model
         self.config = config
         self._encoders = tuple(encoders)
         self._media_walks = frozenset(media_walk_names(self._encoders))
         # a prefill walk's token is the reply's first only on the step before
         # decode, which the walk plan marks
-        prefills = self._media_walks | ({self.PREFILL_WALK} if self.PREFILL_WALK else set())
+        prefills = self._media_walks | ({self.PREFILL_WALK} if self._text_prompts else set())
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
             sampler=self.SAMPLER, walk=self.DECODE_WALK, prefill_walks=frozenset(prefills),
@@ -222,7 +222,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.capture_compile_mode(self.DECODE_WALK),
             ),
         ]
-        if self.PREFILL_WALK is not None and self.CAPTURE_PREFILL:
+        if self._text_prompts and self.CAPTURE_PREFILL:
             configs += [PackedAcceleratorGraphConfig(
                 capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,

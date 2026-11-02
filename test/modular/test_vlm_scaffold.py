@@ -119,6 +119,9 @@ def test_a_text_prompt_is_one_prefill_text_walk():
     # encoder inputs with no layout to place them by are refused, not dropped
     with pytest.raises(ValueError, match="no media layout"):
         media_prefill_step(_signals(text_inputs=1, pixel_values=1), [VISION], model_name="m")
+    # a graph with no text-only walk (TEXT_PROMPTS False) refuses the prompt by what it needs
+    with pytest.raises(ValueError, match="m needs audio"):
+        media_prefill_step(signals, [AUDIO], model_name="m", text=False)
 
 
 @pytest.mark.parametrize(("counts", "walk"), [
