@@ -25,14 +25,16 @@ Ceilings are PER-ENTITY and multiply across a node: with E entities
 (workers + the api-server data worker), /dev/shm demand can reach
 ``MAX_SEGMENTS x SEGMENT_MB x E`` and pinned host RAM approx
 ``PIN_MAX_MB x E`` (consumers pin peer segments too, so one process can pin
-more than its own arena holds). Construction fails fast when one entity's
-ceiling already exceeds /dev/shm, and warns when it exceeds current free
-space or when the pin budget is an outsized share of physical RAM.
+more than its own arena holds). With neither ``MAX_SEGMENTS`` nor
+``SEGMENT_MB`` set, both come from /dev/shm's size so that four entities'
+ceilings fit (``_default_sizing``); set by hand, construction fails fast when
+one entity's ceiling already exceeds /dev/shm. Either way it warns when the
+ceiling exceeds current free space or when the pin budget is an outsized
+share of physical RAM.
 
-Selection: ``create_tensor_communication_manager`` picks this manager for
-the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``
-(use if the ``mstar_rust`` extension imports); default ``0`` keeps the file
-transport. See :doc:`environment_variables` for all knobs.
+Selection: ``create_tensor_communication_manager`` builds this manager for
+the SHM protocol; the file transport it extends is only its spill path. See
+:doc:`environment_variables` for the knobs.
 """
 
 from __future__ import annotations
@@ -66,6 +68,44 @@ from mstar.utils.threads import Thread
 logger = logging.getLogger(__name__)
 
 _CUDA_HOST_ALREADY_REGISTERED = 712
+_sizing_logged = False
+
+
+def _default_sizing(shm_total: int) -> tuple[int, int]:
+    """(segment MiB, max segments) when neither knob is set: 256 MiB segments,
+    as many as let four entities' ceilings fit in /dev/shm (1 to 32). Where
+    four entities cannot have one 256 MiB segment each, one segment of the
+    largest power-of-two MiB that fits four times, 16 MiB at least."""
+    share_mb = (shm_total >> 20) // 4
+    segment_mb = 256 if share_mb >= 256 else max(
+        16, 1 << (max(share_mb, 1).bit_length() - 1))
+    return segment_mb, max(1, min(32, share_mb // segment_mb))
+
+
+def _arena_sizing() -> tuple[int, int, int | None, int | None]:
+    """Segment MiB, max segments, and /dev/shm's total and free bytes. Knobs
+    the user set are taken as given (the constructor fails fast if they do not
+    fit); with neither set the sizes come from /dev/shm, so a small tmpfs (a
+    Kubernetes pod gets 64 MiB) runs a small arena that spills to files
+    instead of refusing to start."""
+    global _sizing_logged
+    try:
+        st = os.statvfs("/dev/shm")
+        total, avail = st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
+    except OSError:
+        total = avail = None
+    segment_env = os.environ.get("MSTAR_SHM_ARENA_SEGMENT_MB")
+    max_env = os.environ.get("MSTAR_SHM_ARENA_MAX_SEGMENTS")
+    if not segment_env and not max_env and total is not None:
+        segment_mb, max_segments = _default_sizing(total)
+        if not _sizing_logged:
+            _sizing_logged = True
+            logger.info(
+                "ARENA: /dev/shm is %d MiB; each entity's arena grows to %d "
+                "segments of %d MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and "
+                "_SEGMENT_MB override)", total >> 20, max_segments, segment_mb)
+        return segment_mb, max_segments, total, avail
+    return int(segment_env or 256), int(max_env or 32), total, avail
 
 
 class _Placements(NamedTuple):
@@ -247,8 +287,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._host_copier = HostCopier(copy_workers)
 
         self._ShmArena = ShmArena
-        segment_mb = int(os.getenv("MSTAR_SHM_ARENA_SEGMENT_MB", "256"))
-        max_segments = int(os.getenv("MSTAR_SHM_ARENA_MAX_SEGMENTS", "32"))
+        segment_mb, max_segments, shm_total, shm_avail = _arena_sizing()
         self._full_timeout_s = float(
             os.getenv("MSTAR_SHM_ARENA_FULL_TIMEOUT_S", "30"))
         self._pin_segments = (
@@ -308,12 +347,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # its own arena). Check the static tmpfs ceiling NOW instead of
         # surfacing as ENOSPC on a growth mid-run.
         per_entity_max = (segment_mb << 20) * max_segments
-        try:
-            st = os.statvfs("/dev/shm")
-            shm_total = st.f_frsize * st.f_blocks
-            shm_avail = st.f_frsize * st.f_bavail
-        except OSError:
-            shm_total = shm_avail = None
         self._shm_total = shm_total
         if shm_total is not None:
             if per_entity_max > shm_total:
@@ -737,20 +770,27 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         queued = False
         try:
             if nbytes:
-                host = torch.frombuffer(
+                flat = torch.frombuffer(
                     self._seg_views[seg][off:off + nbytes],
                     dtype=torch.uint8,
-                ).view(t.dtype).reshape(t.shape)
+                )
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
                 if t.is_cuda:
-                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    flat.view(t.dtype).reshape(t.shape).copy_(
+                        t, non_blocking=self._d2h_stream is not None)
                     queued = True
+                elif t.device.type == "cpu":
+                    # A stored host copy: one memcpy, nothing for the stream
+                    # sync to wait on. numpy, not Tensor.copy_: torch splits a
+                    # CPU copy of more than 32K elements over its intra-op
+                    # OpenMP pool, whose threads then spin on the cores the
+                    # worker's own threads need.
+                    np.copyto(flat.numpy(),
+                              t.reshape(-1).view(torch.uint8).numpy())
                 else:
-                    # a stored host copy: a memcpy, nothing for the stream
-                    # sync to wait on
-                    host.copy_(t)
+                    flat.view(t.dtype).reshape(t.shape).copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:

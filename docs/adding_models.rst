@@ -2150,7 +2150,7 @@ on the GPU inside its forward, so ``postprocess`` hands the tensor it reads stra
 encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
 rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
 A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
-frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
+frame inside PyAV. The SHM arena's CPU read of an output slices a large
 copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
 the CPUs.
 

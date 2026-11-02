@@ -41,13 +41,6 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
-   * - ``MSTAR_SHM_ARENA``
-     - ``0``
-     - SHM tensor-transport implementation. ``0``: per-uuid files.
-       ``1``: the Rust shared-memory arena (requires the ``rust/``
-       extension; raises if missing). ``AUTO``: the arena when the
-       extension imports, files otherwise. Must match across the
-       deployment — arena locations ride in the tensor descriptors.
    * - ``MSTAR_DEPLOYMENT_TOKEN``
      - random per launch
      - Mixed into the namespace of the SHM tensor files and arena segments,
@@ -78,7 +71,7 @@ Communication
        different nodes at one shared directory there: each would sweep the
        other's live directories.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
-     - ``256``
+     - ``256``, less below 1 GiB of /dev/shm
      - Size of each arena segment. The arena grows segment by segment;
        existing segments never move (registrations stay valid). A
        segment's /dev/shm pages are committed when it is created (pinned
@@ -87,13 +80,18 @@ Communication
        /dev/shm by default. A segment /dev/shm cannot hold counts as arena
        full (sends spill, see ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
-     - ``32``
+     - ``32``, fewer below 32 GiB of /dev/shm
      - Growth cap PER ENTITY. Every entity (workers + the api-server data
        worker) creates its own arena, so node-wide /dev/shm demand can
        reach ``MAX_SEGMENTS x SEGMENT_MB x num_entities`` — size against
-       ``df -h /dev/shm`` (tmpfs defaults to ~50% of RAM). Construction
-       fails fast if one entity's ceiling exceeds /dev/shm. At the cap,
-       sends spill (see ``MSTAR_SHM_ARENA_SPILL``).
+       ``df -h /dev/shm`` (tmpfs defaults to ~50% of RAM). With neither
+       this nor ``MSTAR_SHM_ARENA_SEGMENT_MB`` set, both come from the size
+       of /dev/shm so four entities' ceilings fit: 256 MiB segments, 1 to 32
+       of them, or where even one each does not fit, one segment of the
+       largest power-of-two MiB that does (16 MiB at least), logged at
+       startup. Set by hand, construction fails fast if one entity's
+       ceiling exceeds /dev/shm. At the cap, sends spill (see
+       ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``
      - ``30``
      - Strict mode only (``MSTAR_SHM_ARENA_SPILL=0``): how long a send

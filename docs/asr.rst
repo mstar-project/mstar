@@ -112,13 +112,12 @@ the event loop and transport threads. On a 192-core H200 host the cap matched
 models, where the default pool lost 4-9 % (up to 29 % with the server pinned
 to 16 cores), so no launch setting is needed.
 
-Serve with the shared-memory arena, ``MSTAR_SHM_ARENA=1`` (needs the ``rust/``
-extension; see :doc:`environment_variables`). The default SHM transport creates
-and removes one file per tensor, and a transcription moves its audio, encoder
-states and output tokens as many small tensors; the arena places them in
-preallocated segments instead. Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and
-412 at concurrency 1, 8, 32 and 64 on the file transport, 87, 252, 494 and 558
-on the arena, with the same 1.41 % WER.
+A transcription moves its audio, encoder states and output tokens as many small
+tensors. The SHM transport places them in the shared-memory arena's
+preallocated segments; the file per tensor it used before cost throughput.
+Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and 412 at concurrency 1, 8, 32
+and 64 with a file per tensor, 87, 252, 494 and 558 on the arena, with the same
+1.41 % WER.
 
 Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),

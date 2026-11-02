@@ -201,10 +201,9 @@ def test_strict_mode_backpressures_then_fails(tmp_path):
 
 
 def test_transport_mismatch_fails_loudly(tmp_path):
-    """A mixed deployment (arena producer + file consumer, or the reverse)
-    fails with an explicit MSTAR_SHM_ARENA message where data would be
-    unreachable (arena producer -> file consumer); the reverse direction
-    interops via the arena consumer's file fallback."""
+    """The file manager on its own (the spill path) cannot read an arena slot
+    and says so; the reverse direction interops via the arena consumer's
+    file fallback."""
     arena_prod = _manager("mx0", tmp_path)
     file_cons = SharedMemoryCommunicationManager(
         my_entity_id="mx1", hostname="localhost", device="cpu",
@@ -213,7 +212,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
         "rm", {"x": [torch.randn(4)]})
     arena_prod.register_for_send("rm", [infos["x"][0]])
     edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
-    with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
+    with pytest.raises(RuntimeError, match="staged in an SHM arena"):
         file_cons.start_read_tensors("rm", [edge])
 
     # The reverse direction now INTEROPS: a file-producer's tensors carry
@@ -232,20 +231,68 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     assert torch.equal(got, y)
 
 
-def test_factory_flag(tmp_path, monkeypatch):
-    def make(value):
-        monkeypatch.setenv("MSTAR_SHM_ARENA", value)
-        return create_tensor_communication_manager(
-            protocol=CommProtocol.SHM, my_entity_id=f"f_{value}",
-            hostname="localhost", device="cpu",
-            communicator=_NullCommunicator(), shm_dir=str(tmp_path),
-        )
+def test_the_shm_protocol_builds_the_arena(tmp_path):
+    mgr = create_tensor_communication_manager(
+        protocol=CommProtocol.SHM, my_entity_id="f0",
+        hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    assert type(mgr) is ArenaShmCommunicationManager
 
-    assert type(make("0")) is SharedMemoryCommunicationManager
-    assert type(make("1")) is ArenaShmCommunicationManager
-    assert type(make("AUTO")) is ArenaShmCommunicationManager
-    with pytest.raises(ValueError):
-        make("yes")
+
+def _fake_dev_shm(monkeypatch, mib, segment_mb=None, max_segments=None):
+    """/dev/shm reports ``mib`` MiB, all free; the sizing knobs as given."""
+    from types import SimpleNamespace
+
+    from mstar.communication import arena
+
+    blocks = (mib << 20) // 4096
+    monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+        f_frsize=4096, f_blocks=blocks, f_bavail=blocks))
+    monkeypatch.setattr(arena, "_sizing_logged", False)
+    for k, v in (("SEGMENT_MB", segment_mb), ("MAX_SEGMENTS", max_segments)):
+        if v is None:
+            monkeypatch.delenv(f"MSTAR_SHM_ARENA_{k}", raising=False)
+        else:
+            monkeypatch.setenv(f"MSTAR_SHM_ARENA_{k}", str(v))
+    return arena
+
+
+@pytest.mark.parametrize("mib, sizes", [
+    (64, (16, 1)), (1024, (256, 1)), (64 << 10, (256, 32)),
+], ids=["64MiB", "1GiB", "64GiB"])
+def test_unset_sizing_knobs_fit_four_entities_in_dev_shm(monkeypatch, caplog, mib, sizes):
+    arena = _fake_dev_shm(monkeypatch, mib)
+    with caplog.at_level("INFO", logger=arena.__name__):
+        assert arena._arena_sizing()[:2] == arena._arena_sizing()[:2] == sizes
+    assert [r.getMessage() for r in caplog.records] == [  # once per process
+        f"ARENA: /dev/shm is {mib} MiB; each entity's arena grows to {sizes[1]} segments of "
+        f"{sizes[0]} MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and _SEGMENT_MB override)"]
+
+
+def test_sizing_knobs_set_by_hand_are_taken_as_given(monkeypatch, tmp_path):
+    assert _fake_dev_shm(monkeypatch, 64, 1, 4)._arena_sizing()[:2] == (1, 4)
+    assert _fake_dev_shm(monkeypatch, 64, None, 4)._arena_sizing()[:2] == (256, 4)
+    _fake_dev_shm(monkeypatch, 1024, 256, 32)
+    with pytest.raises(RuntimeError, match="exceeds /dev/shm"):
+        ArenaShmCommunicationManager(
+            my_entity_id="big", hostname="localhost", device="cpu",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+
+
+def test_a_small_dev_shm_gets_an_arena_that_spills(monkeypatch, tmp_path):
+    """64 MiB of /dev/shm: one 16 MiB segment, and a 20 MiB tensor goes to a
+    file instead of failing."""
+    _fake_dev_shm(monkeypatch, 64)
+    prod, cons = (ArenaShmCommunicationManager(
+        my_entity_id=e, hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path)) for e in ("s0", "s1"))
+    assert prod._segment_bytes == 16 << 20 and prod._arena.num_segments == 1
+    infos = prod.store_and_return_tensor_info("r", {"x": [torch.ones(8), torch.ones(5 << 20)]})["x"]
+    prod.register_for_send("r", list(infos))
+    assert infos[0].shm_segment is not None and infos[1].shm_segment is None
+    cons.start_read_tensors("r", [GraphEdge(next_node="B", name="x", tensor_info=infos)])
+    assert torch.equal(cons.tensor_store.get_tensor(infos[1].uuid), torch.ones(5 << 20))
 
 
 def test_instance_unique_names_no_collision(tmp_path):
@@ -900,6 +947,33 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
 
 
+@pytest.mark.parametrize("make", [
+    lambda: torch.tensor(3.5),
+    lambda: torch.arange(40_000, dtype=torch.float32),
+    lambda: torch.arange(24, dtype=torch.int16).reshape(4, 6).t(),
+], ids=["scalar", "past_torch_grain", "transposed"])
+def test_a_host_source_is_staged_without_tensor_copy(tmp_path, monkeypatch, make):
+    """A host tensor lands in the arena as one memcpy, not through
+    Tensor.copy_, which splits a copy of more than 32K elements over torch's
+    OpenMP pool and leaves that pool spinning on the serving cores."""
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    src = make()
+    infos = prod.store_and_return_tensor_info("r1", {"x": [src]})
+
+    def no_copy(self, *args, **kwargs):
+        raise AssertionError("a host source went through Tensor.copy_")
+
+    monkeypatch.setattr(torch.Tensor, "copy_", no_copy)
+    prod.register_for_send("r1", infos["x"])
+    monkeypatch.undo()
+    cons.start_read_tensors(
+        "r1", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])],
+    )
+    got = cons.tensor_store.get_tensor(infos["x"][0].uuid)
+    assert got.dtype == src.dtype and got.shape == src.shape and torch.equal(got, src)
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
 def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel):
@@ -1174,7 +1248,7 @@ def _run_in_small_dev_shm(tmp_path, source: str, *args: str):
     script = tmp_path / "small_dev_shm.py"
     script.write_text(source)
     env = [f"{k}={v}" for k, v in os.environ.items()
-           if not k.startswith("MSTAR_SHM_ARENA")]
+           if not k.startswith("MSTAR_SHM_ARENA_")]
     inner = shlex.join([
         "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}",
         "--clear-groups", "env", "-i", *env,

@@ -810,7 +810,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   8, which keep up; from 24 calls up the server fell behind real time, so lag
   grew over the call. Capturing the encoder's live step (below) took its host
   time at 32 calls from 23.6 to 8.4 ms and cut live lag 2-6x at 16-32 calls
-  (paced runs interleaved against the uncaptured encoder, ``MSTAR_SHM_ARENA=1``);
+  (paced runs interleaved against the uncaptured encoder, on the SHM arena);
   32 calls staggered over 2 s all finish, heard latency p50 2.1-2.3 s (from the
   user stopping to agent audio playable without gaps). With the codec in the
   talker's step, on one H200: 16 live calls keep real time whether they start

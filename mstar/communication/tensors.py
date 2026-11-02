@@ -2583,7 +2583,13 @@ def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
 # ---------------------------------------------------------------------------
 
 class SharedMemoryCommunicationManager(TensorCommunicationManager):
-    """Tensor transport via file I/O to a tmpfs directory (``/dev/shm``)."""
+    """Tensor transport via file I/O to a tmpfs directory (``/dev/shm``).
+
+    The base of ``ArenaShmCommunicationManager`` and its spill path: a tensor
+    the arena has no room for goes to a per-uuid file written and read here.
+    Nothing in ``mstar`` builds this class on its own; the SHM protocol is the
+    arena.
+    """
 
     #: Directories besides ``shm_dir`` that hold this transport's
     #: ``mstar_<namespace>_*`` files; each gets its own namespace lock.
@@ -2831,9 +2837,9 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     if info.shm_segment is not None:
                         raise RuntimeError(
                             f"tensor {producer_uuid} from {info.source_entity} "
-                            "was staged in an SHM arena but this consumer "
-                            "runs the file transport — MSTAR_SHM_ARENA must "
-                            "match across the deployment")
+                            "was staged in an SHM arena, which only "
+                            "ArenaShmCommunicationManager reads; this manager "
+                            "reads the per-uuid files the arena spills")
                     path = self._shm_path(info.source_entity, producer_uuid)
                     with open(path, "rb") as f:
                         f.seek(info.offset)
@@ -2911,47 +2917,23 @@ def create_tensor_communication_manager(
 ) -> TensorCommunicationManager:
     """Select tensor transport backend based on protocol.
 
-    For the SHM protocol, ``MSTAR_SHM_ARENA`` selects the implementation
-    (see ``docs/environment_variables.rst``): ``0`` (default) — per-uuid
-    files; ``1`` — the Rust shared-memory arena (raises if the
-    ``mstar_rust`` extension is missing); ``AUTO`` — the arena when the
-    extension imports, files otherwise. The flag must match across the
-    deployment: the arena location rides in the tensor descriptors, so a
-    file-transport consumer cannot read an arena producer. ``copy_workers``
-    is the width of the arena's CPU reads (``host_copy.HostCopier``).
+    The SHM protocol is the Rust shared-memory arena
+    (``ArenaShmCommunicationManager``), which spills a tensor it has no room
+    for to a per-uuid file. ``copy_workers`` is the width of the arena's CPU
+    reads (``host_copy.HostCopier``).
     """
     if protocol == CommProtocol.SHM:
-        choice = os.getenv("MSTAR_SHM_ARENA", "0").upper()
-        if choice not in ("0", "1", "AUTO"):
-            raise ValueError(
-                f"MSTAR_SHM_ARENA must be 0, 1, or AUTO; got {choice!r}")
-        if choice != "0":
-            try:
-                from mstar.communication.arena import (
-                    ArenaShmCommunicationManager,
-                )
-            except ImportError:
-                if choice == "1":
-                    raise
-                logger.debug("MSTAR_SHM_ARENA=AUTO: mstar_rust not "
-                             "installed, using the file transport")
-            else:
-                return ArenaShmCommunicationManager(
-                    my_entity_id=my_entity_id,
-                    hostname=hostname,
-                    device=device,
-                    communicator=communicator,
-                    shm_dir=shm_dir,
-                    enable_prof=enable_prof,
-                    copy_workers=copy_workers,
-                )
-        return SharedMemoryCommunicationManager(
+        # Imported here: arena.py builds on this module's file manager.
+        from mstar.communication.arena import ArenaShmCommunicationManager
+
+        return ArenaShmCommunicationManager(
             my_entity_id=my_entity_id,
             hostname=hostname,
             device=device,
             communicator=communicator,
             shm_dir=shm_dir,
-            enable_prof=enable_prof
+            enable_prof=enable_prof,
+            copy_workers=copy_workers,
         )
     return MooncakeCommunicationManager(
         my_entity_id=my_entity_id,
