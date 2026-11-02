@@ -27,8 +27,23 @@ from torch import nn
 
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
 from mstar.model.components.diffusion.rope import apply_rotary_interleaved
-from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.linear import FusedColumnLinear, LowPrecisionLinears
 from mstar.model.flux2_klein.config import Flux2TransformerConfig
+
+
+# ``linear_precision``: the GEMM-bound block linears may go low precision. The linears that set the modulation and take
+# the latents in and out carry little of the step's FLOPs and all of its conditioning, so they stay bf16.
+LOW_PRECISION_LINEARS = LowPrecisionLinears(
+    candidates=(
+        "double_blocks.*.attn.img_qkv", "double_blocks.*.attn.txt_qkv", "double_blocks.*.attn.img_out",
+        "double_blocks.*.attn.txt_out", "double_blocks.*.img_ff.linear_*", "double_blocks.*.txt_ff.linear_*",
+        "single_blocks.*.qkv_mlp", "single_blocks.*.out",
+    ),
+    keep_bf16=(
+        "time_embed.*", "guidance_embed.*", "mod_double_img", "mod_double_txt", "mod_single",
+        "img_in", "txt_in", "norm_out_mod", "proj_out",
+    ),
+)
 
 
 def sinusoidal_timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:

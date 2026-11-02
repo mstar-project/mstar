@@ -1,8 +1,11 @@
-"""Per-token-group FP8 activation quantization.
+"""Activation quantization for block-scale GEMMs.
 
-The e4m3 activation quant that feeds block-scale W8A8 GEMMs (the fused MoE
-experts today).  Adapted from sglang's ``fused_moe_triton_kernels.py``
-(Apache-2.0).
+Per-token-group FP8: the e4m3 activation quant that feeds block-scale W8A8
+GEMMs (the fused MoE experts today).  Adapted from sglang's
+``fused_moe_triton_kernels.py`` (Apache-2.0).
+
+Block-scaled, for cuBLASLt's MXFP8 and NVFP4 GEMMs (``quant_block``): the same
+idea with the scales in the GEMM's format and swizzled layout.
 """
 
 from __future__ import annotations
@@ -11,7 +14,14 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.utils.fp8_block import FP8_DTYPE  # noqa: F401 - e4m3, re-exported for the kernels' importers
+from mstar.utils.fp8_block import (
+    BLOCKS_PER_TILE,
+    FP8_DTYPE,  # noqa: F401 - e4m3, re-exported for the kernels' importers
+    MXFP8,
+    BlockFormat,
+    BlockQuant,
+    swizzled_scale_elements,
+)
 
 # Groups quantized per program.  One program per group (sglang's shape) is
 # 393k programs for an 8k x 6144 prefill; 16 matches vLLM's CUDA quantizer.
@@ -95,3 +105,94 @@ def per_token_group_quant_fp8(
         GROUPS=GROUPS_PER_PROGRAM,
     )
     return x_q, x_s
+
+
+# Rows per program of the block quantizers: a scale tile's rows come in fours of these.
+_BLOCK_QUANT_ROWS = 32
+
+
+@triton.jit
+def _scale_tile_offsets(g, col_tile, col_tiles, ROWS: tl.constexpr, BLOCKS: tl.constexpr):
+    """Flat offsets of a ``[ROWS, BLOCKS]`` piece of the swizzled scales, row group ``g``, column tile ``col_tile``."""
+    return (
+        512 * ((g // 4) * col_tiles + col_tile) + tl.arange(0, ROWS)[:, None] * 16 + (g % 4) * BLOCKS
+        + tl.arange(0, BLOCKS)[None, :]
+    )
+
+
+@triton.jit
+def _mxfp8_quant_kernel(
+    y_ptr, q_ptr, s_ptr, rows, k, col_tiles, ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: e4m3 data, biased e8m0 scales. One read per value."""
+    g = tl.program_id(0).to(tl.int64)
+    col_tile = tl.program_id(1).to(tl.int64)
+    row = g * ROWS + tl.arange(0, ROWS)
+    live = (row < rows)[:, None]
+    offs = row[:, None] * k + col_tile * (BLOCKS * BLOCK) + tl.arange(0, BLOCKS * BLOCK)[None, :]
+    y = tl.reshape(tl.load(y_ptr + offs, mask=live, other=0.0).to(tl.float32), [ROWS, BLOCKS, BLOCK])
+    # ceil(log2(amax / 448)) from the float's own bits, biased like e8m0; the multiply-back is built the same way
+    bits = (tl.max(tl.abs(y), axis=2) / 448.0).to(tl.int32, bitcast=True)
+    biased = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    biased = tl.minimum(tl.maximum(biased, 1), 253)
+    inverse = ((254 - biased) << 23).to(tl.float32, bitcast=True)
+    tl.store(q_ptr + offs, tl.reshape(y * inverse[:, :, None], [ROWS, BLOCKS * BLOCK]).to(tl.float8e4nv), mask=live)
+    tl.store(s_ptr + _scale_tile_offsets(g, col_tile, col_tiles, ROWS, BLOCKS), biased.to(tl.uint8), mask=live)
+
+
+@triton.jit
+def _nvfp4_quant_kernel(
+    y_ptr, q_ptr, s_ptr, rows, k, col_tiles, inverse_tensor_scale,
+    ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: packed e2m1 data, e4m3 scales rounded up, in units of the
+    tensor scale. One read per value."""
+    g = tl.program_id(0).to(tl.int64)
+    col_tile = tl.program_id(1).to(tl.int64)
+    row = g * ROWS + tl.arange(0, ROWS)
+    live = (row < rows)[:, None]
+    offs = row[:, None] * k + col_tile * (BLOCKS * BLOCK) + tl.arange(0, BLOCKS * BLOCK)[None, :]
+    y = tl.load(y_ptr + offs, mask=live, other=0.0).to(tl.float32) * inverse_tensor_scale
+    y = tl.reshape(y, [ROWS, BLOCKS, BLOCK])
+    want = tl.max(tl.abs(y), axis=2) / 6.0
+    code = want.to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32)
+    code = code + (code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) < want).to(tl.int32)
+    code = tl.minimum(tl.maximum(code, 1), 0x7E)
+    scale = code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    u = y / scale[:, :, None]
+    a = tl.abs(u)
+    nibble = (
+        (a > 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a > 1.25).to(tl.int32) + (a >= 1.75).to(tl.int32)
+        + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32) + (a > 5.0).to(tl.int32) + (u < 0).to(tl.int32) * 8
+    )
+    # e2m1x2 stores the first value of a pair in the low nibble
+    nibble = tl.reshape(nibble, [ROWS, BLOCKS * BLOCK // 2, 2]) << (tl.arange(0, 2) * 4)[None, None, :]
+    q_offs = row[:, None] * (k // 2) + col_tile * (BLOCKS * BLOCK // 2) + tl.arange(0, BLOCKS * BLOCK // 2)[None, :]
+    tl.store(q_ptr + q_offs, tl.sum(nibble, axis=2).to(tl.uint8), mask=live)
+    tl.store(s_ptr + _scale_tile_offsets(g, col_tile, col_tiles, ROWS, BLOCKS), code.to(tl.uint8), mask=live)
+
+
+@torch.compiler.disable
+def quant_block(x: torch.Tensor, fmt: BlockFormat, tensor_scale: float = 1.0) -> BlockQuant:
+    """Quantize a contiguous bf16 ``[rows, K]`` activation for a block-scaled GEMM; ``fp8_block.quantize_block`` is the
+    host-side reference. NVFP4's block scales are in units of ``tensor_scale``. Rows need not fill a scale tile: the
+    GEMM doesn't read scales past its M. A graph break, like ``per_token_group_quant_fp8``."""
+    rows, k = x.shape
+    k_blocks = k // fmt.block
+    col_tiles = k_blocks // BLOCKS_PER_TILE
+    grid = (triton.cdiv(rows, _BLOCK_QUANT_ROWS), col_tiles)
+    # Triton has no e8m0 or e2m1x2 pointers; both are written as bytes and viewed
+    scale = torch.empty(swizzled_scale_elements(rows, k_blocks), dtype=torch.uint8, device=x.device)
+    if fmt is MXFP8:
+        data = torch.empty_like(x, dtype=fmt.data_dtype)
+        _mxfp8_quant_kernel[grid](
+            x, data, scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=fmt.block,
+        )
+        return BlockQuant(data, scale.view(fmt.scale_dtype))
+    packed = torch.empty(rows, k // fmt.packing, dtype=torch.uint8, device=x.device)
+    _nvfp4_quant_kernel[grid](
+        x, packed, scale, rows, k, col_tiles, 1.0 / tensor_scale,
+        ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=fmt.block,
+    )
+    tensor = torch.full((1,), tensor_scale, dtype=torch.float32, device=x.device)
+    return BlockQuant(packed.view(fmt.data_dtype), scale.view(fmt.scale_dtype), tensor)

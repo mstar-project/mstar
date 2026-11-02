@@ -46,12 +46,14 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
+from mstar.model.components.linear import LINEAR_PRECISIONS, apply_linear_precision
 from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_LEN,
     Qwen3TextEncoderSubmodule,
 )
+from mstar.model.flux2_klein.components.transformer import LOW_PRECISION_LINEARS
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -103,10 +105,14 @@ class Flux2KleinModel(Model):
         vae_compile: bool = False,
         async_scheduling: bool = True,
         lora: list | None = None,
+        linear_precision: str = "bf16",
+        linear_precision_keep: list[str] | None = None,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        if linear_precision not in LINEAR_PRECISIONS:
+            raise ValueError(f"linear_precision must be one of {LINEAR_PRECISIONS}, got {linear_precision!r}")
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node, so the engine runs
@@ -143,6 +149,10 @@ class Flux2KleinModel(Model):
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraFile.parse(item) for item in (lora or [])]
+        # The transformer's block linears through a block-scaled GEMM (mxfp8, nvfp4), with this deployment's extra
+        # bf16 patterns on top of the model's declaration. Trades image fidelity for speed; see docs/models.rst.
+        self.linear_precision = linear_precision
+        self.linear_precision_keep = tuple(linear_precision_keep or ())
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -489,6 +499,8 @@ class Flux2KleinModel(Model):
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 
                 apply_transformer_loras(transformer, self.loras)
+            # after the adapters: those fold into the bf16 weights this quantizes
+            apply_linear_precision(transformer, self.linear_precision, LOW_PRECISION_LINEARS, self.linear_precision_keep)
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,

@@ -1,4 +1,4 @@
-"""Non-distributed fused linear projections.
+"""Non-distributed fused linear projections, and linears on block-scaled low precision.
 
 ``FusedColumnLinear`` concatenates several output shards into a single
 weight (and optional bias) so a transformer's QKV or gate/up projections
@@ -11,8 +11,17 @@ This mirrors the role of the TP-aware ``QKVParallelLinear`` /
 ``MergedColumnParallelLinear`` in ``model.components.distributed`` but
 without any tensor-parallel sharding — use it for models that fuse
 projections but don't need TP.
+
+``BlockScaledLinear`` runs a linear through cuBLASLt's block-scaled GEMM: weights quantized once
+at load, the activation per call. A model opts in by declaring which of its linears may run that way
+(``LowPrecisionLinears``, applied by ``apply_linear_precision``). The output differs from the bf16
+GEMM's by the format's rounding, so this is a knob for a calibrated quality bar, never a default.
 """
 from __future__ import annotations
+
+import fnmatch
+import logging
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +29,13 @@ from torch import nn
 
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraCapable, LoraOutputAdd
+from mstar.platforms import current_platform
+from mstar.platforms.block_gemm import block_quant, block_scaled_gemm
+from mstar.utils.fp8_block import BLOCK_FORMATS, BlockFormat, BlockQuant, check_block_gemm, quantize_block
+
+logger = logging.getLogger(__name__)
+
+LINEAR_PRECISIONS = ("bf16", *BLOCK_FORMATS)
 
 
 class FusedColumnLinear(nn.Module, LoraCapable):
@@ -114,3 +130,68 @@ class FusedColumnLinear(nn.Module, LoraCapable):
             parallel="none",
             slice_names=tuple(self._shard_sizes),
         )
+
+
+class BlockScaledLinear(nn.Module):
+    """A bias-free linear whose weight is block-scaled low precision. Input of any rank, ``[..., K]`` contiguous;
+    output bf16, as the linear's was. Replaces the module that held the bf16 weight, so the weight's bytes go."""
+
+    def __init__(self, weight: torch.Tensor, fmt: BlockFormat):
+        super().__init__()
+        self.fmt = fmt
+        self.out_features, self.in_features = weight.shape
+        check_block_gemm(fmt, self.in_features, self.out_features, weight.dtype)
+        quantized = quantize_block(weight, fmt)
+        self.register_buffer("weight_data", quantized.data)
+        self.register_buffer("weight_scale", quantized.scale)
+        self.register_buffer("weight_tensor_scale", quantized.tensor_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lead = x.shape[:-1]
+        weight = BlockQuant(self.weight_data, self.weight_scale, self.weight_tensor_scale)
+        out = block_scaled_gemm(block_quant(x.reshape(-1, self.in_features), self.fmt), weight, self.fmt)
+        return out.reshape(*lead, self.out_features)
+
+
+@dataclass(frozen=True)
+class LowPrecisionLinears:
+    """A model's declaration over its linears' names (``fnmatch`` patterns): the ones that may run low precision, and
+    the ones that stay bf16. Every linear has to be in one or the other, so a new layer can't change format
+    silently; ``keep_bf16`` wins where both match."""
+
+    candidates: tuple[str, ...]
+    keep_bf16: tuple[str, ...]
+
+    def selected(self, name: str, keep: tuple[str, ...] = ()) -> bool:
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in (*self.keep_bf16, *keep)):
+            return False
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in self.candidates):
+            return True
+        raise ValueError(f"linear {name!r} is neither a low-precision candidate nor kept bf16")
+
+
+def apply_linear_precision(
+    module: nn.Module, precision: str, declaration: LowPrecisionLinears, keep: tuple[str, ...] = (),
+) -> list[str]:
+    """Move the declared linears of ``module``, weights loaded, to ``precision``; ``keep`` adds patterns to the
+    declaration's bf16 list for one deployment. Returns the names moved. ``bf16``, or a GPU without the block-scaled
+    GEMM, changes nothing."""
+    if precision not in LINEAR_PRECISIONS:
+        raise ValueError(f"linear_precision must be one of {LINEAR_PRECISIONS}, got {precision!r}")
+    if precision == "bf16":
+        return []
+    fmt = BLOCK_FORMATS[precision]
+    linears = [(name, m) for name, m in module.named_modules() if isinstance(m, (nn.Linear, FusedColumnLinear))]
+    selected = [(name, m) for name, m in linears if declaration.selected(name, keep)]
+    if not selected:
+        return []
+    if not current_platform.has_block_scaled_gemm(selected[0][1].weight.device):
+        logger.warning("linear_precision %s needs a block-scaled GEMM, not on this GPU; staying on bf16", precision)
+        return []
+    for name, linear in selected:
+        if linear.bias is not None:
+            raise ValueError(f"{precision} replaces bias-free linears; {name!r} has a bias")
+        parent_name, _, leaf = name.rpartition(".")
+        module.get_submodule(parent_name).register_module(leaf, BlockScaledLinear(linear.weight.data, fmt))
+    logger.info("linear_precision %s: %d of %d linears", precision, len(selected), len(linears))
+    return [name for name, _ in selected]
