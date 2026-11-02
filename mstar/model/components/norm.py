@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.rms_norm import run_rms_norm
+from mstar.engine.resources.rms_norm import gemma_rms_norm, run_rms_norm
 
 
 def rms_norm(
@@ -29,12 +29,7 @@ def rms_norm(
     """``RMSNorm``'s forward, for a norm whose weight lives elsewhere (e.g. a wrapped
     Hugging Face module's): ``mstar::rms_norm``, or Gemma's fp32 ``(1 + weight)``."""
     if gemma_mode:
-        orig_dtype = hidden_states.dtype
-        x = hidden_states.to(torch.float32)
-        var = x.square().mean(dim=-1, keepdim=True)
-        normed = x * torch.rsqrt(var + eps)
-        normed = normed * (1.0 + weight.to(torch.float32))
-        return normed.to(orig_dtype)
+        return gemma_rms_norm(hidden_states, weight, eps)
     # Fused kernels expect 2D input. Reshape/restore so callers can pass
     # arbitrary leading dims, such as [batch, sequence, hidden_size].
     orig_shape = hidden_states.shape
@@ -48,23 +43,17 @@ def add_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``r = hidden_states + residual``; returns ``(rms_norm(r), r)``.
 
-    On CUDA in half precision, one FlashInfer kernel, in place: ``residual +=
-    hidden_states``, then ``hidden_states = norm(residual)``, so both inputs are
-    consumed. Inductor's own fusion of the pair is a reduction over a few rows that
-    takes ~3x as long at decode batch sizes. The kernel normalizes the sum before
-    rounding it to half precision, where the unfused pair rounds first.
+    In place (``mstar::fused_add_rms_norm``): ``residual += hidden_states``, then
+    ``hidden_states = norm(residual)``, so both inputs are consumed. On CUDA in
+    half precision that is one FlashInfer kernel: Inductor's own fusion of the
+    pair is a reduction over a few rows that takes ~3x as long at decode batch
+    sizes.
     """
-    if hidden_states.is_cuda and hidden_states.dtype in (torch.bfloat16, torch.float16):
-        from flashinfer.norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm
-
-        orig_shape = hidden_states.shape
-        h = hidden_states.reshape(-1, orig_shape[-1])
-        r = residual.reshape(-1, orig_shape[-1])
-        fused = gemma_fused_add_rmsnorm if gemma_mode else fused_add_rmsnorm
-        fused(h, r, weight, eps)
-        return h.reshape(orig_shape), r.reshape(orig_shape)
-    r = hidden_states + residual
-    return rms_norm(r, weight, eps, gemma_mode), r
+    orig_shape = hidden_states.shape
+    h = hidden_states.reshape(-1, orig_shape[-1])
+    r = residual.reshape(-1, orig_shape[-1])
+    torch.ops.mstar.fused_add_rms_norm(h, r, weight, eps, gemma_mode)
+    return h.reshape(orig_shape), r.reshape(orig_shape)
 
 
 class RMSNorm(nn.Module):
@@ -94,16 +83,26 @@ class RMSNorm(nn.Module):
         return rms_norm(hidden_states, self.weight, self.variance_epsilon, self.gemma_mode)
 
     def forward_residual(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor,
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None,
         comm_group=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``r = hidden_states + residual``; returns ``(norm(r), r)``.
+
+        ``residual`` None starts a residual stream at ``hidden_states``
+        (``(norm(hidden_states), hidden_states)``), so a layer loop that defers
+        each add into the next norm needs no first-layer branch. It must be a
+        full tensor (e.g. the embeddings), not a TP partial sum, so the start
+        reduces nothing. Later calls update the stream in place, so start it
+        from a tensor the caller may overwrite (``run_layers`` starts it from
+        a copy).
 
         Keeps add and norm together so inductor fuses them, rather than folding
         the add into the producing GEMM as an ``addmm`` (an extra copy of
         ``residual``). Under TP ``hidden_states`` is a row-parallel partial sum
         that ``comm_group`` reduces in the same fused kernel.
         """
+        if residual is None:
+            return self(hidden_states), hidden_states
         if comm_group is not None and comm_group.world_size > 1:
             orig_shape = hidden_states.shape
             normed, r = comm_group.allreduce_add_rmsnorm(

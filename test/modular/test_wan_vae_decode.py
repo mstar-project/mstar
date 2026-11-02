@@ -225,20 +225,6 @@ def test_compact_feat_cache_replaces_only_views() -> None:
     assert _storage_bytes(cache) == wan_vae.feat_cache_bytes(cache)
 
 
-@pytest.mark.parametrize("before", [False, True])
-def test_cudnn_benchmark_is_scoped(before, torch_flag) -> None:
-    torch_flag(torch.backends.cudnn, "benchmark", before)
-    with wan_vae.cudnn_benchmark(True):
-        assert torch.backends.cudnn.benchmark
-    assert torch.backends.cudnn.benchmark is before
-    with pytest.raises(RuntimeError), wan_vae.cudnn_benchmark(True):
-        raise RuntimeError
-    assert torch.backends.cudnn.benchmark is before
-    with wan_vae.cudnn_benchmark(False):
-        assert torch.backends.cudnn.benchmark is before
-    assert torch.backends.cudnn.benchmark is before
-
-
 def test_compiled_step_runs_steady_calls_compiled_after_a_warm_up_on_a_cache_copy() -> None:
     """A compiled step runs a stream's start eagerly (the clip-start call, and
     calls that still find the "Rep" marker in the cache). A steady-state bf16

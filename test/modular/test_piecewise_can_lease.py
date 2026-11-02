@@ -135,7 +135,7 @@ def test_a_one_row_per_step_region_refuses_a_lora_step():
     runner._config = SimpleNamespace(
         one_row_per_step=True,
         get_capture_shapes=lambda sizes: [PiecewiseCaptureShape(bs=1, seq_lens=[8], total_tokens=8)],
-        declare_step=lambda rids, seq_lens: SubmoduleStep(steps={"lora": LoraStep()}),
+        region_step=lambda rids, seq_lens: SubmoduleStep(steps={"lora": LoraStep()}),
     )
     runner._label, runner._node_name, runner._prepared_shapes = "region", "vision", None
     runner._capture_batch_sizes = [1]
@@ -143,3 +143,29 @@ def test_a_one_row_per_step_region_refuses_a_lora_step():
     runner._dummy_key = lambda shape, slot: "k"
     with pytest.raises(ValueError, match="one_row_per_step"):
         runner.prepare_for_capture()
+
+
+@pytest.mark.parametrize("one_row, request_ids, seq_lens, rows", [
+    (False, ["a", "b", "pad"], [5, 3, 0], ["a", "b", "pad"]),
+    (True, ["a"], [5, 3, 2], ["a", "a", "a"]),
+])
+def test_attn_key_declares_one_segment_per_row(one_row, request_ids, seq_lens, rows):
+    """A packed region naming its attention resource declares a non-causal
+    segment per row, all on the one row under `one_row_per_step`, and so does
+    a copy of its config."""
+    from dataclasses import replace
+
+    from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
+
+    kwargs = {"capture_fn": lambda inp: {}, "make_static_inputs": lambda shape: {}, "attn_key": "attn"}
+    if one_row:
+        kwargs.update(lease_before_step=True, one_row_per_step=True, capture_batch_sizes=[1])
+    config = PiecewisePackedConfig(**kwargs, total_tokens=[8])
+    for step in (config.region_step(request_ids, seq_lens),
+                 replace(config, total_tokens=[16]).region_step(request_ids, seq_lens)):
+        assert [(s.request_id, s.label, s.span) for s in step.segments] == [
+            (rid, "main", n) for rid, n in zip(rows, seq_lens, strict=True)
+        ]
+        assert list(step.steps) == ["attn"] and step.steps["attn"].causal is False
+    with pytest.raises(ValueError, match="attn_key"):
+        PiecewisePackedConfig(**kwargs, declare_step=lambda ids, lens: None, total_tokens=[8])
