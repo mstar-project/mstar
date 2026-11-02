@@ -332,6 +332,8 @@ wan22 = [
     # mp4 encode for the video output. PyAV bundles its own FFmpeg libs;
     # torchcodec is unusable here without a system FFmpeg install.
     "av",
+    # The DiT's default self-attention runs on the engine's FlashInfer ragged resource.
+    "flashinfer-python==0.7.2",
 ]
 
 waypoint = [

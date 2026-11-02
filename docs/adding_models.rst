@@ -287,10 +287,15 @@ There are two ``ResourceReqConfig`` subclasses:
   metadata. The model passes ``return_logprobs`` into its ``SamplingReqConfig`` (the
   conductor refuses the request otherwise), its forward samples once per step and
   hands over row-addressed stop buffers (``BatchedModelOutput.check_stop_buffers``):
-  the log-probs ride the same copy to the host. ``logprobs_mode`` is ``"raw"`` only
-  for now. The captured sampler scores every step once it is on, so it is off by
-  default and a deployment turns it on with
+  the log-probs ride the same copy to the host. The captured sampler scores every
+  step once it is on, so it is off by default and a deployment turns it on with
   ``resources: {<sampler key>: {enable_logprobs: true}}``.
+  ``logprobs_mode: "processed"`` (``enable_processed_logprobs``, CUDA) scores the
+  distribution the token was drawn from instead: after the penalty, temperature,
+  min-p, top-k/top-p and min-tokens floor. A greedy token scores 0 there, so a
+  trainer sampling greedily wants ``"raw"``. It renorms every step's distribution
+  again, about 0.15 ms at batch 1 and 0.5 ms at batch 128 on a GB200 with a 248k
+  vocabulary, so it is a separate switch.
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
@@ -487,7 +492,9 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   keys its page; a step whose token never reaches the chain, such as the one speculated
   past the reply's end, leaves the previous one in place.
 - A snapshot is keyed by the KV chain's key at its page. A full set of slots evicts the
-  least recently used snapshot that no request holds.
+  least recently used snapshot that no request holds, a decode snapshot before a prompt's,
+  so the slots hold about one prompt each. A decode snapshot that a later prompt restores
+  is kept like a prompt's from then on.
 
 Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
 cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
@@ -629,7 +636,11 @@ The spec types are:
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper and Qwen3-ASR declare ``False``. ``FLASHINFER_MLA`` is
+       Whisper and Qwen3-ASR declare ``False``. ``decode_fmha`` (default ``False``) runs
+       captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
+       with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
+       the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
+       kernels. Qwen3.5 declares ``True``. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
        the softmax scale of the model's original qk head dim, which the other backends
        refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
@@ -1137,7 +1148,20 @@ methods are:
    ``declare_step`` needs a value that ``forward`` does not use, put that value in
    ``resource_step_info``.
 
-``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, **kwargs) -> SubmoduleStep | None``
+``get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None`` (optional)
+   Return the length of the row's whole input, before any cached prefix is cut --
+   the engine subtracts what the prefix cache already holds. Return ``None`` for a
+   walk that declares no length, or when the inputs it would measure are absent.
+   Read off input shapes alone: this runs before ``prepare_inputs``.
+
+``speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len) -> int | None`` (optional)
+   Estimate the length of a row continuing from the step in flight, before that step's
+   outputs reach it; ``prev_seq_len`` is its length in that step, or -1 if it ran on
+   another node. The default repeats ``prev_seq_len``. Only an estimate: it sizes the
+   token budget left for the rows a speculation merges in beside it. A walk with a fixed
+   length (one token a decode step) should return it.
+
+``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, per_request_info=None, **kwargs) -> SubmoduleStep | None``
    Declare what this batch's step does to the node's resources. See
    `Step 4a — Declare the step`_ below.
 
@@ -1249,6 +1273,25 @@ methods are:
    starting early on a thread of the submodule's own; it must not touch the device. The
    DiT scaffold draws a request's seeded noise here (``PREFETCH_SEEDS``).
 
+``get_stop_policies(self, graph_walk) -> dict[str, StopPolicy] | None`` (optional)
+   Declare what ``check_stop`` amounts to on a walk, per loop it can stop, when it is
+   only the common checks; the graph runtime then runs them over the step's token column
+   without calling ``check_stop``. That takes the batched output carrying the policies'
+   ``token_signal`` as a stop buffer (``BatchedModelOutput(check_stop_buffers={...})``,
+   as Qwen3.5 and Orpheus return); a step without one, or one that mixes walks,
+   still calls ``check_stop``. ``StopPolicy(StopKind.AR, token_signal=...,
+   eos_tokens=..., sampler=...)`` stops its loop on an EOS token (unless the ``sampler``
+   resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
+   one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
+   only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
+   The limits are computed from the request's forward-pass info whenever
+   the worker receives it, not per step. Return ``{}`` for a
+   walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
+   calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
+   ``test/modular/test_stop_policies.py`` checks the models that declare them. A
+   ``TokenStop`` with ``runtime_check=True`` declares them for you: its loop's stop ids,
+   as ``StopKind.EOS``, on ``walk``; its ``prefill_walks`` keep ``check_stop``.
+
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
    per-request caches, counters. See Qwen3-Omni's ``Code2WavSubmodule`` for an example.
@@ -1279,6 +1322,54 @@ methods are:
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
+
+**Chunked prefill (optional).** A walk with long prompts can run each across several steps,
+at most a token budget per step, so the decode rows batched beside it keep running. Each
+chunk is one iteration of a Loop around the node, which counts the tokens its chunks ran
+and ends at the prompt's length. To opt a walk in:
+
+- ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
+  naming the ``walks`` it covers. It is declared on the model, not the submodule, because
+  the graph build reads it: ``Model`` wraps each chunkable node in its Loop wherever
+  ``get_graph_walk_graphs`` is read, so the model returns its walks as usual. The fields:
+
+  - ``chunkable=True`` lets the walk's rows be cut.
+  - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
+    chunked rows sets one too, since its steps run under it.
+  - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
+    one item per chunk, all when the prompt finishes.
+  - ``per_chunk_outputs``: streaming edges sent on every chunk as it runs, for a consumer
+    that can start on a prefix. Any edge in neither set carries the final chunk's output
+    alone.
+  - ``reuses_cached_prefix``: a callable saying whether a row may start past its cached
+    prefix; ``None`` (the default) is always. Set it where a row may have to write its
+    prefix again.
+  - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
+    whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
+    a walk whose state grows by something other than the tokens a step runs.
+
+  A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
+  (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
+  joins the pieces into that item. A consumer that can take the pieces as they come says
+  so with ``ChunkPolicy.allow_partial_input`` (``FixedChunkPolicy(allow_partial=True)``),
+  and the producer then sends the edge per chunk, as Qwen3-Omni's Thinker does into its
+  Talker. A chunked stream its consumer would misread, each piece taken for the whole
+  input, is refused at startup.
+- ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
+  input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
+  row whose prepared input turns out another length fails.
+- ``split_inputs(graph_walk, fwd_info, inputs, start, end)`` cuts the whole prepared input
+  to tokens ``[start, end)``. ``ARNodeSubmodule``'s default cuts the token ids or
+  embeddings and any custom position ids, and refuses inputs it cannot see into
+  (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
+
+Each chunk is a full forward, so it samples a token, but only the final chunk's token is
+real (``inputs.is_final_chunk``). The model need not handle that: the sampler commits no
+RNG offset or seen token for a row mid-prefill (it reads ``StepContext.chunk_tokens_after``),
+the Loop carries only the final chunk's outputs, and the worker takes no stop or prefix
+key from a non-final chunk. ``test/modular/test_chunked_prefill.py`` and
+``test/modular/test_bagel_chunked_prefill.py`` show how to test a chunking model. A
+deployment can change the budgets (see *Chunked prefill budgets* in :doc:`serving`).
 
 .. _Step 4a — Declare the step:
 
@@ -1481,6 +1572,12 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
 Higgs Audio, Qwen3-ASR and Whisper declare it.
+
+On such a node a captured step writes each row's token and RNG offset back to the request's
+row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
+allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
+admits it and waits while none is free, as it does for a recurrent state slot. A row the
+step drops (``SamplerStep(kept_rids=...)``) writes the trash row, so it keeps its offset.
 
 State that a decode loop carries from step to step beside the token, such as Whisper's
 timestamp rule state, is declared on the sampler, not kept in the model (Whisper adds its
@@ -1785,10 +1882,11 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
 - ``can_lease`` has signature ``(inputs: list[NodeInputs]) -> bool``. It applies only with
   ``lease_before_step``, and lets the region refuse a batch for a limit that the
   capture bucket key doesn't express, such as Qwen3.5's segment count per step. The
-  engine then gives the region no lease for that step. A ``lease_before_step`` region is
-  in ``engine_inputs.piecewise_runners`` only on a step that leased it, so the forward
-  replays it whenever its runner is there and runs it eagerly otherwise: an unleased
-  step declared the region's resources itself, and a replay would declare them twice.
+  engine then gives the region no lease for that step. Your forward must replay a
+  ``lease_before_step`` region exactly when its label is in
+  ``engine_inputs.piecewise_leases``, and not whenever ``runner.can_run`` is true: a
+  refused batch can still fit a bucket, and replaying it would declare the region's
+  resources twice.
 - ``one_row_per_step`` makes the runner lease, check (``can_run``) and replay the region as
   one row, whatever the step's batch size, under the step's first request. It is for a
   packed region that runs every request's segments as one ragged batch, such as a vision
@@ -1908,8 +2006,8 @@ sequence, and an eager section after the region.
        }
 
    # --- invoke it inside the forward ---
-   runner = engine_inputs.piecewise_runners.get(BLOCK_LOOP_REGION)   # here when leased
-   if runner is not None:
+   runner = engine_inputs.piecewise_runners.get(BLOCK_LOOP_REGION)
+   if runner is not None and runner.can_run(x.size(0)):
        out = runner.run(                       # admits + plans + replays + commits
            static_inputs={"x": x, "d_pos": d_pos, ...},
            request_ids=engine_inputs.request_ids,
@@ -1995,7 +2093,7 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``)
+       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
    * - ``CrossAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
@@ -2537,10 +2635,14 @@ step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
 ``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
 the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
 
-A multi-step scheduler that carries solver state between iterations (wan22's UniPC, with
-``unipc_model_outputs`` and ``unipc_last_sample``) names it in ``SOLVER_STATE``; those
-become loop-back edges alongside ``latents``, seeded by ``seed_loop_back`` and returned
-from ``denoise`` as a ``{name: tensor}`` mapping. A scheduler needing another per-step
+A multi-step scheduler that carries solver state between iterations names it in
+``SOLVER_STATE``; those become loop-back edges alongside ``latents``, seeded by
+``seed_loop_back`` and returned from ``denoise`` as a ``{name: tensor}`` mapping. UniPC
+comes with the scaffold: a subclass of ``UniPCDenoiseLoopSubmodule`` implements
+``model_output`` in place of ``denoise``, and the base carries
+``unipc_model_outputs`` and ``unipc_last_sample`` and steps each row by the loop counter
+from its own tables, with no host read, so rows at different steps share a forward
+(wan22 is the example). A scheduler needing another per-step
 scalar adds a ``STEP_SCALARS`` entry naming the attribute of its ``FlowMatchSchedule``
 to slice it from — the base stages that tensor on the device and slices it per step, so
 nothing in the batching path has to change.

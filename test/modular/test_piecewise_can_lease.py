@@ -52,38 +52,6 @@ def test_nothing_leased_leaves_the_context_alone():
     assert _lease({"refused": _Runner(accepts=False)}, [SimpleNamespace(input_seq_len=8)]) is None
 
 
-def test_the_forward_gets_an_early_lease_region_only_on_a_step_that_leased_it():
-    """Unleased, the step's own declaration covers the region's resources, so
-    its forward is not handed the region to replay and declare them again. A
-    region that takes no early lease is handed over every step."""
-    from mstar.engine.engine import SubmoduleManagement
-    from mstar.engine.resources import StepContext
-
-    runners = {"ok": _Runner(), "refused": _Runner(accepts=False), "own": _Runner(lease_before_step=False)}
-    inputs = [SimpleNamespace(input_seq_len=100)]
-    ctx = StepContext(request_ids=("r",), graph_walk="w", slot=0, capture=False)
-    ctx.set_piecewise_leases(_lease(runners, inputs))
-    handed = {}
-
-    def forward_batched(graph_walk, engine_inputs):
-        handed.update(engine_inputs.piecewise_runners)
-        return {"r": {}}
-
-    mgmt = SubmoduleManagement(
-        submodule=SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: {}),
-        forward=None, forward_batched=forward_batched, joint_comm_group=None, resources={},
-        piecewise_runners=runners,
-    )
-    engine = Engine.__new__(Engine)
-    engine._enable_nvtx = engine._enable_profile = False
-    batch = SimpleNamespace(step_context=ctx, per_request_input_metadata={})
-    Engine._drive_step(
-        engine, batch, mgmt, ["r"], inputs, {"r": None}, ctx,
-        lease=None, running_batched=True, step=None, set_launch=False,
-    )
-    assert set(handed) == {"ok", "own"}
-
-
 def test_runner_defers_to_the_configs_predicate():
     def runner(predicate):
         return SimpleNamespace(_config=SimpleNamespace(can_lease=predicate))

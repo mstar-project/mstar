@@ -2,6 +2,7 @@
 
 from typing import Any, NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import (
@@ -29,6 +30,7 @@ from mstar.engine.resources.base import (
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
+    HostLens,
     KVPlanOutputs,
     PagedIndptrs,
     SequenceView,
@@ -203,11 +205,11 @@ class FlashInferCrossManager(CrossAttentionManager):
 
             # The context pages are immutable once written, so only the query
             # side moves between steps; when neither moved, FlashInfer's plan
-            # is skippable. Every tensor here is on CPU: `.tolist()` costs no sync.
+            # is skippable. Every tensor here is on CPU.
             plan_key = PlanCacheKey(
                 q_seq_lens=qo_indptr,
-                page_indices=tuple(indptrs.paged_kv_indices.tolist()),
-                last_page_lens=tuple(indptrs.paged_kv_last_page_len.tolist()),
+                page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
+                last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
             )
             if last is None or last.plan_key != plan_key:
                 wrapper.plan(
@@ -307,6 +309,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         kv_indptr = [0]
         all_pages: list[int] = []
         last_page_lens: list[int] = []
+        kv_lens: list[int] = []
 
         for request_id in packing.request_ids:
             context = context_views.get(request_id)
@@ -323,13 +326,16 @@ class FlashInferCrossManager(CrossAttentionManager):
                 all_pages.append(SINK_PAGE)
                 kv_indptr.append(kv_indptr[-1] + 1)
                 last_page_lens.append(1)
+                kv_lens.append(1)
                 continue
             # stream can have more pages than context needs takes only the prefix
             # written length covers
             n_pages = (context.length + page_size - 1) // page_size
             all_pages.extend(context.page_idxs[:n_pages])
             kv_indptr.append(kv_indptr[-1] + n_pages)
-            last_page_lens.append(context.last_page_len(page_size) or page_size)
+            last = context.last_page_len(page_size) or page_size
+            last_page_lens.append(last)
+            kv_lens.append((n_pages - 1) * page_size + last)
 
         # fork repeats pages, so batch can index more than held in cache.
         assert len(all_pages) <= self._kv_config.max_num_pages, (
@@ -338,11 +344,15 @@ class FlashInferCrossManager(CrossAttentionManager):
             "raise max_num_pages on the context cache's PagedKVConfig"
         )
 
+        # numpy builds an int32 array from a list in about half the time
+        # `torch.tensor(list)` takes; host `kv_lens` let a captured decode
+        # wrapper call FlashInfer's planner directly (see `_plan_direct`)
         return PagedIndptrs(
             qo_indptr=packing.qo_indptr,
-            paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
-            paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
-            paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
+            paged_kv_indptr=torch.from_numpy(np.array(kv_indptr, np.int32)),
+            paged_kv_indices=torch.from_numpy(np.array(all_pages, np.int32)),
+            paged_kv_last_page_len=torch.from_numpy(np.array(last_page_lens, np.int32)),
+            kv_lens=torch.from_numpy(np.array(kv_lens, np.int32)).as_subclass(HostLens),
         )
 
     def _wrapper_for(

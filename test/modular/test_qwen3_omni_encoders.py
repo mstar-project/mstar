@@ -79,8 +79,8 @@ class StandInRagged:
 
 
 def _engine_inputs(rids):
-    # no capture runners and a declared step: the eager path
-    return SimpleNamespace(request_ids=list(rids), piecewise_runners={}, step=object())
+    # no capture runners and no lease: the eager path
+    return SimpleNamespace(request_ids=list(rids), piecewise_runners={}, piecewise_leases={}, step=object())
 
 
 def _fwd(rid="r"):

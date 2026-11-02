@@ -124,6 +124,13 @@ def test_missing_loop_back_latents_past_iteration_zero_raises():
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
 
 
+def test_a_step_without_the_loop_counter_raises():
+    """Read as 0, it would reseed from noise every iteration and run to max_iters."""
+    sub = ToyDenoise()
+    with pytest.raises(KeyError, match=LOOP):
+        sub.prepare_inputs(WALK, dataclasses_replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
+
+
 def test_overshoot_iteration_is_vetoed():
     sub = ToyDenoise()
     sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
