@@ -218,9 +218,9 @@ def test_a_release_that_cannot_be_sent_does_not_lose_the_request_taken_with_it()
     ]
 
 
-def _factory(monkeypatch, choice, *, has_try_send):
-    """``make_communicator`` over a fake ``mstar_rust`` build, with each
-    transport's constructor returning its name."""
+def _factory(monkeypatch, *, version=None, has_try_send=True):
+    """``make_communicator`` over a fake ``mstar_rust`` build, with the Rust
+    communicator's constructor returning ``"rust"``."""
     import sys
     from types import SimpleNamespace
 
@@ -233,37 +233,40 @@ def _factory(monkeypatch, choice, *, has_try_send):
 
     if has_try_send:
         _Zmq.try_send = lambda self, peer_id, data: True
-    version = communicator.EXPECTED_MSTAR_RUST_VERSION if has_try_send else "0.1.0"
     monkeypatch.setitem(sys.modules, "mstar_rust", SimpleNamespace(
-        ZmqCommunicator=_Zmq, __version__=version, __file__="mstar_rust.so"))
+        ZmqCommunicator=_Zmq, __version__=version or communicator.EXPECTED_MSTAR_RUST_VERSION,
+        __file__="mstar_rust.so"))
     monkeypatch.setattr(rust_communicator, "RustZMQCommunicator", lambda *args, **kwargs: "rust")
-    monkeypatch.setattr(communicator, "ZMQCommunicator", lambda *args, **kwargs: "pyzmq")
-    monkeypatch.setenv("MSTAR_RUST_ZMQ", choice)
     return communicator.make_communicator
 
 
-@pytest.mark.parametrize("choice", ["AUTO", "1"])
-def test_a_rust_build_without_try_send_still_carries_the_other_senders(monkeypatch, choice):
-    """Only the outbox needs try_send: the conductor's and the workers'
-    communicators stay Rust, which a worker's Rust graph runtime requires."""
-    make = _factory(monkeypatch, choice, has_try_send=False)
+def test_the_expected_build_carries_every_sender(monkeypatch):
+    make = _factory(monkeypatch)
     assert make("conductor", []) == "rust"
+    assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "rust"
 
 
-def test_a_rust_build_without_try_send_puts_the_outbox_on_pyzmq_under_auto(monkeypatch, caplog):
-    make = _factory(monkeypatch, "AUTO", has_try_send=False)
-    with caplog.at_level("WARNING"):
-        assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "pyzmq"
-    assert "try_send" in caplog.text
+def test_a_build_of_another_version_is_refused(monkeypatch):
+    """A stale build left in an env after an upgrade fails the process at
+    startup: there is no other transport to carry the mesh."""
+    make = _factory(monkeypatch, version="0.1.0")
+    with pytest.raises(RuntimeError, match="0.1.0 at .* does not match the expected"):
+        make("conductor", [])
 
 
-def test_a_rust_build_without_try_send_fails_the_outbox_when_rust_is_required(monkeypatch):
-    make = _factory(monkeypatch, "1", has_try_send=False)
-    with pytest.raises(RuntimeError, match="rebuild"):
+def test_a_build_without_try_send_fails_the_outbox(monkeypatch):
+    """Only the outbox needs try_send, so the other senders still start."""
+    make = _factory(monkeypatch, has_try_send=False)
+    assert make("conductor", []) == "rust"
+    with pytest.raises(RuntimeError, match="predates ZmqCommunicator.try_send"):
         make("api_server_preprocess_worker", [], nonblocking_send=True)
 
 
-@pytest.mark.parametrize("choice", ["AUTO", "1"])
-def test_a_rust_build_with_try_send_carries_the_outbox(monkeypatch, choice):
-    make = _factory(monkeypatch, choice, has_try_send=True)
-    assert make("api_server_preprocess_worker", [], nonblocking_send=True) == "rust"
+def test_a_missing_extension_says_how_to_build_it(monkeypatch):
+    import sys
+
+    from mstar.communication.communicator import make_communicator
+
+    monkeypatch.setitem(sys.modules, "mstar_rust", None)
+    with pytest.raises(ImportError, match="maturin develop --release -m rust/Cargo.toml"):
+        make_communicator("conductor", [])

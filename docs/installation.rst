@@ -52,7 +52,7 @@ To work on the code, install from source in editable mode:
 
    uv pip install --torch-backend=auto -e .
 
-This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, ZMQ, …) and installs the two
+This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
 console scripts, ``mstar`` and ``mstar-serve``. To serve from a checkout, also build the
 extension (see `Rust extension`_).
 
@@ -474,15 +474,17 @@ Rust extension
 --------------
 
 Serving needs the ``mstar_rust`` extension (vendored in ``rust/``): the graph
-runtime is Rust, and a worker raises at startup without it. Importing ``mstar``
-does not need it. The extension carries (see :doc:`environment_variables` for
-the flags):
+runtime is Rust and every process sends on its ZeroMQ transport, so each one
+raises at startup without it. Importing ``mstar`` does not need it. The
+extension carries (see :doc:`environment_variables` for the flags):
 
 * **Graph runtime**: graph state, scheduling, routing and speculation, and the
   frames a worker sends. It holds a share of the Rust transport and of the Rust
   tensor bookkeeper, and needs the msgpack codec.
-* **ZeroMQ control mesh** — ``MSTAR_RUST_ZMQ``: same endpoints, same wire
-  format as pyzmq.
+* **ZeroMQ control mesh**: the transport every process sends its control
+  messages on. Each process logs it at startup (``control mesh transport:
+  rust <version> from <path>``) and refuses an extension of another version
+  than the one its ``mstar`` expects.
 * **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
   transport; requires the extension, interoperates on the same descriptor
   wire (and depends on the transport above only in the sense that both ship

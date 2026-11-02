@@ -164,8 +164,8 @@ primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
 ### Rust extension
 
 Serving needs the `mstar_rust` extension (vendored in [`rust/`](rust/)): the graph runtime is
-Rust, and it runs on a Rust ZeroMQ transport that is wire-compatible with pyzmq. Each process logs
-its transport at startup (`control mesh transport: ...`), and a worker refuses `MSTAR_RUST_ZMQ=0`.
+Rust, and every process sends its control messages on the extension's ZeroMQ transport. Each
+process logs it at startup (`control mesh transport: rust <version> from <path>`).
 From a checkout, build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
 The Linux wheels of `mstar-ai` on PyPI carry it, with libzmq 4.3.4 statically linked under
 LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).

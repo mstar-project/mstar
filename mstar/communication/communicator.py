@@ -6,17 +6,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
 
-import zmq
-
-from mstar.communication.codec import Codec, decode_each, default_codec
 from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
 
 #: The ``mstar_rust`` extension version this tree expects (the vendored
-#: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
-#: install - e.g. a stale wheel after an upgrade - takes over the mesh
-#: silently, so the factory warns when the imported version differs.
+#: ``rust/`` crate's version). Every process sends on the extension's
+#: transport, so a mismatching install - e.g. a stale wheel after an upgrade -
+#: is refused at startup rather than left to carry the mesh.
 EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
 
 
@@ -64,7 +61,7 @@ class BaseCommunicator(ABC):
         ``timeout_ms`` elapses, whichever comes first. True when a message is
         waiting for ``get_all_new_messages``; a fired event is drained."""
 
-    # -- endpoint scheme (shared by every ZMQ-based communicator) ------------
+    # -- endpoint scheme ------------------------------------------------------
     # Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.
 
     def _endpoint(self, entity_id: str) -> str:
@@ -132,195 +129,46 @@ class BaseCommunicator(ABC):
     #     pass
 
 
-class ZMQCommunicator(BaseCommunicator):
-    def __init__(
-        self,
-        my_id: str,
-        push_ids: list[str],
-        protocol: CommProtocol=CommProtocol.IPC,
-        ipc_socket_path_prefix: str="/tmp/mstar/",
-        codec: type[Codec] | None = None,
-        # TODO: for TCP
-    ):
-        self.codec = codec or default_codec()
-        self.context = zmq.Context.instance()
-        transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
-        self.protocol = CommProtocol(transport)
-        self.pull_socket = self.context.socket(zmq.PULL)
-        if self.protocol == CommProtocol.IPC:
-            os.makedirs(ipc_socket_path_prefix, exist_ok=True)
-
-        # TODO: maybe only open sockets as we need them, and close sockets
-        # when we no longer need them
-        self.push_sockets: dict[str, zmq.SyncSocket] = {}
-        self.my_id = my_id
-        self.ipc_socket_path_prefix = ipc_socket_path_prefix
-
-        if self.protocol == CommProtocol.IPC:
-            self._lock_deployment(my_id)
-            self.pull_socket.bind(self._endpoint(my_id))
-            self.pull_socket.setsockopt(zmq.LINGER, 0)
-        elif self.protocol == CommProtocol.TCP:
-            self.pull_socket.bind(self._endpoint(my_id))
-            self.pull_socket.setsockopt(zmq.LINGER, 0)
-        else:
-            raise NotImplementedError(f"Protocol {protocol} not yet supported yet")
-
-        for id in push_ids:
-            if id == my_id:
-                continue
-            self.push_sockets[id] = self.context.socket(zmq.PUSH)
-            self.push_sockets[id].connect(self._endpoint(id))
-            self.push_sockets[id].setsockopt(zmq.LINGER, 0)
-        self.poller = zmq.Poller()
-        self.poller.register(self.pull_socket, zmq.POLLIN)
-        self.event = None
-
-    def register_event_for_poll(self, event: EventWakeup):
-        self.poller.register(event.fd,  zmq.POLLIN)
-        self.event = event
-
-    def wait_for_work(self, timeout_ms=50):
-        events = dict(self.poller.poll(timeout=timeout_ms))
-        if self.event.fd in events:
-            self.event.drain()
-
-    def poll_for_messages(self, timeout_ms=20):
-        """Block until a message is readable, a registered wakeup event
-        fires, or ``timeout_ms`` elapses — whichever comes first. True when
-        a message is available (left queued for ``get_all_new_messages``);
-        a wakeup ends the poll early with False (the event is drained,
-        exactly as in ``wait_for_work``). Mirrors the Rust communicator's
-        method so call sites work against either transport."""
-        events = dict(self.poller.poll(timeout=timeout_ms))
-        if self.event is not None and self.event.fd in events:
-            self.event.drain()
-        return self.pull_socket in events
-
-    # def get_session_id(self) -> str:
-    #     return self.session_id
-
-    def send(self, entity_id: str, msg):
-        # TODO: maybe serialize to JSON instead if more efficient
-        # no str(): the repr is ~10us on an InputSignals and DEBUG is off here
-        logger.debug(
-            "%s to send a message %s to entity %s",
-            self.my_id, msg, entity_id
-        )
-        self._push_socket(entity_id).send(self.codec.encode(msg))
-
-    def try_send_bytes(self, entity_id: str, data: bytes) -> bool:
-        try:
-            self._push_socket(entity_id).send(data, flags=zmq.NOBLOCK)
-        except zmq.Again:
-            return False
-        return True
-
-    def _push_socket(self, entity_id: str):
-        if entity_id not in self.push_sockets:
-            sock = self.context.socket(zmq.PUSH)
-            sock.connect(self._endpoint(entity_id))
-            sock.setsockopt(zmq.LINGER, 0)
-            self.push_sockets[entity_id] = sock
-        return self.push_sockets[entity_id]
-
-    def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
-        messages = []
-        if blocking:
-            # Wait until the pull socket is readable before draining. A
-            # registered wakeup event also ends the wait (and is drained
-            # here, exactly as in wait_for_work), so a completed compute
-            # future can interrupt a blocking receive. `timeout_s` bounds
-            # the wait (None = indefinitely); on expiry, drain what's there.
-            timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
-            events = dict(self.poller.poll(timeout=timeout_ms))
-            if self.event is not None and self.event.fd in events:
-                self.event.drain()
-        while True:
-            try:
-                # zmq.NOBLOCK means zmq doesn't wait for a new message to be
-                # available, it returns a message if it exists or raises an error
-                # if no messages are available (error is caught below)
-                frame = self.pull_socket.recv(flags=zmq.NOBLOCK)
-                decoded = decode_each(self.codec, [frame], self.my_id)
-                messages.extend(decoded)
-                # no str(): the repr is ~10us and DEBUG is off here
-                if decoded:
-                    logger.debug(
-                        "%s to received message %s", self.my_id, decoded[0]
-                    )
-            except zmq.Again:
-                # zmq.Again actually means no messages left to read
-                break
-        return messages
-
-
-def requested_transport() -> str:
-    """``MSTAR_RUST_ZMQ`` as set, upper-cased: ``0``, ``1`` or ``AUTO``."""
-    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
-    if choice not in ("0", "1", "AUTO"):
-        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
-    return choice
-
-
 def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCommunicator:
-    """Construct the process's communicator, selecting the transport.
+    """Construct the process's communicator: ``RustZMQCommunicator``, on the
+    vendored ``rust/`` extension (see ``communication/rust_communicator.py``).
 
-    ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):
-
-    * ``AUTO`` (default) — the Rust-backed ``RustZMQCommunicator`` (vendored
-      ``rust/`` extension; see ``communication/rust_communicator.py``) when
-      the extension imports successfully, pyzmq otherwise.
-    * ``1`` — the Rust communicator; raises if the extension is missing.
-    * ``0`` — always the pyzmq ``ZMQCommunicator``. A worker refuses this: the
-      graph runtime holds a share of the Rust transport.
-
-    The two are wire-compatible (same endpoints, same codec).
-
-    ``nonblocking_send`` is for a communicator ``OutboxCommunicator`` wraps,
-    which needs ``try_send_bytes``: an extension built before
-    ``ZmqCommunicator.try_send`` falls back to pyzmq under ``AUTO`` and
-    raises under ``1``. Every other caller keeps such a build.
+    Raises when the extension is missing or is not the version this tree
+    expects. ``nonblocking_send`` is for a communicator ``OutboxCommunicator``
+    wraps, which needs ``try_send_bytes``: an extension built before
+    ``ZmqCommunicator.try_send`` is refused for it.
     """
-    choice = requested_transport()
-    if choice != "0":
-        try:
-            import mstar_rust
+    try:
+        import mstar_rust
+    except ImportError as e:
+        raise ImportError(
+            "The control mesh runs on the mstar_rust extension, which this "
+            "environment does not have. The Linux wheels of mstar-ai on PyPI "
+            "carry it; from a checkout, build it with `maturin develop "
+            "--release -m rust/Cargo.toml` (see docs/installation.rst)."
+        ) from e
+    from mstar.communication.rust_communicator import RustZMQCommunicator
 
-            from mstar.communication.rust_communicator import RustZMQCommunicator
-        except ImportError:
-            if choice == "1":
-                raise
-            logger.debug("MSTAR_RUST_ZMQ=AUTO: mstar_rust not installed, using pyzmq")
-        else:
-            # A support bundle must be able to tell what a mesh was running,
-            # and an old wheel left in an env must not silently take over
-            # the whole mesh under AUTO after an upgrade.
-            # The path says which copy loaded: a maturin-built mstar-rust
-            # package shadows the module an mstar-ai Linux wheel ships.
-            version = getattr(mstar_rust, "__version__", "<pre-versioning>")
-            logger.info(
-                "control mesh transport: rust %s from %s (MSTAR_RUST_ZMQ=%s)",
-                version, mstar_rust.__file__, choice)
-            if version != EXPECTED_MSTAR_RUST_VERSION:
-                logger.warning(
-                    "mstar_rust version %s at %s does not match the expected "
-                    "%s: in a checkout, rebuild it with `maturin develop "
-                    "--release -m rust/Cargo.toml`; in a pip install, upgrade "
-                    "mstar-ai and `pip uninstall mstar-rust` if a leftover "
-                    "build is shadowing the wheel's copy",
-                    version, mstar_rust.__file__, EXPECTED_MSTAR_RUST_VERSION)
-            if not nonblocking_send or hasattr(mstar_rust.ZmqCommunicator, "try_send"):
-                return RustZMQCommunicator(*args, **kwargs)
-            # built before try_send: every send the outbox makes would fail.
-            # Only this process's outbox falls back; pyzmq shares the wire.
-            stale = (f"mstar_rust {version} predates ZmqCommunicator.try_send; "
-                     "rebuild it with `maturin develop --release` in rust/")
-            if choice == "1":
-                raise RuntimeError(stale)
-            logger.warning("%s. Using pyzmq for this non-blocking sender meanwhile", stale)
-    logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
-    return ZMQCommunicator(*args, **kwargs)
+    # A support bundle must be able to tell what a mesh was running. The path
+    # says which copy loaded: a maturin-built mstar-rust package shadows the
+    # module an mstar-ai Linux wheel ships.
+    version = getattr(mstar_rust, "__version__", "<pre-versioning>")
+    logger.info("control mesh transport: rust %s from %s", version, mstar_rust.__file__)
+    if version != EXPECTED_MSTAR_RUST_VERSION:
+        raise RuntimeError(
+            f"mstar_rust version {version} at {mstar_rust.__file__} does not "
+            f"match the expected {EXPECTED_MSTAR_RUST_VERSION}: in a checkout, "
+            "rebuild it with `maturin develop --release -m rust/Cargo.toml`; in "
+            "a pip install, upgrade mstar-ai and `pip uninstall mstar-rust` if "
+            "a leftover build is shadowing the wheel's copy"
+        )
+    if nonblocking_send and not hasattr(mstar_rust.ZmqCommunicator, "try_send"):
+        raise RuntimeError(
+            f"mstar_rust {version} predates ZmqCommunicator.try_send, which the "
+            "API server's preprocess thread sends with: rebuild it with "
+            "`maturin develop --release -m rust/Cargo.toml`"
+        )
+    return RustZMQCommunicator(*args, **kwargs)
 
 
 class OutboxCommunicator:
