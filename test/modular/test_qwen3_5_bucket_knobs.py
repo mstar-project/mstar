@@ -1,5 +1,6 @@
 """The Qwen3.5 graph-bucket ladders: the decode one from the environment, the
-prefill one from the deployment's model_kwargs."""
+prefill one from the deployment's model_kwargs; and every prefill ladder a
+shipped config sets, for whichever model it serves."""
 import ast
 import importlib
 from pathlib import Path
@@ -63,16 +64,48 @@ def test_prefill_buckets_hold_near_power_of_two_batches(monkeypatch):
     assert {256, 512, 1024, 2048, 4096, 8192} <= set(buckets)
 
 
+def _configs_with_prefill_ladders():
+    """``{config: (model, ladder)}`` for every shipped config that sets
+    ``model_kwargs.prefill_token_buckets``."""
+    import yaml
+    ladders = {}
+    for path in sorted((Path(__file__).resolve().parents[2] / "configs").rglob("*.yaml")):
+        config = yaml.safe_load(path.read_text())
+        buckets = (config.get("model_kwargs") or {}).get("prefill_token_buckets")
+        if buckets is not None:
+            ladders[path.name] = (config["model"], buckets)
+    return ladders
+
+
 def _shipped_prefill_ladders():
     """None (the default) and every ``prefill_token_buckets`` a Qwen3.5 config sets."""
-    import yaml
-    configs = sorted((Path(__file__).resolve().parents[2] / "configs").glob("qwen3_5*.yaml"))
     ladders = {str(None): None}
-    for path in configs:
-        buckets = (yaml.safe_load(path.read_text()).get("model_kwargs") or {}).get("prefill_token_buckets")
-        if buckets is not None:
-            ladders[path.name] = buckets
+    for name, (model, buckets) in _configs_with_prefill_ladders().items():
+        if model.startswith("qwen3_5"):
+            ladders[name] = buckets
     return ladders
+
+
+def _prefill_capture(model, buckets):
+    """The token ladder ``model``'s prefill capture is built on, given ``buckets``."""
+    if model.startswith("qwen3_5"):
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+        node = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
+    elif model == "qwen3_omni":
+        from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+        node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
+    else:
+        raise AssertionError(f"a {model} config sets prefill_token_buckets, which this test doesn't check")
+    configs = node.get_accelerator_graph_configs(torch.device("cpu"))
+    return next(c.capture_token_lengths for c in configs if c.capture_graph_walk == "prefill_text")
+
+
+@pytest.mark.parametrize("config", _configs_with_prefill_ladders())
+def test_every_shipped_prefill_ladder_is_its_models_capture(config):
+    """A config's ladder is valid for the model it serves, which captures its
+    prefill on it rather than on the class default."""
+    model, buckets = _configs_with_prefill_ladders()[config]
+    assert _prefill_capture(model, buckets) == sorted(buckets)
 
 
 @pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
