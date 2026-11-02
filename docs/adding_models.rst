@@ -2518,8 +2518,9 @@ its pool serves whatever labels a step declares, so a split one could reach it.
 already stores ``c`` tokens gives rank ``r`` its tokens at positions ``x`` with ``x % P == r``,
 exactly the ones whose K/V it stores, so it writes its own K/V and nothing moves. Each layer
 then runs ``P`` rounds: rank ``r`` sends its queries to rank ``r + i``, attends rank ``r - i``'s
-over its own slots (stored context and the step's tokens together, one causal call), sends the
-partial back, and merges what it gets in fp32. Its hops are synchronous for now. A captured step
+over its own slots (stored context and the step's tokens together, one call, causal or not as the
+step declares), sends the partial back, and merges what it gets in fp32. Its hops are
+synchronous for now. A captured step
 runs copied on a ring node (ring is eager only), so prefill buckets above ``min_tokens`` that
 all-gather would split run copied there. A step that combines labels (batched CFG's) has no
 stored positions to stripe by, so it fails at plan on a ring node. A step's peak memory is its resident tensors plus the
