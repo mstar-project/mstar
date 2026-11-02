@@ -486,7 +486,7 @@ class _EvictingWorker(_HoldingWorker):
             self.scheduler.note_arrival(rid)
             self.scheduler.note_ran(_sched_batch([rid]))
         engine = SimpleNamespace(
-            evictable=lambda node: True,
+            evictable=lambda node, resources=None: True,
             is_offloaded=lambda node, rid: rid in self.offloaded,
             reclaimable=lambda node, rid, resources: rid in holders,
             offload_request=lambda node, rid, affected_resources=None: self.offloaded.append(rid) or 12,
