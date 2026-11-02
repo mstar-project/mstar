@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -686,6 +685,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.rms_norm.rms_norm.gemma_rms_norm"><code class="docutils literal notranslate"><span class="pre">gemma_rms_norm()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.rms_norm.rms_norm.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
 </ul>
             </nav>
@@ -704,16 +704,40 @@
 <p>The operator keeps fused accelerator implementations behind one stable
 <code class="docutils literal notranslate"><span class="pre">mstar::rms_norm</span></code> graph boundary. CUDA currently dispatches to FlashInfer,
 XPU dispatches to vllm-xpu-kernels, and other devices use the portable
-PyTorch implementation.</p>
+PyTorch implementation. <code class="docutils literal notranslate"><span class="pre">mstar::fused_add_rms_norm</span></code> does the same for the
+in-place residual add + RMSNorm: FlashInfer’s fused kernel on CUDA in half
+precision, the unfused add and norm elsewhere.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.rms_norm.rms_norm.run_rms_norm" title="mstar.engine.resources.rms_norm.rms_norm.run_rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">run_rms_norm</span></code></a>(input, weight[, eps, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.rms_norm.rms_norm.gemma_rms_norm" title="mstar.engine.resources.rms_norm.rms_norm.gemma_rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gemma_rms_norm</span></code></a>(x, weight, eps)</p></td>
+<td><p>Gemma's RMSNorm, <code class="docutils literal notranslate"><span class="pre">normed</span> <span class="pre">*</span> <span class="pre">(1</span> <span class="pre">+</span> <span class="pre">weight)</span></code>, computed in fp32 as Hugging Face Gemma computes it and returned in <code class="docutils literal notranslate"><span class="pre">x</span></code>'s dtype.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.rms_norm.rms_norm.run_rms_norm" title="mstar.engine.resources.rms_norm.rms_norm.run_rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">run_rms_norm</span></code></a>(input, weight[, eps, ...])</p></td>
 <td><p>Apply the backend-neutral <code class="docutils literal notranslate"><span class="pre">mstar::rms_norm</span></code> custom operator.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.rms_norm.rms_norm.gemma_rms_norm">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.rms_norm.rms_norm.</span></span><span class="sig-name descname"><span class="pre">gemma_rms_norm</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/rms_norm/rms_norm.html#gemma_rms_norm"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.rms_norm.rms_norm.gemma_rms_norm" title="Link to this definition">#</a></dt>
+<dd><p>Gemma’s RMSNorm, <code class="docutils literal notranslate"><span class="pre">normed</span> <span class="pre">*</span> <span class="pre">(1</span> <span class="pre">+</span> <span class="pre">weight)</span></code>, computed in fp32 as Hugging
+Face Gemma computes it and returned in <code class="docutils literal notranslate"><span class="pre">x</span></code>’s dtype.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.rms_norm.rms_norm.run_rms_norm">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.rms_norm.rms_norm.</span></span><span class="sig-name descname"><span class="pre">run_rms_norm</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-6</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/rms_norm/rms_norm.html#run_rms_norm"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.rms_norm.rms_norm.run_rms_norm" title="Link to this definition">#</a></dt>
@@ -782,6 +806,7 @@ PyTorch implementation.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.rms_norm.rms_norm.gemma_rms_norm"><code class="docutils literal notranslate"><span class="pre">gemma_rms_norm()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.rms_norm.rms_norm.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
 </ul>
   </nav></div>

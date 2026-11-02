@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -697,11 +696,16 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.cuts_tensor_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.cuts_tensor_inputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.get_stop_policies()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.inline_client_signals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.loopback_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.token_stop"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.token_stop</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.uniform_row_inputs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -739,6 +743,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reserve_whole_prefill</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reuses_cached_prefix"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reuses_cached_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.walks"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.walks</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.buffer"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.buffer</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.sampler"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.sampler</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.signal"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.signal</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.walk"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.walk</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows"><code class="docutils literal notranslate"><span class="pre">HostRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -791,10 +802,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_batch"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_use_accelerator_graphs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_use_accelerator_graphs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.capture_cudnn_benchmark"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.capture_cudnn_benchmark</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cg_key_info"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cg_key_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.compile_regions"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.compile_regions()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cudnn_allow_tf32</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
@@ -818,7 +831,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.preprocess()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.reads_device_loopback"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.reads_device_loopback</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
@@ -889,6 +901,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.sampler"><code class="docutils literal notranslate"><span class="pre">TokenStop.sampler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.stop_ids"><code class="docutils literal notranslate"><span class="pre">TokenStop.stop_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.walk"><code class="docutils literal notranslate"><span class="pre">TokenStop.walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.withhold"><code class="docutils literal notranslate"><span class="pre">TokenStop.withhold</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
@@ -936,49 +949,52 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ChunkingPolicy" title="mstar.model.submodule_base.ChunkingPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ChunkingPolicy</span></code></a>([walks, chunkable, ...])</p></td>
 <td><p>How a walk's prefill may be split across steps; the default is not at all.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostRows</span></code></a>(request_ids, buffers)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.DeviceLoopback" title="mstar.model.submodule_base.DeviceLoopback"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DeviceLoopback</span></code></a>(walk, signal, sampler, buffer)</p></td>
+<td><p>A decode walk whose rows read their last sampled token off the sampler's slot masters instead of a routed tensor (<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code>), while the client edge carries the token inline, off the stop check's host copy.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostRows</span></code></a>(request_ids, buffers)</p></td>
 <td><p>A step's row-addressed outputs (<code class="docutils literal notranslate"><span class="pre">check_stop_buffers</span></code>) on the host.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputMetadata</span></code></a>([stream_chunks, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputMetadata</span></code></a>([stream_chunks, ...])</p></td>
 <td><p>What the worker knows about one request's inputs to this step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputSeqLenInfo" title="mstar.model.submodule_base.InputSeqLenInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSeqLenInfo</span></code></a>(seq_len[, cached_prefix])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputSeqLenInfo" title="mstar.model.submodule_base.InputSeqLenInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSeqLenInfo</span></code></a>(seq_len[, cached_prefix])</p></td>
 <td><p>A row's token count before <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, for admission.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.LazyRequestStates" title="mstar.model.submodule_base.LazyRequestStates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a>(submodule, rids)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.LazyRequestStates" title="mstar.model.submodule_base.LazyRequestStates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a>(submodule, rids)</p></td>
 <td><p>The batch's <a href="#id1"><span class="problematic" id="id2">``</span></a>PerRequestState``s, resolved on first read.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code></a>(request_ids, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code></a>(request_ids, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NodeInputs</span></code></a>(tensor_inputs, kwargs, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NodeInputs</span></code></a>(tensor_inputs, kwargs, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a>()</p></td>
 <td><p>Base class for a model's compute units: defines the prepare_inputs → preprocess → forward(_batched) contract the engines drive.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PerRequestState</span></code></a>([tensors, kwargs, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PerRequestState</span></code></a>([tensors, kwargs, ...])</p></td>
 <td><p>Engine-owned per-request state a submodule persists across forwards.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StackingMethod" title="mstar.model.submodule_base.StackingMethod"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StackingMethod</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StackingMethod" title="mstar.model.submodule_base.StackingMethod"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StackingMethod</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StepOrder" title="mstar.model.submodule_base.StepOrder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepOrder</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StepOrder" title="mstar.model.submodule_base.StepOrder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StepOrder</span></code></a>(*values)</p></td>
 <td><p>Who runs first when more rows of a node are ready than its step takes (<code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopCheck" title="mstar.model.submodule_base.StopCheck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopCheck</span></code></a>([stops, withheld])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopCheck" title="mstar.model.submodule_base.StopCheck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopCheck</span></code></a>([stops, withheld])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">check_stop</span></code>'s answer when the step also has outputs that are not data.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopKind" title="mstar.model.submodule_base.StopKind"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopKind</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopKind" title="mstar.model.submodule_base.StopKind"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopKind</span></code></a>(*values)</p></td>
 <td><p>How a loop's stop is decided after each step (<code class="docutils literal notranslate"><span class="pre">StopPolicy</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopLimits" title="mstar.model.submodule_base.StopLimits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLimits</span></code></a>(max_iters, ignore_eos)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopLimits" title="mstar.model.submodule_base.StopLimits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLimits</span></code></a>(max_iters, ignore_eos)</p></td>
 <td><p>One request's limits under a <code class="docutils literal notranslate"><span class="pre">StopPolicy</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopPolicy" title="mstar.model.submodule_base.StopPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopPolicy</span></code></a>(kind[, token_signal, eos_tokens, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StopPolicy" title="mstar.model.submodule_base.StopPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopPolicy</span></code></a>(kind[, token_signal, eos_tokens, ...])</p></td>
 <td><p>A loop's stop check, declared so the graph runtime can run it without calling <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> (<code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_stop_policies</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.TokenStop" title="mstar.model.submodule_base.TokenStop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TokenStop</span></code></a>(loop, buffer, stop_ids, sampler[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.TokenStop" title="mstar.model.submodule_base.TokenStop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TokenStop</span></code></a>(loop, buffer, stop_ids, sampler[, ...])</p></td>
 <td><p>When an AR submodule's sampled token ends its decode loop: on a stop id, unless the request's sampler config sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>.</p></td>
 </tr>
 </tbody>
@@ -1107,6 +1123,36 @@ falls back to the per-request path.</p>
 <span class="sig-name descname"><span class="pre">cuts_tensor_inputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.cuts_tensor_inputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.device_loopback">
+<span class="sig-name descname"><span class="pre">device_loopback</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.submodule_base.DeviceLoopback" title="mstar.model.submodule_base.DeviceLoopback"><span class="pre">DeviceLoopback</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals">
+<span class="sig-name descname"><span class="pre">device_loopback_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.device_loopback_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals" title="Link to this definition">#</a></dt>
+<dd><p>Loop-back input signals of this walk whose per-row value the node
+keeps on the device itself (a sampler’s slot master), so the worker
+routes them with no tensor: the next step reads the value in
+<code class="docutils literal notranslate"><span class="pre">preprocess</span></code> and every fallback batch arrives with the signal
+empty. <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> is told per row (<code class="docutils literal notranslate"><span class="pre">has_loopback</span></code>) whether
+its last step here kept the value on the device; a row without it
+(e.g. its previous step ran on another rank) brings the tensor.
+On a walk whose output signals all stay on the device the
+engine builds no per-request output dicts and does not call
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code>: the stop check, the inline emit and the next step’s
+speculation read the step’s rows instead. Empty by default;
+<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK=0</span></code> keeps every node on the tensor path.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies">
 <span class="sig-name descname"><span class="pre">get_stop_policies</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.get_stop_policies"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies" title="Link to this definition">#</a></dt>
@@ -1122,6 +1168,47 @@ Every policy must agree with <code class="docutils literal notranslate"><span cl
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="#mstar.model.submodule_base.StopPolicy" title="mstar.model.submodule_base.StopPolicy"><em>StopPolicy</em></a>] | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals">
+<span class="sig-name descname"><span class="pre">inline_client_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.inline_client_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals" title="Link to this definition">#</a></dt>
+<dd><p>Output signals whose client-facing value is one scalar per row that
+the stop check already copies to the host, as signal name -&gt; the name
+of the row-addressed stop buffer holding it. The worker then sends
+those values inline, one frame per step, instead of one tensor per
+request. Only for a walk whose emit edge is not persisted.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs">
+<span class="sig-name descname"><span class="pre">loopback_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">states</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.loopback_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs" title="Link to this definition">#</a></dt>
+<dd><p>A loop-back step’s <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, and each of the sampler’s declared
+loop-back <code class="docutils literal notranslate"><span class="pre">states</span></code>, one row per row of the step, read by slot
+(padding rows read the trash row). A row whose last step did not keep
+them on the device (its first decode step, after the prefill) brings
+them routed, in <code class="docutils literal notranslate"><span class="pre">input_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">tensor_inputs[state]</span></code>, and they
+override its slot’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>engine_inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a><em>]</em>)</p></li>
+<li><p><strong>states</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1187,6 +1274,30 @@ of them says for itself how they are cut, or refuses to be cut at all.</p>
 <dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.token_stop">
 <span class="sig-name descname"><span class="pre">token_stop</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.submodule_base.TokenStop" title="mstar.model.submodule_base.TokenStop"><span class="pre">TokenStop</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.token_stop" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.uniform_row_inputs">
+<span class="sig-name descname"><span class="pre">uniform_row_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_loopback</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.uniform_row_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.uniform_row_inputs" title="Link to this definition">#</a></dt>
+<dd><p>The inputs every row of this walk gets, when <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>
+would return an equal object for each regardless of the request, its
+routed signals and its metadata (a decode walk that reads its token
+off the device). The engine then prepares the batch with one call and
+shares the object across the step’s rows, so it must not be mutated
+per row. <code class="docutils literal notranslate"><span class="pre">has_loopback</span></code>: every row’s last step on this node kept its
+loop-back signals on the device (<code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>). None
+(the default) prepares row by row.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>has_loopback</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -1465,6 +1576,57 @@ and reserves per chunk.</p>
 <dt class="sig sig-object py" id="mstar.model.submodule_base.ChunkingPolicy.walks">
 <span class="sig-name descname"><span class="pre">walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.model.submodule_base.ChunkingPolicy.walks" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.DeviceLoopback">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">DeviceLoopback</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">signal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sampler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">buffer</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#DeviceLoopback"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.DeviceLoopback" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A decode walk whose rows read their last sampled token off the
+sampler’s slot masters instead of a routed tensor
+(<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code>), while the client edge carries the token
+inline, off the stop check’s host copy.</p>
+<p>Declared as <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback</span></code>; the loop-back hooks
+(<code class="docutils literal notranslate"><span class="pre">uniform_row_inputs</span></code>, <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>,
+<code class="docutils literal notranslate"><span class="pre">inline_client_signals</span></code>) and the read in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>
+(<code class="docutils literal notranslate"><span class="pre">loopback_inputs</span></code>) follow from it. The sampler keeps the masters only
+for a node that declares this: their eager step write is a small
+synchronous host-to-device copy per step, which a node that reads its
+tokens on the host would pay for nothing.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>signal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>sampler</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>buffer</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.DeviceLoopback.buffer">
+<span class="sig-name descname"><span class="pre">buffer</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.DeviceLoopback.buffer" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.DeviceLoopback.sampler">
+<span class="sig-name descname"><span class="pre">sampler</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.DeviceLoopback.sampler" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.DeviceLoopback.signal">
+<span class="sig-name descname"><span class="pre">signal</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.DeviceLoopback.signal" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.DeviceLoopback.walk">
+<span class="sig-name descname"><span class="pre">walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.DeviceLoopback.walk" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
 
 </dd></dl>
 
@@ -1853,6 +2015,11 @@ codec submodules that need homogeneous frame counts).</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.capture_cudnn_benchmark">
+<span class="sig-name descname"><span class="pre">capture_cudnn_benchmark</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.capture_cudnn_benchmark" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.cg_key_info">
 <span class="sig-name descname"><span class="pre">cg_key_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_input_metadata</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.cg_key_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.cg_key_info" title="Link to this definition">#</a></dt>
@@ -1869,6 +2036,9 @@ capture and runs eager — so derive both from one place.</p>
 <p><code class="docutils literal notranslate"><span class="pre">per_request_input_metadata</span></code> is the batch’s per-step input facts (as
 on <code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code>), e.g. for a bucket that follows a stream chunk.</p>
 <p>None (the default) means the walk has a single capture.</p>
+<p>On a node whose only capture is a piecewise region, no forward
+replays by this key: it only groups the scheduler’s rows
+(<code class="docutils literal notranslate"><span class="pre">split_batches_by_capture_key</span></code>) and need not name a bucket.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1954,6 +2124,27 @@ call super().</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.compile_regions">
+<span class="sig-name descname"><span class="pre">compile_regions</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.compile_regions"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.compile_regions" title="Link to this definition">#</a></dt>
+<dd><p>Parts of this node the engine compiles on their own, for a node
+whose <code class="docutils literal notranslate"><span class="pre">forward</span></code> is not compiled whole (<code class="docutils literal notranslate"><span class="pre">disable_torch_compile</span></code>, or
+start-up raises): <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> with dynamic shapes in its default
+mode, under the platform’s inductor settings, before capture, so a
+region inside a captured graph is compiled there too. Skipped without
+an accelerator.</p>
+<p>Maps an attribute path from the submodule (a module, whose <code class="docutils literal notranslate"><span class="pre">forward</span></code>
+is compiled, or a method: <code class="docutils literal notranslate"><span class="pre">&quot;model.merger&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;model.embed&quot;</span></code>) to the
+argument tuples it is called with once at start-up, so its compile
+does not land on a live request; with none, it compiles on its first
+call.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>]]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2366,11 +2557,6 @@ that don’t need audio);</p></li>
 </dl>
 </dd></dl>
 
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.reads_device_loopback">
-<span class="sig-name descname"><span class="pre">reads_device_loopback</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.reads_device_loopback" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.request_state">
 <span class="sig-name descname"><span class="pre">request_state</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.request_state"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.request_state" title="Link to this definition">#</a></dt>
@@ -2447,7 +2633,10 @@ beside it.</p>
 <dd><p>Whether the scheduler batches each <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> group apart.</p>
 <p>A batch spanning two groups matches no capture. Opt in when that batch
 runs worse than two captured ones, e.g. per-request eager; leave it off
-when a batched eager forward handles the mix well.</p>
+when a batched eager forward handles the mix well. On a node whose only
+capture is a piecewise region, the key only groups the scheduler’s
+rows (e.g. Qwen3.5’s vision node puts a request too large for one
+replay in a group of its own).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
@@ -2878,8 +3067,8 @@ the token is an EOS id the request does not ignore.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">TokenStop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">loop</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stop_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sampler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefill_walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">last_prefill_flag</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">runtime_check</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#TokenStop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.TokenStop" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">TokenStop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">loop</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stop_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sampler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefill_walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">last_prefill_flag</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">withhold</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">runtime_check</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#TokenStop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.TokenStop" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>When an AR submodule’s sampled token ends its decode loop: on a stop
 id, unless the request’s sampler config sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>. The token
 budget is the loop’s cap (<code class="docutils literal notranslate"><span class="pre">Model.get_loop_caps</span></code>), which the runtime
@@ -2896,6 +3085,7 @@ enforces.</p>
 <li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>prefill_walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>last_prefill_flag</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>withhold</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
 <li><p><strong>runtime_check</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
@@ -2903,50 +3093,47 @@ enforces.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.buffer">
 <span class="sig-name descname"><span class="pre">buffer</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.buffer" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 1</p>
-</dd></dl>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.last_prefill_flag">
-<span class="sig-name descname"><span class="pre">last_prefill_flag</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.last_prefill_flag" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 6</p>
-</dd></dl>
+<span class="sig-name descname"><span class="pre">last_prefill_flag</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.last_prefill_flag" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.loop">
 <span class="sig-name descname"><span class="pre">loop</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.loop" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 0</p>
-</dd></dl>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.prefill_walks">
-<span class="sig-name descname"><span class="pre">prefill_walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.prefill_walks" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 5</p>
-</dd></dl>
+<span class="sig-name descname"><span class="pre">prefill_walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({})</span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.prefill_walks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.runtime_check">
-<span class="sig-name descname"><span class="pre">runtime_check</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.runtime_check" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 7</p>
-</dd></dl>
+<span class="sig-name descname"><span class="pre">runtime_check</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.runtime_check" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.sampler">
 <span class="sig-name descname"><span class="pre">sampler</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.sampler" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 3</p>
-</dd></dl>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.stop_ids">
 <span class="sig-name descname"><span class="pre">stop_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.stop_ids" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 2</p>
-</dd></dl>
+<dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.walk">
-<span class="sig-name descname"><span class="pre">walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.walk" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 4</p>
-</dd></dl>
+<span class="sig-name descname"><span class="pre">walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.walk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.TokenStop.withhold">
+<span class="sig-name descname"><span class="pre">withhold</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">()</span></span><a class="headerlink" href="#mstar.model.submodule_base.TokenStop.withhold" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 </dd></dl>
 
@@ -3053,11 +3240,16 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.cuts_tensor_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.cuts_tensor_inputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.get_stop_policies()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.inline_client_signals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.loopback_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.token_stop"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.token_stop</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.uniform_row_inputs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -3095,6 +3287,13 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reserve_whole_prefill</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.reuses_cached_prefix"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.reuses_cached_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ChunkingPolicy.walks"><code class="docutils literal notranslate"><span class="pre">ChunkingPolicy.walks</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.buffer"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.buffer</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.sampler"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.sampler</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.signal"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.signal</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.DeviceLoopback.walk"><code class="docutils literal notranslate"><span class="pre">DeviceLoopback.walk</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.HostRows"><code class="docutils literal notranslate"><span class="pre">HostRows</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -3147,10 +3346,12 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_batch"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_use_accelerator_graphs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_use_accelerator_graphs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.capture_cudnn_benchmark"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.capture_cudnn_benchmark</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cg_key_info"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cg_key_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.compile_regions"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.compile_regions()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cudnn_allow_tf32</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
@@ -3174,7 +3375,6 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.preprocess()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.reads_device_loopback"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.reads_device_loopback</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.spanned_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.spanned_outputs()</span></code></a></li>
@@ -3245,6 +3445,7 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.sampler"><code class="docutils literal notranslate"><span class="pre">TokenStop.sampler</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.stop_ids"><code class="docutils literal notranslate"><span class="pre">TokenStop.stop_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.walk"><code class="docutils literal notranslate"><span class="pre">TokenStop.walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.TokenStop.withhold"><code class="docutils literal notranslate"><span class="pre">TokenStop.withhold</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>

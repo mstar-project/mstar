@@ -29,6 +29,7 @@ mstar.model.omnivoice.components
 
    backbone
    codec
+   silence
    text
    unmask
 

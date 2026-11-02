@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1468,7 +1467,7 @@ the sampler writes each request’s last token to a slot-addressed
 master and the next step reads its input ids from it, so the worker
 routes the signal with no tensor (no per-request store, hold or
 cleanup per step). Only nodes that declare the read
-(<code class="docutils literal notranslate"><span class="pre">reads_device_loopback</span></code>: the decode walks of Qwen3.5, Qwen3-ASR and
+(<code class="docutils literal notranslate"><span class="pre">DeviceLoopback</span></code>: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
 Whisper, which also keeps its timestamp rule state in the sampler’s
 declared loop-back state) and only when the sampler has graph
 buffers; the sampler keeps the masters for those nodes alone, so a
@@ -1477,11 +1476,11 @@ master write. <code class="docutils literal notranslate"><span class="pre">0</sp
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">ingraph_decode_rope</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>A captured step of a text walk (Qwen3.5 decode, text prefill and
-mixed) builds its rotary tables inside the graph from the position
-resource’s planned positions instead of building them before the
-replay (<code class="docutils literal notranslate"><span class="pre">LLMSubmodule._rope_in_graph</span></code>). Experiment knob, measured
-and gated on its own.</p></td>
+<td><p>A captured Qwen3.5 text prefill or mixed step builds its rotary tables
+inside the graph from the position resource’s planned positions instead
+of building them before the replay (<code class="docutils literal notranslate"><span class="pre">LLMSubmodule._rope_in_graph</span></code>); a
+captured decode step always does. Experiment knob, measured and gated
+on its own.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>

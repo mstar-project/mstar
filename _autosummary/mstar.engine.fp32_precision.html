@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -691,6 +690,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.Fp32Precision.matmul"><code class="docutils literal notranslate"><span class="pre">Fp32Precision.matmul</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.cudnn_benchmark"><code class="docutils literal notranslate"><span class="pre">cudnn_benchmark()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.fp32_precision_scope"><code class="docutils literal notranslate"><span class="pre">fp32_precision_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.node_fp32_precision"><code class="docutils literal notranslate"><span class="pre">node_fp32_precision()</span></code></a></li>
 </ul>
@@ -729,10 +729,13 @@ setting. A model that flips the flags itself still can.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.fp32_precision.fp32_precision_scope" title="mstar.engine.fp32_precision.fp32_precision_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fp32_precision_scope</span></code></a>(precision)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.fp32_precision.cudnn_benchmark" title="mstar.engine.fp32_precision.cudnn_benchmark"><code class="xref py py-obj docutils literal notranslate"><span class="pre">cudnn_benchmark</span></code></a>(enabled)</p></td>
+<td><p>Within the block, let cuDNN time its conv algorithms per new shape (once, then cached) instead of taking its heuristic pick; restores the process-wide flag on exit.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.fp32_precision.fp32_precision_scope" title="mstar.engine.fp32_precision.fp32_precision_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fp32_precision_scope</span></code></a>(precision)</p></td>
 <td><p>Apply <code class="docutils literal notranslate"><span class="pre">precision</span></code> for the duration of the block, then restore what was there before, also when the block raises.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.fp32_precision.node_fp32_precision" title="mstar.engine.fp32_precision.node_fp32_precision"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_fp32_precision</span></code></a>(node_name, submodule)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.fp32_precision.node_fp32_precision" title="mstar.engine.fp32_precision.node_fp32_precision"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_fp32_precision</span></code></a>(node_name, submodule)</p></td>
 <td><p>The submodule's declared settings, checked when the engine loads it.</p></td>
 </tr>
 </tbody>
@@ -772,6 +775,22 @@ setting. A model that flips the flags itself still can.</p>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.fp32_precision.cudnn_benchmark">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.fp32_precision.</span></span><span class="sig-name descname"><span class="pre">cudnn_benchmark</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">enabled</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/fp32_precision.html#cudnn_benchmark"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.fp32_precision.cudnn_benchmark" title="Link to this definition">#</a></dt>
+<dd><p>Within the block, let cuDNN time its conv algorithms per new shape
+(once, then cached) instead of taking its heuristic pick; restores the
+process-wide flag on exit. Not safe against convs on other threads, like
+the scope below: the engine applies it around a node’s capture sizing
+(<code class="docutils literal notranslate"><span class="pre">NodeSubmodule.capture_cudnn_benchmark</span></code>), and the VAE decoders around
+their forward on the worker’s one GPU thread.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>enabled</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py function">
@@ -855,6 +874,7 @@ None when it declares neither.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.Fp32Precision.matmul"><code class="docutils literal notranslate"><span class="pre">Fp32Precision.matmul</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.cudnn_benchmark"><code class="docutils literal notranslate"><span class="pre">cudnn_benchmark()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.fp32_precision_scope"><code class="docutils literal notranslate"><span class="pre">fp32_precision_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.fp32_precision.node_fp32_precision"><code class="docutils literal notranslate"><span class="pre">node_fp32_precision()</span></code></a></li>
 </ul>

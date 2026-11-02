@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1110,9 +1109,9 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.ingraph_decode_rope">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">ingraph_decode_rope</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off): a</span>
-<span class="sd">    captured step of a text walk (decode, text prefill, mixed) builds its</span>
-<span class="sd">    rotary tables inside the graph from the position resource's planned</span>
-<span class="sd">    positions instead of building them before the replay."""</span>
+<span class="sd">    captured text prefill or mixed step builds its rotary tables inside the</span>
+<span class="sd">    graph from the position resource's planned positions instead of building</span>
+<span class="sd">    them before the replay. A captured decode step always does."""</span>
     <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"ingraph_decode_rope"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 

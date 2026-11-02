@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -984,7 +983,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">SubmoduleStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span>
 
 <span class="c1"># A compile mode of the engine's own rather than torch.compile's: Inductor's</span>
@@ -1373,6 +1372,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"with capture_batch_sizes=[1]"</span>
             <span class="p">)</span>
 
+<div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig.region_step">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.region_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">region_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This region's step over the padded batch (``declare_step``); None</span>
+<span class="sd">        for a region that declares none."""</span>
+        <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="PiecewiseAcceleratorGraphConfig.get_config_type">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.get_config_type">[docs]</a>
     <span class="nd">@abstractmethod</span>
@@ -1454,6 +1461,33 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    replay.</span>
 <span class="sd">    """</span>
     <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>  <span class="c1"># token-count buckets to capture</span>
+    <span class="c1"># The attention resource of a region whose rows each attend within</span>
+    <span class="c1"># themselves. Set with `declare_step` left None, the region declares one</span>
+    <span class="c1"># non-causal "main" segment per row on it; a `one_row_per_step` region's</span>
+    <span class="c1"># lengths are all segments of its one row.</span>
+    <span class="n">attn_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"attn_key declares the region's step; leave declare_step None"</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PiecewisePackedConfig.region_step">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.region_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">region_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">region_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">one_row_per_step</span><span class="p">:</span>
+            <span class="p">(</span><span class="n">rid</span><span class="p">,)</span> <span class="o">=</span> <span class="n">request_ids</span>
+            <span class="n">request_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmoduleStep</span><span class="p">(</span>
+            <span class="n">segments</span><span class="o">=</span><span class="p">[</span>
+                <span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="n">n</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="p">],</span>
+            <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_key</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">)},</span>
+        <span class="p">)</span></div>
+
 
 <div class="viewcode-block" id="PiecewisePackedConfig.get_config_type">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_config_type">[docs]</a>

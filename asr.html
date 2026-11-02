@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -771,8 +770,9 @@ cut at the quietest point before each boundary. See <a class="reference internal
 <h2>Qwen3-ASR<a class="headerlink" href="#qwen3-asr" title="Link to this heading">#</a></h2>
 <p><strong>Graph.</strong> <code class="docutils literal notranslate"><span class="pre">audio_encoder</span></code> is the AuT encoder: three strided convolutions
 (13 tokens per 100 mel frames), transformer layers whose attention is
-confined to 8 s windows, run as one packed forward per batch with ragged
-attention (one segment per window of every request), and a projection into
+confined to 8 s windows, run as one packed forward per batch of up to 4096
+tokens (a larger step runs its clips one by one) with ragged attention (one
+segment per window of every request), and a projection into
 the LLM’s hidden size. <code class="docutils literal notranslate"><span class="pre">LLM</span></code> is a dense Qwen3 decoder: the ChatML prompt
 with <code class="docutils literal notranslate"><span class="pre">&lt;|audio_pad|&gt;</span></code> placeholders is embedded, the encoder output is
 scattered over the placeholders, and prefill (captured on packed token

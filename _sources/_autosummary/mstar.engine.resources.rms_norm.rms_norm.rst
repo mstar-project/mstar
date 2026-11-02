@@ -13,6 +13,7 @@ mstar.engine.resources.rms\_norm.rms\_norm
 
    .. autosummary::
    
+      gemma_rms_norm
       run_rms_norm
    
    

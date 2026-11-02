@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1239,6 +1238,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">max_segments_per_request</span>
 
     <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_segments_per_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Segments a one-row replay's plan holds for its whole step, as</span>
+<span class="sd">        configured; None for a resource sized per request."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">max_segments_per_step</span>
+
+    <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">force_double_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># plan H2Ds each layout into static buffers that a captured replay reads</span>
         <span class="k">return</span> <span class="kc">True</span>
@@ -1254,9 +1259,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Built on the first plan for that key, like the paged backend's. Its</span>
 <span class="sd">        static buffers are fixed for its lifetime, so they are sized off the</span>
-<span class="sd">        config's per-request ceilings and the bucket — NOT off this first</span>
-<span class="sd">        plan's ``num_rows``, which is only one of the layouts the bucket will</span>
-<span class="sd">        replay.</span>
+<span class="sd">        config's segment ceiling at the bucket's batch size</span>
+<span class="sd">        (``max_segments_for``) and the bucket's token count — NOT off this</span>
+<span class="sd">        first plan's ``num_rows``, which is only one of the layouts the bucket</span>
+<span class="sd">        will replay.</span>
 <span class="sd">        """</span>
         <span class="n">key</span> <span class="o">=</span> <span class="n">CGSlotKey</span><span class="p">(</span><span class="n">bucket</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">label</span><span class="p">)</span>
         <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>

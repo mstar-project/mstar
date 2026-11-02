@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1103,6 +1102,21 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Set by _refresh_checkpoint_defaults; None until weights load.</span>
     <span class="n">checkpoint_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Replay the backbone's layer stack from CUDA graphs, one per (requests,</span>
+    <span class="c1"># packed-token bucket), with attention through the engine's ragged</span>
+    <span class="c1"># resource. Eager, a step is launch-bound: ~400 kernels for ~2 ms of GPU</span>
+    <span class="c1"># work. ``model_kwargs: {backbone_graphs: false}`` captures nothing and</span>
+    <span class="c1"># runs the same layer loop eagerly.</span>
+    <span class="n">backbone_graphs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">backbone_capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">])</span>
+    <span class="c1"># Packed tokens per step (both CFG documents of every request); a step</span>
+    <span class="c1"># above the largest bucket runs eagerly. Past a few thousand tokens the</span>
+    <span class="c1"># step is GPU-bound, eager launches hide behind it, and a bucket's padding</span>
+    <span class="c1"># would only add work.</span>
+    <span class="n">backbone_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">768</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">1536</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">2560</span><span class="p">,</span> <span class="mi">3072</span><span class="p">,</span> <span class="mi">3584</span><span class="p">,</span> <span class="mi">4096</span><span class="p">]</span>
+    <span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">audio_embedding_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>

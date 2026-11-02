@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1078,11 +1077,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    designed or automatic voice has no reference to match and is peak-normalised</span>
 <span class="sd">    to 0.5 instead.</span>
 
-<span class="sd">    Imported from the ``omnivoice`` package rather than re-ported: the silence</span>
-<span class="sd">    trim is pydub-based and re-implementing it would drift from the reference</span>
-<span class="sd">    for no gain.</span>
+<span class="sd">    The fade and pad are the ``omnivoice`` package's own; the silence trim is</span>
+<span class="sd">    a sample-exact vectorized port of its pydub-based one (``silence.py``),</span>
+<span class="sd">    which cost ~14 ms of Python per second of audio.</span>
 <span class="sd">    """</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">omnivoice.utils.audio</span><span class="w"> </span><span class="kn">import</span> <span class="n">fade_and_pad_audio</span><span class="p">,</span> <span class="n">remove_silence</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.omnivoice.components.silence</span><span class="w"> </span><span class="kn">import</span> <span class="n">remove_silence</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">omnivoice.utils.audio</span><span class="w"> </span><span class="kn">import</span> <span class="n">fade_and_pad_audio</span>
 
     <span class="n">audio</span> <span class="o">=</span> <span class="n">waveform</span>
     <span class="k">if</span> <span class="n">audio</span><span class="o">.</span><span class="n">ndim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>

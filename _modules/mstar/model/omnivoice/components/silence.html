@@ -7,7 +7,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mstar.model.omnivoice.components.backbone &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.model.omnivoice.components.silence &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -403,7 +403,7 @@ mermaid.initialize(
 
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/model/omnivoice/components/backbone';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/model/omnivoice/components/silence';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../../search.html" />
@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -899,7 +898,7 @@ window.runMermaid = runMermaid;</script>
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/model/omnivoice/components/backbone.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/model/omnivoice/components/silence.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -976,312 +975,185 @@ window.runMermaid = runMermaid;</script>
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <h1>Source code for mstar.model.omnivoice.components.backbone</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""The OmniVoice backbone, run as one packed bidirectional forward per step.</span>
+  <h1>Source code for mstar.model.omnivoice.components.silence</h1><div class="highlight"><pre>
+<span></span><span class="sd">"""The reference's silence trim (``omnivoice.utils.audio.remove_silence``),</span>
+<span class="sd">vectorized and sample-exact.</span>
 
-<span class="sd">A request in a step becomes two documents — the conditional canvas and its CFG</span>
-<span class="sd">counterpart — packed end to end into a single row and separated by flashinfer's</span>
-<span class="sd">ragged attention rather than by a mask, or one document when it turned CFG off.</span>
-<span class="sd">Nothing is padded, so a batch mixing a 2-second and a 25-second utterance wastes</span>
-<span class="sd">nothing, and the head GEMM runs only at the positions whose logits are read.</span>
-
-<span class="sd">The per-step kernel path is the reference's own fastest mode, reused rather than</span>
-<span class="sd">re-derived: ``apply_flashinfer`` fuses QKV, swaps in flashinfer RoPE, RMSNorm</span>
-<span class="sd">and ``silu_and_mul``, and keeps the whole layer in ``(S, H, D)`` so no transpose</span>
-<span class="sd">copies happen.  Re-implementing that here would mean a second copy of tuned</span>
-<span class="sd">kernels whose only job is to end up numerically identical.</span>
-
-<span class="sd">What M* adds on top is what the reference cannot do from inside one</span>
-<span class="sd">``generate()`` call: the documents in a step come from *different concurrent</span>
-<span class="sd">requests*, at different diffusion steps, with different per-request knobs.  Its</span>
-<span class="sd">own server has no batching at all (k2-fsa/OmniVoice#251).</span>
-
-<span class="sd">The coupling to ``omnivoice.models.omnivoice_flashinfer`` is deliberate but</span>
-<span class="sd">narrow — four module-private names, checked at load by ``assert_flashinfer_api``</span>
-<span class="sd">so an upstream rename fails at boot rather than at the first request.</span>
+<span class="sd">The reference runs pydub: an RMS window every 10 ms, each a fresh</span>
+<span class="sd">``AudioSegment`` slice and an ``audioop.rms`` call, which costs about 14 ms of</span>
+<span class="sd">Python per second of audio and ran inside the code2wav forward, stalling the</span>
+<span class="sd">worker's loop for every finished request. This computes the same windows from</span>
+<span class="sd">one prefix sum of squared int16 samples and replays pydub's millisecond</span>
+<span class="sd">slicing (``int(ms * rate / 1000)`` samples, zero-filled past the end), its</span>
+<span class="sd">range merging and its edge trim, so the output is the reference's to the</span>
+<span class="sd">sample; ``test_omnivoice_silence`` checks it against pydub.</span>
 <span class="sd">"""</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">itertools</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 
-<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
-
-<span class="c1"># The private surface this integration rides on. Checked once at load.</span>
-<span class="n">_REQUIRED_FI_NAMES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"_CTX"</span><span class="p">,</span> <span class="s2">"PackedAttnRunner"</span><span class="p">,</span> <span class="s2">"_forward_logits"</span><span class="p">,</span> <span class="s2">"apply_flashinfer"</span><span class="p">)</span>
+<span class="c1"># pydub's dBFS: amplitude relative to the int16 full scale</span>
+<span class="n">_FULL_SCALE</span> <span class="o">=</span> <span class="mf">32768.0</span>
 
 
-<div class="viewcode-block" id="assert_flashinfer_api">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.assert_flashinfer_api">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">assert_flashinfer_api</span><span class="p">():</span>
-<span class="w">    </span><span class="sd">"""Fail at boot if the reference's private surface moved.</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_Segment</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""An int16 mono signal addressed the way ``pydub.AudioSegment`` slices it.</span>
 
-<span class="sd">    These names are private to ``omnivoice``. Pinning them here means an</span>
-<span class="sd">    upgrade that renames one produces a clear error on startup instead of a</span>
-<span class="sd">    silent fallback or a first-request crash.</span>
-<span class="sd">    """</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">omnivoice.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">omnivoice_flashinfer</span> <span class="k">as</span> <span class="n">fi</span>
-
-    <span class="n">missing</span> <span class="o">=</span> <span class="p">[</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">_REQUIRED_FI_NAMES</span> <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">fi</span><span class="p">,</span> <span class="n">name</span><span class="p">)]</span>
-    <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-            <span class="s2">"omnivoice.models.omnivoice_flashinfer is missing "</span>
-            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">missing</span><span class="si">}</span><span class="s2">; mstar's OmniVoice backbone drives its packed "</span>
-            <span class="s2">"attention directly. Pin the omnivoice version, or port the "</span>
-            <span class="s2">"packed forward into mstar."</span>
-        <span class="p">)</span>
-
-    <span class="kn">from</span><span class="w"> </span><span class="nn">omnivoice.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">omnivoice</span> <span class="k">as</span> <span class="n">ov</span>
-
-    <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">ov</span><span class="p">,</span> <span class="s2">"_resolve_instruct"</span><span class="p">):</span>
-        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-            <span class="s2">"omnivoice.models.omnivoice is missing _resolve_instruct; "</span>
-            <span class="s2">"mstar validates voice-design instructs with it. Pin the "</span>
-            <span class="s2">"omnivoice version, or port the validator into mstar."</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">fi</span></div>
-
-
-
-<div class="viewcode-block" id="CanvasItem">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.CanvasItem">[docs]</a>
-<span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">CanvasItem</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""One request's contribution to a step's packed batch.</span>
-
-<span class="sd">    ``prefix_ids`` is ``[C, N]`` — style tokens, then text tokens, then the</span>
-<span class="sd">    reference audio tokens when cloning.  ``tokens`` is ``[1, C, T]``, the live</span>
-<span class="sd">    target canvas: all MASK at step 0, fully revealed when the loop ends.</span>
-
-<span class="sd">    An item at ``guidance_scale == 0`` contributes one document instead of</span>
-<span class="sd">    two. Scoring throws the unconditional logits away in that case, and the</span>
-<span class="sd">    unconditional document is the whole target region plus its share of the</span>
-<span class="sd">    head GEMM, so building it would be close to twice the work for nothing.</span>
+<span class="sd">    It reads ``samples[lo:lo + n]``, zeros past the end of ``samples``, and</span>
+<span class="sd">    backwards when ``flipped``, so a trimmed or reversed segment shares its</span>
+<span class="sd">    parent's prefix sums instead of building its own.</span>
 <span class="sd">    """</span>
 
-    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">prefix_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
-    <span class="n">prefix_audio_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
-    <span class="n">tokens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
-    <span class="n">guidance_scale</span><span class="p">:</span> <span class="nb">float</span>
-    <span class="c1"># Filled in by build_packed_canvas; scoring reads them back.</span>
-    <span class="c1"># flat_u_start stays -1 for an item with no unconditional document.</span>
-    <span class="n">flat_start</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-    <span class="n">flat_u_start</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">samples</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">samples</span> <span class="o">=</span> <span class="n">samples</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rate</span> <span class="o">=</span> <span class="n">rate</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_ms</span> <span class="o">=</span> <span class="n">rate</span> <span class="o">/</span> <span class="mf">1000.0</span>
+        <span class="n">squares</span> <span class="o">=</span> <span class="n">samples</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">prefix</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([[</span><span class="mi">0</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">squares</span><span class="p">)])</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lo</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">flipped</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">samples</span><span class="p">),</span> <span class="kc">False</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">target_len</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># milliseconds, rounded as pydub rounds them</span>
+        <span class="k">return</span> <span class="nb">round</span><span class="p">(</span><span class="mi">1000</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">n</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">rate</span><span class="p">))</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">cond_len</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefix_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_len</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bounds</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start_ms</span><span class="p">,</span> <span class="n">end_ms</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Sample bounds and zero-filled length of ``segment[start_ms:end_ms]``."""</span>
+        <span class="n">n_ms</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="n">start</span> <span class="o">=</span> <span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">minimum</span><span class="p">(</span><span class="n">start_ms</span><span class="p">,</span> <span class="n">n_ms</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_ms</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+        <span class="n">end</span> <span class="o">=</span> <span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">minimum</span><span class="p">(</span><span class="n">end_ms</span><span class="p">,</span> <span class="n">n_ms</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_ms</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">does_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">guidance_scale</span> <span class="o">!=</span> <span class="mi">0</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reversed_tail</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start_ms</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"_Segment"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``segment[start_ms:].reverse()``, over the same prefix sums."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">flipped</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"reversed_tail of a reversed segment"</span><span class="p">)</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">bounds</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">start_ms</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="p">))))</span>
+        <span class="n">tail</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="n">tail</span><span class="o">.</span><span class="n">lo</span><span class="p">,</span> <span class="n">tail</span><span class="o">.</span><span class="n">n</span><span class="p">,</span> <span class="n">tail</span><span class="o">.</span><span class="n">flipped</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">lo</span> <span class="o">+</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="n">tail</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_span</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Where ``[start, end)`` of the segment, clipped to it, lies in ``samples``."""</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">minimum</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">minimum</span><span class="p">(</span><span class="n">end</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">flipped</span><span class="p">:</span>
+            <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span> <span class="o">-</span> <span class="n">end</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span> <span class="o">-</span> <span class="n">start</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lo</span> <span class="o">+</span> <span class="n">start</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">lo</span> <span class="o">+</span> <span class="n">end</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">rms</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start_ms</span><span class="p">,</span> <span class="n">end_ms</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``audioop.rms`` of each ``[start_ms, end_ms)`` slice (an int, floored)."""</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bounds</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">start_ms</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">end_ms</span><span class="p">))</span>
+        <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_span</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">)</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">samples</span><span class="p">)</span>
+        <span class="n">squares</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prefix</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">minimum</span><span class="p">(</span><span class="n">hi</span><span class="p">,</span> <span class="n">n</span><span class="p">)]</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefix</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">minimum</span><span class="p">(</span><span class="n">lo</span><span class="p">,</span> <span class="n">n</span><span class="p">)])</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
+        <span class="n">width</span> <span class="o">=</span> <span class="p">(</span><span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>  <span class="c1"># past the end pydub pads zeros</span>
+        <span class="k">with</span> <span class="n">np</span><span class="o">.</span><span class="n">errstate</span><span class="p">(</span><span class="n">divide</span><span class="o">=</span><span class="s2">"ignore"</span><span class="p">,</span> <span class="n">invalid</span><span class="o">=</span><span class="s2">"ignore"</span><span class="p">):</span>
+            <span class="n">rms</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">floor</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">squares</span> <span class="o">/</span> <span class="n">width</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">width</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="n">rms</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span>
 
-<div class="viewcode-block" id="PackedCanvas">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.PackedCanvas">[docs]</a>
-<span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PackedCanvas</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""One step's packed inputs, plus the index that gathers its logits."""</span>
-
-    <span class="n">packed_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>       <span class="c1"># [1, C, total]</span>
-    <span class="n">audio_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>       <span class="c1"># [1, total]</span>
-    <span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>     <span class="c1"># [1, total]</span>
-    <span class="n">doc_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>            <span class="c1"># [c_0, u_0, c_1, ...], u only where CFG is on</span>
-    <span class="n">tgt_index</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>        <span class="c1"># [flat_target_total + flat_uncond_total]</span>
-    <span class="n">flat_target_total</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">flat_uncond_total</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CanvasItem</span><span class="p">]</span>
-
-<div class="viewcode-block" id="PackedCanvas.slice_logits">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.PackedCanvas.slice_logits">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">slice_logits</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">item</span><span class="p">:</span> <span class="n">CanvasItem</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""Conditional and unconditional target logits for one item.</span>
-
-<span class="sd">        Laid out as every item's conditional target block followed by the</span>
-<span class="sd">        unconditional blocks of the items that asked for CFG, which is the</span>
-<span class="sd">        gather order ``tgt_index`` was built in.</span>
-
-<span class="sd">        The unconditional half is ``None`` for an item at</span>
-<span class="sd">        ``guidance_scale == 0``: it has no unconditional document, because</span>
-<span class="sd">        scoring would discard those logits anyway.</span>
-<span class="sd">        """</span>
-        <span class="n">start</span><span class="p">,</span> <span class="n">length</span> <span class="o">=</span> <span class="n">item</span><span class="o">.</span><span class="n">flat_start</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">target_len</span>
-        <span class="n">c_logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">start</span> <span class="p">:</span> <span class="n">start</span> <span class="o">+</span> <span class="n">length</span><span class="p">,</span> <span class="p">:]</span>
-        <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">flat_u_start</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">c_logits</span><span class="p">,</span> <span class="kc">None</span>
-        <span class="n">u_start</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">flat_target_total</span> <span class="o">+</span> <span class="n">item</span><span class="o">.</span><span class="n">flat_u_start</span>
-        <span class="n">u_logits</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">u_start</span> <span class="p">:</span> <span class="n">u_start</span> <span class="o">+</span> <span class="n">length</span><span class="p">,</span> <span class="p">:]</span>
-        <span class="k">return</span> <span class="n">c_logits</span><span class="p">,</span> <span class="n">u_logits</span></div>
-</div>
-
-
-
-<div class="viewcode-block" id="build_packed_canvas">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.build_packed_canvas">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">build_packed_canvas</span><span class="p">(</span>
-    <span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CanvasItem</span><span class="p">],</span>
-    <span class="n">audio_mask_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PackedCanvas</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Pack a step's requests into one ragged row.</span>
-
-<span class="sd">    Documents are laid out ``[cond_0, uncond_0, cond_1, uncond_1, ...]`` and</span>
-<span class="sd">    kept apart by the attention plan's ``doc_lens``, not by a mask — so there</span>
-<span class="sd">    are no pad positions at all, and therefore none of the fully-masked-row</span>
-<span class="sd">    hazard a dense padded batch has to guard against.</span>
-
-<span class="sd">    An item at ``guidance_scale == 0`` contributes only its conditional</span>
-<span class="sd">    document, so a batch of those is close to half the packed length and half</span>
-<span class="sd">    the head GEMM.  Mixing the two kinds in one step is fine: the layout is</span>
-<span class="sd">    driven per item.</span>
-
-<span class="sd">    ``position_ids`` restart at 0 in every document.  Without that, RoPE would</span>
-<span class="sd">    read a later document's canvas as a continuation of the previous request's.</span>
-<span class="sd">    """</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">items</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"build_packed_canvas called with no items"</span><span class="p">)</span>
-
-    <span class="n">num_codebook</span> <span class="o">=</span> <span class="n">items</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">prefix_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-
-    <span class="n">doc_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="n">offsets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>   <span class="c1"># (cond_offset, uncond_offset or -1)</span>
-    <span class="n">cursor</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">items</span><span class="p">:</span>
-        <span class="n">c_off</span> <span class="o">=</span> <span class="n">cursor</span>
-        <span class="n">cursor</span> <span class="o">+=</span> <span class="n">item</span><span class="o">.</span><span class="n">cond_len</span>
-        <span class="n">doc_lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">cond_len</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">does_cfg</span><span class="p">:</span>
-            <span class="n">u_off</span> <span class="o">=</span> <span class="n">cursor</span>
-            <span class="n">cursor</span> <span class="o">+=</span> <span class="n">item</span><span class="o">.</span><span class="n">target_len</span>
-            <span class="n">doc_lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">target_len</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">slice</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start_ms</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">end_ms</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">bounds</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">start_ms</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">end_ms</span><span class="p">)))</span>
+        <span class="n">lo</span><span class="p">,</span> <span class="n">hi</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_span</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">))</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">samples</span><span class="p">[</span><span class="n">lo</span><span class="p">:</span><span class="n">hi</span><span class="p">]</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">samples</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">flipped</span><span class="p">:</span>
+            <span class="c1"># the segment's [start, min(end, n)) is `samples[lo:hi]` backwards;</span>
+            <span class="c1"># what lies past the samples' end are its leading zeros</span>
+            <span class="n">last</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">end</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">n</span><span class="p">)</span> <span class="o">-</span> <span class="n">start</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">last</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">):</span><span class="n">last</span><span class="p">]</span> <span class="o">=</span> <span class="n">data</span><span class="p">[::</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">u_off</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
-        <span class="n">offsets</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">c_off</span><span class="p">,</span> <span class="n">u_off</span><span class="p">))</span>
-    <span class="n">total</span> <span class="o">=</span> <span class="n">cursor</span>
-
-    <span class="n">packed_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">(</span>
-        <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_codebook</span><span class="p">,</span> <span class="n">total</span><span class="p">),</span> <span class="n">audio_mask_id</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span>
-    <span class="p">)</span>
-    <span class="n">audio_mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="n">total</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-    <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="n">total</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-
-    <span class="n">cond_ranges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="n">uncond_ranges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="n">flat_cursor</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="n">flat_u_cursor</span> <span class="o">=</span> <span class="mi">0</span>
-
-    <span class="k">for</span> <span class="n">item</span><span class="p">,</span> <span class="p">(</span><span class="n">c_off</span><span class="p">,</span> <span class="n">u_off</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">items</span><span class="p">,</span> <span class="n">offsets</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-        <span class="n">c_len</span><span class="p">,</span> <span class="n">t_len</span> <span class="o">=</span> <span class="n">item</span><span class="o">.</span><span class="n">cond_len</span><span class="p">,</span> <span class="n">item</span><span class="o">.</span><span class="n">target_len</span>
-
-        <span class="n">prefix_ids</span> <span class="o">=</span> <span class="n">item</span><span class="o">.</span><span class="n">prefix_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-        <span class="n">tokens</span> <span class="o">=</span> <span class="n">item</span><span class="o">.</span><span class="n">tokens</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-
-        <span class="c1"># Conditional document: [style | text | ref | target].</span>
-        <span class="n">packed_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="p">:,</span> <span class="n">c_off</span> <span class="p">:</span> <span class="n">c_off</span> <span class="o">+</span> <span class="n">c_len</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">prefix_ids</span><span class="p">,</span> <span class="n">tokens</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-        <span class="n">audio_mask</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="n">c_off</span> <span class="p">:</span> <span class="n">c_off</span> <span class="o">+</span> <span class="n">c_len</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
-            <span class="p">[</span>
-                <span class="n">item</span><span class="o">.</span><span class="n">prefix_audio_mask</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
-                <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">t_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-            <span class="p">],</span>
-            <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
-        <span class="p">)</span>
-        <span class="n">position_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="n">c_off</span> <span class="p">:</span> <span class="n">c_off</span> <span class="o">+</span> <span class="n">c_len</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">c_len</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-
-        <span class="n">item</span><span class="o">.</span><span class="n">flat_start</span> <span class="o">=</span> <span class="n">flat_cursor</span>
-        <span class="n">flat_cursor</span> <span class="o">+=</span> <span class="n">t_len</span>
-        <span class="n">cond_ranges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">c_off</span> <span class="o">+</span> <span class="n">c_len</span> <span class="o">-</span> <span class="n">t_len</span><span class="p">,</span> <span class="n">c_off</span> <span class="o">+</span> <span class="n">c_len</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-        <span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">u_off</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">item</span><span class="o">.</span><span class="n">flat_u_start</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
-            <span class="k">continue</span>
-
-        <span class="c1"># Unconditional document: the target canvas alone. Dropping the</span>
-        <span class="c1"># conditioning entirely *is* the null prompt here.</span>
-        <span class="n">packed_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="p">:,</span> <span class="n">u_off</span> <span class="p">:</span> <span class="n">u_off</span> <span class="o">+</span> <span class="n">t_len</span><span class="p">]</span> <span class="o">=</span> <span class="n">tokens</span>
-        <span class="n">audio_mask</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="n">u_off</span> <span class="p">:</span> <span class="n">u_off</span> <span class="o">+</span> <span class="n">t_len</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
-        <span class="n">position_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="n">u_off</span> <span class="p">:</span> <span class="n">u_off</span> <span class="o">+</span> <span class="n">t_len</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">t_len</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-
-        <span class="n">item</span><span class="o">.</span><span class="n">flat_u_start</span> <span class="o">=</span> <span class="n">flat_u_cursor</span>
-        <span class="n">flat_u_cursor</span> <span class="o">+=</span> <span class="n">t_len</span>
-        <span class="n">uncond_ranges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">u_off</span><span class="p">,</span> <span class="n">u_off</span> <span class="o">+</span> <span class="n">t_len</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">))</span>
-
-    <span class="k">return</span> <span class="n">PackedCanvas</span><span class="p">(</span>
-        <span class="n">packed_ids</span><span class="o">=</span><span class="n">packed_ids</span><span class="p">,</span>
-        <span class="n">audio_mask</span><span class="o">=</span><span class="n">audio_mask</span><span class="p">,</span>
-        <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
-        <span class="n">doc_lens</span><span class="o">=</span><span class="n">doc_lens</span><span class="p">,</span>
-        <span class="n">tgt_index</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">cond_ranges</span> <span class="o">+</span> <span class="n">uncond_ranges</span><span class="p">),</span>
-        <span class="n">flat_target_total</span><span class="o">=</span><span class="n">flat_cursor</span><span class="p">,</span>
-        <span class="n">flat_uncond_total</span><span class="o">=</span><span class="n">flat_u_cursor</span><span class="p">,</span>
-        <span class="n">items</span><span class="o">=</span><span class="n">items</span><span class="p">,</span>
-    <span class="p">)</span></div>
+            <span class="n">out</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)]</span> <span class="o">=</span> <span class="n">data</span>
+        <span class="k">return</span> <span class="n">out</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_silent_ranges</span><span class="p">(</span><span class="n">seg</span><span class="p">:</span> <span class="n">_Segment</span><span class="p">,</span> <span class="n">min_silence_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">threshold</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">seek_step</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""``pydub.silence.detect_silence``."""</span>
+    <span class="n">seg_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">seg_len</span> <span class="o">&lt;</span> <span class="n">min_silence_len</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="n">last</span> <span class="o">=</span> <span class="n">seg_len</span> <span class="o">-</span> <span class="n">min_silence_len</span>
+    <span class="n">starts</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">last</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">seek_step</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">last</span> <span class="o">%</span> <span class="n">seek_step</span><span class="p">:</span>
+        <span class="n">starts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">last</span><span class="p">)</span>
+    <span class="n">starts</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">starts</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+    <span class="n">silent</span> <span class="o">=</span> <span class="n">starts</span><span class="p">[</span><span class="n">seg</span><span class="o">.</span><span class="n">rms</span><span class="p">(</span><span class="n">starts</span><span class="p">,</span> <span class="n">starts</span> <span class="o">+</span> <span class="n">min_silence_len</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">threshold</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">silent</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="n">ranges</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">prev</span> <span class="o">=</span> <span class="n">range_start</span> <span class="o">=</span> <span class="n">silent</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">silent</span><span class="p">[</span><span class="mi">1</span><span class="p">:]:</span>
+        <span class="k">if</span> <span class="n">s</span> <span class="o">!=</span> <span class="n">prev</span> <span class="o">+</span> <span class="n">seek_step</span> <span class="ow">and</span> <span class="n">s</span> <span class="o">&gt;</span> <span class="n">prev</span> <span class="o">+</span> <span class="n">min_silence_len</span><span class="p">:</span>
+            <span class="n">ranges</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">range_start</span><span class="p">,</span> <span class="n">prev</span> <span class="o">+</span> <span class="n">min_silence_len</span><span class="p">])</span>
+            <span class="n">range_start</span> <span class="o">=</span> <span class="n">s</span>
+        <span class="n">prev</span> <span class="o">=</span> <span class="n">s</span>
+    <span class="n">ranges</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">range_start</span><span class="p">,</span> <span class="n">prev</span> <span class="o">+</span> <span class="n">min_silence_len</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">ranges</span>
 
-<div class="viewcode-block" id="OmniVoiceBackbone">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.OmniVoiceBackbone">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">OmniVoiceBackbone</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""The patched reference model, driven one packed step at a time.</span>
 
-<span class="sd">    Holding the reference instance rather than borrowing its submodules is what</span>
-<span class="sd">    keeps the embedding merge, the audio head reshape and the fused attention</span>
-<span class="sd">    path byte-for-byte the upstream ones; every line of per-step math that could</span>
-<span class="sd">    drift is theirs.</span>
-<span class="sd">    """</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_nonsilent_ranges</span><span class="p">(</span><span class="n">seg</span><span class="p">:</span> <span class="n">_Segment</span><span class="p">,</span> <span class="n">min_silence_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">threshold</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">seek_step</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""``pydub.silence.detect_nonsilent``."""</span>
+    <span class="n">silent</span> <span class="o">=</span> <span class="n">_silent_ranges</span><span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">min_silence_len</span><span class="p">,</span> <span class="n">threshold</span><span class="p">,</span> <span class="n">seek_step</span><span class="p">)</span>
+    <span class="n">seg_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">silent</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[[</span><span class="mi">0</span><span class="p">,</span> <span class="n">seg_len</span><span class="p">]]</span>
+    <span class="k">if</span> <span class="n">silent</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">silent</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="n">seg_len</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">[]</span>
+    <span class="n">ranges</span><span class="p">,</span> <span class="n">prev_end</span> <span class="o">=</span> <span class="p">[],</span> <span class="mi">0</span>
+    <span class="k">for</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="ow">in</span> <span class="n">silent</span><span class="p">:</span>
+        <span class="n">ranges</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">prev_end</span><span class="p">,</span> <span class="n">start</span><span class="p">])</span>
+        <span class="n">prev_end</span> <span class="o">=</span> <span class="n">end</span>
+    <span class="k">if</span> <span class="n">end</span> <span class="o">!=</span> <span class="n">seg_len</span><span class="p">:</span>
+        <span class="n">ranges</span><span class="o">.</span><span class="n">append</span><span class="p">([</span><span class="n">prev_end</span><span class="p">,</span> <span class="n">seg_len</span><span class="p">])</span>
+    <span class="k">if</span> <span class="n">ranges</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]:</span>
+        <span class="n">ranges</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">ranges</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">plan_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">plan_dtype</span> <span class="o">=</span> <span class="n">plan_dtype</span>
-        <span class="c1"># The engine runs forwards on a single dedicated GPU thread</span>
-        <span class="c1"># (worker.py: ThreadPoolExecutor(max_workers=1)), so the module-global</span>
-        <span class="c1"># _CTX the reference's attention reads is not contended today. The lock</span>
-        <span class="c1"># costs nothing per step and makes that assumption survive a change to</span>
-        <span class="c1"># the worker's threading, where the failure mode would otherwise be one</span>
-        <span class="c1"># request attending with another's document boundaries.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_ctx_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
 
-<div class="viewcode-block" id="OmniVoiceBackbone.forward">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.backbone.html#mstar.model.omnivoice.components.backbone.OmniVoiceBackbone.forward">[docs]</a>
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">inference_mode</span><span class="p">()</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">canvas</span><span class="p">:</span> <span class="n">PackedCanvas</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""One packed forward; returns ``[1, C, 2 * flat_target_total, V]``.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_split_on_silence</span><span class="p">(</span><span class="n">seg</span><span class="p">:</span> <span class="n">_Segment</span><span class="p">,</span> <span class="n">min_silence_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">threshold</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">keep</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">seek_step</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``pydub.silence.split_on_silence``, its pieces joined back together."""</span>
+    <span class="n">ranges</span> <span class="o">=</span> <span class="p">[[</span><span class="n">s</span> <span class="o">-</span> <span class="n">keep</span><span class="p">,</span> <span class="n">e</span> <span class="o">+</span> <span class="n">keep</span><span class="p">]</span> <span class="k">for</span> <span class="n">s</span><span class="p">,</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">_nonsilent_ranges</span><span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">min_silence_len</span><span class="p">,</span> <span class="n">threshold</span><span class="p">,</span> <span class="n">seek_step</span><span class="p">)]</span>
+    <span class="k">for</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">itertools</span><span class="o">.</span><span class="n">pairwise</span><span class="p">(</span><span class="n">ranges</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">b</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]:</span>
+            <span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">b</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">//</span> <span class="mi">2</span>
+            <span class="n">b</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">a</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">n_ms</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
+    <span class="n">pieces</span> <span class="o">=</span> <span class="p">[</span><span class="n">seg</span><span class="o">.</span><span class="n">slice</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="nb">min</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="n">n_ms</span><span class="p">))</span> <span class="k">for</span> <span class="n">s</span><span class="p">,</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">ranges</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="k">if</span> <span class="n">pieces</span> <span class="k">else</span> <span class="n">seg</span><span class="o">.</span><span class="n">samples</span><span class="p">[:</span><span class="mi">0</span><span class="p">]</span>
 
-<span class="sd">        Only the logits-consuming positions go through the 1024 -&gt; 8200 head</span>
-<span class="sd">        GEMM and the float32 upcast. Running them over the full packed length</span>
-<span class="sd">        would be several times the work, most of it on prefix positions whose</span>
-<span class="sd">        logits are never read.</span>
-<span class="sd">        """</span>
-        <span class="n">fi</span> <span class="o">=</span> <span class="n">assert_flashinfer_api</span><span class="p">()</span>
 
-        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ctx_lock</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">_fi_runner</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">canvas</span><span class="o">.</span><span class="n">doc_lens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">plan_dtype</span><span class="p">)</span>
-            <span class="n">fi</span><span class="o">.</span><span class="n">_CTX</span><span class="p">[</span><span class="s2">"wrapper"</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">_fi_runner</span><span class="o">.</span><span class="n">wrapper</span>
-            <span class="n">fi</span><span class="o">.</span><span class="n">_CTX</span><span class="p">[</span><span class="s2">"pos_ids"</span><span class="p">]</span> <span class="o">=</span> <span class="n">canvas</span><span class="o">.</span><span class="n">position_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
-            <span class="c1"># CUDA-graph bucketing is not used here; M* has its own capture</span>
-            <span class="c1"># machinery and reconciling the two is a separate piece of work.</span>
-            <span class="n">fi</span><span class="o">.</span><span class="n">_CTX</span><span class="p">[</span><span class="s2">"doc_slots"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-            <span class="k">return</span> <span class="n">fi</span><span class="o">.</span><span class="n">_forward_logits</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
-                <span class="n">canvas</span><span class="o">.</span><span class="n">packed_ids</span><span class="p">,</span>
-                <span class="n">canvas</span><span class="o">.</span><span class="n">audio_mask</span><span class="p">,</span>
-                <span class="n">canvas</span><span class="o">.</span><span class="n">position_ids</span><span class="p">,</span>
-                <span class="n">canvas</span><span class="o">.</span><span class="n">tgt_index</span><span class="p">,</span>
-            <span class="p">)</span></div>
-</div>
+<span class="k">def</span><span class="w"> </span><span class="nf">_leading_silence</span><span class="p">(</span><span class="n">seg</span><span class="p">:</span> <span class="n">_Segment</span><span class="p">,</span> <span class="n">threshold_db</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">chunk</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``pydub.silence.detect_leading_silence``."""</span>
+    <span class="n">n_ms</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
+    <span class="n">starts</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">n_ms</span><span class="p">,</span> <span class="n">chunk</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+    <span class="n">rms</span> <span class="o">=</span> <span class="n">seg</span><span class="o">.</span><span class="n">rms</span><span class="p">(</span><span class="n">starts</span><span class="p">,</span> <span class="n">starts</span> <span class="o">+</span> <span class="n">chunk</span><span class="p">)</span>
+    <span class="k">with</span> <span class="n">np</span><span class="o">.</span><span class="n">errstate</span><span class="p">(</span><span class="n">divide</span><span class="o">=</span><span class="s2">"ignore"</span><span class="p">):</span>
+        <span class="n">db</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">rms</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">20</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">log10</span><span class="p">(</span><span class="n">rms</span> <span class="o">/</span> <span class="n">_FULL_SCALE</span><span class="p">),</span> <span class="o">-</span><span class="n">np</span><span class="o">.</span><span class="n">inf</span><span class="p">)</span>
+    <span class="n">loud</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">flatnonzero</span><span class="p">(</span><span class="n">db</span> <span class="o">&gt;=</span> <span class="n">threshold_db</span><span class="p">)</span>
+    <span class="n">trim</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">starts</span><span class="p">[</span><span class="n">loud</span><span class="p">[</span><span class="mi">0</span><span class="p">]])</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">loud</span><span class="p">)</span> <span class="k">else</span> <span class="nb">len</span><span class="p">(</span><span class="n">starts</span><span class="p">)</span> <span class="o">*</span> <span class="n">chunk</span>
+    <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">trim</span><span class="p">,</span> <span class="n">n_ms</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="remove_silence">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.omnivoice.components.silence.html#mstar.model.omnivoice.components.silence.remove_silence">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">remove_silence</span><span class="p">(</span>
+    <span class="n">audio</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">sampling_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">mid_sil</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span> <span class="n">lead_sil</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">100</span><span class="p">,</span> <span class="n">trail_sil</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">300</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``omnivoice.utils.audio.remove_silence`` for mono ``(1, T)`` float audio."""</span>
+    <span class="k">if</span> <span class="n">audio</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"expected mono (1, T) audio, got </span><span class="si">{</span><span class="n">audio</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="n">samples</span> <span class="o">=</span> <span class="p">(</span><span class="n">audio</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="mf">32768.0</span><span class="p">)</span><span class="o">.</span><span class="n">clip</span><span class="p">(</span><span class="o">-</span><span class="mi">32768</span><span class="p">,</span> <span class="mi">32767</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int16</span><span class="p">)</span>
+    <span class="n">threshold_db</span> <span class="o">=</span> <span class="o">-</span><span class="mf">50.0</span>
+    <span class="n">threshold</span> <span class="o">=</span> <span class="mi">10</span> <span class="o">**</span> <span class="p">(</span><span class="n">threshold_db</span> <span class="o">/</span> <span class="mi">20</span><span class="p">)</span> <span class="o">*</span> <span class="n">_FULL_SCALE</span>
+    <span class="k">if</span> <span class="n">mid_sil</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">samples</span> <span class="o">=</span> <span class="n">_split_on_silence</span><span class="p">(</span><span class="n">_Segment</span><span class="p">(</span><span class="n">samples</span><span class="p">,</span> <span class="n">sampling_rate</span><span class="p">),</span> <span class="n">mid_sil</span><span class="p">,</span> <span class="n">threshold</span><span class="p">,</span> <span class="n">mid_sil</span><span class="p">,</span> <span class="mi">10</span><span class="p">)</span>
+
+    <span class="n">seg</span> <span class="o">=</span> <span class="n">_Segment</span><span class="p">(</span><span class="n">samples</span><span class="p">,</span> <span class="n">sampling_rate</span><span class="p">)</span>
+    <span class="c1"># the trailing trim is the leading one of the lead-trimmed signal reversed</span>
+    <span class="n">tail</span> <span class="o">=</span> <span class="n">seg</span><span class="o">.</span><span class="n">reversed_tail</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">_leading_silence</span><span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">threshold_db</span><span class="p">)</span> <span class="o">-</span> <span class="n">lead_sil</span><span class="p">))</span>
+    <span class="n">start</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">_leading_silence</span><span class="p">(</span><span class="n">tail</span><span class="p">,</span> <span class="n">threshold_db</span><span class="p">)</span> <span class="o">-</span> <span class="n">trail_sil</span><span class="p">)</span>
+    <span class="n">samples</span> <span class="o">=</span> <span class="n">tail</span><span class="o">.</span><span class="n">slice</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">tail</span><span class="p">))[::</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">samples</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">/</span> <span class="mf">32768.0</span><span class="p">)[</span><span class="n">np</span><span class="o">.</span><span class="n">newaxis</span><span class="p">,</span> <span class="p">:]</span></div>
 
 </pre></div>
 

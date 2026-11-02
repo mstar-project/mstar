@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -2869,12 +2868,12 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""A region has no pre-plan path, so a second slot buys nothing unless a</span>
 <span class="sd">        resource its step touches stages into a reused host buffer behind an</span>
 <span class="sd">        async H2D (see ``Resource.force_double_buffer``)."""</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span> <span class="o">&lt;=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span><span class="p">):</span>
             <span class="c1"># handles, not `ensure`: the declaration only labels its rows, and</span>
             <span class="c1"># ingesting here would run before the buffers are built</span>
-            <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
+            <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">region_step</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">),</span>
                 <span class="nb">list</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">),</span>
             <span class="p">)</span>
@@ -2916,9 +2915,9 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Claim this region's static buffers; see ``CudaGraphRunner``."""</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_shapes</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">shapes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">shapes</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">shapes</span><span class="p">:</span>
                 <span class="n">shape</span> <span class="o">=</span> <span class="n">shapes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-                <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
+                <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">region_step</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">),</span>
                     <span class="nb">list</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">),</span>
                 <span class="p">)</span>
@@ -3247,9 +3246,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        ``ctx.request_ids``: counting the tail there makes it scatter padding</span>
 <span class="sd">        rows back over real state.</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="kc">None</span>
-        <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span> <span class="nb">list</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">))</span>
+        <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">region_step</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span> <span class="nb">list</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">n</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">real_bs</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">real_bs</span>

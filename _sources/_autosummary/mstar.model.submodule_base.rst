@@ -29,6 +29,7 @@ mstar.model.submodule\_base
       BatchedModelOutput
       BatchedStopCheck
       ChunkingPolicy
+      DeviceLoopback
       HostRows
       InputMetadata
       InputSeqLenInfo

@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1033,7 +1032,8 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="TokenStop">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.TokenStop">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">TokenStop</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">TokenStop</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""When an AR submodule's sampled token ends its decode loop: on a stop</span>
 <span class="sd">    id, unless the request's sampler config sets ``ignore_eos``. The token</span>
 <span class="sd">    budget is the loop's cap (``Model.get_loop_caps``), which the runtime</span>
@@ -1059,10 +1059,46 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># for a prompt prefilled over several passes: the ``step_metadata`` flag of</span>
     <span class="c1"># the pass whose token is the reply's (earlier passes' tokens are not)</span>
     <span class="n">last_prefill_flag</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># outputs left unrouted on a row whose token is a stop id, ``ignore_eos``</span>
+    <span class="c1"># or not (``StopCheck.withheld``): a frame streamed beside the stop token</span>
+    <span class="c1"># is loop control, and only the stop check's host copy tells it from data</span>
+    <span class="n">withhold</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="c1"># the graph runtime checks ``walk``'s stop ids itself, without calling</span>
     <span class="c1"># check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep</span>
     <span class="c1"># check_stop, which can end the partition</span>
-    <span class="n">runtime_check</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
+    <span class="n">runtime_check</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">withhold</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_check</span><span class="p">:</span>
+            <span class="c1"># the runtime's check never calls check_stop, which is what withholds</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"a TokenStop that withholds outputs needs check_stop: drop runtime_check"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="DeviceLoopback">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.DeviceLoopback">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DeviceLoopback</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A decode walk whose rows read their last sampled token off the</span>
+<span class="sd">    sampler's slot masters instead of a routed tensor</span>
+<span class="sd">    (``MSTAR_DEVICE_LOOPBACK``), while the client edge carries the token</span>
+<span class="sd">    inline, off the stop check's host copy.</span>
+
+<span class="sd">    Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks</span>
+<span class="sd">    (``uniform_row_inputs``, ``device_loopback_signals``,</span>
+<span class="sd">    ``inline_client_signals``) and the read in ``preprocess``</span>
+<span class="sd">    (``loopback_inputs``) follow from it. The sampler keeps the masters only</span>
+<span class="sd">    for a node that declares this: their eager step write is a small</span>
+<span class="sd">    synchronous host-to-device copy per step, which a node that reads its</span>
+<span class="sd">    tokens on the host would pay for nothing.</span>
+<span class="sd">    """</span>
+
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># the input signal the walk's token loops back to</span>
+    <span class="n">signal</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># resource key of the sampler keeping the slot masters</span>
+    <span class="n">sampler</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># the row-addressed output (``check_stop_buffers`` entry) holding the token</span>
+    <span class="n">buffer</span><span class="p">:</span> <span class="nb">str</span></div>
 
 
 
@@ -1891,13 +1927,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">float32_matmul_precision</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">cudnn_allow_tf32</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="c1"># Set True on a submodule whose decode walk may read its last sampled</span>
-    <span class="c1"># tokens back off the sampler's slot masters (``device_loopback_signals``).</span>
-    <span class="c1"># The sampler keeps the masters only for a node that says so: the eager</span>
-    <span class="c1"># step write behind them is a small synchronous host-to-device copy per</span>
-    <span class="c1"># step, which a node that reads its tokens on the host (Whisper's decoder)</span>
-    <span class="c1"># would pay for nothing.</span>
-    <span class="n">reads_device_loopback</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Set True to let cuDNN time its conv algorithms in this node's capture</span>
+    <span class="c1"># warm-up (once per captured shape, then cached) instead of taking its</span>
+    <span class="c1"># heuristic pick. The engine applies it around capture sizing, which runs</span>
+    <span class="c1"># the warm-up forwards; the capture itself turns it off</span>
+    <span class="c1"># (``accelerator_graph_runner``), and eager steps keep the process</span>
+    <span class="c1"># setting, so a new eager shape never searches.</span>
+    <span class="n">capture_cudnn_benchmark</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -1957,6 +1993,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        on ``ModelInputsFromEngine``), e.g. for a bucket that follows a stream chunk.</span>
 
 <span class="sd">        None (the default) means the walk has a single capture.</span>
+
+<span class="sd">        On a node whose only capture is a piecewise region, no forward</span>
+<span class="sd">        replays by this key: it only groups the scheduler's rows</span>
+<span class="sd">        (``split_batches_by_capture_key``) and need not name a bucket.</span>
 <span class="sd">        """</span>
         <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">per_request_info</span><span class="p">,</span> <span class="n">per_request_input_metadata</span><span class="p">,</span> <span class="n">kwargs</span>
         <span class="k">return</span> <span class="kc">None</span></div>
@@ -1984,7 +2024,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        A batch spanning two groups matches no capture. Opt in when that batch</span>
 <span class="sd">        runs worse than two captured ones, e.g. per-request eager; leave it off</span>
-<span class="sd">        when a batched eager forward handles the mix well.</span>
+<span class="sd">        when a batched eager forward handles the mix well. On a node whose only</span>
+<span class="sd">        capture is a piecewise region, the key only groups the scheduler's</span>
+<span class="sd">        rows (e.g. Qwen3.5's vision node puts a request too large for one</span>
+<span class="sd">        replay in a group of its own).</span>
 <span class="sd">        """</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">False</span></div>
@@ -2292,6 +2335,25 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.compile_regions">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.compile_regions">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">compile_regions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">tuple</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""Parts of this node the engine compiles on their own, for a node</span>
+<span class="sd">        whose ``forward`` is not compiled whole (``disable_torch_compile``, or</span>
+<span class="sd">        start-up raises): ``torch.compile`` with dynamic shapes in its default</span>
+<span class="sd">        mode, under the platform's inductor settings, before capture, so a</span>
+<span class="sd">        region inside a captured graph is compiled there too. Skipped without</span>
+<span class="sd">        an accelerator.</span>
+
+<span class="sd">        Maps an attribute path from the submodule (a module, whose ``forward``</span>
+<span class="sd">        is compiled, or a method: ``"model.merger"``, ``"model.embed"``) to the</span>
+<span class="sd">        argument tuples it is called with once at start-up, so its compile</span>
+<span class="sd">        does not land on a live request; with none, it compiles on its first</span>
+<span class="sd">        call.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="p">{}</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.max_rows_in_combined">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.max_rows_in_combined">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_rows_in_combined</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -2590,6 +2652,77 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># sampled token ends a dynamic loop; the stop checks below follow from it.</span>
     <span class="n">token_stop</span><span class="p">:</span> <span class="n">TokenStop</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># Set by a submodule whose decode walk reads its last sampled token back on</span>
+    <span class="c1"># the device; the loop-back hooks below follow from it.</span>
+    <span class="n">device_loopback</span><span class="p">:</span> <span class="n">DeviceLoopback</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_loops_back</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether this walk's token loops back on the device."""</span>
+        <span class="n">loopback</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span>
+        <span class="k">return</span> <span class="n">loopback</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">graph_walk</span> <span class="o">==</span> <span class="n">loopback</span><span class="o">.</span><span class="n">walk</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reads_loopback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether this walk's rows read their token off the slot masters: a</span>
+<span class="sd">        loop-back walk, the knob on, and a sampler that keeps masters."""</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_loops_back</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span> <span class="ow">and</span> <span class="n">device_loopback_enabled</span><span class="p">()</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">sampler</span><span class="p">]</span><span class="o">.</span><span class="n">has_slot_masters</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="ARNodeSubmodule.uniform_row_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.uniform_row_inputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">uniform_row_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">has_loopback</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"NodeInputs | None"</span><span class="p">:</span>
+        <span class="c1"># the loop-back decode row: one token, read in ``preprocess``</span>
+        <span class="k">if</span> <span class="n">has_loopback</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reads_loopback</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_seq_len</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">uniform_row_inputs</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">has_loopback</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ARNodeSubmodule.device_loopback_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.device_loopback_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">device_loopback_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reads_loopback</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">return</span> <span class="nb">frozenset</span><span class="p">({</span><span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">signal</span><span class="p">})</span>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">device_loopback_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ARNodeSubmodule.inline_client_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.inline_client_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">inline_client_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># the client's copy of the token the stop check already has on the host</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loops_back</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">signal</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">buffer</span><span class="p">}</span>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">inline_client_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ARNodeSubmodule.loopback_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.loopback_inputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">loopback_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">:</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ARNodeInputs</span><span class="p">],</span>
+        <span class="n">states</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""A loop-back step's ``input_ids``, and each of the sampler's declared</span>
+<span class="sd">        loop-back ``states``, one row per row of the step, read by slot</span>
+<span class="sd">        (padding rows read the trash row). A row whose last step did not keep</span>
+<span class="sd">        them on the device (its first decode step, after the prefill) brings</span>
+<span class="sd">        them routed, in ``input_ids`` and ``tensor_inputs[state]``, and they</span>
+<span class="sd">        override its slot's."""</span>
+        <span class="n">sampler</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">device_loopback</span><span class="o">.</span><span class="n">sampler</span><span class="p">]</span>
+        <span class="n">rids</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"input_ids"</span><span class="p">:</span> <span class="n">sampler</span><span class="o">.</span><span class="n">loopback_tokens</span><span class="p">(</span><span class="n">rids</span><span class="p">)}</span>
+        <span class="n">out</span><span class="o">.</span><span class="n">update</span><span class="p">((</span><span class="n">name</span><span class="p">,</span> <span class="n">sampler</span><span class="o">.</span><span class="n">loopback_state</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">rids</span><span class="p">))</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">states</span><span class="p">)</span>
+        <span class="n">routed</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">inp</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span> <span class="k">if</span> <span class="n">inp</span><span class="o">.</span><span class="n">input_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">inp</span><span class="o">.</span><span class="n">input_seq_len</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">routed</span><span class="p">:</span>
+            <span class="n">sampler</span><span class="o">.</span><span class="n">overwrite_rows</span><span class="p">(</span>
+                <span class="n">routed</span><span class="p">,</span>
+                <span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="s2">"input_ids"</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">inputs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">input_ids</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">routed</span><span class="p">])),</span>
+                <span class="o">*</span><span class="p">((</span><span class="n">out</span><span class="p">[</span><span class="n">name</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">inputs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">routed</span><span class="p">]))</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">states</span><span class="p">),</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">out</span></div>
+
+
 <div class="viewcode-block" id="ARNodeSubmodule.get_stop_policies">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.get_stop_policies">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stop_policies</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">StopPolicy</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -2618,9 +2751,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="nb">set</span><span class="p">()</span>
         <span class="c1"># a row's first element, as ``HostRows.first_values`` reads it</span>
         <span class="n">token</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="n">stop</span><span class="o">.</span><span class="n">buffer</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_token_stops</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">request_info</span><span class="p">):</span>
-            <span class="k">return</span> <span class="nb">set</span><span class="p">()</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_names</span><span class="p">(</span><span class="n">request_info</span><span class="p">)</span></div>
+        <span class="n">stops</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_names</span><span class="p">(</span><span class="n">request_info</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_token_stops</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">request_info</span><span class="p">)</span> <span class="k">else</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">stop</span><span class="o">.</span><span class="n">withhold</span> <span class="ow">and</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">stop_ids</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">StopCheck</span><span class="p">(</span><span class="n">stops</span><span class="p">,</span> <span class="n">withheld</span><span class="o">=</span><span class="n">stop</span><span class="o">.</span><span class="n">withhold</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">stops</span></div>
 
 
 <div class="viewcode-block" id="ARNodeSubmodule.check_stop_batched">
@@ -2637,10 +2771,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">pairs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">verdict</span><span class="p">,</span> <span class="n">names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_token_stops</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stop_names</span>
-        <span class="k">return</span> <span class="p">{</span>
-            <span class="n">rid</span><span class="p">:</span> <span class="n">names</span><span class="p">(</span><span class="n">info</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">pairs</span>
-            <span class="k">if</span> <span class="n">verdict</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">info</span> <span class="o">:=</span> <span class="n">request_infos</span><span class="p">[</span><span class="n">rid</span><span class="p">])</span>
-        <span class="p">}</span></div>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">stop</span><span class="o">.</span><span class="n">withhold</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">{</span>
+                <span class="n">rid</span><span class="p">:</span> <span class="n">names</span><span class="p">(</span><span class="n">info</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">pairs</span>
+                <span class="k">if</span> <span class="n">verdict</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">info</span> <span class="o">:=</span> <span class="n">request_infos</span><span class="p">[</span><span class="n">rid</span><span class="p">])</span>
+            <span class="p">}</span>
+        <span class="n">stops</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">withheld</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">pairs</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">verdict</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">token</span><span class="p">,</span> <span class="n">info</span> <span class="o">:=</span> <span class="n">request_infos</span><span class="p">[</span><span class="n">rid</span><span class="p">]):</span>
+                <span class="n">stops</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">names</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">stop</span><span class="o">.</span><span class="n">stop_ids</span><span class="p">:</span>
+                <span class="n">withheld</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">stop</span><span class="o">.</span><span class="n">withhold</span>
+        <span class="k">return</span> <span class="n">BatchedStopCheck</span><span class="p">(</span><span class="n">stops</span><span class="p">,</span> <span class="n">withheld</span><span class="p">)</span> <span class="k">if</span> <span class="n">withheld</span> <span class="k">else</span> <span class="n">stops</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_token_stops</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">token</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>

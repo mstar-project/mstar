@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -997,6 +996,12 @@ window.runMermaid = runMermaid;</script>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 <span class="n">ROPE</span> <span class="o">=</span> <span class="s2">"rope"</span>
 <span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">"sampler"</span>
+<span class="c1"># Each audio chunk's mel frame count (the feature extractor's attention-mask</span>
+<span class="c1"># sum), from ``process_prompt`` to the encoder's step metadata: known on the</span>
+<span class="c1"># host there, so the encoder node never reads it back from a tensor. The</span>
+<span class="c1"># prompt's audio placeholders and the encoder's masking and slicing all count</span>
+<span class="c1"># from it.</span>
+<span class="n">AUDIO_FEATURE_LENS_KEY</span> <span class="o">=</span> <span class="s2">"audio_feature_lens"</span>
 
 
 <div class="viewcode-block" id="HiggsAudioModelConfig">

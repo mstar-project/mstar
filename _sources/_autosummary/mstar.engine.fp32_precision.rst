@@ -13,6 +13,7 @@ mstar.engine.fp32\_precision
 
    .. autosummary::
    
+      cudnn_benchmark
       fp32_precision_scope
       node_fp32_precision
    

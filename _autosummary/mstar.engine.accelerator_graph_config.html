@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -722,6 +721,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.lease_before_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.lease_before_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.make_static_inputs"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.make_static_inputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.one_row_per_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.one_row_per_step</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.region_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.region_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.replay_seq_lens"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.replay_seq_lens()</span></code></a></li>
 </ul>
 </li>
@@ -751,8 +751,10 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.attn_key"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.attn_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_capture_shapes"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.get_capture_shapes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_config_type"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.get_config_type()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.region_step"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.region_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.replay_seq_lens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.replay_seq_lens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.total_tokens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.total_tokens</span></code></a></li>
 </ul>
@@ -1123,6 +1125,24 @@ without colliding with the defaulted ones here.</p>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.region_step">
+<span class="sig-name descname"><span class="pre">region_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_lens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#PiecewiseAcceleratorGraphConfig.region_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.region_step" title="Link to this definition">#</a></dt>
+<dd><p>This region’s step over the padded batch (<code class="docutils literal notranslate"><span class="pre">declare_step</span></code>); None
+for a region that declares none.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>seq_lens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.replay_seq_lens">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">replay_seq_lens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">shape</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_lens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real_bs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#PiecewiseAcceleratorGraphConfig.replay_seq_lens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.replay_seq_lens" title="Link to this definition">#</a></dt>
 <dd><p>Per-request lengths to declare at replay, padded to <code class="docutils literal notranslate"><span class="pre">shape.bs</span></code>.</p>
@@ -1304,7 +1324,7 @@ generalize across config types.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.PiecewisePackedConfig">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">PiecewisePackedConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_fn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">make_static_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">declare_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lease_before_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">can_lease</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">one_row_per_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_batch_sizes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#PiecewisePackedConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">PiecewisePackedConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_fn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">make_static_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">declare_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lease_before_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">can_lease</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">one_row_per_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">forward_kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">capture_batch_sizes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compile_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attn_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#PiecewisePackedConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig"><code class="xref py py-class docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig</span></code></a></p>
 <p>Packed variable-length capture: static input <code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">D]</span></code>.</p>
 <p>One graph per (bs, token bucket). Each bucket is partitioned across <code class="docutils literal notranslate"><span class="pre">bs</span></code>
@@ -1324,9 +1344,15 @@ replay.</p>
 <li><p><strong>compile</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>compile_mode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>total_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>attn_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.PiecewisePackedConfig.attn_key">
+<span class="sig-name descname"><span class="pre">attn_key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.attn_key" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_capture_shapes">
 <span class="sig-name descname"><span class="pre">get_capture_shapes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_sizes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#PiecewisePackedConfig.get_capture_shapes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_capture_shapes" title="Link to this definition">#</a></dt>
@@ -1349,6 +1375,24 @@ replay.</p>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.PiecewiseConfigType" title="mstar.engine.accelerator_graph_config.PiecewiseConfigType"><em>PiecewiseConfigType</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.PiecewisePackedConfig.region_step">
+<span class="sig-name descname"><span class="pre">region_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_lens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#PiecewisePackedConfig.region_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.region_step" title="Link to this definition">#</a></dt>
+<dd><p>This region’s step over the padded batch (<code class="docutils literal notranslate"><span class="pre">declare_step</span></code>); None
+for a region that declares none.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>seq_lens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1514,6 +1558,7 @@ there are fewer tokens than rows.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.lease_before_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.lease_before_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.make_static_inputs"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.make_static_inputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.one_row_per_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.one_row_per_step</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.region_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.region_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig.replay_seq_lens"><code class="docutils literal notranslate"><span class="pre">PiecewiseAcceleratorGraphConfig.replay_seq_lens()</span></code></a></li>
 </ul>
 </li>
@@ -1543,8 +1588,10 @@ there are fewer tokens than rows.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.attn_key"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.attn_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_capture_shapes"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.get_capture_shapes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.get_config_type"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.get_config_type()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.region_step"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.region_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.replay_seq_lens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.replay_seq_lens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.total_tokens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.total_tokens</span></code></a></li>
 </ul>

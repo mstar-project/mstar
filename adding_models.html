@@ -355,7 +355,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1419,7 +1418,8 @@ forward. Nothing is paged, and nothing carries to the next step.
 defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code>, the
 default, <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>, or <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code>),
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, the
-two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
+two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> (<code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>
+for a <code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code> region) and
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>, <code class="docutils literal notranslate"><span class="pre">shard_over_sp</span></code> and
 <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3
 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm) and falls back to FlashInfer if that kernel is
@@ -1431,8 +1431,8 @@ replicated stream, or a cross-attention from the rank’s query shard).
 <code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512); a node with many labels can declare less,
 since a ragged prefill only uses it for split-KV partials. <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>,
 <code class="docutils literal notranslate"><span class="pre">shard_over_sp</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> are the model’s declaration; the serving
-config’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> overrides take only the backends and the two ceilings.
-See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a> for <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>.</p></td>
+config’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code> overrides take only the backends and the ceilings. See
+<a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a> for <code class="docutils literal notranslate"><span class="pre">compile_op</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>The cross-attention counterpart: one span of each request attends another
@@ -1879,7 +1879,15 @@ dimension that varies with <code class="docutils literal notranslate"><span clas
 <code class="docutils literal notranslate"><span class="pre">marks_dynamic_dims</span> <span class="pre">=</span> <span class="pre">True</span></code> and compiles as any other submodule. Keep the compiled
 paths compile-friendly. If a helper must not be traced, because it uses
 data-dependent Python control flow or forces a host synchronization, exclude it
-explicitly with <code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>.</p>
+explicitly with <code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>. A submodule that disables the
+whole-forward compile but wants parts of it compiled returns them from
+<code class="docutils literal notranslate"><span class="pre">compile_regions()</span></code>: attribute paths (a module, or a method) mapped to example
+arguments to warm each with at start-up. The engine compiles them, with dynamic
+shapes and before capture, on an accelerator only; prefer it to calling
+<code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> in model code. Its options are fixed (dynamic shapes,
+torch.compile’s default mode), so a part that needs static shapes, a mode or
+<code class="docutils literal notranslate"><span class="pre">fullgraph</span></code> still compiles in model code. Qwen3.5’s vision encoder and
+Omnilingual ASR are examples.</p>
 <p>Some submodules must run in their own parameter dtype. One example is an fp32 vocoder
 that is numerically sensitive. Such a submodule sets <code class="docutils literal notranslate"><span class="pre">disable_autocast</span> <span class="pre">=</span> <span class="pre">True</span></code>. The
 engine then does not cast its parameters to the autocast dtype, does not wrap its
@@ -1896,6 +1904,15 @@ nodes keep TF32. <code class="docutils literal notranslate"><span class="pre">No
 the precision it was captured with. The setting covers <code class="docutils literal notranslate"><span class="pre">forward</span></code> and
 <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> only, not <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> or <code class="docutils literal notranslate"><span class="pre">postprocess</span></code>. It can also be set
 per instance in <code class="docutils literal notranslate"><span class="pre">__init__</span></code>, for example only when the model loads in fp32.</p>
+<p>A node whose captured convolutions are faster with cuDNN’s timed algorithm choice
+sets <code class="docutils literal notranslate"><span class="pre">capture_cudnn_benchmark</span> <span class="pre">=</span> <span class="pre">True</span></code>: the engine turns
+<code class="docutils literal notranslate"><span class="pre">torch.backends.cudnn.benchmark</span></code> on around that node’s capture sizing only, so
+each captured shape is searched once, and eager steps keep the heuristic pick
+(Kokoro is an example). The search tries workspaces as large as the GPU has free,
+so on a deployment that sets <code class="docutils literal notranslate"><span class="pre">gpu_memory_fraction</span></code> the engine holds the
+allocator to that share while it sizes the node’s captures, and the boot fails
+if the node’s largest eager step does not fit in it beside what the worker
+already holds.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">postprocess(...)</span></code> (optional)</dt><dd><p>Metadata-only fixups that run on the GPU thread. This method must not read tensor
 values. Do not call <code class="docutils literal notranslate"><span class="pre">.item()</span></code>, <code class="docutils literal notranslate"><span class="pre">.cpu()</span></code> or <code class="docutils literal notranslate"><span class="pre">.tolist()</span></code> here. This is a
@@ -1909,7 +1926,10 @@ objects to stop, for example after seeing the EOS token. This is how a decode lo
 terminates. An AR submodule whose loop ends on a stop token sets
 <code class="docutils literal notranslate"><span class="pre">self.token_stop</span> <span class="pre">=</span> <span class="pre">TokenStop(...)</span></code> in <code class="docutils literal notranslate"><span class="pre">__init__</span></code> instead of writing one; that also
 gives it <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>, which checks a whole step off one host copy of its
-tokens. The token budget is the loop’s cap from <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>, not a stop check.
+tokens. Qwen3.5’s <code class="docutils literal notranslate"><span class="pre">LLMSubmodule</span></code> is an example. The token budget is the loop’s cap
+from <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>, not a stop check. A decode walk that feeds each row
+its last sampled token can keep that token on the device instead of routing it, with a
+<code class="docutils literal notranslate"><span class="pre">DeviceLoopback</span></code> (see <a class="reference internal" href="#device-loop-back">Device loop-back</a>).
 A prefill samples the first token before its decode loop exists, so a stop there is
 returned as <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code> (from <code class="docutils literal notranslate"><span class="pre">mstar.model.submodule_base</span></code>) instead: the worker
 reports the partition done with that pass, and the conductor ends it rather than start
@@ -1926,8 +1946,9 @@ To also keep some of this step’s outputs from being routed, return
 <code class="docutils literal notranslate"><span class="pre">StopCheck(stops,</span> <span class="pre">withheld=(names...))</span></code>, for example a frame streamed alongside the
 EOS token: its consumer then never receives it, instead of finding and dropping it with
 a device read. <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code> returns a <code class="docutils literal notranslate"><span class="pre">BatchedStopCheck</span></code> for the same.
-The Qwen3-TTS and Qwen3-Omni Talkers and Fish S2 Pro’s AR keep their EOS frame out of
-the codec stream this way.</p>
+The Qwen3-Omni Talker and Fish S2 Pro’s AR keep their EOS frame out of the codec
+stream this way; a <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> names such outputs in <code class="docutils literal notranslate"><span class="pre">withhold</span></code>, left unrouted on a
+row whose token is a stop id (the Qwen3-TTS Talker).</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">on_request_added(self,</span> <span class="pre">request_id,</span> <span class="pre">request_info)</span></code> (optional)</dt><dd><p>Called on the worker’s main thread when the request reaches the worker, before any of
 its steps, with the request’s first <code class="docutils literal notranslate"><span class="pre">CurrentForwardPassInfo</span></code>. For host work worth
@@ -2194,20 +2215,23 @@ drives the layer stack binds the label once, then advances the index for each la
 <p>Cursors are used instead of arguments because passing the layer index as an argument makes
 inductor specialize on that integer. The frame is then retraced once per layer.</p>
 <p id="device-loop-back"><strong>Device loop-back.</strong> A decode loop normally routes its sampled token back to itself as a
-tensor per request. A node that sets <code class="docutils literal notranslate"><span class="pre">reads_device_loopback</span> <span class="pre">=</span> <span class="pre">True</span></code> can instead read
-each row’s last sampled token off the sampler on the device. It names those signals in
-<code class="docutils literal notranslate"><span class="pre">device_loopback_signals(graph_walk)</span></code>, so the worker routes them without a tensor, and
-reads them in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> with <code class="docutils literal notranslate"><span class="pre">sampler.loopback_tokens(request_ids)</span></code>. A row whose
-last step did not keep its value on the device (its first decode step, after the prefill)
-still brings it routed; put it over the one read from the device with
-<code class="docutils literal notranslate"><span class="pre">sampler.overwrite_rows(rows,</span> <span class="pre">(ids,</span> <span class="pre">routed_ids))</span></code>.</p>
+tensor per request. An AR node that sets <code class="docutils literal notranslate"><span class="pre">self.device_loopback</span> <span class="pre">=</span> <span class="pre">DeviceLoopback(walk,</span>
+<span class="pre">signal,</span> <span class="pre">sampler,</span> <span class="pre">buffer)</span></code> instead reads each row’s last sampled token off the sampler on
+the device (<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code>): the base class’s <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code> names
+the signal, so the worker routes it without a tensor and sends the client’s copy inline,
+<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> returns <code class="docutils literal notranslate"><span class="pre">self.uniform_row_inputs(...)</span></code> for such a row, and
+<code class="docutils literal notranslate"><span class="pre">preprocess</span></code> reads the tokens with <code class="docutils literal notranslate"><span class="pre">self.loopback_inputs(engine_inputs,</span> <span class="pre">inputs)</span></code>. A
+row whose last step did not keep its value on the device (its first decode step, after
+the prefill) still brings it routed, and that read puts it over the slot’s. Qwen3.5,
+Higgs Audio, Qwen3-ASR and Whisper declare it.</p>
 <p>On such a node a captured step writes each row’s token and RNG offset back to the request’s
 row inside the graph (<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, on by default). Those rows are
 allocated once, <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code> of them, so a request takes its row when the runner
 admits it and waits while none is free, as it does for a recurrent state slot. A row the
 step drops (<code class="docutils literal notranslate"><span class="pre">SamplerStep(kept_rids=...)</span></code>) writes the trash row, so it keeps its offset.</p>
 <p>State that a decode loop carries from step to step beside the token, such as Whisper’s
-timestamp rule state, is declared on the sampler, not kept in the model:</p>
+timestamp rule state, is declared on the sampler, not kept in the model (Whisper adds its
+signal to <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code> and passes its name to <code class="docutils literal notranslate"><span class="pre">loopback_inputs</span></code>):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">SamplerSpec</span><span class="p">(</span>
     <span class="n">resource_key</span><span class="o">=</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"decoder"</span><span class="p">},</span> <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab</span><span class="p">,</span>
     <span class="n">loopback_state</span><span class="o">=</span><span class="p">{</span><span class="s2">"ts_rules"</span><span class="p">:</span> <span class="n">LoopbackState</span><span class="p">(</span>
@@ -2504,19 +2528,20 @@ tells the outer declaration which resources are already taken, so that it can ex
 them.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">can_lease</span></code> has signature <code class="docutils literal notranslate"><span class="pre">(inputs:</span> <span class="pre">list[NodeInputs])</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code>. It applies only with
 <code class="docutils literal notranslate"><span class="pre">lease_before_step</span></code>, and lets the region refuse a batch for a limit that the
-capture bucket key doesn’t express, such as Qwen3.5’s per-request segment count. The
-engine then gives the region no lease for that step. Your forward must replay only
-when the region was leased, for example when the outer step is <code class="docutils literal notranslate"><span class="pre">None</span></code>, and not
-whenever <code class="docutils literal notranslate"><span class="pre">runner.can_run</span></code> is true: a refused batch can still fit a bucket, and
-replaying it would declare the region’s resources twice.</p></li>
+capture bucket key doesn’t express, such as Qwen3.5’s segment count per step. The
+engine then gives the region no lease for that step. Your forward must replay a
+<code class="docutils literal notranslate"><span class="pre">lease_before_step</span></code> region exactly when its label is in
+<code class="docutils literal notranslate"><span class="pre">engine_inputs.piecewise_leases</span></code>, and not whenever <code class="docutils literal notranslate"><span class="pre">runner.can_run</span></code> is true: a
+refused batch can still fit a bucket, and replaying it would declare the region’s
+resources twice.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code> makes the runner lease, check (<code class="docutils literal notranslate"><span class="pre">can_run</span></code>) and replay the region as
 one row, whatever the step’s batch size, under the step’s first request. It is for a
 packed region that runs every request’s segments as one ragged batch, such as a vision
 tower, and needs <code class="docutils literal notranslate"><span class="pre">lease_before_step</span></code> and <code class="docutils literal notranslate"><span class="pre">capture_batch_sizes=[1]</span></code>. The region’s
 <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> then receives <code class="docutils literal notranslate"><span class="pre">[first_rid]</span></code> with every request’s <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code>, so the
-whole step’s segments count against that one request’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
-which for this region is a per-step ceiling. Pair it with a <code class="docutils literal notranslate"><span class="pre">can_lease</span></code> that refuses a
-step with more.</p></li>
+whole step’s segments count against one replay’s plan: size its attention resource with
+<code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, and pair it with a <code class="docutils literal notranslate"><span class="pre">can_lease</span></code> that refuses a step with
+more.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> lists the batch sizes to record. <code class="docutils literal notranslate"><span class="pre">None</span></code> uses the runner
 default.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture. The default is
@@ -2638,7 +2663,10 @@ under <strong>Splitting the declaration</strong> above.</p>
 <p>BAGEL’s ViT tower is the packed, cacheless counterpart. See
 <code class="docutils literal notranslate"><span class="pre">mstar/model/bagel/submodules.py</span></code>, region <code class="docutils literal notranslate"><span class="pre">&quot;vit_block_loop&quot;</span></code>: a
 <code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig</span></code> whose region declares only ragged attention, with patch
-embedding and the RoPE gathers left eager because they are data-dependent indexing.</p>
+embedding and the RoPE gathers left eager because they are data-dependent indexing.
+A packed region whose rows each attend within themselves passes <code class="docutils literal notranslate"><span class="pre">attn_key</span></code> (the
+attention resource) instead of a <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>: the config then declares one
+non-causal segment per row, or under <code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code> one per length of its row.</p>
 </section>
 </section>
 <section id="step-6-write-a-config-yaml">
@@ -2712,8 +2740,9 @@ that a misspelled setting is never silently ignored:</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
-<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The two ceilings size CUDA-graph buckets, which is a
-memory-against-coverage trade the deployment makes, not the model.</p></td>
+<code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The ceilings size CUDA-graph
+buckets, which is a memory-against-coverage trade the deployment makes, not the model.
+A resource sized per step refuses <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, which it would ignore.</p></td>
 </tr>
 </tbody>
 </table>

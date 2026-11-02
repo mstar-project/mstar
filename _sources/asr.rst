@@ -75,8 +75,9 @@ Qwen3-ASR
 
 **Graph.** ``audio_encoder`` is the AuT encoder: three strided convolutions
 (13 tokens per 100 mel frames), transformer layers whose attention is
-confined to 8 s windows, run as one packed forward per batch with ragged
-attention (one segment per window of every request), and a projection into
+confined to 8 s windows, run as one packed forward per batch of up to 4096
+tokens (a larger step runs its clips one by one) with ragged attention (one
+segment per window of every request), and a projection into
 the LLM's hidden size. ``LLM`` is a dense Qwen3 decoder: the ChatML prompt
 with ``<|audio_pad|>`` placeholders is embedded, the encoder output is
 scattered over the placeholders, and prefill (captured on packed token

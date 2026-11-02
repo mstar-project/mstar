@@ -356,7 +356,6 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -772,7 +771,7 @@ against what the request’s earlier files used.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">(num_frames,</span> <span class="pre">fps,</span> <span class="pre">height,</span> <span class="pre">width)</span></code> from the container header, or None when neither torchcodec nor PyAV can read it.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_image" title="mstar.model.media_limits.read_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_image</span></code></a>(filepath, *[, rgb])</p></td>
-<td><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large.</p></td>
+<td><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large (a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, as is a file that does not decode).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_sound_file" title="mstar.model.media_limits.read_sound_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_sound_file</span></code></a>(filepath, max_seconds)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile.read(filepath,</span> <span class="pre">dtype=&quot;float32&quot;,</span> <span class="pre">always_2d=True)</span></code> for a header that gives no sample count, where <code class="docutils literal notranslate"><span class="pre">soundfile.read</span></code> would size its buffer from the header (libsndfile's 2**63 - 1 frames) and fail; decodes block by block and stops just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>, so the caller's length check refuses a longer clip.</p></td>
@@ -1057,7 +1056,8 @@ when neither torchcodec nor PyAV can read it.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.media_limits.read_image">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">read_image</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">filepath</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">rgb</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#read_image"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.read_image" title="Link to this definition">#</a></dt>
-<dd><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large.</p>
+<dd><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large
+(a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, as is a file that does not decode).</p>
 <p><code class="docutils literal notranslate"><span class="pre">rgb</span></code> forces three channels, with any transparency composited on white
 as the Qwen-VL reference preprocessing does for RGBA (dropping the alpha
 would turn a transparent background black); otherwise the file’s own

@@ -709,7 +709,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -982,7 +981,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">The operator keeps fused accelerator implementations behind one stable</span>
 <span class="sd">``mstar::rms_norm`` graph boundary. CUDA currently dispatches to FlashInfer,</span>
 <span class="sd">XPU dispatches to vllm-xpu-kernels, and other devices use the portable</span>
-<span class="sd">PyTorch implementation.</span>
+<span class="sd">PyTorch implementation. ``mstar::fused_add_rms_norm`` does the same for the</span>
+<span class="sd">in-place residual add + RMSNorm: FlashInfer's fused kernel on CUDA in half</span>
+<span class="sd">precision, the unfused add and norm elsewhere.</span>
 <span class="sd">"""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1078,6 +1079,68 @@ window.runMermaid = runMermaid;</script>
         <span class="n">rms_norm_dtype</span><span class="p">,</span>
     <span class="p">)</span></div>
 
+
+
+<div class="viewcode-block" id="gemma_rms_norm">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.rms_norm.html#mstar.engine.resources.rms_norm.gemma_rms_norm">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">gemma_rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Gemma's RMSNorm, ``normed * (1 + weight)``, computed in fp32 as Hugging</span>
+<span class="sd">    Face Gemma computes it and returned in ``x``'s dtype."""</span>
+    <span class="n">orig_dtype</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="n">var</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">square</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">normed</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span>
+    <span class="n">normed</span> <span class="o">=</span> <span class="n">normed</span> <span class="o">*</span> <span class="p">(</span><span class="mf">1.0</span> <span class="o">+</span> <span class="n">weight</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">normed</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_unfused_add_rms_norm</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">residual</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+    <span class="n">x</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">gemma_rms_norm</span><span class="p">(</span><span class="n">residual</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span> <span class="k">if</span> <span class="n">gemma_mode</span> <span class="k">else</span> <span class="n">rms_norm</span><span class="p">(</span><span class="n">residual</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">))</span>
+
+
+<span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">"mstar::fused_add_rms_norm"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">(</span><span class="s2">"x"</span><span class="p">,</span> <span class="s2">"residual"</span><span class="p">))</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">fused_add_rms_norm</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""In place: ``residual += x``, then ``x = rms_norm(residual)`` (Gemma's</span>
+<span class="sd">    ``(1 + weight)`` when ``gemma_mode``). Portable fallback: the add, then</span>
+<span class="sd">    ``mstar::rms_norm``."""</span>
+    <span class="c1"># The portable fallback (XPU, and CUDA in fp32). Inductor can't</span>
+    <span class="c1"># fuse the add across the op boundary; if an XPU model adopts ``run_layers``,</span>
+    <span class="c1"># register a fused XPU kernel for this op as CUDA does below.</span>
+    <span class="n">_unfused_add_rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">)</span>
+
+
+<span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">register_kernel</span><span class="p">(</span><span class="n">fused_add_rms_norm</span><span class="p">,</span> <span class="s2">"cuda"</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_fused_add_rms_norm_cuda</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""FlashInfer's fused kernel, which takes half precision only, and reads</span>
+<span class="sd">    ``residual`` and ``weight`` in ``x``'s dtype: any other mix runs unfused. It</span>
+<span class="sd">    normalizes the sum before rounding it, where the unfused pair rounds first.</span>
+
+<span class="sd">    The op, rather than calling FlashInfer's wrapper directly, keeps the kernel</span>
+<span class="sd">    behind a graph boundary: the wrapper is plain Python (its op registration is</span>
+<span class="sd">    a no-op), so Dynamo traces into it and breaks the graph, and each call site</span>
+<span class="sd">    then compiles as a frame of its own, once per norm module and shape.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">residual</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">weight</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+        <span class="n">_unfused_add_rms_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">flashinfer.norm</span><span class="w"> </span><span class="kn">import</span> <span class="n">fused_add_rmsnorm</span><span class="p">,</span> <span class="n">gemma_fused_add_rmsnorm</span>
+
+    <span class="p">(</span><span class="n">gemma_fused_add_rmsnorm</span> <span class="k">if</span> <span class="n">gemma_mode</span> <span class="k">else</span> <span class="n">fused_add_rmsnorm</span><span class="p">)(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+
+
+<span class="nd">@fused_add_rms_norm</span><span class="o">.</span><span class="n">register_fake</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_fused_add_rms_norm_fake</span><span class="p">(</span>
+    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">return</span> <span class="kc">None</span>
 </pre></div>
 
                 </article>
