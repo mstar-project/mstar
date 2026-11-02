@@ -25,6 +25,10 @@ class Segment(NamedTuple):
 class ResourceStep:
     # Work for one resource, for one step
     segments: tuple[Segment, ...] | None = None
+    # source labels -> the plan label one forward packs them under (batched CFG, say); the
+    # resources that plan the step's layout (KV, the sequence shard) read it. Out of the hash, so a
+    # step without other unhashable fields stays hashable
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True, hash=False)
 
 @dataclass(frozen=True)
 class BucketKey:
@@ -167,6 +171,9 @@ class SubmoduleStep:
     # used for convenience only: if a ResourceStep does not specify segments,
     # it gets this list
     segments: list[Segment] | None = None
+    # the labels this step's forward packs together, declared once here: every ResourceStep
+    # that doesn't set its own gets it, so the KV plan and the sequence shard agree
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True)
 
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
@@ -174,11 +181,13 @@ class SubmoduleStep:
     _ctx: StepContext = None # set by the engine
 
     def __post_init__(self):
-        if self.segments is None:
+        if self.segments is None and not self.combined_labels:
             return
         for step in self.steps.values():
-            if step.segments is None:
+            if step.segments is None and self.segments is not None:
                 object.__setattr__(step, "segments", self.segments)
+            if self.combined_labels and not step.combined_labels:
+                object.__setattr__(step, "combined_labels", self.combined_labels)
 
     @property
     def ctx(self):

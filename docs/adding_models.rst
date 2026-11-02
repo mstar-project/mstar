@@ -1382,8 +1382,12 @@ resource key:
   nothing. A request contributes one segment per label that is active for it.
 - The ``segments`` argument of ``SubmoduleStep`` is a default value. Any ``ResourceStep``
   that does not set its own ``segments`` uses this list.
-- ``KVStep(commit=, eager_write=, combined_labels=, pre_forks=, post_forks=)``. See
-  below.
+- ``SubmoduleStep(combined_labels={("main", "cfg_img"): "cfg_batched"})`` packs several
+  labels into a single plan. Batched classifier-free guidance uses this to run two
+  branches through one attention call. Every ``ResourceStep`` gets the mapping, so the KV
+  plan and a sequence shard read the same grouping; positions take their packing from the
+  KV plan, and ``PositionStep`` keys its ``pos_ids`` by the combined label.
+- ``KVStep(commit=, eager_write=, pre_forks=, post_forks=)``. See below.
 - ``AttentionStep(causal=, context_only=)`` describes the attention plan.
   ``context_only=True`` has the queries attend to the stored context alone, not to the
   tokens this step appends, and the step's own ``segments`` then give the query counts.
@@ -1448,10 +1452,6 @@ handled as special cases. BAGEL uses all of them, in
 ``mstar/model/bagel/submodules.py``:
 
 - ``commit=False``: the step reads and plans, but its writes do not become resident yet.
-- ``combined_labels={("main", "cfg_img"): "cfg_batched"}``: pack several labels into a
-  single plan. Batched classifier-free guidance uses this to run two branches through one
-  attention call. Positions take their packing from the KV plan, so the grouping is
-  declared once here, and ``PositionStep`` keys its ``pos_ids`` by the combined label.
 - ``pre_forks`` and ``post_forks``: a value such as ``(("main", "cfg_text"),)`` forks one
   cache stream from another. ``pre_forks`` forks before any planning or writing, for a
   branch that must keep the context from before this step. ``post_forks`` forks at commit
@@ -2126,9 +2126,8 @@ Splitting is declared in four places:
   nodes the shard doesn't cover is refused.
 - **Every** ``declare_step`` branch of the node puts a ``SeqShardStep`` in its step, at any SP size
   (at one rank its plan is a constant); the attention resources refuse a step without one, so a
-  forgotten branch fails on one GPU. ``SubmoduleStep(segments=...)`` fills its segments. A step
-  whose KV plan combines labels (``KVStep(combined_labels=...)``) gives the shard step the same
-  mapping, so the combined label gets a range too.
+  forgotten branch fails on one GPU. ``SubmoduleStep`` fills its segments and its
+  ``combined_labels``, so a combined plan label gets a range too.
 - The forward **brackets** its layer stack: ``shard.scatter(label, *xs, dim=None)`` before it
   (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
   ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
@@ -2581,7 +2580,8 @@ and also a system prompt in ``think_mode``. ``postprocess`` selects an encoding 
 modality: ``utf-8`` text for ``decode``, and PNG bytes for ``image``.
 
 **Step 4a — Step declarations.** BAGEL's ``LLMSubmodule.declare_step`` is the most complex
-declaration in the tree. Read it to see every advanced ``KVStep`` field in context:
+declaration in the tree. Read it to see every advanced ``KVStep`` field (and
+``SubmoduleStep.combined_labels``) in context:
 
 - ``pre_forks`` and ``post_forks``: guidance requires a ``cfg_text`` stream forked from
   ``main``, and the fork time differs by walk. In ``prefill_text``, the branch must keep

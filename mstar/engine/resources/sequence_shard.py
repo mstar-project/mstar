@@ -47,10 +47,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class SeqShardStep(ResourceStep):
-    """The step's segments (``SubmoduleStep(segments=...)`` fills them), and the KV step's
-    ``combined_labels``, so a combined plan label gets a range over its sources too."""
-
-    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
+    """The step's segments and ``combined_labels`` (``SubmoduleStep`` fills both), so a combined
+    plan label gets a range over its sources too."""
 
 
 @dataclass
@@ -404,16 +402,6 @@ def check_shard_plan(owner: str, shard_key: str, ctx: StepContext) -> SeqShardPl
             "every declare_step branch of its node declares a SeqShardStep"
         )
     return plan
-
-
-def check_covered(owner: str, label: str, sources: Iterable[str], shard: SequenceShard, plan: SeqShardPlan) -> None:
-    """On a split step, refuse a plan label with no range whose tokens include a listed label's:
-    a model whose shard step and attention steps disagree."""
-    if label not in plan.ranges and any(source in shard.labels for source in sources):
-        raise ValueError(
-            f"{owner}: label {label!r} holds tokens of split labels {sorted(set(sources) & set(shard.labels))}, "
-            "but the step's SeqShardStep gives it no range: give the shard step the same combined_labels"
-        )
 
 
 # --- exchanges ---------------------------------------------------------------------------------

@@ -31,7 +31,6 @@ from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineReso
 from mstar.engine.resources.sequence_shard import (
     SeqShardPlan,
     SequenceShard,
-    check_covered,
     check_shard_plan,
     head_slice,
     sharded_key_merge,
@@ -500,8 +499,6 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
             if shard_plan is None:
                 continue
             r = shard_plan.ranges.get(label) if shard_plan.split else None
-            if shard_plan.split:
-                check_covered(f"ragged attention {self._key!r}", label, (label,), self._shard, shard_plan)
             if r is not None:
                 if not self._ulysses:
                     raise ValueError(
@@ -534,8 +531,6 @@ class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):
             label = cross_label(q_label, kv_label)
             if split:
                 owner = f"ragged cross-attention {self._key!r}"
-                for side in (q_label, kv_label):
-                    check_covered(owner, side, (side,), self._shard, shard_plan)
                 q_range, kv_range = shard_plan.ranges.get(q_label), shard_plan.ranges.get(kv_label)
                 if q_range is not None and kv_range is not None:
                     raise ValueError(

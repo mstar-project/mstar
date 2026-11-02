@@ -148,7 +148,7 @@ COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
 
 # Combined plan key for the single plan that runs both guidance branches in
-# one forward (``KVStep.combined_labels`` in the step declaration).
+# one forward (``SubmoduleStep.combined_labels`` in the step declaration).
 CFG_BATCHED_LABEL = "_cfg_batched"
 
 # A captured denoise step's static-buffer inputs, each stacked on a leading
@@ -1029,14 +1029,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         read its own context. ``retention`` (per label) rides on the step
         for the pool to apply once the span is counted."""
         labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
-        combined_labels = {labels: CFG_BATCHED_LABEL} if cfg and self.batched_cfg else {}
         return SubmoduleStep(
             segments=self._segments(request_ids, labels, [spans] * len(labels)),
+            combined_labels={labels: CFG_BATCHED_LABEL} if cfg and self.batched_cfg else {},
             steps={
-                SEQ_SHARD: SeqShardStep(combined_labels=combined_labels),
+                SEQ_SHARD: SeqShardStep(),
                 KV_CACHE: KVStep(
                     commit=True,
-                    combined_labels=combined_labels,
                     retention={
                         (rid, label): policy
                         for rid in request_ids
@@ -1477,9 +1476,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # pages, which the dense backend never writes.
             cfg = bool(inputs[0].kwargs.get("cfg"))
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
-            combined_labels = {labels: CFG_BATCHED_LABEL} if cfg else {}
             return SubmoduleStep(
                 cg_key_info=cfg or None,
+                combined_labels={labels: CFG_BATCHED_LABEL} if cfg else {},
                 segments=self._segments(
                     request_ids, labels,
                     [
@@ -1488,8 +1487,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     ],
                 ),
                 steps={
-                    SEQ_SHARD: SeqShardStep(combined_labels=combined_labels),
-                    KV_CACHE: KVStep(commit=True, combined_labels=combined_labels),
+                    SEQ_SHARD: SeqShardStep(),
+                    KV_CACHE: KVStep(commit=True),
                     ATTN: AttentionStep(causal=True),
                 },
             )
@@ -1580,15 +1579,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     ) -> SubmoduleStep:
         """A denoise step: the same span under each live label, nothing
         committed, non-causal attention over [frozen prefix | fresh tokens]."""
-        combined_labels = {labels: CFG_BATCHED_LABEL} if combined else {}
         return SubmoduleStep(
             cg_key_info=cg_key_info,
+            combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
             segments=self._segments(
                 request_ids, labels, [spans] * len(labels)
             ),
             steps={
-                SEQ_SHARD: SeqShardStep(combined_labels=combined_labels),
-                KV_CACHE: KVStep(commit=False, combined_labels=combined_labels),
+                SEQ_SHARD: SeqShardStep(),
+                KV_CACHE: KVStep(commit=False),
                 attn_key: AttentionStep(causal=False),
             },
         )

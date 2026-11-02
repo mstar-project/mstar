@@ -22,7 +22,7 @@ from flashinfer_reference import reference_attention
 from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.context_parallel import gather_merge, merge
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.position.manager import PositionManager
@@ -35,7 +35,7 @@ from mstar.engine.resources.sequence_shard import (
     ulysses,
 )
 from mstar.engine.resources.spec import resolve_spec_dependencies
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
 from mstar.model.components.diffusion.attention import sdpa_attention
 
 HEADS = 6
@@ -229,8 +229,13 @@ def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=
     rids = rows or sorted({rid for rid, _, _ in segments})
     ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, slot_lease=lease,
                       force_prefill=force_prefill)
-    step = SeqShardStep(segments=tuple(Segment(*seg) for seg in segments), combined_labels=combined or {})
-    plan = shard.plan(step, ctx)
+    # declared once on the submodule step, as a model does, which hands it to every resource step
+    step = SubmoduleStep(
+        segments=tuple(Segment(*seg) for seg in segments), combined_labels=combined or {},
+        steps={"shard": SeqShardStep(), "kv": KVStep()},
+    )
+    assert step.steps["kv"].combined_labels == (combined or {})
+    plan = shard.plan(step.steps["shard"], ctx)
     return {label: (r.counts, r.rows) for label, r in plan.ranges.items()} if plan.split else None
 
 

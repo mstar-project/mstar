@@ -96,5 +96,4 @@ class PositionStep(ResourceStep):
     # label -> ids for one step
     pos_ids: "dict[str, torch.Tensor] | torch.Tensor | None" = None
     advance: tuple[int, ...] | None = None  # `advance=None` means own rule
-    # no combined_labels: positions take the packing off KV's plan output,
-    # so the step declares the grouping once, on KVStep
+    # positions take their packing off KV's plan output, not off `combined_labels`

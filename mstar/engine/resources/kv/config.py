@@ -829,8 +829,6 @@ class KVStep(ResourceStep):
     # is far longer than its prompt can then replay a graph sized by the prompt.
     eager_write: bool = False
 
-    # e.g., for batched CFG
-    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
     # the rows the forks apply to; None is every row. A chunked prompt forks

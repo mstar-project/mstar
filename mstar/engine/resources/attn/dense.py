@@ -294,7 +294,7 @@ class DenseAttentionManager(AttentionManager):
         assert plan_outputs is not None, (
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )
-        self._check_sequence_shard(plan_outputs, ctx)
+        self._check_sequence_shard(ctx)
 
         self._current_plans = {
             plan_label: self._build_plan(kv_out, step.causal, EagerSlotKey(label=plan_label, slot=ctx.slot))

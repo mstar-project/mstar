@@ -20,7 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.sequence_shard import SequenceShard, check_covered, check_shard_plan, head_slice, ulysses
+from mstar.engine.resources.sequence_shard import SequenceShard, check_shard_plan, head_slice, ulysses
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -109,20 +109,10 @@ class AttentionManager(AttentionResource):
         finally:
             shard.exchanging = False
 
-    def _check_sequence_shard(self, plan_outputs, ctx) -> None:
-        """At plan: the step declares the node's sequence shard, and on a split step every plan
-        label holding split tokens has its range."""
-        if self._shard_key is None:
-            return
-        owner = f"attention over KV {self._kv_cache_name!r}"
-        plan = check_shard_plan(owner, self._shard_key, ctx)
-        if self._shard is None or not plan.split:
-            return
-        for label, kv_out in plan_outputs.items():
-            if label not in plan.ranges:
-                rows = kv_out.rows
-                sources = {row[1] for row in rows} if rows is not None else {view.label for view in kv_out.views}
-                check_covered(owner, label, sources, self._shard, plan)
+    def _check_sequence_shard(self, ctx) -> None:
+        """At plan: the step declares the node's sequence shard."""
+        if self._shard_key is not None:
+            check_shard_plan(f"attention over KV {self._kv_cache_name!r}", self._shard_key, ctx)
 
     def _bind_placement(self, placement: "ContextParallel") -> None:
         """This rank's share of a context-parallel pool. Reached only for a backend that supports

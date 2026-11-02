@@ -351,9 +351,6 @@ class T3Submodule(ARNodeSubmodule):
             for label in labels
             for rid, inp in zip(request_ids, inputs, strict=True)
         ]
-        kv_step = (
-            KVStep(combined_labels={labels: CFG_LABEL}) if requires_cfg else KVStep()
-        )
         tracked = {}
         if graph_walk in PREFILL_WALKS:
             # the reference penalises repeats of everything after the text,
@@ -362,8 +359,9 @@ class T3Submodule(ARNodeSubmodule):
             tracked = {rid: bos for rid in request_ids}
         return SubmoduleStep(
             segments=segments,
+            combined_labels={labels: CFG_LABEL} if requires_cfg else {},
             steps={
-                self._kv_key(): kv_step,
+                self._kv_key(): KVStep(),
                 T3_ATTN: AttentionStep(causal=True),
                 T3_POS: PositionStep(),
                 T3_SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=tracked),

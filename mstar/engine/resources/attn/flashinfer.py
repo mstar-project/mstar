@@ -312,7 +312,7 @@ class FlashInferManager(AttentionManager):
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
-        self._check_sequence_shard(plan_outputs, ctx)
+        self._check_sequence_shard(ctx)
         if self._group_idx:
             plan_outputs = plan_outputs.groups[self._group_idx]
 
