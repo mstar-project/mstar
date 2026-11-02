@@ -22,7 +22,7 @@ The walk sequence is fixed up front from the input modalities and stepped throug
     I2V: encode_text -> encode_image -> video_gen_i2v
 
 The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling, and the
-request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
+request's ``num_inference_steps`` is the loop's cap (``get_loop_caps``).
 """
 
 import html
@@ -74,8 +74,6 @@ class Wan22Model(Model):
     VIDEO_GEN_WALK = "video_gen"
     VIDEO_GEN_I2V_WALK = "video_gen_i2v"
 
-    # Denoise loop name — referenced by ``Wan22DitSubmodule.check_stop`` via
-    # ``request_info.dynamic_loop_iter_counts[...]``.
     DENOISE_LOOP_NAME = DENOISE_LOOP_NAME
 
     def __init__(
@@ -194,12 +192,10 @@ class Wan22Model(Model):
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
-                # Async scheduling may dispatch an iteration past the stop
-                # check_stop registers; Wan22DitSubmodule.prepare_inputs vetoes
-                # the overshoot (None -> the engine skips that forward).
+                # the loop's cap keeps speculation off a request's last step
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; the request's step count stops the loop early.
+            # Ceiling only; the request's step count is the loop's cap.
             max_iters=self.config.max_denoise_steps,
             outputs=[
                 # Matched by name against the section's loop-back edges: the final
@@ -510,6 +506,14 @@ class Wan22Model(Model):
             "on" if self.config.compile_dit else "off",
         )
 
+    def _resolve_steps(self, model_kwargs: dict) -> int:
+        requested = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
+        return max(1, min(requested, self.config.max_denoise_steps))
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own step count, and is never speculated past it
+        return {DENOISE_LOOP_NAME: self._resolve_steps(model_kwargs)}
+
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
@@ -549,7 +553,7 @@ class Wan22Model(Model):
         requested_steps = int(
             model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
         )
-        num_inference_steps = max(1, min(requested_steps, self.config.max_denoise_steps))
+        num_inference_steps = self._resolve_steps(model_kwargs)
         if num_inference_steps != requested_steps:
             logger.info(
                 "Clamped num_inference_steps from %d to %d (max_denoise_steps=%d)",
