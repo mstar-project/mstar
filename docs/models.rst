@@ -1661,8 +1661,10 @@ binary on the server's ``PATH`` and falls back to video only without it.
 Deployment knobs: ``compile`` (the DiT's blocks, static per packed row count: each new count
 compiles once, ~8 s; past the engine's recompile limit new counts run eager), ``vae_tile_batch`` (256-px tiles per
 decoder call; 28 is one 768p clip), ``vae_parallel`` (a per-model stand-in for decode
-parallelism the engine does not provide yet), ``vae_compile`` (the decoder's blocks; not in
-the shipped config until measured), ``attention_backend`` (``flashinfer``, or ``sdpa``, the
+parallelism the engine does not provide yet), ``vae_compile`` (the decoder's blocks: a
+768p clip's share decodes in 2.1 s instead of 3.2 s on one H200, and the frames of the
+reference's latents stay within 62.9 dB of eager, 96.6% of bytes equal; on in
+``configs/minimax_h3_sp2.yaml``), ``attention_backend`` (``flashinfer``, or ``sdpa``, the
 reference's kernel). Runtime needs: PyAV (video encoding), transformers' image processor
 (keyframes; a server that cannot import it, for example next to a torchaudio built for
 another torch, refuses to start), FlashInfer (``attention_backend: flashinfer``), and the
