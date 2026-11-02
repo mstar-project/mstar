@@ -8,6 +8,7 @@ from typing import Any
 from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.context_parallel import positions_over_sp
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -112,8 +113,8 @@ def check_worker_graphs(
 ) -> list[str]:
     """Problems with the worker graphs ``model.get_worker_graphs`` built, and
     with the parallel groups the conductor would hand each worker. With no
-    ``specs`` (the model could not declare them) only the checks on resource
-    placement are skipped."""
+    ``specs`` (the model could not declare them) the checks on resource
+    placement, and on what a node's SP ranks do, are skipped."""
     walk_to_wgs: dict[str, list[WorkerGraph]] = {}
     for wg in worker_graphs:
         for walk in sorted(wg.graph_walks):
@@ -124,6 +125,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
+        *_sequence_parallel(model, worker_graphs, specs),
     ]
 
 
@@ -201,14 +203,12 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
                 f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
             )
-        for size, axis, enabled in (
-            (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
-        ):
-            if size > 1 and any(node not in enabled for node in names):
-                yield (
-                    f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
-                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"
-                )
+        # sp_size is checked with the resources, in `_sequence_parallel`
+        if tp > 1 and any(node not in sharding.tp_enabled_nodes for node in names):
+            yield (
+                f"node_groups[{i}] has tp_size {tp} and contains nodes not "
+                f"in tp_enabled_nodes {sorted(sharding.tp_enabled_nodes)}: {names}"
+            )
 
 
 def _walk_partitions(model: Model, walk_graphs: Mapping[str, GraphSection]) -> Iterator[str]:
@@ -514,3 +514,33 @@ def _worker_parallelism(
                 "per node, so a shared pool can admit out of step. "
                 "Give each node a resource of its own, or place them on different workers."
             )
+
+
+def _sequence_parallel(
+    model: Model, worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec] | None,
+) -> Iterator[str]:
+    """What a node group's SP ranks do (`positions_over_sp`, which the engine manager checks
+    again at load), and whether each KV pool placed over a group's ranks can stripe over them.
+    Without ``specs`` (the model's resources failed to resolve, which is reported apart) there is
+    nothing to check this against."""
+    enabled = model.get_default_sharding_config().sp_enabled_nodes
+    if specs is None:
+        return
+    groups: dict[int, tuple[int, int, set[str]]] = {}
+    for wg in worker_graphs:
+        groups.setdefault(wg._group_id, (wg._tp_comm_size, wg.sp_size, set()))[2].update(wg.section.get_nodes())
+    placed_pools = [spec for spec in specs if spec.places_positions]
+    for i, (tp, sp, nodes) in sorted(groups.items()):
+        for spec in placed_pools:
+            if spec.nodes & nodes:
+                try:
+                    spec.config.context_parallel_size(spec.resource_key, tp, sp)
+                except ValueError as e:
+                    yield f"node_groups[{i}]: {e}"
+        if sp == 1:
+            continue
+        for node in sorted(nodes):
+            try:
+                positions_over_sp(specs, node, sp, enabled)
+            except ValueError as e:
+                yield f"node_groups[{i}]: {e}"

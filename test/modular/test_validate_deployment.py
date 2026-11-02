@@ -14,8 +14,10 @@ import pytest
 import yaml
 from test_graph_runtime import _sharding_config
 from test_startup_graph_validation import (
+    ROOT,
     _loop_feeding_post,
     _prefill_decode,
+    _qwen3_5,
     _start_conductor,
     _stream_model,
     _ToyModel,
@@ -260,10 +262,47 @@ def test_ranks_not_divisible_by_the_instance_size_are_refused(tmp_path):
              r"node_groups\[0\] \(nodes \['llm'\]\) has 3 ranks; not divisible by tp_size\*sp_size \(2\*1=2\)")
 
 
-@pytest.mark.parametrize("axis", ["tp", "sp"])
-def test_parallel_node_group_over_a_node_without_support_is_refused(axis, tmp_path):
+@pytest.mark.parametrize("axis, pattern", [
+    ("tp", r"node_groups\[0\] has tp_size 2 and contains nodes not in tp_enabled_nodes"),
+    ("sp", r"node_groups\[0\]: node 'llm' on 2 SP ranks is not in sp_enabled_nodes"),
+])
+def test_parallel_node_group_over_a_node_without_support_is_refused(axis, pattern, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], f"{axis}_size": 2}])
-    _refused(_Model(), cfg, rf"node_groups\[0\] has {axis}_size 2 and contains nodes not in {axis}_enabled_nodes")
+    _refused(_Model(), cfg, pattern)
+
+
+def _paged_llm(sp_enabled_nodes=(), **kw) -> _Model:
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
+    ))
+    return _Model(specs=[kv], kv_labels={"kv": {"main": KVLabel()}}, sp_enabled_nodes=sp_enabled_nodes, **kw)
+
+
+@pytest.mark.parametrize("model,group,kv,pattern", [
+    # the placement would load the node without the SP group its own sequence parallelism needs
+    (dict(sp_enabled_nodes=["llm"]), dict(sp_size=2), {},
+     r"node_groups\[0\]: node 'llm' runs its own sequence parallelism .* sets context_parallel"),
+    ({}, dict(sp_size=4), dict(page_size=6),
+     r"node_groups\[0\]: KV 'kv': context_parallel stripes each page over 4 ranks, which doesn't divide page_size 6"),
+    (dict(tp_enabled_nodes=["llm"]), dict(tp_size=2), {},
+     r"node_groups\[0\]: KV 'kv': .* 2 KV head\(s\) over 2 TP rank\(s\) leave none sharing one"),
+], ids=["own_sp", "page_size", "kv_heads"])
+def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, pattern, tmp_path):
+    """The engine refused these on every worker, after loading the weights."""
+    size = group.get("tp_size", 1) * group.get("sp_size", 1)
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}],
+               resources={"kv": {"context_parallel": True, **kv}})
+    _refused(_paged_llm(**model), cfg, pattern)
+
+
+def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
+    config = yaml.safe_load((ROOT / "configs/qwen3_5_27b_tp4.yaml").read_text())
+    llm, = (group for group in config["node_groups"] if group["node_names"] == ["LLM"])
+    llm.update(ranks=list(range(8)), tp_size=4, sp_size=2)
+    config["resources"]["kv_cache"] = {"context_parallel": True}
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(config))
+    assert _validate(_qwen3_5(config["model"], {}, tmp_path, monkeypatch), str(path)).worker_graphs
 
 
 def test_model_yaml_hook_refusal_is_reported(tmp_path):

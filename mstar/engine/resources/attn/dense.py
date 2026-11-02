@@ -220,9 +220,6 @@ class DenseAttentionManager(AttentionManager):
         # differ in the last bits
         return fingerprint(type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend)
 
-    def depends_on(self):
-        return {self._kv_cache_name}
-
     def can_capture(self) -> bool:
         return False
 

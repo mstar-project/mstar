@@ -16,6 +16,7 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 
 import functools
 import logging
+import math
 
 import numpy as np
 import torch
@@ -406,17 +407,23 @@ class FlashInferPrefillWrapper:
         w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run planned batched prefill attention.
 
         Args:
             q: [total_tokens, num_qo_heads, head_dim]
             kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
                 (single layer slice of the full KV cache)
+            return_lse: also return each query row's log-sum-exp of its scaled scores
         Returns:
-            output: [total_tokens, num_qo_heads, head_dim]
+            output: [total_tokens, num_qo_heads, head_dim], and with ``return_lse``
+            the log-sum-exp [total_tokens, num_qo_heads], fp32, natural log
         """
-        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        if not return_lse:
+            return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True, lse_base="ln")
 
 
 class FlashInferDecodeWrapper:
@@ -614,16 +621,24 @@ class FlashInferDecodeWrapper:
         w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run planned batched decode attention.
 
         Args:
             q: [n_req, num_qo_heads, head_dim]
             kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
+            return_lse: as for the prefill wrapper's ``run``
         Returns:
-            output: [n_req, num_qo_heads, head_dim]
+            output: [n_req, num_qo_heads, head_dim], and with ``return_lse`` the
+            log-sum-exp [n_req, num_qo_heads], fp32, natural log
         """
-        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        if not return_lse:
+            return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        out, lse = self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True)
+        # the decode wrapper has no lse_base: its kernels (fa2, on either core type) report base 2
+        return out, lse * math.log(2)
 
 
 class FmhaDecodeWrapper:

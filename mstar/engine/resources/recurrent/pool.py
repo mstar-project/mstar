@@ -132,6 +132,10 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # it reads the KV pool only to key prefix snapshots, which are off above one rank; over a
+    # pool placed over SP ranks `head_shards` is TP's, so every SP partner holds the same state
+    supports_context_parallel = True
+
     @classmethod
     def build(
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,

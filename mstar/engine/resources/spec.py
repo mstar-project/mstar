@@ -133,6 +133,13 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
+    def places_positions(self) -> bool | None:
+        """Whether this resource places its token positions over ranks that would otherwise hold
+        the same copy (``mstar.engine.resources.context_parallel``); None for one that holds no
+        positions to place. A node whose resources place them runs replicated across its SP ranks."""
+        return None
+
+    @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
         """What builds this spec. Imported inside the property, so declaring a

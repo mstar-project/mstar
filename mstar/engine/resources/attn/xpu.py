@@ -58,9 +58,6 @@ class XPUPagedAttentionManager(AttentionManager):
         self._preplanned = False
         self._plan_stagers: dict[str, PinnedStager] = {}
 
-    def depends_on(self):
-        return {self._kv_cache_name}
-
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
