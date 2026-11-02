@@ -107,6 +107,11 @@ class MuseGlimmerVisionConfig:
         return self.hidden_size // self.num_attention_heads
 
     @property
+    def num_heads(self) -> int:
+        # the name the shared ViT block reads
+        return self.num_attention_heads
+
+    @property
     def patch_dim(self) -> int:
         return self.patch_temporal * 3 * self.patch_size ** 2
 

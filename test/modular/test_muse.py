@@ -39,6 +39,7 @@ from mstar.model.muse.config import (
 )
 from mstar.model.muse.weight_loader import (
     _STACKED_PARAMS,
+    _VISION_STACKED,
     text_name_remapper,
     vision_name_remapper,
 )
@@ -463,7 +464,13 @@ def test_every_vision_parameter_has_a_checkpoint_tensor():
         for mod in ("attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.proj",
                     "mlp.fc1", "mlp.fc2", "norm1", "norm2"):
             names += [f"model.vision_tower.layers.{i}.{mod}.{p}" for p in ("weight", "bias")]
-    assert {vision_name_remapper(n) for n in names} == {n for n, _ in tower.named_parameters()}
+    targets: dict[str, set] = {}
+    for name in names:
+        target, shard = _apply_stacked(vision_name_remapper(name), _VISION_STACKED)
+        targets.setdefault(target, set()).add(shard)
+    assert set(targets) == {n for n, _ in tower.named_parameters()}
+    # the split q/k/v land in the shared block's one fused projection
+    assert targets["layers.0.attn.qkv.weight"] == {"q", "k", "v"}
     assert vision_name_remapper("model.language_model.norm.weight") is None
 
 

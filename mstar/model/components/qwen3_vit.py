@@ -1,7 +1,7 @@
 """The Qwen3-VL family's ViT, and the parts other towers over packed patches
 share with it (Muse Glimmer's): a learned position grid resampled to each
 image (`bilinear_table_taps`), axial 2D rope, and attention through a ragged
-attention resource (`PackedVisionAttention`).
+attention resource (`VisionAttention`).
 
 Ported from transformers' ``modeling_qwen3_5.py`` and ``vision_utils.py``
 (Apache-2.0); the grid helpers are copied because ``transformers.vision_utils``
@@ -20,21 +20,28 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.linear import FusedColumnLinear
 
-class ViTConfig(Protocol):
-    """What the shared modules read off a tower's config."""
+
+class ViTBlockConfig(Protocol):
+    """What the rotary table and the transformer block read off a tower's config."""
 
     hidden_size: int
     intermediate_size: int
     num_heads: int
-    in_channels: int
-    patch_size: int
-    temporal_patch_size: int
     hidden_act: str
     rope_theta: float
 
     @property
     def head_dim(self) -> int: ...
+
+
+class ViTConfig(ViTBlockConfig, Protocol):
+    """What the patch embedding reads besides."""
+
+    in_channels: int
+    patch_size: int
+    temporal_patch_size: int
 
 
 # ----------------------------------------------------------------------------
@@ -170,7 +177,7 @@ class VisionRotaryEmbedding(nn.Module):
     engine's ``.to(bfloat16)`` would otherwise round them).
     """
 
-    def __init__(self, config: ViTConfig, keep_fp32: bool = False):
+    def __init__(self, config: ViTBlockConfig, keep_fp32: bool = False):
         super().__init__()
         self._spatial_dim = config.head_dim // 2
         self._theta = config.rope_theta
@@ -229,7 +236,10 @@ class VisionPatchEmbed(nn.Module):
 class VisionMLP(nn.Module):
     """Plain, not gated: one up projection, an activation, one down."""
 
-    def __init__(self, config: ViTConfig):
+    # the activations the towers here use: tanh-approximated GELU (Qwen3-VL) or exact (Muse Glimmer)
+    _GELU = {"gelu_pytorch_tanh": "tanh", "gelu_new": "tanh", "gelu": "none"}
+
+    def __init__(self, config: ViTBlockConfig):
         super().__init__()
         self.linear_fc1 = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=True,
@@ -237,33 +247,40 @@ class VisionMLP(nn.Module):
         self.linear_fc2 = nn.Linear(
             config.intermediate_size, config.hidden_size, bias=True,
         )
-        if config.hidden_act not in ("gelu_pytorch_tanh", "gelu_new"):
+        if config.hidden_act not in self._GELU:
             raise NotImplementedError(
                 f"vision activation {config.hidden_act!r} is not wired up"
             )
-        self.act_fn = nn.GELU(approximate="tanh")
+        self.act_fn = nn.GELU(approximate=self._GELU[config.hidden_act])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
-class PackedVisionAttention(nn.Module):
+class VisionAttention(nn.Module):
     """Non-causal attention over packed patches, through the plan the ragged
-    attention resource under ``attn_key`` holds for ``label`` (frames,
-    windows, ...), so this forward never sees the boundaries. That is what
-    lets a tower compile: splitting per frame here gave each frame its own
-    symint, and inductor then refused (``CantSplit``) to codegen packed runs
-    of three or more images. Rope runs in fp32, then back.
+    attention resource under ``attn_key`` holds for ``label`` (frames by
+    default; a windowed tower declares windows and frames as two labels).
 
-    A subclass provides ``project_qkv(x) -> (q, k, v)``, each
-    ``[patches, heads, head_dim]``.
+    The resource plans the layout, so this forward never sees the boundaries.
+    That is what lets the tower compile: splitting per frame here gave each
+    frame its own symint, and inductor then refused (``CantSplit``) to codegen
+    packed runs of three or more images.
+
+    q, k and v are one GEMM. A checkpoint that stores them fused loads as is,
+    one that keeps them apart loads each into its rows (``q`` / ``k`` / ``v``
+    shards, via the loader's stacked-param rules).
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, attn_key: str, label: str | None = None):
+    def __init__(self, config: ViTBlockConfig, attn_key: str, label: str | None = None):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        hidden = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.qkv = FusedColumnLinear(hidden, {"q": hidden, "k": hidden, "v": hidden}, bias=True)
+        # initialised as the nn.Linear it replaces (a checkpoint overwrites it)
+        nn.Linear.reset_parameters(self.qkv)
+        self.proj = nn.Linear(hidden, hidden)
         self.attn_key = attn_key
         self.label = label
         self.ragged_attn = None
@@ -280,12 +297,18 @@ class PackedVisionAttention(nn.Module):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         if self.ragged_attn is None:
-            raise RuntimeError(
+            raise ValueError(
                 "the vision tower has no ragged attention resource; declare a "
                 f"RaggedAttentionSpec under {self.attn_key!r} for its node"
             )
         seq_len = hidden_states.shape[0]
-        q, k, v = self.project_qkv(hidden_states)
+        # [tokens, heads, head_dim]: the ragged kernel's layout, no transposes
+        q, k, v = (
+            self.qkv(hidden_states)
+            .reshape(seq_len, 3, self.num_heads, -1)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
         # rope in fp32, as upstream does, then back
         dtype = q.dtype
         c, s = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
@@ -296,28 +319,15 @@ class PackedVisionAttention(nn.Module):
         out = self.ragged_attn.run(q, k, v, label=self.label)
         return self.proj(out.reshape(seq_len, -1).contiguous())
 
-    def project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
-
-
-class VisionAttention(PackedVisionAttention):
-    """Full attention within each frame, q, k and v from one fused projection."""
-
-    def __init__(self, config: ViTConfig, attn_key: str):
-        super().__init__(config.hidden_size, config.num_heads, attn_key)
-        self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=True)
-
-    def project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # [tokens, heads, head_dim]: the ragged kernel's layout, no transposes
-        return self.qkv(x).reshape(x.shape[0], 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
-
 
 class VisionBlock(nn.Module):
-    def __init__(self, config: ViTConfig, attn_key: str):
+    """Pre-norm attention and MLP. ``eps`` is the tower's LayerNorm epsilon."""
+
+    def __init__(self, config: ViTBlockConfig, attn_key: str, label: str | None = None, eps: float = 1e-6):
         super().__init__()
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = VisionAttention(config, attn_key)
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=eps)
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=eps)
+        self.attn = VisionAttention(config, attn_key, label)
         self.mlp = VisionMLP(config)
 
     def forward(

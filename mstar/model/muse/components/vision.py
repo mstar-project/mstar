@@ -22,7 +22,7 @@ from torch import nn
 
 from mstar.model.components.norm import rms_norm_no_weight
 from mstar.model.components.qwen3_vit import (
-    PackedVisionAttention,
+    VisionBlock,
     VisionRotaryEmbedding,
     bilinear_table_taps,
 )
@@ -133,47 +133,6 @@ def tower_inputs(grid: list[tuple[int, int, int]], config: MuseGlimmerVisionConf
 # ----------------------------------------------------------------------------
 
 
-class VisionAttention(PackedVisionAttention):
-    """Attention within each window or each frame (``label``)."""
-
-    def __init__(self, config: MuseGlimmerVisionConfig, label: str):
-        super().__init__(config.hidden_size, config.num_attention_heads, VISION_ATTN, label)
-        dim = config.hidden_size
-        self.q_proj = nn.Linear(dim, dim, bias=True)
-        self.k_proj = nn.Linear(dim, dim, bias=True)
-        self.v_proj = nn.Linear(dim, dim, bias=True)
-
-    def project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        shape = (x.shape[0], self.num_heads, self.head_dim)
-        return self.q_proj(x).view(shape), self.k_proj(x).view(shape), self.v_proj(x).view(shape)
-
-
-class VisionMLP(nn.Module):
-    def __init__(self, config: MuseGlimmerVisionConfig):
-        super().__init__()
-        if config.hidden_act != "gelu":
-            raise ValueError(f"the vision MLP's activation is gelu here, not {config.hidden_act!r}")
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(x)))
-
-
-class VisionEncoderLayer(nn.Module):
-    def __init__(self, config: MuseGlimmerVisionConfig, label: str):
-        super().__init__()
-        # eps hard-coded in the reference, not `layer_norm_eps`
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-5)
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-5)
-        self.attn = VisionAttention(config, label)
-        self.mlp = VisionMLP(config)
-
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin)
-        return x + self.mlp(self.norm2(x))
-
-
 class PatchEmbedder(nn.Module):
     def __init__(self, config: MuseGlimmerVisionConfig):
         super().__init__()
@@ -194,9 +153,11 @@ class MuseGlimmerVisionModel(nn.Module):
         # the reference keeps the frequencies fp32 and rounds only cos / sin
         self.rotary_emb = VisionRotaryEmbedding(config, keep_fp32=True)
         self.ln_pre = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Qwen3-VL's block, attending within each window or each frame (its
+        # label); the norms' eps is hard-coded in the reference, not `layer_norm_eps`
         self.layers = nn.ModuleList(
-            VisionEncoderLayer(
-                config, VISION_WINDOW if kind == WINDOW_ATTENTION else VISION_FULL,
+            VisionBlock(
+                config, VISION_ATTN, VISION_WINDOW if kind == WINDOW_ATTENTION else VISION_FULL, eps=1e-5,
             )
             for kind in config.layer_types
         )

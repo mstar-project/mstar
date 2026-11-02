@@ -2658,8 +2658,8 @@ The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_de
 which declares the walks (``media_walks(max_iters, encoders)`` and
 ``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
 through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
-media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
-also the request's output budget), the KV label and its one-span layout (``kv_labels``,
+media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
+request's output budget less the prefill's token), the KV label and its one-span layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
 the request's ``SAMPLING_KEYS`` over ``sampling_defaults``, which ``__init__`` reads
 from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
@@ -2696,9 +2696,11 @@ The ``LLM`` node subclasses ``SampledTokenDecoder``
 which also caps their batches), device loop-back of the sampled token, the splice of
 the encoders' outputs into the prompt's embeddings inside the forward
 (``where(pad, media[cumsum(pad) - 1], embed(ids))``), the step declaration around the
-sampler and the position resource, the forward through the sampler and both stop
-checks, ``TokenStepNode``'s (EOS, or the request's token count, where the loop's cap
-also ends it) on decode rows only. A media row's tensor holds exactly the pads in its
+sampler and the position resource, the forward through the sampler, and the stop: a
+``TokenStop`` over the prefill walks and decode. A stop id on a decode row ends the
+loop; a stop id on the prefill row, or a one-token budget, ends the partition before
+decode runs. The loop's cap, ``max(1, max_output_tokens - 1)``, is the only budget.
+A media row's tensor holds exactly the pads in its
 ids, checked against the layout in ``prepare_inputs``. A prompt's ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:
@@ -2733,9 +2735,11 @@ provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`
 ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
 A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
-``VisionRotaryEmbedding`` and ``PackedVisionAttention`` (attention over the packed
-patches through the ragged resource, rope in fp32), which a tower subclasses with its
-q/k/v projections (Qwen3.5's fused ``VisionAttention``, Muse Glimmer's).
+``VisionRotaryEmbedding`` (axial 2D rope; ``keep_fp32`` keeps its frequencies fp32
+through the node's dtype cast) and ``VisionBlock``, whose attention runs over the packed
+patches through the ragged resource under the block's ``label`` (Qwen3.5's frames;
+Muse Glimmer's windows and frames), q, k and v as one projection a split checkpoint
+loads by stacked-param rules.
 
 Advanced: async partitions and streaming
 ----------------------------------------

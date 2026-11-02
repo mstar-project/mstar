@@ -33,8 +33,9 @@ class FusedColumnLinear(nn.Module):
     The fused ``weight`` / ``bias`` carry a ``weight_loader(param, tensor,
     shard_id)`` method that copies one checkpoint shard into its slice of
     the fused parameter, dispatched by ``shard_id`` (a key of
-    ``shard_sizes``). Wire the per-shard checkpoint keys to it with the
-    loader's stacked-param rules.
+    ``shard_sizes``), or, with no shard id, a tensor that is already fused.
+    Wire the per-shard checkpoint keys to it with the loader's stacked-param
+    rules.
     """
 
     def __init__(
@@ -77,6 +78,13 @@ class FusedColumnLinear(nn.Module):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | int | None = None,
     ) -> None:
+        if loaded_shard_id is None:
+            # a checkpoint that stores the projection already fused
+            assert param.data.shape == loaded_weight.shape, (
+                f"fused shape mismatch: param {tuple(param.data.shape)} vs weight {tuple(loaded_weight.shape)}"
+            )
+            param.data.copy_(loaded_weight)
+            return
         assert loaded_shard_id in self._shard_sizes, (
             f"FusedColumnLinear got unknown shard id {loaded_shard_id!r}; "
             f"expected one of {list(self._shard_sizes)}"
