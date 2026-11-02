@@ -646,10 +646,10 @@ class H3Model(Model):
         return None
 
     def get_default_sharding_config(self) -> ShardingConfig:
-        # The dit shards its rows by rank (Ulysses). No tensor parallelism: the linears
-        # support it, but no config or test runs it.
+        # The dit shards its rows by rank (Ulysses), the video decoder its clips. No tensor
+        # parallelism: the linears support it, but no config or test runs it.
         return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={},
-                              sp_enabled_nodes={DIT_NODE})
+                              sp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE})
 
     def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
         if node_name in self._submodule_cache:
@@ -684,7 +684,8 @@ class H3Model(Model):
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
+                                           sp_group=sp_group)
         if node_name.startswith(VAE_DECODER_NODE + "_"):
             part = (int(node_name.rsplit("_", 1)[1]), self.vae_parallel)
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,

@@ -25,6 +25,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
@@ -419,14 +420,18 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
 
     As part ``(index, count)`` of a decode spread over ``count`` nodes, it decodes only
     its contiguous share of the clips (``clip_share``) and passes them on, stitched but
-    not yet cross-faded, to ``H3VideoCombineSubmodule``."""
+    not yet cross-faded, to ``H3VideoCombineSubmodule``. As a sequence-parallel node
+    (``sp_group``), each rank decodes its share and the shares are gathered on every rank:
+    the DiT's ranks then decode in lockstep, scheduled by its rank 0 between denoise steps."""
 
     disable_torch_compile = True
 
     def __init__(self, vae: nn.Module, config: H3Config, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 part: tuple[int, int] | None = None, compile_blocks: bool = False):
+                 part: tuple[int, int] | None = None, compile_blocks: bool = False,
+                 sp_group: CommGroup | None = None):
         super().__init__()
         self.vae = vae
+        self.sp_group = sp_group if sp_group is not None and sp_group.world_size > 1 else None
         if compile_blocks and vae is not None:
             # every call decodes tile_batch same-size tiles, so the blocks compile static
             compile_blocks_(vae.decoder.transformer_blocks)
@@ -449,6 +454,8 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         # SDPA within each fixed-size tile, as the reference: dense, one segment, no capture,
         # so a ragged resource would add planning for nothing
         z = self.ends.latents(latents.to(self.get_device()), layout)
+        if self.sp_group is not None:
+            return {VIDEO_OUTPUT: self.ends.frames(self._decode_shared(z))}
         if self.part is None:
             return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}
         z, num_clips = self.vae.clip_plan(z)
@@ -456,6 +463,19 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         # [B, clips, 3, F, H, W]; a part with no clips sends an empty run
         out = torch.stack(clips, dim=1) if clips else z.new_zeros(z.shape[0], 0, 1, 1, 1, 1)
         return {self.output_keys[0]: out}
+
+    def _decode_shared(self, z: torch.Tensor) -> torch.Tensor:
+        """This rank's ``clip_share`` of the decode, all-gathered in clip order and cross-faded
+        on every rank. A rank with no share decodes the last clip for the gather's shape."""
+        group, num_latents = self.sp_group, z.shape[2]
+        z, num_clips = self.vae.clip_plan(z)
+        share = clip_share(num_clips, group.rank, group.world_size) or range(num_clips - 1, num_clips)
+        clips = self.vae.decode_clips(z, share, sdpa_attention, self.tile_batch)
+        # rank r holds clips r * per ..., padded to per, so the gather lists them in order
+        per = -(-num_clips // group.world_size)
+        clips += [clips[-1]] * (per - len(clips))
+        gathered = group.all_gather(torch.stack(clips), dim=0)[:num_clips]
+        return self.vae.walk.assemble(list(gathered.unbind(0)), num_latents)
 
 
 class H3VideoCombineSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):

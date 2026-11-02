@@ -1629,12 +1629,17 @@ then the DiT's ``condition_proj`` and token refiner, once per request), ``vae_en
 (keyframes), ``dit`` (the DiT scaffold's denoise loop; Ulysses sequence parallel),
 ``vae_decoder`` and ``audio_decoder``. With ``vae_parallel: N`` the video decode is split
 by clips over ``vae_decoder_0`` .. ``vae_decoder_<N-1>`` (place them on the DiT's ranks)
-and cross-faded by ``video_combine``, with the same pixels as one decoder.
+and cross-faded by ``video_combine``, with the same pixels as one decoder. Placed with the
+``dit`` in its sequence-parallel group instead, ``vae_decoder`` splits the clips over the
+DiT's ranks itself and runs in lockstep with it, scheduled by its rank 0 between denoise
+steps, so a finished clip does not wait for another request's denoise
+(``configs/minimax_h3_sp2.yaml``).
 
 .. code-block:: bash
 
    mstar serve minimax_h3                                        # 4 GPUs: DiT SP4
    mstar serve minimax_h3 --config configs/minimax_h3_sp8.yaml   # 8 GPUs: DiT SP8
+   mstar serve minimax_h3 --config configs/minimax_h3_sp2.yaml   # 2 GPUs: DiT SP2
    mstar serve minimax_h3 --config configs/minimax_h3_2gpu.yaml  # 2 GPUs, no SP
 
 Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32, aspect 1:4 to

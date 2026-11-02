@@ -360,13 +360,11 @@ def test_keyframe_noise_is_drawn_first():
     assert torch.equal(seeded["latents"], want) and torch.equal(seeded["audio_latents"], audio)
 
 
-@pytest.mark.parametrize("count", [2, 3, 4])
-def test_split_decode_nodes_give_the_one_nodes_frames(count):
-    """``count`` clip shares through ``video_combine`` against one ``vae_decoder``, for a
-    batch of two requests; 14 latents make 3 clips, the last padded, so 4 leaves a share empty."""
+def _tiny_decode_case():
+    """A tiny video VAE, its config, and a batch of two requests' rows: 14 latents make 3
+    clips, the last padded."""
     from mstar.model.minimax_h3.components.video_vae import H3VideoDecoder
     from mstar.model.minimax_h3.config import H3VideoVAEConfig
-    from mstar.model.minimax_h3.submodules import H3VideoCombineSubmodule, H3VideoDecoderSubmodule
 
     torch.manual_seed(0)
     vcfg = H3VideoVAEConfig(latent_channels=4, decoder_layers=1, decoder_heads=2, decoder_head_dim=32,
@@ -375,15 +373,56 @@ def test_split_decode_nodes_give_the_one_nodes_frames(count):
     with torch.no_grad():
         for param in vae.parameters():
             param.normal_(0, 0.2)
-    config = H3Config(video_vae=vcfg)
     layout = H3Layout(text_len=3, latent_frames=14, latent_height=6, latent_width=4, audio_latents=2)
-    rows = torch.randn(2, layout.num_video_rows, 4 * 2 * 2)
+    return vae, H3Config(video_vae=vcfg), layout, torch.randn(2, layout.num_video_rows, 4 * 2 * 2)
+
+
+@pytest.mark.parametrize("count", [2, 3, 4])
+def test_split_decode_nodes_give_the_one_nodes_frames(count):
+    """``count`` clip shares through ``video_combine`` against one ``vae_decoder``; 4 leaves a share empty."""
+    from mstar.model.minimax_h3.submodules import H3VideoCombineSubmodule, H3VideoDecoderSubmodule
+
+    vae, config, layout, rows = _tiny_decode_case()
     with torch.no_grad():
         want = H3VideoDecoderSubmodule(vae, config).run_batch(rows, layout)["video_output"]
         parts = [H3VideoDecoderSubmodule(vae, config, part=(i, count)).run_batch(rows, layout)[f"video_clips_{i}"]
                  for i in range(count)]
         got = H3VideoCombineSubmodule(config, count).run_batch(parts, layout)["video_output"]
     assert got.dtype == torch.uint8 and torch.equal(got, want)
+
+
+def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
+    import torch.distributed as dist
+
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.minimax_h3.submodules import H3VideoDecoderSubmodule
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    try:
+        torch.set_num_threads(1)
+        group = CommGroup(rank, rank, list(range(world)))
+        group.device_group, group.initialized = dist.group.WORLD, True
+        vae, config, layout, rows = _tiny_decode_case()
+        with torch.no_grad():
+            frames = H3VideoDecoderSubmodule(vae, config, sp_group=group).run_batch(rows, layout)["video_output"]
+            if rank == 0:  # at the same thread count: CPU reductions round by it
+                torch.save(H3VideoDecoderSubmodule(vae, config).run_batch(rows, layout)["video_output"], f"{out}.one")
+        torch.save(frames, f"{out}.{rank}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_sequence_parallel_decode_gives_every_rank_the_one_nodes_frames(tmp_path, world):
+    """``vae_decoder`` as an SP node: each rank's share, gathered, against one decode; 4 ranks
+    over 3 clips leaves one rank without a share."""
+    import torch.multiprocessing as mp
+
+    out = str(tmp_path / "frames")
+    mp.spawn(_sp_decode, args=(world, str(tmp_path / "store"), out), nprocs=world)
+    want = torch.load(f"{out}.one")
+    for rank in range(world):
+        assert torch.equal(torch.load(f"{out}.{rank}"), want)
 
 
 def test_a_torchaudio_that_does_not_load_fails_startup_by_name(monkeypatch):
