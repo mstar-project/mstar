@@ -21,10 +21,12 @@ KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of th
 KDA = "kda"                # the KDA linear attention run against KDA_STATE
 DSA = "dsa"                # dsa_long_context: the k-pool DSA over KV_CACHE's index planes
 # KDA_STATE blocks held per request with MTP: the MTP state that drafts the next
-# step's first token, and that draft; under mtp_trims, the request's tokens in cache
+# step's first token, and that draft; under mtp_trims, the request's tokens in cache;
+# under mtp_shares_selection, the index pools the next step's draft passes attend
 MTP_HIDDEN = "mtp_hidden"
 MTP_DRAFT = "mtp_draft"
 MTP_LEN = "mtp_len"
+MTP_POOLS = "mtp_pools"
 # The one cache stream label glm5_next uses (single-label model).
 LABEL = "main"
 
@@ -386,6 +388,13 @@ class Glm5NextModelConfig:
         one's verdict exists, and never takes rows back; the device moves the block to the
         request's true rows (Glm5NextLLMSubmodule._trim_on_device)."""
         return self.mtp_num_draft_tokens > 0 and self.dsa_long_context
+
+    @property
+    def mtp_shares_selection(self) -> bool:
+        """index_share_for_mtp_iteration past index_topk: draft passes attend the last seed
+        pass's selection at the row before the block (vLLM's first pass's), not their own."""
+        return (self.mtp_trims and self.index_share_for_mtp_iteration
+                and self.mtp_num_draft_tokens > 1)
 
     @property
     def kv_rows(self) -> int:

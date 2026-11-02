@@ -84,10 +84,11 @@ class Glm5NextMLAAttention(MLAAttention):
             # plan's padding) carry a very negative rope slot: a query rope part of ones adds 0
             # to a real key (its slot is 0).
             self.kpe_query_fill = 1.0
-        # index_share_for_mtp_iteration: an MTP draft pass attends what the step's first pass
-        # attended, the cache before the step's block, so no draft sees its own or an earlier
-        # draft's row (``_draft_row_entry``)
-        self.share_mtp_indices = config.mtp_num_draft_tokens > 0 and config.index_share_for_mtp_iteration
+        # index_share_for_mtp_iteration: a draft pass attends only what the step's first pass did
+        mtp_layer = layer_idx == config.num_hidden_layers
+        self.share_mtp_indices = (mtp_layer and config.mtp_num_draft_tokens > 0
+                                  and config.index_share_for_mtp_iteration)
+        self.keeps_pools = mtp_layer and config.mtp_shares_selection
         # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages; the
@@ -115,7 +116,7 @@ class Glm5NextMLAAttention(MLAAttention):
                           ape=self.indexer.index_kpool_compress_ape)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
         return paged.select(q, w, self._kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
-                            self.dsa_group)
+                            self.dsa_group, keep_pools=self.keeps_pools)
 
     def _attend_selected(self, slots, q_nope, q_pe, latent):
         """Write the step's latents, then attend each row over just its selected slots."""
@@ -124,12 +125,14 @@ class Glm5NextMLAAttention(MLAAttention):
                                    self._dsa.ctx, self.softmax_scale)
 
     def _select_block(self, hidden_states, q_c, position_ids, row, rows):
-        """The draft row's slots under dsa_long_context: its index key joins the block's rows
-        so far (``rows["index"]``), then every block row selects (only ``row`` has a query; the
-        rest go unused)."""
+        """The draft row's slots under dsa_long_context: the first pass's (``DSAContext.reuse``),
+        or else its index key joins the block's rows so far (``rows["index"]``), then every
+        block row selects (only ``row`` has a query; the rest go unused)."""
         ctx = self._dsa.ctx if self._dsa is not None else None
         if ctx is None:
             return None
+        if ctx.reused is not None:
+            return ctx.reused
         keys, gates = rows["index"]
         n, block = keys.shape[:2]
         keys[:, row], gates[:, row] = self.indexer.keys_and_gate(hidden_states)

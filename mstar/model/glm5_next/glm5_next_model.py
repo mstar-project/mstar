@@ -56,6 +56,7 @@ from mstar.model.glm5_next.config import (
     MTP_DRAFT,
     MTP_HIDDEN,
     MTP_LEN,
+    MTP_POOLS,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -219,6 +220,12 @@ class Glm5NextModel(Model):
             # each request's tokens in cache, which every verify step advances on device
             kda_blocks[MTP_LEN] = RecurrentBlockConfig(
                 shape=(1,), dtype=torch.long, per_layer=False,
+            )
+        if self.config.mtp_shares_selection:
+            # the seed pass's top index pools, by index in the request
+            kda_blocks[MTP_POOLS] = RecurrentBlockConfig(
+                shape=(self.config.index_topk // self.config.index_kpool,), dtype=torch.int32,
+                per_layer=False,
             )
         specs = [
             KVSpec(

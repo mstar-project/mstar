@@ -114,9 +114,7 @@ class SparseGraphPlan:
         lens = _lens(lens, self.width)
         key = (tuple(lens), heads, kv_lora_rank, kpe, sm_scale)
         if key == self._plan_key:
-            # Unchanged (a decode row's length stops growing at the width): the wrapper's
-            # buffers still hold this plan. It reads only the lengths; _pack rewrites the
-            # index entries in the graph every replay.
+            # unchanged lengths (a decode row stops growing at the width): the wrapper still holds this plan
             return
         if self._planned is not None:
             # the last plan's copy out of the wrapper's pinned buffer may still be queued

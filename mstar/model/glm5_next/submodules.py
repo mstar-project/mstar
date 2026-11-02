@@ -45,6 +45,7 @@ from mstar.model.glm5_next.config import (
     MTP_DRAFT,
     MTP_HIDDEN,
     MTP_LEN,
+    MTP_POOLS,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -590,14 +591,16 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             last_hidden = torch.stack(hidden)
             new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
             if nxt is not None:
-                seeds = []
+                seeds, pools = [], []
                 for i, r in enumerate(last):  # its MTP row again, now with the sampled token
-                    self._dsa.ctx = ctx.rows(r, r + 1)
+                    self._dsa.ctx = row = ctx.rows(r, r + 1)
                     with kv.token_window(r, r + 1, LABEL):
                         embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
                         seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))
+                    pools.append(row.last_pools)
                 stored = ctx.pos.index_select(0, self._long_stager.to_device(last, ctx.pos.device)) + 1
-                self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored)
+                self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored,
+                               torch.cat(pools) if self.config.mtp_shares_selection else None)
         finally:
             self._dsa.ctx = ctx
         return new_tokens
@@ -629,16 +632,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _mtp_seed(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, prev: torch.Tensor,
-        ends: torch.Tensor | None = None,
+        ends: torch.Tensor | None = None, pools: torch.Tensor | None = None,
     ) -> None:
         """The next step's draft seed in each row's slot: the MTP state and d1, the draft for
         the token after ``prev`` (the step's next input). A prefill's ``ends`` (device: each
-        request's tokens in cache) start its ``MTP_LEN`` under mtp_trims."""
+        request's tokens in cache) start its ``MTP_LEN`` under mtp_trims; ``pools`` are the
+        seed row's selection (mtp_shares_selection)."""
         pool = engine_inputs.resources[KDA_STATE]
         pool.scatter_(MTP_HIDDEN, hidden, None)
         pool.scatter_(MTP_DRAFT, self._draft_tokens(hidden, prev)[:, None], None)
         if ends is not None and self.config.mtp_trims:
             pool.scatter_(MTP_LEN, ends[:, None], None)
+        if pools is not None:
+            pool.scatter_(MTP_POOLS, pools, None)
+
+    def _draft_ctx(self, ctx, pool, base: torch.Tensor):
+        """mtp_shares_selection: the draft passes' context, each block row attending its
+        request's seed selection (``MTP_POOLS``, made at ``base - 1``)."""
+        block = self.mtp_block
+        pos = (base - 1).to(ctx.pos.dtype).repeat_interleave(block)
+        host = (None if ctx.host_pos is None
+                else [p - 1 for p in ctx.host_pos[::block] for _ in range(block)])
+        return ctx.reuse(pos, pool.gather(MTP_POOLS, None).repeat_interleave(block, 0), host)
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """mtp_trims: point this verify step's rows (their positions, and the cache slots their
@@ -676,8 +691,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         embeds = lm.model.embed_tokens(nxt) * mtp_keep[:, None]
         ctx = self._dsa_ctx
         ends = None if ctx is None else ctx.pos.index_select(0, last) + 1
-        self._mtp_seed(engine_inputs, lm.mtp(embeds, hidden).index_select(0, last), new_tokens,
-                       ends)
+        seeds = lm.mtp(embeds, hidden).index_select(0, last)
+        pools = ctx.last_pools.index_select(0, last) if self.config.mtp_shares_selection else None
+        self._mtp_seed(engine_inputs, seeds, new_tokens, ends, pools)
 
     def _mtp_decode(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, mtp_seq: torch.Tensor,
@@ -699,13 +715,18 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         attn = lm.mtp.transformer_layer.self_attn
         latents = h.new_zeros(n, block, attn.kv_lora_rank + attn.mla_cache_kpe)
         index_rows = None
-        if self.config.dsa_long_context:  # the MTP layer's own index keys and gates
+        ctx = self._dsa_ctx
+        if self.config.mtp_shares_selection:
+            self._dsa.ctx = self._draft_ctx(ctx, pool, base)
+        elif self.config.dsa_long_context:  # the MTP layer's own index keys and gates
             d = attn.indexer.head_dim
             index_rows = (h.new_zeros(n, block, d), h.new_zeros(n, block, d))
         for row in range(k - 1):
             h = lm.mtp(lm.model.embed_tokens(drafts[-1]), h, row=row, latents=latents,
                        index_rows=index_rows)
             drafts.append(self._draft_tokens(h, drafts[-1]))
+        if self.config.mtp_shares_selection:
+            self._dsa.ctx = ctx  # the step's own, for the verify and the seed pass
         drafts = self._broadcast(torch.stack(drafts, 1))
 
         # Verify: greedy, the longest prefix of drafts the target agrees with.
@@ -730,7 +751,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         each = torch.arange(n, device=accepted.device)
         next_input = target[each, accepted]
         h_block = lm.mtp(lm.model.embed_tokens(target.reshape(-1)), hidden)
-        self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[each, accepted], next_input)
+        pools = None
+        if self.config.mtp_shares_selection:
+            pools = ctx.last_pools.view(n, block, -1)[each, accepted]
+        self._mtp_seed(engine_inputs, h_block.view(n, block, -1)[each, accepted], next_input,
+                       pools=pools)
 
         if not self.config.mtp_trims:
             keep = torch.arange(block, device=accepted.device)[None, :] <= accepted[:, None]
