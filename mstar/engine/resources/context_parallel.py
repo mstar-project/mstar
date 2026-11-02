@@ -295,7 +295,7 @@ class RingAttentionWrapper:
             queries = group.all_to_all_rows(q, to, back) if i else q
             part = _masked(*self._paged[j].run(queries, kv_cache_layer, return_lse=True), self._valid[j])
             if i:
-                part = _unpack(group.all_to_all_rows(_pack(*part), back, to), q.dtype)
+                part = _unpack(group.all_to_all_rows(_pack(*part), back, to), part[0].dtype)
             if out is None:
                 out, lse = part[0].float(), part[1]
             else:

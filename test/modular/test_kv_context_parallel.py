@@ -604,7 +604,9 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         kv.cache = case.cache(kv.placement, stored_only=True)
         _plan(attn, case, shard=shard, causal=causal)
         assert (shard.split_range("main") is not None) == split_it
-        out = shard.gather("main", attend(*shard.scatter("main", q, k, v)))
+        # the ring's hops carry queries in their own dtype and partials in the kernel's
+        queries = q.double() if split == "ring" and split_it else q
+        out = shard.gather("main", attend(*shard.scatter("main", queries, k, v)))
         assert torch.isfinite(out).all(), "a step token's K/V wasn't written"
         torch.testing.assert_close(out.float(), case.want(causal), **tol)
         last = attn.select_last_hidden(torch.arange(n, device=device)[:, None])
