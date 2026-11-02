@@ -228,7 +228,6 @@ class CanaryModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -252,7 +251,6 @@ class CanaryModel(Model):
             full_metadata=metadata,
             inputs=[edge],
             unpersist_tensors=list(edge.tensor_info),
-            step_metadata={"is_prefill": False},
         )
 
     # -------------------------------------------------------------------

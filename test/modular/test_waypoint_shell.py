@@ -149,7 +149,7 @@ def _fwd_info(
         random_seed=random_seed,
         max_tokens=0,
         resource_configs={},
-        step_metadata={"is_prefill": graph_walk == PRIME_WALK, "num_steps": num_steps},
+        step_metadata={"num_steps": num_steps},
         resource_publish_info={},
         dynamic_loop_iter_counts=(
             {} if loop_iter is None else {ROLLOUT_LOOP_NAME: loop_iter}

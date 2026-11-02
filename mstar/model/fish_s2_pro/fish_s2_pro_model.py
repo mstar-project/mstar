@@ -236,14 +236,10 @@ class FishS2ProModel(Model):
             PartitionDefinition(
                 name="AR",
                 graph_walks={"ar_prefill", "ar_prefill_clone", "ar_decode"},
-                initial_walk="ar_prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="Codec",
                 graph_walks={"codec_chunk"},
-                initial_walk=None,
-                producer_partitions=["AR"],
             ),
         ]
 
@@ -412,7 +408,7 @@ class FishS2ProModel(Model):
                 kwargs={"ar_max_tokens": self.get_max_output_tokens(**model_kwargs)},
             )
             routes = [(name, "AR") for name in self.PREFILL_INPUTS]
-            step_metadata = {**self._ar_step_metadata(metadata), PROMPT_LAYOUT_KEY: model_kwargs[PROMPT_LAYOUT_KEY]}
+            step_metadata = {PROMPT_LAYOUT_KEY: model_kwargs[PROMPT_LAYOUT_KEY]}
             if clone:
                 routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
                 step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
@@ -468,7 +464,6 @@ class FishS2ProModel(Model):
                     full_metadata=partition_metadata,
                     inputs=[edge],
                     unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._ar_step_metadata(partition_metadata),
                 )
             if partition_metadata.graph_walk == "ar_decode":
                 return ForwardPassArgs(
@@ -482,10 +477,6 @@ class FishS2ProModel(Model):
             partition_metadata.graph_walk = "codec_chunk"
             return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[])
         raise ValueError(f"Unknown Fish S2-Pro partition: {partition_name!r}")
-
-    @staticmethod
-    def _ar_step_metadata(metadata: CurrentForwardConductorMetadata) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill}
 
     # -----------------------------------------------------------------------
     # Sampling and output encoding

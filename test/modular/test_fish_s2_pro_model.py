@@ -664,7 +664,6 @@ def test_partition_state_machine_routes_clones_through_the_ref_encoder():
         ("audio_inputs", "RefEncoder"),
     }
     assert clone.step_metadata == {
-        "is_prefill": True,
         "prompt_layout": [5, 21],
         "ref_clip_key": "k",
     }
@@ -676,7 +675,7 @@ def test_partition_state_machine_routes_clones_through_the_ref_encoder():
     meta = clone.full_metadata
     decode = model.get_partition_forward_pass_args("AR", meta, pointers("ar_input_embeds"))
     assert meta.graph_walk == "ar_decode" and not meta.is_prefill and not decode.request_done
-    assert decode.inputs[0].name == "ar_input_embeds" and decode.step_metadata["is_prefill"] is False
+    assert decode.inputs[0].name == "ar_input_embeds"
     assert model.get_partition_forward_pass_args("AR", meta, {}).request_done
 
     # one frame allowed: the prefill sampled it, so the request ends without a decode walk

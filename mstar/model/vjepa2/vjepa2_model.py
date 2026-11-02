@@ -943,7 +943,7 @@ class VJepa2Model(Model):
                 edge.tensor_info = input_signals["goal_hidden"]
                 inputs.append(edge)
 
-        step_metadata: dict = {"is_prefill": True}
+        step_metadata: dict = {}
         if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
             # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
             # via ``check_stop`` once iter_idx + 1 reaches it.  The

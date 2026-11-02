@@ -310,10 +310,7 @@ class HiggsAudioModel(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={
-                "is_prefill": True,
-                "is_last_prefill": len(schedule) == 1,
-            },
+            step_metadata={"is_last_prefill": len(schedule) == 1},
         )
 
     def get_partition_forward_pass_args(
@@ -340,10 +337,7 @@ class HiggsAudioModel(Model):
                     full_metadata=metadata,
                     inputs=inputs,
                     unpersist_tensors=unpersist_tensors,
-                    step_metadata={
-                        "is_prefill": True,
-                        "is_last_prefill": step == len(schedule) - 1,
-                    },
+                    step_metadata={"is_last_prefill": step == len(schedule) - 1},
                 )
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
@@ -365,7 +359,6 @@ class HiggsAudioModel(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": False},
         )
 
     # -------------------------------------------------------------------

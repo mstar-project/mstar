@@ -62,7 +62,7 @@ def _fwd_info() -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id="r0", fwd_index=3, random_seed=7, max_tokens=128,
         graph_walk="decode", partition_name="p0",
-        step_metadata={"is_prefill": False, "chunk": 2},
+        step_metadata={"last_prefill": False, "chunk": 2},
     )
 
 

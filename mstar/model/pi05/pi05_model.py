@@ -593,7 +593,6 @@ class Pi05Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -624,7 +623,6 @@ class Pi05Model(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
             request_done=request_done,
         )
 

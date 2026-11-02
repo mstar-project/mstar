@@ -142,7 +142,6 @@ def test_glm52_initial_forward_pass_args_seed_prefill_from_the_prompt():
         "default", ["text"], ["text"], signals)
     assert args.full_metadata.graph_walk == "prefill"
     assert args.full_metadata.is_prefill is True
-    assert args.step_metadata == {"is_prefill": True}
     (edge,) = args.inputs
     assert (edge.next_node, edge.name) == ("LLM", "text_inputs")
     assert edge.tensor_info == ["PROMPT"]
@@ -165,7 +164,6 @@ def test_glm52_prefill_transitions_to_decode():
     )
 
     assert result.full_metadata.graph_walk == "decode"
-    assert result.step_metadata["is_prefill"] is False
     assert result.request_done is False
 
 
@@ -227,7 +225,6 @@ def test_glm52_decode_completion_marks_done():
     )
 
     assert result.request_done is True
-    assert result.full_metadata.kwargs["decode_finished"] is True
 
 
 # ── per-request sampling config ──

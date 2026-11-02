@@ -754,7 +754,6 @@ class Qwen3_5DenseModel(Model):
             inputs=inputs,
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
             step_metadata={
-                "is_prefill": True,
                 "last_prefill": len(schedule) == 1,
                 "prefill_order": step.order,
             },
@@ -806,7 +805,6 @@ class Qwen3_5DenseModel(Model):
         else:
             # decode stops via `LLMSubmodule.check_stop` or the loop cap;
             # reaching here again after either means the request is finished
-            metadata.kwargs["decode_finished"] = True
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=[],
@@ -819,7 +817,6 @@ class Qwen3_5DenseModel(Model):
             inputs=inputs,
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
             step_metadata={
-                "is_prefill": metadata.is_prefill,
                 "last_prefill": last_prefill,
                 "prefill_order": order,
             },

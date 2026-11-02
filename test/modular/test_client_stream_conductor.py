@@ -94,7 +94,7 @@ class _DuplexToy(Model):
         ))}
 
     def get_partitions(self):
-        return [PartitionDefinition(name="Ear", graph_walks={"listen"}, initial_walk="listen")]
+        return [PartitionDefinition(name="Ear", graph_walks={"listen"})]
 
     def get_partition_topology(self):
         return PartitionTopology(partitions=["Ear"], connections=[
@@ -365,7 +365,7 @@ def test_a_client_stream_has_one_consumer(tmp_path, monkeypatch):
             return walks
 
         def get_partitions(self):
-            return [PartitionDefinition(name="Ear", graph_walks={"listen", "listen2"}, initial_walk="listen")]
+            return [PartitionDefinition(name="Ear", graph_walks={"listen", "listen2"})]
 
     assert _refused(_TwoEars(), "exactly one consuming node")
 

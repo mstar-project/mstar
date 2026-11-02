@@ -98,8 +98,6 @@ class PartitionDefinition:
     """
     name: str                                                   # e.g., "LLM", "SNAC"
     graph_walks: set[str]                                       # walks this partition uses
-    initial_walk: str | None = None                             # first walk, or None = triggered later
-    producer_partitions: list[str] = field(default_factory=list)  # partitions feeding tokens to this one
 
 
 @dataclass

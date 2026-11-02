@@ -661,20 +661,14 @@ class Qwen3OmniModel(Model):
                     "prefill_text", "prefill_audio",
                     "prefill_vision", "thinker_decode",
                 },
-                initial_walk="prefill_text",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name="Talker",
                 graph_walks={"talker_prefill", "talker_last_prefill", "talker_decode"},
-                initial_walk="talker_prefill",
-                producer_partitions=["Thinker"],
             ),
             PartitionDefinition(
                 name="Code2Wav",
                 graph_walks={"code2wav_chunk"},
-                initial_walk="code2wav_chunk",
-                producer_partitions=["Talker"],
             ),
         ]
 
@@ -824,7 +818,6 @@ class Qwen3OmniModel(Model):
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
             step_metadata={
-                "is_prefill": True,
                 # Tell the Thinker whether to emit thinker_states.  Text only
                 # requests skip it to save cross-partition bandwidth.
                 "audio_output": audio_output,
@@ -1020,7 +1013,6 @@ class Qwen3OmniModel(Model):
         )
 
         step_metadata = {
-            "is_prefill": metadata.is_prefill,
             "is_last_prefill": is_last_prefill,
             # Persist the audio_output flag across every Thinker step so
             # the submodule can gate thinker_states emission.  Default True
@@ -1076,10 +1068,7 @@ class Qwen3OmniModel(Model):
                 full_metadata=metadata,
                 inputs=inputs,
                 unpersist_tensors=unpersist_tensors,
-                step_metadata={
-                    "is_prefill": False,
-                    "talker_max_tokens": metadata.kwargs.get("talker_max_tokens")
-                },
+                step_metadata={"talker_max_tokens": metadata.kwargs.get("talker_max_tokens")},
             )
 
         elif metadata.graph_walk == "talker_decode":

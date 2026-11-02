@@ -218,7 +218,7 @@ def test_ingest_releases_the_union_of_every_partitions_declaration(tmp_path, mon
         "b": GraphNode(name="nb", input_names=["x"], outputs=[]),
         "c": GraphNode(name="nc", input_names=["z"], outputs=[]),
     }
-    partitions = [PartitionDefinition(name=p.upper(), graph_walks={p}, initial_walk=p) for p in "abc"]
+    partitions = [PartitionDefinition(name=p.upper(), graph_walks={p}) for p in "abc"]
 
     def initial(partition, signals):
         if partition == "A":

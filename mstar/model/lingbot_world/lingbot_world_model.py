@@ -310,7 +310,6 @@ class LingBotWorldModel(Model):
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
         kw = metadata.kwargs
         return {
-            "is_prefill": metadata.is_prefill,
             "guidance_scale": 1.0,
             "num_latent_frames": kw["num_latent_frames"],
             "num_chunks": kw["num_latent_frames"] // self.config.chunk_size,

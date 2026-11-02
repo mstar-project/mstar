@@ -214,7 +214,7 @@ class ZImageModel(Model):
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
         kw = metadata.kwargs
         return {
-            "is_prefill": metadata.is_prefill, "height": kw["height"], "width": kw["width"],
+            "height": kw["height"], "width": kw["width"],
             "num_inference_steps": kw["num_inference_steps"], "text_len": kw["text_len"], "cap_len": kw["cap_len"],
         }
 

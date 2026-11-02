@@ -340,7 +340,6 @@ class Flux2KleinModel(Model):
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
         kw = metadata.kwargs
         return {
-            "is_prefill": metadata.is_prefill,
             "height": kw["height"], "width": kw["width"],
             "num_inference_steps": kw["num_inference_steps"],
             "ref_grids": kw["ref_grids"],

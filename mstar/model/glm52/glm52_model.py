@@ -293,7 +293,6 @@ class Glm52Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -313,7 +312,6 @@ class Glm52Model(Model):
             # The decode Loop ran to EOS (submodule check_stop) or to
             # max_iters; either way the request is finished.
             request_done = True
-            metadata.kwargs["decode_finished"] = True
 
         if request_done:
             return ForwardPassArgs(
@@ -332,7 +330,6 @@ class Glm52Model(Model):
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
         )
 
     # -------------------------------------------------------------------

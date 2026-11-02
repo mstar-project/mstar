@@ -229,9 +229,8 @@ def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=No
     return _ToyModel(
         walks,
         partitions=lambda: [
-            PartitionDefinition(name="P", graph_walks={"gen"}, initial_walk="gen"),
-            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})},
-                                initial_walk="chunk", producer_partitions=["P"]),
+            PartitionDefinition(name="P", graph_walks={"gen"}),
+            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})}),
         ],
         topology=lambda: PartitionTopology(partitions=["P", "C"], connections=[
             Connection(from_partition="P", to_partition="C", edge_name="codes",

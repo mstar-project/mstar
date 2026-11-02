@@ -244,7 +244,7 @@ def test_schedule_encode_text_then_generate_then_done(outputs, walk):
     )
     md = args.full_metadata
     assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, walk]
-    assert args.step_metadata == {"is_prefill": True, "height": 544, "width": 960, "num_frames": 121, "fps": 24.0}
+    assert args.step_metadata == {"height": 544, "width": 960, "num_frames": 121, "fps": 24.0}
     assert md.kwargs["request"]["recipe"] == "single"
     persist = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
     nxt = model.get_partition_forward_pass_args("default", md, persist)
