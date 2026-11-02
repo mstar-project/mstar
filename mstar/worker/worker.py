@@ -689,7 +689,7 @@ class Worker:
         # has consumed it. See ``_removal_step_reached``.
         self._removes_awaiting_step: dict[int, list[str]] = {}
 
-        # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
+        # Teardown drain: _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids take no new work and
         # persist until REMOVE_REQUEST; _reads_done_sent tracks which have
         # already ACKed, after which no read starts. These three are keyed
@@ -1077,10 +1077,8 @@ class Worker:
                 )
 
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
-        # ignoring ref counts / persist. Safe because the conductor only sends
-        # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
-        # on the abort/fail path via a prior DrainRequest, on the happy path
-        # once the api server finished reading the outputs.
+        # ignoring ref counts / persist. The conductor waits for every reader's
+        # READS_DONE first, including the API worker's output-delivery ACK.
         laps = PhaseLaps("worker.msg.remove_request.")
         self._mark_removed(body.request_id)
         freed = self.engine_manager.remove_request(request_id)
@@ -1107,10 +1105,13 @@ class Worker:
         laps.lap("runtime")
 
     def _drain_request(self, body: DrainRequest) -> None:
-        """Phase-1 teardown (abort/fail): stop scheduling this rid, then ACK
+        """Phase-1 teardown: stop scheduling this rid, then ACK
         READS_DONE once its in-flight reads finish. The hard cleanup
         (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
         only after every reader has ACKed."""
+        # A forwarded drain can arrive after removal on another socket.
+        if body.request_id in self._removed_rids:
+            return
         if self.is_tp_follower and body.source not in (
             MessageSource.TP_RANK_0, MessageSource.SELF
         ):

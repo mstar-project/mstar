@@ -1,13 +1,13 @@
-"""Teardown barrier (conductor side): the hard RemoveRequest that unlinks a
-segment is sent only after every reader has drained (READS_DONE).
+"""Teardown barrier (conductor side): every reader drains before hard removal.
 
-Covers the happy path (defer Remove until the preprocess worker finished
-delivering outputs, and unpersist still-held signals with correct counts) and
-the abort/fail path (drain all workers + preprocess worker, then Remove).
+Covers the happy path (drain workers and wait for output delivery, unpersist
+still-held signals with correct counts) and the abort/fail path (drain all
+workers + preprocess worker, then Remove).
 """
 
 import types
 from collections import deque
+from itertools import permutations
 
 import pytest
 import torch
@@ -168,23 +168,40 @@ def test_fail_defers_client_notification_until_barrier_completes():
 
 # ── happy path ──────────────────────────────────────────────────────────────
 
-def test_done_completes_client_immediately_but_defers_remove():
+@pytest.mark.parametrize("ack_order", list(permutations(("w0", "w1", PREPROCESS))))
+def test_done_completes_client_immediately_but_defers_remove(ack_order):
     c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
     c._process_request_done("r1")
 
-    # Client told right away; workers assumed done so only the preprocess worker
-    # must ACK — no Remove yet.
+    # The client hears immediately; the API worker finishes delivery on its own.
     completes = [m for e, m in c.sent if e == "api_server"
                  and m.message_type == "request_complete"]
     assert len(completes) == 1
+    assert _drain_targets(c, "r1") == {"w0", "w1"}
     assert _remove_targets(c, "r1") == set()
-    assert c.draining["r1"].expected_acks == {PREPROCESS}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
     assert "r1" in c.requests
 
-    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    for entity in ack_order[:-1]:
+        c._handle_reads_done(ReadsDone(request_id="r1", entity_id=entity))
+        assert _remove_targets(c, "r1") == set()
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=ack_order[-1]))
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
     assert "r1" not in c.requests
     assert c.admits == 1
+
+
+def test_success_sends_all_drains_before_early_acks_can_finalize():
+    c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
+    for entity in ("w0", "w1", PREPROCESS):
+        c._handle_reads_done(ReadsDone(request_id="r1", entity_id=entity))
+    c._process_request_done("r1")
+    kinds = [m.message_type for _, m in c.sent]
+    first_remove = kinds.index(WorkerMessageType.REMOVE_REQUEST)
+    assert kinds[:first_remove].count(WorkerMessageType.DRAIN_REQUEST) == 2
+    assert WorkerMessageType.DRAIN_REQUEST not in kinds[first_remove:]
+    assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
+    assert "r1" not in c.requests
 
 
 def test_done_unpersists_still_held_signals_with_ref_counts():

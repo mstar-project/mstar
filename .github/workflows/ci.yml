@@ -187,4 +187,6 @@ jobs:
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
           # the row store needs the columnar tensor store; CPU Core skips most of it
-          pytest test/rust/ test/modular/test_row_output_store.py -v
+          pytest test/rust/ test/modular/test_row_output_store.py \
+            test/modular/test_request_cleanup_race.py test/modular/test_teardown_barrier.py \
+            test/modular/test_worker_drain.py -v
