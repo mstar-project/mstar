@@ -379,8 +379,9 @@ class RecurrentStateSpec(NodeResourceSpec):
 class RecurrentStep(ResourceStep):
     """One step's work against the pool.
 
-    No ``commit`` flag, unlike ``KVStep``: a backend writes the pool in place,
-    so a non-committing reader needs two labels, reading one and writing another.
+    No ``commit`` flag, unlike ``KVStep``: a backend writes the pool in place
+    (or a decode step the row's twin slot, which commit makes current), so a
+    non-committing reader needs two labels, reading one and writing another.
 
     Forks mirror ``KVStep``'s: ``(from_label, to_label)`` pairs, reserved at
     admit and copied at plan (pre) or commit (post).

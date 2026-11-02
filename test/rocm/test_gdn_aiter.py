@@ -494,7 +494,7 @@ def _seed_state(pool, rid, seed):
 
 
 @pytest.mark.parametrize("rows", [1, 3, 8])
-def test_twin_slots_decode_exactly_what_in_place_decodes(rows):
+def test_twin_slots_decode_what_in_place_decodes(rows):
     """Eager, three steps: output, and the state and conv tail in whichever slot now holds them, bit-equal."""
     plain_pool, plain = build()
     twin_pool, twin = build(twin_slots=True)

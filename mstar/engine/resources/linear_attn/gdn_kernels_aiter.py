@@ -1,7 +1,7 @@
 """GDN on AMD GPUs through AITER's Triton and FlyDSL kernels.
 
-Every kernel reads and writes the K-last pool in place by slot, so nothing is
-gathered, transposed or scattered:
+Every kernel reads and writes the K-last pool by slot, so nothing is gathered,
+transposed or scattered:
 
 - eager prefill: ``chunk_gated_delta_rule_opt_vk``, its chunk schedule built
   once per step in ``plan`` and shared by every layer. It reads that schedule
@@ -440,8 +440,8 @@ class AiterSequentialPrefill(GDNPrefillKernel):
 
 class FlyDSLDecode(GDNDecodeKernel):
     """FlyDSL's decode: q/k/v/a/b read as the projection's column views, the
-    pool updated in place by slot. A -1 slot gets zeros and leaves the pool
-    alone (only without a sink, which this backend refuses).
+    pool updated by slot, in place or into each row's twin. A -1 slot gets zeros
+    and leaves the pool alone (only without a sink, which this backend refuses).
 
     Compiled on first call per launch shape (strides and a tiling chosen from
     rows x heads), so each capture bucket compiles in its eager warmup.
