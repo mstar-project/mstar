@@ -160,6 +160,48 @@ def test_a_delta_runs_only_between_its_steps_plan_and_commit(adapters):
             delta()
 
 
+class _Warmed(torch.nn.Module):
+    """A node whose ``fc`` the engine compiles and warms (``compile_regions``)."""
+
+    disable_torch_compile = True
+
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(4, 4, dtype=F64)
+
+    def compile_regions(self):
+        return {"fc": [(torch.ones(2, 4, dtype=F64),)]}
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(compiled, monkeypatch):
+    """The engine warms compile_regions (and warmup_compiles) outside any step: a bound
+    module there adds no delta, eager or traced, instead of refusing for want of a plan,
+    and the pool is left with none."""
+    from lora_module_helpers import pool as lora_pool
+    from lora_module_helpers import serve
+
+    from mstar.engine.engine import Engine
+    from mstar.model.components.lora.modules import bind_module_lora, module_lora_spec
+
+    real = torch.compile
+    monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
+                        else (lambda fn, **kw: fn))
+    torch._dynamo.reset()
+    with torch.device("meta"):
+        spec = module_lora_spec(_Warmed(), resource_key="lora", nodes={"N"}, root_path="")
+    node, pool = _Warmed(), lora_pool(serve(spec, {}))
+    bind_module_lora(node, {"lora": pool})
+    engine = object.__new__(Engine)
+    engine._device, engine._device_capability = CPU, SimpleNamespace(is_available=True)
+    engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None,
+                                               lora_pools=(pool,))}
+    engine._compile_regions()
+    assert pool._current is None and pool.active
+    with pytest.raises(RuntimeError, match="no plan"):
+        node.fc(torch.ones(2, 4, dtype=F64))
+
+
 # --- base-only captures ------------------------------------------------------------------
 
 class _CountingBackend(LoraOpsBackend):

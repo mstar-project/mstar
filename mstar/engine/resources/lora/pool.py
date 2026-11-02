@@ -62,8 +62,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -461,6 +462,18 @@ class LoraAdapterPool(Resource):
                 "segments to lay its LoRA rows out from"
             )
         return self._current[grouping]
+
+    @contextmanager
+    def base_only(self) -> Iterator[None]:
+        """A forward outside any step (a compile's warm-up) on this thread, as a base-only
+        step: its deltas add nothing. A compile traced here takes the base-only branch,
+        so the first step with an adapter row compiles its own."""
+        saved = self._current, self._plan_thread, self.active
+        self._current, self._plan_thread, self.active = {}, threading.get_ident(), False
+        try:
+            yield
+        finally:
+            self._current, self._plan_thread, self.active = saved
 
     def slot_state(self, index: int) -> SlotState:
         return self._slots[index]
