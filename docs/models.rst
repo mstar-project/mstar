@@ -855,10 +855,12 @@ Fish Audio S2-Pro notes
   probability carries the running total past top-p, while the reference drops
   it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
   4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
-- Each codec window carries the decoder's whole receptive field as context.
-  The codec decodes with TF32 by default: TF32 halves its conv stack, most of
-  the GPU time under concurrency (c=32 throughput +35% on an H200), and the
-  audio stays within ~60 dB SNR of the exact decode. With
+- The codec decodes each chunk's new frames from its stream's decoder state
+  (the ``codec_state`` recurrent pool, 256 streams by default; size it with
+  ``resources: {codec_state: {max_slots: ...}}``), so every frame is decoded
+  once. It decodes with TF32 by default: TF32 roughly halves its conv stack
+  and the audio stays within ~60 dB SNR of the exact decode, both measured on
+  the earlier windowed codec, not yet on the frame-once codec. With
   ``model_kwargs: {codec_exact_fp32: true}`` it runs in fp32 with TF32 off and
   the streamed audio matches the whole-utterance decode to within one int16 step.
 

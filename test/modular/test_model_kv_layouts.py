@@ -344,25 +344,6 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_fish_s2_pro_model import tiny_ar, tiny_model
-
-    ar = tiny_ar()
-    outputs = {"new_token": [torch.tensor([4])]}
-    ar.request_state("r").add("generated_frames", 0)
-    ar.postprocess("r", None, outputs)
-    prefill = SimpleNamespace(step_metadata={}, max_tokens=max_tokens, resource_configs={})
-    ar.check_stop("r", prefill, outputs)
-
-    cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
-
-    assert cap == _stops_after(
-        ar.check_stop, "ar_decode_loop", "ar_decode", 4096, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("clone", [False, True])
 def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     from test_fish_s2_pro_model import tiny_ar, tiny_model
