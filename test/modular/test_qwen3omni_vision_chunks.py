@@ -114,7 +114,7 @@ def test_a_non_final_chunk_still_streams_its_own_states_to_the_talker():
     # tokens 0-1 multimodal (layer N), 2 kept text (layer 0), 3 dropped
     mask = torch.tensor([[1, 1, 0, 0], [0, 0, 1, 0]])
     outputs = {"new_token": [torch.tensor([7])], "thinker_states": [states], "thinker_mask": [mask]}
-    info = SimpleNamespace(graph_walk="prefill_audio", step_metadata={"is_last_prefill": False})
+    info = SimpleNamespace(graph_walk="prefill_audio", step_metadata={})
 
     thinker.postprocess(0, info, outputs)
 

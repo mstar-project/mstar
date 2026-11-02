@@ -316,10 +316,11 @@ class FlashInferManager(AttentionManager):
         from prefill.
         """
         if label not in self._current_plan_states:
-            raise RuntimeError(f"FlashInfer: no plan for label {label!r} to select last tokens by")
+            raise ValueError(f"select_last_hidden: no plan for label {label!r}")
         qo_indptr_buf = self.qo_indptr_buf(label)
         if qo_indptr_buf is None:
-            # planned as a decode: one token per row, so every token is a row's last
+            # an eager step of one-token rows plans the decode wrapper, which
+            # keeps no qo_indptr: each row is its own last token
             return hidden
         last_token_indices = (qo_indptr_buf[1:] - 1).long()
         return hidden.index_select(0, last_token_indices)

@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, NamedTuple, Type
 import torch
 import yaml
 
+from mstar.api_server import media_io
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     DEFAULT_PARTITION,
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
-    StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
@@ -277,6 +277,14 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
     return keyed
 
 
+def growth_walks(model: "Model") -> frozenset[str]:
+    """The walks that grow a KV label: the conductor marks the plan step before
+    one `FINAL_PREFILL`."""
+    return frozenset(
+        walk for labels in model.kv_labels().values() for label in labels.values() for walk, _ in label.growth
+    )
+
+
 def names_checkpoint(model: "Model") -> bool:
     """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
     which may download the checkpoint (BAGEL's does)."""
@@ -515,26 +523,18 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
-@dataclass
-class ForwardPassArgs:
-    # full_metadata is at the conductor level
-    full_metadata: CurrentForwardConductorMetadata
-    inputs: list[GraphEdge]
-
-    # de_persist_tensors are tensors that will be used for the final time and
-    # not go into future graph nodes
-    unpersist_tensors: list[TensorPointerInfo]
-
-    # e.g., saw EOS or max tokens. Is used to end the request
-    request_done: bool = False
-
-    # step_metadata is at the engine / worker level; and
-    # is passed into the fwd pass
-    step_metadata: dict = field(default_factory=dict)
-
-    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
-    # partition's consumer streams
-    stream_lead_items: dict[str, int] = field(default_factory=dict)
+def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set[tuple[str, str]]:
+    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
+    edge of a connection into the walk's partition (the client's included),
+    at each node of the walk that takes it. The worker graphs and the
+    conductor's walk plans both read this, so they agree on what is streamed."""
+    partition = next(
+        (part.name for part in model.get_partitions() if graph_walk in part.graph_walks), DEFAULT_PARTITION,
+    )
+    names = {conn.edge_name for conn in model.get_partition_topology().connections if conn.to_partition == partition}
+    return {
+        (name, node.name) for node in graph.get_nodes().values() for name in names & set(node.input_names)
+    }
 
 
 class Model(ABC):
@@ -578,6 +578,12 @@ class Model(ABC):
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
 
+    # The rate the default ``load_audio`` decodes an upload to, and the longest
+    # clip it decodes (default 30 min). The request's audio budget
+    # (``media_limits``) holds on top of that.
+    AUDIO_INPUT_RATE: int = 16_000
+    MAX_AUDIO_SECONDS: float = media_io.MAX_AUDIO_SECONDS
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,
@@ -593,22 +599,12 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = DEFAULT_PARTITION
-        for part in self.get_partitions():
-            if graph_walk in part.graph_walks:
-                partition = part.name
-                break
-        input_streams = set()
-        for conn in self.get_partition_topology().connections:
-            if conn.to_partition == partition:
-                input_streams.add(conn.edge_name)
-
         return _divide_into_worker_graphs(
             graph,
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams,
+            input_streams={name for name, _ in streamed_inputs(self, graph_walk, graph)},
         )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -769,16 +765,18 @@ class Model(ABC):
 
     def get_request_resource_configs(
         self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
-        CFG, retention. The conductor resolves this once per request and the
+        CFG, retention. The conductor resolves this once per request, from the
+        request's modalities and kwargs as `walk_plan` gets them, and the
         engine hands each config to its resource at ingest.
         """
-        del model_kwargs, partition_fwd_args
+        del input_modalities, output_modalities, model_kwargs
         return {}
 
     def get_sampling_config(
@@ -867,15 +865,27 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        pass
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The walks ``partition_name`` runs for this request, in order, decided
+        at ingest; ``[]`` when the request doesn't use the partition.
+
+        The conductor runs the plan: it sends each step's inputs from the walk's
+        graph (see `WalkStep`), releases a persisted tensor once no later step
+        reads it, sets `FINAL_PREFILL` on the step before a walk that grows a KV
+        label, and ends the partition after the last step reports. A step whose
+        walk a stream feeds, and that is a bare node (or its chunk loop), runs
+        once per chunk until the worker reports the stream's final chunk. A
+        ``ValueError`` refuses the request with a 400, and so do a plan of
+        ``[]`` for every partition, a step whose walk is not the partition's,
+        and a ``bind`` key that is not an input of the step's walk.
+        """
 
     @abstractmethod
     def process_prompt(
@@ -958,11 +968,13 @@ class Model(ABC):
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
-        # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        # video-only one); torchcodec for the other containers. When FFmpeg
+        # loads, an upload neither decodes is the client's error (400).
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
+        rate = self.AUDIO_INPUT_RATE
+        audio = load_speech_file(filepath, rate, self.MAX_AUDIO_SECONDS)
+        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=rate, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
@@ -1014,11 +1026,21 @@ class Model(ABC):
         - text: utf-8; a chunk may end inside a character, since the API
           server joins a request's text chunks before decoding them
         - image: png
+        - audio: headerless 16-bit PCM at ``get_output_sample_rate``. The
+          default encodes mono: a float waveform in [-1, 1] is scaled and
+          truncated, integer samples are cast. A model with more channels
+          overrides it.
         """
         text = self.text_output() if modality == TEXT else None
         if text is not None:
             ids = drop_stop_tokens(output, text.stop_token_ids, request_kwargs)
             return text.detokenizer.to_bytes(ids)
+        if modality == "audio":
+            pcm = output.detach().cpu()
+            if pcm.is_floating_point():
+                # in fp32: bf16 and fp16 round 32767 up to 32768, which wraps
+                pcm = pcm.float().clamp(-1, 1) * 32767
+            return pcm.to(torch.int16).numpy().tobytes()
         return output.cpu().numpy().tobytes()
 
     def postprocess_inline(
@@ -1183,27 +1205,5 @@ class Model(ABC):
             PartitionDefinition(
                 name=DEFAULT_PARTITION,
                 graph_walks=walks,
-                initial_walk=None,
-                producer_partitions=[],
             )
         ]
-
-    @abstractmethod
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> "ForwardPassArgs":
-        """Return the next forward pass arguments for a specific partition.
-
-        Called by the conductor after each completed forward pass to determine
-        the next graph walk, inputs, and whether the request is done.
-
-        ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions, one per stream from another
-        partition; a client stream has no entry. For single-partition models,
-        this will be ``None`` or an empty list.
-        """
-        pass

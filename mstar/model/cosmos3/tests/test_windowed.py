@@ -60,10 +60,8 @@ def _dit(cfg=None):
 
 
 def test_windowed_gen_params_and_walk_selection() -> None:
-    """Windowed knobs quantize to latent units, the AR walk is selected at the
-    prefill transition, and every rejection fires at request resolution."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
-
+    """Windowed knobs quantize to latent units, the plan runs the AR walk after
+    the prefill, and every rejection fires at request resolution."""
     model = _windowed_model()
     p = model._resolve_gen_params(
         {"window_mode": "chained", "num_frames": 189, "size": "832x480"}, [], ["video"],
@@ -75,31 +73,12 @@ def test_windowed_gen_params_and_walk_selection() -> None:
     assert p["num_frames"] == 189
     assert p["flow_shift"] == C.V2V_DEFAULT_FLOW_SHIFT
 
-    md = CurrentForwardConductorMetadata(
-        input_modalities=[], output_modalities=["video"],
-        graph_walk=C.PREFILL_WALK, is_prefill=True, kwargs=p,
-    )
-    args = model.get_partition_forward_pass_args("default", md, {})
-    assert args.full_metadata.graph_walk == C.VIDEO_GEN_AR_WALK
-    assert [e.name for e in args.inputs] == ["latents", "unipc_model_outputs", "unipc_last_sample", "cond_latents"]
-    done = model.get_partition_forward_pass_args("default", args.full_metadata, {})
-    assert done.request_done
-
-    dec = model.get_partition_forward_pass_args(
-        C.WINDOW_DECODER_PARTITION,
-        CurrentForwardConductorMetadata(
-            input_modalities=[], output_modalities=["video"],
-            graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs=p,
-        ),
-        {},
-    )
-    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert not dec.request_done and dec.inputs == []
-    init = model.get_initial_forward_pass_args(
+    plan = model.walk_plan("default", [], ["video"], {}, {"window_mode": "chained", "num_frames": 189})
+    assert [step.walk for step in plan] == [C.PREFILL_WALK, C.VIDEO_GEN_AR_WALK]
+    (dec,) = model.walk_plan(
         C.WINDOW_DECODER_PARTITION, ["text"], ["video"], {}, {"window_mode": "kv", "num_frames": 61},
     )
-    assert init.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert init.step_metadata["num_windows"] == 2 and init.inputs == []
+    assert dec.walk == C.VIDEO_DECODE_AR_WALK and dec.step_metadata["num_windows"] == 2
 
     for bad in (
         {"window_mode": "bogus", "num_frames": 189},
@@ -160,7 +139,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     parts = {p.name: p for p in model.get_partitions()}
     assert set(parts) == {"default", C.WINDOW_DECODER_PARTITION}
     assert parts[C.WINDOW_DECODER_PARTITION].graph_walks == {C.VIDEO_DECODE_AR_WALK}
-    assert parts[C.WINDOW_DECODER_PARTITION].initial_walk == C.VIDEO_DECODE_AR_WALK
     assert C.VIDEO_DECODE_AR_WALK not in parts["default"].graph_walks
     topo = model.get_partition_topology()
     (conn,) = topo.connections
@@ -271,9 +249,10 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     sees the tail behind ``chained_head_context_latents`` latents, the encode
     sees those frames quantized as served (``_to_uint8``), and the head's
     first latent is the encoder's clip-start latent."""
+    import mstar.model.cosmos3.submodules as cosmos3_submodules
     from mstar.model.cosmos3.submodules import ChainedWindowHead, Cosmos3VAEDecoderSubmodule
 
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
     cfg.chained_head_context_latents = ctx

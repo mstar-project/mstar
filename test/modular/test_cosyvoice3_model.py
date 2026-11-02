@@ -17,6 +17,7 @@ import importlib.util
 import io
 import math
 import urllib.error
+from dataclasses import asdict
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -215,7 +216,6 @@ def test_graph_walks_and_partitions(model):
     assert walks["decode"].max_iters == model.config.max_speech_tokens
     partitions = {p.name: p for p in model.get_partitions()}
     assert partitions[LM_PARTITION].graph_walks == {"prefill", "prefill_voice", "decode"}
-    assert partitions[TOKEN2WAV_PARTITION].producer_partitions == [LM_PARTITION]
     (connection,) = model.get_partition_topology().connections
     assert connection.edge_name == SPEECH_TOKENS
     policy = connection.chunk_policy_factory()
@@ -354,53 +354,26 @@ def test_conductor_walk_follows_the_prompt_process_prompt_built(
     assert torch.equal(ids[: zero_shot_prompt.numel()], zero_shot_prompt) == (walk == "prefill_voice")
     # the data worker folds the metadata into model_kwargs, over the caller's keys
     model_kwargs = {**kwargs, **out.metadata}
-    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
-    args = model.get_initial_forward_pass_args(LM_PARTITION, modalities, ["audio"], signals, model_kwargs=model_kwargs)
-    assert args.full_metadata.graph_walk == walk
-    assert ("speaker_encoder" in {edge.next_node for edge in args.inputs}) == (walk == "prefill_voice")
+    assert model.walk_plan(LM_PARTITION, modalities, ["audio"], {}, model_kwargs)[0].walk == walk
 
 
-def test_initial_and_partition_args_route_the_walks(model):
-    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
+def test_walk_plan_binds_decode_to_the_prefill_token(model):
     facts = {MIN_SPEECH_TOKENS: 3, MAX_SPEECH_TOKENS: 40, VOICE_KEY: 77}
-    zero = model.get_initial_forward_pass_args(
-        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={PROMPT_MODE: "zero_shot", **facts}
-    )
-    assert zero.full_metadata.graph_walk == "prefill_voice"
-    routes = sorted((edge.next_node, edge.name) for edge in zero.inputs)
-    assert routes == [("llm", TEXT_INPUTS), ("speaker_encoder", "ref_audio")]
-    # the clip stays persisted for the flow node
-    assert zero.unpersist_tensors == [f"ptr-{TEXT_INPUTS}"]
-    assert facts.items() <= zero.step_metadata.items()
-    cross = model.get_initial_forward_pass_args(
-        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={PROMPT_MODE: "cross_lingual", **facts}
-    )
-    assert cross.full_metadata.graph_walk == "prefill"
-    assert {edge.next_node for edge in cross.inputs} == {"llm"}
+    lm = model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, {PROMPT_MODE: "zero_shot", **facts})
+    assert [(step.walk, dict(step.bind)) for step in lm] == [
+        ("prefill_voice", {}), ("decode", {PREV_TOKEN: SPEECH_TOKENS}),
+    ]
+    assert all(facts.items() <= step.step_metadata.items() for step in lm)
+    cross = model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, {PROMPT_MODE: "cross_lingual", **facts})
+    assert [step.walk for step in cross] == ["prefill", "decode"]
     with pytest.raises(ValueError, match="process_prompt"):
-        model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals)
+        model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, {})
     with pytest.raises(ValueError, match="process_prompt"):
-        model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs=facts)
+        model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, facts)
 
-    decode = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {SPEECH_TOKENS: ["ptr-token"]})
-    assert zero.full_metadata.graph_walk == "decode" and decode.inputs[0].name == PREV_TOKEN
-    assert decode.unpersist_tensors == ["ptr-token"]
-    assert facts.items() <= decode.step_metadata.items()
-    done = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {})
-    assert done.request_done
-
-    t2w = model.get_initial_forward_pass_args(TOKEN2WAV_PARTITION, ["text", "audio"], ["audio"], signals, facts)
-    assert t2w.full_metadata.graph_walk == "token2wav"
-    assert [edge.tensor_info for edge in t2w.inputs] == [["ptr-ref_audio"]]
-    assert t2w.step_metadata[VOICE_KEY] == 77
-    later = model.get_partition_forward_pass_args(TOKEN2WAV_PARTITION, t2w.full_metadata, signals)
-    assert all(edge.tensor_info == [] for edge in later.inputs) and later.step_metadata[VOICE_KEY] == 77
-
-
-def test_postprocess_encodes_pcm16(model):
-    pcm = model.postprocess(torch.tensor([0.0, 0.5, -2.0]), "audio")
-    assert torch.frombuffer(bytearray(pcm), dtype=torch.int16).tolist() == [0, 16383, -32767]
-    assert model.get_output_sample_rate() == SR
+    # the flow's voice walk reads the clip beside the stream, on every chunk's pass
+    [t2w] = model.walk_plan(TOKEN2WAV_PARTITION, ["text", "audio"], ["audio"], {}, facts)
+    assert t2w.walk == "token2wav" and t2w.step_metadata[VOICE_KEY] == 77
 
 
 # -- adapter (#411 media rules) -----------------------------------------------------------
@@ -846,7 +819,6 @@ def _info(rid: int, seed: int, limits=(0, 30), **knobs):
         "ras_window": 10,
         "ras_tau": 0.1,
         "ignore_eos": False,
-        "is_prefill": True,
         **knobs,
     }
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta)
@@ -1074,13 +1046,14 @@ def test_lm_caps_decode_where_its_stop_check_ends_it(model, budget):
 
 @pytest.mark.parametrize("seconds", [0.5, 1.0 + 1 / SR, 7.3, 30.0])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(seconds):
-    from mstar.model.chatterbox.components.audio import MelSpectrogram24k
+
     from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
+    from mstar.model.components.audio_features import MatchaLogMel
     from mstar.model.cosyvoice3.submodules import ReferenceEncoder, reference_tokens
 
     cfg = CosyVoice3Config()
     # token counts follow from the clip's length alone, so the weights are left as allocated
-    encoder = ReferenceEncoder(S3Tokenizer(cfg.tokenizer).eval(), MelSpectrogram24k(cfg.mel), None)
+    encoder = ReferenceEncoder(S3Tokenizer(cfg.tokenizer).eval(), MatchaLogMel(**asdict(cfg.mel)), None)
     clip = _clip(seconds)
     with torch.no_grad():
         tokens = encoder.tokens(clip)
@@ -1125,7 +1098,7 @@ def test_kv_labels_pass_the_load_checks_and_the_longest_request_fits(model):
     kwargs["max_new_tokens"] = model.config.max_speech_tokens
     out = model.process_prompt(text, ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip(30.0)]}, **kwargs)
     model_kwargs = {**kwargs, **out.metadata}
-    configs = model.get_request_resource_configs({}, model_kwargs)
+    configs = model.get_request_resource_configs([], [], model_kwargs)
     layout = model_kwargs["kv_layout"]
     refuse_undeclared_labels("CosyVoice3Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
     caps = model.get_loop_caps(**model_kwargs)

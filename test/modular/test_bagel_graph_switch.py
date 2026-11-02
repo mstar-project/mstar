@@ -1,4 +1,5 @@
 
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,3 +139,13 @@ def test_model_graph_switch_gates_optional_vit_capture(
         config = next(iter(configs.values()))
         assert config.total_tokens == [512, 1024]
         assert config.capture_batch_sizes == ([1, 2, 4] if batching else [1])
+
+
+def test_image_output_is_quantized_by_truncation_and_encoded_per_request():
+    model = bagel_model.BagelModel.__new__(bagel_model.BagelModel)
+    image = torch.full((1, 3, 8, 8), 0.5)  # the decoder's [0, 1] pixels
+    assert model.postprocess(image, "image", {"output_format": "jpeg"}).startswith(b"\xff\xd8")
+    from PIL import Image
+
+    png = Image.open(io.BytesIO(model.postprocess(image, "image")))
+    assert png.format == "PNG" and png.getpixel((0, 0)) == (127, 127, 127)  # trunc(0.5 * 255)

@@ -52,6 +52,9 @@ def test_graph_structure():
     assert isinstance(gen, Sequential)
     loop, decoder = gen.sections
     assert isinstance(loop, Loop) and loop.name == DENOISE_LOOP and loop.max_iters == model.config.max_denoise_steps
+    # the request's own step count ends the loop (and its speculation), clamped to the ceiling
+    assert model.get_loop_caps(num_inference_steps=3) == {DENOISE_LOOP: 3}
+    assert model.get_loop_caps(num_inference_steps=10**6) == {DENOISE_LOOP: model.config.max_denoise_steps}
     assert loop.section.input_names == {"text_embeds", "latents"}
     assert [(e.name, e.next_node) for e in loop.section.outputs] == [("latents", "dit")]
     assert decoder.outputs[0].next_node == EMIT_TO_CLIENT and decoder.outputs[0].output_modality == "image"
@@ -91,18 +94,14 @@ def test_process_prompt_and_validation():
 
 def test_schedule_and_caption_bucket_from_token_count():
     model = _make_model()
-    args = model.get_initial_forward_pass_args("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
-                                               model_kwargs={"width": 768, "num_inference_steps": 8})
-    md = args.full_metadata
-    assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
-    assert args.step_metadata["text_len"] == 45 and args.step_metadata["cap_len"] == 64
-    assert (args.step_metadata["height"], args.step_metadata["width"]) == (1024, 768)
-    shape = shape_from_metadata(model.config, args.step_metadata)
+    plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
+                           {"width": 768, "num_inference_steps": 8})
+    assert [step.walk for step in plan] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
+    md = plan[0].step_metadata
+    assert md["text_len"] == 45 and md["cap_len"] == 64
+    assert (md["height"], md["width"]) == (1024, 768)
+    shape = shape_from_metadata(model.config, md)
     assert shape == ZShape(grid=(64, 48), cap_len=64) and shape.image_tokens_padded == 3072
-    nxt = model.get_partition_forward_pass_args("default", md, {"text_embeds": [_info("e", [1, 64, 2560])]})
-    assert nxt.full_metadata.graph_walk == IMAGE_GEN_WALK and not nxt.request_done
-    assert {e.name for e in nxt.inputs} == {"text_embeds", "latents"}
-    assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
 
 
 def test_capture_shapes_cover_sizes_times_caption_buckets():
@@ -162,8 +161,9 @@ def test_requests_above_max_image_area_are_rejected():
 
 
 def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
-    """Mirror of the klein test: unwarmed latent shapes skip the compiled decode (no in-request autotune)."""
-    import mstar.model.z_image.submodules as subs
+    """A latent shape the compiled decode was not warmed with goes to the eager decode: an in-request
+    max-autotune compile cost 40-100 s on 1024x768 / 512^2 edits."""
+    import mstar.model.components.diffusion.decode_utils as subs
     from mstar.model.z_image.config import ZImageConfig
     from mstar.model.z_image.submodules import ZImageVaeDecoderSubmodule
 
@@ -196,10 +196,10 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     h, w = config.latent_grid(1024, 1024)
     assert len(vae.compiled) == 2 and vae.eager == []
     vae.compiled.clear()
-    node._decode_fn(torch.zeros(2, c, h * p, w * p))
-    assert [s[0] for s in vae.compiled] == [2] and vae.eager == []
-    node._decode_fn(torch.zeros(1, c, h * p // 2, w * p))
-    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2]
+    node._vae_decode(torch.zeros(3, c, h * p, w * p))  # warmed grid: compiled chunks of 2 + 1
+    assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
+    node._vae_decode(torch.zeros(1, c, h * p // 2, w * p))  # unwarmed grid: eager
+    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2, 1]
 
 
 def test_blank_prompts_are_rejected():

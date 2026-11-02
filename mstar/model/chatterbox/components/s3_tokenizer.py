@@ -17,9 +17,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.chatterbox.components.audio_frontend import mel_filter_bank, stft_power
+from mstar.model.chatterbox.components.audio_frontend import stft_power
 from mstar.model.chatterbox.config import S3TokenizerConfig
 from mstar.model.chatterbox.loader import DEFAULT_SKIP_FRAGMENTS, WeightStream, load_component
+from mstar.model.components.audio_features import librosa_mel_filters
 
 
 def _rotary_cos_sin(head_dim: int, max_positions: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,7 +177,8 @@ class S3Tokenizer(nn.Module):
         self.encoder = AudioEncoderV2(cfg)
         self.quantizer = FSQuantizer(cfg.n_state, cfg.fsq_dim, cfg.fsq_levels)
         self.register_buffer(
-            "mel_filters", mel_filter_bank(cfg.sample_rate, cfg.n_fft, cfg.n_mels), persistent=False,
+            "mel_filters", torch.from_numpy(librosa_mel_filters(cfg.sample_rate, cfg.n_fft, cfg.n_mels)),
+            persistent=False,
         )
         self.register_buffer("window", torch.hann_window(cfg.n_fft, periodic=True), persistent=False)
 

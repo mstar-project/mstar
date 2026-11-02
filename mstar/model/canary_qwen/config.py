@@ -19,7 +19,6 @@ KV_CACHE = "kv_cache"
 ATTN = "attn"
 ROPE = "rope"
 SAMPLER = "sampler"
-PREFILL_WALK = "prefill"
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
 
@@ -38,6 +37,8 @@ class CanaryQwenModelConfig:
     audio_locator_tag: str = "<|audioplaceholder|>"
     lora_scale: float = 2.0
     sampling_rate: int = 16_000
+    # the tokenizer's <|im_end|> and <|endoftext|>, set by the model
+    stop_token_ids: frozenset[int] = frozenset()
 
     @classmethod
     def from_pretrained(cls, local_dir: str | Path, llm_dir: str | Path) -> CanaryQwenModelConfig:

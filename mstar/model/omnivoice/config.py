@@ -55,7 +55,7 @@ class OmniVoiceGenerationDefaults:
     """Per-request decoding knobs and their defaults.
 
     Every one of these is per-request: they ride ``step_metadata`` and are
-    resolved once in ``OmniVoiceModel.get_initial_forward_pass_args``.  This is
+    resolved once in ``OmniVoiceModel.walk_plan``.  This is
     the reason to serve OmniVoice on a graph runtime at all — a fixed-pipeline
     port has to pick one value for the whole server.
     """

@@ -13,6 +13,9 @@ import torch
 
 from mstar.model.base import Model
 
+# the declarations the base loader reads, at their defaults
+BASE = types.SimpleNamespace(AUDIO_INPUT_RATE=Model.AUDIO_INPUT_RATE, MAX_AUDIO_SECONDS=Model.MAX_AUDIO_SECONDS)
+
 
 class _VideoOnlyFFmpegDecoder:
     calls: list[str] = []
@@ -51,7 +54,7 @@ def test_common_containers_decode_without_ffmpeg(tmp_path, video_only_ffmpeg, ex
     path = tmp_path / f"clip.{ext}"
     sf.write(path, _tone(rate, channels=channels), rate, subtype=subtype)
 
-    out = Model.load_audio(None, str(path), "cpu")
+    out = Model.load_audio(BASE, str(path), "cpu")
 
     assert video_only_ffmpeg.calls == []
     assert out.metadata == {"sample_rate": 16_000, "num_channels": 1}
@@ -65,7 +68,7 @@ def test_16k_wav_samples_are_the_file_samples(tmp_path, video_only_ffmpeg):
     sf = pytest.importorskip("soundfile")
     path = tmp_path / "clip.wav"
     sf.write(path, _tone(16_000), 16_000, subtype="FLOAT")
-    out = Model.load_audio(None, str(path), "cpu")
+    out = Model.load_audio(BASE, str(path), "cpu")
     assert torch.equal(out.data, torch.from_numpy(_tone(16_000)[:, 0]))
 
 
@@ -84,14 +87,18 @@ def test_a_crafted_header_rate_is_refused_before_resampling(tmp_path, video_only
     path = tmp_path / "crafted.wav"
     sf.write(path, _tone(16_000), rate, subtype="PCM_16")
     with pytest.raises(ValueError, match=f"unsupported sample rate {rate} Hz"):
-        Model.load_audio(None, str(path), "cpu")
+        Model.load_audio(BASE, str(path), "cpu")
 
 
-def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg):
+def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg, monkeypatch):
+    from mstar.model.components import audio_features
+
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: True)
     path = tmp_path / "clip.m4a"
     path.write_bytes(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
-    with pytest.raises(RuntimeError, match="Invalid data"):
-        Model.load_audio(None, str(path), "cpu")
+    # once FFmpeg loads, a file neither decoder reads is a 400, FFmpeg's message withheld
+    with pytest.raises(ValueError, match="could not decode the audio upload"):
+        Model.load_audio(BASE, str(path), "cpu")
     assert video_only_ffmpeg.calls == [str(path)]
 
 
@@ -111,8 +118,7 @@ def test_omnivoice_reads_a_wav_reference_without_ffmpeg(tmp_path, video_only_ffm
     req = SpeechRequest(input="hi", ref_audio=base64.b64encode(clip.read_bytes()).decode(), ref_text="hi")
     (path,) = adapters.OmniVoiceAdapter().speech_to_request(req, uploads).file_paths["audio"]
 
-    model = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24_000))
-    out = OmniVoiceModel.load_audio(model, path, "cpu")
+    out = OmniVoiceModel("k2-fsa/OmniVoice").load_audio(path, "cpu")
 
     assert video_only_ffmpeg.calls == []
     assert out.metadata == {"sample_rate": 24_000, "num_channels": 1}

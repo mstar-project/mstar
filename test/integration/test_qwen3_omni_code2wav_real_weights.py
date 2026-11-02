@@ -80,7 +80,6 @@ from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig  
 from mstar.model.qwen3_omni.submodules import Code2WavSubmodule  # noqa: E402
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards  # noqa: E402
-from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo  # noqa: E402
 
 
@@ -110,9 +109,7 @@ def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[tuple[Str
     cfg = submodule.config.code2wav
     buffer = StreamBuffer(
         request_id="r", edge_name="codec_tokens", from_partition="Talker",
-        policy=ScheduledLeftContextChunkPolicy(
-            schedule=cfg.codec_chunk_schedule, chunk=cfg.codec_chunk_frames, left_context=cfg.codec_left_context_frames,
-        ),
+        policy=cfg.chunk_policy(),
     )
     for i, frame in enumerate(frames):
         buffer.pre_read_register(f"t{i}")

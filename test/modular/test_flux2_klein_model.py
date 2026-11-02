@@ -91,6 +91,8 @@ def test_denoise_walk_structure(walk, edit):
     loop, decoder = section.sections
     assert isinstance(loop, Loop) and loop.name == DENOISE_LOOP
     assert loop.max_iters == model.config.max_denoise_steps
+    # the request's own step count ends the loop (and its speculation)
+    assert model.get_loop_caps(num_inference_steps=3) == {DENOISE_LOOP: 3}
     dit = loop.section
     assert isinstance(dit, GraphNode) and dit.name == "dit"
     expected = {"text_embeds", "latents"} | ({"ref_latents"} if edit else set())
@@ -165,14 +167,12 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
 
 def test_steps_are_clamped_to_the_loop_ceiling():
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        "default", ["text"], ["image"], _text_signals(), model_kwargs={"num_inference_steps": 10_000},
-    )
-    assert args.step_metadata["num_inference_steps"] == model.config.max_denoise_steps
+    plan = model.walk_plan("default", ["text"], ["image"], _text_signals(), {"num_inference_steps": 10_000})
+    assert plan[0].step_metadata["num_inference_steps"] == model.config.max_denoise_steps
 
 
 # ----------------------------------------------------------------------
-# Walk schedule (state machine)
+# Walk plan
 # ----------------------------------------------------------------------
 
 
@@ -180,57 +180,21 @@ def _text_signals():
     return {"text_inputs": [_tensor_info("t", [512])], "text_mask": [_tensor_info("m", [512])]}
 
 
-def _step(model, metadata, persist):
-    return model.get_partition_forward_pass_args("default", metadata, persist)
-
-
-def test_t2i_schedule_encode_text_then_image_gen_then_done():
+@pytest.mark.parametrize("refs, kwargs, walks, size, grids", [
+    ([], {"height": 768, "width": 1024}, [ENCODE_TEXT_WALK, IMAGE_GEN_WALK], (768, 1024), []),
+    # an edit encodes its references first; the size defaults to the first, and each gets a grid
+    ([[3, 512, 768], [3, 256, 256]], {}, [ENCODE_TEXT_WALK, ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK],
+     (512, 768), [[32, 48], [16, 16]]),
+], ids=["t2i", "edit"])
+def test_plan_walks_and_request_metadata(refs, kwargs, walks, size, grids):
     model = _make_model()
-    args = model.get_initial_forward_pass_args("default", ["text"], ["image"], _text_signals(),
-                                               model_kwargs={"height": 768, "width": 1024, "num_inference_steps": 4})
-    md = args.full_metadata
-    assert md.graph_walk == ENCODE_TEXT_WALK and md.is_prefill
-    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
-    assert args.step_metadata["height"] == 768 and args.step_metadata["width"] == 1024
-    assert args.step_metadata["ref_grids"] == []
-    targets = {(e.next_node, e.name) for e in args.inputs}
-    assert targets == {("text_encoder", "text_inputs"), ("text_encoder", "text_mask")}
-
-    persist = {"text_embeds": [_tensor_info("e", [1, 512, 7680])]}
-    nxt = _step(model, md, persist)
-    assert nxt.full_metadata.graph_walk == IMAGE_GEN_WALK and not nxt.full_metadata.is_prefill
-    assert not nxt.request_done
-    by_name = {e.name: e for e in nxt.inputs}
-    assert set(by_name) == {"text_embeds", "latents"}
-    assert by_name["text_embeds"].tensor_info == persist["text_embeds"]
-    assert by_name["latents"].tensor_info == []  # seeded by the dit at iteration 0
-    assert persist["text_embeds"][0].uuid in {i.uuid for i in nxt.unpersist_tensors}
-
-    done = _step(model, nxt.full_metadata, {})
-    assert done.request_done and done.inputs == []
-
-
-def test_edit_schedule_inserts_encode_image_and_defaults_size_to_the_reference():
-    model = _make_model()
-    refs = [_tensor_info("i0", [3, 512, 768]), _tensor_info("i1", [3, 256, 256])]
-    signals = {**_text_signals(), "image_inputs": refs}
-    args = model.get_initial_forward_pass_args("default", ["image", "image", "text"], ["image"], signals)
-    md = args.full_metadata
-    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK]
-    # output size defaults to the first reference image; ref grids follow every image
-    assert (args.step_metadata["height"], args.step_metadata["width"]) == (512, 768)
-    assert args.step_metadata["ref_grids"] == [[32, 48], [16, 16]]
-
-    nxt = _step(model, md, {"image_inputs": signals["image_inputs"]})
-    assert nxt.full_metadata.graph_walk == ENCODE_IMAGE_WALK and nxt.full_metadata.is_prefill
-    assert [(e.next_node, e.name) for e in nxt.inputs] == [("vae_encoder", "image_inputs")]
-
-    persist = {"text_embeds": [_tensor_info("e", [1, 512, 7680])],
-               "ref_latents": [_tensor_info("r", [1, 1792, 128])]}
-    nxt = _step(model, nxt.full_metadata, persist)
-    assert nxt.full_metadata.graph_walk == IMAGE_EDIT_WALK
-    assert {e.name for e in nxt.inputs} == {"text_embeds", "ref_latents", "latents"}
-    assert _step(model, nxt.full_metadata, {}).request_done
+    signals = {**_text_signals(), "image_inputs": [_tensor_info(f"i{k}", dims) for k, dims in enumerate(refs)]}
+    plan = model.walk_plan("default", ["image"] * len(refs) + ["text"], ["image"], signals, kwargs)
+    assert [step.walk for step in plan] == walks and not any(step.bind for step in plan)
+    assert all(step.step_metadata == plan[0].step_metadata for step in plan)
+    assert plan[0].step_metadata == {
+        "height": size[0], "width": size[1], "num_inference_steps": 4, "ref_grids": grids,
+    }
 
 
 def test_shape_key_from_step_metadata_and_capture_buckets():
@@ -447,14 +411,15 @@ def test_vae_compile_knob_reaches_the_decoder_node():
 
     vae = FakeVae()
     plain = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig())
-    assert plain._decode_one == vae.decode and plain._decode_batch_sizes == ()  # parity path: eager, any batch
+    # parity path: eager, any batch
+    assert plain._vae_decode._decode_one == vae.decode and plain._vae_decode._batch_sizes == ()
     compiled = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
-    assert compiled._decode_one != vae.decode and compiled._decode_batch_sizes == (1, 2, 4, 8)
+    assert compiled._vae_decode._decode_one != vae.decode and compiled._vae_decode._batch_sizes == (1, 2, 4, 8)
     assert _make_model(vae_compile=True).vae_compile is True and _make_model().vae_compile is False
 
 
 def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(monkeypatch):
-    import mstar.model.flux2_klein.submodules as subs
+    import mstar.model.components.diffusion.decode_utils as subs
     from mstar.model.components.diffusion.decode_utils import decode_in_chunks
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
@@ -482,7 +447,7 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
     assert vae.shapes == [(bs, lc, 64 * ph, 64 * pw) for bs in (1, 2, 4, 8)]
     vae.shapes.clear()
-    out = node._decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
+    out = node._vae_decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
     assert [s[0] for s in vae.shapes] == [4, 2, 1] and out.shape[0] == 7
     assert torch.equal(out[:, 0, 0, 0], torch.arange(7.0))  # rows stay in order
     # eager path: no warmup, any batch in one call
@@ -570,46 +535,6 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(Flux2KleinConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040), [])
-
-
-def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
-    """A latent shape the compiled decode was not warmed with goes to the eager decode: an in-request
-    max-autotune compile cost 40-100 s on 1024x768 / 512^2 edits."""
-    import mstar.model.flux2_klein.submodules as subs
-    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
-
-    class RecordingVae(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(1))
-            self.eager, self.compiled = [], []
-
-        @property
-        def dtype(self):
-            return self.weight.dtype
-
-        def decode(self, x):
-            self.eager.append(tuple(x.shape))
-            return x
-
-    def fake_compile(vae):
-        def compiled(x):
-            vae.compiled.append(tuple(x.shape))
-            return x
-        return compiled
-
-    monkeypatch.setattr(subs, "compile_vae_decode", fake_compile)
-    config = Flux2KleinConfig()
-    vae = RecordingVae()
-    node = KleinVaeDecoderSubmodule(vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-                                    decode_batch_sizes=(1, 2))
-    lc, (ph, pw) = config.vae.latent_channels, config.vae.patch_size
-    assert len(vae.compiled) == 2 and vae.eager == []
-    vae.compiled.clear()
-    node._decode(torch.zeros(3, lc, 64 * ph, 64 * pw))  # warmed grid: compiled chunks of 2 + 1
-    assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
-    node._decode(torch.zeros(2, lc, 48 * ph, 64 * pw))  # unwarmed grid: eager, no compile
-    assert vae.eager == [(2, lc, 48 * ph, 64 * pw)] and [s[0] for s in vae.compiled] == [2, 1]
 
 
 def test_blank_prompts_are_rejected():

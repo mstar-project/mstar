@@ -13,11 +13,7 @@ import warnings
 import pytest
 import torch
 
-from mstar.model.qwen3_tts.components.speaker_encoder import (
-    Qwen3TTSMelFrontEnd,
-    Qwen3TTSSpeakerEncoder,
-    slaney_mel_filterbank,
-)
+from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
 from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
 
 
@@ -72,13 +68,9 @@ def test_mel_front_end_matches_reference():
         wave, n_fft=config.n_fft, num_mels=config.mel_dim, sampling_rate=config.sample_rate,
         hop_size=config.hop_size, win_size=config.win_size, fmin=config.fmin, fmax=config.fmax,
     ).transpose(1, 2)
-    actual = Qwen3TTSMelFrontEnd(config)(wave)
+    actual = speaker_mel(config)(wave).transpose(1, 2)
     assert actual.shape == expected.shape == (2, 24000 // config.hop_size, config.mel_dim)
-    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    # the reference's own librosa filters and op sequence: bit-equal on CPU
+    assert torch.equal(actual, expected)
 
 
-def test_slaney_filterbank_matches_librosa():
-    librosa = pytest.importorskip("librosa")
-    expected = torch.from_numpy(librosa.filters.mel(sr=24000, n_fft=1024, n_mels=128, fmin=0, fmax=12000))
-    actual = slaney_mel_filterbank(24000, 1024, 128, 0, 12000)
-    torch.testing.assert_close(actual, expected.to(torch.float32), rtol=1e-6, atol=1e-7)

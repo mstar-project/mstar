@@ -37,10 +37,6 @@ from dataclasses import replace
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -59,7 +55,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.media_limits import read_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.config import (
@@ -525,135 +521,42 @@ class WaypointModel(Model):
             )
         return requested
 
-    def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        """Per-pass metadata the submodule reads off ``request_info``.
-
-        ``num_steps`` is what ``check_stop`` counts the rollout loop against;
-        nothing else in the shell is per-request.
-        """
-        return {
-            "is_prefill": metadata.is_prefill,
-            "num_steps": metadata.kwargs["num_steps"],
-            "seed_hw": metadata.kwargs.get("seed_hw"),
-        }
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """Prime the world from the seed clip, then roll it out.
+
+        Both walks read the controller streams at the dit. ``num_steps`` is
+        what ``check_stop`` counts the rollout loop against, and ``seed_hw``
+        (from the clip's ``[H, W, 3]`` or ``[T, H, W, 3]`` dims) is what the
+        encoder's ``cg_key_info`` reads; nothing else is per-request.
+        """
         del partition_name, input_modalities
         if output_modalities != ["video_frame"]:
             raise ValueError(
                 "Waypoint requires exactly one output modality, 'video_frame'; "
                 f"got {output_modalities!r}."
             )
-        # Backstop: process_prompt already rejects a malformed request (400).
-        # A raise here runs at the conductor, whose main loop swallows it, so
-        # the client would hang instead.
+        # Backstop: process_prompt already rejects a malformed request.
         for name in _CONTROLLER_STREAMS:
             if not input_signals.get(name):
                 raise ValueError(
                     f"Waypoint needs the {name!r} controller stream; "
                     "process_prompt emits all three."
                 )
-
         if not input_signals.get("image_inputs"):
             raise ValueError("Waypoint cannot start without its required seed clip.")
-        schedule = [PRIME_WALK, ROLLOUT_WALK]
-
-        # ``dims`` is ``[H, W, 3]`` or ``[T, H, W, 3]``; read by the encoder's ``cg_key_info``.
         dims = input_signals["image_inputs"][0].dims
-        seed_hw = (int(dims[-3]), int(dims[-2]))
-
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
+        request = {
             "num_steps": self._resolve_num_steps(model_kwargs),
-            "seed_hw": seed_hw,
+            "seed_hw": (int(dims[-3]), int(dims[-2])),
         }
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=["tensor"],
-            output_modalities=output_modalities,
-            graph_walk=schedule[0],
-            is_prefill=schedule[0] == PRIME_WALK,
-            kwargs=kwargs,
-        )
-        inputs = self._walk_inputs(schedule[0], input_signals)
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            # Nothing is released after the first pass: the controller streams
-            # are re-read by every frame of the rollout, and the seed clip is
-            # dropped with the request. Unpersisting either here would strand
-            # the rollout walk with no inputs and the node would never become
-            # ready.
-            unpersist_tensors=[],
-            step_metadata=self._get_step_metadata(full_metadata),
-        )
-
-    def _walk_inputs(
-        self, walk: str, signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """The external edges seeding one walk. Both walks read the controller
-        streams at the dit; only ``prime`` reads the seed clip, and it reads it
-        at the vae_encoder; only ``rollout`` seeds the dit's self loop-back."""
-        inputs = [
-            GraphEdge(next_node=DIT_NODE, name=name, persist=True)
-            for name in _CONTROLLER_STREAMS
-        ]
-        if walk == PRIME_WALK:
-            inputs.insert(
-                0,
-                GraphEdge(
-                    next_node=VAE_ENCODER_NODE, name="image_inputs", persist=True
-                ),
-            )
-        else:
-            # Sent empty, like wan22's denoise loop-back edges: the dit
-            # submodule never reads its value, only its name (F4 pattern).
-            inputs.append(GraphEdge(next_node=DIT_NODE, name="clock"))
-        for edge in inputs:
-            edge.tensor_info = signals.get(edge.name, [])
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Step through the request's walk schedule; done after the rollout."""
-        del partition_name, incoming_connections
-        metadata = partition_metadata
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        if step >= len(schedule):
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                step_metadata=self._get_step_metadata(metadata),
-                request_done=True,
-            )
-
-        metadata.kwargs["walk_step"] = step
-        walk = schedule[step]
-        metadata.graph_walk = walk
-        metadata.is_prefill = walk == PRIME_WALK
-        inputs = self._walk_inputs(walk, persist_signals)
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            # The rollout is the last walk, so its inputs are consumed for the
-            # last time here.
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata=self._get_step_metadata(metadata),
-        )
+        return [WalkStep(walk, step_metadata=request) for walk in (PRIME_WALK, ROLLOUT_WALK)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

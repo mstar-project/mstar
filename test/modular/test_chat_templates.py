@@ -35,7 +35,8 @@ def _qwen3_omni(path, text, in_mods, parts):
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
     model._processor = AutoProcessor.from_pretrained(path, trust_remote_code=False)
     model.tokenizer = model._processor.tokenizer
-    [ids] = model.process_prompt(text, in_mods, ["text"], prompt_parts=parts).new_input_tensors["text_inputs"]
+    tensors = model.process_prompt(text, in_mods, ["text"], prompt_parts=parts).new_input_tensors
+    [ids] = [t for name, ts in tensors.items() if name.startswith("text_inputs.") for t in ts]
     rendered = model._processor.apply_chat_template(CHAT, tokenize=False, add_generation_prompt=True)
     return ids.tolist(), model.tokenizer(rendered)["input_ids"]
 

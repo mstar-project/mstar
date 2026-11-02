@@ -28,8 +28,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.config import Wan22Config
@@ -106,44 +108,6 @@ class _Fp32IslandMixin:
         return result
 
 
-class _SingleRequestMixin:
-    """Serve one request per step, through the engine's batched entry point.
-
-    The v1 engine always dispatches to ``forward_batched`` — the worker builds
-    every batch with ``running_batched=True``, and nothing flips it back — so a
-    submodule that only defines ``forward`` never runs. None of the wan22 nodes
-    batch: a request's latent grid is sized by its own height/width/num_frames,
-    so two requests in one step would have to be padded to a common grid, and
-    the DiT step is large enough that the padding would cost more than the
-    batching saves. So they cap the batch at one and hand that row to
-    ``forward``, rather than pretending to a batching they do not implement.
-
-    ``max_batch_size`` is what actually keeps the batch at one: the micro
-    scheduler reads it (``Engine.get_max_batch_size``) and chunks accordingly.
-    The assert below is the backstop, not the mechanism.
-    """
-
-    def max_batch_size(self, graph_walk: str):
-        return 1
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-        assert len(request_ids) == 1, (
-            f"{type(self).__name__} does not batch; got {len(request_ids)} "
-            "requests in one step (max_batch_size should have capped it at 1)"
-        )
-        return {
-            request_ids[0]: self.forward(
-                graph_walk, engine_inputs=engine_inputs, **kwargs
-            )
-        }
-
-
 def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     owner_path, _, attr = dotted_name.rpartition(".")
     owner = module.get_submodule(owner_path) if owner_path else module
@@ -163,7 +127,7 @@ def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, in
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """UMT5-XXL prompt encoder.
 
     Consumes ``text_inputs`` = ``[positive_ids, negative_ids]``; emits
@@ -182,6 +146,10 @@ class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmo
         self.text_encoder = text_encoder
         self.config = config
         self._record_fp32_islands()
+
+    def max_batch_size(self, graph_walk: str):
+        # not batched: it runs once per request, before the denoise loop
+        return 1
 
     def prepare_inputs(
         self,
@@ -237,12 +205,12 @@ class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmo
 # vae_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE first-frame encoder (I2V requests only).
 
     Consumes ``image_inputs`` (one ``[C, H, W]`` image, float in ``[0, 1]`` or
     uint8, already at the request's height/width — the server does not resize, and
-    a mismatch is an error). Emits ``image_latent`` ``[1, vae_z_dim, 1, H/16,
+    a mismatch is an error). Emits ``image_latent`` ``[1, z_dim, 1, H/16,
     W/16]``: the mode sample of the encoded frame, normalized with the checkpoint's
     per-channel statistics in float32. The dit node injects it at frame 0 and
     rebuilds the first-frame mask itself, since the mask follows from the latent
@@ -256,6 +224,10 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         self.vae = vae
         self.config = config
         self._record_fp32_islands()
+
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each request has its own latent grid
+        return 1
 
     def prepare_inputs(
         self,
@@ -290,15 +262,8 @@ class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
             # prepare_latents: cast to fp32, then (latent - mean) * (1 / std)
             # with mean / reciprocal-std built at the latent dtype.
             latent = latent.to(torch.float32)
-            z_dim = self.config.vae_z_dim
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean).view(1, z_dim, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(
-                latent.device, latent.dtype
-            )
-            latent = (latent - latents_mean) * latents_std
+            mean, inv_std = latent_affine(self.vae, latent.dtype, latent.device)
+            latent = (latent - mean) * inv_std
         return {"image_latent": [latent]}
 
 
@@ -433,7 +398,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 infos = (engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids)
                 out[self.LATENTS] = torch.stack([
                     (1 - mask) * image_latent + mask * sample
-                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["num_steps"] else sample
+                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["schedule"].num_steps
+                    else sample
                     for info, image_latent, sample in zip(infos, kwargs["image_latent"], out[self.LATENTS], strict=True)
                 ])
         return out
@@ -517,7 +483,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 # vae_decoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE latent -> pixel decoder (tiled).
 
     Consumes the loop's final ``latents`` and emits ``video_output`` as uint8
@@ -586,22 +552,14 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 ", ".join(f"{w}x{h}" for w, h in sorted(self._fast_sizes)),
             )
 
+    def max_batch_size(self, graph_walk: str):
+        # never batched: each request has its own latent grid
+        return 1
+
     def _decode_dtype(self):
-        # TODO: pull conv3d-dtype resolution into a common helper shared with
-        # cosmos3 (same cuDNN-version issue there).
-        # cuDNN ships fast bf16 conv3d for this VAE decode only from 9.16. On
-        # older builds bf16 is 2-10x SLOWER than fp32/TF32, so read the live cuDNN
-        # version and pick accordingly; an upgrade then flips the choice on its own.
-        # WAN22_VAE_DECODE_FP32 forces fp32.
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
-        override = os.environ.get("WAN22_VAE_DECODE_FP32")
-        if override is not None:
-            on = override.lower() not in ("0", "false", "no", "off")
-            self._decode_dtype_cached = torch.float32 if on else torch.bfloat16
-        else:
-            ver = torch.backends.cudnn.version() or 0
-            self._decode_dtype_cached = torch.bfloat16 if ver >= 91600 else torch.float32
+        self._decode_dtype_cached = wan_vae_decode_dtype()
         logger.info("Wan2.2 VAE decode dtype = %s (cuDNN %s)",
                     self._decode_dtype_cached, torch.backends.cudnn.version())
         return self._decode_dtype_cached
@@ -676,15 +634,8 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 vae = vae.to(vae_dtype)
             device = self.get_device()
             latents = latents.to(device=device, dtype=vae_dtype)
-            z_dim = self.config.vae_z_dim
-            latents_mean = (
-                torch.tensor(vae.config.latents_mean).view(1, z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            mean, inv_std = latent_affine(vae, latents.dtype, latents.device)
+            latents = latents / inv_std + mean
 
             # Feature 1: pick untiled vs tiled from live free VRAM at decode time.
             height, width, num_frames = self._output_size(latents)
@@ -718,5 +669,5 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
             else:
                 video = vae.decode(latents, return_dict=False)[0]
             # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
-            frames = (video[0] / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).permute(1, 2, 3, 0).contiguous()
+            frames = truncate_to_uint8(video[0]).permute(1, 2, 3, 0).contiguous()
         return {"video_output": [frames]}

@@ -1,9 +1,9 @@
-"""The decode Loop's runaway cap against the request's output budget.
+"""The decode Loop's window against the request's output budget.
 
-check_stop enforces the per-request ``max_tokens``; the Loop's ``max_iters``
-is only the runaway guard. It used to be sized to the *default* budget
-(1024), so a request asking for more was cut short at 1025 tokens with no
-error while vLLM honored the same request in full.
+The request's loop cap (``get_loop_caps``) is its ``max_tokens``; the Loop's
+``max_iters`` is the window every cap must fit. It used to be sized to the
+*default* budget (1024), so a request asking for more was cut short at 1025
+tokens with no error while vLLM honored the same request in full.
 """
 
 import pytest
@@ -58,7 +58,7 @@ def test_loop_cap_covers_every_reachable_budget_and_stays_below_the_guard():
     m = _model()
     guard = _guard(m.config)
     decode = m.get_graph_walk_graphs()["decode"]
-    # the largest budget check_stop can honor needs guard-1 iterations
+    # the largest budget the window holds needs guard-1 iterations
     assert decode.max_iters >= m.get_loop_caps(max_output_tokens=guard)["decode_loop"]
     # ...and the cap alone cannot run a one-token prompt into the guard
     assert decode.max_iters == guard - 1
@@ -122,7 +122,7 @@ def test_postprocess_emits_raw_token_bytes():
 def test_sampling_knobs_without_a_config_default_reach_the_sampler():
     from mstar.model.glm52.config import SAMPLER_RESOURCE
 
-    cfg = _model().get_request_resource_configs({}, {"top_k": 20, "min_p": 0.05})
+    cfg = _model().get_request_resource_configs([], [], {"top_k": 20, "min_p": 0.05})
     assert cfg[SAMPLER_RESOURCE].top_k == 20 and cfg[SAMPLER_RESOURCE].min_p == 0.05
 
 

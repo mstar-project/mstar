@@ -20,7 +20,7 @@ import yaml
 
 sys.path.insert(0, ".")
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo  # noqa: E402
+from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.base import GraphNode, Loop  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.kokoro import g2p  # noqa: E402
@@ -547,26 +547,17 @@ def test_process_prompt_language_and_phonemes(voices_dir):
     assert out[PHONEME_IDS][0].shape == (1, 7) and model.g2p.calls[-1][0] == "Hola"
 
 
-def test_state_machine_and_postprocess(voices_dir):
+def test_postprocess(voices_dir):
     model = make_model(voices_dir)
-    signals = {name: [f"ptr_{name}"] for name in (PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED)}
-    first = model.get_initial_forward_pass_args("default", ["text"], ["audio"], signals)
-    assert first.full_metadata.graph_walk == SYNTH_WALK and first.request_done is False
-    assert [(e.next_node, e.name, e.tensor_info) for e in first.inputs] == [
-        (SYNTH_NODE, name, [f"ptr_{name}"]) for name in (PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED)
-    ]
-    metadata = CurrentForwardConductorMetadata(graph_walk=SYNTH_WALK, is_prefill=False)
-    assert model.get_partition_forward_pass_args("default", metadata, {}).request_done is True
-    assert model.get_initial_forward_pass_args("default", ["text"], ["text"], signals).request_done is True
     pcm = torch.tensor([1, -2, 32767], dtype=torch.int16)
     assert model.postprocess(pcm, "audio") == pcm.numpy().tobytes()
     expected = torch.tensor([16383, -32767], dtype=torch.int16).numpy().tobytes()
-    assert model.postprocess(torch.tensor([0.5, -1.0]), "audio") == expected
+    assert model.postprocess(torch.tensor([0.5, -2.0]), "audio") == expected  # scaled, truncated, clamped
     assert model.postprocess(torch.zeros(0), "audio") == b""
+    full_scale = torch.tensor([32767], dtype=torch.int16).numpy().tobytes()
+    assert model.postprocess(torch.ones(1, dtype=torch.bfloat16), "audio") == full_scale  # no bf16 wrap
     assert model.get_output_sample_rate() == model.config.sample_rate == 24000
     assert model.get_voices() == ["af_heart", "af_sky", "am_adam"] and model.get_default_voice() == "af_heart"
-    with pytest.raises(ValueError):
-        model.postprocess(pcm, "text")
 
 
 # --------------------------------------------------------------------------

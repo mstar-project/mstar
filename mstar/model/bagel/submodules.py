@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
@@ -45,7 +45,7 @@ from mstar.model.bagel.components.modeling_utils import (
 )
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
-from mstar.model.higgs_audio.config import SAMPLER
+from mstar.model.keys import SAMPLER
 from mstar.model.submodule_base import (
     END_PARTITION,
     ARNodeInputs,
@@ -1112,7 +1112,7 @@ class LLMSubmodule(ARNodeSubmodule):
         kept_rids = frozenset(
             rid for rid, walk in zip(request_ids, row_walks, strict=True)
             if walk == "decode" or (
-                rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
+                rid in info and info[rid].step_metadata.get(FINAL_PREFILL, False)
             )
         ) if graph_walk in {"prefill_text", "prefill_vit", MIXED_TEXT} else None
 
@@ -1175,7 +1175,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # passes in dummy metadata
         result["requires_cfg"] = requires_cfg_for_inputs(inputs)
         result["sample_token"] = any([
-            info.step_metadata.get("sample_prefill_token", True) \
+            info.step_metadata.get(FINAL_PREFILL, False) \
                 for info in engine_inputs.per_request_info.values()
         ])
         return result
@@ -1189,6 +1189,8 @@ class LLMSubmodule(ARNodeSubmodule):
 
         request_info = engine_inputs.single_request_info
         kwargs.update(request_info.step_metadata)
+        # the conductor marks the prefill that samples the reply's first token
+        kwargs["sample_prefill_token"] = kwargs.pop(FINAL_PREFILL, False)
 
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
@@ -1229,7 +1231,6 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
         if requires_cfg:
@@ -1266,7 +1267,6 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("requires_cfg", None)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
         hidden = self.language_model(
@@ -1295,7 +1295,6 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("requires_cfg", None)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
 
         self.language_model(
             input_embeds, mode="gen",
@@ -1325,7 +1324,6 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         kwargs.pop("temperature", None)
         kwargs.pop("top_k", None)
         kwargs.pop("top_p", None)
@@ -1382,7 +1380,6 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
 
         latents = input_embeds
 
@@ -1531,7 +1528,6 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
-        kwargs.pop("is_prefill", None)
         kwargs.pop("requires_cfg", None)
         kwargs.pop("cfg_text_scale", None)
         kwargs.pop("cfg_img_scale", None)
@@ -1701,7 +1697,7 @@ class LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         if request_info.graph_walk != "decode" and (
-            not request_info.step_metadata.get("sample_prefill_token", False)
+            not request_info.step_metadata.get(FINAL_PREFILL, False)
         ):
             outputs.pop("new_token")
             return
@@ -1718,11 +1714,12 @@ class LLMSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         hit_eos = not ignore_eos and self.eos_token_id == token
         if request_info.graph_walk != "decode":
-            # The last prefill's token comes before decode_loop exists. The
-            # conductor says whether a stop there ends the request: not for an
-            # earlier prefill's throwaway token, nor for a think-then-image
-            # request, whose image_gen only the conductor's transition can start.
-            ends = request_info.step_metadata.get("prefill_stop_ends", False)
+            # The last prefill's token comes before decode_loop exists. A stop
+            # there ends the request, but not on an earlier prefill's throwaway
+            # token, nor for a think-then-image request, whose image_gen is
+            # still to run.
+            md = request_info.step_metadata
+            ends = md.get(FINAL_PREFILL, False) and md.get("prefill_stop_ends", False)
             return {END_PARTITION} if hit_eos and ends else set()
         if hit_eos or request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens:
             return {"decode_loop"}

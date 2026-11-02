@@ -19,10 +19,11 @@ The dataclasses below preserve that ownership while exposing one
 """
 
 import json
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 
 # ---------------------------------------------------------------------------
 # Resource label constants (Talker node)
@@ -300,28 +301,13 @@ class Qwen3TTSCodecConfig:
         })
         return cls(**values)
 
-    def codec_windows(self, lead_frames: Sequence[int] = (0,)) -> list[int]:
-        """Distinct window sizes (context + new frames) the chunk schedule produces.
-
-        One pass per entry of ``lead_frames``: a stream that starts with that
-        many context-only frames (a voice clone's reference tail). These are
-        the shapes the codec captures CUDA graphs for; any other window (a
-        terminal flush, a shorter reference tail) pads up to the next one.
-        """
-        left = self.left_context_frames
-        windows = set()
-        for lead in lead_frames:
-            delivered = lead
-            for size in self.chunk_schedule:
-                windows.add(min(left, delivered) + size)
-                delivered += size
-            while True:
-                windows.add(min(left, delivered) + self.chunk_frames)
-                if delivered >= left:
-                    break
-                delivered += self.chunk_frames
-        return sorted(windows)
-
+    def chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        """The Talker -> Codec edge's chunking, in codec frames."""
+        return ScheduledLeftContextChunkPolicy(
+            schedule=self.chunk_schedule,
+            chunk=self.chunk_frames,
+            left_context=self.left_context_frames,
+        )
 
     def frames_for_samples(self, num_samples: int) -> int:
         """Codec frames the encoder emits for ``num_samples`` of input audio."""

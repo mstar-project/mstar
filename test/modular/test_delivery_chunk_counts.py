@@ -24,7 +24,7 @@ from mstar.communication.event import EventWakeup
 from mstar.communication.tensor_store import TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.conductor import Conductor, RequestData
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionState
+from mstar.conductor.request_info import PartitionState
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
@@ -143,10 +143,7 @@ def expected_counts(reports: list[WorkerGraphsDone]) -> dict[str, int]:
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: [WORKER], 1: [WORKER]}, all_worker_graph_ids={0, 1},
         max_output_tokens=64, random_seed=0, resource_configs={},
-        partition_states={"default": PartitionState(
-            partition_name="default",
-            metadata=CurrentForwardConductorMetadata(graph_walk=PREFILL, is_prefill=True),
-        )},
+        partition_states={"default": PartitionState(partition_name="default", graph_walk=PREFILL)},
     )
     conductor.requests = {"r1": request}
     for body in reports:
@@ -347,10 +344,7 @@ def test_every_rank_reports_the_chunks_it_sent():
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: ["worker_0", "worker_1"]}, all_worker_graph_ids={0},
         max_output_tokens=64, random_seed=0, resource_configs={},
-        partition_states={"default": PartitionState(
-            partition_name="default",
-            metadata=CurrentForwardConductorMetadata(graph_walk=DECODE, is_prefill=False),
-        )},
+        partition_states={"default": PartitionState(partition_name="default", graph_walk=DECODE)},
     )
     conductor.requests = {"r1": request}
     for first, names in [(True, ["sharded", "replicated"]), (False, ["sharded"])]:

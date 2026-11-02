@@ -13,7 +13,6 @@ import pytest
 import torch
 import yaml
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
@@ -457,18 +456,18 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     with pytest.raises(ValueError, match=r"max_new_tokens=5000 is outside \[1, 4096\]"):
         model.resolve_generation_kwargs({"max_new_tokens": 5000})
 
-    configs = model.get_request_resource_configs({}, {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
+    configs = model.get_request_resource_configs([], [], {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
     assert configs[T3_SAMPLER].temperature == 0.5
     assert configs[T3_SAMPLER].repetition_penalty == 1.2
     assert isinstance(configs[T3_KV], KVReqConfig)
     assert configs[T3_KV].needed_labels == [COND_LABEL, UNCOND_LABEL]
-    assert model.get_request_resource_configs({}, {"cfg_weight": 0})[T3_KV].needed_labels == [COND_LABEL]
+    assert model.get_request_resource_configs([], [], {"cfg_weight": 0})[T3_KV].needed_labels == [COND_LABEL]
 
     turbo = _make_model("turbo")
     knobs = turbo.resolve_generation_kwargs({"cfg_weight": 0.5, "exaggeration": 0.7, "min_p": 0.1})
     assert knobs["cfg_weight"] == 0.0 and knobs["exaggeration"] == 0.0 and knobs["min_p"] == 0.0
     assert knobs["top_k"] == 1000 and knobs["top_p"] == 0.95
-    assert turbo.get_request_resource_configs({}, {})[T3_KV].needed_labels == [COND_LABEL]
+    assert turbo.get_request_resource_configs([], [], {})[T3_KV].needed_labels == [COND_LABEL]
 
 
 # Each of these hung a request for 600 s, failed its whole batch, or was
@@ -597,90 +596,23 @@ def test_kv_fit_counts_the_requests_and_the_sink_page():
 
 
 # ---------------------------------------------------------------------------
-# conductor state machine
+# walk plan
 # ---------------------------------------------------------------------------
 
 
-def _pointers(*names):
-    return {name: [SimpleNamespace(name=name)] for name in names}
-
-
-def test_initial_args_builtin_voice():
+@pytest.mark.parametrize("voice", [False, True])
+def test_the_plan_picks_the_voice_walks_and_carries_each_partitions_knobs(voice):
     model = _make_model()
-    signals = _pointers(TEXT_INPUTS)
-    t3 = model.get_initial_forward_pass_args("T3", ["text"], ["audio"], signals, {"cfg_weight": 0.4})
-    assert t3.full_metadata.graph_walk == "prefill" and t3.full_metadata.is_prefill
-    assert [e.name for e in t3.inputs] == [TEXT_INPUTS]
-    assert t3.unpersist_tensors == signals[TEXT_INPUTS]
-    assert t3.step_metadata["cfg_weight"] == 0.4 and t3.step_metadata["is_prefill"] is True
-
-    s3 = model.get_initial_forward_pass_args("S3Gen", ["text"], ["audio"], signals, {})
-    assert s3.full_metadata.graph_walk == "s3gen_chunk" and s3.inputs == []
-    assert s3.step_metadata["n_cfm_timesteps"] == 10 and s3.step_metadata["watermark"] is True
-    assert s3.request_done is False
-
-
-def test_initial_args_uploaded_voice_routes_reference_to_both_partitions():
-    model = _make_model()
-    signals = _pointers(TEXT_INPUTS, REF_AUDIO, VOICE_KEY)
-    t3 = model.get_initial_forward_pass_args("T3", ["text", "audio"], ["audio"], signals, None)
-    assert t3.full_metadata.graph_walk == "prefill_voice"
-    assert {(e.name, e.next_node) for e in t3.inputs} == {
-        (TEXT_INPUTS, "T3"), (REF_AUDIO, "voice_encoder"), (VOICE_KEY, "voice_encoder"),
-    }
-    # the clip stays persisted: S3Gen reads it too
-    assert t3.unpersist_tensors == signals[TEXT_INPUTS]
-
-    s3 = model.get_initial_forward_pass_args("S3Gen", ["text", "audio"], ["audio"], signals, None)
-    assert s3.full_metadata.graph_walk == "s3gen_chunk_voice"
-    assert {(e.name, e.next_node) for e in s3.inputs} == {(REF_AUDIO, "s3gen"), (VOICE_KEY, "s3gen")}
-    assert s3.inputs[0].tensor_info == signals[REF_AUDIO]
-
-
-def test_t3_prefill_transitions_to_decode_then_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["audio"],
-        graph_walk="prefill_voice", is_prefill=True,
-        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05},
-    )
-    persist = {SPEECH_TOKENS: [SimpleNamespace(name=SPEECH_TOKENS)]}
-    result = model.get_partition_forward_pass_args("T3", metadata, persist)
-    assert result.full_metadata.graph_walk == "decode" and not result.full_metadata.is_prefill
-    assert result.inputs[0].name == PREV_TOKEN and result.inputs[0].next_node == "T3"
-    assert result.inputs[0].tensor_info == persist[SPEECH_TOKENS]
-    assert result.unpersist_tensors == persist[SPEECH_TOKENS]
-    assert result.step_metadata == {"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": False}
-    assert result.request_done is False
-
-    result = model.get_partition_forward_pass_args("T3", metadata, {})
-    assert result.request_done is True
-
-
-def test_s3gen_partition_reinjects_reference_each_chunk():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text", "audio"], output_modalities=["audio"],
-        graph_walk="s3gen_chunk_voice", is_prefill=False,
-        kwargs={"n_cfm_timesteps": 10, "watermark": False},
-    )
-    persist = _pointers(REF_AUDIO, VOICE_KEY, SPEECH_TOKENS)
-    result = model.get_partition_forward_pass_args("S3Gen", metadata, persist)
-    assert result.full_metadata.graph_walk == "s3gen_chunk_voice"
-    assert [e.name for e in result.inputs] == [REF_AUDIO, VOICE_KEY]
-    # signal-only after the first chunk: the node keeps the conditioned
-    # reference, and the handshake the conductor issues after the final chunk
-    # must not read a tensor the teardown may already have unlinked
-    assert all(e.tensor_info == [] for e in result.inputs)
-    assert result.unpersist_tensors == [] and result.request_done is False
-    assert result.step_metadata["watermark"] is False
-    # the first forward is the one that carries the clip
-    initial = model.get_initial_forward_pass_args("S3Gen", ["text", "audio"], ["audio"], persist, {})
-    assert [e.name for e in initial.inputs] == [REF_AUDIO, VOICE_KEY]
-    assert all(len(e.tensor_info) == 1 for e in initial.inputs)
-
-    metadata.graph_walk = "s3gen_chunk"
-    assert model.get_partition_forward_pass_args("S3Gen", metadata, persist).inputs == []
+    signals = {name: [SimpleNamespace(name=name)] for name in (TEXT_INPUTS, *((REF_AUDIO, VOICE_KEY) * voice))}
+    inputs = ["text", "audio"] if voice else ["text"]
+    t3 = model.walk_plan("T3", inputs, ["audio"], signals, {"cfg_weight": 0.4})
+    assert [(step.walk, dict(step.bind)) for step in t3] == [
+        ("prefill_voice" if voice else "prefill", {}), ("decode", {PREV_TOKEN: SPEECH_TOKENS}),
+    ]
+    assert all(step.step_metadata == {"cfg_weight": 0.4, "exaggeration": 0.5, "min_p": 0.05} for step in t3)
+    (s3,) = model.walk_plan("S3Gen", inputs, ["audio"], signals, {})
+    assert s3.walk == ("s3gen_chunk_voice" if voice else "s3gen_chunk")
+    assert s3.step_metadata == {"n_cfm_timesteps": 10, "watermark": True}
 
 
 def test_t3_dtype_switch():
@@ -698,16 +630,6 @@ def test_t3_dtype_switch():
     assert ChatterboxModel(
         model_path_hf="ResembleAI/chatterbox", variant="chatterbox", t3_dtype="float16",
     ).get_autocast_dtype() == torch.float16
-
-
-def test_postprocess_encodes_pcm16():
-    model = _make_model()
-    assert model.postprocess(torch.tensor([-1.0, 0.0, 1.0]), "audio") == \
-        torch.tensor([-32767, 0, 32767], dtype=torch.int16).numpy().tobytes()
-    assert model.postprocess(torch.zeros(0), "audio") == b""
-    assert model.get_output_sample_rate() == 24000
-    with pytest.raises(ValueError):
-        model.postprocess(torch.zeros(1), "text")
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +672,7 @@ def _fwd_info(rid, cfg_weight=0.5, temperature=0.8, max_new=1000):
     # the wire id differs from the handle, so state keyed by the wrong one shows
     return SimpleNamespace(
         request_id=f"wire-{rid}", rid_handle=rid,
-        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": True},
+        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=temperature, ignore_eos=False)},
         max_tokens=max_new, random_seed=0,
     )
@@ -901,10 +823,10 @@ def test_sampler_min_p_goes_through_the_resource():
     order only exists inside the sampler, so the knob rides the request's
     SamplingReqConfig and the T3 node declares the capability."""
     model = _make_model()
-    assert model.get_request_resource_configs({}, {"seed": 1})[T3_SAMPLER].min_p == 0.05
+    assert model.get_request_resource_configs([], [], {"seed": 1})[T3_SAMPLER].min_p == 0.05
     assert _sampler_spec(model).enable_min_p is True
     turbo = _make_model("turbo")
-    assert turbo.get_request_resource_configs({}, {"min_p": 0.1, "seed": 1})[T3_SAMPLER].min_p == 0.0
+    assert turbo.get_request_resource_configs([], [], {"min_p": 0.1, "seed": 1})[T3_SAMPLER].min_p == 0.0
     assert _sampler_spec(turbo).enable_min_p is False
 
 

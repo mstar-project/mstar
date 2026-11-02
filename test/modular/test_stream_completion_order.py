@@ -25,17 +25,17 @@ from mstar.communication.tensors import TensorCommunicationManager
 from mstar.communication.wire import decode
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
     PartitionState,
     StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.model.base import ForwardPassArgs, WorkerGraph
+from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList
@@ -198,27 +198,14 @@ def _collect(box):
     return out
 
 
-class _EndsLLM:
-    """The LLM partition ends on its ``passes``-th pass."""
-
-    def __init__(self, passes):
-        self.left = passes
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata,
-                                        persist_signals, incoming_connections=None):
-        assert partition_name == "LLM"
-        self.left -= 1
-        return ForwardPassArgs(
-            full_metadata=partition_metadata, inputs=[], unpersist_tensors=[],
-            request_done=self.left == 0,
-        )
-
-
 def _conductor(passes=1):
+    """The LLM partition's plan ends on its ``passes``-th pass."""
     c = object.__new__(Conductor)
-    c.model = _EndsLLM(passes)
     c.producer_triggered_partitions = set()
-    c._stream_fed_partitions = {"SNAC"}
+    c._walk_inputs = {"decode": (), "snac_chunk": ()}
+    c._walk_persists = dict.fromkeys(c._walk_inputs, frozenset())
+    c._repeating_walks = frozenset({"snac_chunk"})
+    c._growth_walks = frozenset()
     c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()
@@ -228,22 +215,20 @@ def _conductor(passes=1):
     def next_pass(request_id, pname, walk):
         c.requests[request_id].partition_states[pname].current_worker_graph_ids = {0}
     c._set_partition_worker_graph_ids = next_pass
-    meta = CurrentForwardConductorMetadata
     req = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: [PRODUCER], 1: [CONSUMER]},
         all_worker_graph_ids={0, 1}, max_output_tokens=10_000, random_seed=0,
         resource_configs={},
         partition_states={
-            "LLM": PartitionState("LLM", meta(graph_walk="decode", is_prefill=False),
-                                  current_worker_graph_ids={0}),
-            "SNAC": PartitionState("SNAC", meta(graph_walk="snac_chunk", is_prefill=False),
-                                   current_worker_graph_ids={1}),
+            "LLM": PartitionState("LLM", "decode", current_worker_graph_ids={0},
+                                  plan=[WalkStep("decode")] * passes),
+            "SNAC": PartitionState("SNAC", "snac_chunk", current_worker_graph_ids={1},
+                                   plan=[WalkStep("snac_chunk")]),
         },
         partition_definitions={
             "LLM": PartitionDefinition(name="LLM", graph_walks={"decode"}),
-            "SNAC": PartitionDefinition(name="SNAC", graph_walks={"snac_chunk"},
-                                        producer_partitions=["LLM"]),
+            "SNAC": PartitionDefinition(name="SNAC", graph_walks={"snac_chunk"}),
         },
         streaming_connections={("LLM", "SNAC", EDGE): StreamingConnectionState(
             from_partition="LLM", to_partition="SNAC", edge_name=EDGE,

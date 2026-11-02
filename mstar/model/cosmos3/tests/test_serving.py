@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 
 import pytest
-import torch
 
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.tests.stubs import StubSampler
@@ -109,14 +108,14 @@ def test_gen_params_and_step_metadata() -> None:
     p = model._resolve_gen_params({}, ["image", "text"], ["image"])
     assert p["has_image_condition"] is True
 
-    fpa = model.get_initial_forward_pass_args(
-        "p0", ["text"], ["image"], {"text_inputs": []},
-        model_kwargs={"size": "256x256", "num_inference_steps": 7},
+    plan = model.walk_plan(
+        "default", ["text"], ["image"], {"text_inputs": []}, {"size": "256x256", "num_inference_steps": 7},
     )
-    sm = fpa.step_metadata
-    assert sm["is_prefill"] is True
-    assert sm["height"] == 256 and sm["width"] == 256
-    assert sm["num_inference_steps"] == 7
+    assert [step.walk for step in plan] == ["prefill", "image_gen"]
+    for step in plan:
+        sm = step.step_metadata
+        assert sm["height"] == 256 and sm["width"] == 256
+        assert sm["num_inference_steps"] == 7
 
 
 def test_dynamic_loop_check_stop_and_wasted_step() -> None:
@@ -594,32 +593,17 @@ def test_vae_encoder_walk_and_signal_wiring() -> None:
         (loop,) = walks[walk].get_loops().values()
         assert ("cond_latents", DIT_NODE) in loop._external_inputs, walk
 
-    # The conditioning media edge targets the encoder node.
-    fpa = model.get_initial_forward_pass_args(
-        "p0", ["image", "text"], ["video"],
-        {"text_inputs": [], "image_inputs": [TensorPointerInfo(
-            dims=[3, 8, 8], dtype="float32", nbytes=768, address=0, stride=[64, 8, 1],
-            uuid="u-img", source_session_id="s", source_entity="api_server")]},
-    )
-    targets = {(e.name, e.next_node) for e in fpa.inputs}
-    assert ("image_inputs", VAE_ENCODER_NODE) in targets
-
-    # Prefill -> gen: the persisted latents ride the cond_latents edge and are
-    # unpersisted with this pass; without a persist signal the edge is empty.
-    info = TensorPointerInfo(
-        dims=[1], dtype=torch.bfloat16, nbytes=2, address=0, stride=[1],
-        uuid="u-lat", source_session_id="s", source_entity="worker",
-    )
-    fpa2 = model.get_partition_forward_pass_args(
-        "default", fpa.full_metadata, {"cond_latents": [info]},
-    )
-    cond_edges = [e for e in fpa2.inputs if e.name == "cond_latents"]
-    assert len(cond_edges) == 1 and cond_edges[0].tensor_info == [info]
-    assert info in fpa2.unpersist_tensors
-    fpa3 = model.get_initial_forward_pass_args("p1", ["text"], ["image"], {"text_inputs": []})
-    fpa4 = model.get_partition_forward_pass_args("default", fpa3.full_metadata, {})
-    (empty_edge,) = [e for e in fpa4.inputs if e.name == "cond_latents"]
-    assert empty_edge.tensor_info == []
+    # A conditioning image picks the conditioned prefill, whose encoder reads it;
+    # the denoise walk after it reads the latents that prefill persists.
+    image = TensorPointerInfo(
+        dims=[3, 8, 8], dtype="float32", nbytes=768, address=0, stride=[64, 8, 1],
+        uuid="u-img", source_session_id="s", source_entity="api_server")
+    plan = model.walk_plan("default", ["image", "text"], ["video"], {"text_inputs": [], "image_inputs": [image]}, {})
+    assert [step.walk for step in plan] == ["prefill_cond", "video_gen"]
+    assert ("image_inputs", VAE_ENCODER_NODE) in walks["prefill_cond"].get_inputs_outputs().ext_inputs
+    assert [step.walk for step in model.walk_plan("default", ["text"], ["image"], {"text_inputs": []}, {})] == [
+        "prefill", "image_gen",
+    ]
 
 
 def test_ingest_cond_latents_routing() -> None:
