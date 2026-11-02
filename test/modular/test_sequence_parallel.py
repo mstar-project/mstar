@@ -785,7 +785,7 @@ def test_an_exchange_of_a_label_the_stack_didnt_scatter_is_refused_on_every_rank
     shard = _shard(labels=("a", "b"))
     _split(shard, [("r0", "a", 8), ("r0", "b", 7)])
     x = shard.scatter("a", torch.zeros(8, HEADS, 4))
-    attn = types.SimpleNamespace(_shard=shard, _default_label="a")
+    attn = types.SimpleNamespace(_shard=shard, _default_label="a", _split_exchange="ulysses")
     with pytest.raises(ValueError, match="before the layer stack scattered it"):
         AttentionManager.exchange(attn, lambda q, k, v: q, x, x, x, label="b")
 

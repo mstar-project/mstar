@@ -432,29 +432,30 @@ class _Case:
 
 def _cp_attention(
     joint: JointGroups, device: torch.device, dtype: torch.dtype, mla=False, num_kv_heads=1, num_qo_heads=Q_HEADS,
-    shard: SequenceShard | None = None, sp_exchange: str | None = None, kv_resource=None, **attention,
+    shard: SequenceShard | None = None, sp_exchange: str | None = None, kv_resource=None, placed=True, **attention,
 ):
-    """A ``FlashInferManager`` (``FlashInferMLAManager`` for ``mla``) over a placed pool, and this
-    rank's placement; under ``shard`` (key ``"shard"``) with its ``sp_exchange``, bound to the KV
-    resource ``kv_resource(placement)`` builds (by default one holding only the placement)."""
+    """A ``FlashInferManager`` (``FlashInferMLAManager`` for ``mla``) over a placed pool (by head
+    without ``placed``), and this rank's placement; under ``shard`` (key ``"shard"``) with its
+    ``sp_exchange``, bound to the KV resource ``kv_resource(placement)`` builds (by default one
+    holding only the placement)."""
     layout = dict(head_dim=HEAD_DIM)
     if mla:
         layout = dict(head_dim=LATENT, layout=KVLayout.MLA, kv_lora_rank=CKV, qk_rope_head_dim=KPE)
         attention.update(backend=AttnBackend.FLASHINFER_MLA, sm_scale=LATENT ** -0.5)
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=num_kv_heads, max_seq_len=64, num_qo_heads=num_qo_heads,
-        max_num_pages=16, page_size=CP_PAGE, context_parallel=True, **layout,
+        max_num_pages=16, page_size=CP_PAGE, context_parallel=placed, **layout,
     ))
     info = EngineResourceInfo(
         device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies={"kv": kv},
-        head_shards=joint.tp_group.world_size,
+        head_shards=joint.tp_group.world_size if placed else joint.world_size,
     )
     spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
     if shard is not None:
         spec.shard_key, spec.sp_exchange = "shard", sp_exchange
         spec.split_exchange = spec.resolve_exchange({"kv": kv})
     attn = AttentionManager.build(spec, info)
-    placement = kv.config.place(joint, "kv")
+    placement = kv.config.place(joint, "kv") if placed else None
     # by default the KV resource's one field attention reads
     resource = types.SimpleNamespace(placement=placement, bind_sequence_shard=lambda shard: None) \
         if kv_resource is None else kv_resource(placement)
@@ -656,6 +657,85 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         torch.testing.assert_close(out.float(), case.want(causal), **tol)
         last = attn.select_last_hidden(torch.arange(n, device=device)[:, None])
         assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
+
+
+class _LatentKV:
+    """An MLA pool's layer holding ``case``'s stored context, whose ``write_kv`` writes a step's
+    latents at their slots: this rank's under ``placement`` (the rest to the sink page), every one
+    stored by head (None)."""
+
+    def __init__(self, placement, case: _Case):
+        self.placement, self._sequence_shard = placement, None
+        whole = placement or ContextParallel(1, 0, CommGroup.trivial(), True, (0,))
+        self.cache = case.cache(whole, stored_only=True)
+        logical = [(view.page_idxs[pos // CP_PAGE], pos % CP_PAGE) for view in case.plan["main"].views
+                   for pos in range(view.length - view.to_compute, view.length)]
+        pages, slots = whole.write_slots(*(np.array(a) for a in zip(*logical, strict=True)))
+        self._where = tuple(torch.as_tensor(a, dtype=torch.long) for a in (pages, slots))
+
+    def bind_sequence_shard(self, shard):
+        self._sequence_shard = shard
+
+    def write_kv(self, latent, v=None):
+        assert v is None and latent.shape[0] == len(self._where[0]), "a write of the whole step's latents"
+        self._sequence_shard.check_bypass("main", "a K/V write", by_head=self.placement is None)
+        self.cache[self._where] = latent
+
+
+def _mla_split_step(rank, world, store, placed):
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    torch.set_num_threads(1)
+    sys.modules["flashinfer"] = reference_flashinfer()
+    group = _group(rank, world)
+    group.device_group, group.initialized = dist.group.WORLD, True
+    try:
+        _mla_split(group, placed)
+    finally:
+        group.device_group = None
+        dist.destroy_process_group()
+
+
+def _mla_split(group: CommGroup, placed: bool) -> None:
+    """``PREFILL_ROWS`` through ``FlashInferMLAManager.exchange``, as the MLA layer calls it (the
+    latents' write and the attention), copied and then split: over a pool stored by head by
+    ``kv_gather`` (every rank attends its own queries over the gathered latents), over a placed
+    one by ``all_gather`` (the query parts and latents gathered). Each against one rank's
+    attention, and the sampler's rows are each row's last token of the whole step."""
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+    shard = SequenceShard(("main",), 0, None, 0, group)
+    case = _Case.build(PREFILL_ROWS, CPU, torch.float32, mla=True)
+    kv = None
+
+    def latent_kv(placement):
+        nonlocal kv
+        kv = _LatentKV(placement, case)
+        return kv
+
+    attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, shard=shard, placed=placed,
+                            sp_exchange="all_gather" if placed else None, kv_resource=latent_kv)
+    assert attn._split_exchange == ("all_gather" if placed else "kv_gather")
+
+    def run(q, latent, v):
+        kv.write_kv(latent, v)
+        return attn.run(q[0], "main", kv_cache_layer=kv.cache, k=latent, q_pe=q[1])
+
+    (q_nope, q_pe), (latent,) = case.queries(), case.new_keys()
+    n = q_nope.shape[0]
+    for split_it in (False, True):
+        shard.min_tokens = 0 if split_it else n + 1
+        kv.cache = _LatentKV(kv.placement, case).cache
+        _plan(attn, case, shard=shard)
+        assert (shard.split_range("main") is not None) == split_it
+        q_nope_r, q_pe_r, latent_r = shard.scatter("main", q_nope, q_pe, latent)
+        out = shard.gather("main", attn.exchange(run, (q_nope_r, q_pe_r), latent_r, None))
+        torch.testing.assert_close(out, case.want())
+        last = attn.select_last_hidden(torch.arange(n)[:, None])
+        assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
+
+
+@pytest.mark.parametrize("placed", [False, True], ids=["kv_gather", "all_gather"])
+def test_sp_ranks_split_an_mla_step_like_one_rank(tmp_path, placed):
+    mp.spawn(_mla_split_step, args=(P, str(tmp_path / "store"), placed), nprocs=P)
 
 
 def _assert_paired(everyone: list) -> None:

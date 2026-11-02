@@ -28,14 +28,14 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
 )
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
@@ -325,6 +325,17 @@ def _cross() -> RaggedCrossAttentionSpec:
     return RaggedCrossAttentionSpec("xattn", {"llm"}, RaggedAttentionConfig(4, 4, 8))
 
 
+def _mla_llm(q_heads=4) -> _Model:
+    """A model whose ``llm`` attends an MLA pool, and splits its steps."""
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=q_heads, page_size=16,
+        layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4,
+    ))
+    attn = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA,
+                                                          sm_scale=0.1))
+    return _Model(specs=[kv, attn, _shard()], kv_labels={"kv": {"main": KVLabel()}})
+
+
 def _linear(k_heads=2, v_heads=4, k_dim=8, v_dim=8) -> list[NodeResourceSpec]:
     """A gated delta rule layer stack's pool and resource on ``llm``."""
     geometry = DeltaNetGeometry(
@@ -458,6 +469,33 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
+
+
+@pytest.mark.parametrize("q_heads, resources, pattern", [
+    (4, {"attn": {"sp_exchange": "ulysses"}},
+     r"resources.attn: sp_exchange 'ulysses' trades tokens for KV heads, and MLA pool 'kv' stores one latent head"),
+    (4, {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}},
+     r"resources.attn: sp_exchange 'ring' passes queries round, which over MLA pool 'kv'"),
+    (4, {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "kv_gather"}},
+     r"resources.attn: sp_exchange 'kv_gather' needs KV 'kv' stored by head"),
+    # FlashInfer's FA planner may refuse a rank's own plan at a head count not dividing 64
+    (6, {}, r"node_groups\[0\]: attention 'attn' gathers its MLA latents \(kv_gather\) and plans each rank's own "
+            r"queries at 6 query heads a rank, which must divide 64"),
+], ids=["ulysses", "ring", "kv_gather_by_position", "heads"])
+def test_an_mla_node_whose_sp_ranks_cant_split_its_steps_is_refused(q_heads, resources, pattern, tmp_path):
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
+    _refused(_mla_llm(q_heads), cfg, pattern)
+
+
+def test_an_mla_node_splits_its_steps_by_gathering_its_latents(tmp_path):
+    """Unset over an MLA pool stored by head, the attention gathers the latents (kv_gather), so the
+    pool's one KV head doesn't refuse the split; kv_gather over another pool is refused."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
+    assert _validate(_mla_llm(), cfg).worker_graphs
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}],
+               resources={"attn": {"sp_exchange": "kv_gather"}})
+    _refused(_paged_llm(_shard(), _attention()), cfg,
+             r"resources.attn: sp_exchange 'kv_gather' gathers an MLA pool's one latent, which KV 'kv' doesn't store")
 
 
 def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():

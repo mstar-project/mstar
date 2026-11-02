@@ -118,12 +118,21 @@ class MLAAttention(nn.Module):
     @torch.compiler.disable
     def _write_and_attend(self, q, k, v, q_pe=None):
         layer_idx = self.cache_layer_idx
-        self._kv.write_kv(k, v, layer_idx=layer_idx)
-        layer = self._kv.layer_view(layer_idx)
-        # k (and v) too: over a context-parallel pool a step's own tokens attend each other from them
-        if q_pe is None:
-            return self._attn.run(q, kv_cache_layer=layer, k=k, v=v)
-        return self._attn.run(q, kv_cache_layer=layer, k=k, q_pe=q_pe)
+
+        def run(q, k, v):
+            self._kv.write_kv(k, v, layer_idx=layer_idx)
+            layer = self._kv.layer_view(layer_idx)
+            # k (and v) too: over a context-parallel pool a step's own tokens attend each other from them
+            if q_pe is None:
+                return self._attn.run(q, kv_cache_layer=layer, k=k, v=v)
+            return self._attn.run(q[0], kv_cache_layer=layer, k=k, q_pe=q[1])
+
+        queries = q if q_pe is None else (q, q_pe)
+        # on a node whose steps may split over SP ranks, through the attention's exchange (a
+        # stand-in attention has no `splits`)
+        if getattr(self._attn, "splits", False) is True:
+            return self._attn.exchange(run, queries, k, v)
+        return run(queries, k, v)
 
     def forward(
         self,

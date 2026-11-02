@@ -26,6 +26,7 @@ from mstar.engine.resources.sequence_shard import (
     all_gather,
     check_shard_plan,
     head_slice,
+    kv_gather,
     ring,
     ulysses,
 )
@@ -112,13 +113,20 @@ class AttentionManager(AttentionResource):
     def exchange(self, run, q, k, v, label: str | None = None):
         """``run(q, k, v)`` (a K/V write and the attention, ``q=None`` the write alone) for this
         step's ``label`` through the exchange its pool takes: of a split label's tokens, or of a
-        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`)."""
+        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`). ``q`` is one tensor or
+        a tuple of query parts (MLA's)."""
         label = self._default_label if label is None else label
         shard = self._shard
         r = shard.split_range(label)
         # the paged run and K/V writes refuse a call reached outside it (`check_bypass`)
         shard.exchanging = True
         try:
+            if self._split_exchange == "kv_gather":
+                # every rank stores the pool whole and attends its TP heads: a copied step runs as is
+                if r is None:
+                    return run(q, k, v)
+                shard.check_scattered(label)
+                return kv_gather(run, q, k, v, r)
             if r is None:
                 return head_slice(run, q, k, v, shard.group) if self._placement is None else run(q, k, v)
             shard.check_scattered(label)
