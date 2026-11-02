@@ -363,7 +363,8 @@ class Wan22DiT(nn.Module):
         if self.sp_group.world_size > 1:
             # a rank's tokens need not be whole frames, so it modulates per token
             timestep = timestep.repeat_interleave(hidden_states.shape[1] // grid[0], dim=1)
-        hidden_states, timestep, *rotary_emb = (sp.scatter(x) for x in (hidden_states, timestep, *rotary_emb))
+        hidden_states, timestep = sp.scatter(hidden_states), sp.scatter(timestep)
+        rotary_emb = tuple(sp.scatter(t, dim=0) for t in rotary_emb)  # [S, D] tables
         self_attend = functools.partial(sp.attend, run=functools.partial(joint_attention, ragged=self_attn_fn))
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
