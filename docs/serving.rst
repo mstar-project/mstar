@@ -407,7 +407,8 @@ them by that name:
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp,
                                 # context_parallel
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha,
+                                # sp_exchange
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
      seq_shard:                 # a node's sequence shard (SP ranks)
@@ -439,10 +440,29 @@ Separately, ``context_parallel: true`` stores a paged pool's K/V by position rat
 head: each request's positions split over the ranks that would otherwise hold the same KV
 heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model with no
 sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
-factor to turn the freed memory into context. A node on SP ranks needs at least one of the two,
-and can't yet have both: a node that splits its steps stores its pools by head.
-**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does
-and what is refused.
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
+
+With both, a paged attention's ``sp_exchange`` picks how a split step reaches it: unset, it
+follows the pool's storage (``ulysses`` by head, ``all_gather`` by position); ``ring`` (by
+position) bounds the attention phase's memory to this rank's tokens and runs eager only; ``none``
+keeps the node's steps copied (KV capacity alone). A value that doesn't match the storage fails
+at load:
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       context_parallel: true   # store K/V by position over the SP ranks
+     attn:
+       sp_exchange: ring        # none / ulysses (by head) / all_gather / ring (by position)
+     seq_shard:
+       min_tokens: 8192
+
+A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
+so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
+for Qwen3-Omni's Thinker) and sooner for dense models. Chunked prefill stays off on SP ranks.
+**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does,
+how to pick, and what is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on
