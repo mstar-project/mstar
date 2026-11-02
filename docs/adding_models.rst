@@ -2158,8 +2158,9 @@ also refuse, before a worker starts: a node on SP ranks that neither declares a 
 nor places its pools by position; a shard with no attention that can take split tokens; a
 shard on axis 1 over a pool stored by position; a head-stored pool whose query and KV heads per
 TP rank don't divide by ``sp_size``; a ragged ``sp_exchange`` whose heads don't divide by
-``tp * sp``, or beside a ring; a ragged cross-attention under a shard on axis 0 (a packed split
-can leave a rank none of a row); expert parallelism; piecewise captures; a capture replayed
+``tp * sp``, or beside a ring; a paged attention taking ``none`` beside attentions that split; a
+ragged cross-attention under a shard on axis 0 (a packed split can leave a rank none of a row);
+expert parallelism; piecewise captures; a capture replayed
 under listed and unlisted walks; and a packed capture of a listed walk unless the shard lists
 one label on axis 0 (its padding joins that label). Each attention resource of a splitting node
 logs at load how it takes split steps.
@@ -2220,8 +2221,8 @@ Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` ab
 
 Every attention of a node taking ``none`` (set, or unset over KV stored by position) makes it plan
 every step copied, from the config alone, so it takes what a node without a shard takes (expert
-parallelism, say). A ``none`` attention
-beside others that split refuses a split label at plan, the same on every rank.
+parallelism, say). A paged attention taking ``none`` beside others that split is refused at load:
+its pool serves whatever labels a step declares, so a split one could reach it.
 
 **Ring** stripes each split step's tokens over the SP ranks by KV position: a row whose pool
 already stores ``c`` tokens gives rank ``r`` its tokens at positions ``x`` with ``x % P == r``,

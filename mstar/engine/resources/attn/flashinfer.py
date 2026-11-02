@@ -324,7 +324,7 @@ class FlashInferManager(AttentionManager):
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
-            r = self._split_range(shard_plan, label)
+            r = None if shard_plan is None else shard_plan.ranges.get(label)
             if r is not None and self._split_exchange == "ring":
                 assert lease is None, "a striped sequence shard plans a leased step copied"
                 wrapper = self._ring_wrapper(label, ctx.slot)

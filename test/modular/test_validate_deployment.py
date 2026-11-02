@@ -339,6 +339,12 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # every attention none over KV stored by head: its SP ranks would only share heads
     ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "none"}},
      r"node_groups\[0\]: node 'llm' runs on 2 SP ranks, and every attention there has sp_exchange none"),
+    # a paged pool serves every label a step declares, so a split one would reach the attention
+    # taking none (unset over position storage)
+    ([_shard(), _attention(), AttentionSpec("attn2", {"llm"}, AttentionConfig(kv_cache="kv"))], dict(sp_size=2),
+     {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}},
+     r"node_groups\[0\]: attention 'attn2' takes no split steps \(sp_exchange unset, none over KV stored by "
+     r"position\), and node 'llm''s other attentions split its steps"),
     # a ring stripes steps by stored position, which Ulysses' ragged plan doesn't read
     ([_shard(), _attention(), _ulysses(heads=2)], dict(sp_size=2),
      {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "ring"}},
@@ -355,8 +361,8 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
      r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
 ], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
-        "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
-        "axis0_cross", "shard_misses_a_node"])
+        "ulysses_by_position", "unknown_exchange", "none_by_head", "none_beside_a_split", "ring_beside_ragged_ulysses",
+        "ulysses_heads", "axis0_cross", "shard_misses_a_node"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)

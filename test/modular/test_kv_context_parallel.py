@@ -830,21 +830,6 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
             attn.run(q, "main", kv_cache_layer=None, k=q[:, :1], v=q[:, :1])
 
 
-def test_an_attention_configured_for_no_split_steps_refuses_one_at_plan(monkeypatch):
-    """sp_exchange none beside an attention that takes split steps: a step splitting a label it
-    plans is refused at plan, from the shard's plan every rank shares; a copied one plans."""
-    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
-    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
-    shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
-    attn, _ = _cp_attention(joint, CPU, torch.float32, shard=shard, sp_exchange="none")
-    case = _Case.build(PREFILL_ROWS, CPU, torch.float32)
-    with pytest.raises(ValueError, match="sp_exchange none, and this step splits its label 'main'"):
-        _plan(attn, case, shard=shard)
-    shard.min_tokens = 100
-    _plan(attn, case, shard=shard)
-
-
 def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_shard():
     """sp_exchange ring makes the sequence shard depend on the pool whose stored positions it
     stripes by: the engine takes that edge to a pool stored by position, and plans the pool

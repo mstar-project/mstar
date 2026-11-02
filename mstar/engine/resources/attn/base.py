@@ -106,7 +106,7 @@ class AttentionManager(AttentionResource):
             self._warm_ring(shard.group)
         logger.info(
             "attention over KV %r takes split steps over %d SP ranks: split labels by %s, copied ones %s",
-            self._kv_cache_name, shard.group.world_size, "none (refused)" if split == "none" else split,
+            self._kv_cache_name, shard.group.world_size, split,
             "by head slice" if placement is None else "over the placed pool",
         )
 
@@ -164,17 +164,6 @@ class AttentionManager(AttentionResource):
             return None
         plan = check_shard_plan(f"attention over KV {self._kv_cache_name!r}", self._shard_key, ctx)
         return plan if self._shard is not None else None
-
-    def _split_range(self, shard_plan: SeqShardPlan | None, label: str) -> SeqRange | None:
-        """``label``'s split this step, None when copied; refused for an attention configured to
-        take none (``sp_exchange`` none), alike on every rank, as the shard's plan is."""
-        r = None if shard_plan is None else shard_plan.ranges.get(label)
-        if r is not None and self._split_exchange == "none":
-            raise ValueError(
-                f"attention over KV {self._kv_cache_name!r} has sp_exchange none, and this step splits its label "
-                f"{label!r} over SP ranks: pick an sp_exchange for it, or set none on the node's other attentions too"
-            )
-        return r
 
     def _bind_placement(self, placement: "ContextParallel") -> None:
         """This rank's share of a context-parallel pool. Reached only for a backend that supports

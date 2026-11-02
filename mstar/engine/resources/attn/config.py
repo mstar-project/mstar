@@ -16,6 +16,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,17 @@ class AttentionSpec(NodeResourceSpec):
     def attends_split_steps(self) -> bool:
         # a kind that can; `sp_exchange` none turns it off (`SeqShardSpec.derive`)
         return True
+
+    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+        # a paged pool serves whatever labels a step declares, so nothing rules out a split one
+        # reaching an attention that takes none
+        if self.split_exchange != "none":
+            return []
+        why = "sp_exchange unset, none over KV stored by position" if self.sp_exchange is None else "sp_exchange none"
+        return [
+            f"attention {self.resource_key!r} takes no split steps ({why}), and node {node!r}'s other attentions "
+            "split its steps: set its sp_exchange to all_gather or ring, or none on the others"
+        ]
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
