@@ -604,6 +604,10 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         kv.cache = case.cache(kv.placement, stored_only=True)
         _plan(attn, case, shard=shard, causal=causal)
         assert (shard.split_range("main") is not None) == split_it
+        if split_it:
+            # a K/V write without attention lands each token on the rank storing it (page 0, the sink, aside)
+            attend.write(*shard.scatter("main", k, v))
+            torch.testing.assert_close(kv.cache[1:], case.cache(kv.placement)[1:], equal_nan=True)
         # the ring's hops carry queries in their own dtype and partials in the kernel's
         queries = q.double() if split == "ring" and split_it else q
         out = shard.gather("main", attend(*shard.scatter("main", queries, k, v)))

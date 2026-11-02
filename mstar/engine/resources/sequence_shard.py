@@ -563,15 +563,19 @@ def ulysses(run: Callable, q, k, v, r: SeqRange):
 
 def all_gather(run: Callable, q, k, v, r: SeqRange):
     """Every rank's q, k and v gathered whole in one collective, in the step's order whatever the
-    label's layout, ``run`` on them as on a copied step, then this rank's share of the output."""
+    label's layout, ``run`` on them as on a copied step, then this rank's share of the output.
+    ``q`` None: k and v alone, for the write."""
     _check_entry(r, q, k, v)
-    assert r.rows is None and len({q.dtype, k.dtype, v.dtype}) == 1, (
+    parts = [x for x in (q, k, v) if x is not None]
+    assert r.rows is None and len({x.dtype for x in parts}) == 1, (
         "all_gather takes a packed label's q, k and v of one dtype"
     )
-    parts = (q, k, v)
     whole = r.whole(torch.cat([x.flatten(1) for x in parts], dim=-1))
     pieces = whole.split([math.prod(x.shape[1:]) for x in parts], dim=-1)
     gathered = [piece.unflatten(-1, x.shape[1:]).contiguous() for piece, x in zip(pieces, parts, strict=True)]
+    if q is None:
+        run(None, *gathered)
+        return None
     return r.local(run(*gathered))
 
 

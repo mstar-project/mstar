@@ -139,23 +139,18 @@ class AttentionManager(AttentionResource):
             shard.check_scattered(label)
             if self._placement is None:
                 return ulysses(run, q, k, v, r)
-            if q is None:
-                raise ValueError(
-                    f"a K/V write without attention of label {label!r}, which this step splits over SP ranks above "
-                    f"KV {self._kv_cache_name!r} stored by position: attend it, or store the KV by head"
-                )
             if self._split_exchange == "ring":
                 return self._ring(label, q, k, v, r)
             return all_gather(run, q, k, v, r)
         finally:
             shard.exchanging = False
 
-    def _ring(self, label: str, q, k, v, r: SeqRange) -> torch.Tensor:
+    def _ring(self, label: str, q, k, v, r: SeqRange) -> torch.Tensor | None:
         """This rank's tokens' K/V into the slots it stores them in (all of them, as the step is
-        striped by stored position), then the ring (`RingAttentionWrapper`), at the KV resource's
-        layer cursor (`AttentionCallable.set_layer_idx`)."""
+        striped by stored position), then, ``q`` given, the ring (`RingAttentionWrapper`), at the KV
+        resource's layer cursor (`AttentionCallable.set_layer_idx`)."""
         self._kv.write_kv(k, v, label=label, tokens=r.index)
-        return self._current_plan_states[label].attend(q, self._kv.layer_view())
+        return None if q is None else self._current_plan_states[label].attend(q, self._kv.layer_view())
 
     def _check_sequence_shard(self, ctx) -> SeqShardPlan | None:
         """At plan: the step declares the node's sequence shard, whose plan this returns where the
