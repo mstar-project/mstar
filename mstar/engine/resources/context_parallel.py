@@ -300,8 +300,8 @@ class RingAttentionWrapper:
         for i in range(p):
             j = (r - i) % p
             to, back = ring_hop(p, r, i, counts[r], counts[j])
-            queries = group.all_to_all_rows(q, to, back) if i else q
-            part = _masked(*self._paged[j].run(queries, kv_cache_layer, return_lse=True), self._valid[j])
+            theirs = group.all_to_all_rows(q, to, back) if i else q
+            part = _masked(*self._paged[j].run(theirs, kv_cache_layer, return_lse=True), self._valid[j])
             if i:
                 part = _unpack(group.all_to_all_rows(_pack(*part), back, to), part[0].dtype)
             # one partial at a time, so the ring holds two, not P
