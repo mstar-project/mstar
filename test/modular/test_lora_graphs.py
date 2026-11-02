@@ -72,8 +72,9 @@ def test_custom_ops_pass_opcheck():
     torch.library.opcheck(lora_apply_, (y, x, a, b, *common, scalings, widths))
 
 
-def test_qwen3_5_stack_with_adapters_compiles_whole_and_matches_eager(qwen_adapters):
-    """Inductor with ``fullgraph`` (no graph break in the layer stack) equals eager, whose
+def test_qwen3_5_stack_with_adapters_compiles_and_matches_eager(qwen_adapters):
+    """Adapters add no graph break to the layer stack (the plain stack breaks at its
+    per-layer cursor moves, compiled out on purpose), and Inductor equals eager, whose
     parity with merged weights test_lora_models checks."""
     batch = [("r0", "a1", 5), ("r1", None, 3), ("r2", "a2", 4), ("r3", "a1", 2)]
     llm, pool, rows = _llm(qwen_adapters)
@@ -82,13 +83,21 @@ def test_qwen3_5_stack_with_adapters_compiles_whole_and_matches_eager(qwen_adapt
     rows.lengths = [n for *_, n in batch]
     x = torch.randn(sum(rows.lengths), Q.HIDDEN, generator=torch.Generator().manual_seed(7), dtype=F64)
 
+    plain, _, plain_rows = _llm(qwen_adapters, with_pool=False)
+    plain_rows.lengths = rows.lengths
+
+    def breaks(model):
+        torch._dynamo.reset()
+        return torch._dynamo.explain(lambda x: model.model.model(x, label="main"))(x).graph_break_count
+
     def fwd(x):
         return llm.model.model(x, label="main")
 
     with torch.no_grad():
+        assert breaks(llm) == breaks(plain)
         eager = fwd(x)
         torch._dynamo.reset()
-        compiled = torch.compile(fwd, backend="inductor", fullgraph=True)(x)
+        compiled = torch.compile(fwd, backend="inductor")(x)
     # the stack without LoRA differs between eager and Inductor by ~1e-6 on its own
     torch.testing.assert_close(compiled, eager, rtol=1e-5, atol=1e-5)
 
@@ -165,8 +174,8 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
     ctx.set_padded_rids(padded)
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
-    pool.commit(step, ctx)
     assert pool.addressing().token_order.data_ptr() == captured.token_order.data_ptr()
+    pool.commit(step, ctx)
 
     real, g = sum(span for _, _, span in rows), torch.Generator().manual_seed(11)
     for target, layer in [("qkv_proj", 1), ("o_proj", 3), ("gate_up_proj", 0), ("down_proj", 2)]:

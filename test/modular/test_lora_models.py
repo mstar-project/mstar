@@ -76,7 +76,7 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
             sub.bind_node_resources({spec.resource_key: lora_pool})
             assert sum(map(_bound, sub.modules())) == len(spec.module_map.bindings)
             H.admit_declared(lora_pool, stack.declare(sub, rids, rows), ROWS)
-        with torch.no_grad(), H.compute(lora_pool):
+        with torch.no_grad():
             return stack.run(sub, rows)
 
     results = H.run_ranks(world, rank_run)
@@ -382,11 +382,10 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
         assert (want - _encode(_vision_node(tower()))).abs().max() > 1e-3
 
 
-def test_qwen3_5_text_only_adapter_holds_no_vision_slot_nor_a_wait(tmp_path):
-    """An adapter with nothing for the tower is rank 0 on the vision pool. A row on it
-    held back for want of a slot before its adapter was read leaves the wait list once a
-    read finds it empty (else it would age as the oldest waiter and drain a slot), and
-    rows on it are admitted with the pool full."""
+def test_qwen3_5_text_only_adapter_holds_no_vision_slot(tmp_path):
+    """An adapter with nothing for the tower is empty for the vision pool, known from its
+    header through the linked specs: its rows are admitted with the pool full and address
+    the zero adapter."""
     path, _ = write_vision_adapter(tmp_path / "v")
     text, _ = H.write_peft_adapter(tmp_path / "t", 2, ("self_attn.q_proj",), text_only=True)
     lora_pool = _vision_pool({"v": path, "t": text}, max_slots=1)
@@ -400,14 +399,7 @@ def test_qwen3_5_text_only_adapter_holds_no_vision_slot_nor_a_wait(tmp_path):
         return lora_pool.slot_of(rid)
 
     assert encode("r0", "v") == 1  # the one slot, held
-    lora_pool.ingest_request("w", LoraReqConfig(adapter="t"))
-    assert not lora_pool.admit_retrieve("w", "vision_encoder", "encode", None).ready
-    assert "w" in lora_pool._waiting_since
-    lora_pool.remove_request("r0")
-    assert encode("r1", "t") == 0  # its admit reads the adapter: nothing for the tower
-    assert lora_pool.admit_retrieve("w", "vision_encoder", "encode", None).ready
-    assert "w" not in lora_pool._waiting_since
-    assert encode("r2", "v") == 1 and encode("r3", "t") == 0  # ready with the pool full
+    assert encode("r1", "t") == 0 and encode("r2", "t") == 0  # ready with the pool full
     assert lora_pool.slot_state(1).adapter == "v" and lora_pool.slot_state(1).refcount == 1
 
 
@@ -426,7 +418,7 @@ def test_qwen3_5_tied_head_and_embedding_keep_each_delta_on_its_own_side(tmp_pat
     H.bind(model, H._Rows(), {H.LORA: lora_pool})
     H.plan([lora_pool], [("r0", "h", 1), ("r1", "h", 1), ("r2", "h", 1)])  # three decode rows
     ids, hidden = torch.tensor([1, 2, 60]), H.rand(3, H.HIDDEN, seed=4)
-    with torch.no_grad(), H.compute(lora_pool):
+    with torch.no_grad():
         embeds, logits = model.model.embed(ids), model.lm_head(hidden)
     table = base[embed + ".weight"]
     torch.testing.assert_close(embeds, H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"][ids])

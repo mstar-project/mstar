@@ -674,8 +674,9 @@ def _omni(dense: bool):
 
 
 def _qwen3_tts():
+    from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.loader import LLAMA_STACKED_PARAMS
-    from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
+    from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.config import (
         Qwen3TTSCodePredictorConfig,
         Qwen3TTSModelConfig,
@@ -706,7 +707,8 @@ def _qwen3_tts():
         # the code predictor sits beside the Talker, with relative paths of the same shape
         build=lambda c, group, w: TalkerSubmodule(
             _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w, stacked_params=LLAMA_STACKED_PARAMS),
-            Qwen3TTSCodePredictor(c).to(DTYPE), c),
+            ResidualCodePredictor(c.code_predictor, c.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+                                  embed_sum_dtype=None).to(DTYPE), c),
         weights=weights,
         a1=lambda c: {**llama_layers(c.talker, "model."), "codec_head": (c.talker.vocab_size, c.talker.hidden_size)},
         a2=lambda c: _subset(llama_layers(c.talker, "model."), "q_proj", "gate_proj"),
