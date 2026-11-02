@@ -1746,8 +1746,8 @@ class TensorCommunicationManager(ABC):
             self.uuid_to_shard_dim.pop(uuid, None)
             self.uuid_to_edge_name.pop(uuid, None)
             self.tensor_store.remove_tensor(uuid)
-        if not buffers:
-            return
+        # The read may still touch its source when this transport lists no
+        # destination buffers (arena event futures), or they were already kept.
         kept = _KeptRead(
             ep.request_id, self.rid_to_str(ep.request_id), buffers, registered,
             sum(b.nbytes for b in buffers),
