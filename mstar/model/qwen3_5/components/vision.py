@@ -1,9 +1,5 @@
-"""Qwen3.5's vision tower: a ViT over packed image patches.
-
-Ported from transformers' ``modeling_qwen3_5.py`` and ``vision_utils.py``
-(Apache-2.0); the grid helpers are copied because ``transformers.vision_utils``
-is internal. Dropped, as Qwen3.5 does not use them: bicubic resampling, the
-temporal rotary axis, and deepstack.
+"""Qwen3.5's vision tower: the shared Qwen3-VL ViT (``components.qwen3_vit``)
+with Qwen3.5's patch merger and no deepstack.
 
 Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
 ``grid_thw`` gives each image's ``(t, h, w)`` patch grid.
@@ -11,137 +7,10 @@ Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.vit import (
-    AxialVisionRope,
-    RaggedVisionAttention,
-    bilinear_table_taps,
-)
-from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
-
-# ----------------------------------------------------------------------------
-# Grid helpers
-# ----------------------------------------------------------------------------
-
-
-def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> tuple[int, ...]:
-    """One attending segment per frame, on the host: ``t`` segments of
-    ``h * w`` per entry, planned by the ragged attention resource."""
-    return tuple(h * w for t, h, w in grid for _ in range(t))
-
-
-def vision_position_ids(
-    grid: list[tuple[int, int, int]],
-    spatial_merge_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """``[total_patches, 2]`` (h, w) indices in spatial-merge-block order.
-
-    Block-major, so the rotary sees the order the merger will fold.
-    """
-    # a video's frames come as one-frame grids of one size: build each run once
-    runs: list[list[int]] = []
-    for t, h, w in grid:
-        if runs and runs[-1][1:] == [h, w]:
-            runs[-1][0] += t
-        else:
-            runs.append([t, h, w])
-    out = []
-    for t, h, w in runs:
-        hpos, wpos = torch.meshgrid(
-            torch.arange(h, device=device),
-            torch.arange(w, device=device),
-            indexing="ij",
-        )
-        block = (
-            h // spatial_merge_size, spatial_merge_size,
-            w // spatial_merge_size, spatial_merge_size,
-        )
-        hpos = hpos.reshape(block).transpose(1, 2).flatten()
-        wpos = wpos.reshape(block).transpose(1, 2).flatten()
-        out.append(torch.stack([hpos, wpos], dim=-1).repeat(t, 1))
-    return torch.cat(out, dim=0)
-
-
-def _align_corners_src(index: torch.Tensor, size: torch.Tensor, side: int) -> torch.Tensor:
-    """Where positions on an axis of length ``size`` sample a ``side``-long
-    table: ``align_corners=True``, matching the ``F.interpolate`` call
-    upstream reproduces (with border padding)."""
-    index = index.to(torch.float32)
-    # closed form of `linspace(0, side - 1, size)[index]`; clamp avoids a
-    # divide-by-zero at size == 1, where index is 0 anyway
-    return index * (side - 1) / torch.clamp(size - 1, min=1)
-
-
-def vision_interpolation(
-    grid: list[tuple[int, int, int]],
-    num_grid_per_side: int,
-    spatial_merge_size: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather indices and weights that resample the square learned position
-    table onto each image's ``(h, w)`` grid.
-
-    Returns ``[total_patches, 4]`` each — the 2x2 bilinear neighbourhood per
-    patch, as the outer product of the two axes' taps.
-    """
-    side, merge = num_grid_per_side, spatial_merge_size
-
-    grid_thw = torch.tensor(grid, dtype=torch.long, device=device)
-    counts = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
-    heights = torch.repeat_interleave(grid_thw[:, 1], counts)
-    widths = torch.repeat_interleave(grid_thw[:, 2], counts)
-    starts = torch.repeat_interleave(
-        F.pad(counts.cumsum(0)[:-1], (1, 0)), counts,
-    )
-    # position within one frame's flat patch run, repeating across frames;
-    # the total comes off the host grid to avoid a device read
-    total_patches = sum(t * h * w for t, h, w in grid)
-    within = (
-        torch.arange(total_patches, device=device) - starts
-    ) % (heights * widths)
-
-    # undo the spatial-merge-block ordering to recover (row, col)
-    blocks_w = widths // merge
-    in_col = within % merge
-    in_row = (within // merge) % merge
-    block_col = (within // (merge * merge)) % blocks_w
-    block_row = within // (merge * merge * blocks_w)
-    row = block_row * merge + in_row
-    col = block_col * merge + in_col
-
-    return bilinear_table_taps(
-        _align_corners_src(row, heights, side), _align_corners_src(col, widths, side), side,
-        zero_pad=False,
-    )
-
-
-# ----------------------------------------------------------------------------
-# Modules
-# ----------------------------------------------------------------------------
-
-
-class VisionPatchEmbed(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__()
-        self.in_channels = config.in_channels
-        self.temporal_patch_size = config.temporal_patch_size
-        self.patch_size = config.patch_size
-        self.embed_dim = config.hidden_size
-        kernel = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv3d(
-            config.in_channels, config.hidden_size,
-            kernel_size=kernel, stride=kernel, bias=True,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(
-            -1, self.in_channels, self.temporal_patch_size,
-            self.patch_size, self.patch_size,
-        )
-        return self.proj(x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
+from mstar.model.components.qwen3_vit import VisionBlock, VisionPatchEmbed, VisionRotaryEmbedding
+from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 
 
 class VisionPatchMerger(nn.Module):
@@ -160,70 +29,6 @@ class VisionPatchMerger(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
-class VisionMLP(nn.Module):
-    """Plain, not gated: one up projection, an activation, one down."""
-
-    def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__()
-        self.linear_fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True,
-        )
-        self.linear_fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True,
-        )
-        if config.hidden_act not in ("gelu_pytorch_tanh", "gelu_new"):
-            raise NotImplementedError(
-                f"vision activation {config.hidden_act!r} is not wired up"
-            )
-        self.act_fn = nn.GELU(approximate="tanh")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
-class VisionAttention(RaggedVisionAttention):
-    """Full attention within each frame, over packed patches.
-
-    The ragged attention resource plans the per-frame layout, so this forward
-    never sees the boundaries. That is what lets the tower compile: splitting
-    per frame here gave each frame its own symint, and inductor then refused
-    (``CantSplit``) to codegen packed runs of three or more images.
-    """
-
-    def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__(config.hidden_size, config.num_heads)
-        self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=True)
-
-    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # [tokens, heads, head_dim]: the ragged kernel's layout, no transposes
-        return (
-            self.qkv(hidden_states)
-            .reshape(hidden_states.shape[0], 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )
-
-
-class VisionBlock(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = VisionAttention(config)
-        self.mlp = VisionMLP(config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cos, sin,
-        )
-        return hidden_states + self.mlp(self.norm2(hidden_states))
-
-
 class Qwen3_5VisionModel(nn.Module):
     def __init__(self, config: Qwen3_5VisionConfig):
         super().__init__()
@@ -238,9 +43,9 @@ class Qwen3_5VisionModel(nn.Module):
         self.pos_embed = nn.Embedding(
             config.num_position_embeddings, config.hidden_size,
         )
-        self.rotary_pos_emb = AxialVisionRope(config.head_dim, config.rope_theta)
+        self.rotary_pos_emb = VisionRotaryEmbedding(config)
         self.blocks = nn.ModuleList(
-            VisionBlock(config) for _ in range(config.depth)
+            VisionBlock(config, VISION_ATTN) for _ in range(config.depth)
         )
         self.merger = VisionPatchMerger(config)
 
@@ -283,8 +88,8 @@ class Qwen3_5VisionModel(nn.Module):
         pos = (self.pos_embed(indices) * weights[:, :, None]).sum(1)
         hidden = hidden + pos.to(hidden.dtype)
 
-        cos, sin = self.rotary_pos_emb(position_ids, hidden.dtype)
-        return hidden, cos, sin
+        cos, sin = self.rotary_pos_emb(position_ids)
+        return hidden, cos.to(hidden.dtype), sin.to(hidden.dtype)
 
     def encode(
         self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,

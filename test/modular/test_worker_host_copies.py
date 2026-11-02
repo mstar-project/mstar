@@ -23,7 +23,7 @@ from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.base import GraphEdge
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -46,8 +46,10 @@ class _Communicator(BaseCommunicator):
         return False
 
 
-class _AccumulatingRuntime:
+class _AccumulatingRuntime(PhasedPostprocess):
     """Holds every iteration's output and registers all of them on the last."""
+
+    supports_inline_emit = False
 
     def __init__(self):
         self.held: list[int] = []
@@ -88,8 +90,8 @@ def _worker(tmp_path):
     w._walk_driven_edges = {}
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.device = torch.device("cpu")
-    w._last_active = {}
     w._innermost_loop_by_node = {}
     w._graph_runtime = _AccumulatingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())
@@ -97,7 +99,7 @@ def _worker(tmp_path):
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
         after_output_copy=lambda batch: None,
-        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+        step_finished=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     ))
     w.request_state = SimpleNamespace(

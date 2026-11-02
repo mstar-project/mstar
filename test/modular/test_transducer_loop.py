@@ -198,7 +198,7 @@ class Harness:
         # one tensor: the engine clones it once, and the client's copy is the stop check's host copy
         assert out.check_stop_buffers["tokens"] is out.row_outputs["tokens"]
         host = HostRows(request_ids=tuple(rids), buffers={"active": out.check_stop_buffers["active"].cpu()})
-        stops = self.node.check_stop_batched(rids, infos, host, step_walk=WALK)
+        stops = self.node.check_stop_batched(rids, infos, host)
         assert all(loops == {DECODE_LOOP} for loops in stops.values())
         for rid in rids:
             self.iterations[rid] += 1

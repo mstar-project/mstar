@@ -21,11 +21,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.norm import rms_norm_no_weight
-from mstar.model.components.vit import (
-    AxialVisionRope,
-    RaggedVisionAttention,
+from mstar.model.components.qwen3_vit import (
+    PackedVisionAttention,
+    VisionRotaryEmbedding,
     bilinear_table_taps,
 )
+from mstar.model.keys import VISION_ATTN
 from mstar.model.muse.config import (
     VISION_FULL,
     VISION_WINDOW,
@@ -132,11 +133,11 @@ def tower_inputs(grid: list[tuple[int, int, int]], config: MuseGlimmerVisionConf
 # ----------------------------------------------------------------------------
 
 
-class VisionAttention(RaggedVisionAttention):
+class VisionAttention(PackedVisionAttention):
     """Attention within each window or each frame (``label``)."""
 
     def __init__(self, config: MuseGlimmerVisionConfig, label: str):
-        super().__init__(config.hidden_size, config.num_attention_heads, label)
+        super().__init__(config.hidden_size, config.num_attention_heads, VISION_ATTN, label)
         dim = config.hidden_size
         self.q_proj = nn.Linear(dim, dim, bias=True)
         self.k_proj = nn.Linear(dim, dim, bias=True)
@@ -191,7 +192,7 @@ class MuseGlimmerVisionModel(nn.Module):
         self.config = config
         self.patch_embedder = PatchEmbedder(config)
         # the reference keeps the frequencies fp32 and rounds only cos / sin
-        self.rotary_emb = AxialVisionRope(config.head_dim, config.rope_theta, keep_fp32=True)
+        self.rotary_emb = VisionRotaryEmbedding(config, keep_fp32=True)
         self.ln_pre = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layers = nn.ModuleList(
             VisionEncoderLayer(

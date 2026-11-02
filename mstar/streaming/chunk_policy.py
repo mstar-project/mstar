@@ -46,6 +46,13 @@ class ChunkPolicy(ABC):
         """
         ...
 
+    def allow_partial_input(self) -> bool:
+        """Whether the consumer takes a chunked prefill a chunk at a time, each
+        chunk's piece an item of its own (``ChunkingPolicy.per_chunk_outputs``).
+        Default ``False``: a stream that does so into this consumer is refused
+        at load, since the consumer would read a piece as the whole input."""
+        return False
+
     def continue_after_producer_done(self) -> bool:
         """Whether the buffer should keep producing (empty) chunks after the
         producer signals done and all buffered items have been consumed.
@@ -150,14 +157,18 @@ class FixedChunkPolicy(ChunkPolicy):
             the producer finishes and all buffered items are consumed. A set
             of consumer walks does so only while the consumer is in one of
             them; in its other walks the stream just waits.
+        allow_partial: if True, take a chunked prefill's pieces as they
+            land (``ChunkPolicy.allow_partial_input``).
     """
 
     def __init__(
         self, chunk_size: int, continue_after_done: bool | frozenset[str] = False,
+        allow_partial: bool = False,
     ):
         super().__init__()
         self._chunk_size = chunk_size
         self._continue_after_done = continue_after_done
+        self._allow_partial = allow_partial
 
     def is_ready(self, buffer_len) -> bool:
         return buffer_len >= self._chunk_size
@@ -175,6 +186,9 @@ class FixedChunkPolicy(ChunkPolicy):
         if isinstance(self._continue_after_done, frozenset):
             return consumer_walk in self._continue_after_done
         return self._continue_after_done
+
+    def allow_partial_input(self) -> bool:
+        return self._allow_partial
 
 
 class RampChunkPolicy(ChunkPolicy):
@@ -245,9 +259,11 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
     larger chunks once the stream is running. Chunk ``k`` delivers
     ``schedule[k]`` new items (``chunk`` once the schedule is exhausted) with
     up to ``left_context`` already-delivered items in front of them, so a
-    causal decoder can warm up on frames it has processed before. Unlike
-    ``LeftContextChunkPolicy`` the first chunk may be smaller than the
-    context: the context is whatever has been delivered so far, capped.
+    causal decoder can warm up on frames it has processed before. A primed
+    first chunk carries the whole primed lead instead, whatever
+    ``left_context`` is (see ``prime``). Unlike ``LeftContextChunkPolicy``
+    the first chunk may be smaller than the context: the context is whatever
+    has been delivered so far, capped.
 
     Example (Qwen3-TTS, 12 Hz frames): ``schedule=(4, 8, 16)``, ``chunk=25``,
     ``left_context=25`` pops windows of 4, 4+8, 12+16, 25+25, 25+25, ...
@@ -270,11 +286,11 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         self._delivered = 0  # new items handed to the consumer so far
 
     def prime(self, context_items: int) -> None:
-        if not 0 <= context_items <= self._left_context or self._chunks_popped:
-            raise ValueError(
-                f"can prime 0..{self._left_context} context items before the first chunk, "
-                f"got {context_items}"
-            )
+        """The first chunk leads with ``context_items`` context-only items, however
+        many ``left_context`` allows later chunks (a stateful consumer warms up
+        on them once and needs no context after)."""
+        if context_items < 0 or self._chunks_popped:
+            raise ValueError(f"can prime context items only before the first chunk, got {context_items}")
         self._delivered = context_items
 
     def _new_items(self) -> int:
@@ -283,6 +299,8 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         return self._chunk
 
     def _context(self) -> int:
+        if not self._chunks_popped:
+            return self._delivered   # what was primed
         return min(self._left_context, self._delivered)
 
     def is_ready(self, buffer_len: int) -> bool:

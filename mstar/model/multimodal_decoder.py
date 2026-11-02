@@ -183,9 +183,8 @@ class MultimodalDecoderModel(Model):
         return media_walks(self.config.max_position_embeddings, self.encoders)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the request's output budget; the stop check counts decode tokens only,
-        # so a reply is max_tokens + 1 tokens, as on main (#604)
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -----------------------------------------------------------------------
     # KV layout

@@ -6,12 +6,12 @@ without pulling FlashInfer in behind it.
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -190,6 +190,17 @@ class PagedKVConfig(KVConfig):
     def _arena_page(self) -> int:
         # tokens of every layer in an arena page, a page of the first group's layers
         return self.tokens_per_page * len(self.groups[0].layers)
+
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        """`NodeResourceSpec.keeps_prefix_cache` for a pool of this config.
+        Above one rank only with ``prefix_cache_tp``, and a model that names no
+        checkpoint needs a salt, or builds that differ only in their weights
+        could not be told apart."""
+        return (
+            self.prefix_cache
+            and (world_size == 1 or self.prefix_cache_tp)
+            and (checkpoint_named or bool(self.prefix_cache_salt))
+        )
 
     @property
     def request_pages(self) -> int:
@@ -512,6 +523,80 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
         for key, config in configs.items()
     }
 
+
+def instance_size(spec: NodeResourceSpec, instance: Mapping[str, int]) -> int:
+    """What `opening_prefix_caches` sizes ``spec`` at: the smallest lockstep
+    instance of its nodes in ``instance``, 1 where it has none."""
+    return min((instance[node] for node in spec.nodes if node in instance), default=1)
+
+
+def unrestorable(specs: Mapping[str, NodeResourceSpec], opened: Collection[str]) -> list[NodeResourceSpec]:
+    """The resources that can't restore what a hit skips while ``opened`` open:
+    those that set `NodeResourceSpec.restores_prefix` and keep no open cache of
+    their own, unless they are over open caches that restore. Each keeps every
+    cache on its nodes shut."""
+    return [
+        spec for spec in specs.values()
+        if spec.restores_prefix and spec.resource_key not in opened and not (
+            spec.depends_on() and all(dep in opened and specs[dep].restores_prefix for dep in spec.depends_on())
+        )
+    ]
+
+
+def opening_prefix_caches(
+    specs: Iterable[NodeResourceSpec], instance: Mapping[str, int], checkpoint_named: bool,
+) -> frozenset[str]:
+    """The prefix caches that open: those each spec keeps of its own
+    (`NodeResourceSpec.keeps_prefix_cache`), less those a resource on their
+    nodes keeps from serving a hit. Every input is fixed at startup, so the
+    engines, the conductor's routing and the data worker agree.
+
+    ``instance`` is the lockstep instance of each node the caller places
+    (`instance_size`). A cache over other caches, such as a recurrent pool's
+    snapshots over its KV cache's pages, keeps only where they open on all of
+    its nodes. A node carrying a resource that can't restore what a hit skips
+    (`unrestorable`) keeps every cache on it shut: a hit there would skip
+    tokens its state never saw. Closing one cache can close others, so the rule
+    runs until nothing changes.
+    """
+    by_key = {spec.resource_key: spec for spec in specs}
+    opened = {
+        key for key, spec in by_key.items() if spec.keeps_prefix_cache(instance_size(spec, instance), checkpoint_named)
+    }
+    while True:
+        kept = {
+            key for key in opened
+            if all(dep in opened and by_key[key].nodes <= by_key[dep].nodes for dep in by_key[key].depends_on())
+        }
+        blocked = {node for spec in unrestorable(by_key, kept) for node in spec.nodes}
+        now = {key for key in kept if by_key[key].nodes.isdisjoint(blocked)}
+        if now == opened:
+            return frozenset(now)
+        opened = now
+
+
+def prefix_caches_by_rank(
+    specs: Iterable[NodeResourceSpec],
+    groups: Iterable[tuple[Sequence[int], int, Collection[str]]],
+    checkpoint_named: bool,
+) -> dict[int, frozenset[str]]:
+    """The caches each rank's engine opens: `opening_prefix_caches` over the
+    nodes on the rank, each at its lockstep instance size, as `Engine.load_model`
+    evaluates it, less the caches with no node there, which that engine counts at
+    one rank for its item encoders but never builds. ``groups`` gives each node
+    group's ranks, instance size and nodes."""
+    specs = list(specs)
+    local: dict[int, dict[str, int]] = {}
+    for ranks, size, nodes in groups:
+        for rank in ranks:
+            local.setdefault(rank, {}).update(dict.fromkeys(nodes, size))
+    return {
+        rank: opening_prefix_caches(specs, nodes, checkpoint_named)
+        & {spec.resource_key for spec in specs if not spec.nodes.isdisjoint(nodes)}
+        for rank, nodes in local.items()
+    }
+
+
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
@@ -534,6 +619,18 @@ class KVSpec(NodeResourceSpec):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
+
+    def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
+        return isinstance(self.config, PagedKVConfig) and self.config.keeps_prefix_cache(world_size, checkpoint_named)
+
+    def routing_mirror(self, ctx: RoutingContext):
+        """A mirror of the prefix cache where it opens and a walk that keys it runs."""
+        labels = [label for label, walks in ctx.keyed.items() if ctx.walks.intersection(walks)]
+        if not labels or not ctx.prefix_cache_opens:
+            return None
+        from mstar.engine.resources.kv.routing import KVRoutingMirror
+
+        return KVRoutingMirror(ctx.num_replicas, self.config.num_units, self.config.tokens_per_page, labels)
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         # the attentions over a pool decide what it keeps, and their module imports this one
@@ -645,8 +742,8 @@ class KVStep(ResourceStep):
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
-    # the rows the forks apply to; None is every row (a chunked prompt
-    # pre-forks on its first chunk and post-forks on its last)
+    # the rows the forks apply to; None is every row. A chunked prompt forks
+    # on some of its chunks only, e.g. a pre-fork on its first
     fork_rids: frozenset | None = None
     # (request_id, label) pairs that run against SINK_PAGE and hold no pages
     sink: frozenset[tuple[str, str]] = frozenset()

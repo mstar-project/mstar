@@ -51,6 +51,11 @@ class AttentionConfig:
     # narrow GQA, where the tensor-core kernel pads few query heads per KV
     # head out to a tile.
     decode_tensor_cores: bool = True
+    # FlashInfer only: run captured one-token decode rows on trtllm-gen's fmha
+    # kernel where one exists for this GPU and geometry (`FmhaDecodeWrapper`),
+    # which also drops the paged kernel's per-step plan. Eager steps and prompt
+    # rows stay on the paged kernels.
+    decode_fmha: bool = False
     # Each query attends to the last ``sliding_window`` positions, its own included, and the
     # pool keeps about that window of K/V per request for this attention's layers and frees
     # the rest (`derive_kv_groups`).
@@ -95,6 +100,7 @@ class AttentionSpec(NodeResourceSpec):
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
+        decode_fmha: bool | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -108,6 +114,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.flashinfer_backend = flashinfer_backend
         if decode_tensor_cores is not None:
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+        if decode_fmha is not None:
+            self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:

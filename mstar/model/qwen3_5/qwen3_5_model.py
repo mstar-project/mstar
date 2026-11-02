@@ -21,6 +21,7 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
+from mstar.model.keys import MIXED
 from mstar.model.multimodal import (
     VIDEO,
     PromptPart,
@@ -52,7 +53,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
@@ -201,6 +203,20 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 ),
             ),
         ]
+
+    # -----------------------------------------------------------------------
+    # Chunked prefill
+    # -----------------------------------------------------------------------
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
+        )}
 
     # ------------------------------------------------------------------
     # Model ABC: I/O

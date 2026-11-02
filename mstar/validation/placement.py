@@ -1,9 +1,11 @@
 """Placement checks: walks and partitions, ``node_groups``, the worker graphs
-they divide into, and the parallel groups each worker is handed."""
+they divide into, the parallel groups each worker is handed, and the weights
+that pick a request's replica among them."""
 
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
+from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.spec import NodeResourceSpec
@@ -26,6 +28,37 @@ def node_groups_problems(config: Mapping[str, Any]) -> list[str]:
         problem for i, group in enumerate(node_groups)
         if (problem := _node_group_entry_problem(i, group))
     ]
+
+
+# Far above any useful weight, and low enough that no replica's cost overflows to inf, where
+# inf - inf would make it NaN and fail every pick.
+_MAX_ROUTING_WEIGHT = 1e6
+
+
+def routing_weights_problems(config: Mapping[str, Any]) -> list[str]:
+    """``routing_weights``, the data-parallel replica pick's: one per term of
+    the cost, each a number from 0 to ``_MAX_ROUTING_WEIGHT``, since the cost
+    is a sum of weighted terms, and ``load`` above 0 when another term is, or
+    nothing would spread a hot prefix."""
+    weights = config.get("routing_weights")
+    if weights is None:
+        return []
+    if not isinstance(weights, Mapping):
+        return [f"routing_weights must be a mapping of {list(RoutingWeights._fields)}; got {weights!r}"]
+    problems = []
+    unknown = sorted(set(weights) - set(RoutingWeights._fields), key=str)
+    if unknown:
+        problems.append(f"routing_weights names {unknown}; it takes {list(RoutingWeights._fields)}")
+    for name, weight in weights.items():
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= _MAX_ROUTING_WEIGHT:
+            problems.append(
+                f"routing_weights.{name} must be a number from 0 to {_MAX_ROUTING_WEIGHT:g}; got {weight!r}"
+            )
+    if not problems and not weights.get("load", RoutingWeights._field_defaults["load"]) and any(
+        weights.get(name, default) for name, default in RoutingWeights._field_defaults.items() if name != "load"
+    ):
+        problems.append("routing_weights.load must be above 0 while another weight is")
+    return problems
 
 
 def _is_count(value: Any, least: int) -> bool:
@@ -67,6 +100,7 @@ def check_placement(model: Model, config: Mapping[str, Any]) -> list[str]:
         *_node_group_shapes(model, node_groups),
         *_walk_partitions(model, walk_graphs),
         *_node_placement(walk_graphs, node_groups),
+        *_chunked_streams(model, walk_graphs),
     ]
 
 
@@ -91,6 +125,63 @@ def check_worker_graphs(
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
     ]
+
+
+def _chunked_streams(
+    model: Model, walk_graphs: Mapping[str, GraphSection],
+) -> Iterator[str]:
+    """A chunked node's stream that its consumer would misread.
+
+    A ``per_chunk_outputs`` edge sends each chunk's piece as an item of its
+    own, so its consumer has to allow partial input. A gathered stream sends
+    every piece at once, which the consumer reads as one item only if the
+    connection joins them (``join_dim``) or it takes pieces anyway. A
+    consumer's ChunkPolicy counts items, so either mistake hands it the first
+    chunk as the whole input rather than failing.
+    """
+    from mstar.model.submodule_base import chunk_loop_name
+
+    connections = {
+        (conn.edge_name, conn.to_partition): conn
+        for conn in model.get_partition_topology().connections
+    }
+    for (node, walk), policy in model.chunking_policy_of().items():
+        if not policy.chunkable:
+            continue
+        loop = walk_graphs[walk].get_loops().get(chunk_loop_name(node, walk))
+        if loop is None:
+            continue
+        where = f"node {node!r} in walk {walk!r}"
+        per_chunk = {e.name: e for e in loop.section.outputs if e.name in policy.per_chunk_outputs}
+        for name in sorted(policy.per_chunk_outputs - per_chunk.keys()):
+            yield f"{where} names per-chunk output {name!r}, which is not one of its outputs"
+        for edge in per_chunk.values():
+            if not edge.is_streaming:
+                yield (
+                    f"{where} sends {edge.name!r} per chunk, but it is not a streaming edge; "
+                    "only a streaming consumer can take a prompt's chunks one at a time"
+                )
+                continue
+            conn = connections.get((edge.name, getattr(edge, "target_partition", "")))
+            if conn is not None and not conn.chunk_policy_factory().allow_partial_input():
+                yield (
+                    f"{where} sends {edge.name!r} per chunk, but its consumer in partition "
+                    f"{conn.to_partition!r} does not allow partial input; set it "
+                    "(FixedChunkPolicy(allow_partial=True)), or gather the edge "
+                    "(accumulated_outputs) and join it (Connection.join_dim)"
+                )
+        for edge in loop.accumulated_outputs:
+            if not edge.is_streaming:
+                continue
+            conn = connections.get((edge.name, getattr(edge, "target_partition", "")))
+            if conn is not None and conn.join_dim is None \
+                    and not conn.chunk_policy_factory().allow_partial_input():
+                yield (
+                    f"{where} gathers stream {edge.name!r}, whose consumer in partition "
+                    f"{conn.to_partition!r} would read each chunk's piece as an item of "
+                    "its own; join them (Connection.join_dim), or send it per chunk "
+                    "(per_chunk_outputs) into a consumer that allows partial input"
+                )
 
 
 def _describe(wg: WorkerGraph) -> str:
@@ -191,11 +282,9 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
 
 def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
     """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica per node_group, so they share a
-    node_group, or each is a single instance on the same ranks."""
-    if len({wg._group_id for wg in wgs}) == 1:
-        return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+    workers: the conductor picks one replica for every node_group on the same
+    lockstep instances (``ReplicaRouter``), so they share those instances."""
+    return len({tuple(map(tuple, wg.replica_ranks)) for wg in wgs}) == 1
 
 
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
@@ -235,8 +324,8 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
                 f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
                 "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass and every worker graph on the same workers (one "
-                "node_group, or one instance on the same ranks); otherwise run it as "
+                "arrives once per pass and every worker graph on the same workers (node_groups "
+                "on the same ranks, instance for instance); otherwise run it as "
                 "one worker graph, or move the work after the consumer into a "
                 "downstream partition fed by a StreamingGraphEdge."
             )

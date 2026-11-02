@@ -310,7 +310,7 @@ def test_the_position_resample_matches_interpolate(grid):
     in the merger's block order."""
     import torch.nn.functional as F
 
-    from mstar.model.qwen3_5.components.vision import vision_interpolation
+    from mstar.model.components.qwen3_vit import vision_interpolation
 
     side, merge, dim = 4, 2, 3
     table = torch.randn(side * side, dim, dtype=torch.float64)
@@ -526,16 +526,15 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
 
 
 def test_vision_block_loop_replays_exactly_when_leased():
-    """A leased step declares nothing of its own, so the forward replays
-    then and runs eagerly otherwise, whatever the runner's buckets allow; a
-    replay plans the frames under the one label."""
+    """The forward replays when its step leased the region and runs eagerly
+    otherwise, whatever the runner's buckets allow: ``can_lease`` may have
+    refused a batch that fits one. A replay plans the frames under the one
+    label."""
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 
     class Runner:
-        has_bucket = True
-
         def can_run(self, batch_size, total_tokens):
-            return self.has_bucket
+            return True
 
         def run(self, **kwargs):
             self.ran = kwargs
@@ -544,20 +543,15 @@ def test_vision_block_loop_replays_exactly_when_leased():
     encoder, runner = _encoder(max_segments=4), Runner()
     hidden = cos = sin = torch.zeros(8, 32)
 
-    def replay(step):
+    def replay(leases):
         engine_inputs = SimpleNamespace(
-            piecewise_runners={VISION_BLOCK_LOOP: runner}, request_ids=["r"], step=step,
+            piecewise_runners={VISION_BLOCK_LOOP: runner}, piecewise_leases=leases, request_ids=["r"],
         )
         return encoder._replay_block_loop(engine_inputs, hidden, cos, sin, {"main": (4, 4)})
 
-    assert replay(step=object()) is None
+    assert replay({}) is None
     assert not hasattr(runner, "ran")
-    # no declaration but no bucket either (a forward driven outside the engine)
-    runner.has_bucket = False
-    assert replay(step=None) is None
-    assert not hasattr(runner, "ran")
-    runner.has_bucket = True
-    assert replay(step=None) == "replayed"
+    assert replay({VISION_BLOCK_LOOP: object()}) == "replayed"
     assert runner.ran["seq_lens"] == [4, 4]
     assert runner.ran["label_seq_lens"] == {"main": [4, 4]}
 

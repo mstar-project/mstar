@@ -1,6 +1,7 @@
 """The parts of a decoder node that samples one token per decode step which
-don't depend on the model: the decode capture, the batch caps, feeding the
-sampled token back in, and the stop checks."""
+don't depend on the model: the decode capture, the batch caps and feeding the
+sampled token back in. Its stop checks are ``ARNodeSubmodule``'s, from the
+node's ``token_stop``."""
 from __future__ import annotations
 
 import torch
@@ -8,23 +9,26 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.model.submodule_base import ARNodeInputs, HostRows, NodeInputs
+from mstar.model.submodule_base import ARNodeInputs, NodeInputs
 
 
 class TokenStepNode:
     """Mixin for an ``ARNodeSubmodule`` whose forward returns ``new_token``.
 
-    A subclass binds ``SAMPLER`` to its sampler resource's key and sets
-    ``MAX_PREFILL_BATCH_SIZE`` and ``stop_token_ids``; it overrides the walk
-    and loop names if its graph uses others.
+    A subclass binds ``SAMPLER`` to its sampler resource's key, sets
+    ``MAX_PREFILL_BATCH_SIZE``, and sets ``token_stop`` in ``__init__`` as any
+    ``ARNodeSubmodule`` does; it overrides the walk and loop names if its graph
+    uses others.
     """
 
     DECODE_WALK = "decode"
     DECODE_LOOP = "decode_loop"
+    # the walk that samples the first token, before DECODE_LOOP exists: a
+    # subclass whose stop there ends the reply names it in ``prefill_walks``
+    PREFILL_WALK = "prefill"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
     MAX_PREFILL_BATCH_SIZE: int | None
-    stop_token_ids: frozenset[int]
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -59,14 +63,6 @@ class TokenStepNode:
         if "new_token" in outputs:
             outputs["text_inputs"] = outputs["new_token"]
 
-    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
-        # the set test first: a stop id is rare, and the config read behind it
-        # goes through the wrapper
-        return (
-            token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos
-        ) or decoded >= request_info.max_tokens
-
     def check_stop(
         self,
         request_id: str,
@@ -74,22 +70,6 @@ class TokenStepNode:
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
         # a batched decode step routes its token as text_inputs alone
-        tokens = outputs.get("text_inputs") or outputs.get("new_token")
-        if not tokens:
-            return set()
-        return {self.DECODE_LOOP} if self._stops(tokens[0].item(), request_info) else set()
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``. The base default
-        ignores ``step_walk``, so prefill's token can end the decode loop too;
-        subclasses may narrow that."""
-        pairs = host_rows.first_values("new_token", request_ids)
-        if pairs is None:
-            return None
-        return {rid: {self.DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}
+        if "new_token" not in outputs and "text_inputs" in outputs:
+            outputs = {**outputs, "new_token": outputs["text_inputs"]}
+        return super().check_stop(request_id, request_info, outputs)

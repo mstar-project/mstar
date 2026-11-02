@@ -43,10 +43,10 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -109,6 +109,12 @@ def _file_state(path: str) -> tuple[int, int, int]:
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
+def _prefix_cache(model_kwargs: dict) -> bool:
+    """A client's prefix_cache: unset or None is on, otherwise its truth."""
+    value = model_kwargs.get("prefix_cache")
+    return value is None or bool(value)
+
+
 class _FileChangedError(Exception):
     """A file was rewritten between its load and its hash."""
 
@@ -162,6 +168,8 @@ class InlineTokens:
     request_ids: list[str]
     values: list[int]
     modality: str
+    # per request, or None when no request of the frame asked
+    logprobs: list[float | None] | None = None
 
 
 def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> None:
@@ -187,13 +195,18 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
+    YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
+    groups = [
+        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        for group in model_config.get("node_groups") or []
+    ]
+    opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
     return {
-        spec.resource_key: spec.config.tokens_per_page
-        for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
+        spec.resource_key: spec.config.tokens_per_page for spec in specs
+        if isinstance(spec, KVSpec) and spec.resource_key in opened
     }
 
 
@@ -400,6 +413,7 @@ class PreprocessWorker:
 
     def new_result_tokens(
         self, request_ids: list[str], values: list[int], signal: str, modality: str,
+        logprobs: list[float | None] | None = None,
     ):
         """A frame's values that rode inline: the same accounting per request
         as a result tensor, no transport read and nothing to ack. A request
@@ -408,7 +422,8 @@ class PreprocessWorker:
         reading = self.per_request_reading_tensors
         kept_ids: list[str] = []
         kept_values: list[int] = []
-        for rid, value in zip(request_ids, values, strict=True):
+        kept_logprobs: list[float | None] = []
+        for i, (rid, value) in enumerate(zip(request_ids, values, strict=True)):
             counts = counts_by_rid.get(rid)
             if counts is None:
                 logger.debug("Late token for cleaned-up request %s dropped", rid)
@@ -417,8 +432,12 @@ class PreprocessWorker:
             reading[rid] += 1
             kept_ids.append(rid)
             kept_values.append(value)
+            if logprobs:
+                kept_logprobs.append(logprobs[i])
         if kept_ids:
-            self.result_tensor_input_queue.put(InlineTokens(kept_ids, kept_values, modality))
+            self.result_tensor_input_queue.put(
+                InlineTokens(kept_ids, kept_values, modality, kept_logprobs or None)
+            )
             self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
@@ -805,7 +824,7 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            if model_kwargs.get("prefix_cache") is not False:
+            if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
                 ))
@@ -1343,11 +1362,12 @@ class PreprocessWorkerThread:
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
-        rids, values = item.request_ids, item.values
+        rids, values, logprobs = item.request_ids, item.values, item.logprobs
         if self._draining_rids:
             keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
             rids = [rids[i] for i in keep]
             values = [values[i] for i in keep]
+            logprobs = logprobs and [logprobs[i] for i in keep]
         kwargs = self.request_model_kwargs
         try:
             datas = self.model.postprocess_inline(
@@ -1370,18 +1390,30 @@ class PreprocessWorkerThread:
                     )[0]
                 else:
                     data = datas[i]
+                metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
+                if self._wants_token_ids(request_id, item.modality):
+                    metadata["token_ids"] = [values[i]]
                 self._queue_completed_output(
                     request_id,
                     sequence,
-                    ResultChunk(
-                        request_id=request_id, modality=item.modality, data=data, metadata={},
-                    ),
+                    ResultChunk(request_id=request_id, modality=item.modality, data=data, metadata=metadata),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
                     request_id, exc, f"{item.modality} output postprocessing",
                     sequence=sequence,
                 )
+
+    def _wants_token_ids(self, request_id: str, modality: str) -> bool:
+        """A text chunk of a request that set ``return_token_ids``."""
+        return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
+
+    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+        """``metadata`` plus the chunk's sampled ids, stop tokens included. A
+        float text tensor (Whisper's word alignment) carries no ids."""
+        if tensor.is_floating_point() or not self._wants_token_ids(request_id, modality):
+            return metadata
+        return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
 
     def _queue_completed_output(
         self,
@@ -1446,6 +1478,7 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.

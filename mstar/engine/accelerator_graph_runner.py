@@ -431,15 +431,25 @@ def _capture_thrown_away(
     except RuntimeError:
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
-    taken = None if graph is None else sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
-    )
+    taken = None if graph is None else _pool_bytes(pool.handle)
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
+
+
+def _pool_bytes(pool_id) -> int:
+    """The bytes the caching allocator holds for graph pool ``pool_id``, read off the whole
+    snapshot: ``memory_snapshot(pool_id)`` drops a reference to each item of the id (torch
+    2.9-2.13), which past 256 pools frees the id while the pool's handle still holds it.
+    """
+    pool_id = tuple(pool_id)
+    return sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot()
+        if tuple(segment.get("segment_pool_id", ())) == pool_id
+    )
 
 
 def _graph_nodes(graph) -> int:
@@ -2143,9 +2153,10 @@ class PiecewiseAcceleratorGraphRunner:
         """The captured bucket serving this call, or None for eager.
 
         BATCHED buckets are fixed by the padded batch size; PACKED ones take
-        the smallest captured token bucket that fits.
+        the smallest captured token bucket that fits. A ``one_row_per_step``
+        region resolves every batch as one row.
         """
-        padded_bs = self._padded_bs(batch_size)
+        padded_bs = self._padded_bs(1 if self._config.one_row_per_step else batch_size)
         if padded_bs is None:
             return None
         if self._config.get_config_type() == PiecewiseConfigType.BATCHED:
@@ -2209,11 +2220,18 @@ class PiecewiseAcceleratorGraphRunner:
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
 
+        A ``one_row_per_step`` region replays the step as one row named by its
+        first request, however many requests or segments it is passed.
+
         ``label_seq_lens`` is for a region whose step plans several ragged
         layouts over the same tokens (windows and whole frames): label ->
         spans, padded as ``seq_lens`` is. Its total must be ``seq_lens``'s for
         every label, so the bucket is the one ``seq_lens`` picked.
         """
+        if self._config.one_row_per_step:
+            real_bs = 1
+            if request_ids is not None:
+                request_ids = request_ids[:1]
         if label_seq_lens is not None and seq_lens is not None:
             total = sum(seq_lens)
             bad = {k: sum(v) for k, v in label_seq_lens.items() if sum(v) != total}

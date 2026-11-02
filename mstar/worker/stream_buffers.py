@@ -82,6 +82,7 @@ class StreamBufferManager:
                     edge_name=conn.edge_name,
                     from_partition=conn.from_partition,
                     policy=conn.chunk_policy_factory(),
+                    join_dim=conn.join_dim,
                     walk_tagged=conn.consumer_walk is not None,
                 )
                 req_info.stream_buffers[conn.edge_name] = sbuf

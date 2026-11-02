@@ -14,6 +14,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import DETERMINISTIC_COMPILE_MODE
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
@@ -21,21 +22,22 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.step import ResourceStep
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.qwen3_vit import (
+    vision_interpolation,
+    vision_seq_lengths,
+)
+from mstar.model.components.qwen3_vit import (
+    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    vision_position_ids as vision_grid_position_ids,
+)
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.keys import MIXED
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
     vision_position_advance,
     vision_position_ids,
-)
-from mstar.model.qwen3_5.components.vision import (
-    vision_interpolation,
-    vision_seq_lengths,
-)
-from mstar.model.qwen3_5.components.vision import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
-    vision_position_ids as vision_grid_position_ids,
 )
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -47,7 +49,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
-from mstar.utils.knobs import ingraph_decode_rope
+from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PhaseLaps
 
 
@@ -56,13 +58,22 @@ class LLMSubmodule(SampledTokenDecoder):
 
     # An eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs to 8192. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or
-    # extends it (static buffers are sized by the largest bucket).
+    # ladder runs past 8192. The powers of two stay, since a batch of prompts
+    # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
+    # above them for the decode rows a mixed step carries beside four prompts
+    # and for batches a few tokens over, which would otherwise pad to twice the
+    # width. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or extends it (static
+    # buffers are sized by the largest bucket).
     PREFILL_TOKEN_BUCKETS = [
         int(x) for x in os.environ.get(
-            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,4096,8192",
+            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704",
         ).split(",")
     ]
+    # Four prompts and their decode rows reach 2176, the only slack bucket a
+    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
+    # the forward all these captures share, and past Dynamo's limit the buckets
+    # compiled last run uncompiled inside their graphs.
+    MIXED_TOKEN_BUCKETS = [b for b in PREFILL_TOKEN_BUCKETS if b <= 2176 or b & (b - 1) == 0]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -78,6 +89,12 @@ class LLMSubmodule(SampledTokenDecoder):
             or os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,32,48,64,96,128")
         ).split(",")
     ]
+    # Tokens a step runs (the model's chunking budget), on a prefill capture
+    # bucket since a step over it pads to the next bucket up. 2048 measured
+    # best on 0.8B-9B: 1024 costs 3-10% throughput in steps and speculation,
+    # 4096 gives back most of the short-prompt TTFT gain and doubles decode
+    # ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
 
     def __init__(
         self,
@@ -87,8 +104,20 @@ class LLMSubmodule(SampledTokenDecoder):
         encoders: tuple[MediaEncoder, ...] = (),
     ):
         super().__init__(model, config, encoders)
+        # the graph runtime checks a decode row's stop ids itself, without
+        # calling check_stop (measured on this model; see TokenStop.runtime_check)
+        self.token_stop = self.token_stop._replace(runtime_check=True)
         # patches per merged token along each axis, for the MRoPE grids
         self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
+
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # Prefill loses nothing to deterministic mode and compiles faster.
+        # Decode keeps its tuned kernels, which win at one row, unless the
+        # deployment asks for output that reproduces across processes: both
+        # the cost and that guarantee sit on this graph.
+        if graph_walk == self.DECODE_WALK and not compile_deterministic():
+            return None
+        return DETERMINISTIC_COMPILE_MODE
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {
@@ -134,12 +163,14 @@ class LLMSubmodule(SampledTokenDecoder):
         return torch.cat(pos_ids, dim=1), pos - start
 
     @staticmethod
-    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
-        """A decode step replayed on a leased slot, or being captured for one.
-        The caller's walk decides (a capture's own context carries the
-        piecewise walk), the lease says the slot's static buffers are in
-        play."""
-        if graph_walk != "decode":
+    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A step of a text walk replayed on a leased slot, or being captured
+        for one, with ``ingraph_decode_rope`` on: its rotary tables come from
+        the planned positions inside the graph. The caller's walk decides (a
+        capture's own context carries the piecewise walk), the lease says the
+        slot's static buffers are in play. Only media walks' rows bring their
+        own 3D positions."""
+        if graph_walk not in ("decode", "prefill_text", MIXED) or not ingraph_decode_rope():
             return False
         step = getattr(engine_inputs, "step", None)
         ctx = getattr(step, "ctx", None) if step is not None else None
@@ -168,11 +199,10 @@ class LLMSubmodule(SampledTokenDecoder):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out = super().preprocess(graph_walk, engine_inputs, inputs)
-        if (
-            self._reads_loopback(inputs)
-            and self._captured_decode(engine_inputs, graph_walk)
-            and ingraph_decode_rope()
-        ):
+        if self._rope_in_graph(engine_inputs, graph_walk):
+            assert self._reads_loopback(inputs) or all(inp.custom_pos_ids is None for inp in inputs), (
+                "a text walk's rows take the planned 1D positions"
+            )
             # the captured forward builds the rotary tables itself
             return out
         laps = PhaseLaps("engine.preprocess.")
@@ -195,10 +225,7 @@ class LLMSubmodule(SampledTokenDecoder):
         sin_3d: torch.Tensor | None = None,
         **tensors: torch.Tensor,
     ) -> dict[str, Any]:
-        if (
-            (self._captured_decode(engine_inputs, graph_walk) and ingraph_decode_rope())
-            or cos_3d is None or sin_3d is None
-        ):
+        if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
             # positions, inside the graph; the static cos/sin stay unread
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)

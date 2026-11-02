@@ -137,8 +137,7 @@ class AttentionManager(AttentionResource):
                 f"holds a {type(kv_config).__name__}. "
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
-        if info.joint_comm_group is not None:
-            kv_config.shard(info.joint_comm_group.world_size)
+        kv_config.shard(info.head_shards)
         if backend == AttnBackend.DENSE:
             # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
             # that has no kernel for the GPU or does not import, the same pass
@@ -196,6 +195,7 @@ class AttentionManager(AttentionResource):
                 max_rows_in_combined=info.max_rows_in_combined,
                 decode_tensor_cores=spec.config.decode_tensor_cores,
                 sliding_window=spec.config.sliding_window,
+                decode_fmha=spec.config.decode_fmha,
                 layers=spec.config.layers,
                 sm_scale=spec.config.sm_scale,
             )
@@ -255,8 +255,9 @@ class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
     between steps the re-plan is skippable."""
     q_seq_lens: tuple
-    page_indices: tuple
-    last_page_lens: tuple
+    # the int32 arrays' bytes
+    page_indices: bytes
+    last_page_lens: bytes
 
 
 class EagerSlotKey(NamedTuple):
