@@ -58,7 +58,7 @@ class SamplerRows(RowState):
             self.seen = space.buffer(
                 "sampler.seen", (width,), torch.bool, pad=False, mirrored=False, moved=False,
             )
-        self._samplers: dict[int, AcceleratorGraphableSampler] = {}
+        self._samplers: dict[tuple[int, int | None], AcceleratorGraphableSampler] = {}
 
     def check_out(self, rows: StepRows) -> None:
         d = rows.diff
@@ -106,9 +106,13 @@ class SamplerRows(RowState):
         # freed only now, after its check-in was queued
         rows.on_commit(lambda released: bufs.drop_slots(masters))
 
-    def sampler_for(self, bs: int) -> AcceleratorGraphableSampler:
-        """A sampler over the first ``bs`` rows, cached: the rows never move."""
-        sampler = self._samplers.get(bs)
+    def sampler_for(self, bs: int, slot: int | None) -> AcceleratorGraphableSampler:
+        """A sampler over the first ``bs`` rows, cached: the rows never move.
+        Its log-probs land in the leased ``slot``'s row, as on the slot path,
+        or in a new tensor per eager step."""
+        key = (bs, slot)
+        bufs = self._buffers()
+        sampler = self._samplers.get(key)
         if sampler is None:
             def view(name: str) -> torch.Tensor | None:
                 row = self.scalars.get(name)
@@ -117,7 +121,7 @@ class SamplerRows(RowState):
             order = None
             if "top_p_first" in self.scalars:
                 order = FilterOrder(view("top_p_first"), view("top_p_min_keep"))
-            sampler = self._samplers[bs] = AcceleratorGraphableSampler(
+            sampler = self._samplers[key] = AcceleratorGraphableSampler(
                 temperature_buf=view("temperature"),
                 top_k_buf=view("top_k"),
                 top_p_buf=view("top_p"),
@@ -130,7 +134,12 @@ class SamplerRows(RowState):
                 seen_tokens_buf=None if self.seen is None else self.seen.resident,
                 seen_rows=None if self.seen is None else self._space.gather_slots[:bs],
                 seen_write_rows=None if self.seen is None else self._space.scatter_slots[:bs],
-                tp_group=self._buffers().tp_group,
+                return_logprobs_buf=view("return_logprobs"),
+                logprob_buf=None if bufs.logprob is None or slot is None else bufs.logprob[slot, :bs],
+                processed_logprobs_buf=view("processed_logprobs"),
+                tp_group=bufs.tp_group,
             )
+        if slot is None and bufs.logprob is not None:
+            sampler.logprob_buf = torch.zeros(bs, device=bufs.logprob.device)
         sampler.applied_penalty_in_graph = False
         return sampler

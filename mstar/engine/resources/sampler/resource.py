@@ -571,7 +571,7 @@ class SamplerResource(Resource):
         self.clear_preplan()
         self._cg_buffers.sync_slots()
         bs = len(ctx.padded_request_ids)
-        self._cg_sampler = rows.sampler_for(bs)
+        self._cg_sampler = rows.sampler_for(bs, ctx.slot_lease.slot if ctx.slot_lease is not None else None)
         self._step_slot = None
         self._row_step = (rows, bs)
 

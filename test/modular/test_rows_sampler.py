@@ -22,6 +22,7 @@ from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.sampler.config import (  # noqa: E402
+    SAMPLED_LOGPROB,
     LoopbackState,
     SamplerSpec,
     SamplerStep,
@@ -34,7 +35,7 @@ from mstar.engine.resources.sampler.utils import (  # noqa: E402
 )
 from mstar.engine.resources.step import SubmoduleStep  # noqa: E402
 from mstar.engine.rows import RowWalk  # noqa: E402
-from mstar.model.submodule_base import NodeInputs, NodeSubmodule  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 
 NODE, ROWS_WALK, OTHER_WALK, MAX_ROWS, HANDLES, VOCAB = "toy", "decode", "other", 8, 32, 64
 ACC, ACC_DEFAULT = "acc", (7, -7)
@@ -48,6 +49,7 @@ class _Toy(NodeSubmodule):
         self.penalty = penalty
         # set: a step of the other walk writes this loop-back state, by slot
         self.other_acc: int | None = None
+        self.stop_rows = False
         # rid -> (token, state) its next step brings routed, as a request's
         # first decode step does
         self.routed: dict[int, tuple[int, tuple[int, int]]] = {}
@@ -100,15 +102,20 @@ class _Toy(NodeSubmodule):
         acc = sampler.loopback_state(ACC, rids).clone()
         tokens = sampler.sample(rids, self.logits[torch.tensor(rids, device="cuda")])
         sampler.store_loopback_state(ACC, rids, acc + 1)
-        return {
+        out = {
             rid: {"token": [tokens[i:i + 1]], "prev": [prev[i:i + 1]], "acc": [acc[i:i + 1]]}
             for i, rid in enumerate(rids)
         }
+        if self.stop_rows:
+            # what the sampler's log-prob rows join
+            return BatchedModelOutput(per_rid_outputs=out, check_stop_buffers={"token": tokens})
+        return out
 
 
-def _engine(penalty: bool = False, max_live: int | None = None) -> Engine:
+def _engine(penalty: bool = False, max_live: int | None = None, logprobs: bool = False) -> Engine:
     spec = SamplerSpec(
         resource_key="sampler", nodes={NODE}, vocab_size=VOCAB, enable_repetion_penalty=penalty,
+        enable_logprobs=logprobs,
         loopback_state={ACC: LoopbackState(width=2, dtype=torch.long, default=ACC_DEFAULT)},
     )
     engine = Engine(None, autocast_dtype=None, max_concurrent_requests=max_live)
@@ -121,11 +128,11 @@ def _engine(penalty: bool = False, max_live: int | None = None) -> Engine:
     return engine
 
 
-def _config(rid: int, gen: int, penalty: float = 1.0) -> SamplingReqConfig:
+def _config(rid: int, gen: int, penalty: float = 1.0, logprobs: bool = False) -> SamplingReqConfig:
     # a recycled handle is a new request, with a seed of its own
     return SamplingReqConfig(
         temperature=1.0, top_k=8 * (rid % 3), top_p=0.9, _seed=1000 * gen + rid,
-        repetition_penalty=penalty,
+        repetition_penalty=penalty, return_logprobs=logprobs,
     )
 
 
@@ -164,13 +171,26 @@ def _mask(tokens) -> torch.Tensor:
     return mask
 
 
+def _info(rid, walk) -> CurrentForwardPassInfo:
+    return CurrentForwardPassInfo(
+        request_id=f"r{rid}", rid_handle=rid, graph_walk=walk,
+        fwd_index=0, random_seed=0, max_tokens=1,
+    )
+
+
+def _admitted(engine, walk, rids) -> dict[int, CurrentForwardPassInfo]:
+    """Each request's step info, once the node admitted it, as the scheduler's
+    readiness check does: that is where the sampler takes a request's slot."""
+    infos = {rid: _info(rid, walk) for rid in rids}
+    for rid, info in infos.items():
+        assert engine.check_ready(NODE, rid, info).ok, rid
+    return infos
+
+
 def _step(engine, walk, rids):
     batch = ExecutingBatch(
         node_name=NODE,
-        per_request_info={rid: CurrentForwardPassInfo(
-            request_id=f"r{rid}", rid_handle=rid, graph_walk=walk,
-            fwd_index=0, random_seed=0, max_tokens=1,
-        ) for rid in rids},
+        per_request_info=_admitted(engine, walk, rids),
         step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False),
         per_request_input_tensors={rid: {} for rid in rids},
     )
@@ -286,10 +306,7 @@ def test_a_removed_request_s_slot_waits_for_its_row_s_check_in():
     _step(engine, ROWS_WALK, [0, 1])
     leaving = ExecutingBatch(
         node_name=NODE,
-        per_request_info={1: CurrentForwardPassInfo(
-            request_id="r1", rid_handle=1, graph_walk=ROWS_WALK,
-            fwd_index=0, random_seed=0, max_tokens=1,
-        )},
+        per_request_info=_admitted(engine, ROWS_WALK, [1]),
         step_context=StepContext(request_ids=(1,), graph_walk=ROWS_WALK, slot=0, capture=False),
         per_request_input_tensors={1: {}},
     )
@@ -346,3 +363,24 @@ def test_each_request_is_penalised_for_its_own_draws_across_rows_and_removals(se
             cfg, draws, _ = live[rid]
             live[rid] = (cfg, draws + 1, out[rid][0])
             seen[rid].add(out[rid][0])
+
+
+def test_rows_report_the_log_probs_their_requests_asked_for():
+    """Log-probs come off the rows' sampler as off the slot path's: each
+    asking row's sampled token scored, NaN for the rest."""
+    engine = _engine(logprobs=True)
+    engine._submodules[NODE].submodule.stop_rows = True
+    sampler = engine._resources["sampler"]
+    logits = engine._submodules[NODE].submodule.logits
+    for rid in range(4):
+        engine.add_request(rid, {"sampler": _config(rid, 1, logprobs=rid % 2 == 0)})
+    for rids in ([0, 1, 2, 3], [3, 0], [1, 2, 0]):
+        batch, seen = _step(engine, ROWS_WALK, rids)
+        order = list(batch.request_ids)
+        rows = sampler.step_host_rows()[SAMPLED_LOGPROB][: len(order)]
+        for i, rid in enumerate(order):
+            if rid % 2:
+                assert rows[i].isnan(), rid
+            else:
+                want = torch.log_softmax(logits[rid].float(), -1)[seen[rid][0]]
+                torch.testing.assert_close(rows[i], want, rtol=1e-3, atol=1e-3)

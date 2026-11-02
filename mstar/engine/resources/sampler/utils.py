@@ -842,11 +842,11 @@ def _token_logprobs_cuda(logits: torch.Tensor, tokens: torch.Tensor, temperature
     hist_args, hist_flags = _history_kernel_args(None, logits)
     with torch.cuda.device(logits.device):
         _split_partials_kernel[(B, nsplit)](
-            logits, temperature, logits, logits, *hist_args, cmax, csum, carg,
+            logits, temperature, logits, logits, logits, *hist_args, cmax, csum, carg,
             V, chunk, logits.stride(0), logits.stride(1), 0, 0, cmax.stride(0),
             BLOCK_SIZE=min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk)),
             # for its greedy rows' T = 1; the argmax it also takes goes unread
-            APPLY_PENALTY=False, INCLUDE_GREEDY=True, **hist_flags,
+            APPLY_PENALTY=False, MASK_ROWS=False, INCLUDE_GREEDY=True, **hist_flags,
             num_warps=8, num_stages=2,
         )
         _token_logprob_kernel[(B,)](
