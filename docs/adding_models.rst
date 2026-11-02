@@ -2168,8 +2168,10 @@ logs at load how it takes split steps.
 **Choosing the exchange.** ``sp_exchange`` on a paged attention's ``resources:`` block picks how
 its split steps' tokens reach it. Unset, it takes the storage's default: ``ulysses`` by head, and
 ``none`` by position, so a node whose pools store KV by position splits its steps only where the
-deployment opts in with ``all_gather`` or ``ring``. It must match the storage at any SP size, or
-loading fails; and it only picks the split exchange: copied steps keep the storage's own path.
+deployment opts in with ``all_gather`` or ``ring``. Loading fails where it doesn't match the
+storage, at any SP size, and where it can't take effect (a node with no ``SeqShardSpec``, or on one
+SP rank), unlike a model's declarations, which are no-ops there. It only picks the split exchange:
+copied steps keep the storage's own path.
 Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` above 1:
 
 .. list-table::

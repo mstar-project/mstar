@@ -446,7 +446,8 @@ With both, a paged attention's ``sp_exchange`` picks how a split step reaches it
 takes the storage's default, ``ulysses`` by head and ``none`` by position (the node's steps run
 copied, KV capacity alone); by position, ``all_gather`` splits them, and ``ring`` also bounds the
 attention phase's memory to this rank's tokens and runs eager only. A value that doesn't match
-the storage fails at load:
+the storage, or set where the node never splits its steps (no sequence shard, or one SP rank),
+fails at load:
 
 .. code-block:: yaml
 

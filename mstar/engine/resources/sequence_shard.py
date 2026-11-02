@@ -607,12 +607,20 @@ def sequence_parallel_refusals(
     moe_parallel: MoeParallelConfig | None = None,
 ) -> list[str]:
     """What ``node``, on ``tp`` TP and ``sp`` SP ranks, declares that its SP ranks can't run; each
-    a sentence. Nothing at one SP rank. Each resource answers for itself
+    a sentence. At one SP rank, only an ``sp_exchange`` set there. Each resource answers for itself
     (``NodeResourceSpec.split_step_refusals``); the checks on built objects
     (``supports_split_steps``, ``check_captures``) are the engine's."""
-    if sp == 1:
-        return []
     specs = [spec for spec in specs if node in spec.nodes]
+    if sp == 1:
+        from mstar.engine.resources.attn.config import AttentionSpec
+
+        # a deployment's sp_exchange would be silently ignored here (`AttentionSpec.derive` refuses it
+        # without a shard)
+        return [
+            f"node {node!r} runs on one SP rank, so its steps never split, and attention {spec.resource_key!r} "
+            f"sets sp_exchange {spec.sp_exchange!r}, which picks how a split step reaches it: drop it"
+            for spec in specs if isinstance(spec, AttentionSpec) and spec.sp_exchange is not None
+        ]
     try:
         placed = any(position_pools(specs, node).values())
     except ValueError as e:

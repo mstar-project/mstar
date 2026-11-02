@@ -830,12 +830,14 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
             attn.run(q, "main", kv_cache_layer=None, k=q[:, :1], v=q[:, :1])
 
 
-def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_shard():
+def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_shard(monkeypatch):
     """sp_exchange ring makes the sequence shard depend on the pool whose stored positions it
     stripes by: the engine takes that edge to a pool stored by position, and plans the pool
-    first whatever the keys' order. On one SP rank (here, TP placement) the edge is there too."""
+    first whatever the keys' order."""
+    # one rank of the two, with no group to warm
+    monkeypatch.setattr(AttentionManager, "_warm_ring", lambda self, group: None)
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add(NODE, _group(0, P))
+    groups.add_sp(NODE, _group(0, P))
     specs = [
         KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS, max_num_pages=8,
