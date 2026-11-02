@@ -147,11 +147,9 @@ _DECLARED = LowPrecisionLinears(candidates=("fused", "plain"), keep_bf16=("keep"
 def block_gemm_gpu(monkeypatch):
     monkeypatch.setattr(Platform, "has_block_scaled_gemm", lambda self, device=None: True)
     monkeypatch.setattr(linear_module, "current_platform", Platform())
-    block_gemm.block_quant.reset()
-    block_gemm.block_scaled_gemm.reset()
-    yield
-    block_gemm.block_quant.reset()
-    block_gemm.block_scaled_gemm.reset()
+    # the reference kernels, also where a GPU is visible: these tests hand them host tensors
+    monkeypatch.setattr(block_gemm.block_quant, "_impl", block_gemm._reference_quant)
+    monkeypatch.setattr(block_gemm.block_scaled_gemm, "_impl", block_gemm._reference_gemm)
 
 
 def test_bf16_changes_nothing():
