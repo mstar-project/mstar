@@ -120,15 +120,19 @@ def fused_experts(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
-    block_m = config["BLOCK_SIZE_M"]
+    block_m = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
     if alignment is None:
         alignment = MoeAlignment(*moe_align_block_size(topk_ids, block_m, E), block_m)
     assert alignment.block_m == block_m, f"alignment uses BLOCK_SIZE_M={alignment.block_m}, config {block_m}"
     sorted_token_ids, expert_ids, num_tokens_post_padded, _ = alignment
+
+    # Read here, not above: the alignment is a graph break to dynamo, and an int that
+    # crosses one and differs between compiles turns symbolic, which a launch's tile
+    # sizes can't be. A tuned table's tiles differ with the batch.
+    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
 
     # 2. Scratch buffers (all sized from static inputs -- no data-dependent shapes).
     m_topk = num_tokens * top_k

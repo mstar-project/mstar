@@ -462,16 +462,19 @@ def _omni_submodule():
 
 
 @pytest.mark.parametrize("max_tokens", [1, 64])
-def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_tokens):
+@pytest.mark.parametrize("walk", ["thinker_decode", "thinker_text_decode"])
+def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(walk, max_tokens):
     pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.config import THINKER_SAMPLER
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
     cap = Qwen3OmniModel.get_loop_caps(object.__new__(Qwen3OmniModel), max_output_tokens=max_tokens)
+    thinker = object.__new__(ThinkerSubmodule)
+    thinker.config = _omni_submodule().config
 
     assert cap["thinker_decode_loop"] == _stops_after(
-        lambda *args: ThinkerSubmodule.check_stop(_omni_submodule(), *args), "thinker_decode_loop", "thinker_decode",
+        thinker.check_stop, "thinker_decode_loop", walk,
         2048, {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
         resource_configs={THINKER_SAMPLER: SamplingReqConfig(ignore_eos=True)},
     ), "the cap and the stop check end decode on different iterations"

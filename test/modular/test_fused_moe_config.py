@@ -19,9 +19,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="fused MoE requi
 def tuned_table(tmp_path, monkeypatch):
     path = tmp_path / "table.json"
     monkeypatch.setattr(kernels, "config_path", lambda E, N, K: path)
-    kernels._tuned_configs.cache_clear()
+    monkeypatch.setattr(kernels, "_tuned_tables", {})
     yield path
-    kernels._tuned_configs.cache_clear()
 
 
 def test_get_config_falls_back_to_default(tuned_table):

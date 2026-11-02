@@ -98,6 +98,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_TEXT_DECODE,
     VISION_ATTN,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
@@ -406,7 +407,7 @@ class Qwen3OmniModel(Model):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"Thinker": {THINKER_MIXED: {
-            "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
+            "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode", THINKER_TEXT_DECODE,
         }}}
 
     def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
@@ -431,7 +432,9 @@ class Qwen3OmniModel(Model):
             prefill_text   - text token embedding + Thinker prefill
             prefill_audio  - audio feature encoding + Thinker prefill
             prefill_vision - vision feature encoding + Thinker prefill
-            thinker_decode - autoregressive text token generation
+            thinker_decode - autoregressive text token generation, streaming
+                             its states to the Talker
+            thinker_text_decode - the same for a request with no audio output
 
         Talker walks:
             talker_prefill - prefill Talker KV cache from Thinker states
@@ -571,6 +574,26 @@ class Qwen3OmniModel(Model):
             outputs=[],
         )
 
+        # -- Thinker decode with no Talker: the sampled token stays on the
+        #    device between steps and reaches the client inline --
+        thinker_text_decode = Loop(
+            name="thinker_decode_loop",
+            section=GraphNode(
+                name="Thinker",
+                input_names=["text_inputs"],
+                outputs=[
+                    GraphEdge(next_node="Thinker", name="text_inputs"),
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="text_inputs",
+                        output_modality="text",
+                    ),
+                ],
+            ),
+            max_iters=self.config.thinker_text.max_position_embeddings,
+            outputs=[],
+        )
+
         # -- Talker prefill: extends the KV cache with each streamed state --
         talker_prefill = GraphNode(
             name="Talker",
@@ -643,6 +666,7 @@ class Qwen3OmniModel(Model):
             "prefill_audio": prefill_audio,
             "prefill_vision": prefill_vision,
             "thinker_decode": thinker_decode,
+            THINKER_TEXT_DECODE: thinker_text_decode,
             "talker_prefill": talker_prefill,
             "talker_last_prefill": talker_last_prefill,
             "talker_decode": talker_decode,
@@ -659,7 +683,7 @@ class Qwen3OmniModel(Model):
                 name="Thinker",
                 graph_walks={
                     "prefill_text", "prefill_audio",
-                    "prefill_vision", "thinker_decode",
+                    "prefill_vision", "thinker_decode", THINKER_TEXT_DECODE,
                 },
                 initial_walk="prefill_text",
                 producer_partitions=[],
@@ -798,7 +822,7 @@ class Qwen3OmniModel(Model):
             input_modalities, input_signals,
         )
 
-        first_walk = schedule[0][0] if schedule else "thinker_decode"
+        first_walk = schedule[0][0] if schedule else self._decode_walk(audio_output)
         is_last_prefill = (schedule and len(schedule) == 1)
 
         full_metadata = CurrentForwardConductorMetadata(
@@ -831,6 +855,10 @@ class Qwen3OmniModel(Model):
                 "is_last_prefill": is_last_prefill
             },
         )
+
+    @staticmethod
+    def _decode_walk(audio_output: bool) -> str:
+        return "thinker_decode" if audio_output else THINKER_TEXT_DECODE
 
     # Per-modality walk name and the signal keys it consumes: primary feature
     # tensor first, then that encoder's auxiliary tensors. Video rides the
@@ -969,7 +997,7 @@ class Qwen3OmniModel(Model):
 
         1. Build prefill schedule: [prefill_text] + [modality walks] + [prefill_text]
         2. Pop walks from schedule until done
-        3. Transition to thinker_decode
+        3. Transition to the request's decode walk
         4. Each decode step: check new_token for EOS (im_end_token_id)
         5. On EOS: request_done=True for Thinker
         """
@@ -984,11 +1012,11 @@ class Qwen3OmniModel(Model):
                 metadata.kwargs["prefill_step"] = step
                 metadata.graph_walk = schedule[step][0]
             else:
-                # All prefill done -- transition to thinker_decode
+                # All prefill done -- transition to decode
                 metadata.is_prefill = False
-                metadata.graph_walk = "thinker_decode"
+                metadata.graph_walk = self._decode_walk(metadata.kwargs.get("audio_output", True))
 
-        elif metadata.graph_walk == "thinker_decode":
+        elif metadata.graph_walk in ("thinker_decode", THINKER_TEXT_DECODE):
             # if the decode loop returns to conductor, the thinker is fully done
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -1415,7 +1443,7 @@ class Qwen3OmniModel(Model):
         file, and its replies as they decode."""
         return {
             THINKER_KV: {"main": KVLabel(
-                growth=(("thinker_decode", "thinker_decode_loop"),),
+                growth=(("thinker_decode", "thinker_decode_loop"), (THINKER_TEXT_DECODE, "thinker_decode_loop")),
                 keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vision", "prefill_audio"), growth=True),
             )},
             TALKER_KV: {"main": KVLabel(
