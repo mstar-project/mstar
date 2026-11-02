@@ -988,6 +988,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
+
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 
@@ -1023,12 +1025,14 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="rotate_queries_or_keys_BNHD">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">rotate_queries_or_keys_BNHD</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">pos</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-    <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">()</span>
-    <span class="n">omega</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">D</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-    <span class="n">omega</span> <span class="o">/=</span> <span class="n">D</span> <span class="o">/</span> <span class="mf">2.0</span>
+<div class="viewcode-block" id="rope_tables_BNHD">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">rope_tables_BNHD</span><span class="p">(</span>
+    <span class="n">pos</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``(sin, cos)`` for ``apply_rope_BNHD`` over the last ``dim`` dims."""</span>
+    <span class="n">omega</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">omega</span> <span class="o">/=</span> <span class="n">dim</span> <span class="o">/</span> <span class="mf">2.0</span>
     <span class="n">omega</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="mi">10000</span><span class="o">**</span><span class="n">omega</span>
 
     <span class="k">if</span> <span class="n">pos</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
@@ -1038,11 +1042,30 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">emb_sin</span> <span class="o">=</span> <span class="n">freq</span><span class="o">.</span><span class="n">sin</span><span class="p">()</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>  <span class="c1"># [B, N, num_heads, D]</span>
     <span class="n">emb_cos</span> <span class="o">=</span> <span class="n">freq</span><span class="o">.</span><span class="n">cos</span><span class="p">()</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">emb_sin</span><span class="p">,</span> <span class="n">emb_cos</span></div>
 
+
+
+<div class="viewcode-block" id="apply_rope_BNHD">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">apply_rope_BNHD</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">emb_sin</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">emb_cos</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
     <span class="n">y</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">unflatten</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">))</span>
     <span class="n">y1</span><span class="p">,</span> <span class="n">y2</span> <span class="o">=</span> <span class="n">y</span><span class="o">.</span><span class="n">unbind</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
     <span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">((</span><span class="o">-</span><span class="n">y2</span><span class="p">,</span> <span class="n">y1</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
     <span class="k">return</span> <span class="p">(</span><span class="n">x</span> <span class="o">*</span> <span class="n">emb_cos</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">y</span> <span class="o">*</span> <span class="n">emb_sin</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="RopeTables">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.RopeTables">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RopeTables</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One cached step's ``(sin, cos)`` per axis (``rope_tables_BNHD``): built once</span>
+<span class="sd">    from the step's positions and shared by every block, q and k."""</span>
+
+    <span class="n">d</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">h</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">w</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">time</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span>  <span class="c1"># action tokens, over the d dims</span></div>
 
 </pre></div>
 

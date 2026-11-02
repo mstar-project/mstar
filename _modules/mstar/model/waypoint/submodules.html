@@ -982,7 +982,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AcceleratorGraphConfig</span><span class="p">,</span> <span class="n">BatchedAcceleratorGraphConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">AcceleratorGraphConfig</span><span class="p">,</span>
+    <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">,</span>
+    <span class="n">geometric_batch_sizes</span><span class="p">,</span>
+<span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">compile_kwargs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">RingKVStep</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
@@ -1029,22 +1033,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">z</span> <span class="o">^=</span> <span class="n">z</span> <span class="o">&gt;&gt;</span> <span class="mi">31</span>
     <span class="c1"># manual_seed takes a signed 64-bit; keep it non-negative.</span>
     <span class="k">return</span> <span class="n">z</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">_U64</span> <span class="o">&gt;&gt;</span> <span class="mi">1</span><span class="p">)</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_rollout_capture_batch_sizes</span><span class="p">(</span><span class="n">step_batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""Powers of two up to ``step_batch_size``, with ``step_batch_size`` itself.</span>
-
-<span class="sd">    A geometric bucket set makes capture startup grow with ``log B`` instead</span>
-<span class="sd">    of linearly in B; a step of ``n`` rows replays the smallest bucket</span>
-<span class="sd">    ``&gt;= n`` and pads the tail with dummy rows (see ``RingKVManager.plan``).</span>
-<span class="sd">    """</span>
-    <span class="n">sizes</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="n">bs</span> <span class="o">=</span> <span class="mi">1</span>
-    <span class="k">while</span> <span class="n">bs</span> <span class="o">&lt;</span> <span class="n">step_batch_size</span><span class="p">:</span>
-        <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">bs</span><span class="p">)</span>
-        <span class="n">bs</span> <span class="o">*=</span> <span class="mi">2</span>
-    <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">step_batch_size</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">sizes</span>
 
 
 <span class="c1"># The prime-walk capture and the decode compile share this mode. max-autotune</span>
@@ -1557,7 +1545,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># sort is descending and stable, so rollout captures first at every</span>
         <span class="c1"># size tie with prime and sizes the shared graph pool at its biggest</span>
         <span class="c1"># allocation; prime reuses freed blocks going down.</span>
-        <span class="n">batch_sizes</span> <span class="o">=</span> <span class="n">_rollout_capture_batch_sizes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">step_batch_size</span><span class="p">)</span>
+        <span class="c1"># a step of n rows replays the smallest bucket &gt;= n, the tail padded with</span>
+        <span class="c1"># dummy rows (see RingKVManager.plan)</span>
+        <span class="n">batch_sizes</span> <span class="o">=</span> <span class="n">geometric_batch_sizes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">step_batch_size</span><span class="p">)</span>
         <span class="n">walks</span> <span class="o">=</span> <span class="p">[(</span><span class="n">ROLLOUT_WALK</span><span class="p">,</span> <span class="s2">"noise"</span><span class="p">)]</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">capture_dit_prime</span><span class="p">:</span>
             <span class="c1"># Prime captures the same geometric buckets as rollout, so a</span>

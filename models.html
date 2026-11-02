@@ -691,6 +691,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#orpheus-notes">Orpheus notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#bagel-notes">BAGEL notes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
@@ -1143,6 +1144,31 @@ and startup refuses a cap the caches can’t hold.</p></li>
 <li><p>Canary-Qwen’s default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
 smaller GPU, lower <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">resources.kv_cache.max_num_pages</span></code>
 together.</p></li>
+</ul>
+</section>
+<section id="bagel-notes">
+<h3>BAGEL notes<a class="headerlink" href="#bagel-notes" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Text-to-image runs only the CFG branches a denoising step reads: two with
+image guidance off, and the main branch alone outside <code class="docutils literal notranslate"><span class="pre">cfg_interval</span></code>, about
+-37% latency at 1024² on an H200. A step then computes fewer rows and returns
+the main branch’s velocity outside the interval where it used to recombine all
+three, which is equal only up to rounding, so images move. Against the
+previous output on one GPU, seeded text-to-image at the default guidance is
+34 dB PSNR at worst and 45 dB at the median (58–60 dB between two boots of
+one version), text-to-image without guidance 42 / 53 dB, and edits 24 / 40 dB,
+about what two runs of one version’s edit differ by (23 / 39 dB).</p></li>
+<li><p>A guided request’s steps inside <code class="docutils literal notranslate"><span class="pre">cfg_interval</span></code> run as a walk of their own,
+<code class="docutils literal notranslate"><span class="pre">image_gen_guided2</span></code> (<code class="docutils literal notranslate"><span class="pre">image_gen_guided3</span></code> with image guidance), between
+<code class="docutils literal notranslate"><span class="pre">image_gen_head</span></code> and <code class="docutils literal notranslate"><span class="pre">image_gen</span></code>. A config that places <code class="docutils literal notranslate"><span class="pre">LLM</span></code> per walk
+(<code class="docutils literal notranslate"><span class="pre">configs/bagel_*_disaggregated.yaml</span></code>) lists all four on the rank that
+generates images.</p></li>
+<li><p>On a CFG-parallel deployment (<code class="docutils literal notranslate"><span class="pre">configs/bagel_cfg_parallel*.yaml</span></code>) those
+steps run on the guidance GPUs instead, as the <code class="docutils literal notranslate"><span class="pre">image_gen_cfg2</span></code> walk
+(<code class="docutils literal notranslate"><span class="pre">image_gen_cfg3</span></code> with image guidance); the other steps run on the main
+GPU. A config that places <code class="docutils literal notranslate"><span class="pre">LLM_cfg_text</span></code> or <code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code> with
+<code class="docutils literal notranslate"><span class="pre">graph_walks</span></code> names these walks: <code class="docutils literal notranslate"><span class="pre">LLM_cfg_text</span></code> and <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code> both,
+<code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code> only <code class="docutils literal notranslate"><span class="pre">image_gen_cfg3</span></code>.</p></li>
 </ul>
 </section>
 </section>
@@ -1961,6 +1987,15 @@ pip-installable).</p></li>
 <li><p>The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN &gt;=
 9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
 automatically.</p></li>
+<li><p>Two GPUs (H200 numbers, measured before the Cosmos3-Edge Blackwell changes,
+so the one-GPU baselines are older): <code class="docutils literal notranslate"><span class="pre">configs/cosmos3_nano_sp2.yaml</span></code> halves
+one request’s denoise (Nano 832x480x189x35: 1.47 -&gt; 0.78 s per step), while
+<code class="docutils literal notranslate"><span class="pre">configs/cosmos3_nano_dp2.yaml</span></code> (a whole replica per GPU) serves more under
+concurrency: 2.13 videos/min at 2 concurrent vs 1.63 for sp2 and 1.07 on one GPU.
+For Edge (832x480x121, 20 steps): <code class="docutils literal notranslate"><span class="pre">configs/cosmos3_edge_sp2.yaml</span></code> takes one
+request from 6.3 to 4.4 s (generation only: the reasoner has no SP path), and
+<code class="docutils literal notranslate"><span class="pre">configs/cosmos3_edge_dp2.yaml</span></code> serves 15.8 videos/min at 4 concurrent vs 7.9 on
+one GPU.</p></li>
 </ul>
 </section>
 <section id="cosmos3-image-to-video-conditioning">
@@ -2271,12 +2306,20 @@ therefore independent and the loop is resumable across ranks. <code class="docut
 (default 1) lets requests at one latent grid and guidance scale share a forward,
 each row count compiling its own graph.</p>
 <p><strong>What is accelerated by default.</strong> The DiT runs under <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>
-(<code class="docutils literal notranslate"><span class="pre">compile_dit</span></code>) and the untiled VAE decode runs the shared Wan VAE decoder,
+(<code class="docutils literal notranslate"><span class="pre">compile_dit</span></code>); its self-attention runs on the engine’s ragged attention
+resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
+6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
+an earlier version of the DiT block, before the adaLN was computed in one pass
+and the q/k norm and RoPE were fused
+(<code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">attention_backend:</span> <span class="pre">sdpa</span></code> restores the reference kernel; the
+cross-attention over the 512 text tokens stays on SDPA, which is faster at that
+shape). The untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (<code class="docutils literal notranslate"><span class="pre">vae_decode_fast</span></code>; set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> under the
 yaml’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> for stock <code class="docutils literal notranslate"><span class="pre">vae.decode</span></code>). Both compile on first use:
 the DiT only for the <code class="docutils literal notranslate"><span class="pre">compile_dit_sizes</span></code> shapes (see Compiled DiT shapes), so
 the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only
-for the sizes in <code class="docutils literal notranslate"><span class="pre">vae_decode_fast_sizes</span></code> (default <code class="docutils literal notranslate"><span class="pre">1280x704</span></code>); any other
+for the sizes in <code class="docutils literal notranslate"><span class="pre">vae_decode_fast_sizes</span></code> (model default <code class="docutils literal notranslate"><span class="pre">1280x704</span></code>; the
+shipped configs add <code class="docutils literal notranslate"><span class="pre">832x480</span></code>, where it decodes 1.59x faster); any other
 size decodes with stock <code class="docutils literal notranslate"><span class="pre">vae.decode</span></code>, frames identical to
 <code class="docutils literal notranslate"><span class="pre">vae_decode_fast:</span> <span class="pre">false</span></code>. The compile uses Inductor’s deterministic mode, so
 every server process decodes the same latents to the same frames; torch 2.9.1
@@ -2286,6 +2329,9 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 (the <code class="docutils literal notranslate"><span class="pre">auto</span></code> policy; <code class="docutils literal notranslate"><span class="pre">WAN22_VAE_DECODE_TILING</span></code> forces a path), which keeps the untiled conv3d from OOMing a
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.</p>
+<p><strong>Two GPUs.</strong> <code class="docutils literal notranslate"><span class="pre">configs/wan22_dp2.yaml</span></code> serves a whole replica per GPU: 5.2
+videos/min at 4 concurrent on H200s (measured on an earlier version), while one
+request takes the 1-GPU time.</p>
 </section>
 <section id="ltx-2-5-ltx2-5">
 <h2>LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)<a class="headerlink" href="#ltx-2-5-ltx2-5" title="Link to this heading">#</a></h2>
@@ -2518,6 +2564,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#orpheus-notes">Orpheus notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#bagel-notes">BAGEL notes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>

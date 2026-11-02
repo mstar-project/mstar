@@ -685,8 +685,16 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables"><code class="docutils literal notranslate"><span class="pre">RopeTables</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.d"><code class="docutils literal notranslate"><span class="pre">RopeTables.d</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.h"><code class="docutils literal notranslate"><span class="pre">RopeTables.h</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.time"><code class="docutils literal notranslate"><span class="pre">RopeTables.time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.w"><code class="docutils literal notranslate"><span class="pre">RopeTables.w</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD"><code class="docutils literal notranslate"><span class="pre">apply_rope_BNHD()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD"><code class="docutils literal notranslate"><span class="pre">rope_tables_BNHD()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys"><code class="docutils literal notranslate"><span class="pre">rotate_queries_or_keys()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD"><code class="docutils literal notranslate"><span class="pre">rotate_queries_or_keys_BNHD()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -710,15 +718,105 @@ would break the pretrained weights.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD" title="mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">apply_rope_BNHD</span></code></a>(x, emb_sin, emb_cos)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD" title="mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rope_tables_BNHD</span></code></a>(pos, dim, dtype, device)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(sin,</span> <span class="pre">cos)</span></code> for <code class="docutils literal notranslate"><span class="pre">apply_rope_BNHD</span></code> over the last <code class="docutils literal notranslate"><span class="pre">dim</span></code> dims.</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys" title="mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rotate_queries_or_keys</span></code></a>(x, pos)</p></td>
 <td><p>Apply rotary embeddings along the last <code class="docutils literal notranslate"><span class="pre">D</span></code> dims of <code class="docutils literal notranslate"><span class="pre">x</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD" title="mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rotate_queries_or_keys_BNHD</span></code></a>(x, pos)</p></td>
-<td><p></p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p class="rubric">Classes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.vjepa2.components.rope_utils.RopeTables" title="mstar.model.vjepa2.components.rope_utils.RopeTables"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RopeTables</span></code></a>(d, h, w, time)</p></td>
+<td><p>One cached step's <code class="docutils literal notranslate"><span class="pre">(sin,</span> <span class="pre">cos)</span></code> per axis (<code class="docutils literal notranslate"><span class="pre">rope_tables_BNHD</span></code>): built once from the step's positions and shared by every block, q and k.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.RopeTables">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.vjepa2.components.rope_utils.</span></span><span class="sig-name descname"><span class="pre">RopeTables</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">d</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">w</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">time</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/vjepa2/components/rope_utils.html#RopeTables"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.RopeTables" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>One cached step’s <code class="docutils literal notranslate"><span class="pre">(sin,</span> <span class="pre">cos)</span></code> per axis (<code class="docutils literal notranslate"><span class="pre">rope_tables_BNHD</span></code>): built once
+from the step’s positions and shared by every block, q and k.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>d</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>h</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>w</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>time</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.RopeTables.d">
+<span class="sig-name descname"><span class="pre">d</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.d" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.RopeTables.h">
+<span class="sig-name descname"><span class="pre">h</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.h" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.RopeTables.time">
+<span class="sig-name descname"><span class="pre">time</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.time" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.RopeTables.w">
+<span class="sig-name descname"><span class="pre">w</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.w" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.vjepa2.components.rope_utils.</span></span><span class="sig-name descname"><span class="pre">apply_rope_BNHD</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">emb_sin</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">emb_cos</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/vjepa2/components/rope_utils.html#apply_rope_BNHD"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>emb_sin</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>emb_cos</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.vjepa2.components.rope_utils.</span></span><span class="sig-name descname"><span class="pre">rope_tables_BNHD</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/vjepa2/components/rope_utils.html#rope_tables_BNHD"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">(sin,</span> <span class="pre">cos)</span></code> for <code class="docutils literal notranslate"><span class="pre">apply_rope_BNHD</span></code> over the last <code class="docutils literal notranslate"><span class="pre">dim</span></code> dims.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pos</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.vjepa2.components.rope_utils.</span></span><span class="sig-name descname"><span class="pre">rotate_queries_or_keys</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pos</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/vjepa2/components/rope_utils.html#rotate_queries_or_keys"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys" title="Link to this definition">#</a></dt>
@@ -735,22 +833,6 @@ would break the pretrained weights.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.vjepa2.components.rope_utils.</span></span><span class="sig-name descname"><span class="pre">rotate_queries_or_keys_BNHD</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pos</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/vjepa2/components/rope_utils.html#rotate_queries_or_keys_BNHD"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>pos</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -804,8 +886,16 @@ would break the pretrained weights.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables"><code class="docutils literal notranslate"><span class="pre">RopeTables</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.d"><code class="docutils literal notranslate"><span class="pre">RopeTables.d</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.h"><code class="docutils literal notranslate"><span class="pre">RopeTables.h</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.time"><code class="docutils literal notranslate"><span class="pre">RopeTables.time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.RopeTables.w"><code class="docutils literal notranslate"><span class="pre">RopeTables.w</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.apply_rope_BNHD"><code class="docutils literal notranslate"><span class="pre">apply_rope_BNHD()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.rope_tables_BNHD"><code class="docutils literal notranslate"><span class="pre">rope_tables_BNHD()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys"><code class="docutils literal notranslate"><span class="pre">rotate_queries_or_keys()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys_BNHD"><code class="docutils literal notranslate"><span class="pre">rotate_queries_or_keys_BNHD()</span></code></a></li>
 </ul>
   </nav></div>
 

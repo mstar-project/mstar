@@ -3150,16 +3150,28 @@ GPU 2:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">prefill_text</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">prefill_vit</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">prefill_vae</span><span class="p p-Indicator">]}</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">decode</span><span class="p p-Indicator">]}</span>
-<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">2</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">image_gen</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">2</span><span class="p p-Indicator">],</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">image_gen</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">image_gen_head</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">image_gen_guided2</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">image_gen_guided3</span><span class="p p-Indicator">]}</span>
 </pre></div>
 </div>
+<p>A guided request’s denoising runs as a sequence of walks. Its guided steps form one window,
+known when the request arrives, which runs as <code class="docutils literal notranslate"><span class="pre">image_gen_guided2</span></code> (text guidance) or
+<code class="docutils literal notranslate"><span class="pre">image_gen_guided3</span></code> (text and image guidance), every branch in one combined forward on
+<code class="docutils literal notranslate"><span class="pre">LLM</span></code>. The steps before the window run as <code class="docutils literal notranslate"><span class="pre">image_gen_head</span></code>, and the steps after it run
+as <code class="docutils literal notranslate"><span class="pre">image_gen</span></code>, which also decodes; a window that reaches the last step is followed by the
+decode alone (<code class="docutils literal notranslate"><span class="pre">image_decode</span></code>). Each walk’s loop is capped per request at its share of the
+steps (<code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>), the conductor moves the request from one walk to the next, and
+the latents cross between walks as persisted edges. Each walk’s branch count is fixed when
+the request arrives, so no node reads a loop counter to decide it. A request without
+guidance runs <code class="docutils literal notranslate"><span class="pre">image_gen</span></code> alone. A config that places <code class="docutils literal notranslate"><span class="pre">LLM</span></code> per walk, as above, lists
+all four of its denoise walks.</p>
 <p>BAGEL also supports a CFG-parallel mode. When the config names the extra
 <code class="docutils literal notranslate"><span class="pre">LLM_cfg_text</span></code> and <code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code> nodes, as in <code class="docutils literal notranslate"><span class="pre">configs/bagel_cfg_parallel.yaml</span></code>, the
-model uses an <code class="docutils literal notranslate"><span class="pre">image_gen_cfg</span></code> walk instead. The loop body of that walk is a <code class="docutils literal notranslate"><span class="pre">Parallel</span></code>
-of the three classifier-free-guidance branches, each on its own GPU, feeding a
-<code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code> node. The model code detects this mode only from the node names present in
-the config, so the extra parallelism is enabled in YAML and requires no code change. One
-model can therefore run in many physical layouts.</p>
+window runs as <code class="docutils literal notranslate"><span class="pre">image_gen_cfg2</span></code> or <code class="docutils literal notranslate"><span class="pre">image_gen_cfg3</span></code> instead. The loop body of that walk
+is a <code class="docutils literal notranslate"><span class="pre">Parallel</span></code> of the guidance branches, each on its own GPU, feeding a <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code>
+node, and a request without guidance never reaches the branch GPUs. The model code detects
+this mode only from the node names present in the config, so the extra parallelism is
+enabled in YAML and requires no code change. One model can therefore run in many physical
+layouts.</p>
 </section>
 <section id="worked-example-whisper">
 <h2>Worked example: Whisper<a class="headerlink" href="#worked-example-whisper" title="Link to this heading">#</a></h2>

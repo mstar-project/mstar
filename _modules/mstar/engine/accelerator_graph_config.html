@@ -1163,6 +1163,20 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="geometric_batch_sizes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.geometric_batch_sizes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">geometric_batch_sizes</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Powers of two below ``max_batch_size``, then ``max_batch_size`` itself.</span>
+
+<span class="sd">    Startup grows with ``log B`` rather than ``B``; a batch between two sizes</span>
+<span class="sd">    pads up to the next (or splits into these sizes), and a full batch fits one.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="n">max_batch_size</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"max_batch_size must be at least 1, got </span><span class="si">{</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">[</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">((</span><span class="n">max_batch_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">bit_length</span><span class="p">())]</span> <span class="o">+</span> <span class="p">[</span><span class="n">max_batch_size</span><span class="p">]</span></div>
+
+
+
 <div class="viewcode-block" id="distribute_tokens">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.distribute_tokens">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">distribute_tokens</span><span class="p">(</span><span class="n">total_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>

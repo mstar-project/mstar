@@ -1067,6 +1067,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># own compiled graph, on top of the shapes above.</span>
     <span class="n">dit_max_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
+    <span class="c1"># The DiT's self-attention kernel: "flashinfer" runs it through the engine's</span>
+    <span class="c1"># ragged resource (FlashInfer's ragged prefill, FA3 on Hopper); "sdpa" runs</span>
+    <span class="c1"># torch SDPA, the reference pipeline's kernel. The cross-attention always</span>
+    <span class="c1"># runs SDPA.</span>
+    <span class="n">attention_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"flashinfer"</span>
+
     <span class="c1"># VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably</span>
     <span class="c1"># exceeds the estimated untiled peak for the output size and tiles otherwise;</span>
     <span class="c1"># "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.</span>
@@ -1087,6 +1093,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># rather than read as on.</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vae_decode_fast</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Wan2.2 vae_decode_fast must be true or false, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">vae_decode_fast</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"flashinfer"</span><span class="p">,</span> <span class="s2">"sdpa"</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Wan2.2 attention_backend must be 'flashinfer' or 'sdpa', got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_backend</span><span class="si">!r}</span><span class="s2">."</span>
+            <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fast_decode_sizes</span><span class="p">()</span>
 
 <div class="viewcode-block" id="Wan22Config.fast_decode_sizes">

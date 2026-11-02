@@ -13,12 +13,19 @@ mstar.model.vjepa2.components.rope\_utils
 
    .. autosummary::
    
+      apply_rope_BNHD
+      rope_tables_BNHD
       rotate_queries_or_keys
-      rotate_queries_or_keys_BNHD
    
    
 
    
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      RopeTables
    
    
 

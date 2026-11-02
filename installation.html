@@ -1091,6 +1091,8 @@ default. That backend needs the <strong>flash-attn-4</strong> package, which pro
 <code class="docutils literal notranslate"><span class="pre">flash_attn.cute</span></code> — the CuTe DSL rewrite of flash-attn; on H100 it runs the
 FA3-style sm90 kernel with TMA and warpgroup specialisation. It is <strong>not on
 PyPI</strong> as of 2026-09-17, and it is <strong>not</strong> pulled in by any extra.</p>
+<p>Install it after <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> (FA2): the FA2 package ships an older
+<code class="docutils literal notranslate"><span class="pre">flash_attn/cute</span></code> that overwrites flash-attn-4’s.</p>
 <p>FLASH needs <strong>torch 2.11 or newer</strong>: older torch does not pass flash-attn-4 the
 block-sparse block size, and capture fails with <code class="docutils literal notranslate"><span class="pre">Block</span> <span class="pre">sparse</span> <span class="pre">tensors</span> <span class="pre">...</span>
 <span class="pre">require</span> <span class="pre">explicit</span> <span class="pre">sparse_block_size[0]</span></code>. Note this rules out the flash-attn

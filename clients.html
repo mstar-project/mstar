@@ -1092,11 +1092,17 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 <p>Per-model notes:</p>
 <ul class="simple">
 <li><p><strong>BAGEL</strong> — chat returns text only; use <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> and
-<code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for image output.</p></li>
+<code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for image output, with <code class="docutils literal notranslate"><span class="pre">output_format</span></code> and <code class="docutils literal notranslate"><span class="pre">output_compression</span></code>
+as for FLUX.2 klein below.</p></li>
 <li><p><strong>FLUX.2 klein / Z-Image</strong> — <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> (and <code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for
 klein) only: <code class="docutils literal notranslate"><span class="pre">size</span></code> as <code class="docutils literal notranslate"><span class="pre">WxH</span></code> (multiples of 16); <code class="docutils literal notranslate"><span class="pre">seed</span></code>; <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code>,
 <code class="docutils literal notranslate"><span class="pre">output_format</span></code> (<code class="docutils literal notranslate"><span class="pre">png</span></code> default, <code class="docutils literal notranslate"><span class="pre">jpeg</span></code>, <code class="docutils literal notranslate"><span class="pre">webp</span></code>), <code class="docutils literal notranslate"><span class="pre">output_compression</span></code> (JPEG /
-WebP quality) and <code class="docutils literal notranslate"><span class="pre">png_compress_level</span></code> (0-9, default 1) via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p></li>
+WebP quality, 0-100) and <code class="docutils literal notranslate"><span class="pre">png_compress_level</span></code> (0-9, default 1) via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>; a
+value of the chosen format’s knob that is not a whole number in range (<code class="docutils literal notranslate"><span class="pre">90</span></code>, <code class="docutils literal notranslate"><span class="pre">90.0</span></code>
+and <code class="docutils literal notranslate"><span class="pre">&quot;90&quot;</span></code> are; <code class="docutils literal notranslate"><span class="pre">true</span></code> and <code class="docutils literal notranslate"><span class="pre">50.9</span></code> are not) is a 400, the other format’s knob is
+ignored, and <code class="docutils literal notranslate"><span class="pre">null</span></code> means the default. The PNG writer favours
+speed (no scanline filters, zlib level 1), so its files are ~30% larger than PIL’s
+defaults; a higher <code class="docutils literal notranslate"><span class="pre">png_compress_level</span></code> shrinks them.</p></li>
 <li><p><strong>Qwen3-Omni</strong> — text sampling uses <code class="docutils literal notranslate"><span class="pre">thinker_*</span></code> keys, speech uses <code class="docutils literal notranslate"><span class="pre">talker_*</span></code>, and the
 residual codec groups use <code class="docutils literal notranslate"><span class="pre">code_predictor_*</span></code>; set the speaker with <code class="docutils literal notranslate"><span class="pre">voice</span></code> (default
 <code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>.
