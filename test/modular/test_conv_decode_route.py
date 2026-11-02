@@ -1,5 +1,7 @@
 """Which conv kernel a decode step takes: AMD GPUs the decode kernel where it fits, every other platform today's."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -19,24 +21,20 @@ def _wrapper():
 @pytest.mark.parametrize(("rocm", "expected"), [(True, "decode"), (False, "update")])
 def test_route(monkeypatch, rocm, expected):
     called = []
-    monkeypatch.setattr(wrappers.current_platform, "is_rocm", lambda: rocm)
+    # the module's reference, not an attribute of the shared proxy, which undoing would leave pinned
+    monkeypatch.setattr(wrappers, "current_platform", SimpleNamespace(is_rocm=lambda: rocm))
     monkeypatch.setattr(causal_conv1d, "causal_conv1d_decode", lambda **kw: called.append("decode"))
     monkeypatch.setattr(causal_conv1d, "causal_conv1d_update", lambda **kw: called.append("update"))
     _wrapper().run_conv(torch.zeros(2, 8), torch.zeros(3, 8, 3), torch.zeros(8, 4))
     assert called == [expected]
 
 
-def test_a_plan_with_write_slots_takes_the_decode_kernel():
+def test_a_plan_with_write_slots_takes_the_decode_kernel(monkeypatch):
     called = {}
-    causal = causal_conv1d
     w = _wrapper()
     w._plan_state = wrappers.GDNDecodePlan(slots=torch.tensor([1, 2]), num_rows=2, write_slots=torch.tensor([3, 4]))
-    original = causal.causal_conv1d_decode
-    causal.causal_conv1d_decode = lambda **kw: called.update(kw)
-    try:
-        w.run_conv(torch.zeros(2, 8), torch.zeros(5, 8, 3), torch.zeros(8, 4))
-    finally:
-        causal.causal_conv1d_decode = original
+    monkeypatch.setattr(causal_conv1d, "causal_conv1d_decode", lambda **kw: called.update(kw))
+    w.run_conv(torch.zeros(2, 8), torch.zeros(5, 8, 3), torch.zeros(8, 4))
     assert called["write_indices"].tolist() == [3, 4]
 
 

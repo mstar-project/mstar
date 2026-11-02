@@ -582,6 +582,8 @@ def test_a_decode_never_evicts_the_snapshot_a_prompt_restored_in_the_same_step()
 class _StubKeyedWalks:
     """The pool's answer for the walks its KV cache keys."""
 
+    config = SimpleNamespace(twin_slots=False)
+
     def __init__(self, walks):
         self.walks = frozenset(walks)
 
