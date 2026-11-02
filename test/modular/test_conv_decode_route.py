@@ -1,5 +1,7 @@
 """Which conv kernel a decode step takes: AMD GPUs the decode kernel where it fits, every other platform today's."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -19,7 +21,8 @@ def _wrapper():
 @pytest.mark.parametrize(("rocm", "expected"), [(True, "decode"), (False, "update")])
 def test_route(monkeypatch, rocm, expected):
     called = []
-    monkeypatch.setattr(wrappers.current_platform, "is_rocm", lambda: rocm)
+    # the module's reference, not an attribute of the shared proxy, which undoing would leave pinned
+    monkeypatch.setattr(wrappers, "current_platform", SimpleNamespace(is_rocm=lambda: rocm))
     monkeypatch.setattr(causal_conv1d, "causal_conv1d_decode", lambda **kw: called.append("decode"))
     monkeypatch.setattr(causal_conv1d, "causal_conv1d_update", lambda **kw: called.append("update"))
     _wrapper().run_conv(torch.zeros(2, 8), torch.zeros(3, 8, 3), torch.zeros(8, 4))
