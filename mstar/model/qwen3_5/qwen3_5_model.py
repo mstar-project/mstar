@@ -82,7 +82,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
@@ -235,6 +235,7 @@ class Qwen3_5DenseModel(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(_MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
@@ -303,6 +304,16 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
