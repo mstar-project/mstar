@@ -692,7 +692,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.mask"><code class="docutils literal notranslate"><span class="pre">CpuPlan.mask</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.pinned"><code class="docutils literal notranslate"><span class="pre">CpuPlan.pinned</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.png_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.png_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.prepare_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.prepare_workers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.preprocess_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.preprocess_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.preprocess_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.preprocess_workers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.result"><code class="docutils literal notranslate"><span class="pre">CpuPlan.result</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.usable"><code class="docutils literal notranslate"><span class="pre">CpuPlan.usable</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.why"><code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code></a></li>
@@ -887,6 +889,23 @@ are sized from.</p>
 <dd><p>Threads one PNG deflates on (<code class="docutils literal notranslate"><span class="pre">image_io.uint8_to_png</span></code>).</p>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.prepare_workers">
+<span class="sig-name descname"><span class="pre">prepare_workers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">threads</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/cpus.html#CpuPlan.prepare_workers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.prepare_workers" title="Link to this definition">#</a></dt>
+<dd><p>Requests the data worker prepares at once, for a model that
+declares <code class="docutils literal notranslate"><span class="pre">PREPROCESS_PARALLEL</span></code>, when each runs on <code class="docutils literal notranslate"><span class="pre">threads</span></code>
+intra-op threads: at most 8, and the pool times the threads stays
+within the CPUs left.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>threads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.preprocess_threads">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">preprocess_threads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.preprocess_threads" title="Link to this definition">#</a></dt>
@@ -894,6 +913,12 @@ are sized from.</p>
 model sets them. A quarter of the CPUs left, at most 4: the process
 shares them with the engine workers, and its per-request ops are a few
 MB.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.preprocess_workers">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">preprocess_workers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.preprocess_workers" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">prepare_workers</span></code> at the default thread count.</p>
 </dd></dl>
 
 <dl class="py attribute">
@@ -1256,7 +1281,9 @@ by the cgroup quota rounded down. At least 1.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.mask"><code class="docutils literal notranslate"><span class="pre">CpuPlan.mask</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.pinned"><code class="docutils literal notranslate"><span class="pre">CpuPlan.pinned</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.png_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.png_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.prepare_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.prepare_workers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.preprocess_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.preprocess_threads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.preprocess_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.preprocess_workers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.result"><code class="docutils literal notranslate"><span class="pre">CpuPlan.result</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.usable"><code class="docutils literal notranslate"><span class="pre">CpuPlan.usable</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.why"><code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code></a></li>

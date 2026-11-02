@@ -1151,6 +1151,21 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        MB."""</span>
         <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">left</span> <span class="o">//</span> <span class="mi">4</span><span class="p">))</span>
 
+<div class="viewcode-block" id="CpuPlan.prepare_workers">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.CpuPlan.prepare_workers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">threads</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Requests the data worker prepares at once, for a model that</span>
+<span class="sd">        declares ``PREPROCESS_PARALLEL``, when each runs on ``threads``</span>
+<span class="sd">        intra-op threads: at most 8, and the pool times the threads stays</span>
+<span class="sd">        within the CPUs left."""</span>
+        <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">left</span> <span class="o">//</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">threads</span><span class="p">)))</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``prepare_workers`` at the default thread count."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_workers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">preprocess_threads</span><span class="p">)</span>
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">png_threads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Threads one PNG deflates on (``image_io.uint8_to_png``)."""</span>

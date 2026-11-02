@@ -2786,6 +2786,21 @@ default:</p>
 torch’s default. It does not size video decoding: each torchcodec decode that asks
 <code class="docutils literal notranslate"><span class="pre">media_limits.video_decode_threads</span></code> (<code class="docutils literal notranslate"><span class="pre">Model.load_video</span></code> does) runs FFmpeg with up to 8
 threads, no more than the CPUs the process’s CPU plan leaves unpinned (<code class="docutils literal notranslate"><span class="pre">CpuPlan.left</span></code>).</p>
+<p>The data worker prepares one request at a time on its own thread, so a request’s media
+decode holds up every request behind it and the output chunks of the ones running. A model
+whose <code class="docutils literal notranslate"><span class="pre">load_image</span></code> / <code class="docutils literal notranslate"><span class="pre">load_audio</span></code> / <code class="docutils literal notranslate"><span class="pre">load_video</span></code> and <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> keep no shared
+state sets <code class="docutils literal notranslate"><span class="pre">PREPROCESS_PARALLEL</span> <span class="pre">=</span> <span class="pre">True</span></code>, and requests then prepare on a pool sized to the
+CPUs left (<code class="docutils literal notranslate"><span class="pre">CpuPlan.prepare_workers</span></code>: at most 8, and the pool times the process’s intra-op
+thread count stays within the CPUs left, so a higher <code class="docutils literal notranslate"><span class="pre">preprocess_torch_threads</span></code> means fewer
+workers).
+Tensors are still stored and requests still reach the conductor from the data worker’s thread,
+in arrival order. A deployment sets the pool at the top level of its config; 1 turns it off:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"qwen3_omni"</span>
+<span class="nt">preprocess_workers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+</pre></div>
+</div>
+<p>The pool only helps work that releases the GIL, so measure each stage first. A model with
+client streams always prepares inline, since an append has to follow its request.</p>
 <p>A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> hands the tensor it reads straight to the

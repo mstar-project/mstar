@@ -1157,7 +1157,13 @@ rendezvouses. Default 512.</p></td>
 (default), <code class="docutils literal notranslate"><span class="pre">false</span></code> or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">preprocess_workers</span></code></p></td>
+<td><p><em>(optional)</em> Requests the data worker prepares at once, for a model that
+declares <code class="docutils literal notranslate"><span class="pre">PREPROCESS_PARALLEL</span></code>. Default: as many as fit the CPUs left
+beside the API server’s intra-op threads (<code class="docutils literal notranslate"><span class="pre">preprocess_torch_threads</span></code>),
+at most 8; <code class="docutils literal notranslate"><span class="pre">1</span></code> prepares inline. See <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
