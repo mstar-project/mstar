@@ -618,10 +618,14 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
     group = joint.sp_group
     shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=device)
     case = _Case.build(PREFILL_ROWS, device, dtype)
-    attn, _ = _cp_attention(
-        joint, device, dtype, shard=shard, sp_exchange=split, kv_resource=lambda p: _PlacedKV(p, case),
-    )
-    kv = attn._kv
+
+    def placed_kv(placement):
+        nonlocal kv
+        kv = _PlacedKV(placement, case)
+        return kv
+
+    kv = None
+    attn, _ = _cp_attention(joint, device, dtype, shard=shard, sp_exchange=split, kv_resource=placed_kv)
     attend = AttentionCallable(kv, attn)
     attend.bind_step("main")
     attend.set_layer_idx(0)

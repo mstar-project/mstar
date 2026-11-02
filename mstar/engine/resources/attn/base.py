@@ -21,19 +21,18 @@ from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.sequence_shard import (
-    SeqRange,
     SeqShardPlan,
     SequenceShard,
     all_gather,
     check_shard_plan,
     head_slice,
+    ring,
     ulysses,
 )
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
     from mstar.engine.resources.context_parallel import ContextParallel
-    from mstar.engine.resources.kv.manager import KVManager
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -69,8 +68,6 @@ class AttentionManager(AttentionResource):
     _shard: SequenceShard | None = None
     # how split steps reach it (`AttentionSpec.split_exchange`), set by `build`
     _split_exchange: SpExchange = "ulysses"
-    # the KV resource, which the ring writes and reads itself (`exchange`)
-    _kv: "KVManager | None" = None
 
     @property
     def splits(self) -> bool:
@@ -100,7 +97,6 @@ class AttentionManager(AttentionResource):
         # copied step's heads are sliced. Stored by position, heads over TP: every rank attends a
         # copied step, and a split step's tokens are gathered or passed round (`exchange`)
         shard = self._shard = resources[self._shard_key]
-        self._kv = kv
         kv.bind_sequence_shard(shard)
         split = self._split_exchange
         if split == "ring":
@@ -126,8 +122,7 @@ class AttentionManager(AttentionResource):
     def exchange(self, run, q, k, v, label: str | None = None):
         """``run(q, k, v)`` (a K/V write and the attention, ``q=None`` the write alone) for this
         step's ``label`` through the exchange its pool takes: of a split label's tokens, or of a
-        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`). The ring writes and
-        attends through the KV resource itself, not ``run``."""
+        copied label's heads at a ``tp * sp`` geometry (`sequence_shard`)."""
         label = self._default_label if label is None else label
         shard = self._shard
         r = shard.split_range(label)
@@ -139,18 +134,9 @@ class AttentionManager(AttentionResource):
             shard.check_scattered(label)
             if self._placement is None:
                 return ulysses(run, q, k, v, r)
-            if self._split_exchange == "ring":
-                return self._ring(label, q, k, v, r)
-            return all_gather(run, q, k, v, r)
+            return (ring if self._split_exchange == "ring" else all_gather)(run, q, k, v, r)
         finally:
             shard.exchanging = False
-
-    def _ring(self, label: str, q, k, v, r: SeqRange) -> torch.Tensor | None:
-        """This rank's tokens' K/V into the slots it stores them in (all of them, as the step is
-        striped by stored position), then, ``q`` given, the ring (`RingAttentionWrapper`), at the KV
-        resource's layer cursor (`AttentionCallable.set_layer_idx`)."""
-        self._kv.write_kv(k, v, label=label, tokens=r.index)
-        return None if q is None else self._current_plan_states[label].attend(q, self._kv.layer_view())
 
     def _check_sequence_shard(self, ctx) -> SeqShardPlan | None:
         """At plan: the step declares the node's sequence shard, whose plan this returns where the

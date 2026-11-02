@@ -17,13 +17,13 @@ functions at the bottom of this module, each wrapped around the resource's own `
   cacheless attention declaring ``sp_exchange="ulysses"``);
 - ``all_gather``: every rank's q, k and v gathered, ``run`` as on a copied step, this rank's share
   of the output (KV stored by position, ``context_parallel``);
+- ``ring``: a striped label's own tokens, whose K/V this rank stores, ``run`` on them with their
+  indices in the step; the plan passes queries round the partners (KV stored by position,
+  ``RingAttentionWrapper``);
 - ``head_slice``: a copied step at a ``tp * sp`` head geometry: this rank's heads, ``run``, gather
   the heads;
 - ``sharded_key_merge``: copied queries over split keys (cacheless cross-attention): each rank's
   partial with its log-sum-exp, merged.
-
-The ring over KV stored by position (``sp_exchange: ring``) isn't one of them: it writes and
-attends through the KV resource itself (``AttentionManager.exchange``, ``RingAttentionWrapper``).
 
 ``sequence_parallel_refusals`` is what a node on SP ranks may not declare; the engine and
 ``validate_deployment`` both run it.
@@ -521,8 +521,9 @@ def check_shard_plan(owner: str, shard_key: str, ctx: StepContext) -> SeqShardPl
 # --- exchanges ---------------------------------------------------------------------------------
 
 # ``run(q, k, v)`` attends (and for a paged resource writes K/V) on the tensors it is handed, each
-# packed ``[N, H, D]``; ``q=None`` writes alone. A ``[B, S, ...]`` label (``SeqRange.rows``) is
-# exchanged along S, viewed from the packed tensor.
+# packed ``[N, H, D]``; ``q=None`` writes alone; ``tokens=`` names which of the step's tokens they
+# are, by index, where not all of them in order (the ring's). A ``[B, S, ...]`` label
+# (``SeqRange.rows``) is exchanged along S, viewed from the packed tensor.
 
 
 def _check_entry(r: SeqRange, *xs: torch.Tensor | None) -> None:
@@ -577,6 +578,14 @@ def all_gather(run: Callable, q, k, v, r: SeqRange):
         run(None, *gathered)
         return None
     return r.local(run(*gathered))
+
+
+def ring(run: Callable, q, k, v, r: SeqRange):
+    """A striped label (``SeqRange.order``): this rank holds the tokens whose K/V it stores, so
+    nothing moves here. ``run`` writes them into its own slots and attends its queries, which the
+    plan passes round the partners (``RingAttentionWrapper``)."""
+    _check_entry(r, q, k, v)
+    return run(q, k, v, tokens=r.index)
 
 
 def head_slice(run: Callable, q, k, v, group: CommGroup):

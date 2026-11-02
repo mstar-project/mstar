@@ -228,7 +228,7 @@ class RingAttentionWrapper:
     Eager only: a striped shard plans a leased step copied. Partner plans differ by rank, so a
     backend with a plan check (``_plan_check``) would have to check every rank's before planning."""
 
-    # the step attends its own tokens from the pages, which it writes first (`AttentionManager.exchange`)
+    # the step attends its own tokens from the pages, which it writes first (`sequence_shard.ring`)
     reads_step_kv = True
 
     def __init__(
@@ -288,10 +288,14 @@ class RingAttentionWrapper:
     def forget_plan(self) -> None:
         """Every ``plan`` plans every kernel, so there is nothing to forget."""
 
-    def attend(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
-        """This rank's queries' attention over the whole pool, in ``q``'s dtype; the step's own
-        tokens already written. ``2(P - 1)`` exchanges, the same on every rank, each awaited
+    def attend(
+        self, queries: tuple[torch.Tensor], kv_cache_layer: torch.Tensor, new_keys: tuple[torch.Tensor | None, ...],
+    ) -> torch.Tensor:
+        """This rank's queries' attention over the whole pool, in their dtype, as
+        ``ContextParallelWrapper.attend`` takes them; the step's own tokens are already written,
+        so ``new_keys`` is unread. ``2(P - 1)`` exchanges, the same on every rank, each awaited
         before its result is read."""
+        (q,) = queries
         p, r, group = self._placement.size, self._placement.index, self._placement.group
         counts = self._counts
         out = lse = None

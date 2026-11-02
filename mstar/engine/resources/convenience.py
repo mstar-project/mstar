@@ -68,10 +68,16 @@ class AttentionCallable:
             return self.attn.exchange(self._attend, q, k, v)
         return self._attend(q, k, v)
 
-    def _attend(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
-        # q None: the write alone, as the exchanges hand it on
+    def _attend(
+        self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        # q None: the write alone. `tokens`: which of the step's tokens k and v are, named only by
+        # the ring's exchange (`sequence_shard.ring`), so a stand-in KV (the tests') needn't take it
         if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v)
+            if tokens is None:
+                self.kv.write_kv(k, v)
+            else:
+                self.kv.write_kv(k, v, tokens=tokens)
         if q is None:
             return None
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
