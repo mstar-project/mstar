@@ -91,6 +91,8 @@ def test_denoise_walk_structure(walk, edit):
     loop, decoder = section.sections
     assert isinstance(loop, Loop) and loop.name == DENOISE_LOOP
     assert loop.max_iters == model.config.max_denoise_steps
+    # the request's own step count ends the loop (and its speculation)
+    assert model.get_loop_caps(num_inference_steps=3) == {DENOISE_LOOP: 3}
     dit = loop.section
     assert isinstance(dit, GraphNode) and dit.name == "dit"
     expected = {"text_embeds", "latents"} | ({"ref_latents"} if edit else set())

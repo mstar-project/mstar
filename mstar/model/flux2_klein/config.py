@@ -22,7 +22,7 @@ from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
 
 # Resource key the dit node declares its ragged joint attention under.
 DIT_ATTN = "dit_attn"
-# Loop name the model file and the dit submodule's check_stop agree on.
+# Loop name the model's graph and its loop cap agree on.
 DENOISE_LOOP = "denoise_loop"
 
 # Registry defaults (HF ids).

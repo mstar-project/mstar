@@ -398,7 +398,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 infos = (engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids)
                 out[self.LATENTS] = torch.stack([
                     (1 - mask) * image_latent + mask * sample
-                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["num_steps"] else sample
+                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["schedule"].num_steps
+                    else sample
                     for info, image_latent, sample in zip(infos, kwargs["image_latent"], out[self.LATENTS], strict=True)
                 ])
         return out
