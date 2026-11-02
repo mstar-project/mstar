@@ -2032,8 +2032,9 @@ state in an ``on_commit`` hook, so a proposal that never commits changes
 nothing), and ``released`` frees what a removed request's row held. The base
 ``RowState()`` keeps nothing. While planning, a resource writes the step's
 other changes through ``ctx.rows`` (``write_at``). A pre-planned step is
-planned again at exec with the same ``ctx.rows``, so write on one of the two
-passes (``ctx.is_preplan``). What a forward can build from the rows, it builds
+planned again at exec, with the same ``ctx.rows`` or, if the pre-plan was
+dropped, a fresh one, so write on the exec pass, or on both when the write
+repeats the same values. What a forward can build from the rows, it builds
 inside the graph: a ``RowFills`` state's ``arm`` records a fill while the
 graph is captured.
 
