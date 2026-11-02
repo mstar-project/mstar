@@ -846,7 +846,8 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"talker_input_embeds": [torch.zeros(1, 16)]},
     )
-    assert torch.equal(prepared.input_embeds[0], state["tts_pad_embed"])
+    assert torch.equal(prepared.input_embeds[0], torch.zeros(16))
+    assert prepared.kwargs["text_condition"] is state["tts_pad_embed"]
 
 
 def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
@@ -1228,7 +1229,9 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
     packed = submodule.preprocess("talker_decode", engine_inputs, rows)
     _assert_same_tensor(packed["suppress_eos"], _old_flags(flags))
     _assert_same_tensor(packed["last_token_indices"], torch.arange(len(rows)))
-    _assert_same_tensor(packed["input_embeds"], torch.cat([row.input_embeds for row in rows]))
+    _assert_same_tensor(
+        packed["input_embeds"], torch.cat([row.input_embeds + row.kwargs["text_condition"] for row in rows]),
+    )
 
     def prefill_row(rid, walk, text_ids, layout, speaker_id, language_id, **inputs) -> ARNodeInputs:
         metadata = {PROMPT_LAYOUT_KEY: layout, SPEAKER_ID_KEY: speaker_id, LANGUAGE_ID_KEY: language_id}
@@ -2328,6 +2331,45 @@ def test_codec_reads_a_window_of_collated_row_items():
     from_rows = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [rows]}, input_metadata=meta)
     flat = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [rows.view(3, groups)]}, input_metadata=meta)
     assert torch.equal(from_rows.tensor_inputs["codec_tokens"], flat.tensor_inputs["codec_tokens"])
+
+
+def test_talker_adds_text_conditions_once_per_batch():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    hidden = config.talker.hidden_size
+    embeds = torch.randn(3, hidden)
+    pad = torch.randn(hidden)
+
+    def row(i, condition):
+        kwargs = {"suppress_eos": False, **({"text_condition": condition} if condition is not None else {})}
+        return ARNodeInputs(input_embeds=embeds[i:i + 1], input_seq_len=1, kwargs=kwargs)
+
+    def packed(*conditions):
+        rows = [row(i, c) for i, c in enumerate(conditions)]
+        return submodule._add_text_conditions(torch.cat([r.input_embeds for r in rows]), rows)
+
+    # one PAD tensor for the batch, and a padding row beside it reads whatever is there
+    assert torch.equal(packed(pad, pad)[:2], embeds[:2] + pad)
+    assert torch.equal(packed(pad, pad, None)[:2], embeds[:2] + pad)
+    # a streamed prompt's rows differ; a padding row beside them adds nothing
+    streamed = torch.randn(hidden)
+    mixed = packed(pad, streamed, None)
+    assert torch.equal(mixed, torch.stack([embeds[0] + pad, embeds[1] + streamed, embeds[2]]))
+    # a capture's template rows carry none
+    assert packed(None, None) is not None and torch.equal(packed(None, None), embeds[:2])
+    # a row's own condition is not written back into the previous step's output
+    single = [row(0, pad)]
+    before = single[0].input_embeds.clone()
+    submodule._add_text_conditions(single[0].input_embeds, single)
+    assert torch.equal(single[0].input_embeds, before)
+
+
+def test_talker_prefill_projects_special_embeds_once():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    first = submodule._special_text_embeds(torch.float32)
+    assert all(a is b for a, b in zip(first, submodule._special_text_embeds(torch.float32), strict=True))
+    assert submodule._special_text_embeds(torch.float64)[0].dtype == torch.float64
 
 
 def test_talker_cap_sets_its_capture_sizes():
