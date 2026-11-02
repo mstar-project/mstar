@@ -13,7 +13,11 @@ import torch
 from mstar.engine.resources.sampler import filtered as F
 from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.sampler.utils import AcceleratorGraphableSampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import (
+    FUSED_FILTER_MAX_VOCAB,
+    AcceleratorGraphableSampler,
+    SamplerBuffers,
+)
 
 
 def _draw(logits, temperature, top_k, top_p, seed=None, offset=None):
@@ -106,7 +110,8 @@ def test_a_fused_sampler_takes_the_draw_only_when_it_can(monkeypatch):
     logits = torch.zeros(2, 2048)
     assert sampler.sample([], logits) == "fused" and len(calls) == 1
     # a step with its filters off, a penalty, or a vocabulary a program can't hold samples in full
-    for kwargs, vocab in (({"apply_filters": False}, 2048), ({"apply_penalty": True}, 2048), ({}, F.MAX_VOCAB + 1)):
+    cases = (({"apply_filters": False}, 2048), ({"apply_penalty": True}, 2048), ({}, FUSED_FILTER_MAX_VOCAB + 1))
+    for kwargs, vocab in cases:
         sampler.seen_tokens_buf = None
         assert torch.is_tensor(sampler.sample([], torch.zeros(2, vocab), **kwargs))
     assert len(calls) == 1
