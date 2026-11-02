@@ -486,14 +486,23 @@ class SequenceShard(Resource):
                 "shard's scatter of that label"
             )
 
-    def check_bypass(self, label: str, what: str) -> None:
-        """Refuse a paged ``what`` (run or a KV write) of a split label reached outside an
-        exchange: it would see this rank's share of the tokens as the whole step."""
-        if not self.exchanging and self.split_range(label) is not None:
-            raise ValueError(
-                f"{what} reached label {label!r}, which this step splits over SP ranks, outside an "
-                "exchange: call the attention through AttentionCallable (or the resource's exchange)"
-            )
+    def check_bypass(self, label: str, what: str, by_head: bool = False) -> None:
+        """Refuse a paged ``what`` (run or a KV write) reached outside an exchange: of a split label
+        it would see this rank's share of the tokens as the whole step, and over a pool stored by
+        head (``by_head``) any step's q, k and v at the node's TP heads where the pool holds this
+        rank's ``tp * sp`` slice."""
+        if self.exchanging:
+            return
+        if self.split_range(label) is not None:
+            why = "which this step splits over SP ranks"
+        elif by_head:
+            why = "whose KV this rank stores a head slice of"
+        else:
+            return
+        raise ValueError(
+            f"{what} reached label {label!r}, {why}, outside an exchange: call the attention through "
+            "AttentionCallable (or the resource's exchange)"
+        )
 
 
 def check_shard_plan(owner: str, shard_key: str, ctx: StepContext) -> SeqShardPlan:

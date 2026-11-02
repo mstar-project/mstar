@@ -835,7 +835,8 @@ def test_two_ranks_attend_a_placed_pool_like_one_rank_with_the_same_collectives(
 
 def test_a_split_label_reached_outside_an_exchange_is_refused():
     """A layer that writes its K/V itself (``write_target``) or calls ``run`` directly would treat
-    this rank's range as the whole step; it raises on every rank at the first split step."""
+    this rank's range as the whole step, or over a pool stored by head write its TP heads into this
+    rank's slice of them; it raises on every rank at the first such step."""
     shard = SequenceShard(("main",), 0, None, 0, _group(0, P))
     kv = _manager(0, PagedKVConfig(
         num_layers=2, num_kv_heads=2, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4, page_size=8,
@@ -852,6 +853,14 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
     shard.exchanging = True
     with pytest.raises(KeyError):
         kv.write_slots("main")
+    # the pool stores this rank's head slice, so a copied step's direct write would land the TP
+    # heads in it too: only the exchange's head slice may write
+    shard.exchanging = False
+    shard.commit(None, ctx)
+    shard.plan(SeqShardStep(segments=(Segment("r0", "main", 1),)), ctx)
+    assert shard.split_range("main") is None
+    with pytest.raises(ValueError, match="'main', whose KV this rank stores a head slice of, outside an exchange"):
+        kv.write_target(label="main")
 
     # an attention's run over a placed pool, on either rank, under a lease whose replay pads 6
     # real tokens to its 16-token bucket, which the step splits 8 and 8

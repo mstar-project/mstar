@@ -400,7 +400,7 @@ class DenseAttentionManager(AttentionManager):
         if label is None:
             label = self._default_label
         if self._shard is not None:
-            self._shard.check_bypass(label, "attention run")
+            self._shard.check_bypass(label, "attention run", by_head=self._placement is None)
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         assert k is not None and v is not None and layer_idx is not None, (

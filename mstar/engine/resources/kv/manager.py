@@ -4490,7 +4490,7 @@ class KVManager(AttentionResource):
         if label is None:
             label = self._default_label
         if self._sequence_shard is not None:
-            self._sequence_shard.check_bypass(label, "KV write_target")
+            self._sequence_shard.check_bypass(label, "KV write_target", by_head=self.placement is None)
         if self.kv_cache.layout != KVLayout.NHD:
             raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
         state = self._current_plan_states[label, self._layer_group[layer_idx]]
@@ -4521,7 +4521,7 @@ class KVManager(AttentionResource):
         if label is None:
             label = self._default_label
         if self._sequence_shard is not None:
-            self._sequence_shard.check_bypass(label, "KV write_slots")
+            self._sequence_shard.check_bypass(label, "KV write_slots", by_head=self.placement is None)
         plan_state = self._current_plan_states[label, 0]
         n = plan_state.total_tokens
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
@@ -4539,7 +4539,7 @@ class KVManager(AttentionResource):
         if label is None:
             label = self._default_label
         if self._sequence_shard is not None:
-            self._sequence_shard.check_bypass(label, "KV write_kv")
+            self._sequence_shard.check_bypass(label, "KV write_kv", by_head=self.placement is None)
         plan_state = self._current_plan_states[label, self._layer_group[layer_idx]]
         if plan_state.ready is not None:
             torch.cuda.current_stream(k.device).wait_event(plan_state.ready)

@@ -432,7 +432,7 @@ class FlashInferManager(AttentionManager):
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
         if self._shard is not None:
-            self._shard.check_bypass(label, "attention run")
+            self._shard.check_bypass(label, "attention run", by_head=self._placement is None)
         if self._layers is not None:
             # an explicit layer over the cursor, checked as the cursor is
             if layer_idx is not None:
