@@ -40,17 +40,17 @@ The model declares the footprint as KV spans (#832). A span's kind says what its
 - `digest`: an encoder's output
 - `rows`: another node's outputs
 
-The conductor sets the class once, at ingest, and the same class holds in every pool.
+The conductor sets the class at ingest for rows 1 and 2, and that class holds in every pool. The worker then guarantees a request in the pools of a node where it can't keep what a rebuild needs (rows 3 and 4).
 
 | # | A request with | Class | Why |
 |---|---|---|---|
 | 1 | Audio it streams out | guaranteed | a pause is a gap in playback |
 | 2 | A `rows` span | guaranteed | its KV comes from another node's outputs, such as the Thinker's hidden states the Qwen3-Omni Talker reads |
-| 3 | A `digest` span | guaranteed | its KV comes from an encoder's output, freed after prefill |
+| 3 | A `digest` span | preemptible at one rank where the node's rebuild policy copies the walk's inputs, guaranteed elsewhere | its KV comes from an encoder's output, freed after prefill, so a rebuild needs a host copy of it |
 | 4 | No rebuild policy on its node | guaranteed there | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
-Row 3 becomes preemptible with a followup, R5, which keeps a host copy of the encoder's output for the rebuild. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Until then, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker.
+R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed.
 
 On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTFT under pressure. On a 48-page pool at c16, Qwen3.5 image requests' TTFT p50 fell from 3.48 s to 3.18 s once R5a made them preemptible.
 
