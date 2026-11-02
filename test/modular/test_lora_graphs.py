@@ -219,6 +219,7 @@ def _engine_with(pool, captured_keys, model_key="cfg"):
     engine._submodules = {"LLM": SimpleNamespace(
         submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key), lora_pools=(pool,),
         accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
+        resident=None,
     )}
     return engine, asked
 
