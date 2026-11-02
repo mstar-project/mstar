@@ -169,12 +169,12 @@ You must implement these abstract methods:
    this for a ``MultimodalDecoderModel``.
    A step whose walk a stream feeds and that is a bare node runs once per chunk until the
    worker reports the stream's final chunk, its inputs' tensors sent with the first chunk
-   only; any other step advances when its walk
-   reports, and the partition is done after its last step. A ``ValueError`` here refuses
-   the request with a 400, and so does a plan of ``[]`` for every partition (nothing would
-   ever run); an ``HTTPException`` below 500 refuses it with its own status and detail. A plan the conductor can't run is a model bug, refused with a 500: a step
-   whose walk is not one of its partition's, a ``bind`` key that is not an input of
-   the step's walk, or a later step whose walk takes no input the conductor sends (it moves
+   only; any other step advances when its walk reports, and the partition is done after
+   its last step. A ``ValueError`` here refuses the request with a 400, and so does a plan
+   of ``[]`` for every partition (nothing would ever run); an ``HTTPException`` below 500
+   refuses the request with its own status and detail. A plan the conductor can't run is
+   a model bug, refused with a 500: a step whose walk is not one of its partition's, a
+   ``bind`` key that is not an input of the step's walk, or a later step whose walk takes no input the conductor sends (it moves
    a worker onto a step only by sending it inputs). In a partition a stream moves
    (``Connection.consumer_walk``), the stream decides how many passes each step runs, but
    the conductor moves past a step on its first report when it is the last step (the
