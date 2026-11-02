@@ -31,7 +31,8 @@ model_kwargs:
   # 16 here. A step of 3 or 5-7 rows replays the next captured size with dummy rows.
   # Capturing every batch size up to max_batch_size (the commented line) skips that padding,
   # which pays under concurrency (requests at different steps, one or two outside the dit).
-  # H200, 1024^2, 8 steps, 2 rounds: c=4 1.05-1.08 -> 1.22 images/s, c=8 1.12-1.14 -> 1.21-1.22,
+  # H200, 1024^2, 8 steps, 2 rounds (before the fused q/k norm + rotary):
+  # c=4 1.05-1.08 -> 1.22 images/s, c=8 1.12-1.14 -> 1.21-1.22,
   # c=16 1.17-1.19 -> 1.23, c=1 unchanged, same peak VRAM. But each graph is a compile of its own:
   # 32 graphs start ~100 s slower than 16 on a warm Inductor cache, ~8 min slower on a cold one.
   # The text encoder captures its own geometric_batch_sizes: powers of two below max_batch_size,
