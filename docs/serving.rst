@@ -239,8 +239,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
+       ``sp_size`` and ``cfg_size``. An ``ep_config`` block picks TP or EP for the
+       group's MoE experts.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -358,7 +359,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        Unset keeps PyTorch's default throughout. Raise it only where weight load,
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
-     - *(optional)* Small-message all-reduce path of every TP and SP group:
+     - *(optional)* Small-message all-reduce path of every TP, SP and CFG group:
        ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
        any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
        up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
@@ -620,10 +621,29 @@ weight loaders then shard parameters automatically, with no model-code changes. 
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
 
-Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
-groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
-then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
-in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
+**Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
+that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
+classifier-free-guidance branches, each rank running its share of them and the noise
+predictions gathered every step. Each needs the model to declare the node SP- or
+CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+The axes compose: a group's ``ranks`` form lockstep instances of
+``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
+each instance's ranks listed in ascending order, and the conductor routes each request to
+one whole instance:
+
+.. code-block:: yaml
+
+   model: "wan22"
+   max_seq_len: 512
+   node_groups:
+     - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
+     # one guidance branch per rank
+     - {node_names: [dit], ranks: [0, 1], cfg_size: 2}
+
+Several lockstep-parallel nodes can share GPUs when, on each worker, they are in the same
+groups on every axis, each declared parallel on those axes by the model. The ranks then run
+every node's steps in one order. The conductor refuses lockstep nodes on one worker in
+different groups, and two lockstep nodes on one worker that share a paged KV cache:
 rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
 per node, riding on one node's next step, so two nodes on one pool could admit out of step on
 a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on

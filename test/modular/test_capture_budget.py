@@ -76,7 +76,8 @@ class _StubMeasuredRunner:
         self._capture_costs = {}
         self._lent = set()
         self._executables = {}
-        self._comm_group = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = CommGroup.trivial()
+        self._comm_group = JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial)
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
 
@@ -236,7 +237,7 @@ def test_a_tp_group_sizes_its_buckets_again_together(measured, wanted, peer_want
         _bucket("decode", bs, bs): CaptureCost(bs * _MIB, 2 * bs * _MIB, 0, 2) for bs in (16, 8, 4, 2)
     }
     runner = _StubMeasuredRunner(torch.device("cpu"), walk)
-    runner._comm_group.tp_group = _PeerGroup([peer_wanted])
+    runner._comm_group.instance = _PeerGroup([peer_wanted])
     runner.size_captures()
 
     costs = _sized(runner.size_lent_captures(wanted))
@@ -790,7 +791,8 @@ class _StubPlannedRunner:
         self._submodule_name = "Thinker"
         self._num_slots = 1
         self._buckets = {}
-        self._comm_group = JointGroups(tp_group=_PeerGroup(peer), sp_group=CommGroup.trivial())
+        peer_group = _PeerGroup(peer)
+        self._comm_group = JointGroups(tp_group=peer_group, sp_group=CommGroup.trivial(), instance=peer_group)
         self._dummy_rows = SimpleNamespace(release_all=lambda: None)
         self._graph_backend = SimpleNamespace(
             is_available=lambda: True, graph_pool_handle=lambda: AcceleratorGraphPool(object()),

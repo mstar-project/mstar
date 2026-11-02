@@ -1,6 +1,6 @@
 """Choosing a new request's data-parallel replica in each node group.
 
-A replica is one lockstep instance of a group: its ``tp_size * sp_size`` ranks,
+A replica is one lockstep instance of a group: its ``cfg_size * sp_size * tp_size`` ranks,
 or one rank. A replica's cost for the request is ``routing_weights.load`` times
 its live requests, plus ``routing_cost`` of the facts the mirrors predict for
 the request there:
@@ -133,7 +133,8 @@ class ReplicaRouter:
             for key, labels in keyed_labels(model).items()
         }
         by_rank = prefix_caches_by_rank(
-            specs, ((wg.ranks, wg.tp_size, wg.section.get_nodes()) for wg in worker_graphs), names_checkpoint(model),
+            specs, ((wg.ranks, wg.instance_size, wg.section.get_nodes()) for wg in worker_graphs),
+            names_checkpoint(model),
         )
         self._units: list[_Unit] = []
         for instances, wgs in units.items():

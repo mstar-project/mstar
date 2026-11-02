@@ -2,12 +2,14 @@
 they divide into, the parallel groups each worker is handed, and the weights
 that pick a request's replica among them."""
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from mstar.conductor.routing import RoutingWeights
-from mstar.distributed.base import ShardingConfig
+from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -79,7 +81,7 @@ def _node_group_entry_problem(i: int, group: Any) -> str | None:
             return f"node_groups[{i}]: {key} must be a list of names; got {names!r}"
     if not all(_is_count(rank, 0) for rank in group["ranks"]):
         return f"node_groups[{i}]: ranks must be integers >= 0; got {group['ranks']!r}"
-    for key in ("tp_size", "sp_size"):
+    for key in (f"{axis}_size" for axis in PARALLEL_AXES):
         if not _is_count(group.get(key, 1), 1):
             return f"node_groups[{i}]: {key} must be an integer >= 1; got {group[key]!r}"
     return None
@@ -124,6 +126,7 @@ def check_worker_graphs(
         *_loop_successors(walk_to_wgs),
         *_sharding_groups(worker_graphs, sharding_config),
         *_worker_parallelism(worker_graphs, specs or ()),
+        *_paged_kv_on_cfg_ranks(worker_graphs, specs or ()),
     ]
 
 
@@ -195,19 +198,43 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
     sharding = model.get_default_sharding_config()
     for i, group in enumerate(node_groups):
         names, ranks = group["node_names"], group["ranks"]
-        tp, sp = group.get("tp_size", 1), group.get("sp_size", 1)
-        if len(ranks) % (tp * sp):
+        sizes = node_group_axis_sizes(group)
+        instance = math.prod(sizes.values())
+        if len(ranks) % instance:
             yield (
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
-                f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
+                f"divisible by its instance size ({sizes}: {instance})."
             )
-        for size, axis, enabled in (
-            (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
-        ):
-            if size > 1 and any(node not in enabled for node in names):
+        blocks = [ranks[base:base + instance] for base in range(0, len(ranks), instance)]
+        if instance > 1 and any(block != sorted(block) for block in blocks):
+            # torch orders a process group by global rank, the mesh by this
+            # list: out of order, a gather would come back in another order
+            # than the one each rank split its work by
+            yield (
+                f"node_groups[{i}] (nodes {names}) lists its ranks {ranks} out of order; "
+                f"each lockstep instance's {instance} ranks must be ascending."
+            )
+        for axis, size in sizes.items():
+            enabled = getattr(sharding, f"{axis}_enabled_nodes")
+            unsupported = [node for node in names if node not in enabled]
+            if size > 1 and unsupported:
+                # guidance branches rode sp_size before they had an axis of their own
+                hint = (
+                    "; split guidance branches with cfg_size instead"
+                    if axis == "sp" and any(node in sharding.cfg_enabled_nodes for node in unsupported)
+                    else ""
+                )
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
-                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"
+                    f"in {axis}_enabled_nodes {sorted(enabled)}: {names}{hint}"
+                )
+        cfg = sizes["cfg"]
+        for node in names:
+            branches = sharding.cfg_enabled_nodes.get(node)
+            if cfg > 1 and branches is not None and branches % cfg:
+                yield (
+                    f"node_groups[{i}] has cfg_size {cfg}, which does not divide the "
+                    f"{branches} guidance branches {node!r} runs."
                 )
 
 
@@ -371,8 +398,9 @@ def _sharding_groups(
     worker_graphs: Sequence[WorkerGraph], sharding_config: ShardingConfig,
 ) -> Iterator[str]:
     """v1: one sharding group per worker graph, with the worker graph's
-    tp_size, and no custom graph_walks on a group holding a streaming
-    consumer."""
+    tp_size, no custom graph_walks on a group holding a streaming consumer,
+    and no shard_dim signal on a node whose instance is wider than its TP
+    group: the fanout splits by instance rank, the weights by TP rank."""
     streaming_consumers: set[str] = set()
     node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
     for wg in worker_graphs:
@@ -407,19 +435,60 @@ def _sharding_groups(
                         f"and {key!r}). v1 requires one TP group per worker graph; split "
                         "the worker graph or merge the groups."
                     )
-                if wg.tp_size != group.tp_size and (id(wg), "tp") not in reported:
+                if wg.instance_size != group.tp_size and (id(wg), "tp") not in reported:
                     reported.add((id(wg), "tp"))
                     yield (
-                        f"{_describe(wg)} has tp_size {wg.tp_size}, but its sharding group "
-                        f"has tp_size {group.tp_size}. node_groups and sharding_config disagree."
+                        f"{_describe(wg)} has instance size {wg.instance_size}, but its sharding "
+                        f"group has tp_size {group.tp_size}. node_groups and sharding_config disagree."
                     )
+
+    refused: set[str] = set()
+    for wg in worker_graphs:
+        if wg.instance_size == wg.tp_size:
+            continue
+        for name, node in sorted(wg.section.get_nodes().items()):
+            sharded = sorted(
+                signal for signal in node.input_names | {edge.name for edge in node.outputs}
+                if sharding_config.shard_dim.get(signal) is not None
+            )
+            if sharded and name not in refused:
+                refused.add(name)
+                yield (
+                    f"node {name!r} takes or emits {sharded}, which have a shard_dim, but "
+                    f"{_describe(wg)} spans {wg.axis_sizes}: a sharded signal is split over "
+                    "the whole lockstep instance, not the TP group. Drop their "
+                    "sharding_config.shard_dim entries, or set sp_size and cfg_size to 1."
+                )
+
+
+def _paged_kv_on_cfg_ranks(
+    worker_graphs: Sequence[WorkerGraph], specs: Sequence[NodeResourceSpec],
+) -> Iterator[str]:
+    """A paged KV cache on a node with ``cfg_size > 1``: the pool's rank math
+    (prefix publishing, transfer slices) takes every instance rank for a head
+    shard, which a CFG rank isn't."""
+    for spec in specs:
+        if not (isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)):
+            continue
+        wg = next((
+            wg for wg in worker_graphs
+            if wg.cfg_size > 1 and spec.nodes & wg.section.get_nodes().keys()
+        ), None)
+        if wg is not None:
+            yield (
+                f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
+                f"cache, since its CFG ranks run different branches ({_describe(wg)} has "
+                f"cfg_size {wg.cfg_size}). Make each branch its own node in a graph Parallel, "
+                "on a node group with cfg_size 1, as BAGEL's LLM_cfg_text and LLM_cfg_img are."
+            )
 
 
 def _placement(groups, node: str) -> str:
-    """``node``'s TP and SP ranks on a worker, leaving out an axis of one rank."""
-    axes = (("TP", groups.get_tp_config_for_node(node)), ("SP", groups.get_sp_config_for_node(node)))
+    """``node``'s ranks on each mesh axis on a worker, leaving out an axis of one rank."""
+    axes = ((axis, groups.axis_groups[axis].get(node)) for axis in PARALLEL_AXES)
     return f"{node} on " + ", ".join(
-        f"{axis} ranks {group.group_members}" for axis, group in axes if group.world_size > 1
+        f"{axis.upper()} ranks {group.group_members}" for axis, group in axes
+        if group is not None and group.world_size > 1
     )
 
 
@@ -428,8 +497,8 @@ def _worker_parallelism(
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
     same groups the conductor hands it: every lockstep-parallel node on a
-    worker in the same TP and SP groups (one lockstep instance), every
-    resource spec's nodes on one TP x SP shape and, on each worker, in one
+    worker in the same parallel groups (one lockstep instance), every
+    resource spec's nodes on one parallel shape and, on each worker, in one
     parallel group, and no resource that journals resident moves under two
     lockstep nodes of a worker. Over every node placed on the worker; the
     engine checked only nodes it built a submodule for, so a dummy run (no
@@ -440,19 +509,19 @@ def _worker_parallelism(
     # GlobalParallelConfig and init_dist number workers by their position
     # among the deployment's ranks, and parallel groups by rank
     misplaced = sorted({
-        rank for wg in worker_graphs for group in wg._tp_ranks + wg._sp_ranks
+        rank for wg in worker_graphs for groups in wg._axis_ranks.values() for group in groups
         for rank in group if rank >= len(ranks) or ranks[rank] != rank
     })
     if misplaced:
         yield (
-            f"the deployment uses ranks {ranks}; ranks {misplaced} are in tensor- or "
-            "sequence-parallel groups, which need every lower rank in use too."
+            f"the deployment uses ranks {ranks}; ranks {misplaced} are in parallel "
+            "groups, which need every lower rank in use too."
         )
         return
     worker_ids = [f"worker_{rank}" for rank in ranks]
     try:
         per_worker = GlobalParallelConfig(dict(enumerate(worker_graphs)), worker_ids).per_worker_config
-    except RuntimeError as e:
+    except ValueError as e:
         yield str(e)
         return
 
@@ -473,9 +542,9 @@ def _worker_parallelism(
         if not groups.all_in_same_group(parallel_nodes):
             placed = "; ".join(_placement(groups, node) for node in parallel_nodes)
             yield (
-                f"Lockstep-parallel nodes on {wid} are not in the same TP and SP groups: "
+                f"Lockstep-parallel nodes on {wid} are not in the same parallel groups: "
                 f"{placed}. A worker's lockstep nodes must share one instance: the same "
-                "TP and SP groups, of the same ranks in the same order."
+                "groups on every axis, of the same ranks in the same order."
             )
 
     all_nodes = set().union(*deployed.values())
@@ -486,7 +555,7 @@ def _worker_parallelism(
         if not any_worker.all_have_compatible_parallel_shape(spec.nodes):
             yield (
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
-                "must use the same TP x SP shape across replicas"
+                "must use the same parallel shape across replicas"
             )
         shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
@@ -494,7 +563,7 @@ def _worker_parallelism(
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
                 yield (
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
-                    f"on {wid} must all be in the same parallel (tp x sp) group"
+                    f"on {wid} must all be in the same parallel group"
                 )
             lockstep = tuple(sorted(
                 node for node in local

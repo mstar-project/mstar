@@ -39,6 +39,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
@@ -152,13 +153,22 @@ class Wan22Model(Model):
                     num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim,
                     # one segment per guidance branch
-                    max_segments_per_request=2,
+                    max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
                     # the DiT is compiled, not captured: keep attention in its graph
                     compile_op=True,
                     dtype=torch.bfloat16,
                 ),
             ),
         ]
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        # CFG-parallel: the dit's two guidance branches split over cfg_size
+        # ranks, which all-gather the noise predictions (see Wan22DitSubmodule).
+        # Signals stay replicated: no shard_dim entries.
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
+            cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
+        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -705,20 +715,19 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None, cfg_group=None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype`` and ``sp_group`` exist for interface parity only.
-        # Weights load in the checkpoint's own dtypes, and wan22 declares no
-        # sp-enabled nodes.
+        # ``autocast_dtype`` exists for interface parity only: weights load in the
+        # checkpoint's own dtypes. ``cfg_group`` reaches the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, cfg_group=cfg_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str = "cpu", cfg_group=None) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -755,7 +764,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config)
+            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 

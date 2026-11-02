@@ -105,7 +105,8 @@ class _Node:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, KV_YAML)
         by_key = resolve_spec_dependencies(specs)
-        self.groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = CommGroup.trivial()
+        self.groups = JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial)
         transfer = TransferEngineInfo(
             my_entity_id="glm52_capture", my_session_id="glm52_capture",
             transfer_engine=LocalTransferEngine("localhost"),

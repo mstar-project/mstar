@@ -86,7 +86,7 @@ class _FakeRunner:
         self._blocked_buckets = []
         self._executables = {}
         self.barrier = _Group(peer_flags)
-        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier)
+        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier, instance=self.barrier)
         self.declared: list = []
         self._dummy_rows = SimpleNamespace(
             released=False,
@@ -175,9 +175,7 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
     clean.warmup_and_capture()
     failed.warmup_and_capture()
 
-    assert failed.barrier.count == clean.barrier.count == 2 * len(_specs(
-        walks=("decode", "prefill")
-    ))
+    assert failed.barrier.count == clean.barrier.count == len(_specs(walks=("decode", "prefill")))
 
 
 def test_a_bucket_another_rank_dropped_is_dropped_here_too():

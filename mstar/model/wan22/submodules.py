@@ -28,9 +28,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.unipc import make_unipc_tables
+from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.config import Wan22Config
 
@@ -322,7 +324,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     """Dense 5B video DiT on the scaffold's denoise loop, stepped by its UniPC.
 
     One loop iteration is one transformer forward over every row's positive and
-    negative embeddings, plus a UniPC predictor/corrector update per row.
+    negative embeddings (with cfg_size 2, one branch per cfg rank), plus a UniPC
+    predictor/corrector update per row.
 
     Loop-carried edges, all float32 over ``[1, C, T, H, W]``:
 
@@ -348,14 +351,23 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     # The ragged self-attention resource (Wan22Model.get_node_resources).
     SELF_ATTN = "dit_self_attn"
+    # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
+    CFG_BRANCHES = 2
 
-    def __init__(self, transformer: nn.Module, config: Wan22Config):
+    def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
             attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
         )
         self.transformer = transformer
         self.config = config
+        # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
+        # the ranks split the CFG stack (my_rows, then an all-gather), each
+        # running one branch over the batch's rows, so the step costs one
+        # branch's forward plus a latent-sized gather. Every rank then runs the
+        # same combine and UniPC step on replicated latents. Without guidance
+        # both ranks compute the whole step, correct but no faster.
+        self.cfg_group = cfg_group or CommGroup.trivial()
         self._record_fp32_islands()
         # The WHOLE forward cannot be one compiled region: Inductor would fuse the
         # UniPC step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma
@@ -399,9 +411,18 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         )
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
 
+    def _branch_rows(self, guidance_scale: float) -> slice:
+        """This rank's branches of the [cond, uncond] stack; the unguided step is
+        the one conditional branch, which every rank runs.
+
+        ``guidance_scale`` is in the bucket key, identical on every rank of the
+        instance, so all ranks agree on whether the forward's gather runs."""
+        return my_rows(self.cfg_group, self.CFG_BRANCHES) if guidance_scale > 1.0 else slice(0, 1)
+
     def attention_segments(self, bucket_key: WanStepKey):
-        # one segment per guidance branch, all the same span
-        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (2 if bucket_key.guidance > 1.0 else 1)
+        # one segment per guidance branch this rank computes, all the same span
+        rows = self._branch_rows(bucket_key.guidance)
+        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (rows.stop - rows.start)
 
     def seed_latents(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
@@ -488,7 +509,9 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         transformer's output dtype (bf16), like the reference. ``temp_ts`` is per
         row, ``[B, frames]``, or one row's ``[frames]``."""
         do_cfg = guidance_scale > 1.0
-        branches = 2 if do_cfg else 1
+        rows = model_input.shape[0]
+        branch_rows = self._branch_rows(guidance_scale)
+        branches = branch_rows.stop - branch_rows.start
         hidden_states = model_input.repeat(branches, 1, 1, 1, 1)
         timestep = temp_ts.repeat(branches, 1)
         # dynamic=False keys the compiled trace on the full input shape (batch
@@ -505,21 +528,24 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                     "this resolution now (one-time pause); later requests reuse it.",
                     shape_key,
                 )
-        encoder_hidden_states = (
-            torch.cat([text_embeds_pos, text_embeds_neg], dim=0) if do_cfg else text_embeds_pos
-        ).to(self.transformer.dtype)
+        if do_cfg:
+            # this rank's branches of the CFG stack, gathered back after the forward
+            stack = torch.cat([text_embeds_pos, text_embeds_neg], dim=0)
+            encoder_hidden_states = stack[branch_rows.start * rows : branch_rows.stop * rows]
+        else:
+            encoder_hidden_states = text_embeds_pos
         transformer = self.transformer
         if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
             transformer = self._eager_forward[1]
         out = transformer(
             hidden_states=hidden_states,
             timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
             self_attn_fn=self._ragged(),
         )
         if not do_cfg:
             return out
-        rows = model_input.shape[0]
+        out = self.cfg_group.all_gather(out.contiguous(), dim=0)
         noise_cond, noise_uncond = out[:rows], out[rows:]
         return noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
