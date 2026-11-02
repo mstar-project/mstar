@@ -267,6 +267,11 @@ There are two ``ResourceReqConfig`` subclasses:
   put the leased bucket's key on the step. Such batches replay a graph whose draw is one
   read of the logits (``mstar::sample_unfiltered``, Gumbel-max); mixed ones replay the
   ordinary capture. AMD GPUs only so far; Qwen3.5's decode is the example.
+- A node that samples many times per step with top-k or top-p and nothing else, and reads
+  no token back on the device, can set ``SamplerSpec(fused_draw=True)``: a captured step
+  then draws in one kernel per call (``mstar::sample_filtered``, Gumbel-max over the kept
+  set) instead of about nine, from the same distribution. AMD GPUs and vocabularies up to
+  16384 only; elsewhere the node samples as before. Qwen3-TTS's code predictor uses it.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
