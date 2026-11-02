@@ -252,6 +252,11 @@ class PreprocessWorker:
         is_pending: Callable[[str], bool] | None = None,
     ):
         check_media_limits()
+        # Here, before the thread starts: the thread reads it as it starts, and
+        # a value it cannot take would end the thread with every request waiting.
+        workers = (model_config or {}).get("preprocess_workers")
+        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
+            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
