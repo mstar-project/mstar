@@ -1994,56 +1994,34 @@ BAGEL's ViT tower is the packed, cacheless counterpart. See
 ``PiecewisePackedConfig`` whose region declares only ragged attention, with patch
 embedding and the RoPE gathers left eager because they are data-dependent indexing.
 
+Persistent rows
+~~~~~~~~~~~~~~~
+
+A walk listed in ``NodeSubmodule.persistent_row_walks()`` keeps each
+request in a fixed row of device buffers across steps
+(``mstar/engine/rows/``), so a step uploads only what changed: the rows that
+joined or left, and single elements such as an appended page. The engine
+runs the step in row order (``request_ids`` is a permutation of the batch
+the worker scheduled), and checks a request's row in before a step of
+another walk or an eviction touches its state.
+
+Each resource of the node opts in through ``Resource.row_state(space,
+node_name, graph_walk)``, called once before capture. It registers its
+buffers with ``space.buffer(...)`` (a ``mirrored`` one keeps a host copy
+that is the truth for its rows) and returns a ``RowState``: ``check_out``
+writes joining rows, ``check_in`` reads leaving rows back (host state in an
+``on_commit`` hook, so a proposal that never commits changes nothing), and
+``released`` frees what a removed request's row held. The base
+``RowState()`` keeps nothing. While planning, a resource writes the step's
+changes through ``ctx.rows`` (``write_at``, ``advance``). A pre-planned step
+is planned again at exec with the same ``ctx.rows``, so write on one of the
+two passes (``ctx.is_preplan``).
+
+The engine refuses the walk at startup if a resource returns None (the
+default), the walk has no batch cap, the node is tensor- or
+sequence-parallel, or it shares a resource with another node.
+
 .. _config-yaml:
-
-Persistent rows (keeping per-row state on the device across steps)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-A decode loop's per-row state (lengths, page tables, positions, sampler
-settings) is mostly the same from one step to the next. A walk listed in
-``NodeSubmodule.persistent_row_walks()`` keeps each request in a fixed row
-of device buffers across steps (``mstar/engine/rows/``). Each step then
-uploads only what changed: the rows that joined or left, and single elements
-such as an appended page. A step with no changes uploads nothing.
-
-The engine runs such a step in row order, so ``request_ids`` is a
-permutation of what the worker scheduled. It proposes the step's rows before
-planning (``ctx.rows``), uploads them after every resource has planned,
-commits them before the launch, and applies them on the step's stream. A
-step of another walk that runs a request holding a row first checks that
-request in. A removed request's row leaves at its walk's next step.
-
-Every resource of the node takes part through ``Resource.row_state(space,
-node_name, graph_walk)``, called once at startup before capture:
-
-- It registers its buffers with ``space.buffer(name, shape, dtype, pad,
-  mirrored)``. A mirrored buffer keeps a host copy that is the truth for the
-  rows it holds; an unmirrored one is device-only state, checked out of a
-  store the resource owns.
-- It returns a ``RowState``:
-
-  - ``check_out`` writes joining rows (``write``, or ``copy_in`` from a
-    store).
-  - ``check_in`` reads leaving rows back: ``copy_out`` to a store, and host
-    state from the mirror in an ``on_commit`` hook, so that a proposal that
-    never commits changes nothing.
-  - ``released`` frees what was kept for a request removed while it held a
-    row.
-
-  The base ``RowState()`` is for a resource that keeps nothing per row.
-- While planning, it writes the step's changes through ``ctx.rows``:
-  ``write_at`` for single elements, ``advance`` for what the forward adds to
-  every active row. A step planned ahead is planned again at exec with the
-  same ``ctx.rows``, so a resource that pre-plans writes on one of the two
-  passes (``ctx.is_preplan`` tells them apart); ``advance`` refuses a second
-  call for a buffer.
-
-The engine refuses the walk at startup if any resource returns None (the
-default), if the walk has no batch cap to size the rows, if the node is
-tensor- or sequence-parallel, or if it shares a resource with another node.
-A node may keep rows for several walks; a request's step of one walk checks
-in its row of another first. Evicting a request that holds a row checks
-the row in first too, so its resources offload the state the row held.
 
 Step 6 — Write a config YAML
 ----------------------------
