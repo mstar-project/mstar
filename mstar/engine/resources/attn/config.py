@@ -78,7 +78,7 @@ class AttentionConfig:
                 raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
-SpExchange = Literal["none", "ulysses", "all_gather", "ring"]
+SpExchange = Literal["none", "ulysses", "all_gather", "ring", "kv_gather"]
 SP_EXCHANGES: tuple[SpExchange, ...] = get_args(SpExchange)
 
 
@@ -89,11 +89,14 @@ class AttentionSpec(NodeResourceSpec):
     shard_key: str | None = field(default=None, init=False, repr=False)
     # how a split step's labels reach this attention: a deployment's choice, set only by its
     # `resources:` block (`apply_yaml_overrides`), never by a model. "ulysses" over KV stored by
-    # head, "all_gather" or "ring" over KV stored by position (`context_parallel`), "none" for no
-    # split steps; None takes the storage's default (`resolve_exchange`)
+    # head, "kv_gather" over an MLA pool stored by head (its one latent is whole on every rank),
+    # "all_gather" or "ring" over KV stored by position (`context_parallel`), "none" for no split
+    # steps; None takes the storage's default (`resolve_exchange`)
     sp_exchange: SpExchange | None = field(default=None, init=False, repr=False)
     # `sp_exchange` resolved against the pool's storage (`derive`)
     split_exchange: SpExchange = field(default="ulysses", init=False, repr=False)
+    # its pool's config (`derive`), which the refusals read
+    _pool: KVConfig | None = field(default=None, init=False, repr=False, compare=False)
 
     def depends_on(self) -> set[str]:
         # the wrappers are planned against the cache's geometry, and it has to
@@ -108,29 +111,57 @@ class AttentionSpec(NodeResourceSpec):
 
         problems = take_shard_edge(self, specs)
         self.split_exchange = self.resolve_exchange(specs)
+        self._pool = specs[self.config.kv_cache].config
         # a deployment's own setting, so refused at every SP size where it doesn't match the pool's
         # storage, and where nothing reads it (`sequence_parallel_refusals`)
-        by_position = {"ulysses": False, "all_gather": True, "ring": True}.get(self.sp_exchange)
-        if by_position is not None and bool(specs[self.config.kv_cache].places_positions) != by_position:
+        exchange, kv = self.sp_exchange, specs[self.config.kv_cache]
+        by_position = {"ulysses": False, "kv_gather": False, "all_gather": True, "ring": True}.get(exchange)
+        if by_position is not None and bool(kv.places_positions) != by_position:
             storage = "by position (context_parallel: true)" if by_position else "by head (context_parallel off)"
-            problems.append(f"sp_exchange {self.sp_exchange!r} needs KV {self.config.kv_cache!r} stored {storage}")
+            problems.append(f"sp_exchange {exchange!r} needs KV {self.config.kv_cache!r} stored {storage}")
+        elif exchange in ("kv_gather", "ulysses", "ring") and (exchange == "kv_gather") != _mla(kv):
+            why = {
+                "kv_gather": "gathers an MLA pool's one latent, which KV {kv!r} doesn't store",
+                "ulysses": "trades tokens for KV heads, and MLA pool {kv!r} stores one latent head",
+                "ring": "passes queries round, which over MLA pool {kv!r} moves every query head's latent width",
+            }[exchange]
+            problems.append(f"sp_exchange {exchange!r} " + why.format(kv=self.config.kv_cache))
         return problems
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
-        """``sp_exchange``, or where unset its pool's storage's default: ``ulysses`` by head, and
-        ``none`` by position, where splitting a step's tokens is the deployment's to opt into."""
+        """``sp_exchange``, or where unset its pool's storage's default: ``ulysses`` by head
+        (``kv_gather`` over an MLA pool), and ``none`` by position, where splitting a step's tokens
+        is the deployment's to opt into."""
         if self.sp_exchange is not None:
             return self.sp_exchange
-        return "none" if specs[self.config.kv_cache].places_positions else "ulysses"
+        kv = specs[self.config.kv_cache]
+        if kv.places_positions:
+            return "none"
+        return "kv_gather" if _mla(kv) else "ulysses"
+
+    def captures_split_steps(self, specs: Mapping[str, NodeResourceSpec]) -> bool:
+        # the ring's partner plans and kv_gather's local plans differ by rank, so run eagerly
+        return self.resolve_exchange(specs) not in ("ring", "kv_gather")
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+        name = f"attention {self.resource_key!r}"
+        if self.split_exchange == "kv_gather":
+            heads = self._pool._unsharded_qo_heads
+            if heads % (tp * sp) or 64 % (heads // tp):
+                # FlashInfer's FA planner refuses some causal plans at a head count not dividing its
+                # 64-query tile, which with plans differing by rank would come on one rank alone
+                return [
+                    f"{name} gathers its MLA latents (kv_gather) and plans each rank's own queries at "
+                    f"{heads // tp} query heads a rank, which must divide 64 (and {heads} divide {tp * sp} ways)"
+                ]
+            return []
         # a paged pool serves whatever labels a step declares, so nothing rules out a split one
         # reaching an attention that takes none
         if self.split_exchange != "none":
             return []
         why = "sp_exchange unset, none over KV stored by position" if self.sp_exchange is None else "sp_exchange none"
         return [
-            f"attention {self.resource_key!r} takes no split steps ({why}), and node {node!r}'s other attentions "
+            f"{name} takes no split steps ({why}), and node {node!r}'s other attentions "
             "split its steps: set its sp_exchange to all_gather or ring, or none on the others"
         ]
 
@@ -170,6 +201,11 @@ class AttentionSpec(NodeResourceSpec):
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
         if decode_fmha is not None:
             self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
+
+
+def _mla(kv: NodeResourceSpec) -> bool:
+    """Whether ``kv`` is a pool of MLA latents."""
+    return getattr(getattr(kv, "config", None), "layout", None) == KVLayout.MLA
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:

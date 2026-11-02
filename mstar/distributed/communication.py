@@ -300,8 +300,8 @@ class CommGroup:
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
 
-        ``input_`` may be several tensors that differ only in the extent of
-        ``scatter_dim``, split evenly (q, k and v with their own head counts):
+        ``input_`` may be several tensors of one dtype and one extent along
+        ``gather_dim``, each split evenly (q, k and v with their own head counts):
         they go in one exchange and come back as a tuple. Each exchange is one
         ``all_to_all_single`` over a buffer packed in a single copy, which
         replays from a CUDA graph. The collective is hidden from torch.compile,
@@ -310,6 +310,8 @@ class CommGroup:
         Cosmos3's batched capture.
         """
         tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
+        # packed into one buffer of the first's dtype, which would silently convert the others
+        assert len({x.dtype for x in tensors}) == 1, f"all_to_all packs one dtype, got {[x.dtype for x in tensors]}"
         if self.world_size == 1:
             return input_ if isinstance(input_, torch.Tensor) else tensors
         world_size = self.world_size

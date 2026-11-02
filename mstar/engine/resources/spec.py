@@ -145,8 +145,18 @@ class NodeResourceSpec(ABC):
         """How a split step's tokens reach this attention (``sequence_shard``): ``none`` (the
         default) for a resource that takes none. From raw fields, so the sequence shard's
         ``derive`` can ask in any order; a node's steps split where any of its attentions answers
-        otherwise (``SeqShardSpec.splits``)."""
+        otherwise (``SeqShardSpec.splits``).
+
+        Every hook the sequence shard reads is computed from the spec's own raw fields and other
+        specs' hooks, never from a field ``derive`` sets: specs derive in key order, so such a
+        field may still hold its default when the shard derives."""
         return "none"
+
+    def captures_split_steps(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
+        """Whether this resource runs a split step inside an accelerator graph. False for one whose
+        split exchange plans per rank or syncs the host; a node with any such resource plans every
+        leased step copied (``SeqShardSpec.eager_splits``). From raw fields, as ``resolve_exchange``."""
+        return True
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP

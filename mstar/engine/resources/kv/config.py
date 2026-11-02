@@ -609,11 +609,15 @@ def unrestorable(specs: Mapping[str, NodeResourceSpec], opened: Collection[str])
     """The resources that can't restore what a hit skips while ``opened`` open:
     those that set `NodeResourceSpec.restores_prefix` and keep no open cache of
     their own, unless they are over open caches that restore. Each keeps every
-    cache on its nodes shut."""
+    cache on its nodes shut. A dependency that plans from the step a hit trimmed
+    (``prefix_skip_safe``, a sequence shard's say) holds nothing to restore."""
+    def held(spec: NodeResourceSpec) -> set[str]:
+        return {dep for dep in spec.depends_on() if not specs[dep].resource_class.prefix_skip_safe}
+
     return [
         spec for spec in specs.values()
         if spec.restores_prefix and spec.resource_key not in opened and not (
-            spec.depends_on() and all(dep in opened and specs[dep].restores_prefix for dep in spec.depends_on())
+            (deps := held(spec)) and all(dep in opened and specs[dep].restores_prefix for dep in deps)
         )
     ]
 
@@ -708,6 +712,9 @@ class KVSpec(NodeResourceSpec):
                     f"{self.resource_key!r} stores them by position (context_parallel), which takes a packed "
                     "split (axis 0) only"
                 ]
+            return []
+        if cfg.layout == KVLayout.MLA:
+            # one latent, whole on every rank: its attention answers for the query heads (kv_gather)
             return []
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:

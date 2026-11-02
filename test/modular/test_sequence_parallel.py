@@ -268,6 +268,139 @@ def test_all_to_all_rows_counts_are_group_relative(tmp_path):
     _run(_rows_to_peers, 4, tmp_path / "store")
 
 
+# --- a recurrent layer's exchanges ----------------------------------------------------------------
+
+
+def test_row_pieces_cut_each_row_at_the_rank_bounds():
+    r = SeqRange(CommGroup(0, 0, [0, 1, 2]), (7, 6, 6), None)
+    assert r.row_pieces([7, 1, 2, 9]).tolist() == [[7, 0, 0, 0], [0, 1, 2, 3], [0, 0, 0, 6]]
+
+
+def _conv_rows(x, weight, initial, spans):
+    """A depthwise causal conv over each row of packed ``x`` ``[n, C]``, from its window
+    ``initial[i]`` ``[C, W - 1]``: the output, and each row's window after it."""
+    outs, finals, start = [], [], 0
+    for window, span in zip(initial, spans, strict=True):
+        seq = torch.cat([window, x[start:start + span].T], dim=1)
+        outs.append(torch.nn.functional.conv1d(seq[None], weight[:, None], groups=weight.shape[0])[0].T)
+        finals.append(seq[:, -window.shape[1]:])
+        start += span
+    return torch.cat(outs), torch.stack(finals)
+
+
+def _halo(rank, world, spans):
+    """``conv_halo`` over this rank's tokens of rows split ``spans``, some carrying a stored window:
+    its output and final windows against the conv over whole rows on one rank."""
+    from mstar.engine.resources.sequence_shard import conv_halo, conv_halo_plan
+
+    group = _group(rank, world)
+    channels, width = 5, 4
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(sum(spans), channels, generator=gen)
+    weight = torch.randn(channels, width, generator=gen)
+    stored = torch.randn(len(spans), channels, width - 1, generator=gen)
+    stored[1::2] = 0  # rows without state read their window as zeros
+    want, want_final = _conv_rows(x, weight, stored, spans)
+    r = SeqRange(group, tuple(sp_seq_split(sum(spans), world)), None)
+    halo = conv_halo_plan(r.row_pieces(spans), rank, width - 1)
+
+    def conv(x, initial):
+        return _conv_rows(x, weight, initial, halo.spans.tolist())[0]
+
+    out, final = conv_halo(conv, r.local(x), stored, halo, group)
+    torch.testing.assert_close(out, r.local(want))
+    torch.testing.assert_close(final, want_final)
+
+
+@pytest.mark.parametrize("world, spans", [
+    (2, [4, 6]),
+    (3, [7, 1, 2, 9]),
+    (3, [1, 5, 1]),
+], ids=["2", "3-a-row-on-rank-0-and-short-pieces", "3-a-window-over-three-ranks"])
+def test_conv_halo_gives_each_rank_the_windows_of_the_whole_rows(tmp_path, world, spans):
+    _run(_halo, world, tmp_path / "store", spans)
+
+
+def _delta_rule(state, q, k, v, g, beta):
+    """A gated delta rule over one row's tokens from ``state`` ``[H, V, K]``, decay ``g`` per head
+    (``[n, H]``) or per head and key channel (``[n, H, K]``, KDA's): each token's output and the
+    final state."""
+    outs = []
+    for t in range(q.shape[0]):
+        decay = g[t][:, None, None] if g.dim() == 2 else g[t][:, None, :]
+        state = state * decay
+        state = state + beta[t][:, None, None] * torch.einsum(
+            "hv,hk->hvk", v[t] - torch.einsum("hvk,hk->hv", state, k[t]), k[t],
+        )
+        outs.append(torch.einsum("hvk,hk->hv", state, q[t]))
+    return torch.stack(outs) if outs else q.new_zeros(0, *v.shape[1:]), state
+
+
+def _hand_off(rank, world, spans, per_key):
+    """``state_passing`` for a recurrence whose transition is linear in the state: each rank runs
+    the rows it holds from their start, hands off the last one, and runs a row continuing into it
+    from the state it gets; outputs and final states against one rank."""
+    from mstar.engine.resources.sequence_shard import state_passing
+
+    group = _group(rank, world)
+    heads, dim = 2, 3
+    gen = torch.Generator().manual_seed(0)
+    n = sum(spans)
+    q, k, v = (torch.randn(n, heads, dim, generator=gen) for _ in range(3))
+    k = torch.nn.functional.normalize(k, dim=-1)
+    g = torch.rand((n, heads, dim) if per_key else (n, heads), generator=gen) * 0.5 + 0.5
+    beta = torch.rand(n, heads, generator=gen)
+    start_state = torch.randn(len(spans), heads, dim, dim, generator=gen)
+    start_state[::2] = 0
+    bounds = np.concatenate([[0], np.cumsum(spans)])
+    want = [_delta_rule(start_state[i], *(t[a:b] for t in (q, k, v, g, beta))) for i, (a, b) in
+            enumerate(zip(bounds[:-1], bounds[1:], strict=True))]
+
+    r = SeqRange(group, tuple(sp_seq_split(n, world)), None)
+    pieces = r.row_pieces(spans)
+    first = bounds[:-1] + pieces[:rank].sum(0)
+    rows = np.flatnonzero(pieces[rank])
+    starts = {i: pieces[:rank, i].sum() == 0 for i in rows}
+    ends = {i: pieces[rank + 1:, i].sum() == 0 for i in rows}
+
+    def piece(i, state, values=v):
+        a = first[i]
+        return _delta_rule(state, *(t[a:a + pieces[rank, i]] for t in (q, k, values, g, beta)))
+
+    outs, finals = {}, {}
+    for i in rows:
+        if starts[i]:
+            outs[i], finals[i] = piece(i, start_state[i])
+    eye = torch.eye(dim).expand(heads, dim, dim)
+    transition, offset = eye, torch.zeros(heads, dim, dim)
+    if len(rows) and not ends[rows[-1]]:
+        last = rows[-1]
+        if starts[last]:
+            transition, offset = torch.zeros(heads, dim, dim), finals[last]
+        else:
+            # a middle piece: its map from the state it starts with, by linearity
+            transition = piece(last, eye, torch.zeros_like(v))[1]
+            offset = piece(last, torch.zeros(heads, dim, dim))[1]
+    entering = state_passing(group, transition, offset, torch.matmul)
+    for i in rows:
+        if not starts[i]:
+            outs[i], finals[i] = piece(i, entering)
+    for i in rows:
+        torch.testing.assert_close(outs[i], want[i][0][first[i] - bounds[i]:][:pieces[rank, i]])
+        if ends[i]:
+            torch.testing.assert_close(finals[i], want[i][1])
+
+
+@pytest.mark.parametrize("per_key", [False, True], ids=["gdn", "kda"])
+@pytest.mark.parametrize("world, spans", [
+    (2, [3, 5, 4]),
+    (2, [2, 4, 6]),
+    (3, [2, 12, 2]),
+], ids=["2", "2-a-row-ends-on-a-bound", "3-a-rank-holds-a-middle-piece"])
+def test_state_passing_hands_each_row_on_as_one_rank_runs_it(tmp_path, world, spans, per_key):
+    _run(_hand_off, world, tmp_path / "store", spans, per_key)
+
+
 # --- when a step splits ---------------------------------------------------------------------------
 
 
@@ -359,7 +492,8 @@ def _kv_plan(*rows) -> KVPlanOutputs:
 ], ids=["split", "a-rank-gets-none", "leased"])
 def test_a_striped_shard_gives_each_rank_its_stored_positions(world, rows, lease, counts):
     shard = _shard(world=world)
-    shard.stripe_pool = "kv"
+    # as a ring attention's shard derives them
+    shard.stripe_pool, shard.eager_splits = "kv", True
     ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False, slot_lease=lease,
                       force_prefill=lease is not None)
     ctx.plan_results["kv"] = _kv_plan(*rows)
@@ -399,6 +533,40 @@ def test_a_node_whose_attentions_all_take_no_split_steps_plans_every_step_copied
         joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup(0, 0, [0, 1]))
         shard = spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
         assert (spec.splits, shard.can_split, _split(shard, [("r0", "main", 10)]) is not None) == (splits,) * 3
+
+
+@pytest.mark.parametrize("placed, choice, want", [
+    (True, None, (False, False, None, "none")),
+    (True, "all_gather", (True, True, None, "ulysses")),
+    (True, "ring", (True, True, "kv", "ulysses")),
+    (False, None, (True, True, None, "ulysses")),
+], ids=["placed-unset", "placed-all-gather", "ring", "by-head"])
+def test_the_shard_reads_the_same_split_from_its_nodes_specs_in_any_order(placed, choice, want):
+    """The shard derives from the specs' hooks alone, so whichever spec derives first (the shard
+    first or last) it reads the same: whether the node splits, whether a leased step plans copied
+    (a recurrent layer and the ring run split steps eagerly), the striped pool; and an unset
+    linear spec follows the node."""
+    import itertools
+
+    from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+    from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
+
+    blocks = DeltaNetGeometry(num_k_heads=2, num_v_heads=4, head_k_dim=8, head_v_dim=8, conv_kernel_size=4).to_blocks()
+    for order in itertools.permutations(range(5)):
+        specs = [
+            KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64,
+                                              num_qo_heads=4, context_parallel=placed)),
+            AttentionSpec("attn", {"n"}, AttentionConfig(kv_cache="kv")),
+            RecurrentStateSpec("state", {"n"}, RecurrentStateConfig(num_layers=1, blocks=blocks)),
+            LinearAttnSpec("linear", {"n"}, LinearAttnConfig(recurrent_state="state", variant=LinearAttnVariant.GDN)),
+            SeqShardSpec("shard", {"n"}, ("main",), 0),
+        ]
+        specs = [specs[i] for i in order]
+        apply_yaml_overrides(specs, {"resources": {} if choice is None else {"attn": {"sp_exchange": choice}}})
+        by_key = resolve_spec_dependencies(specs)
+        shard = by_key["shard"]
+        assert (shard.splits, shard.eager_splits, shard.stripe_pool, by_key["linear"].split_exchange) == want, order
+        assert by_key["linear"].depends_on() == {"state", "shard"}
 
 
 @pytest.mark.parametrize("end", ["commit", "capture"])
