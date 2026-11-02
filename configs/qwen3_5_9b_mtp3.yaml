@@ -11,14 +11,6 @@ model_kwargs:
   num_draft_tokens: 3
   # drafts read an fp8 copy of lm_head (see Fp8DraftHead), the verify the checkpoint's
   draft_head: fp8
-platform_overrides:
-  rocm:
-    # Twice the GDN state's memory: a verify step reads a request's state from one group of slots and
-    # writes every token's to the other. Same values.
-    resources:
-      gdn_state:
-        max_slots: 257
-        twin_slots: true
 resources:
   gdn_state:
     # A request holds num_draft_tokens + 1 state slots: 64 requests, plus the sink.

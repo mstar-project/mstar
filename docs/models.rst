@@ -384,15 +384,16 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints);
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
-On AMD GPUs the 0.8B, 2B, 4B and 9B configs, 9B TP2 and the MTP configs also set
+On AMD GPUs the 0.8B, 2B, 4B and 9B configs and 9B TP2 also set
 ``gdn_state.twin_slots``: a request holds two slots, a decode step reads one and writes
 the other, and ``max_slots`` still counts what it counted (requests, or a speculative
 config's slots per token). The state's memory doubles, and its traffic takes 22-48 % less
 time at 16-64 rows (0.8B, MI325X), with the same values. A speculative verify step reads
 its start from one group of ``k + 1`` slots and writes every token's state to the other,
-which pays about 1 % there; a mixed step's decode rows write their twins while its prompt
-rows update in place; under TP each rank holds its shard's two slots, and the ranks
-compare which twin each row reads in their vote on the step.
+but the MTP configs leave the key off: 9B showed no gain beyond run spread on MI325X for
+9-13 GiB more. A mixed step's decode rows write their twins while its prompt rows update
+in place; under TP each rank holds its shard's two slots, and the ranks compare which
+twin each row reads in their vote on the step.
 
 On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
 auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
