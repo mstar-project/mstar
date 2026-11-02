@@ -31,7 +31,9 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
+from mstar.model.components.linear import LINEAR_PRECISIONS, apply_linear_precision
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.z_image.components.transformer import LOW_PRECISION_LINEARS
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import (
     IMAGE_OUTPUT,
@@ -69,10 +71,14 @@ class ZImageModel(Model):
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         async_scheduling: bool = True,
+        linear_precision: str = "bf16",
+        linear_precision_keep: list[str] | None = None,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        if linear_precision not in LINEAR_PRECISIONS:
+            raise ValueError(f"linear_precision must be one of {LINEAR_PRECISIONS}, got {linear_precision!r}")
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -92,6 +98,9 @@ class ZImageModel(Model):
         self.vae_compile = bool(vae_compile)
         # speculative scheduling of the image nodes, on by default (see Flux2KleinModel.async_scheduling)
         self.async_scheduling = bool(async_scheduling)
+        # the blocks' linears through a block-scaled GEMM (see Flux2KleinModel.linear_precision)
+        self.linear_precision = linear_precision
+        self.linear_precision_keep = tuple(linear_precision_keep or ())
         self._snapshot = None
         self._config: ZImageConfig | None = None
         self.tokenizer = None
@@ -311,8 +320,12 @@ class ZImageModel(Model):
                 warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes],
             )
         if node_name == "dit":
+            transformer = build_transformer(self.config, self.snapshot, device)
+            apply_linear_precision(
+                transformer, self.linear_precision, LOW_PRECISION_LINEARS, self.linear_precision_keep,
+            )
             return ZImageDenoiseSubmodule(
-                build_transformer(self.config, self.snapshot, device), self.config, loop_name=DENOISE_LOOP,
+                transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,

@@ -26,7 +26,7 @@ import torch
 from torch import nn
 
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
-from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.linear import FusedColumnLinear, LowPrecisionLinears
 from mstar.model.z_image.config import ZImageTransformerConfig
 
 # Sinusoidal timestep feature width (diffusers ``TimestepEmbedder.frequency_embedding_size``).
@@ -119,6 +119,14 @@ class ZImageFeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.w13(x).split(self.hidden, dim=-1)
         return self.w2(self.act(gate) * up)
+
+
+# ``linear_precision``: the blocks' attention and feed-forward linears may go low precision. The linears that set the
+# modulation and take the latents and the caption in and out carry little of the step's FLOPs, and have biases.
+LOW_PRECISION_LINEARS = LowPrecisionLinears(
+    candidates=("*.attn.qkv", "*.attn.out", "*.ff.w13", "*.ff.w2"),
+    keep_bf16=("*.adaln", "time_in", "time_out", "x_embedder", "cap_proj", "final_mod", "final_proj"),
+)
 
 
 # The three spans a forward attends over: the noise refiner over the (padded) image tokens

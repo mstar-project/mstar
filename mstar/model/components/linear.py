@@ -149,7 +149,10 @@ class BlockScaledLinear(nn.Module):
         unit = None if quantized.tensor_scale is None else torch.ones_like(quantized.tensor_scale)
         self.register_buffer("x_tensor_scale", unit)
 
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # A graph break: the quantizer is one anyway, and its resume frame, shared by every instance at every shape,
+        # would run into Dynamo's recompile limit. Capture records the same kernels either way.
         lead = x.shape[:-1]
         weight = BlockQuant(self.weight_data, self.weight_scale, self.weight_tensor_scale)
         quantized = block_quant(x.reshape(-1, self.in_features), self.fmt)._replace(tensor_scale=self.x_tensor_scale)

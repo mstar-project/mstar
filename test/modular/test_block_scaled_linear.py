@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components import linear as linear_module
 from mstar.model.components.linear import (
     BlockScaledLinear,
@@ -16,8 +17,12 @@ from mstar.model.components.linear import (
     apply_linear_precision,
 )
 from mstar.model.flux2_klein.components.transformer import LOW_PRECISION_LINEARS, Flux2DiT
-from mstar.model.flux2_klein.config import Flux2TransformerConfig
+from mstar.model.flux2_klein.config import Flux2KleinConfig, Flux2TransformerConfig
 from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+from mstar.model.flux2_klein.submodules import KleinDenoiseSubmodule
+from mstar.model.z_image.components.transformer import LOW_PRECISION_LINEARS as Z_LOW_PRECISION_LINEARS
+from mstar.model.z_image.components.transformer import ZImageDiT
+from mstar.model.z_image.config import ZImageTransformerConfig
 from mstar.platforms import block_gemm
 from mstar.platforms.interface import CudaPlatform, Platform, RocmPlatform
 from mstar.utils import quant_fp8
@@ -276,3 +281,68 @@ def test_quant_block_host_contract(monkeypatch, fmt, kernel, block, stored):
     assert call["grid"] == (3, k // block // 4)
     assert call["kwargs"] == {"ROWS": 32, "BLOCKS": 4, "BLOCK": block}
     assert q.tensor_scale is None
+
+
+def _klein_model(**kwargs):
+    model = Flux2KleinModel(
+        skip_weight_loading=True, capture_sizes=[[1024, 1024]], capture_edit_sizes=[], **kwargs,
+    )
+    model.set_config(Flux2KleinConfig())
+    return model
+
+
+def _step_submodule(bf16_steps):
+    """The real key methods on the smallest object they read."""
+    sub = KleinDenoiseSubmodule.__new__(KleinDenoiseSubmodule)
+    sub.config = Flux2KleinConfig()
+    sub.loop_name = "denoise_loop"
+    sub._bf16_steps = bf16_steps
+    return sub
+
+
+def _step_info(k, metadata=True):
+    return CurrentForwardPassInfo(
+        request_id="r", graph_walk="image_gen", fwd_index=k, random_seed=0, max_tokens=0,
+        step_metadata={"height": 1024, "width": 1024, "num_inference_steps": 4, "ref_grids": []} if metadata else {},
+        dynamic_loop_iter_counts={"denoise_loop": k},
+    )
+
+
+def test_bf16_steps_capture_each_bucket_twice_only_under_low_precision():
+    assert len(_klein_model(linear_precision_bf16_steps=1).capture_buckets()) == 1
+    buckets = _klein_model(linear_precision="mxfp8", linear_precision_bf16_steps=1).capture_buckets()
+    assert [key.bf16_step for _, key in buckets] == [False, True]
+    assert len(_klein_model(linear_precision="mxfp8").capture_buckets()) == 1
+
+
+def test_a_steps_key_marks_the_leading_steps_and_the_requests_key_stays_shape_alone():
+    sub = _step_submodule(bf16_steps=1)
+    assert sub.cg_key_info("image_gen", {"r": _step_info(0)}).bf16_step is True
+    assert sub.cg_key_info("image_gen", {"r": _step_info(1)}).bf16_step is False
+    # a padding row carries no metadata and doesn't vote
+    assert sub.cg_key_info("image_gen", {"r": _step_info(0), "pad": _step_info(0, metadata=False)}).bf16_step is True
+    # a mix can't share a graph; can_batch keeps them apart since their keys differ
+    assert sub.cg_key_info("image_gen", {"a": _step_info(0), "b": _step_info(2)}) is None
+    assert sub.bucket_key_for(_step_info(0)).bf16_step is False
+
+
+def test_without_bf16_steps_the_step_key_is_the_requests():
+    sub = _step_submodule(bf16_steps=0)
+    assert sub.cg_key_info("image_gen", {"r": _step_info(0)}) == sub.bucket_key_for(_step_info(0))
+
+
+def _z_image_config():
+    return ZImageTransformerConfig()
+
+
+def test_z_image_declaration_classifies_every_linear_and_its_widths_pass_the_guards():
+    config = _z_image_config()
+    with torch.device("meta"):
+        modules = ZImageDiT(config).named_modules()
+    linears = [(name, m) for name, m in modules if isinstance(m, (nn.Linear, FusedColumnLinear))]
+    selected = [(name, m) for name, m in linears if Z_LOW_PRECISION_LINEARS.selected(name)]
+    assert selected and all(m.bias is None for _, m in selected)
+    for _, m in selected:
+        for fmt in (MXFP8, NVFP4):
+            check_block_gemm(fmt, m.weight.shape[1], m.weight.shape[0], torch.bfloat16)
+    assert all(m.bias is not None or name.endswith("adaln") for name, m in linears if (name, m) not in selected)
