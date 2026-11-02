@@ -503,8 +503,7 @@ class KVManager(AttentionResource):
     # written through an exchange (`sequence_shard`): the step's every token, or a ring's own ones
     # (`write_kv(tokens=)`)
     supports_split_steps = True
-    # the node's sequence shard, which refuses a write of a split label outside an exchange
-    # (`bind_sequence_shard`)
+    # the node's sequence shard, which refuses a write outside an exchange (`check_bypass`)
     _sequence_shard = None
 
     def __init__(

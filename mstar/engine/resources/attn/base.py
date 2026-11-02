@@ -116,7 +116,7 @@ class AttentionManager(AttentionResource):
         label = self._default_label if label is None else label
         shard = self._shard
         r = shard.split_range(label)
-        # the paged run and K/V writes refuse a split label reached without it (`check_bypass`)
+        # the paged run and K/V writes refuse a call reached outside it (`check_bypass`)
         shard.exchanging = True
         try:
             if r is None:
