@@ -1124,13 +1124,13 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The decode step is captured into CUDA graphs per batch bucket and, by default,
-compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
-turns it off): the eager step is over a thousand tiny kernels, and the fused
-step runs at the weight-streaming floor (about twice the uncompiled rate at
-batch size 1 on an H100). Concurrent chat requests share decode steps
-(continuous batching over the captured decode graphs, padded to the next batch
-bucket). Requests never see each other's data, but the batch bucket changes the
+The reasoner is a ``SampledTokenDecoder``: its decode steps are captured into
+CUDA graphs per batch bucket, each compiled first: the eager decode step is over
+a thousand tiny kernels, and the fused step runs at the weight-streaming floor
+(about twice the uncompiled rate at batch size 1 on an H100). Its prefills, text
+and vision (one vision prompt a step), run eagerly and uncompiled. Concurrent chat requests share
+decode steps (continuous batching over the captured decode graphs, padded to the
+next batch bucket). Requests never see each other's data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run
 where two candidate tokens tie: in every measured divergence the two tokens'
 logits were equal or one bf16 ulp apart, the first differing token came after

@@ -20,15 +20,10 @@ from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.step import ResourceStep
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
-from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-from mstar.model.qwen3_5.components.rope import (
-    text_position_ids,
-    vision_position_advance,
-    vision_position_ids,
-)
 from mstar.model.qwen3_5.components.vision import (
     vision_interpolation,
     vision_seq_lengths,
@@ -113,25 +108,8 @@ class LLMSubmodule(SampledTokenDecoder):
         ``t * h' * w'`` tokens, so the cursor advances by the real amount and
         the position resource is handed the total.
         """
-        device = self.get_device()
-        merge = self._merge_size
-        pos = start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label="main")
-        pos_ids: list[torch.Tensor] = []
-        cursor = 0
-        for offset, tokens, grid in zip(
-            layout.get("offset", ()), layout.get("tokens", ()), layout.get("grid", ()), strict=True,
-        ):
-            if offset > cursor:
-                pos_ids.append(text_position_ids(offset - cursor, pos, device))
-                pos += offset - cursor
-            grid = torch.tensor(grid)
-            pos_ids.append(vision_position_ids(grid, merge, pos, device))
-            pos += vision_position_advance(grid, merge)
-            cursor = offset + tokens
-        if num_tokens > cursor:
-            pos_ids.append(text_position_ids(num_tokens - cursor, pos, device))
-            pos += num_tokens - cursor
-        return torch.cat(pos_ids, dim=1), pos - start
+        start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label="main")
+        return layout_position_ids(layout, self._merge_size, num_tokens, start, self.get_device())
 
     @staticmethod
     def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:

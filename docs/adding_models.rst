@@ -2541,7 +2541,9 @@ sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's p
 rows, ``COMPILE_MODE`` names every capture's ``compile_mode`` (``None``, the default,
 takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
 only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
-calls it something other than ``prefill_<name>``.
+calls it something other than ``prefill_<name>`` (the Cosmos3 reasoner's
+``reasoner_prefill_vision``). A graph that names its other walks otherwise sets
+``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image

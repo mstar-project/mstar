@@ -29,7 +29,7 @@ from mstar.model.cosmos3.cosmos3_model import (
     Cosmos3Model,
 )
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, REASONER_DECODE_LOOP, SAMPLER
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.multimodal import MEDIA_LAYOUT
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -105,7 +105,7 @@ def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
     from mstar.model.cosmos3 import constants as C
 
     model = _model(tmp_path, enable_windowed_video=True)
-    signals = {"text_inputs": [], "position_ids": []}
+    signals = {"text_inputs": []}
     mk = {"max_output_tokens": 8}
     dec = model.get_initial_forward_pass_args(C.WINDOW_DECODER_PARTITION, ["text"], ["text"], signals, mk)
     assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK and dec.inputs == []
@@ -157,7 +157,7 @@ def test_enable_reasoner_false_serves_generator_only(tmp_path) -> None:
     assert Cosmos3Model.REASONER_DECODE_WALK not in model.get_graph_walk_graphs()
     assert REASONER_NODE not in model.nodes
     with pytest.raises(ValueError, match="reasoner"):
-        model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": [], "position_ids": []})
+        model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": []})
 
 
 def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
@@ -178,17 +178,19 @@ def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
 
 def test_reasoner_request_state_machine(tmp_path) -> None:
     model = _model(tmp_path)
-    sig = {k: [object()] for k in ("text_inputs", "position_ids", "pixel_values", "vision_grid_thw")}
-    fpa = model.get_initial_forward_pass_args("default", ["image", "text"], ["text"], sig, {"max_output_tokens": 32})
+    sig = {k: [object()] for k in ("text_inputs", "pixel_values", "vision_grid_thw")}
+    layout = {"offset": [3], "tokens": [8], "output": ["vision_embeds"], "grid": [[1, 4, 8]]}
+    mk = {"max_output_tokens": 32, MEDIA_LAYOUT: layout}
+    fpa = model.get_initial_forward_pass_args("default", ["image", "text"], ["text"], sig, mk)
     assert fpa.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_VISION_WALK
     assert fpa.full_metadata.is_prefill
     routed = {(e.next_node, e.name) for e in fpa.inputs}
-    assert routed == {(REASONER_NODE, "text_inputs"), (REASONER_NODE, "position_ids"),
+    assert routed == {(REASONER_NODE, "text_inputs"),
                       (VISION_ENCODER_NODE, "pixel_values"), (VISION_ENCODER_NODE, "vision_grid_thw")}
+    # the reasoner splices the encoder's tokens and places its positions by the intake's layout
+    assert fpa.step_metadata[MEDIA_LAYOUT] == layout
     # Text-only prompts skip the encoder.
-    text_only = model.get_initial_forward_pass_args(
-        "default", ["text"], ["text"], {"text_inputs": [object()], "position_ids": [object()]},
-    )
+    text_only = model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": [object()]})
     assert text_only.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_WALK
 
     token = object()
@@ -307,78 +309,57 @@ def test_distilled_checkpoint_refuses_stream_video(tmp_path) -> None:
         model._resolve_gen_params({"num_frames": 121, "stream_video": True}, ["image", "text"], ["video"])
 
 
-def test_reasoner_submodule_step_and_stop(tmp_path) -> None:
+def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
+    """A text prompt leaves its positions to the position resource; a vision
+    prompt places its own from the intake's layout and moves the counter to
+    ``max(position) + 1``. A stop id ends the decode loop, and on either
+    prefill walk it, or a one-token budget, ends the partition."""
     import types
 
+    from mstar.engine.resources.position.config import PositionConfig
+    from mstar.engine.resources.position.manager import RopeManager
+    from mstar.model.components.mrope import layout_position_ids
+    from mstar.model.cosmos3.components.reasoner import MediaGrid, vision_layout
     from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+    from mstar.model.keys import ROPE
+    from mstar.model.submodule_base import END_PARTITION
 
     model = _model(tmp_path)
-    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
-    assert sub.eos_token_id == 11
+    r = model.config.reasoner
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
+    sub.get_device = lambda: torch.device("cpu")
+    sub.node_resources = {ROPE: RopeManager(PositionConfig(kv_cache=KV_CACHE), torch.device("cpu"))}
 
-    ids = torch.tensor([5, 6, 7, 19, 19, 8])
-    pos = torch.zeros(3, 6, dtype=torch.long)
-    pos[:, :] = torch.arange(6)
-    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={})
-    inp = sub.prepare_inputs(
-        Cosmos3Model.REASONER_PREFILL_VISION_WALK, fwd,
-        {"text_inputs": [ids], "position_ids": [pos], "vision_embeds": [torch.zeros(2, 8)]},
-    )
-    assert inp.input_seq_len == 6 and sub.request_state("r")["next_pos"] == 6
-    step = sub.declare_step(Cosmos3Model.REASONER_PREFILL_VISION_WALK, ["r"], [inp])
-    assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 6)]
-    assert step.steps[KV_CACHE].commit and step.steps[ATTN].causal
+    ids = torch.tensor([5, 6, 7] + [r.image_token_id] * 8 + [8, 9])
+    layout = vision_layout(ids, r, [MediaGrid(1, 4, 8)], [], "vision_embeds")
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={MEDIA_LAYOUT: layout})
+    walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    inp = sub.prepare_inputs(walk, fwd, {"text_inputs": [ids], "vision_embeds": [torch.zeros(8, 4)]})
+    pos, advance = layout_position_ids(layout, r.vision.spatial_merge_size, len(ids))
+    assert torch.equal(inp.custom_pos_ids, pos) and inp.resource_step_info == advance == int(pos.max()) + 1
+    step = sub.declare_step(walk, ["r"], [inp])
+    assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 13)]
+    assert step.steps[ROPE].advance == (advance,)
     assert torch.equal(step.steps[SAMPLER].prefill_tracked_tokens["r"], ids)
 
-    dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
-    assert dec.input_seq_len == 1 and dec.tensor_inputs["position_ids"].tolist() == [[6], [6], [6]]
-    assert sub.request_state("r")["next_pos"] == 7
-    step = sub.declare_step(Cosmos3Model.REASONER_DECODE_WALK, ["r"], [dec])
-    assert step.steps[SAMPLER].prefill_tracked_tokens == {}
+    text = sub.prepare_inputs(Cosmos3Model.REASONER_PREFILL_WALK, fwd, {"text_inputs": [ids[:3]]})
+    assert text.custom_pos_ids is None
+    assert sub.declare_step(Cosmos3Model.REASONER_PREFILL_WALK, ["r"], [text]).steps[ROPE].advance is None
 
-    info = types.SimpleNamespace(
-        resource_configs={SAMPLER: types.SimpleNamespace(ignore_eos=False)},
-        dynamic_loop_iter_counts={REASONER_DECODE_LOOP: 3}, max_tokens=100,
-    )
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([11])]}) == {REASONER_DECODE_LOOP}
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([12])]}) == set()
-    info.max_tokens = 5
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([12])]}) == {REASONER_DECODE_LOOP}
-    info.resource_configs[SAMPLER].ignore_eos = True
-    info.max_tokens = 100
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([11])]}) == set()
-    out = {"new_token": [torch.tensor([12])]}
-    sub.postprocess("r", info, out)
-    assert out["text_inputs"] is out["new_token"]
+    def stops(walk, token, ignore_eos=False, max_tokens=100):
+        info = types.SimpleNamespace(
+            graph_walk=walk, max_tokens=max_tokens,
+            resource_configs={SAMPLER: types.SimpleNamespace(ignore_eos=ignore_eos)},
+        )
+        return sub.check_stop("r", info, {"new_token": [torch.tensor([token])]})
 
-
-def test_reasoner_padded_decode_batch_shares_one_device(tmp_path) -> None:
-    """A captured decode pads the batch with the capture config's rows, which
-    live on the model's device; the real rows' position ids must land there
-    too, or the batch concatenation fails (seen on H100 with three concurrent
-    requests filling a bucket of four)."""
-    import types
-
-    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
-
-    model = _model(tmp_path)
-    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
-    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={})
-    sub.request_state("r").add_all(next_pos=6)
-
-    token = torch.tensor([42])
-    dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [token]})
-    assert dec.tensor_inputs["position_ids"].device == token.device
-
-    # Padding rows shaped like the capture config's single-request inputs.
-    pad = ARNodeInputs(
-        input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1,
-        tensor_inputs={"position_ids": torch.zeros((3, 1), dtype=torch.long)},
-    )
-    out = sub.preprocess(Cosmos3Model.REASONER_DECODE_WALK, None, [dec, pad, pad, pad])
-    assert out["input_ids"].tolist() == [42, 0, 0, 0]
-    assert out["position_ids"].tolist() == [[6, 0, 0, 0]] * 3 and out["seq_lens"] == [1, 1, 1, 1]
-    assert out["input_ids"].device == out["position_ids"].device == token.device
+    eos = r.eos_token_id
+    assert stops(Cosmos3Model.REASONER_DECODE_WALK, eos) == {REASONER_DECODE_LOOP}
+    assert stops(Cosmos3Model.REASONER_DECODE_WALK, 12) == set()
+    assert stops(Cosmos3Model.REASONER_DECODE_WALK, eos, ignore_eos=True) == set()
+    assert stops(Cosmos3Model.REASONER_PREFILL_WALK, eos) == {END_PARTITION}
+    assert stops(Cosmos3Model.REASONER_PREFILL_VISION_WALK, 12, max_tokens=1) == {END_PARTITION}
+    assert stops(Cosmos3Model.REASONER_PREFILL_VISION_WALK, 12, max_tokens=2) == set()
 
 
 def test_edge_chat_adapter(tmp_path) -> None:
@@ -422,7 +403,5 @@ def test_a_chat_the_template_refuses_is_a_bad_request(tmp_path) -> None:
 
 def test_forward_pass_args_type(tmp_path) -> None:
     model = _model(tmp_path)
-    fpa = model.get_initial_forward_pass_args(
-        "default", ["text"], ["text"], {"text_inputs": [object()], "position_ids": [object()]},
-    )
+    fpa = model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": [object()]})
     assert isinstance(fpa, ForwardPassArgs)
