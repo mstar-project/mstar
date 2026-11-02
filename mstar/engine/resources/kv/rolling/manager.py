@@ -1,15 +1,12 @@
 """A pool of rolling sink + window K/V, one contiguous region per request.
 
 The pool (``pool_tokens`` a layer, keys and values) is reserved at startup. A
-request takes a region of exactly its sink plus window at its first step, first
-fit, and gives it back when it is removed. When no free gap is large enough but
-the free tokens are, the resident regions slide left to join the gaps.
-
-A request that declares its size when it opens (``RollingKVReqConfig``) waits in
-the engine's admission queue, in arrival order, until the pool has room for it
-(see ``Resource.ask``); the room is set aside then and the region placed at its
-first step. One that declares nothing is refused with ``AllocationFailed`` while
-it doesn't fit, which the worker answers by retrying it later.
+request declares the tokens it keeps, its sink plus window, when it opens
+(``RollingKVReqConfig``), and waits in the engine's admission queue, in arrival
+order, until the pool has room for it (see ``Resource.ask``). The room is set
+aside then; the request's first step takes a region of exactly that size, first
+fit, and gives it back when the request is removed. When no free gap is large
+enough but the free tokens are, the resident regions slide left to join the gaps.
 """
 
 from __future__ import annotations
@@ -33,7 +30,6 @@ from mstar.engine.resources.step import (
     ASKS,
     AdmitOutcome,
     AdmitRuntimeError,
-    AllocationFailed,
     StepContext,
 )
 
@@ -119,16 +115,20 @@ class RollingKVManager(Resource):
         # free gaps ``(start, length)``, by start, adjacent ones merged
         self._free: list[tuple[int, int]] = [(0, c.pool_tokens)]
         self._requests: dict[int, _Request] = {}
+        # Guards the free gaps and the set-aside room, which request intake, removal and
+        # the admission calls (ask / reserve / unreserve / grew_since) on the main thread
+        # share with admit and rollback_admit on the GPU thread. plan, write, window and
+        # commit touch only their own step's requests, which the worker doesn't remove
+        # while a step holds them, and offsets move only in admit, on that same thread.
         self._lock = threading.RLock()
-        # Admission. `_wants` holds the tokens each request declared when it opened,
-        # `_reserved` the tokens set aside for an admitted request whose region isn't
-        # placed yet, and `_kept` their sum, which no other request may take.
+        # `_wants` holds the tokens each request declared when it opened, `_reserved`
+        # the tokens set aside for an admitted request whose region isn't placed yet,
+        # and `_kept` their sum, which no other request may take.
         self._wants: dict[int, int] = {}
         self._reserved: dict[int, int] = {}
         self._kept = 0
-        # rid -> the reservation its region took (0 for none), for regions the
-        # live admit placed, so ``rollback_admit`` can undo them
-        self._admit_taken: dict[int, int] = {}
+        # regions the live admit placed, which ``rollback_admit`` gives back
+        self._admit_taken: set[int] = set()
         self._current: RollingPlan | None = None
 
     def can_capture(self) -> bool:
@@ -175,20 +175,9 @@ class RollingKVManager(Resource):
 
     def remove_request(self, rid):
         with self._lock:
-            self.reset_request(rid, free=True)
+            self._release(rid)
             self._wants.pop(rid, None)
             self._kept -= self._reserved.pop(rid, 0)
-
-    def reset_request(self, rid, free: bool = False):
-        """Nothing to zero: K/V are only read up to what their request wrote."""
-        with self._lock:
-            req = self._requests.get(rid)
-            if req is None:
-                return
-            if free:
-                self._release(rid)
-            else:
-                req.written, req.compacted_for = 0, None
 
     def num_free_tokens(self) -> int:
         with self._lock:
@@ -245,7 +234,7 @@ class RollingKVManager(Resource):
 
     def _release(self, rid) -> None:
         req = self._requests.pop(rid, None)
-        self._admit_taken.pop(rid, None)
+        self._admit_taken.discard(rid)
         if req is None:
             return
         gaps = sorted([*self._free, (req.offset, req.capacity)])
@@ -279,8 +268,7 @@ class RollingKVManager(Resource):
             return ADMIT_OK
         with self._lock:
             taken = self._admit_taken
-            for r in [r for r in taken if ctx.is_real_row(r)]:
-                del taken[r]
+            taken -= {r for r in taken if ctx.is_real_row(r)}
             for seg in step.segments or ():
                 rid = seg.request_id
                 if ctx.is_padding_row(rid):
@@ -289,36 +277,32 @@ class RollingKVManager(Resource):
                 if pos is None:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         "rolling KV step declares no position for a request", request_ids=frozenset({rid})))
-                capacity = pos.sink + pos.window
-                if capacity > self.config.pool_tokens or pos.window < seg.span:
+                if pos.window < seg.span:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                        f"the request keeps a {pos.sink}-token sink and a {pos.window}-token window, writing "
-                        f"{seg.span} a step; the rolling KV pool holds {self.config.pool_tokens} tokens "
-                        f"(resources: {self.name}: pool_tokens) and the window must hold the step",
-                        request_ids=frozenset({rid})))
+                        f"the request keeps a {pos.window}-token window and writes {seg.span} tokens a "
+                        "step; the window must hold the step", request_ids=frozenset({rid})))
+                capacity = pos.sink + pos.window
                 req = self._requests.get(rid)
                 if req is None:
-                    # `_kept` already counts this request's own reservation
-                    reserved = self._reserved.get(rid, 0)
-                    if reserved and reserved != capacity:
+                    reserved = self._reserved.get(rid)
+                    if reserved is None:
+                        return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                            "no rolling K/V was set aside for the request: a model using the store "
+                            f"declares each request's tokens ({self.name}: RollingKVReqConfig, from "
+                            "get_request_resource_configs)", request_ids=frozenset({rid})))
+                    if reserved != capacity:
                         return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                             f"the request declared {reserved} tokens of rolling K/V when it opened; its "
                             f"first step keeps {capacity}", request_ids=frozenset({rid})))
-                    room = self._room() + reserved
-                    if capacity > room:
-                        return AdmitOutcome(ok=False, reason=AllocationFailed(
-                            message=f"rolling KV pool is full: {capacity} tokens wanted, {room} of "
-                                    f"{self.config.pool_tokens} free and not set aside",
-                            pages_short=capacity - room, label=seg.label, request_id=rid))
+                    # the free tokens always cover what is set aside, so rearranging makes room
                     start = self._take(capacity)
                     if start is None:
                         self._rearrange()
                         start = self._take(capacity)
+                    del self._reserved[rid]
+                    self._kept -= capacity
                     req = self._requests[rid] = _Request(start, capacity)
-                    if reserved:
-                        del self._reserved[rid]
-                        self._kept -= reserved
-                    taken[rid] = reserved
+                    taken.add(rid)
                 elif capacity != req.capacity:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"the request declares a {capacity}-token sink and window; its first step "
@@ -330,18 +314,17 @@ class RollingKVManager(Resource):
         return ADMIT_OK
 
     def rollback_admit(self, step: RollingKVStep, ctx: StepContext) -> None:
-        """Free the regions this step's admit took, giving back the reservation each
-        took; a region a request already held stays with it."""
+        """Free the regions this step's admit placed, setting their room aside again
+        for the retry; a region a request already held stays with it."""
         del step
         if ctx.capture or not self._admit_taken:
             return
         with self._lock:
             for rid in [r for r in self._admit_taken if ctx.is_real_row(r)]:
-                reserved = self._admit_taken.pop(rid)
+                capacity = self._requests[rid].capacity
                 self._release(rid)
-                if reserved:
-                    self._reserved[rid] = reserved
-                    self._kept += reserved
+                self._reserved[rid] = capacity
+                self._kept += capacity
 
     def plan(self, step: RollingKVStep, ctx: StepContext) -> RollingPlan:
         """Each row's write range, and the shift that makes room for it.
@@ -381,13 +364,12 @@ class RollingKVManager(Resource):
     def commit(self, step: RollingKVStep, ctx: StepContext) -> None:
         if ctx.capture:
             return
-        with self._lock:
-            for seg in step.segments or ():
-                req = self._requests.get(seg.request_id)
-                pos = step.positions.get(seg.request_id)
-                if req is not None and pos is not None and not ctx.is_padding_row(seg.request_id):
-                    # from the declared position, so committing a step twice is harmless
-                    req.written = pos.written + seg.span
+        for seg in step.segments or ():
+            req = self._requests.get(seg.request_id)
+            pos = step.positions.get(seg.request_id)
+            if req is not None and pos is not None and not ctx.is_padding_row(seg.request_id):
+                # from the declared position, so committing a step twice is harmless
+                req.written = pos.written + seg.span
 
     def post_warmup_validate(self):
         held = len(self._requests) + len(self._wants) + len(self._reserved)

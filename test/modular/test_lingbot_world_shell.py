@@ -79,8 +79,11 @@ def _rollout_frames(model, image_hw, num_chunks: int, passes: int = 5):
     sub = _bare_dit_submodule(model, {})
     spans = [sub.chunk_spans(c, image_hw, num_chunks * cfg.chunk_size) for c in range(num_chunks)]
     fs = spans[0].chunk // cfg.chunk_size
-    store = _store(cfg, max(s.position.sink + s.position.window for s in spans))
+    tokens = max(s.position.sink + s.position.window for s in spans)
+    store = _store(cfg, tokens)
     sub.node_resources = {DIT_KV: store}
+    store.ingest_request(7, RollingKVReqConfig(tokens=tokens))
+    assert store.reserve(7, "dit", ROLLOUT_WALK, None) is None
     for c, s in enumerate(spans):
         step = sub.declare_step(ROLLOUT_WALK, [7], [NodeInputs(resource_step_info=s)]).steps[DIT_KV]
         ctx = StepContext(request_ids=(7,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
@@ -695,6 +698,8 @@ def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
                              torch.device("cpu"))
     sub = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True), {DIT_KV: store})
     sub.config = cfg
+    store.ingest_request(1, RollingKVReqConfig(tokens=store.config.pool_tokens))
+    assert store.reserve(1, "dit", ROLLOUT_WALK, None) is None
     for chunk in range(chunks):
         spans = sub.chunk_spans(chunk, (32, 32))
         step = sub.declare_step(ROLLOUT_WALK, [1], [NodeInputs(resource_step_info=spans)]).steps[DIT_KV]

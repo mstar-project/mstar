@@ -25,7 +25,6 @@ from mstar.engine.resources.step import (
     ASKS,
     FULL_ADMIT_QUEUED,
     AdmitRuntimeError,
-    AllocationFailed,
     Segment,
     StepContext,
 )
@@ -50,10 +49,19 @@ def _expected(total: int, sink: int, window: int, base: int = 0) -> list[int]:
     return [base + i for i in keep]
 
 
+def _open(store: RollingKVManager, rid: int, tokens: int) -> None:
+    """Open a request as the engine does: it declares its tokens, and the admission
+    queue sets that room aside once it fits."""
+    store.ingest_request(rid, RollingKVReqConfig(tokens=tokens))
+    assert store.reserve(rid, "dit", "rollout", None) is None
+
+
 def _run(store, rid, spans, sink, window, passes=1, base=0):
-    """Drive one stream through admit -> plan -> write (``passes`` times) -> commit,
-    tagging every token with ``base`` plus its stream index; yields what each step
-    attended."""
+    """Open ``rid`` unless the test already has, then drive one stream through
+    admit -> plan -> write (``passes`` times) -> commit, tagging every token with
+    ``base`` plus its stream index; yields what each step attended."""
+    if rid not in store._requests and rid not in store._reserved:
+        _open(store, rid, sink + window)
     written = 0
     for span in spans:
         step, ctx = _step(rid, written, span, sink, window)
@@ -137,15 +145,25 @@ def test_the_pool_is_reserved_once_and_requests_take_exact_regions_first_fit():
     assert store._free == [(6, 34)]  # merged with both neighbours
 
 
-def test_a_full_pool_refuses_with_an_allocation_failure_until_a_region_frees():
+def test_a_request_gets_no_room_until_a_region_frees():
     store = _store(18)
-    first, ctx1 = _step(1, 0, 4, 6, 12)
-    assert store.admit(first, ctx1).ok
-    second, ctx2 = _step(2, 0, 4, 6, 12)
-    outcome = store.admit(second, ctx2)
-    assert not outcome.ok and isinstance(outcome.reason, AllocationFailed) and not outcome.reason.terminal
+    list(_run(store, 1, [4], 6, 12))
+    store.ingest_request(2, RollingKVReqConfig(tokens=18))
+    assert store.reserve(2, "dit", "rollout", None) == 0  # the room it didn't fit against
+    assert not store.grew_since(0)
     store.remove_request(1)
+    assert store.grew_since(0) and store.reserve(2, "dit", "rollout", None) is None
+    second, ctx2 = _step(2, 0, 4, 6, 12)
     assert store.admit(second, ctx2).ok and store.num_free_tokens() == 0
+
+
+def test_a_request_that_declared_nothing_fails_at_its_first_step():
+    store = _store(30)
+    assert store.ask(1, "dit", "rollout") is None  # nothing to wait for
+    step, ctx = _step(1, 0, 4, 6, 12)
+    outcome = store.admit(step, ctx)
+    assert not outcome.ok and isinstance(outcome.reason, AdmitRuntimeError) and outcome.reason.terminal
+    assert "RollingKVReqConfig" in outcome.reason.message and store.num_free_tokens() == 30
 
 
 def test_rearranging_joins_the_gaps_and_keeps_every_requests_tokens():
@@ -169,27 +187,29 @@ def test_rearranging_joins_the_gaps_and_keeps_every_requests_tokens():
         assert keys == _expected(total, 2, 18, base=4000)
 
 
-def test_a_refused_step_gives_back_the_region_its_admit_took():
+def test_a_refused_step_gives_back_its_region_and_sets_the_room_aside_again():
     store = _store(36)
+    _open(store, 1, 18)
     step, ctx = _step(1, 0, 4, 6, 12)
-    assert store.admit(step, ctx).ok and store.num_free_tokens() == 18
+    assert store.admit(step, ctx).ok and store.num_free_tokens() == 18 and store._kept == 0
     store.rollback_admit(step, ctx)
-    assert store.num_free_tokens() == 36 and store._free == [(0, 36)]
+    assert store._free == [(0, 36)] and store._reserved == {1: 18} and store._kept == 18
+    assert store.admit(step, ctx).ok and store._kept == 0
     # a region held from an earlier step stays held
     list(_run(store, 3, [4], 6, 12))
     held, ctx3 = _step(3, 4, 4, 6, 12)
     assert store.admit(held, ctx3).ok
     store.rollback_admit(held, ctx3)
-    assert store.num_free_tokens() == 18
+    assert store.num_free_tokens() == 0 and store._kept == 0
 
 
-@pytest.mark.parametrize("sink,window,span", [(6, 13, 4), (0, 3, 4)])
-def test_a_window_the_pool_cannot_hold_fails_the_request(sink, window, span):
+def test_a_window_that_cannot_hold_the_step_fails_the_request():
     store = _store(18)
-    step, ctx = _step(1, 0, span, sink, window)
+    _open(store, 1, 3)
+    step, ctx = _step(1, 0, 4, 0, 3)
     outcome = store.admit(step, ctx)
     assert not outcome.ok and isinstance(outcome.reason, AdmitRuntimeError) and outcome.reason.terminal
-    assert "pool_tokens" in outcome.reason.message
+    assert "window must hold the step" in outcome.reason.message
 
 
 def test_a_request_must_keep_the_window_it_started_with():
@@ -227,6 +247,7 @@ def test_a_removed_request_starts_over():
 
 def test_writing_more_rows_than_the_step_has_is_refused():
     store = _store(18)
+    _open(store, 1, 18)
     step, ctx = _step(1, 0, 4, 6, 12)
     store.admit(step, ctx)
     store.plan(step, ctx)
@@ -263,7 +284,7 @@ def _declared(store: RollingKVManager, rid: int, tokens: int) -> None:
 
 def test_ask_queues_only_a_declared_request_that_holds_nothing_yet():
     store = _store(30)
-    assert store.ask(1, "dit", "rollout") is None  # declared nothing: placed at its first step
+    assert store.ask(1, "dit", "rollout") is None  # declared nothing: no room to wait for
     _declared(store, 2, 18)
     assert store.ask(2, "dit", "rollout") is ASKS
     assert store.reserve(2, "dit", "rollout", None) is None and store._kept == 18
@@ -293,52 +314,20 @@ def test_requests_wait_in_arrival_order_so_a_large_one_is_not_overtaken():
     assert store._reserved == {2: 18, 3: 6} and store._kept == 24
 
 
-def test_room_set_aside_for_a_waiting_request_is_not_taken_by_another():
+def test_room_set_aside_for_a_request_is_not_given_to_another():
     store = _store(30)
-    _declared(store, 1, 18)
-    assert store.reserve(1, "dit", "rollout", None) is None
-    step, ctx = _step(2, 0, 4, 6, 12)  # declared nothing, needs 18 of the 12 not set aside
-    outcome = store.admit(step, ctx)
-    assert not outcome.ok and isinstance(outcome.reason, AllocationFailed) and not outcome.reason.terminal
-    assert store.reserve(3, "dit", "rollout", None) is None  # declared nothing either: takes nothing
-    _declared(store, 4, 13)
-    assert store.reserve(4, "dit", "rollout", None) == 12  # the room it didn't fit against
+    _open(store, 1, 18)
+    _declared(store, 2, 13)
+    assert store.reserve(2, "dit", "rollout", None) == 12  # 30 free, 18 of them set aside
     assert not store.grew_since(12)
     first, ctx1 = _step(1, 0, 4, 6, 12)
     assert store.admit(first, ctx1).ok and store._kept == 0 and store.num_free_tokens() == 12
-
-
-def test_a_reserved_request_is_placed_even_when_the_free_room_is_split():
-    store = _store(30)
-    streams = {rid: _run(store, rid, [4] * 3, 2, 8, base=1000 * rid) for rid in (1, 2, 3)}
-    for stream in streams.values():
-        next(stream)
-    store.remove_request(1)
-    store.remove_request(3)
-    assert store._free == [(0, 10), (20, 10)]
-    _declared(store, 4, 20)
-    assert store.reserve(4, "dit", "rollout", None) is None
-    total, keys, _ = next(_run(store, 4, [4], 2, 18, base=4000))
-    assert keys == _expected(total, 2, 18, base=4000) and store._free == []
-    total, keys, _ = next(streams[2])
-    assert keys == _expected(total, 2, 8, base=2000)
-
-
-def test_a_refused_step_gives_back_its_region_and_keeps_its_reservation():
-    store = _store(30)
-    _declared(store, 1, 18)
-    assert store.reserve(1, "dit", "rollout", None) is None
-    step, ctx = _step(1, 0, 4, 6, 12)
-    assert store.admit(step, ctx).ok and store._kept == 0
-    store.rollback_admit(step, ctx)
-    assert store._reserved == {1: 18} and store._kept == 18 and store.num_free_tokens() == 30
-    assert store.admit(step, ctx).ok and store._kept == 0
+    assert not store.grew_since(12)
 
 
 def test_removing_a_request_drops_what_it_declared_and_reserved():
     store = _store(30)
-    _declared(store, 1, 18)
-    assert store.reserve(1, "dit", "rollout", None) is None
+    _open(store, 1, 18)
     assert not store.grew_since(12)
     store.remove_request(1)
     assert store._wants == {} and store._reserved == {} and store._kept == 0
@@ -347,8 +336,7 @@ def test_removing_a_request_drops_what_it_declared_and_reserved():
 
 def test_a_first_step_that_keeps_other_than_it_declared_fails_the_request():
     store = _store(30)
-    _declared(store, 1, 18)
-    assert store.reserve(1, "dit", "rollout", None) is None
+    _open(store, 1, 18)
     step, ctx = _step(1, 0, 4, 6, 14)
     outcome = store.admit(step, ctx)
     assert not outcome.ok and isinstance(outcome.reason, AdmitRuntimeError) and "declared" in outcome.reason.message

@@ -27,7 +27,7 @@ import torch
 
 torch.set_float32_matmul_precision("high")
 
-from run_parity import DEVICE, bind_resources, drive, frame_stats, fwd_info, same, stats  # noqa: E402
+from run_parity import DEVICE, bind_resources, drive, frame_stats, fwd_info, open_request, same, stats  # noqa: E402
 
 from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
@@ -47,6 +47,7 @@ def timed_rollout(sub, runner, text, image, cond, poses, intr, md, rid, seed=42)
     info.random_seed = seed
     inputs = {"text_embeds_pos": [text], "image_inputs": [image], "camera_poses": [poses],
               "intrinsics": [intr], "clock": []}
+    open_request(sub, runner, rid, image, md["num_latent_frames"])
     latents, pixels, chunk_ms, dit_ms = [], [], [], []
     encode = submodules.encode_condition_chunk
     submodules.encode_condition_chunk = lambda vae, image, cache, first, n, cfg: cond[:, first:first + n]
