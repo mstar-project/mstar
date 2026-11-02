@@ -701,9 +701,18 @@ def _omnivoice() -> nn.Module:
     return OmniVoiceBackbone(reference)
 
 
+def _cross_attention(parallel: bool) -> nn.Module:
+    from mstar.model.components.attention import CrossAttention
+    from mstar.model.components.distributed.attention import ParallelCrossAttention
+
+    return (ParallelCrossAttention if parallel else CrossAttention)(hidden_size=HIDDEN, num_heads=2, head_dim=4)
+
+
 # a module that runs these children other than through their forward over the step's
 # tokens, by its own `lora_unservable`
 ANNOTATED = {
+    "cross_attention_context": (lambda: _cross_attention(False), {"k_proj", "v_proj"}),
+    "parallel_cross_attention_context": (lambda: _cross_attention(True), {"k_proj", "v_proj"}),
     "code_predictor_heads": (_code_predictor, {"lm_head.0", "lm_head.1"}),
     "fastconformer_positions": (lambda: _fastconformer("attention"), {"relative_k_proj"}),
     "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
