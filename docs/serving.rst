@@ -421,6 +421,8 @@ them by that name:
                                     # flashinfer_backend
      seq_shard:                 # a node's sequence shard (SP ranks)
        min_tokens: 2048         # steps below this run copied on every SP rank
+     linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
+       sp_exchange: ulysses     # also: backend; ulysses / state_passing / none
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
@@ -441,21 +443,23 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache: true`` on it is refused.
 
 A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
-declares a sequence shard (``SeqShardSpec``: LTX-2.5's and Cosmos3's DiTs) splits a step's tokens
-over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
+declares a sequence shard (``SeqShardSpec``: LTX-2.5's and Cosmos3's DiTs, Qwen3-Omni's Thinker,
+Qwen3.5's LLM) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
 step that can split does). A captured step decides from its bucket's size, not its prompt's.
 Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
 head: each request's positions split over the ranks that would otherwise hold the same KV
-heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model with no
-sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
+heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose
+attention takes no split steps runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
 factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
 
 With both, a paged attention's ``sp_exchange`` picks how a split step reaches it: unset, it
 takes the storage's default, ``ulysses`` by head and ``none`` by position (the node's steps run
 copied, KV capacity alone); by position, ``all_gather`` splits them, and ``ring`` also bounds the
-attention phase's memory to this rank's tokens and runs eager only. A value that doesn't match
-the storage, or set where the node never splits its steps (no sequence shard, or one SP rank),
-fails at load:
+attention phase's memory to this rank's tokens and runs eager only. An MLA pool stored by head
+takes ``kv_gather``. A recurrent layer's resource (``linear_attn``) follows the node unset
+(``ulysses`` where its steps split); ``state_passing`` serves head counts that don't divide. A
+value that doesn't match the storage, or set where the node never splits its steps (no sequence
+shard, or one SP rank), fails at load:
 
 .. code-block:: yaml
 
@@ -463,7 +467,7 @@ fails at load:
      kv_cache:
        context_parallel: true   # store K/V by position over the SP ranks
      attn:
-       sp_exchange: all_gather  # none / ulysses (by head) / all_gather / ring (by position)
+       sp_exchange: all_gather  # none / ulysses / kv_gather (MLA) (by head) / all_gather / ring (by position)
      seq_shard:
        min_tokens: 8192
 

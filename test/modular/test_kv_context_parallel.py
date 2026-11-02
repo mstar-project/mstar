@@ -294,7 +294,6 @@ def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what
     groups.add_sp(NODE, _group(0, P))
     specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
-    specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
     pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
     heads = pool.config.blocks["state"].shape[0]
 

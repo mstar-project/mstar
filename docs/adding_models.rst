@@ -2430,7 +2430,8 @@ Splitting is declared in four places:
   and on SP ranks each breaks the graph once. Everything between them runs on this rank's tokens.
   LTX-2.5 brackets the DiT in its denoise step (``mstar/model/ltx2_5/submodules.py``); Cosmos3
   brackets the generation layer stack after its whole-sequence prologue
-  (``mstar/model/cosmos3/components/transformer.py``).
+  (``mstar/model/cosmos3/components/transformer.py``); Qwen3.5 brackets its LLM's stack, gated
+  delta rule layers included (``LLMSubmodule._forward``).
 - The attention is reached through the resource: a paged attention through ``AttentionCallable``
   (``attend.write(k, v)`` writes K/V alone; a no-op where the attention writes K/V inside its own
   run, ``requires_kv_write`` False), a ragged one through its ``run``. A layer that writes
@@ -2441,16 +2442,43 @@ Splitting is declared in four places:
   ``RaggedAttentionSpec(..., sp_exchange="ulysses")`` (the default is ``"none"``); it is a no-op
   on a node with no ``SeqShardSpec``, so one declaration serves every deployment shape.
 
+**Recurrent and MLA layers.** They take split steps through their own resources too, and the
+model writes nothing more than the bracket:
+
+- A **recurrent pool** (GDN, Mamba-2) shards heads over TP alone, so every SP rank holds every
+  slot's whole state, and a split step leaves the same bytes in every replica. Decode reads it with
+  no collective. On a split step the conv runs on each rank's tokens from the earlier ranks'
+  last inputs (``conv_halo``, one all-gather a layer), and every row's final window is written on
+  every rank. A combined walk's leading decode rows run copied. The prompt rows take the linear
+  resource's ``sp_exchange`` (a ``resources:`` override): ``ulysses`` (the default where another
+  resource on the node splits; one all-to-all to a block of heads, the chunked kernel over that
+  block of the state, the block's final states gathered, one all-to-all back) or ``state_passing``
+  (each rank runs its pieces, hands its state on in one fixed-size gather, and runs a row
+  continuing into it from the state it gets). Mamba-2's scan is a loop over tokens, so
+  ``ulysses`` saves memory there, not time. Both run eagerly: a captured step runs copied on a node
+  with a recurrent layer. Prefix snapshots stay off above one rank.
+- An **MLA** pool stored by head holds its one latent whole on every rank. Its attention's
+  default, ``kv_gather``, gathers the step's latents, writes them on every rank, and attends each
+  rank's own queries over each row's keys up to its piece. Copied steps attend on the TP heads
+  with no collective. Over a pool stored by position it takes ``all_gather`` (both query parts
+  gathered), as GQA does. It runs eagerly too.
+
 Every resource of a splitting node must support split steps (``Resource.supports_split_steps``:
-the KV pool, paged FlashInfer and dense attention, ragged self and cross attention, positions, the
-sampler); recurrent state doesn't, so a splitting node can't own any. The engine and the conductor
+the KV pool, paged FlashInfer, MLA and dense attention, ragged self and cross attention,
+positions, the sampler, the recurrent pool and its GDN and Mamba-2 resources); DSA, flex and XPU
+attention don't, so a splitting node can't own them. The engine and the conductor
 also refuse, before a worker starts: a node on SP ranks that neither splits its steps (a
 ``SeqShardSpec`` with an attention that takes split steps) nor places its pools by position; a
 shard on axis 1 over a pool stored by position; a head-stored pool whose query and KV heads per
 TP rank don't divide by ``sp_size``; a ragged ``sp_exchange`` whose heads don't divide by
 ``tp * sp``, or beside a ring; a paged attention taking ``none`` beside attentions that split; a
 ragged cross-attention under a shard on axis 0 (a packed split can leave a rank none of a row);
-expert parallelism; piecewise captures; a capture replayed
+a linear ``ulysses`` whose key or value heads (Mamba-2's heads, or B/C groups neither dividing
+nor divided by ``sp_size``) per TP rank don't divide by ``sp_size`` (use ``state_passing``); a
+``state_passing`` with unequal key and value head dims at ``sp_size`` 3 or more; a linear layer
+under a shard on axis 1 or a ring's; a linear ``sp_exchange: none`` beside resources that split;
+``kv_gather`` over a pool other than MLA's stored by head, or at query heads per TP rank not
+dividing 64; ``ulysses`` or ``ring`` over MLA; expert parallelism; piecewise captures; a capture replayed
 under listed and unlisted walks; and a packed capture of a listed walk unless the shard lists
 one label on axis 0 (its padding joins that label). Each attention resource of a splitting node
 logs at load how it takes split steps.
@@ -2500,6 +2528,23 @@ Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` ab
      - partials merged
      - attention is the step's peak memory: past a per-model crossover (below, estimated and
        unmeasured)
+   * - off, MLA pool
+     - unset / ``kv_gather``
+     - gather the latents, attend own queries, eager only
+     - TP heads, no collective
+     - MLA attention, whose one latent can't split by head
+   * - any, recurrent layer
+     - unset / ``ulysses`` (linear)
+     - conv halo; all-to-all to heads; eager only
+     - as on one rank
+     - another resource splits the node and the layer's heads per TP rank divide by ``sp_size``
+       (Qwen3.5)
+   * - any, recurrent layer
+     - ``state_passing`` (linear)
+     - conv halo; one state hand-off; eager only
+     - as on one rank
+     - heads that don't divide; a hand-off's bytes don't grow with the prompt (at ``P = 2`` it
+       waits on the previous rank, so it isn't faster)
    * - cacheless (ragged)
      - ``"ulysses"`` (model)
      - Ulysses

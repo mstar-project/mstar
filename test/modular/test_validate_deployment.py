@@ -527,11 +527,16 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path)
                          r"\['b'\] keep KV by head over them, .* share resources \['shared'\]")
 
 
-def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tp, attn", [(4, None), (2, {"sp_exchange": "all_gather"})], ids=["copied", "split"])
+def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tp, attn, tmp_path, monkeypatch):
+    """As placed, its steps run copied (DCP); with its attention's sp_exchange set they split, and
+    its recurrent layers follow by Ulysses (at a TP size leaving their heads two SP ranks' worth)."""
     config = yaml.safe_load((ROOT / "configs/qwen3_5_27b_tp4.yaml").read_text())
     llm, = (group for group in config["node_groups"] if group["node_names"] == ["LLM"])
-    llm.update(ranks=list(range(8)), tp_size=4, sp_size=2)
+    llm.update(ranks=list(range(2 * tp)), tp_size=tp, sp_size=2)
     config["resources"]["kv_cache"] = {"context_parallel": True}
+    if attn is not None:
+        config["resources"]["attn"] = attn
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(config))
     assert _validate(_qwen3_5(config["model"], {}, tmp_path, monkeypatch), str(path)).worker_graphs
