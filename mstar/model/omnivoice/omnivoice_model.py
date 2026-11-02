@@ -20,6 +20,7 @@ same batch.  A fixed-pipeline port has to pick one value for the whole server.
 """
 
 import logging
+import math
 import os
 
 import numpy as np
@@ -46,7 +47,7 @@ from mstar.model.omnivoice.components.backbone import (
     assert_flashinfer_api,
     assert_flashinfer_patched,
 )
-from mstar.model.omnivoice.components.codec import load_codec
+from mstar.model.omnivoice.components.codec import load_codec, post_process
 from mstar.model.omnivoice.components.text import (
     build_prefix,
     resolve_instruct,
@@ -65,6 +66,53 @@ from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
+# Request kwarg: a clone's reference RMS, the level ``postprocess`` matches
+REF_RMS_KEY = "output_ref_rms"
+
+
+def _finite_number(key: str, value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        number = math.nan
+    if isinstance(value, bool) or not math.isfinite(number):
+        raise ValueError(f"{key} must be a finite number, not {value!r}")
+    return number
+
+
+# The longest silence pad, or fade, a request may ask for at each end, in seconds
+MAX_SHAPING_SECONDS = 10.0
+
+
+def output_shaping(kwargs: dict) -> dict:
+    """The request's output-shaping kwargs as ``post_process`` takes them.
+    ``process_prompt`` reads them too, so a bad value fails the request before
+    it generates."""
+    enabled = kwargs.get("postprocess_output", True)
+    # 0 and 1 as well: JSON clients send them for booleans
+    if enabled not in (True, False):
+        raise ValueError(f"postprocess_output must be true or false, not {enabled!r}")
+    shaping = {"enabled": bool(enabled)}
+    for key in ("pad_duration", "fade_duration"):
+        seconds = _finite_number(key, kwargs.get(key, 0.1))
+        if not 0 <= seconds <= MAX_SHAPING_SECONDS:
+            raise ValueError(f"{key} must be between 0 and {MAX_SHAPING_SECONDS:g} seconds, not {seconds!r}")
+        shaping[key] = seconds
+    return shaping
+
+
+# The unmask loop's float knobs a request may set (``extra_body``)
+UNMASK_KNOBS = ("guidance_scale", "t_shift", "layer_penalty_factor", "position_temperature", "class_temperature")
+
+
+def unmask_knobs(kwargs: dict, defaults) -> dict[str, float]:
+    """The request's ``UNMASK_KNOBS`` over the checkpoint's ``defaults``.
+    ``process_prompt`` reads them too, so a value that is not a finite number
+    fails the request before it generates. A finite value extreme enough to
+    overflow the reveal's scores is not caught here: MASK cells it leaves on the
+    canvas fail the request in ``postprocess``, after the loop."""
+    return {key: _finite_number(key, kwargs.get(key, getattr(defaults, key))) for key in UNMASK_KNOBS}
+
 
 class OmniVoiceModel(Model):
     """k2-fsa/OmniVoice."""
@@ -75,8 +123,9 @@ class OmniVoiceModel(Model):
 
     UNMASK_LOOP_NAME = UNMASK_LOOP_NAME
     # The canvas length process_prompt settles (it needs the tokenizer and the
-    # duration estimator); it reaches the backbone as step metadata.
-    INTERNAL_KWARGS = (TARGET_LEN,)
+    # duration estimator), which reaches the backbone as step metadata, and a
+    # clone's reference level, which `postprocess` matches.
+    INTERNAL_KWARGS = (TARGET_LEN, REF_RMS_KEY)
 
     def __init__(
         self,
@@ -201,14 +250,9 @@ class OmniVoiceModel(Model):
             ],
         )
 
-        code2wav_inputs = ["audio_tokens"]
-        if clone:
-            # Level matching only has a target when there is a reference.
-            code2wav_inputs.append("ref_rms")
-
         code2wav = GraphNode(
             name="code2wav",
-            input_names=code2wav_inputs,
+            input_names=["audio_tokens"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
@@ -335,6 +379,8 @@ class OmniVoiceModel(Model):
             raise ValueError("OmniVoice requires a non-empty text prompt")
         if set(output_modalities) != {"audio"}:
             raise ValueError("OmniVoice generates audio only")
+        output_shaping(kwargs)
+        unmask_knobs(kwargs, self.config.generation)
 
         self._ensure_data_worker_assets()
 
@@ -411,13 +457,14 @@ class OmniVoiceModel(Model):
             "prefix_ids": [prefix_ids],
             "prefix_audio_mask": [prefix_audio_mask],
         }
+        metadata = {TARGET_LEN: target_len}
         if ref_audio:
             out["ref_audio_inputs"] = [ref_waveform]
             # The *original* RMS, measured before the level normalisation in
-            # _prepare_reference: post_process uses it to put the clone back at
-            # the source's loudness, so a quiet reference yields quiet speech.
-            out["ref_rms"] = [torch.tensor([ref_rms], dtype=torch.float32)]
-        return ProcessPromptOutput(out, {TARGET_LEN: target_len})
+            # _prepare_reference: ``postprocess`` uses it to put the clone back
+            # at the source's loudness, so a quiet reference yields quiet speech.
+            metadata[REF_RMS_KEY] = float(ref_rms)
+        return ProcessPromptOutput(out, metadata)
 
     def _prepare_reference(
         self, waveform: torch.Tensor, ref_text: str | None
@@ -522,22 +569,7 @@ class OmniVoiceModel(Model):
             # from process_prompt, which settles it on the data worker
             TARGET_LEN: int(model_kwargs[TARGET_LEN]),
             "num_step": num_step,
-            "guidance_scale": float(
-                model_kwargs.get("guidance_scale", defaults.guidance_scale)
-            ),
-            "t_shift": float(model_kwargs.get("t_shift", defaults.t_shift)),
-            "layer_penalty_factor": float(
-                model_kwargs.get("layer_penalty_factor", defaults.layer_penalty_factor)
-            ),
-            "position_temperature": float(
-                model_kwargs.get("position_temperature", defaults.position_temperature)
-            ),
-            "class_temperature": float(
-                model_kwargs.get("class_temperature", defaults.class_temperature)
-            ),
-            "postprocess_output": bool(model_kwargs.get("postprocess_output", True)),
-            "pad_duration": float(model_kwargs.get("pad_duration", 0.1)),
-            "fade_duration": float(model_kwargs.get("fade_duration", 0.1)),
+            **unmask_knobs(model_kwargs, defaults),
         }
 
         full_metadata = CurrentForwardConductorMetadata(
@@ -579,9 +611,6 @@ class OmniVoiceModel(Model):
             "layer_penalty_factor": kw["layer_penalty_factor"],
             "position_temperature": kw["position_temperature"],
             "class_temperature": kw["class_temperature"],
-            "postprocess_output": kw["postprocess_output"],
-            "pad_duration": kw["pad_duration"],
-            "fade_duration": kw["fade_duration"],
         }
 
     def _speech_gen_inputs(
@@ -601,9 +630,6 @@ class OmniVoiceModel(Model):
             ref_edge = GraphEdge(next_node="backbone", name="ref_audio_tokens")
             ref_edge.tensor_info = persist_signals.get("ref_audio_tokens", [])
             inputs.append(ref_edge)
-            rms_edge = GraphEdge(next_node="code2wav", name="ref_rms")
-            rms_edge.tensor_info = persist_signals.get("ref_rms", [])
-            inputs.append(rms_edge)
         inputs += [
             GraphEdge(next_node="backbone", name="audio_tokens"),
             GraphEdge(next_node="backbone", name="step_index"),
@@ -655,13 +681,38 @@ class OmniVoiceModel(Model):
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        """Raw PCM16 bytes; the handler wraps them in the requested container."""
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().astype(np.int16).tobytes()
-        raise ValueError(f"Unsupported modality for OmniVoice: {modality!r}")
+    def postprocess(
+        self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None, **kwargs,
+    ) -> bytes:
+        """The decoded waveform shaped as the reference does it (silence trim,
+        level, fade and pad; ``post_process``), as raw PCM16 bytes the handler
+        wraps in the requested container.
+
+        This host work runs here, on the API side, rather than in the worker's
+        code2wav step, where it held up the unmask loop of every other request.
+        """
+        if modality != "audio":
+            raise ValueError(f"Unsupported modality for OmniVoice: {modality!r}")
+        if output.numel() == 0:
+            return b""
+        kw = request_kwargs or {}
+        waveform = output.detach().float().cpu().numpy().reshape(-1)
+        if not np.isfinite(waveform).all():
+            # code2wav poisons a canvas that still held MASK cells with NaN (see there)
+            raise RuntimeError(
+                "OmniVoice decoded a waveform that is not finite: its canvas still held masked cells "
+                "at decode (the unmask loop ended early), or the codec itself produced NaN or inf."
+            )
+        waveform = post_process(
+            waveform,
+            config=self.config,
+            # None means "no reference to match" and selects peak
+            # normalisation instead; that is a different code path, not a
+            # default value, so it must stay None rather than become 0.
+            ref_rms=kw.get(REF_RMS_KEY),
+            **output_shaping(kw),
+        )
+        return (np.clip(waveform, -1, 1) * 32767).astype(np.int16).tobytes()
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

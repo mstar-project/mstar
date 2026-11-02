@@ -67,10 +67,10 @@ def encode_reference(codec: nn.Module, waveform: torch.Tensor) -> torch.Tensor:
 
 
 @torch.inference_mode()
-def decode_canvas(codec: nn.Module, tokens: torch.Tensor) -> np.ndarray:
-    """``[C, T_tok]`` tokens -> 1-D waveform at ``codec.config.sample_rate``."""
+def decode_canvas(codec: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+    """``[C, T_tok]`` tokens -> 1-D float32 waveform at ``codec.config.sample_rate``, on the codec's device."""
     tokens = tokens.to(codec.device)
-    return codec.decode(tokens.unsqueeze(0)).audio_values[0].float().cpu().numpy()
+    return codec.decode(tokens.unsqueeze(0)).audio_values[0].float().reshape(-1)
 
 
 def post_process(

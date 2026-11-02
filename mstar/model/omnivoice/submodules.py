@@ -38,7 +38,6 @@ from mstar.model.omnivoice.components.backbone import (
 from mstar.model.omnivoice.components.codec import (
     decode_canvas,
     encode_reference,
-    post_process,
 )
 from mstar.model.omnivoice.components.unmask import (
     apply_reveal,
@@ -572,15 +571,20 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
 
 class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
-    """Decode the finished canvas and apply the reference's output shaping.
+    """Decode the finished canvas to the codec's float waveform.
 
-    Emits ``audio_output``, 1-D **int16 PCM** at the codec's sample rate: the
-    speech handler concatenates node output straight into a WAV container, so
-    the conversion belongs here, as it does for orpheus and qwen3_tts.
+    Emits ``audio_output``, 1-D float32 at the codec's sample rate, and nothing
+    else happens here: the reference's output shaping (silence trim, level,
+    fade, pad) and the PCM16 conversion run in ``OmniVoiceModel.postprocess``
+    on the API side. Done in this step they synced the host and held up the
+    unmask loop of every other request.
 
     A canvas that still holds a MASK cell means the loop ended early, which
-    would decode to noise — that is a fault, not a degraded result, so it
-    raises rather than emitting.
+    would decode to noise -- a fault, not a degraded result. The MASK id is
+    outside the codebooks, so the decode reads code 0 there (an out-of-range
+    index on the GPU is a device-side assert that kills the worker), and the
+    step poisons the waveform with NaN (no host sync here) for
+    ``postprocess`` to refuse.
     """
 
     disable_torch_compile = True
@@ -598,43 +602,16 @@ class OmniVoiceCode2WavSubmodule(_SingleRequestMixin, NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        tensor_inputs = {"audio_tokens": inputs["audio_tokens"][0]}
-        ref_rms = inputs.get("ref_rms")
-        if ref_rms:
-            tensor_inputs["ref_rms"] = ref_rms[0]
-        return NodeInputs(tensor_inputs=tensor_inputs)
+        return NodeInputs(tensor_inputs={"audio_tokens": inputs["audio_tokens"][0]})
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         audio_tokens: torch.Tensor,
-        ref_rms: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        info = engine_inputs.single_request_info
-        meta = info.step_metadata
-
-        remaining = int((audio_tokens == self.config.audio_mask_id).sum().item())
-        if remaining:
-            raise RuntimeError(
-                f"OmniVoice canvas for request {info.request_id} still holds "
-                f"{remaining} masked cells at decode; the unmask loop ended early."
-            )
-
-        waveform = decode_canvas(self.codec, audio_tokens)
-        waveform = post_process(
-            waveform,
-            config=self.config,
-            # None means "no reference to match" and selects peak
-            # normalisation instead; that is a different code path, not a
-            # default value, so it must stay None rather than become 0.
-            ref_rms=None if ref_rms is None else float(ref_rms.reshape(-1)[0]),
-            pad_duration=float(meta.get("pad_duration", 0.1)),
-            fade_duration=float(meta.get("fade_duration", 0.1)),
-            enabled=bool(meta.get("postprocess_output", True)),
-        )
-        pcm16 = (
-            torch.from_numpy(waveform).float().clamp(-1, 1).mul(32767).to(torch.int16)
-        )
-        return {"audio_output": [pcm16]}
+        masked = audio_tokens == self.config.audio_mask_id
+        waveform = decode_canvas(self.codec, audio_tokens.masked_fill(masked, 0))
+        waveform = torch.where(masked.any(), torch.full_like(waveform, float("nan")), waveform)
+        return {"audio_output": [waveform]}

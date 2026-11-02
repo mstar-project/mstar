@@ -822,7 +822,27 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     state = submodule.request_state("request")
     assert state["trailing_text_hidden"].shape == (4, 16)
     assert state["tts_pad_embed"].shape == (16,)
-    assert state["generation_step"] == 0
+
+
+def test_qwen3_tts_decode_feeds_its_iterations_text_token_however_often_it_is_prepared():
+    """A refused admit prepares the step's decode rows again: each must feed
+    its own iteration's text token again, not skip to the next one."""
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
+    hidden = config.talker.hidden_size
+    trailing, pad = torch.randn(3, hidden), torch.randn(hidden)
+    submodule.request_state("r").add_all(generated_frames=1, trailing_text_hidden=trailing, tts_pad_embed=pad)
+
+    def text_condition(iteration: int) -> torch.Tensor:
+        return submodule.prepare_inputs(
+            "talker_decode", SimpleNamespace(request_id="r", rid_handle="r"),
+            {"talker_input_embeds": [torch.zeros(1, hidden)]},
+            input_metadata=InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": iteration}),
+        ).kwargs["text_condition"]
+
+    for iteration in (0, 0, 1, 2, 2):   # iterations 0 and 2 refused once
+        assert torch.equal(text_condition(iteration), trailing[iteration])
+    assert torch.equal(text_condition(3), pad)   # the text is used up
 
 
 def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
@@ -1154,7 +1174,6 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
     )
     real_state = submodule.request_state("real")
     real_state.add_all(
-        generation_step=0,
         generated_frames=config.generation.min_new_tokens,
         trailing_text_hidden=torch.zeros(1, config.talker.hidden_size),
         tts_pad_embed=torch.zeros(config.talker.hidden_size),
@@ -1293,7 +1312,7 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
 
     def decode_row(rid: str, generated_frames: int) -> ARNodeInputs:
         submodule.request_state(rid).add_all(
-            generation_step=0, generated_frames=generated_frames,
+            generated_frames=generated_frames,
             trailing_text_hidden=torch.randn(2, hidden), tts_pad_embed=torch.randn(hidden),
         )
         return submodule.prepare_inputs("talker_decode", info(rid), {"talker_input_embeds": [torch.randn(1, hidden)]})

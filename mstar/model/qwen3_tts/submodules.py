@@ -402,7 +402,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         state.add_all(
             trailing_text_hidden=trailing.squeeze(0),
             tts_pad_embed=pad_embed[0, 0],
-            generation_step=0,
             generated_frames=0,
         )
         if ref_frames > 0:
@@ -417,6 +416,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
         """Convert routed request tensors into one Talker sequence fragment.
@@ -424,7 +424,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         Prefill creates the mixed conditioning sequence. Decode combines the
         previous frame's summed codec embedding with the next projected text
         condition. This method performs no transformer compute; the engine can
-        therefore prepare requests before admitting them to a micro-batch.
+        therefore prepare requests before admitting them to a micro-batch, and
+        prepares them again when the admit is refused, so it changes no state
+        a step's position depends on.
         """
         del kwargs
         if graph_walk in ("talker_prefill", "talker_prefill_clone"):
@@ -445,7 +447,8 @@ class TalkerSubmodule(ARNodeSubmodule):
             state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.rid_handle)
-            step = int(state["generation_step"])
+            # the step's own iteration, so a step prepared twice feeds its text token twice
+            step = input_metadata.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
             trailing = state["trailing_text_hidden"]
             text_condition = (
                 trailing[step]
@@ -460,7 +463,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 device=text_condition.device,
                 dtype=text_condition.dtype,
             ).reshape(1, -1)
-            state.add("generation_step", step + 1)
         else:
             raise ValueError(f"Unknown Qwen3-TTS Talker walk: {graph_walk!r}")
 
