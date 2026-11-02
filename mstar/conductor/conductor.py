@@ -1226,6 +1226,7 @@ class Conductor:
         An exception here would otherwise reach the run loop, which only logs
         it, and the client would wait for its timeout. A ``ValueError`` raised
         before any worker heard of the request is the client's fault: a 400.
+        An ``HTTPException`` keeps its status; anything else is a 500.
         """
         try:
             self._do_ingest_request(body)
@@ -1240,7 +1241,8 @@ class Conductor:
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,
                 )
-                self._reject_request(body.request_id, f"Ingest failed: {text}", status=500)
+                status = exc.status_code if isinstance(exc, HTTPException) else 500
+                self._reject_request(body.request_id, f"Ingest failed: {text}", status=status)
             elif body.request_id not in self.draining:
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,

@@ -69,7 +69,7 @@ class OmniVoiceGenerationDefaults:
     denoise: bool = True
 
     # Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step
-    # stops the loop early via check_stop; this only bounds the graph.
+    # is the loop's cap; this only bounds the graph.
     max_num_step: int = 64
 
 
