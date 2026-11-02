@@ -1161,8 +1161,14 @@ class Cosmos3Model(Model):
             # raw_action_dim, the real action width for its embodiment).
             x = output[0] if output.ndim == 3 else output
             return x.detach().to(torch.float32).cpu().numpy().tobytes()
-        # audio: the decoder's [channels, samples] waveform, which the default interleaves
-        return super().postprocess(output, modality, request_kwargs)
+        if modality == "audio":
+            # The audio decoder emits a [channels, samples] waveform in [-1, 1];
+            # the serving convention for audio is headerless interleaved 16-bit
+            # PCM (the API layer wraps it with the model's sample rate).
+            x = output[0] if output.ndim == 3 else output
+            pcm = (x.detach().to(torch.float32).clamp(-1, 1) * 32767.0).round().to(torch.int16)
+            return pcm.T.contiguous().cpu().numpy().tobytes()
+        raise ValueError(f"Unsupported modality for Cosmos3: {modality!r}")
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return int(self.config.sound_sample_rate)

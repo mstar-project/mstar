@@ -425,9 +425,14 @@ class LTX25Model(Model):
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """``video``: uint8 ``[F, H, W, 3]`` frames -> H.264 mp4 at the request's fps. ``audio``:
-        the default's interleaved 16-bit PCM of the ``[2, samples]`` waveform."""
+        ``[2, samples]`` in ``[-1, 1]`` -> headerless interleaved 16-bit PCM (the API layer
+        wraps it with ``get_output_sample_rate``)."""
+        if modality == "audio":
+            x = output[0] if output.ndim == 3 else output
+            pcm = (x.detach().to(torch.float32).clamp(-1, 1) * 32767.0).round().to(torch.int16)
+            return pcm.T.contiguous().cpu().numpy().tobytes()
         if modality != "video":
-            return super().postprocess(output, modality, request_kwargs)
+            raise ValueError(f"unsupported output modality for LTX-2.5: {modality!r}")
         fps = self.resolve_request(request_kwargs or {})["fps"]
         # the decoder emits [F, H, W, 3] already, the layout the encoder takes
         return encode_mp4(output[0] if output.ndim == 5 else output, fps)
