@@ -1254,9 +1254,9 @@ class PreprocessWorkerThread:
                 for row, span, digest in zip(span_rows, keyed, digests, strict=True):
                     at += span.length
                     page, end = divmod(at, page_size)
-                    row += [digest, end_key(
+                    row[4:6] = digest, end_key(
                         page_keys[page - 1] if page else root, pages[page], items.get(page, ()), end,
-                    ) if digest is not None and end else None]
+                    ) if digest is not None and end else None
                 if kv_label.keys.growth:
                     decode.setdefault(resource_key, {})[label] = kv_label.keys.tensor
         if not keys:
