@@ -34,14 +34,22 @@ from transformers.vision_utils import (
 )
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.mrope import mrope_position_ids
@@ -72,6 +80,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -434,6 +443,22 @@ class ThinkerSubmodule(ARNodeSubmodule):
             self._vision_eos_embed
         ], dim=0)
 
+    # multimodal spans carry a start and an end sentinel around the embeds
+    _EMBED_INPUTS = {"prefill_audio": "audio_embeds", "prefill_vision": "vision_embeds"}
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if graph_walk == "thinker_decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        name = self._EMBED_INPUTS.get(graph_walk)
+        if name is not None and name in inputs:
+            return InputSeqLenInfo(inputs[name][0].shape[0] + 2)
+        return None
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -597,6 +622,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+    MAX_BATCH_TOKENS = 1024
+
     def split_inputs(
         self,
         graph_walk: str,
@@ -606,6 +633,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         end: int,
     ) -> ARNodeInputs:
         tensors = inputs.tensor_inputs
+        # a key not cut here would be dropped from the chunk
+        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
+        if unknown:
+            raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
         cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
         if graph_walk == "prefill_vision":
@@ -632,7 +663,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             kept_rids = frozenset(
                 rid for rid, walk in zip(request_ids, row_walks, strict=True)
                 if walk == "thinker_decode" or (
-                    rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+                    rid in info and info[rid].step_metadata.get(FINAL_PREFILL, False)
                 )
             )
         prefill_tokens = {
@@ -645,9 +676,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
             # A vision row's 3D-grid MRoPE span differs from its token count, and
             # a cut audio row moves past its whole clip, so each advances the
-            # counter by its own `mrope_pos_advance`.
+            # counter by its own `mrope_pos_advance`. That value is the WHOLE
+            # span's, and a chunk's positions were cut from it, so a chunked row
+            # applies it once, on its final chunk. A row without one advances by
+            # the span it just ran, which is per chunk.
             pos_advance = tuple(
-                int(inp.tensor_inputs.get("mrope_pos_advance", inp.input_seq_len))
+                (int(inp.tensor_inputs["mrope_pos_advance"]) if inp.is_final_chunk else 0)
+                if "mrope_pos_advance" in inp.tensor_inputs else inp.input_seq_len
                 for inp in inputs
             )
         return SubmoduleStep(
@@ -835,7 +870,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         result: NameToTensorList = {}
 
         # Decode: produce logits for text token sampling
-        if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
+        if graph_walk == "thinker_decode" or request_info.step_metadata.get(FINAL_PREFILL, False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
                 engine_inputs.request_ids, logits=logits
@@ -1121,8 +1156,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        return_token = request_info.graph_walk == "thinker_decode" or \
-            request_info.step_metadata.get("is_last_prefill", False)
+        return_token = request_info.graph_walk == "thinker_decode" or (
+            request_info.step_metadata.get(FINAL_PREFILL, False)
+        )
         if not return_token:
             outputs.pop("new_token", None)
 
@@ -1376,6 +1412,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
 
         if graph_walk == "talker_prefill":
+            # One item, whether or not the Thinker's prefill was chunked: its
+            # per-chunk pieces are joined on arrival by the StreamBuffer
+            # (Connection.join_dim), so the Talker sees what it always did.
             selected_hidden = inputs["thinker_states"][0].to(device)
             multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(

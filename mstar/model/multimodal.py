@@ -19,7 +19,7 @@ rendered prompt ever does.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -29,9 +29,9 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.keys import MIXED
 
 if TYPE_CHECKING:
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    from mstar.communication.tensors import NameToTensorList
     from mstar.graph.base import TensorPointerInfo
-    from mstar.model.base import ForwardPassArgs
+    from mstar.model.base import WalkStep
 
 TEXT = "text"
 VIDEO = "video"
@@ -181,6 +181,44 @@ def prefill_plan(
         plan.append(part)
     flush()
     return plan
+
+
+def span_name(name: str, index: int) -> str:
+    """The signal that carries entry ``index`` of a prompt's ``name`` list on its own (see `split_spans`)."""
+    return f"{name}.{index}"
+
+
+def split_spans(
+    tensors: NameToTensorList, names: Iterable[str], kv_layout: dict | None = None,
+) -> tuple[NameToTensorList, dict | None]:
+    """``tensors`` with each list in ``names`` split into one signal per entry,
+    named by `span_name`, for a model that prefills each entry in a walk of its
+    own: its plan binds the walk's input to the entry (``WalkStep.bind``). The
+    list itself is left empty.
+
+    An ids span keys the next entry of its source (``Span.source``), so in each
+    label of ``kv_layout`` the ``k``-th ids span of a split list now names
+    entry ``k``'s signal.
+    """
+    names = set(names)
+    out = dict(tensors)
+    for name in names & set(tensors):
+        out[name] = []
+        out.update({span_name(name, i): [entry] for i, entry in enumerate(tensors[name])})
+    if kv_layout is None:
+        return out, None
+
+    def split(layout):
+        seen: dict[str, int] = {}
+        spans = []
+        for span in layout.spans:
+            if span.kind == "ids" and span.source in names:
+                seen[span.source] = seen.get(span.source, -1) + 1
+                span = span._replace(source=span_name(span.source, seen[span.source]))
+            spans.append(span)
+        return layout._replace(spans=tuple(spans))
+
+    return out, {key: {label: split(layout) for label, layout in labels.items()} for key, labels in kv_layout.items()}
 
 
 def find_media_spans(
@@ -532,25 +570,19 @@ def text_combined_walks() -> dict[str, dict[str, set[str]]]:
     return {"LLM": {MIXED: {"prefill_text", "decode"}}}
 
 
-@dataclass(frozen=True)
-class PrefillStep:
-    walk: str
-    # (node, input name) -> the tensors that input carries
-    input_tensors: dict[tuple[str, str], list[TensorPointerInfo]]
-    # merged into the walk's step metadata
-    metadata: dict = field(default_factory=dict)
-
-
 def media_prefill_step(
     signals: dict[str, list[TensorPointerInfo]],
     encoders: Sequence[MediaEncoder],
     layout: dict | None = None,
     *,
     model_name: str,
-) -> PrefillStep:
+) -> WalkStep:
     """The one prefill walk a request runs over its whole prompt
     (``text_inputs``, one tensor): with media in its ``layout``, the walk over
-    the encoders it runs (`media_encoders`); without, ``prefill_text``."""
+    the encoders it runs (`media_encoders`), which carries the layout; without,
+    ``prefill_text``."""
+    from mstar.model.base import WalkStep
+
     texts = signals.get("text_inputs", [])
     if not texts:
         # the conductor answers this with a 400
@@ -567,67 +599,5 @@ def media_prefill_step(
         if sent:
             # a text prefill would drop them
             raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
-        return PrefillStep("prefill_text", {("LLM", "text_inputs"): texts})
-    inputs = {("LLM", "text_inputs"): texts}
-    for e in present:
-        for name in e.inputs:
-            inputs[(e.node, name)] = signals.get(name, [])
-    return PrefillStep(media_walk_name(present), inputs, {MEDIA_LAYOUT: layout or {}})
-
-
-def walk_input_edges(step: PrefillStep) -> list[GraphEdge]:
-    """One edge per (node, input) the step's walk reads."""
-    edges = []
-    for (node, name), tensors in step.input_tensors.items():
-        edge = GraphEdge(next_node=node, name=name)
-        edge.tensor_info = list(tensors)
-        edges.append(edge)
-    return edges
-
-
-def _prefill_args(
-    metadata: CurrentForwardConductorMetadata, inputs: list[GraphEdge], step_metadata: dict,
-) -> ForwardPassArgs:
-    from mstar.model.base import ForwardPassArgs
-
-    return ForwardPassArgs(
-        full_metadata=metadata,
-        inputs=inputs,
-        unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-        step_metadata={"is_prefill": metadata.is_prefill, **step_metadata},
-    )
-
-
-def initial_prefill_args(
-    step: PrefillStep, input_modalities: list[str], output_modalities: list[str],
-) -> ForwardPassArgs:
-    """The prefill walk; `next_prefill_args` takes it from there."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
-
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=input_modalities,
-        output_modalities=output_modalities,
-        graph_walk=step.walk,
-        is_prefill=True,
-    )
-    return _prefill_args(metadata, walk_input_edges(step), step.metadata)
-
-
-def next_prefill_args(
-    metadata: CurrentForwardConductorMetadata,
-    persist_signals: dict[str, list[TensorPointerInfo]],
-) -> ForwardPassArgs:
-    """After the prefill, loop in decode until the decoder's stop check ends it."""
-    from mstar.model.base import ForwardPassArgs
-
-    if metadata.is_prefill:
-        metadata.is_prefill = False
-        metadata.graph_walk = "decode"
-        edge = GraphEdge(next_node="LLM", name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
-        return _prefill_args(metadata, [edge], {})
-    # reaching here again after decode stopped means the request is finished
-    metadata.kwargs["decode_finished"] = True
-    return ForwardPassArgs(
-        full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True,
-    )
+        return WalkStep("prefill_text")
+    return WalkStep(media_walk_name(present), step_metadata={MEDIA_LAYOUT: layout or {}})

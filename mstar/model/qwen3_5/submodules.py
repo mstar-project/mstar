@@ -73,6 +73,12 @@ class LLMSubmodule(SampledTokenDecoder):
             or os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,32,48,64,96,128")
         ).split(",")
     ]
+    # Tokens a step runs (the model's chunking budget), on a prefill capture
+    # bucket since a step over it pads to the next bucket up. 2048 measured
+    # best on 0.8B-9B: 1024 costs 3-10% throughput in steps and speculation,
+    # 4096 gives back most of the short-prompt TTFT gain and doubles decode
+    # ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
 
     def __init__(
         self,

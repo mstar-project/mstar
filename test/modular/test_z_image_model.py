@@ -91,18 +91,14 @@ def test_process_prompt_and_validation():
 
 def test_schedule_and_caption_bucket_from_token_count():
     model = _make_model()
-    args = model.get_initial_forward_pass_args("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
-                                               model_kwargs={"width": 768, "num_inference_steps": 8})
-    md = args.full_metadata
-    assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
-    assert args.step_metadata["text_len"] == 45 and args.step_metadata["cap_len"] == 64
-    assert (args.step_metadata["height"], args.step_metadata["width"]) == (1024, 768)
-    shape = shape_from_metadata(model.config, args.step_metadata)
+    plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
+                           {"width": 768, "num_inference_steps": 8})
+    assert [step.walk for step in plan] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
+    md = plan[0].step_metadata
+    assert md["text_len"] == 45 and md["cap_len"] == 64
+    assert (md["height"], md["width"]) == (1024, 768)
+    shape = shape_from_metadata(model.config, md)
     assert shape == ZShape(grid=(64, 48), cap_len=64) and shape.image_tokens_padded == 3072
-    nxt = model.get_partition_forward_pass_args("default", md, {"text_embeds": [_info("e", [1, 64, 2560])]})
-    assert nxt.full_metadata.graph_walk == IMAGE_GEN_WALK and not nxt.request_done
-    assert {e.name for e in nxt.inputs} == {"text_embeds", "latents"}
-    assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
 
 
 def test_capture_shapes_cover_sizes_times_caption_buckets():

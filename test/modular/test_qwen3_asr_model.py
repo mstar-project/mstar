@@ -17,7 +17,9 @@ import yaml
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.request_info import FINAL_PREFILL  # noqa: E402
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
+from mstar.model.base import WalkStep  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
@@ -355,9 +357,11 @@ def test_llm_check_stop():
         ignore_eos = False
 
     def info(walk, decoded, max_tokens=4096):
+        # the conductor marks the prefill, the step before decode, FINAL_PREFILL
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": _Cfg()},
-                              "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded},
+                              "step_metadata": {FINAL_PREFILL: walk == PREFILL_WALK}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
     # a stop token first ends the request: there is no decode loop yet
@@ -378,7 +382,8 @@ def test_llm_check_stop_batched_agrees_with_per_request():
     def info(walk, decoded, max_tokens=4096, ignore_eos=False):
         return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
                               "resource_configs": {"sampler": type("C", (), {"ignore_eos": ignore_eos})()},
-                              "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded},
+                              "step_metadata": {FINAL_PREFILL: walk == PREFILL_WALK}})()
 
     # rows in forward order, plus a padding row a replay leaves at the end
     tokens = torch.tensor([IM_END, 1234, EOT, IM_END, IM_END, 0])
@@ -443,11 +448,11 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
 
 
 # --------------------------------------------------------------------------
-# model: graph, resources, state machine
+# model: graph, resources, walk plan
 # --------------------------------------------------------------------------
 
 
-def test_graph_resources_and_state_machine():
+def test_graph_resources_and_walk_plan():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {PREFILL_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
@@ -465,16 +470,14 @@ def test_graph_resources_and_state_machine():
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
     layout = {"offset": [5], "tokens": [37], "output": ["audio_embeds"], "grid": [[]]}
-    args = model.get_initial_forward_pass_args(
+    # the prefill splices the audio where process_prompt put its placeholders
+    assert model.walk_plan(
         "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
-        model_kwargs={MEDIA_LAYOUT: layout},
-    )
-    assert args.full_metadata.graph_walk == PREFILL_WALK
-    assert args.step_metadata == {"is_prefill": True, MEDIA_LAYOUT: layout}
-    assert {(e.next_node, e.name) for e in args.inputs} == {(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")}
-    nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
-    assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill
-    assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
+        {MEDIA_LAYOUT: layout},
+    ) == [
+        WalkStep(PREFILL_WALK, step_metadata={MEDIA_LAYOUT: layout}),
+        WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"}),
+    ]
 
 
 def test_llm_weight_remap():
@@ -574,10 +577,10 @@ def test_request_kwargs_are_checked_before_the_conductor_reads_them():
     assert model.get_max_output_tokens(max_output_tokens="32") == 32
     with pytest.raises(ValueError, match="max_output_tokens"):
         model.get_max_output_tokens(max_output_tokens="abc")
-    cfgs = model.get_request_resource_configs({}, {"temperature": "0.5", "ignore_eos": "true"})
+    cfgs = model.get_request_resource_configs([], [], {"temperature": "0.5", "ignore_eos": "true"})
     assert cfgs["sampler"].temperature == 0.5 and cfgs["sampler"].ignore_eos is True
     with pytest.raises(ValueError, match="top_p"):
-        model.get_request_resource_configs({}, {"top_p": "abc"})
+        model.get_request_resource_configs([], [], {"top_p": "abc"})
 
 
 def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device(monkeypatch):

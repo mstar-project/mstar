@@ -400,10 +400,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     tensors = out.new_input_tensors
     step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     assert step.walk == "prefill_vision"
-    # the encoder gets each image and video once, in prompt order
-    assert all(a is b for a, b in zip(
-        step.input_tensors[("vision_encoder", "pixel_values")], tensors["pixel_values"], strict=True,
-    ))
 
     media = out.metadata[MEDIA_LAYOUT]
     (prompt,) = tensors["text_inputs"]
@@ -414,9 +410,8 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     (encoder,) = model.encoders
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
-    fwd_info = SimpleNamespace(request_id="r", step_metadata=step.metadata)
-    (ids,) = step.input_tensors[("LLM", "text_inputs")]
-    row = llm._media_inputs(fwd_info, {"text_inputs": [ids], "vision_embeds": [marks]})
+    fwd_info = SimpleNamespace(request_id="r", step_metadata=step.step_metadata)
+    row = llm._media_inputs(fwd_info, {"text_inputs": [prompt], "vision_embeds": [marks]})
 
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
@@ -700,7 +695,7 @@ def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
     (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
     model = Qwen3_5DenseModel(str(ckpt))
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
 

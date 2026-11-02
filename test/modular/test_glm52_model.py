@@ -31,10 +31,7 @@ def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 
-from mstar.conductor.request_info import (  # noqa: E402
-    CurrentForwardConductorMetadata,
-    CurrentForwardPassInfo,
-)
+from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import (  # noqa: E402
     AttentionSpec,
     AttnBackend,
@@ -132,40 +129,7 @@ def test_glm52_resources_flag_off_is_naive():
     assert attn.config.kv_cache == KV_RESOURCE
 
 
-# ── conductor state machine ──
-
-
-def test_glm52_initial_forward_pass_args_seed_prefill_from_the_prompt():
-    signals = {"text_inputs": ["PROMPT"]}
-    args = _make_model().get_initial_forward_pass_args(
-        "default", ["text"], ["text"], signals)
-    assert args.full_metadata.graph_walk == "prefill"
-    assert args.full_metadata.is_prefill is True
-    assert args.step_metadata == {"is_prefill": True}
-    (edge,) = args.inputs
-    assert (edge.next_node, edge.name) == ("LLM", "text_inputs")
-    assert edge.tensor_info == ["PROMPT"]
-    assert args.unpersist_tensors == ["PROMPT"]
-
-
-def test_glm52_prefill_transitions_to_decode():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["text"],
-        graph_walk="prefill",
-        is_prefill=True,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={"new_token": []},
-    )
-
-    assert result.full_metadata.graph_walk == "decode"
-    assert result.step_metadata["is_prefill"] is False
-    assert result.request_done is False
+# ── walks ──
 
 
 def test_glm52_prefill_emits_only_the_new_token():
@@ -175,23 +139,6 @@ def test_glm52_prefill_emits_only_the_new_token():
     (edge,) = prefill.outputs
     assert edge.name == "new_token" and edge.next_node == EMIT_TO_CLIENT
     assert edge.persist is True
-
-
-def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
-    """Decode must be seeded from the emitted token, never from the prompt
-    signal, and must unpersist it so no per-request tensor outlives the
-    transition."""
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"],
-        graph_walk="prefill", is_prefill=True,
-    )
-    res = _make_model().get_partition_forward_pass_args(
-        partition_name="default", partition_metadata=metadata,
-        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
-    )
-    assert res.inputs[0].name == "text_inputs"
-    assert res.inputs[0].tensor_info == ["tok"]
-    assert res.unpersist_tensors == ["tok"]
 
 
 def test_glm52_decode_loop_cap_stays_below_the_context_guard():
@@ -210,32 +157,13 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     assert not any(e.conductor_new_token for e in decode.section.outputs)
 
 
-def test_glm52_decode_completion_marks_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"],
-        output_modalities=["text"],
-        graph_walk="decode",
-        is_prefill=False,
-    )
-
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-
-    assert result.request_done is True
-    assert result.full_metadata.kwargs["decode_finished"] is True
-
-
 # ── per-request sampling config ──
 
 
 def test_glm52_request_config_is_the_sampler_config():
     model = _make_model()
     cfg = model.config
-    configs = model.get_request_resource_configs({})
+    configs = model.get_request_resource_configs([], [], {})
     assert set(configs) == {SAMPLER_RESOURCE}
     sampling = configs[SAMPLER_RESOURCE]
     assert isinstance(sampling, SamplingReqConfig)
@@ -245,7 +173,7 @@ def test_glm52_request_config_is_the_sampler_config():
     assert sampling.repetition_penalty == cfg.repetition_penalty
     assert sampling.ignore_eos is cfg.ignore_eos
     over = model.get_request_resource_configs(
-        {}, {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
+        [], [], {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
     assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
     assert over.temperature == cfg.temperature
 

@@ -40,7 +40,6 @@ from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -87,13 +86,13 @@ from mstar.model.bagel.submodules import (
 )
 from mstar.model.base import (
     DECODE,
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    WalkStep,
     prompt_spans,
 )
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
@@ -107,9 +106,11 @@ from mstar.model.multimodal import (
     find_media_spans,
     parts_from_modalities,
     prefill_plan,
+    span_name,
     split_around_spans,
+    split_spans,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import TextOutput
 
 logger = logging.getLogger(__name__)
@@ -267,11 +268,14 @@ class BagelModel(Model):
         decode        - Autoregressive text generation
         image_gen     - Flow matching loop (3-pass CFG + Euler) + VAE decode
 
-    Graph walk transitions are schedule-driven (no BOI token detection). The
-    output mode is known upfront from the API request's output_modalities.
-    Prefill steps are constructed as a sequential schedule that walks
-    through interleaved text and image inputs.
+    The walk plan is schedule-driven (no BOI token detection). The output
+    mode is known upfront from the API request's output_modalities. Prefill
+    steps are constructed as a sequential schedule that walks through
+    interleaved text and image inputs.
     """
+
+    # the prompt lists whose entries each prefill in a walk of their own
+    SPANS = ("text_inputs", "image_inputs")
 
 
     def __init__(
@@ -618,9 +622,8 @@ class BagelModel(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the prompt into one text span per prefill step.
 
-        Returns model-specific keys matching get_forward_pass_inputs:
-            "text_inputs"    - one tokenized span per text step of the plan
-            "system_prompt"  - tokenized system prompt (think_mode only)
+        Each text span and each image is a signal of its own (`split_spans`:
+        ``text_inputs.N``, ``image_inputs.N``), which its prefill walk reads.
 
         The prompt is rendered once with a placeholder per image, tokenized
         once, and sliced around those placeholders, so text written between two
@@ -708,13 +711,17 @@ class BagelModel(Model):
             ]
 
         if tensors is None:
-            return result
+            return split_spans(result, self.SPANS)[0]
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
         images = result.get("image_inputs") or tensors.get("image_inputs", [])
+        if images:
+            # split into spans below, in place of the loaded list
+            result["image_inputs"] = images
         params = self._request_params(input_modalities, output_modalities, kwargs)
         layout = self._kv_layout(parts, segments, images, output_modalities, params)
-        return ProcessPromptOutput(result, {"kv_layout": {"kv": layout}})
+        result, kv_layout = split_spans(result, self.SPANS, {"kv": layout})
+        return ProcessPromptOutput(result, {"kv_layout": kv_layout})
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
@@ -916,8 +923,7 @@ class BagelModel(Model):
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource knobs a new request is opened with.
 
@@ -930,10 +936,12 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
 
         model_kwargs = model_kwargs or {}
-        request = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs
-        cfg = request["requires_cfg"]
+        # the guidance `walk_plan` settles, from the same request
+        target_output = output_modalities[0]
+        params = self._request_params(input_modalities, output_modalities, model_kwargs)
+        cfg = self._requires_cfg(target_output=target_output, **params)
         # only a generation's image_gen_cfg runs the CFG nodes
-        nodes = self._LLM_NODES if self._has_cfg_parallel and request["target_output"] == "image" else {"LLM"}
+        nodes = self._LLM_NODES if self._has_cfg_parallel and target_output == "image" else {"LLM"}
         sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
         final_publish_labels: dict[tuple[str, str], list[str]] = {}
@@ -1038,6 +1046,20 @@ class BagelModel(Model):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.bagel.submodules import LLMSubmodule, _unguided
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(
+                walks=("prefill_text",), chunkable=True, max_batch_tokens=budget,
+                # a guided row's cfg streams hold context the cache never keyed
+                reuses_cached_prefix=_unguided,
+            ),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(MIXED_TEXT,), max_batch_tokens=budget),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --
@@ -1238,20 +1260,24 @@ class BagelModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         is_understanding: bool,
         think_mode: bool = False,
-    ):
-        """Sequential list of ``(graph_walk_name, input tensor info)``.
+    ) -> list[tuple[str, str, str]]:
+        """Sequential list of ``(graph_walk_name, input name, span signal)``.
 
         Walks the prefill plan, so attachments prefill where they were written
         and N of them get N walks. Understanding opens with the system span
         ahead of them; generation opens straight into them, after the
         think-mode span when there is one.
         """
-        texts = list(input_signals.get("text_inputs", []))
-        images = input_signals.get("image_inputs", [])
+        def spans(name: str) -> list[str]:
+            out = []
+            while span_name(name, len(out)) in input_signals:
+                out.append(span_name(name, len(out)))
+            return out
 
-        schedule: list[tuple[str, TensorPointerInfo]] = []
+        texts, images = spans("text_inputs"), spans("image_inputs")
+        schedule: list[tuple[str, str, str]] = []
         if think_mode and not is_understanding and texts:
-            schedule.append(("prefill_text", texts.pop(0)))
+            schedule.append(("prefill_text", "text_inputs", texts.pop(0)))
 
         plan = prefill_plan(
             parts_from_modalities(input_modalities), leading_text=is_understanding,
@@ -1270,12 +1296,12 @@ class BagelModel(Model):
                 )
                 continue
             if step.modality == "text":
-                schedule.append(("prefill_text", texts[step.index]))
+                schedule.append(("prefill_text", "text_inputs", texts[step.index]))
             else:
                 if not is_understanding:
                     # Generation/editing: VAE encode the image
-                    schedule.append(("prefill_vae", images[step.index]))
-                schedule.append(("prefill_vit", images[step.index]))
+                    schedule.append(("prefill_vae", "image_inputs", images[step.index]))
+                schedule.append(("prefill_vit", "image_inputs", images[step.index]))
         return schedule
 
     def _request_params(
@@ -1313,261 +1339,52 @@ class BagelModel(Model):
                 )
         )
 
-    def _get_step_metadata(
-        self, full_metadata: CurrentForwardConductorMetadata,
-    ) -> dict:
-        return {
-            "is_prefill": full_metadata.is_prefill,
-            "requires_cfg": full_metadata.kwargs["requires_cfg"],
-            "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
-            "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
-            "cfg_interval": full_metadata.kwargs["cfg_interval"],
-            "cfg_renorm_type": full_metadata.kwargs["cfg_renorm_type"],
-            "cfg_renorm_min": full_metadata.kwargs["cfg_renorm_min"],
-            "width": full_metadata.kwargs["width"],
-            "height": full_metadata.kwargs["height"],
-            "image_preprocess": full_metadata.kwargs["image_preprocess"],
-        }
-
-    @staticmethod
-    def _prefill_token_metadata(sample_prefill_token: bool, target_output: str) -> dict:
-        """Whether this pass samples the reply's first token, and whether a stop
-        there ends the request: only for a text reply, which has no walk after
-        decode."""
-        return {
-            "sample_prefill_token": sample_prefill_token,
-            "prefill_stop_ends": sample_prefill_token and target_output == "text",
-        }
-
-    def _get_fwd_pass_inputs(
-        self,
-        metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """Construct the external inputs for the current forward pass.
-
-        The conductor calls this to determine what tensors to send to
-        workers at the start of each forward pass. For prefill graph walks,
-        the schedule entry determines which input to route; for decode
-        and image_gen, the previous output feeds back in.
-
-        persist_signals key conventions:
-            "text_inputs"    - list of per-turn text TensorPointerInfos
-            "image_inputs"   - list of per-image TensorPointerInfos
-            "system_prompt"  - tokenized system prompt (if think_mode)
-            "new_token"      - last generated token (during decode)
-            "latents"        - noise latents (for image_gen entry)
-        """
-        graph_walk = metadata.graph_walk
-
-        if metadata.is_prefill:
-            schedule = metadata.kwargs["prefill_schedule"]
-            step = metadata.kwargs["prefill_step"]
-            input_tensor_info = [schedule[step][1]]
-
-            if graph_walk == "prefill_text":
-                graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-            elif graph_walk == "prefill_vit":
-                graph_edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
-            elif graph_walk == "prefill_vae":
-                graph_edge = GraphEdge(next_node="vae_encoder", name="image_inputs")
-            else:
-                raise ValueError(f"Unrecognized prefill graph_walk {graph_walk}")
-            graph_edge.tensor_info = input_tensor_info
-            return [graph_edge]
-
-        elif graph_walk == DECODE:
-            graph_edge = GraphEdge(
-                next_node="LLM", name="text_inputs",
-                tensor_info=persist_signals.get("new_token", [])
-            )
-            return [graph_edge]
-
-        elif graph_walk == "image_gen":
-            # Initial noise latents feed the LLM denoising loop.
-            # Note: latents are typically initialized by the submodule's
-            # preprocess() (random noise), not passed through persist_signals.
-            # This lookup handles the case where latents are externally provided.
-            graph_edge = GraphEdge(next_node="LLM", name="latents")
-            graph_edge.tensor_info = persist_signals.get("latents", [])
-            return [
-                graph_edge,
-                GraphEdge(next_node="LLM", name="time_index")
-            ]
-
-        elif graph_walk == "image_gen_cfg":
-            return [
-                GraphEdge(next_node="LLM", name="latents"),
-                GraphEdge(next_node="LLM", name="time_index"),
-                GraphEdge(next_node="LLM_cfg_text", name="latents"),
-                GraphEdge(next_node="LLM_cfg_text", name="time_index"),
-                GraphEdge(next_node="LLM_cfg_img", name="latents"),
-                GraphEdge(next_node="LLM_cfg_img", name="time_index"),
-                GraphEdge(next_node="combine_cfg", name="latents"),
-                GraphEdge(next_node="combine_cfg", name="time_index"),
-            ]
-
-        return []
-
-    def _get_unpersist_tensors(
-        self, graph_walk: str, inputs: list[GraphEdge]
-    ) -> list[TensorPointerInfo]:
-        """
-        Lists the tensors that will be used for the last time in this forward pass
-        """
-        if graph_walk == "prefill_vae":
-            # If we have prefill_vae, we know that the image input will be
-            # passed into the ViT encoder for the next forward pass, so it
-            # has to stick around
-            return []
-        # otherwise, we can un-persist all tensors
-        return sum(
-            [inp.tensor_info for inp in inputs], start=[]
-        )
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """One prefill walk per span of the schedule, then decode for a text
+        reply, decode then image generation for a think-then-image request, or
+        straight to image generation.
+
+        Every step carries the request's guidance and image params. The step
+        before decode, the one that samples the reply's first token, is the
+        conductor's `FINAL_PREFILL`; ``prefill_stop_ends`` says whether a stop
+        there ends the request, which only a text reply's does: a
+        think-then-image request still has its image to make.
+        """
         target_output = output_modalities[0]  # "text" or "image"
         params = self._request_params(input_modalities, output_modalities, model_kwargs)
-
-        if "image" in output_modalities and input_signals.get("image_inputs"):
-            image = input_signals["image_inputs"][0]
-            params["height"] = image.dims[1]
-            params["width"] = image.dims[2]
+        image = input_signals.get(span_name("image_inputs", 0))
+        if "image" in output_modalities and image:
+            params["height"], params["width"] = image[0].dims[1], image[0].dims[2]
             logger.info(f"Will generate an image of shape {params['height']} x {params['width']}")
+        think_mode = params.pop("think_mode")
+        params["requires_cfg"] = self._requires_cfg(target_output=target_output, **params)
+        params["prefill_stop_ends"] = target_output == "text"
 
-        think_mode = params.pop("think_mode") # used for schedule logic, not stored in params
         schedule = self._build_prefill_schedule(
             input_modalities=input_modalities,
             input_signals=input_signals,
             is_understanding=(target_output == "text"),
             think_mode=think_mode,
         )
-
-        first_graph_walk = schedule[0][0] if schedule else DECODE
-        kwargs = {
-            "prefill_schedule": schedule,
-            "prefill_step": 0,
-            "target_output": target_output,
-            "num_timesteps": self.config.num_timesteps,
-            "think_mode": think_mode,
-            **params,  # CFG params  + gen width / height
-        }
-        kwargs["requires_cfg"] = self._requires_cfg(**kwargs)
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=first_graph_walk,
-            is_prefill=bool(schedule),
-            kwargs=kwargs,
-        )
-        step_metadata =  self._get_step_metadata(full_metadata)
-
-        sample_prefill_token = (think_mode or target_output != "image") and len(schedule) == 1
-        step_metadata.update(self._prefill_token_metadata(sample_prefill_token, target_output))
-
-        inputs = self._get_fwd_pass_inputs(
-            full_metadata, input_signals
-        )
-        unpersist_tensors = self._get_unpersist_tensors(first_graph_walk, inputs)
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        """Advance graph walk transitions. Schedule-driven, no BOI detection.
-
-        During prefill, steps through the schedule one entry at a time.
-        After all prefill steps, transitions to:
-          - decode (text output)
-          - decode (image output + think_mode: think first, then generate)
-          - image_gen (image output, no think_mode)
-
-        During decode:
-          - Text output: EOS marks request complete.
-          - Image output + think_mode: EOS transitions to image_gen
-            (thinking is done, now generate the image).
-
-        After image_gen, marks request complete (one image per request).
-        """
-        metadata = partition_metadata
-        request_done = False
-
-        has_text_output = (
-            metadata.kwargs.get("think_mode", False) or metadata.kwargs["target_output"] != "image"
-        )
-        sample_prefill_token = False
-
-        if metadata.is_prefill:
-            step = metadata.kwargs["prefill_step"] + 1
-            schedule = metadata.kwargs["prefill_schedule"]
-
-            sample_prefill_token = has_text_output and (
-                step == len(schedule) - 1
-            )
-
-            if step < len(schedule):
-                # More prefill steps remaining
-                metadata.kwargs["prefill_step"] = step
-                metadata.graph_walk = schedule[step][0]
-            else:
-                # All prefill done -- transition based on target_output
-                metadata.is_prefill = False
-                target = metadata.kwargs["target_output"]
-                if target == "text":
-                    metadata.graph_walk = DECODE
-                elif target == "image":
-                    if metadata.kwargs.get("think_mode", False):
-                        # Think first: decode to generate reasoning, then
-                        # EOS triggers transition to image_gen.
-                        metadata.graph_walk = DECODE
-                    else:
-                        metadata.graph_walk = self._image_gen_walk
-        elif metadata.graph_walk == DECODE:
-            target = metadata.kwargs["target_output"]
-            if metadata.kwargs.get("think_mode", False) and target == "image":
-                # Thinking graph walk complete — transition to image generation.
-                metadata.graph_walk = self._image_gen_walk
-            else:
-                request_done = True
-
-        elif metadata.graph_walk in ("image_gen", "image_gen_cfg"):
-            # Image generation complete (one image per request), OR
-            # text generation complete (happens in a dynamic loop)
-            request_done = True
-
-        step_metadata =  self._get_step_metadata(metadata)
-        step_metadata.update(
-            self._prefill_token_metadata(sample_prefill_token, metadata.kwargs["target_output"])
-        )
-        inputs = self._get_fwd_pass_inputs(
-            metadata, persist_signals
-        )
-        unpersist_tensors = self._get_unpersist_tensors(
-            metadata.graph_walk, inputs
-        )
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
-            request_done=request_done
-        )
+        decode = WalkStep(DECODE, bind={"text_inputs": "new_token"}, step_metadata=params)
+        image_gen = WalkStep(self._image_gen_walk, step_metadata=params)
+        if target_output == "text":
+            after = [decode]
+        else:
+            after = [decode, image_gen] if think_mode else [image_gen]
+        if not schedule:
+            # a request with nothing to prefill opens on decode
+            after = [decode, *after[1:]]
+        return [
+            WalkStep(walk, bind={name: span}, step_metadata=params) for walk, name, span in schedule
+        ] + after
 
     def get_sampling_config(
         self, node_name: str,

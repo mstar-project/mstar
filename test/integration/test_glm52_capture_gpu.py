@@ -124,7 +124,7 @@ class _Node:
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True},
         )
         self.cg = None
         if capture:

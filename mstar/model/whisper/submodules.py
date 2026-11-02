@@ -752,9 +752,6 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             rows["ts_rules"] = next_rules
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
-    def _is_prefill_walk(self, walk: str) -> bool:
-        return walk in FIRST_TOKEN_WALKS
-
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
         """A stop id, on a decode step's token or on the first transcript
         token, where it ends the request (an empty transcript has no words to
@@ -766,7 +763,7 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         if walk != DECODE_WALK:
             self._record_prompt_token(request_info, token)
             return (
-                self._is_prefill_walk(walk) and token in self.stop_token_ids
+                walk in FIRST_TOKEN_WALKS and token in self.stop_token_ids
                 and not request_info.resource_configs[SAMPLER].ignore_eos
             )
         self._record(request_info, token)

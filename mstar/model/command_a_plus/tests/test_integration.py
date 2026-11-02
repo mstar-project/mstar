@@ -120,7 +120,7 @@ class ModelIntegrationTests(unittest.TestCase):
         shutil.copyfile(FIXTURE, Path(self.directory) / "config.json")
         self.model = CommandAPlusModel(self.directory)
 
-    def test_graph_resources_and_prefill_decode_transition(self):
+    def test_graph_and_resources(self):
         model = self.model
         resources = {r.resource_key: r for r in model.get_node_resources()}
         self.assertEqual(resources[LOCAL_ATTN].config.sliding_window, 4)
@@ -138,15 +138,10 @@ class ModelIntegrationTests(unittest.TestCase):
                          ("new_token", EMIT_TO_CLIENT, True, True))
         self.assertEqual(walks["decode"].name, "decode_loop")
         self.assertEqual({e.name for e in walks["decode"].section.outputs}, {"new_token", "text_inputs"})
-        seed = object()  # Metadata only; no tensor transfer in this test.
-        first = model.get_initial_forward_pass_args(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [seed]})
-        self.assertEqual(first.full_metadata.graph_walk, "prefill")
-        next_ = model.get_partition_forward_pass_args(DEFAULT_PARTITION, first.full_metadata, {"new_token": [seed]})
-        self.assertEqual(next_.full_metadata.graph_walk, "decode")
-        self.assertEqual(next_.inputs[0].tensor_info, [seed])
-        self.assertEqual(next_.unpersist_tensors, [seed])
-        self.assertTrue(model.get_partition_forward_pass_args(DEFAULT_PARTITION, next_.full_metadata, {}).request_done)
-        cfg = model.get_request_resource_configs({}, {"temperature": 0})[SAMPLER]
+        plan = model.walk_plan(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [object()]}, {})
+        self.assertEqual([(step.walk, dict(step.bind)) for step in plan],
+                         [("prefill", {}), ("decode", {"text_inputs": "new_token"})])
+        cfg = model.get_request_resource_configs([], [], {"temperature": 0})[SAMPLER]
         self.assertEqual((cfg.temperature, cfg.top_p, cfg.repetition_penalty), (0, 0.95, 1.04))
 
     def test_local_checkpoint_node_runs_prefill_and_four_decode_steps(self):
@@ -176,22 +171,14 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertEqual(len(kv.writes), 20)
 
     def test_image_requests_take_the_image_walk(self):
-        text, pixels = object(), object()
         layout = {"offset": [3], "tokens": [4], "output": ["image_embeds"], "grid": [[]]}
-        first = self.model.get_initial_forward_pass_args(
-            DEFAULT_PARTITION, ["text", "image"], ["text"], {"text_inputs": [text], "pixel_values": [pixels]},
+        plan = self.model.walk_plan(
+            DEFAULT_PARTITION, ["text", "image"], ["text"], {"text_inputs": [object()], "pixel_values": [object()]},
             {MEDIA_LAYOUT: layout},
         )
-        self.assertEqual(first.full_metadata.graph_walk, "prefill_image")
-        self.assertEqual({(e.next_node, e.name) for e in first.inputs},
-                         {("LLM", "text_inputs"), ("vision_encoder", "pixel_values")})
-        self.assertEqual(first.unpersist_tensors, [text, pixels])
+        self.assertEqual([step.walk for step in plan], ["prefill_image", "decode"])
         # what the LLM checks the encoder's rows against
-        self.assertEqual(first.step_metadata[MEDIA_LAYOUT], layout)
-        next_ = self.model.get_partition_forward_pass_args(
-            DEFAULT_PARTITION, first.full_metadata, {"new_token": [text]},
-        )
-        self.assertEqual(next_.full_metadata.graph_walk, "decode")
+        self.assertEqual(plan[0].step_metadata[MEDIA_LAYOUT], layout)
 
     def test_vision_node_loads_from_the_checkpoint_and_encodes_tiles(self):
         from mstar.model.command_a_plus.tests.test_vision import checkpoint_name, tiny_encoder

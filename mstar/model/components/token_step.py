@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, NodeInputs
@@ -21,11 +21,6 @@ class TokenStepNode:
 
     DECODE_WALK = "decode"
     DECODE_LOOP = "decode_loop"
-    # The walk that samples the first token, before DECODE_LOOP exists (see
-    # `_is_prefill_walk`). A stop there ends the partition (END_PARTITION); a
-    # stop id on any other walk outside the loop stops nothing, since the
-    # model's transition may still have a walk to run.
-    PREFILL_WALK = "prefill"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
     MAX_PREFILL_BATCH_SIZE: int | None
@@ -65,22 +60,20 @@ class TokenStepNode:
             outputs["text_inputs"] = outputs["new_token"]
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """A stop id on a prefill or decode row, or a budget of one token on a
-        prefill row. The model's loop cap (``max_tokens - 1``) ends decode on
-        budget, so a decode row checks only the id."""
+        """A stop id on a decode row or on the row that samples the request's
+        first token (its step is marked `FINAL_PREFILL`), or a budget of one
+        token on that row. Any other row outside the loop stops nothing, since
+        the plan may still have a walk to run. The model's loop cap
+        (``max_tokens - 1``) ends decode on budget, so a decode row checks only
+        the id."""
         walk = request_info.graph_walk
-        if walk != self.DECODE_WALK and not self._is_prefill_walk(walk):
+        if walk != self.DECODE_WALK and not request_info.step_metadata.get(FINAL_PREFILL, False):
             return False
         # the set test first: a stop id is rare, and the config read behind it
         # goes through the wrapper
         if token in self.stop_token_ids and not request_info.resource_configs[self.SAMPLER].ignore_eos:
             return True
         return walk != self.DECODE_WALK and request_info.max_tokens <= 1
-
-    def _is_prefill_walk(self, walk: str) -> bool:
-        """Whether ``walk`` samples the request's first token. Override for a
-        node with several prefill walks."""
-        return walk == self.PREFILL_WALK
 
     def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
         """``check_stop``'s answer for one row: a decode row stops the loop,

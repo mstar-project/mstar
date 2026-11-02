@@ -1,7 +1,8 @@
+import functools
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, NamedTuple, Type
 
@@ -11,9 +12,8 @@ import yaml
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     DEFAULT_PARTITION,
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
-    StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
@@ -28,9 +28,101 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.submodule_base import (
+    CHUNK_LOOP_END,
+    ChunkingPolicy,
+    chunk_loop_name,
+    chunk_tick_name,
+)
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
+
+
+def _wrap_node_in_loop(
+    section: GraphSection, node_name: str, graph_walk: str,
+    policy: "ChunkingPolicy",
+) -> GraphSection:
+    """``section`` with ``node_name`` wrapped in the Loop its chunks run as.
+
+    The node's real edges move onto the Loop, which is what makes a chunk's
+    output the loop's business rather than the worker's: an edge the policy
+    gathers gets every chunk's tensors at the end, and any other gets the
+    final chunk's alone, earlier ones dropped as the loop advances.
+
+    The body keeps a bare same-named edge to ``EMPTY_DESTINATION``. The Loop
+    caches by edge NAME, so the body has to emit the name for the Loop to have
+    anything to carry; the copy routes nowhere and drops every flag, since
+    persisting or counting a per-chunk tick would stage it and bill the
+    conductor for a token per chunk.
+
+    The Loop counts tokens rather than iterations: each chunk moves it by its
+    ``ChunkRange.stride``, and it ends at the prompt's length, which the
+    scheduler sets as its cap on the first chunk.
+
+    The body also routes ``chunk_tick_name`` back to itself, which is what
+    makes the next chunk a speculation target; see that function for why the
+    conductor seeds the first one. The submodule produces no tensor for it, and
+    a declared signal with no tensor still satisfies readiness, so it is free.
+    """
+    if isinstance(section, GraphNode):
+        if section.name != node_name:
+            return section
+        ticks, final, gathered = [], [], []
+        for edge in section.outputs:
+            ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
+            dest = gathered if edge.name in policy.accumulated_outputs else final
+            dest.append(edge)
+        # a misspelt name would quietly carry only the final chunk
+        unknown = policy.accumulated_outputs - {edge.name for edge in section.outputs}
+        if unknown:
+            raise ValueError(
+                f"node {node_name!r} accumulates {sorted(unknown)} in walk "
+                f"{graph_walk!r}, which are not among its outputs there"
+            )
+        tick = chunk_tick_name(node_name, graph_walk)
+        ticks.append(GraphEdge(next_node=node_name, name=tick))
+        return Loop(
+            name=chunk_loop_name(node_name, graph_walk),
+            section=replace(
+                section, outputs=ticks,
+                input_names=set(section.input_names) | {tick},
+            ),
+            max_iters=CHUNK_LOOP_END,
+            outputs=final,
+            accumulated_outputs=gathered,
+        )
+    if isinstance(section, Sequential):
+        return Sequential([
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
+        ])
+    if isinstance(section, Parallel):
+        return Parallel([
+            _wrap_node_in_loop(s, node_name, graph_walk, policy) for s in section.sections
+        ])
+    if isinstance(section, Loop):
+        # A chunkable node inside an existing Loop nests one loop in another,
+        # where the two runtimes order the completion cascade differently
+        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
+        # rather than ship a shape only one runtime gets right.
+        if node_name in section.section.get_nodes():
+            raise ValueError(
+                f"node {node_name!r} is chunkable and already inside Loop "
+                f"{section.name!r}; nested chunk loops are not supported"
+            )
+        return section
+    raise TypeError(f"cannot wrap a chunkable node in {type(section).__name__}")
+
+
+def _applying_chunking(build):
+    """A model's own ``get_graph_walk_graphs``, its result passed through
+    ``Model.apply_chunking``."""
+    @functools.wraps(build)
+    def get_graph_walk_graphs(self):
+        return self.apply_chunking(build(self))
+    get_graph_walk_graphs._applies_chunking = True
+    return get_graph_walk_graphs
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -177,6 +269,14 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
         if marked:
             keyed[key] = marked
     return keyed
+
+
+def growth_walks(model: "Model") -> frozenset[str]:
+    """The walks that grow a KV label: the conductor marks the plan step before
+    one `FINAL_PREFILL`."""
+    return frozenset(
+        walk for labels in model.kv_labels().values() for label in labels.values() for walk, _ in label.growth
+    )
 
 
 def video_metadata_dict(metadata_obj) -> dict:
@@ -404,29 +504,30 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
-@dataclass
-class ForwardPassArgs:
-    # full_metadata is at the conductor level
-    full_metadata: CurrentForwardConductorMetadata
-    inputs: list[GraphEdge]
-
-    # de_persist_tensors are tensors that will be used for the final time and
-    # not go into future graph nodes
-    unpersist_tensors: list[TensorPointerInfo]
-
-    # e.g., saw EOS or max tokens. Is used to end the request
-    request_done: bool = False
-
-    # step_metadata is at the engine / worker level; and
-    # is passed into the fwd pass
-    step_metadata: dict = field(default_factory=dict)
-
-    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
-    # partition's consumer streams
-    stream_lead_items: dict[str, int] = field(default_factory=dict)
+def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set[tuple[str, str]]:
+    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
+    edge of a connection into the walk's partition (the client's included),
+    at each node of the walk that takes it. The worker graphs and the
+    conductor's walk plans both read this, so they agree on what is streamed."""
+    partition = next(
+        (part.name for part in model.get_partitions() if graph_walk in part.graph_walks), DEFAULT_PARTITION,
+    )
+    names = {conn.edge_name for conn in model.get_partition_topology().connections if conn.to_partition == partition}
+    return {
+        (name, node.name) for node in graph.get_nodes().values() for name in names & set(node.input_names)
+    }
 
 
 class Model(ABC):
+    def __init_subclass__(cls, **kwargs):
+        # A chunkable node runs inside its chunk Loop wherever the walk graphs
+        # are read, so every model's declaration is wrapped here rather than
+        # each model having to call `apply_chunking` itself.
+        super().__init_subclass__(**kwargs)
+        build = cls.__dict__.get("get_graph_walk_graphs")
+        if build is not None and not getattr(build, "_applies_chunking", False):
+            cls.get_graph_walk_graphs = _applying_chunking(build)
+
     # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
     # Retain them locally for postprocessing, but do not send the original
     # values to the conductor alongside their tensor descriptors.
@@ -465,22 +566,12 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = DEFAULT_PARTITION
-        for part in self.get_partitions():
-            if graph_walk in part.graph_walks:
-                partition = part.name
-                break
-        input_streams = set()
-        for conn in self.get_partition_topology().connections:
-            if conn.to_partition == partition:
-                input_streams.add(conn.edge_name)
-
         return _divide_into_worker_graphs(
             graph,
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams,
+            input_streams={name for name, _ in streamed_inputs(self, graph_walk, graph)},
         )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -639,16 +730,18 @@ class Model(ABC):
 
     def get_request_resource_configs(
         self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
-        CFG, retention. The conductor resolves this once per request and the
+        CFG, retention. The conductor resolves this once per request, from the
+        request's modalities and kwargs as `walk_plan` gets them, and the
         engine hands each config to its resource at ingest.
         """
-        del model_kwargs, partition_fwd_args
+        del input_modalities, output_modalities, model_kwargs
         return {}
 
     def get_sampling_config(
@@ -666,20 +759,98 @@ class Model(ABC):
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
         )
 
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """``{node: (policy, ...)}``, each policy naming the walks it covers.
+
+        A node's prefill for a chunkable walk runs as a Loop, one iteration per
+        chunk, so the declaration has to be here rather than on the submodule:
+        the graph build reads it to wrap the node. Pass the walk dict through
+        ``get_graph_walk_graphs`` returns them wrapped (``apply_chunking``).
+        """
+        return {}
+
+    def chunking_policy_of(self) -> dict[tuple[str, str], ChunkingPolicy]:
+        """``(node, walk) -> policy``, validated."""
+        walks = self.get_graph_walk_graphs()
+        combined = self.get_combined_graph_walks()
+        out: dict[tuple[str, str], ChunkingPolicy] = {}
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: a chunking policy for node "
+                        f"{node!r} names no walks"
+                    )
+                for walk in policy.walks:
+                    # a combined walk carries a budget for the steps it batches,
+                    # and is not a walk of its own
+                    real = walk in walks and node in walks[walk].get_nodes()
+                    if not real and walk not in combined.get(node, {}):
+                        raise ValueError(
+                            f"{type(self).__name__}: chunking policy names walk "
+                            f"{walk!r}, which is neither a walk of node {node!r} "
+                            "nor a combined walk of it"
+                        )
+                    if policy.chunkable and not real:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} cannot chunk "
+                            f"combined walk {walk!r}; chunk its constituents"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} gets two "
+                            f"chunking policies for walk {walk!r}"
+                        )
+                    out[(node, walk)] = policy
+        return out
+
+    def apply_chunking(
+        self, walk_graphs: dict[str, GraphSection],
+    ) -> dict[str, GraphSection]:
+        """``get_graph_walk_graphs``'s result with every chunkable node wrapped
+        in a Loop, one iteration per chunk.
+
+        Applied to every model's ``get_graph_walk_graphs`` by ``Model``
+        itself, so a model returns its walks unwrapped. A node already in its
+        chunk Loop (a subclass building on its parent's walks) is left alone.
+        """
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.chunkable:
+                    continue
+                for walk in policy.walks:
+                    section = walk_graphs.get(walk)
+                    if section is None or chunk_loop_name(node, walk) in section.get_loops():
+                        continue
+                    walk_graphs[walk] = _wrap_node_in_loop(section, node, walk, policy)
+        return walk_graphs
+
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
 
     @abstractmethod
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        pass
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The walks ``partition_name`` runs for this request, in order, decided
+        at ingest; ``[]`` when the request doesn't use the partition.
+
+        The conductor runs the plan: it sends each step's inputs from the walk's
+        graph (see `WalkStep`), releases a persisted tensor once no later step
+        reads it, sets `FINAL_PREFILL` on the step before a walk that grows a KV
+        label, and ends the partition after the last step reports. A step whose
+        walk a stream feeds, and that is a bare node (or its chunk loop), runs
+        once per chunk until the worker reports the stream's final chunk. A
+        ``ValueError`` refuses the request with a 400, and so do a plan of
+        ``[]`` for every partition, a step whose walk is not the partition's,
+        and a ``bind`` key that is not an input of the step's walk.
+        """
 
     @abstractmethod
     def process_prompt(
@@ -991,23 +1162,3 @@ class Model(ABC):
                 producer_partitions=[],
             )
         ]
-
-    @abstractmethod
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> "ForwardPassArgs":
-        """Return the next forward pass arguments for a specific partition.
-
-        Called by the conductor after each completed forward pass to determine
-        the next graph walk, inputs, and whether the request is done.
-
-        ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions, one per stream from another
-        partition; a client stream has no entry. For single-partition models,
-        this will be ``None`` or an empty list.
-        """
-        pass

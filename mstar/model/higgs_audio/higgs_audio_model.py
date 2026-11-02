@@ -39,7 +39,6 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
-from mstar.model.base import ForwardPassArgs
 from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
 from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
@@ -146,7 +145,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         )
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         # the request knobs higgs has always read; the rest are ignored, as before
         model_kwargs = model_kwargs or {}

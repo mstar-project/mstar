@@ -317,7 +317,5 @@ def test_llm_node_caps_captures_and_names():
     ]
     walks = object.__new__(CanaryQwenModel).get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
-    # the walk names configs and metrics read; the node splices the audio only
-    # on a walk it knows as its encoder's
+    # the walk names configs and metrics read
     assert set(walks) == {PREFILL_WALK, node.DECODE_WALK} == {"prefill", "decode"}
-    assert node._is_prefill_walk(PREFILL_WALK)

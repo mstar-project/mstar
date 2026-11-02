@@ -413,10 +413,13 @@ def _window_manager(max_num_pages: int = 32, joint_comm_group=None, config: dict
     )
 
 
-def _grow_writing(m: KVManager, rid: str, start: int, span: int) -> None:
-    """One step of ``span`` tokens whose K, in every layer, is the token's position."""
+def _grow_writing(m: KVManager, rid: str, start: int, span: int, after: int = 0) -> None:
+    """One step of ``span`` tokens whose K, in every layer, is the token's position; ``after``
+    is what a chunked prompt runs after this step (``StepContext.chunk_tokens_after``)."""
     step = KVStep(segments=(Segment(rid, "main", span),))
     ctx = _ctx(rid)
+    if after:
+        ctx.chunk_tokens_after = {rid: after}
     assert m.admit(step, ctx).ok
     m.plan(step, ctx)
     k = torch.arange(start, start + span, dtype=torch.float32)[:, None, None].expand(span, 1, 4)
@@ -460,6 +463,27 @@ def test_sliding_layers_keep_a_window() -> None:
         assert _held_positions(m, window, layer, page_size) == list(range(window.released, total))
     m.remove_request("r")
     assert m._arena.num_free == free
+
+
+def test_a_chunked_prompt_reserves_its_prefill_in_every_group() -> None:
+    """A prompt cut into chunks reserves its whole prefill on its first chunk in each group, as
+    one unchunked step would, so no later chunk takes a page; the sliding layers, written chunk
+    by chunk, still keep the newest tokens."""
+    m = _window_manager()
+    m.ingest_request("r")
+    total, chunk = 48, 16
+    page_size = m.config.groups[1].page_size
+    for start in range(0, total, chunk):
+        _grow_writing(m, "r", start, chunk, after=total - start - chunk)
+        st = _stream(m, "r")
+        window = st.groups[1]
+        # every token of the prompt has a page from the first chunk on, less what the window let go
+        assert len(st.page_indices) == total // PS
+        assert len(window.page_indices) + window.released // page_size == total // page_size
+    assert _held_positions(m, st, 0, PS) == list(range(total))
+    for layer in SLIDING:
+        assert _held_positions(m, window, layer, page_size) == list(range(window.released, total))
+    m.assert_pages_conserved()
 
 
 def test_a_window_pool_holds_the_bytes_of_max_num_pages() -> None:

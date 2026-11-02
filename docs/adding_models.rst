@@ -42,20 +42,16 @@ One vocabulary note for this page. A **tensor bundle** routed between nodes is a
 usually has length 1.
 
 The diagram below shows the request flow at the conductor and model level. Its
-granularity is one graph walk. The conductor is notified when a walk completes, and only
-then asks the model what to do next. Everything that happens inside a walk is described
-in later steps and is omitted here::
+granularity is one graph walk. The model decides at ingest which walks a request runs; the
+conductor runs them in order, moving on as each walk completes. Everything that happens
+inside a walk is described in later steps and is omitted here::
 
    process_prompt()              # text/media -> initial tensors
         │
         ▼
-   get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
+   walk_plan()                   # per partition: the walks to run (e.g. prefill, decode)
         │
-        ▼   (conductor walks the graph, the engine runs each node)
-   get_partition_forward_pass_args() # asked after each graph walk completes:
-                                     #   what's next? done?
-        │
-        ▼
+        ▼   (conductor sends each walk its inputs, the engine runs each node)
    postprocess()                 # model output tensor -> bytes for the client
 
 What you will create
@@ -156,15 +152,29 @@ You must implement these abstract methods:
    separately. :mod:`mstar.model.multimodal` turns either into the prefill plan
    that ``process_prompt`` and the schedule builder both work from.
 
-``get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None) -> ForwardPassArgs``
-   Build the first :class:`mstar.model.base.ForwardPassArgs` for a partition. It names
-   the graph walk to start on and the input edges that feed it.
-
-``get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals, incoming_connections=None) -> ForwardPassArgs``
-   The conductor calls this after each graph walk completes. It returns the next walk,
-   the inputs for that walk, and whether the request is finished
-   (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
-   once, then repeats the decode walk until EOS.
+``walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs) -> list[WalkStep]``
+   The walks a partition runs for this request, in order, as
+   :class:`mstar.model.base.WalkStep` s; ``[]`` when the request doesn't use the
+   partition. A prefill-decode model returns
+   ``[WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]``.
+   The conductor derives each step's input edges from the walk's graph: every external
+   and loop-back input that no stream feeds gets the persisted signal of its own name,
+   the one ``bind`` names, or an empty edge (a denoise loop's seed, a chunk loop's tick).
+   A persisted tensor a step reads is released when the step is sent, unless a later step
+   of some partition reads it with no walk of that partition persisting the name in
+   between; anything else stays held until the request ends. ``step_metadata`` carries
+   request constants to every node of the step's walk. The conductor sets
+   ``FINAL_PREFILL`` (from ``mstar.conductor.request_info``) in the step metadata of a
+   step whose next step's walk grows a KV label (``KVLabel.growth``): the step that
+   samples the first token. The decode walk of a token decoder (``TokenStepNode``) must
+   therefore grow one; the worker checks this when it loads the node.
+   A step whose walk a stream feeds and that is a bare node runs once per chunk until the
+   worker reports the stream's final chunk; any other step advances when its walk
+   reports, and the partition is done after its last step. A ``ValueError`` here refuses
+   the request with a 400, and so do a plan of ``[]`` for every partition (nothing would
+   ever run), a step whose walk is not one of its partition's, and a ``bind`` key that
+   is not an input of the step's walk. Qwen3.5 (through ``MultimodalDecoderModel``),
+   Z-Image, Orpheus and Chatterbox are references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
@@ -208,18 +218,19 @@ You must implement these abstract methods:
 .. note::
 
    The metadata ``process_prompt`` returns is laid over the request's own
-   ``model_kwargs``, so a key the model reads back there (a prompt layout, a
-   stream lead) must be set in every mode and listed in ``INTERNAL_KWARGS``: the
-   data worker drops a client's value for it before ``process_prompt``. Qwen3-TTS
-   lists its prompt layout, speaker, language, clip digest and codec stream lead.
+   ``model_kwargs``, so a key the model reads back there (a prompt layout) must be
+   set in every mode and listed in ``INTERNAL_KWARGS``: the data worker drops a
+   client's value for it before ``process_prompt``. Qwen3-TTS lists its prompt
+   layout, speaker, language and clip digest.
 
 .. note::
 
-   The conductor merges each walk's ``ForwardPassArgs.step_metadata`` into the
-   request's ``metadata.kwargs``, so a request fact stored under a key that a
-   later walk's step metadata also uses is overwritten by that walk's value. Keep
-   such facts under their own key: LTX-2.5 nests the request's geometry under
-   ``kwargs["request"]``, since its stage-1 walk sends a half-size ``height``.
+   A stream that starts with context-only items (a voice clone's reference frames)
+   says so in the metadata as ``"stream_lead_items": {edge: n}``: ``edge`` names a
+   streaming ``Connection``, and ``n``, at most that edge's policy's left context,
+   leads the first window as context and is never output. Leave the key out when
+   ``n`` is 0. The data worker drops a client's value, and the consumer partition's
+   workers prime the stream with it (Qwen3-TTS, VoxCPM2).
 
 The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
@@ -259,12 +270,12 @@ differ per request, such as sampling parameters and the set of cache labels a re
 uses, come from a separate method::
 
    get_request_resource_configs(
-       self, partition_fwd_args: dict[str, ForwardPassArgs],
-       model_kwargs: dict | None = None,
+       self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
    ) -> dict[str, ResourceReqConfig]
 
 The returned dict is keyed by ``resource_key``. The conductor calls this method once per
-request, and the engine passes each config to its resource when the request is ingested.
+request, with the request's modalities and kwargs as ``walk_plan`` gets them, and the
+engine passes each config to its resource when the request is ingested.
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
@@ -304,8 +315,7 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 
 .. code-block:: python
 
-   def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-       model_kwargs = model_kwargs or {}
+   def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
        return {
            SAMPLER: SamplingReqConfig(
@@ -1122,7 +1132,20 @@ methods are:
    ``declare_step`` needs a value that ``forward`` does not use, put that value in
    ``resource_step_info``.
 
-``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, **kwargs) -> SubmoduleStep | None``
+``get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None`` (optional)
+   Return the length of the row's whole input, before any cached prefix is cut --
+   the engine subtracts what the prefix cache already holds. Return ``None`` for a
+   walk that declares no length, or when the inputs it would measure are absent.
+   Read off input shapes alone: this runs before ``prepare_inputs``.
+
+``speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len) -> int | None`` (optional)
+   Estimate the length of a row continuing from the step in flight, before that step's
+   outputs reach it; ``prev_seq_len`` is its length in that step, or -1 if it ran on
+   another node. The default repeats ``prev_seq_len``. Only an estimate: it sizes the
+   token budget left for the rows a speculation merges in beside it. A walk with a fixed
+   length (one token a decode step) should return it.
+
+``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, per_request_info=None, **kwargs) -> SubmoduleStep | None``
    Declare what this batch's step does to the node's resources. See
    `Step 4a — Declare the step`_ below.
 
@@ -1182,7 +1205,7 @@ methods are:
    there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
    the worker reports the partition done with that pass, and the conductor ends it rather
    than start decode. Return it only from a row outside any loop; from inside one the
-   request fails. ``TokenStepNode`` does this for its ``PREFILL_WALK``. It suits a partition
+   request fails. ``TokenStepNode`` does this for the step marked ``FINAL_PREFILL``. It suits a partition
    with nothing left to run once generation stops: a model that runs another walk after its
    loop (an ``align`` walk, or image generation after thinking) or publishes final-only
    state at the loop's stop needs its own transition instead. Keep ``check_stop_batched``,
@@ -1230,6 +1253,48 @@ methods are:
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
+
+**Chunked prefill (optional).** A walk with long prompts can run each across several steps,
+at most a token budget per step, so the decode rows batched beside it keep running. Each
+chunk is one iteration of a Loop around the node, which counts the tokens its chunks ran
+and ends at the prompt's length. To opt a walk in:
+
+- ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
+  naming the ``walks`` it covers. It is declared on the model, not the submodule, because
+  the graph build reads it: ``Model`` wraps each chunkable node in its Loop wherever
+  ``get_graph_walk_graphs`` is read, so the model returns its walks as usual. The fields:
+
+  - ``chunkable=True`` lets the walk's rows be cut.
+  - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
+    chunked rows sets one too, since its steps run under it.
+  - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
+    one item per chunk. Any other edge carries the final chunk's output alone.
+  - ``reuses_cached_prefix``: a callable saying whether a row may start past its cached
+    prefix; ``None`` (the default) is always. Set it where a row may have to write its
+    prefix again.
+  - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
+    whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
+    a walk whose state grows by something other than the tokens a step runs.
+
+  A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
+  (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
+  joins the pieces into that item. Leave it unset for a consumer that can take the
+  pieces as they come.
+- ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
+  input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
+  row whose prepared input turns out another length fails.
+- ``split_inputs(graph_walk, fwd_info, inputs, start, end)`` cuts the whole prepared input
+  to tokens ``[start, end)``. ``ARNodeSubmodule``'s default cuts the token ids or
+  embeddings and any custom position ids, and refuses inputs it cannot see into
+  (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
+
+Each chunk is a full forward, so it samples a token, but only the final chunk's token is
+real (``inputs.is_final_chunk``). The model need not handle that: the sampler commits no
+RNG offset or seen token for a row mid-prefill (it reads ``StepContext.chunk_tokens_after``),
+the Loop carries only the final chunk's outputs, and the worker takes no stop or prefix
+key from a non-final chunk. ``test/modular/test_chunked_prefill.py`` and
+``test/modular/test_bagel_chunked_prefill.py`` show how to test a chunking model. A
+deployment can change the budgets (see *Chunked prefill budgets* in :doc:`serving`).
 
 .. _Step 4a — Declare the step:
 
@@ -1515,7 +1580,7 @@ optional. For an autoregressive node, you normally want both. These two mechanis
 the most detailed rules in the submodule interface, so they are described here separately.
 
 **Continuous batching.** The worker's micro-scheduler groups compatible in-flight requests
-into one GPU call. A submodule controls this behavior with three methods:
+into one GPU call. A submodule controls this behavior with these methods:
 
 - ``can_batch(self, batch: ExecutingBatch, model_inputs) -> bool`` returns whether these
   requests can share one forward pass. The default is ``False``, which disables batching.
@@ -1526,6 +1591,16 @@ into one GPU call. A submodule controls this behavior with three methods:
   When a batch runs, the engine calls this method instead of the single-request
   ``forward``.
 - ``max_batch_size(self, graph_walk)`` sets an optional upper limit.
+- ``step_order(self, graph_walk) -> StepOrder`` says who runs first when more rows are ready
+  than ``max_batch_size`` allows. The default, ``StepOrder.ARRIVAL``, is first come, first served
+  to completion: the requests holding the step keep it, then the request that arrived first.
+  ``StepOrder.TURNS`` is longest-waiting first: a request that just ran gives way to one that
+  waited, so a node capped at one row advances its requests a step each in rotation. Declare it
+  on a walk whose sessions have to keep moving while others run, as LingBot's rollout and
+  Cosmos3's chained windows do. A combined walk takes turns if any of its walks does. The order
+  applies to the rows a speculation chain continues, the backlog and the queued rows alike; when
+  every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
+  last in that same line.
 
 .. _combined-walks:
 
@@ -2186,9 +2261,10 @@ config never routes requests to them.
 **Per-request resources.** Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
 BAGEL's ``get_request_resource_configs`` therefore returns a ``KVReqConfig`` that names
-the active labels per node and walk, together with a ``SamplingReqConfig``. A request with
-guidance disabled names only ``"main"``, so a PD-disaggregated transfer copies only that
-stream.
+the active labels per node and walk, together with a ``SamplingReqConfig``. It settles
+guidance from the request's modalities and kwargs as its ``walk_plan`` does (an edit, image
+in and image out, defaults to image guidance). A request with guidance disabled names only
+``"main"``, so a PD-disaggregated transfer copies only that stream.
 
 The ``LLM`` node is deliberately coarse. It contains the text embedding, the lm_head and
 the flow projection. These always run on the same GPU, so splitting them into separate
@@ -2259,15 +2335,19 @@ KV cache, but samples no token, so it does not produce ``new_token``. The edge i
 in the graph because understanding requests need it. Treat declared edges as the possible
 outputs, and let the submodule decide which of them are produced on each step.
 
-**Choosing the walk per request.** BAGEL's transitions are driven by a schedule, unlike
-those of Orpheus. The output modality is known in advance from the request's
-``output_modalities``. ``get_initial_forward_pass_args`` therefore builds a prefill
-schedule, by iterating over the interleaved text and image inputs, and
-``get_partition_forward_pass_args`` advances through that schedule. It then transitions to
-``decode`` for text output, or to ``image_gen`` for image output. In ``think_mode``, the
-model first decodes a reasoning trace, and the EOS token then triggers the transition to
-``image_gen``. These are the same two methods that Orpheus implements. BAGEL only encodes
-a more complex state machine in them.
+**Choosing the walks per request.** BAGEL's plan follows a schedule, unlike Orpheus's two
+fixed steps. The output modality is known in advance from the request's
+``output_modalities``, so ``walk_plan`` builds the prefill schedule by iterating over the
+interleaved text and image inputs, one walk per text span or image, and then adds
+``decode`` for text output or ``image_gen`` for image output. In ``think_mode`` the model
+first decodes a reasoning trace, so the plan runs ``decode`` and then ``image_gen``.
+
+Each prefill walk reads one span, so ``process_prompt`` hands every span over as a signal
+of its own with :func:`mstar.model.multimodal.split_spans` (``text_inputs.0``,
+``image_inputs.0``, ...), and each step binds its walk's input to one:
+``WalkStep("prefill_text", bind={"text_inputs": "text_inputs.1"})``. An ids span keys the
+entry its ``source`` names, so ``split_spans`` renames the KV layout's ids-span sources to
+match. This is the same method Orpheus implements; BAGEL's plan is only longer.
 
 **Step 4 — Submodules.** Each node maps to a ``NodeSubmodule`` in ``bagel/submodules.py``:
 ``ViTEncoderSubmodule``, ``VAEEncoderSubmodule``, ``LLMSubmodule`` and
@@ -2472,8 +2552,8 @@ Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder
 
 The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
 which declares the walks (``media_walks(max_iters, encoders)`` and
-``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
-through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
+``text_combined_walks()``), plans the one prefill walk ``media_prefill_step`` picks
+and then decode (``walk_plan``), decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
 also the request's output budget), the KV label and its one-span layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
@@ -2544,6 +2624,9 @@ only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model
 calls it something other than ``prefill_<name>`` (the Cosmos3 reasoner's
 ``reasoner_prefill_vision``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
+It reports a text prompt's length and a decode row's one token
+(``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text
+prefill by declaring ``get_chunking_policies`` alone, as Qwen3.5 does.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image
@@ -2586,10 +2669,12 @@ Override these methods:
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
-The consuming partition's ``get_partition_forward_pass_args`` reads
-``incoming_connections``, which provides token counts and a ``producer_done`` flag for
-each stream from another partition, and uses them to decide when to run. A stream from the
-client (below) has no entry there.
+A consuming partition's plan needs nothing about the stream. A step whose walk a stream
+feeds, and that is a bare node (or its chunk loop), runs once per chunk the stream brings,
+and the partition ends when the worker reports the pass that consumed the stream's final
+chunk. For a stream from another partition, the conductor tells the consumer
+``producer_done`` once the producer partition is done; the data worker ends a stream from
+the client (below) itself.
 
 Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
 later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
@@ -2622,8 +2707,9 @@ context is reused across calls, so a hook must not keep it.
 
 Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
 ``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
-ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
-``talker_last_prefill`` has run.
+ones run ``talker_decode``. Its plan lists the three walks. The conductor follows the walk
+each pass reports and enters the next step only to send it something, so it feeds
+``talker_decode`` its first input once ``talker_last_prefill`` has run.
 
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -2643,7 +2729,8 @@ producer ``CLIENT``:
 ``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
 ``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
 chunk policy, exactly as it would a stream from another partition. Its partition
-self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+self-triggers from the stream, and the conductor sends its walk none of the streamed
+input. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
 that the model implements ``process_stream_chunk``. A partition may take several client
 streams (audio and video, say): each has its own buffer and its own end.
@@ -2699,8 +2786,7 @@ Checklist
          [ ] get_node_resources
          [ ] get_graph_walk_graphs
          [ ] process_prompt
-         [ ] get_initial_forward_pass_args
-         [ ] get_partition_forward_pass_args
+         [ ] walk_plan
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs

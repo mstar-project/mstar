@@ -159,9 +159,13 @@ def _old_process_prompt(model, prompt, input_modalities):
 
 
 def _new_text_inputs(model, prompt, input_modalities, prompt_parts=None):
-    return model.process_prompt(
+    tensors = model.process_prompt(
         prompt, input_modalities, ["text"], prompt_parts=prompt_parts,
-    ).new_input_tensors["text_inputs"]
+    ).new_input_tensors
+    spans = []
+    while f"text_inputs.{len(spans)}" in tensors:
+        spans += tensors[f"text_inputs.{len(spans)}"]
+    return spans
 
 
 def _ids(segments):
@@ -362,9 +366,8 @@ def test_schedule_matches_the_spans(model):
     mods = ["image", "text", "image"]
     spans = _new_text_inputs(model, "Between.", mods)
     signals = {
-        "text_inputs": [f"t{i}" for i in range(len(spans))],
-        "pixel_values": ["px0", "px1"],
-        "image_grid_thw": ["g0", "g1"],
+        **{f"text_inputs.{i}": [f"t{i}"] for i in range(len(spans))},
+        "pixel_values.0": ["px0"], "pixel_values.1": ["px1"], "image_grid_thw.0": ["g0"], "image_grid_thw.1": ["g1"],
     }
     schedule = model._build_thinker_prefill_schedule(mods, signals)
     assert [walk for walk, _ in schedule] == [

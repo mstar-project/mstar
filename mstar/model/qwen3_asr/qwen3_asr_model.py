@@ -47,7 +47,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.model.base import ForwardPassArgs, TensorAndMetadata
+from mstar.model.base import TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
@@ -169,10 +169,9 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         kw = checked_request_kwargs(model_kwargs)
         return {
             SAMPLER: SamplingReqConfig(

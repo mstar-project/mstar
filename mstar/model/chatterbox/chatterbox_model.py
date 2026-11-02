@@ -39,11 +39,7 @@ import torch
 
 from mstar.api_server.media_io import check_resample_rate
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -59,7 +55,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata, WalkStep
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.config import (
     COND_LABEL,
@@ -128,7 +124,7 @@ MIN_REPETITION_PENALTY = 1e-5
 
 class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
-    per-partition state machine. No GPU compute lives here."""
+    per-partition walk plans. No GPU compute lives here."""
 
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
@@ -340,11 +336,9 @@ class ChatterboxModel(Model):
         ]
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         knobs = self.resolve_generation_kwargs(model_kwargs)
         labels = [COND_LABEL, UNCOND_LABEL] if knobs["cfg_weight"] > 0 else [COND_LABEL]
         return {
@@ -710,122 +704,32 @@ class ChatterboxModel(Model):
         return self.tokenizer(prompt)
 
     # -----------------------------------------------------------------------
-    # Conductor state machine
+    # Walk plan
     # -----------------------------------------------------------------------
 
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata, keys) -> dict[str, Any]:
-        step = {k: metadata.kwargs[k] for k in keys}
-        step["is_prefill"] = metadata.is_prefill
-        return step
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         knobs = self.resolve_generation_kwargs(model_kwargs)
         has_voice = bool(input_signals.get(REF_AUDIO))
-        wants_audio = "audio" in output_modalities
-
+        if "audio" not in output_modalities:
+            return []
         if partition_name == T3_PARTITION:
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="prefill_voice" if has_voice else "prefill",
-                is_prefill=True,
-                kwargs={k: knobs[k] for k in _T3_KNOBS},
-            )
-            names = [TEXT_INPUTS] + ([REF_AUDIO, VOICE_KEY] if has_voice else [])
-            targets = {TEXT_INPUTS: T3_NODE, REF_AUDIO: VOICE_ENCODER_NODE, VOICE_KEY: VOICE_ENCODER_NODE}
-            inputs = []
-            for name in names:
-                edge = GraphEdge(next_node=targets[name], name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                # the text is read once; the reference clip stays persisted for S3Gen
-                unpersist_tensors=list(input_signals.get(TEXT_INPUTS, [])),
-                request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _T3_KNOBS),
-            )
-
+            t3 = {k: knobs[k] for k in _T3_KNOBS}
+            return [
+                WalkStep("prefill_voice" if has_voice else "prefill", step_metadata=t3),
+                WalkStep("decode", bind={PREV_TOKEN: SPEECH_TOKENS}, step_metadata=t3),
+            ]
         if partition_name == S3GEN_PARTITION:
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="s3gen_chunk_voice" if has_voice else "s3gen_chunk",
-                is_prefill=False,
-                kwargs={k: knobs[k] for k in _S3GEN_KNOBS},
-            )
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=self._s3gen_voice_inputs(input_signals) if has_voice else [],
-                unpersist_tensors=[],
-                request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _S3GEN_KNOBS),
-            )
-        raise ValueError(f"Unknown Chatterbox partition {partition_name!r}")
-
-    @staticmethod
-    def _s3gen_voice_inputs(
-        signals: dict[str, list[TensorPointerInfo]], with_tensors: bool = True,
-    ) -> list[GraphEdge]:
-        """The reference clip and its key for the S3Gen node. A stream consumer
-        with non-stream inputs fires once those are in, so the edges accompany
-        every chunk; the tensors themselves ride only with the first forward
-        (``with_tensors``), later chunks carry signal-only edges and the node
-        reuses the reference it conditioned on. Signal-only edges never touch
-        the transport, so the extra handshake the conductor issues after the
-        final chunk cannot race the request's teardown."""
-        inputs = []
-        for name in (REF_AUDIO, VOICE_KEY):
-            edge = GraphEdge(next_node=S3GEN_NODE, name=name)
-            edge.tensor_info = list(signals.get(name, [])) if with_tensors else []
-            inputs.append(edge)
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == T3_PARTITION:
-            if partition_metadata.is_prefill:
-                partition_metadata.is_prefill = False
-                partition_metadata.graph_walk = "decode"
-                edge = GraphEdge(next_node=T3_NODE, name=PREV_TOKEN)
-                edge.tensor_info = persist_signals.get(SPEECH_TOKENS, [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._step_metadata(partition_metadata, _T3_KNOBS),
-                )
-            if partition_metadata.graph_walk == "decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata, inputs=[],
-                    unpersist_tensors=[], request_done=True,
-                )
-            raise ValueError(f"T3 in unexpected walk {partition_metadata.graph_walk!r}")
-
-        if partition_name == S3GEN_PARTITION:
-            inputs = []
-            if partition_metadata.graph_walk == "s3gen_chunk_voice":
-                inputs = self._s3gen_voice_inputs(persist_signals, with_tensors=False)
-            return ForwardPassArgs(
-                full_metadata=partition_metadata,
-                inputs=inputs,
-                unpersist_tensors=[],
-                step_metadata=self._step_metadata(partition_metadata, _S3GEN_KNOBS),
-            )
+            # The voice walk's reference clip and key ride every chunk's pass, so
+            # the node is ready for it; the tensors only the first one's.
+            walk = "s3gen_chunk_voice" if has_voice else "s3gen_chunk"
+            return [WalkStep(walk, step_metadata={k: knobs[k] for k in _S3GEN_KNOBS})]
         raise ValueError(f"Unknown Chatterbox partition {partition_name!r}")
 
     # -----------------------------------------------------------------------

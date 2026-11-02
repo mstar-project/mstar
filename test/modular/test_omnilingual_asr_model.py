@@ -596,11 +596,6 @@ def test_graph_is_one_stateless_node(tiny_model):
     node = walks[TRANSCRIBE_WALK]
     assert node.name == ENCODER_NODE and node.input_names == {WAVEFORM}
     assert [(e.name, e.output_modality) for e in node.outputs] == [(TOKEN_IDS, "text")]
-    fwd = tiny_model.get_initial_forward_pass_args("default", ["audio"], ["text"], {WAVEFORM: []})
-    assert fwd.full_metadata.graph_walk == TRANSCRIBE_WALK and not fwd.request_done
-    assert [e.name for e in fwd.inputs] == [WAVEFORM]
-    done = tiny_model.get_partition_forward_pass_args("default", fwd.full_metadata, {})
-    assert done.request_done
     assert tiny_model.get_autocast_dtype() == torch.float32
 
 

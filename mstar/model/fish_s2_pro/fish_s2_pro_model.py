@@ -37,11 +37,7 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -56,7 +52,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata, WalkStep
 from mstar.model.fish_s2_pro.config import (
     ALLOWED_TEXT_SPECIAL_TOKENS,
     AR_ATTN,
@@ -390,114 +386,44 @@ class FishS2ProModel(Model):
         return ProcessPromptOutput({"prompt_ids": [torch.tensor(ids, dtype=torch.long)]}, metadata)
 
     # -----------------------------------------------------------------------
-    # Conductor partition state machine
+    # Walk plan
     # -----------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """AR prefills (a clone through the RefEncoder first), then decodes; the
+        Codec runs a window per stream chunk."""
         if partition_name == "AR":
+            max_tokens = self.get_max_output_tokens(**model_kwargs)
+            if "audio" not in output_modalities:
+                return []
             clone = "audio" in input_modalities
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="ar_prefill_clone" if clone else "ar_prefill",
-                is_prefill=True,
-                kwargs={"ar_max_tokens": self.get_max_output_tokens(**model_kwargs)},
-            )
-            routes = [(name, "AR") for name in self.PREFILL_INPUTS]
-            step_metadata = {**self._ar_step_metadata(metadata), PROMPT_LAYOUT_KEY: model_kwargs[PROMPT_LAYOUT_KEY]}
+            prompt = {PROMPT_LAYOUT_KEY: model_kwargs[PROMPT_LAYOUT_KEY]}
             if clone:
-                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
-                step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
-            inputs = []
-            for name, node in routes:
-                edge = GraphEdge(next_node=node, name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
-                request_done="audio" not in output_modalities,
-                step_metadata=step_metadata,
-            )
+                prompt[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
+            prefill = WalkStep("ar_prefill_clone" if clone else "ar_prefill", step_metadata=prompt)
+            # the prefill samples the first frame, and a stop from it is dropped
+            # (the decode loop isn't in its walk), so one frame ends there
+            return [prefill, WalkStep("ar_decode")] if max_tokens > 1 else [prefill]
         if partition_name == "Codec":
-            return ForwardPassArgs(
-                full_metadata=CurrentForwardConductorMetadata(
-                    input_modalities=input_modalities,
-                    output_modalities=output_modalities,
-                    graph_walk="codec_chunk",
-                    is_prefill=False,
-                ),
-                inputs=[],
-                unpersist_tensors=[],
-                request_done="audio" not in output_modalities,
-            )
+            return [WalkStep("codec_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown Fish S2-Pro partition: {partition_name!r}")
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == "AR":
-            if partition_metadata.graph_walk in ("ar_prefill", "ar_prefill_clone"):
-                if partition_metadata.kwargs["ar_max_tokens"] <= 1:
-                    # the prefill sampled the only frame allowed; a stop from prefill is dropped
-                    return ForwardPassArgs(
-                        full_metadata=partition_metadata,
-                        inputs=[],
-                        unpersist_tensors=list(persist_signals.get("ar_input_embeds", [])),
-                        request_done=True,
-                    )
-                partition_metadata.graph_walk = "ar_decode"
-                partition_metadata.is_prefill = False
-                edge = GraphEdge(next_node="AR", name="ar_input_embeds")
-                edge.tensor_info = persist_signals.get("ar_input_embeds", [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._ar_step_metadata(partition_metadata),
-                )
-            if partition_metadata.graph_walk == "ar_decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-            raise ValueError(f"AR entered an unexpected graph walk: {partition_metadata.graph_walk!r}")
-        if partition_name == "Codec":
-            partition_metadata.graph_walk = "codec_chunk"
-            return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[])
-        raise ValueError(f"Unknown Fish S2-Pro partition: {partition_name!r}")
-
-    @staticmethod
-    def _ar_step_metadata(metadata: CurrentForwardConductorMetadata) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill}
 
     # -----------------------------------------------------------------------
     # Sampling and output encoding
     # -----------------------------------------------------------------------
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Semantic-code sampling; ``do_sample=False`` is greedy. Residual codebooks are argmax."""
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         generation = self.config.generation
         temperature = model_kwargs.get("temperature", generation.temperature)

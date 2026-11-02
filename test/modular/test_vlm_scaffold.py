@@ -9,21 +9,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.request_info import WalkStep
 from mstar.graph.base import Parallel
 from mstar.model.keys import MIXED, ROPE, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
-    PrefillStep,
     expand_media_pads,
-    initial_prefill_args,
     media_layout,
     media_prefill_step,
     media_walk_names,
     media_walks,
-    next_prefill_args,
     vision_encoder,
-    walk_input_edges,
 )
 
 IMAGE_PAD, VIDEO_PAD, AUDIO_PAD = 90, 91, 80
@@ -117,8 +114,7 @@ def _signals(**counts: int) -> dict[str, list[str]]:
 
 def test_a_text_prompt_is_one_prefill_text_walk():
     signals = _signals(text_inputs=1)
-    step = media_prefill_step(signals, [VISION], model_name="m")
-    assert step == PrefillStep("prefill_text", {("LLM", "text_inputs"): ["text_inputs0"]})
+    assert media_prefill_step(signals, [VISION], model_name="m") == WalkStep("prefill_text")
     # encoder inputs with no layout to place them by are refused, not dropped
     with pytest.raises(ValueError, match="no media layout"):
         media_prefill_step(_signals(text_inputs=1, pixel_values=1), [VISION], model_name="m")
@@ -135,32 +131,7 @@ def test_a_media_prompt_is_one_walk_over_the_encoders_it_needs(counts, walk):
     # the layout's runs name the encoders, as they do the KV layout's walk
     layout = {"offset": [3] * len(counts), "output": [encoder[name].output for name in counts]}
     step = media_prefill_step(signals, [VISION, AUDIO], layout, model_name="m")
-    assert step.walk == walk and step.metadata == {MEDIA_LAYOUT: layout}
-    edges = {(e.next_node, e.name): e.tensor_info for e in walk_input_edges(step)}
-    assert edges == {
-        ("LLM", "text_inputs"): ["text_inputs0"],
-        **{(encoder[name].node, name): signals[name] for name in counts},
-    }
-
-
-def test_the_walks_run_the_prefill_then_decode_then_finish():
-    signals = _signals(text_inputs=1)
-    first = initial_prefill_args(media_prefill_step(signals, [VISION], model_name="m"), ["text"], ["text"])
-    assert first.step_metadata == {"is_prefill": True}
-    meta = first.full_metadata
-    assert meta.graph_walk == "prefill_text"
-    decode = next_prefill_args(meta, {"new_token": ["tok"]})
-    assert meta.graph_walk == "decode" and not meta.is_prefill
-    assert [(e.next_node, e.name, e.tensor_info) for e in decode.inputs] == [("LLM", "text_inputs", ["tok"])]
-    assert next_prefill_args(meta, {}).request_done
-
-
-def test_a_media_walk_carries_its_layout_in_step_metadata():
-    signals = _signals(text_inputs=1, pixel_values=1)
-    layout = {"offset": [1], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
-    step = media_prefill_step(signals, [VISION], layout, model_name="m")
-    first = initial_prefill_args(step, ["image", "text"], ["text"])
-    assert first.step_metadata == {"is_prefill": True, MEDIA_LAYOUT: layout}
+    assert step == WalkStep(walk, step_metadata={MEDIA_LAYOUT: layout})
 
 
 @pytest.mark.parametrize(("texts", "match"), [(0, "nothing to prefill"), (2, "2 text tensors")])
@@ -253,7 +224,6 @@ def test_a_node_keeps_its_walk_name_and_can_capture_decode_only():
         llm, SimpleNamespace(embed_dtype=torch.bfloat16), SimpleNamespace(hidden_size=8, stop_token_ids=()), (named,),
     )
     assert [c.capture_graph_walk for c in llm.get_accelerator_graph_configs(torch.device("cpu"))] == ["decode"]
-    assert llm._is_prefill_walk("prefill")
 
 
 def test_a_media_only_model_has_no_text_walk_mixed_step_or_prefix_keys():

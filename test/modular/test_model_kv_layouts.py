@@ -94,19 +94,10 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     cfg = model.config
     images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
     out = model.process_prompt(prompt, input_modalities, output_modalities, tensors={"image_inputs": images}, **kwargs)
-    tensors = {"text_inputs": out.new_input_tensors.get("text_inputs", []),
-               "image_inputs": out.new_input_tensors.get("image_inputs", images)}
+    tensors = out.new_input_tensors
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
-    fwd = model.get_initial_forward_pass_args(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
-    metadata = fwd.full_metadata
-    by_uuid = {id(t): t for by_name in tensors.values() for t in by_name}
-    later = []
-    while not model.get_partition_forward_pass_args(DEFAULT_PARTITION, metadata, {}).request_done:
-        if not metadata.is_prefill:
-            later.append(metadata.graph_walk)
-            if metadata.graph_walk in ("image_gen", "image_gen_cfg"):
-                break
-    config = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, kwargs)["kv"]
+    plan = model.walk_plan(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
+    config = model.get_request_resource_configs(input_modalities, output_modalities, kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
     config.apply_conductor_config(
         kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"]["kv"].items()},
@@ -116,27 +107,31 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
         SimpleNamespace(posterior_noise=lambda *args, **kw: None), None, None, None, latent_patch_size=1,
         latent_channel=16, latent_downsample=cfg.latent_downsample, max_latent_size=cfg.max_latent_size,
     )
-    preprocess = metadata.kwargs["image_preprocess"]
+    params = plan[0].step_metadata
+    preprocess = params["image_preprocess"]
+    latents = (params["height"] // cfg.latent_downsample) * (params["width"] // cfg.latent_downsample)
     walks = []
-    for walk, info in metadata.kwargs["prefill_schedule"]:
-        tensor = by_uuid[info.uuid]
-        if walk == "prefill_text":
-            walks.append((walk, tensor.numel()))
-        elif walk == "prefill_vit":
+    for step in plan:
+        if step.walk == "decode":
+            walks += [(step.walk, 1)] * cap
+            continue
+        if step.walk in ("image_gen", "image_gen_cfg"):
+            walks += [(step.walk, latents + IMAGE_SENTINELS)] * 3
+            continue
+        (tensor,) = tensors[next(iter(step.bind.values()))]
+        if step.walk == "prefill_text":
+            walks.append((step.walk, tensor.numel()))
+        elif step.walk == "prefill_vit":
             patches = vit_patches(
                 *tensor.shape[-2:], vit_preprocess(preprocess), cfg.vit_config.patch_size,
                 cfg.vit_max_num_patch_per_side,
             )
-            walks.append((walk, patches + IMAGE_SENTINELS))
+            walks.append((step.walk, patches + IMAGE_SENTINELS))
         else:
             info = SimpleNamespace(step_metadata={"image_preprocess": preprocess}, random_seed=0)
-            encoded = vae.prepare_inputs(walk, info, {"image_inputs": [tensor]})
-            walks.append((walk, encoded.kwargs["h"] * encoded.kwargs["w"] + IMAGE_SENTINELS))
-    height, width = metadata.kwargs["height"], metadata.kwargs["width"]
-    latents = (height // cfg.latent_downsample) * (width // cfg.latent_downsample)
-    for walk in later:
-        walks += [(walk, 1)] * cap if walk == "decode" else [(walk, latents + IMAGE_SENTINELS)] * 3
-    return config, metadata.kwargs["requires_cfg"], walks
+            encoded = vae.prepare_inputs(step.walk, info, {"image_inputs": [tensor]})
+            walks.append((step.walk, encoded.kwargs["h"] * encoded.kwargs["w"] + IMAGE_SENTINELS))
+    return config, params["requires_cfg"], walks
 
 
 class _BagelPool:
@@ -260,7 +255,7 @@ def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
     output = model.process_prompt("hello", ["text", "audio"] if clip else ["text"], ["audio"],
                                   tensors=tensors, cfg_weight=cfg_weight)
 
-    opened = model.get_request_resource_configs({}, {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
+    opened = model.get_request_resource_configs([], [], {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
     assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
 
 
@@ -297,10 +292,10 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
     dit._new_scheduler = lambda *args, **kw: SimpleNamespace(timesteps=torch.arange(4))
 
     output = model.process_prompt(prompt, ["text"], outputs, tensors={}, **kwargs)
-    args = model.get_initial_forward_pass_args("default", ["text"], outputs, {"text_inputs": []}, kwargs)
-    walk = args.full_metadata.graph_walk
+    prefill = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)[0]
+    walk = prefill.walk
     info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=1,
-                                  rid_handle="r", step_metadata=args.step_metadata)
+                                  rid_handle="r", step_metadata=dict(prefill.step_metadata))
     dit.prepare_inputs(walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
 
     state, layout = dit.request_states["r"], output.metadata["kv_layout"]["kv"]
@@ -530,7 +525,8 @@ def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
 
     model = _vjepa2()
     kwargs = {"rollout_horizon": horizon}
-    step_metadata = model.get_initial_forward_pass_args("p0", ["video"], ["video"], {}, kwargs).step_metadata
+    [step] = model.walk_plan("p0", ["video"], ["video"], {"video_frames": [_pointer(torch.zeros(1))]}, kwargs)
+    step_metadata = step.step_metadata
 
     assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
         VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",

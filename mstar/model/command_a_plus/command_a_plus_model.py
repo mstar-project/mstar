@@ -18,7 +18,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
@@ -32,13 +32,10 @@ from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
     MediaPads,
-    PrefillStep,
     expand_media_pads,
-    initial_prefill_args,
     media_layout,
     media_walk_name,
     messages_from_parts,
-    next_prefill_args,
     parts_from_modalities,
 )
 
@@ -98,26 +95,15 @@ class CommandAPlusModel(Model):
             ),
         }
 
-    def get_initial_forward_pass_args(
-        self, partition_name, input_modalities, output_modalities, input_signals,
-        model_kwargs=None,
-    ):
-        texts = input_signals.get("text_inputs")
-        if not texts:
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        if not input_signals.get("text_inputs"):
             raise ValueError("Command A+ prefill requires text_inputs")
-        inputs = {("LLM", "text_inputs"): texts}
-        pixels = input_signals.get("pixel_values")
-        if not pixels:
-            step = PrefillStep("prefill", inputs)
+        if input_signals.get("pixel_values"):
+            prefill = WalkStep(self.image_walk, step_metadata={MEDIA_LAYOUT: model_kwargs[MEDIA_LAYOUT]})
         else:
-            inputs[(self.image_encoder.node, "pixel_values")] = pixels
-            step = PrefillStep(self.image_walk, inputs, {MEDIA_LAYOUT: (model_kwargs or {})[MEDIA_LAYOUT]})
-        return initial_prefill_args(step, input_modalities, output_modalities)
-
-    def get_partition_forward_pass_args(
-        self, partition_name, partition_metadata, persist_signals, incoming_connections=None,
-    ):
-        return next_prefill_args(partition_metadata, persist_signals)
+            prefill = WalkStep("prefill")
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [prefill, WalkStep("decode", bind={"text_inputs": "new_token"})]
 
     def get_node_resources(self):
         config = self.config
@@ -142,7 +128,7 @@ class CommandAPlusModel(Model):
                         enable_repetion_penalty=True),
         ]
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
         defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
                         repetition_penalty=1.04, ignore_eos=False)
         supplied = model_kwargs or {}
