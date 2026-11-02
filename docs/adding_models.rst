@@ -1183,10 +1183,11 @@ placed exactly as weights are.
   thread's step is planned; an output cached from an earlier step) refuses when run
   eagerly instead of adding another step's adapters to these rows.
   ``warmup_compiles`` runs outside any step, so a node serving adapters runs no adapted
-  linear there. A piecewise region that runs adapted modules must declare their rows in
-  its own step (a ``LoraStep`` under each pool's key). Nothing checks one that does not:
-  its deltas would read whichever plan is current (an earlier capture's, or the
-  enclosing step's), adding the wrong rows' adapters or none.
+  linear there. A piecewise region's step takes its rows the same way, from its own
+  segments (an ``attn_key`` region's: one per row), planned per replay and handing the
+  enclosing step's plan back at its commit. A region replayed as one row per step
+  (``one_row_per_step``) would give every request the first one's adapter, so on a node
+  serving adapters it is not captured, and runs eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 

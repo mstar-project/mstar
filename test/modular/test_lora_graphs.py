@@ -342,6 +342,42 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
             call(x, y)
 
 
+class _Attn(Resource):
+    build = None
+    force_double_buffer = False
+
+
+def _region_runner(pool, **config):
+    from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+
+    config = PiecewisePackedConfig(
+        capture_fn=lambda inp: inp.static_inputs["x"], make_static_inputs=lambda shape: {},
+        attn_key="attn", total_tokens=[8], **config,
+    )
+    return PiecewiseAcceleratorGraphRunner(
+        label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
+        step_runner=SimpleNamespace(build_accelerator_graph_buffers=lambda *args, **kwargs: None),
+        device=CPU, autocast_dtype=None, num_slots=2, node_name="N", lora_keys=("lora",),
+    )
+
+
+def test_a_piecewise_region_plans_its_own_lora_rows_or_is_not_captured(adapters):
+    """A region's step carries the node's LoRA rows, laid out from its segments as the
+    node's are; a region replayed as one row per step, which would give every request
+    the first one's adapter, is dropped from capture, so it runs eagerly in the node's
+    step."""
+    pool = P.make_pool(adapters[1])
+    runner = _region_runner(pool, capture_batch_sizes=[2])
+    bucket = BucketKey(PIECEWISE_WALK, 2, 8, "N_region")
+    step = runner._declare(["r0", -5], [5, 3], bucket, capture=False, slot=0, real_bs=1)
+    assert step.steps["lora"].segments == (Segment("r0", "main", 5), Segment(-5, "main", 3))
+    assert runner.prepare_for_capture() and not runner.dropped_shapes
+
+    one_row = _region_runner(pool, capture_batch_sizes=[1], lease_before_step=True, one_row_per_step=True)
+    assert one_row.prepare_for_capture() == [] and one_row.dropped_shapes == [(1, 8)]
+
+
 def test_the_base_only_choice_is_the_same_on_every_rank(adapters):
     """It reads only which adapter each request named (and which adapters the files say
     are empty, the same on every rank): two ranks whose ingests landed in another order,

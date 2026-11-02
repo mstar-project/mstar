@@ -27,7 +27,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.engine.resources.lora.config import LoraBaseOnly, LoraStep
+from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -35,6 +35,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     engine_step,
+    lora_rows,
 )
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
@@ -1699,9 +1700,12 @@ class PiecewiseAcceleratorGraphRunner:
         node_name: str | None = None,
         memory_pool: AcceleratorGraphPool | None = None,
         device_capability: DeviceCapability | None = None,
+        lora_keys: tuple[str, ...] = (),
     ):
         self._label = label
         self._config = config
+        # the node's LoRA pools (`_region_step`)
+        self._lora_keys = lora_keys
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
@@ -1748,7 +1752,7 @@ class PiecewiseAcceleratorGraphRunner:
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
             # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
-            step = self._config.region_step(
+            step = self._region_step(
                 self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
@@ -1785,22 +1789,22 @@ class PiecewiseAcceleratorGraphRunner:
         """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
+            if shapes and self._config.one_row_per_step and self._lora_keys:
+                # its replay names only the step's first request, whose adapter every
+                # request's rows would take; eager, it runs under the node's own step
+                logger.error(
+                    "Dropping piecewise accelerator graph config %s: it replays one row "
+                    "per step (one_row_per_step), and LoRA %s addresses each request's "
+                    "rows", self._label, self._lora_keys,
+                )
+                self.dropped_shapes = [(s.bs, s.total_tokens) for s in shapes]
+                shapes = []
             if shapes:
                 shape = shapes[0]
-                step = self._config.region_step(
+                step = self._region_step(
                     self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                     list(shape.seq_lens),
                 )
-                if self._config.one_row_per_step and step is not None and any(
-                    isinstance(work, LoraStep) for work in step.steps.values()
-                ):
-                    # its replay names only the step's first request
-                    raise ValueError(
-                        f"piecewise region {self._label!r} of node {self._node_name!r} "
-                        "declares a LoRA step but replays one row per step "
-                        "(one_row_per_step): every request's tokens would take the "
-                        "first request's adapter"
-                    )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
                     logger.error(
@@ -2116,7 +2120,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        step = self._config.region_step(list(request_ids), list(seq_lens))
+        step = self._region_step(request_ids, seq_lens)
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2131,6 +2135,11 @@ class PiecewiseAcceleratorGraphRunner:
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)
         return step
+
+    def _region_step(self, request_ids: list[int], seq_lens: list[int]):
+        """The config's step for the region, with the node's LoRA rows laid out from its
+        own segments (``lora_rows``)."""
+        return lora_rows(self._config.region_step(list(request_ids), list(seq_lens)), self._lora_keys)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:

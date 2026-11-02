@@ -846,11 +846,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     capture_cudnn_benchmark: bool = False
 
     # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
-    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step
-    # (``lora_rows``) from its segments: in order, the rows the adapted linears see, each
-    # a request's span of tokens (a request may have several, as CFG's cond and uncond
-    # copies). A step that lays its rows out otherwise declares its own ``LoraStep``
-    # under the pool's key.
+    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,
+    # and to each piecewise region's (``lora_rows``), from its segments: in order, the
+    # rows the adapted linears see, each a request's span of tokens (a request may have
+    # several, as CFG's cond and uncond copies). A step that lays its rows out otherwise
+    # declares its own ``LoraStep`` under the pool's key.
     lora_keys: tuple[str, ...] = ()
 
     def __init__(self):

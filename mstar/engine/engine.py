@@ -997,6 +997,7 @@ class Engine:
                 node_name=node_name,
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
+                lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
             )
             runners[label] = runner
         return runners
