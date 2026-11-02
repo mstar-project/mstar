@@ -209,6 +209,7 @@ fn trail_hash(hash: u64, count: u64, pages: &[i32]) -> u64 {
 mod py {
     use std::sync::{Mutex, MutexGuard};
 
+    use pyo3::buffer::PyBuffer;
     use pyo3::exceptions::{PyAssertionError, PyIndexError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::pyclass::CompareOp;
@@ -654,6 +655,57 @@ mod py {
             let bytes = unsafe { std::slice::from_raw_parts(cols.out.as_ptr() as *const u8, cols.out.len() * 4) };
             let lg = unsafe { std::slice::from_raw_parts(lens_gens.as_ptr() as *const u8, lens_gens.len() * 8) };
             Ok((PyByteArray::new(py, bytes), cols.total, cols.all_have_pages, PyByteArray::new(py, lg), max_sink_span, decode))
+        }
+
+        /// `kv_plan::decode_rows`: a persistent walk's decode step on rows.
+        /// The pages its held rows cross onto go into ``stage`` as element
+        /// writes into the page table at ``pages_base`` (rows of
+        /// ``pages_row_bytes``); returns ``paged_kv_indptr (n + 1) | kv_lens
+        /// (n)`` as int32 bytes.
+        #[allow(clippy::too_many_arguments)]
+        fn decode_rows<'py>(
+            &self,
+            py: Python<'py>,
+            lens_by_slot: PyBuffer<i32>,
+            sids_by_slot: PyBuffer<i64>,
+            idx: PyBuffer<i64>,
+            n: usize,
+            pad_slot: i64,
+            skip: PyBuffer<i64>,
+            page_size: i64,
+            max_pages: i64,
+            stage: &Bound<'py, crate::rows::PyRowStage>,
+            pages_base: i64,
+            pages_row_bytes: i64,
+        ) -> PyResult<Bound<'py, PyByteArray>> {
+            use crate::rows::view;
+            let d = {
+                let core = self.core();
+                crate::kv_plan::decode_rows(
+                    |sid| core.pages(sid).map(|p| p.as_slice()).map_err(|e| e.to_string()),
+                    view(&lens_by_slot, "lens_by_slot")?,
+                    view(&sids_by_slot, "sids_by_slot")?,
+                    view(&idx, "idx")?,
+                    n,
+                    pad_slot,
+                    view(&skip, "skip")?,
+                    page_size,
+                    max_pages,
+                )
+                .map_err(PyValueError::new_err)?
+            };
+            if !d.cross_slots.is_empty() {
+                // SAFETY: plain i32 data viewed as its native-endian bytes
+                let pages = unsafe { std::slice::from_raw_parts(d.cross_pages.as_ptr() as *const u8, 4 * d.cross_pages.len()) };
+                stage
+                    .borrow_mut()
+                    .inner
+                    .write(pages_base, pages_row_bytes, &d.cross_slots, pages, 4, Some(&d.cross_offsets))
+                    .map_err(PyValueError::new_err)?;
+            }
+            // SAFETY: as above
+            let out = unsafe { std::slice::from_raw_parts(d.out.as_ptr() as *const u8, 4 * d.out.len()) };
+            Ok(PyByteArray::new(py, out))
         }
 
         /// `kv_plan::plan_columns` over the page lists of the streams ``sids``,

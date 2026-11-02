@@ -20,6 +20,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.rows import RowFills, RowSpace, StepRows
 
@@ -131,6 +132,8 @@ class KVRows(RowFills):
             )
             for label in labels
         }
+        # each slot's stream in the page arena, per label, written as a row joins
+        self._sids = {label: np.full(space.capacity + 2, -1, np.int64) for label in self.labels}
 
     def device_rows(self, label: str) -> KVDeviceRows:
         lens, pages = self.labels[label]
@@ -146,6 +149,7 @@ class KVRows(RowFills):
         d = rows.diff
         out = np.full((len(d.join_rids), self.max_pages), SINK_PAGE, np.int32)
         for label, (lens, pages) in self.labels.items():
+            sids = self._sids[label]
             stored = np.zeros(len(d.join_rids), np.int32)
             out.fill(SINK_PAGE)
             for i, rid in enumerate(d.join_rids):
@@ -157,40 +161,28 @@ class KVRows(RowFills):
                         f"{rid}/{label} holds {held.n} pages, more than a row's {self.max_pages}"
                     )
                 out[i, :held.n] = held.tolist()
+                sids[d.join_slots[i]] = held.sid
             rows.write(lens, d.join_slots, stored)
             rows.write(pages, d.join_slots, out)
 
-    def write_crossings(self, rows: StepRows, streams: dict, held) -> None:
-        """For each held row (``held(rid)``) whose token starts a page, that
-        page, from its stream.
+    def plan(
+        self, rows: StepRows, label: str, n: int, arena: PageArena, skip: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """A step of ``n`` rows (its own, then padding): FlashInfer's
+        ``paged_kv_indptr`` and the kv lengths, each row's stored length plus
+        its token, and for each held row whose token starts a page, that page,
+        from its stream; not for the slots in ``skip``, which have none (a
+        padding row) or hold all theirs (a joining one).
 
         Derived from the committed length rather than from what this step's
         admit reserved: a discarded pre-plan of the step reserved the page
         and left it with the stream, so the admit of the step that runs
         reserves nothing, yet the row has never been given the page."""
-        order = rows.order
-        idx = rows.diff.idx
-        page_size = self.page_size
-        for label, (lens_buf, pages) in self.labels.items():
-            lens = rows.mirror(lens_buf)[:len(order)]
-            crossing = np.flatnonzero(lens % page_size == 0)
-            if not len(crossing):
-                continue
-            slots, at, values = [], [], []
-            for i in crossing.tolist():
-                rid = order[i]
-                if not held(rid):
-                    continue
-                first = int(lens[i]) // page_size
-                if first >= self.max_pages:
-                    raise ValueError(f"a row of {label} grows past its {self.max_pages} pages")
-                slots.append(int(idx[i]))
-                at.append(first)
-                # admit gave the stream this page; an IndexError here is a step admitted without it
-                values.append(streams[rid][label].page_indices[first])
-            if slots:
-                rows.write_at(pages, np.asarray(slots), (np.asarray(at),), np.asarray(values, np.int32))
-
-    def lens_host(self, rows: StepRows, label: str) -> np.ndarray:
-        """This step's lengths, before its token, by slot."""
-        return rows.mirror(self.labels[label][0])
+        lens, pages = self.labels[label]
+        target = rows.element_writes(pages)
+        raw = arena.decode_rows(
+            rows.mirror_by_slot(lens), self._sids[label], rows.diff.idx, n, rows.space.pad_slot, skip,
+            self.page_size, self.max_pages, target.stage, target.base, target.row_bytes,
+        )
+        out = np.frombuffer(raw, np.int32)
+        return out[:n + 1], out[n + 1:]

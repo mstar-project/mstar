@@ -171,6 +171,68 @@ pub fn kv_packed_addressing(
         .map_err(PyValueError::new_err)
 }
 
+/// A persistent walk's decode step on rows (`KVRows`): each row's stored
+/// length is read by its slot (`lens_by_slot`; past `idx`, the pad slot's),
+/// and a row in `idx` whose token starts a page, and whose slot is not in
+/// `skip`, crosses onto that page of its stream (`sids_by_slot`).
+pub struct DecodeRows {
+    /// `paged_kv_indptr (n + 1) | kv_lens (n)`, each row's stored length plus the step's token
+    pub out: Vec<i32>,
+    pub cross_slots: Vec<i64>,
+    /// byte offsets in a row of the page table, `4 * page`
+    pub cross_offsets: Vec<i64>,
+    pub cross_pages: Vec<i32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_rows<'a>(
+    pages: impl Fn(usize) -> Result<&'a [i32], String>,
+    lens_by_slot: &[i32],
+    sids_by_slot: &[i64],
+    idx: &[i64],
+    n: usize,
+    pad_slot: i64,
+    skip: &[i64],
+    page_size: i64,
+    max_pages: i64,
+) -> Result<DecodeRows, String> {
+    if page_size <= 0 {
+        return Err("page_size must be positive".into());
+    }
+    if idx.len() > n {
+        return Err(format!("{} rows for a step of {n}", idx.len()));
+    }
+    let slot_at = |i: usize| if i < idx.len() { idx[i] } else { pad_slot };
+    let mut out = vec![0i32; 2 * n + 1];
+    let (indptr, kv_lens) = out.split_at_mut(n + 1);
+    let mut d = DecodeRows { out: Vec::new(), cross_slots: Vec::new(), cross_offsets: Vec::new(), cross_pages: Vec::new() };
+    let mut k = 0i64;
+    for i in 0..n {
+        let slot = slot_at(i);
+        let len = *lens_by_slot.get(slot as usize).ok_or_else(|| format!("slot {slot} is past the rows"))? as i64;
+        k += len / page_size + 1;
+        indptr[i + 1] = k as i32;
+        kv_lens[i] = (len + 1) as i32;
+        if i >= idx.len() || len % page_size != 0 || skip.contains(&slot) {
+            continue;
+        }
+        let first = len / page_size;
+        if first >= max_pages {
+            return Err(format!("a row grows past its {max_pages} pages"));
+        }
+        let held = pages(sids_by_slot[slot as usize] as usize)?;
+        // admit gave the stream this page; without it the step was admitted short
+        let page = *held.get(first as usize).ok_or_else(|| {
+            format!("slot {slot}'s stream holds {} pages, not the page its token starts ({first})", held.len())
+        })?;
+        d.cross_slots.push(slot);
+        d.cross_offsets.push(4 * first);
+        d.cross_pages.push(page);
+    }
+    d.out = out;
+    Ok(d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +314,27 @@ mod tests {
         let mut out = vec![0i64; 2];
         packed_addressing(&[0, 0, 1], &[0, 0, 1], &[7], &[0, 1], 4, &mut out).unwrap();
         assert_eq!(out, vec![7, 0]);
+    }
+
+    #[test]
+    fn decode_rows_cross_only_held_rows_starting_a_page() {
+        // page size 4; slots 0..4, pad slot 5 (length 0). Rows in slots 2, 0, 3:
+        // slot 2 at 8 crosses onto its stream's page 2, slot 0 at 5 doesn't,
+        // slot 3 at 4 would but is skipped (it joined). Then one padding row.
+        let streams: Vec<Vec<i32>> = vec![vec![10, 11], vec![], vec![20, 21, 22], vec![30, 31]];
+        let lens = [5, 0, 8, 4, 0, 0];
+        let sids = [0, -1, 2, 3, -1, -1];
+        let d = decode_rows(|s| Ok(&streams[s][..]), &lens, &sids, &[2, 0, 3], 4, 5, &[3], 4, 8).unwrap();
+        assert_eq!(&d.out[..5], &[0, 3, 5, 7, 8]);
+        assert_eq!(&d.out[5..], &[9, 6, 5, 1]);
+        assert_eq!((d.cross_slots, d.cross_offsets, d.cross_pages), (vec![2], vec![8], vec![22]));
+    }
+
+    #[test]
+    fn decode_rows_refuse_a_row_whose_stream_lacks_its_page() {
+        let streams: Vec<Vec<i32>> = vec![vec![10]];
+        assert!(decode_rows(|s| Ok(&streams[s][..]), &[4, 0], &[0, -1], &[0], 1, 1, &[], 4, 8).is_err());
+        // nor one past its row's pages
+        assert!(decode_rows(|s| Ok(&streams[s][..]), &[8, 0], &[0, -1], &[0], 1, 1, &[], 4, 2).is_err());
     }
 }

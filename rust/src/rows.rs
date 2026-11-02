@@ -221,7 +221,7 @@ pub fn step_mirrors(slab: &mut [u8], desc: &[i64], n_slots: i64, slots: &[i64]) 
 
 // SAFETY (for the views below): C-contiguous buffers of the declared item
 // type, held by the caller for the call under the GIL.
-fn view<'a, T: pyo3::buffer::Element>(buf: &'a PyBuffer<T>, what: &str) -> PyResult<&'a [T]> {
+pub(crate) fn view<'a, T: pyo3::buffer::Element>(buf: &'a PyBuffer<T>, what: &str) -> PyResult<&'a [T]> {
     if !buf.is_c_contiguous() {
         return Err(PyValueError::new_err(format!("{what} must be C-contiguous")));
     }
@@ -238,7 +238,7 @@ fn view_mut<'a, T: pyo3::buffer::Element>(buf: &'a PyBuffer<T>, what: &str) -> P
 /// `RowStage` for Python: one per staged step.
 #[pyclass(name = "RowStage")]
 pub struct PyRowStage {
-    inner: RowStage,
+    pub(crate) inner: RowStage,
 }
 
 #[pymethods]

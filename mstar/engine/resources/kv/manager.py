@@ -2670,23 +2670,10 @@ class KVManager(AttentionResource):
         rows = ctx.rows
         lease = ctx.slot_lease
         by_label = self._write_rows(step, ctx, kv_rows)
-        order = rows.order
-        page_size = kv_rows.page_size
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
         out = {}
-        for label, segments in by_label.items():
+        for label, (segments, indptr, kv_lens) in by_label.items():
             n = len(segments)
-            if any(map((1).__ne__, map(_SPAN, segments))) or list(
-                map(_RID, segments[:len(order)])
-            ) != order:
-                raise ValueError(
-                    f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} must "
-                    "compute one token a row, in row order"
-                )
-            # padding rows past the active ones hold length 0 and sink pages
-            lens = kv_rows.lens_host(rows, label)[:n]
-            indptr = np.zeros(n + 1, np.int32)
-            np.cumsum(lens // page_size + 1, out=indptr[1:])
             qo = self._decode_qo.get(n)
             if qo is None:
                 qo = self._decode_qo[n] = torch.arange(n + 1, dtype=torch.int32)
@@ -2694,7 +2681,7 @@ class KVManager(AttentionResource):
                 cpu_indptrs=PagedIndptrs(
                     qo_indptr=qo, paged_kv_indptr=torch.from_numpy(indptr),
                     paged_kv_indices=None, paged_kv_last_page_len=None,
-                    kv_lens=torch.from_numpy(lens + 1).as_subclass(HostLens),
+                    kv_lens=torch.from_numpy(kv_lens).as_subclass(HostLens),
                 ),
                 rows=segments,
                 view_builder=lambda segments=segments: self._sequence_views(segments, {}, ctx),
@@ -2711,8 +2698,9 @@ class KVManager(AttentionResource):
         return KVPlanOutputs(out)
 
     def _write_rows(self, step: KVStep, ctx: StepContext, kv_rows: KVRows) -> dict:
-        """The rows a step of a persistent walk changes: those that joined and
-        the pages held rows gained. Its segments by label."""
+        """A step of a persistent walk: its joining rows and the pages its
+        held rows gained written, and by label its segments and FlashInfer's
+        ``paged_kv_indptr`` and kv lengths (`KVRows.plan`)."""
         if (
             step.pre_forks or step.post_forks or step.sink or step.combined_labels
             or step.eager_write or step.retention
@@ -2736,15 +2724,29 @@ class KVManager(AttentionResource):
                 "(RowWalk.labels)"
             )
         rows = ctx.rows
-        d = rows.diff
-        joined = ()
-        if d.join_rids:
+        order = rows.order
+        for segments in by_label.values():
+            if any(map((1).__ne__, map(_SPAN, segments))) or list(
+                map(_RID, segments[:len(order)])
+            ) != order:
+                raise ValueError(
+                    f"KV {self.name}: a step of persistent walk {ctx.graph_walk!r} must "
+                    "compute one token a row, in row order"
+                )
+        if rows.diff.join_rids:
             kv_rows.write_joins(rows, self._streams)
-            joined = set(d.join_rids)
-        kv_rows.write_crossings(
-            rows, self._streams, lambda rid: rid not in joined and not ctx.is_padding_row(rid),
-        )
-        return by_label
+        # rows whose token starts a page get it from their stream, but for
+        # joining rows (written whole) and padding rows (which hold none)
+        skip = rows.diff.join_slots
+        real = ctx.real_rows()
+        padding = [i for i, rid in enumerate(order) if rid not in real] if real is not None else None
+        if padding:
+            skip = np.concatenate([skip, rows.diff.idx[padding]])
+        # padding rows past the active ones hold length 0 and sink pages
+        return {
+            label: (segments, *kv_rows.plan(rows, label, len(segments), self._arena, skip))
+            for label, segments in by_label.items()
+        }
 
     def _arm_rows(self, kv_rows: KVRows, res: "KVPlanOutputs", ctx: StepContext) -> None:
         """While a persistent walk's graph is captured: have it write each

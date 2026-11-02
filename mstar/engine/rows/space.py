@@ -25,6 +25,7 @@ import logging
 import threading
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -121,6 +122,14 @@ class RowBuffer:
         return f"RowBuffer({self.name}, {self.shape}, {self.dtype})"
 
 
+class ElementWrites(NamedTuple):
+    """A step's element writes into one unmirrored buffer (``StepRows.element_writes``):
+    ``stage.write(base, row_bytes, slots, values, elem_bytes, offsets)``."""
+    stage: object
+    base: int
+    row_bytes: int
+
+
 class StepRows:
     """One proposed step: its diff, and what the resources write for it.
 
@@ -168,6 +177,11 @@ class StepRows:
         """``buf``'s host rows as this step's dense view will hold them (before
         its forward's ``step``): its rows in step order, then padding up to
         ``max_rows``. A copy."""
+        return self.mirror_by_slot(buf)[self._gather_idx()]
+
+    def mirror_by_slot(self, buf: RowBuffer) -> np.ndarray:
+        """``buf``'s host rows by resident slot, as ``mirror`` reads them. A
+        view, to read before this step writes the buffer or commits."""
         if not buf.mirrored:
             raise ValueError(f"{buf.name} keeps no host mirror")
         space = self.space
@@ -176,7 +190,7 @@ class StepRows:
             slab = space._host
             if self._read_steps is None and not self.diff.same_step:
                 self._read_steps = space._steps
-        return space._host_view(buf, slab)[self._gather_idx()]
+        return space._host_view(buf, slab)
 
     def _gather_idx(self) -> np.ndarray:
         if self._gather is None:
@@ -221,6 +235,13 @@ class StepRows:
         size = buf.pad.itemsize
         offsets = np.ascontiguousarray(flat * size, dtype=np.int64)
         self._stage.write(buf._ptr, buf.row_bytes, slots, values.view(np.uint8), size, offsets)
+
+    def element_writes(self, buf: RowBuffer) -> ElementWrites:
+        """Where a caller registers ``write_at``'s writes into ``buf`` itself
+        (`PageArena.decode_rows`, say): the step's stage and the buffer's rows."""
+        if buf.mirrored:
+            raise ValueError(f"{buf.name}: a mirrored buffer's rows are written through write_at")
+        return ElementWrites(self._stage, buf._ptr, buf.row_bytes)
 
     def copy_in(self, buf: RowBuffer, slots: np.ndarray, src: torch.Tensor, src_rows: np.ndarray) -> None:
         """Whole rows from a device store: ``buf[slots[i]] = src[src_rows[i]]``.

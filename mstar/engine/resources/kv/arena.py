@@ -121,6 +121,12 @@ class PageArena(Protocol):
     def plan_rows(
         self, streams, segments, real, sink, sink_sid: int, page_size: int,
     ) -> tuple[bytearray, int, bool, bytearray, int, bool]: ...
+    # A persistent walk's decode step on rows (`KVRows.plan`): see `kv_plan::decode_rows`.
+    def decode_rows(
+        self, lens_by_slot: np.ndarray, sids_by_slot: np.ndarray, idx: np.ndarray, n: int,
+        pad_slot: int, skip: np.ndarray, page_size: int, max_pages: int, stage, pages_base: int,
+        pages_row_bytes: int,
+    ) -> bytearray: ...
 
 
 class _ListStreamPages(list):
@@ -335,6 +341,39 @@ class PythonPageArena:
         max_sink = max((span for span, sid in zip(spans, sids, strict=True) if sid == sink_sid), default=0)
         decode = bool(spans) and all(span == 1 for span in spans)
         return raw, total, all_have_pages, bytearray(np.array(lens + gens, np.int64)), max_sink, decode
+
+    def decode_rows(
+        self, lens_by_slot, sids_by_slot, idx, n, pad_slot, skip, page_size, max_pages, stage,
+        pages_base, pages_row_bytes,
+    ):
+        if len(idx) > n:
+            raise ValueError(f"{len(idx)} rows for a step of {n}")
+        slots = np.full(n, pad_slot, np.int64)
+        slots[:len(idx)] = idx
+        lens = lens_by_slot[slots].astype(np.int64)
+        out = np.zeros(2 * n + 1, np.int32)
+        np.cumsum(lens // page_size + 1, out=out[1:n + 1])
+        out[n + 1:] = lens + 1
+        active = lens[:len(idx)]
+        crossing = np.flatnonzero((active % page_size == 0) & ~np.isin(slots[:len(idx)], skip))
+        if len(crossing):
+            first = active[crossing] // page_size
+            if (first >= max_pages).any():
+                raise ValueError(f"a row grows past its {max_pages} pages")
+            cross = slots[crossing]
+            pages = []
+            for slot, at in zip(cross.tolist(), first.tolist(), strict=True):
+                held = self._streams[int(sids_by_slot[slot])]
+                if at >= len(held):
+                    raise ValueError(
+                        f"slot {slot}'s stream holds {len(held)} pages, not the page its token starts ({at})"
+                    )
+                pages.append(held[at])
+            stage.write(
+                pages_base, pages_row_bytes, cross, np.asarray(pages, np.int32).view(np.uint8), 4,
+                np.ascontiguousarray(4 * first, dtype=np.int64),
+            )
+        return bytearray(out)
 
 
 def new_page_arena(max_num_pages: int, backend: str | None = None) -> PageArena:

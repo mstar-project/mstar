@@ -175,3 +175,42 @@ def test_a_page_a_release_leaves_to_the_index_is_queued_for_the_host(backend):
     assert queued == [b"key0"]
     arena.release(pages)  # page 0 freed, page 1 left to its one owner
     assert queued == [b"key0", b"key1"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("seed", [0, 3, 11])
+def test_a_rows_decode_step_crosses_held_rows_onto_their_streams_next_page(backend, seed):
+    from mstar.engine.rows.stage import PyRowStage, new_stage
+
+    rng = random.Random(seed)
+    page_size, max_pages, slots = 4, 6, 10
+    arena = new_page_arena(64, backend)
+    streams = [arena.new_stream() for _ in range(slots)]
+    lens = np.zeros(slots + 1, np.int32)  # the last one is the pad slot
+    for s, pages in enumerate(streams):
+        # odd slots' tokens start a page
+        lens[s] = page_size * rng.randrange(max_pages - 1) + (0 if s % 2 else rng.randrange(page_size))
+        # the page a crossing row's token starts is the stream's, as admit leaves it
+        pages.extend(arena.acquire(lens[s] // page_size + 1))
+    sids = np.array([p.sid for p in streams] + [-1], np.int64)
+    idx = np.array(rng.sample(range(slots), 7), np.int64)
+    skip = idx[rng.sample(range(7), 2)]
+    stage = new_stage(1) if backend == "rust" else PyRowStage(1)
+    raw = arena.decode_rows(lens, sids, idx, 9, slots, skip, page_size, max_pages, stage, 1 << 20, 4 * max_pages)
+    out = np.frombuffer(raw, np.int32)
+    rows = np.concatenate([idx, [slots, slots]])
+    assert out[:10].tolist() == [0, *np.cumsum(lens[rows] // page_size + 1).tolist()]
+    assert out[10:].tolist() == (lens[rows] + 1).tolist()
+    want = {
+        (1 << 20) + 4 * max_pages * s + 4 * (lens[s] // page_size): streams[s][lens[s] // page_size]
+        for s in idx.tolist() if lens[s] % page_size == 0 and s not in skip.tolist()
+    }
+    block = np.zeros(stage.size(), np.uint8)
+    placed = stage.pack(block, 0)
+    got = {}
+    for at, count, _ in placed:
+        segs = block[at:at + 24 * count].view(np.int64).reshape(count, 3)
+        for src, dst, nbytes in segs.tolist():
+            assert nbytes == 4
+            got[dst] = int(block[src:src + 4].view(np.int32)[0])
+    assert want and got == want
