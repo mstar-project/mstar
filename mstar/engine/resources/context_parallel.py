@@ -217,17 +217,20 @@ class RingAttentionWrapper:
     masked the same way. A row this partner holds no query of is left out of its plan.
 
     ``paged`` is one eager wrapper over this rank's slots per partner, all planned per step.
-    Eager only: a striped shard plans a leased step copied."""
+    Eager only: a striped shard plans a leased step copied. ``check`` is ``ContextParallelWrapper``'s,
+    which ``plan`` applies to every rank's plan of every partner, as their lengths differ by rank."""
 
     # the step attends its own tokens from the pages, which it writes first (`AttentionManager.exchange`)
     reads_step_kv = True
 
     def __init__(
         self, placement: ContextParallel, page_size: int, dtype: torch.dtype, paged: list, device: torch.device,
+        check: Callable[[str, np.ndarray], None] | None = None,
     ):
         assert placement.over_sp and len(paged) == placement.size
         self._placement, self._page_size, self._dtype, self._device = placement, page_size, dtype, device
         self._paged = paged
+        self._check = check
         # per partner, whether each of its queries' rows holds any of this rank's slots
         self._valid: list[torch.Tensor] = []
         self._counts: tuple[int, ...] = ()
@@ -247,6 +250,12 @@ class RingAttentionWrapper:
         assert tuple(np.bincount(stripe_owners(qo, stored, p), minlength=p).tolist()) == tuple(counts), (
             f"the sequence shard striped {counts} queries over the partners, and KV's plan stripes otherwise"
         )
+        if self._check is not None:
+            # before anything is planned, so a step one rank's planner may refuse is refused on all
+            for rank in range(p):
+                for j in range(p):
+                    queries = np.concatenate([[0], np.cumsum(_ring_rows(stored, lens, p, rank, j, causal)[0])])
+                    self._check(f"rank {rank}'s plan of partner {j}'s queries", queries)
         kvp = indptrs.paged_kv_indptr.numpy().astype(np.int64)
         indices = indptrs.paged_kv_indices.numpy()
         self._valid = []

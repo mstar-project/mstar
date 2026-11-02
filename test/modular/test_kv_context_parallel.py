@@ -667,6 +667,32 @@ def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(
             assert (queries[0] == 1 and len(queries) > 1) == (j < rank and j < 2), (rank, j, queries)
 
 
+def test_a_ring_step_one_ranks_planner_would_refuse_is_refused_on_every_rank(monkeypatch):
+    """A ring's partner plans differ by rank (a first query planned apart only where this rank
+    holds no key before it), so a backend's check (``_plan_check``) sees every rank's: a step it
+    refuses on one rank is refused on all of them, before anything is planned, and no partner
+    goes on to wait in a hop."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
+    monkeypatch.setattr(AttentionManager, "_warm_ring", lambda self, group: None)
+    # rank 1 plans partner 0's first query of each row apart (3 rows); rank 0 plans 2 rows per partner
+    case = _Case.build(((0, 6), (0, 1)), CPU, torch.float32)
+
+    def check(what, qo_indptr):
+        if len(qo_indptr) > 3:
+            raise ValueError(f"{what}: more rows than this planner takes")
+
+    for rank in range(P):
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P))
+        shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv")
+        attn, _ = _cp_attention(
+            joint, CPU, torch.float32, shard=shard, sp_exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
+        )
+        attn._plan_check = check
+        with pytest.raises(ValueError, match="rank 1's plan of partner 0's queries"):
+            _plan(attn, case, shard=shard)
+
+
 @pytest.mark.parametrize("size", [2, 3, 4])
 def test_zigzag_rows_split_a_steps_tokens_over_the_ranks_with_equal_causal_work(size):
     """SP partners attend a step's own tokens in zigzag chunks: together every token once, and on

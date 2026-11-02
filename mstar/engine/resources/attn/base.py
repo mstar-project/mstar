@@ -235,6 +235,7 @@ class AttentionManager(AttentionResource):
             ]
             wrapper = self._eager_plan_states[key] = RingAttentionWrapper(
                 self._placement, self._kv_config.tokens_per_page, self._dtype, paged, self._device,
+                check=self._plan_check,
             )
         return wrapper
 
