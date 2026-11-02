@@ -57,6 +57,7 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    SeqShardSpec,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -98,6 +99,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_SHARD,
     VISION_ATTN,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
@@ -303,6 +305,8 @@ class Qwen3OmniModel(Model):
                     kv_cache=THINKER_KV
                 )
             ),
+            # every walk may split; a decode step (one token a row) never does
+            SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0),
             PositionSpec(
                 resource_key=TALKER_POS,
                 nodes={"Talker"},

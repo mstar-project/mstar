@@ -1411,3 +1411,134 @@ def test_the_fa_work_item_bound_holds_flashinfers_own_count():
                 assert bound > fm._FA_MAX_WORK_ITEMS
                 continue
             assert count <= bound, (q.tolist(), kv.tolist(), heads, sm, causal)
+
+
+# --- the Qwen3-Omni Thinker, its steps split over SP ranks ---------------------------------------
+
+# where the Thinker's KV pool stores its tokens over the SP ranks, and the split steps' exchange
+THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
+    pytest.param(False, None, id="by_head-ulysses"),
+    pytest.param(True, None, id="by_position-all_gather", marks=pytest.mark.skip(
+        reason="a split step over a pool stored by position needs the all-gather exchange (PR 4's engine change)")),
+    pytest.param(True, "ring", id="by_position-ring", marks=pytest.mark.skip(
+        reason="sp_exchange: ring lands with PR 4's engine change")),
+])
+
+
+def _thinker_over_ranks(rank, world, store, placed, exchange):
+    """One SP rank of a small Qwen3-Omni Thinker (its real layers: a dense one, MoE ones masking the
+    step's last rows as padding, deepstack, the Talker's layer-N states) over the model's own Thinker
+    declarations, built as the engine builds them. Two steps (a first prefill, then one over stored
+    context with a fresh row and a riding decode row) run split, eager and compiled, and give what
+    they give copied; a split prefill samples each row's last token."""
+    from mstar.engine.resources.base import head_shards
+    from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+    from mstar.engine.resources.step import SubmoduleStep
+    from mstar.model.components import MoeParallelConfig
+    from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_SHARD, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    torch.set_num_threads(1)
+    sys.modules["flashinfer"] = reference_flashinfer()
+    manager_mod.KVTransferManager = _StubTransfer
+    group = CommGroup(rank, rank, list(range(world)))
+    group.device_group, group.initialized = dist.group.WORLD, True
+    try:
+        cfg = Qwen3OmniModelConfig()
+        tc = cfg.thinker_text
+        tc.vocab_size, tc.hidden_size, tc.num_hidden_layers = 8, 2 * HEAD_DIM, 3
+        tc.num_attention_heads, tc.num_key_value_heads, tc.head_dim = 4, 2, HEAD_DIM
+        tc.num_experts, tc.num_experts_per_tok, tc.moe_intermediate_size = 4, 2, 16
+        tc.intermediate_size, tc.mlp_only_layers = 32, [0]
+        cfg.talker.accept_hidden_layer = 1
+        thinker = Qwen3OmniThinkerModel(cfg, moe_parallel=MoeParallelConfig(mask_padding=True))
+        gen = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            for p in thinker.parameters():
+                # norms 1, weights at unit gain
+                gain = p.shape[-1] ** -0.5
+                p.copy_(torch.ones_like(p) if p.dim() == 1 else torch.randn(p.shape, generator=gen) * gain)
+
+        omni = object.__new__(Qwen3OmniModel)
+        omni.config = cfg
+        keys = (THINKER_KV, THINKER_ATTN, THINKER_SHARD)
+        specs = [spec for spec in omni.get_node_resources() if spec.resource_key in keys]
+        overrides = {
+            THINKER_KV: dict(max_num_pages=32, page_size=CP_PAGE, max_seq_len=64, context_parallel=placed),
+            **({THINKER_ATTN: dict(sp_exchange=exchange)} if exchange else {}),
+        }
+        apply_yaml_overrides(specs, {"resources": overrides})
+        # the engine's order: derive, then the SP refusals
+        by_key = resolve_spec_dependencies(specs)
+        assert sequence_parallel_refusals(specs, "Thinker", 1, world) == []
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+
+        # (rid, tokens) per step: two first prefills, then their next tokens beside a fresh prompt,
+        # one row a decode; 13 tokens, the last 2 the MoE's padding
+        steps = [(("r0", 5), ("r1", 6)), (("r0", 2), ("r1", 1), ("r2", 10))]
+        inputs = []
+        for rows in steps:
+            n = sum(span for _, span in rows)
+            hidden, cos, sin = (torch.randn(n, d, generator=gen) for d in (tc.hidden_size, HEAD_DIM, HEAD_DIM))
+            # vision features on every third row
+            deepstack = [torch.randn(n, tc.hidden_size, generator=gen) * (torch.arange(n)[:, None] % 3 == 0)
+                         for _ in range(2)]
+            inputs.append(dict(input_embeds=hidden, cos_sin_3d=(cos, sin), deepstack_visual_embeds=deepstack,
+                               num_valid_tokens=torch.tensor([n - 2])))
+
+        def run(split: bool, compiled: bool) -> list[torch.Tensor]:
+            res = {
+                key: build_resource(spec, EngineResourceInfo(
+                    device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, nodes=frozenset(spec.nodes),
+                    dependencies={dep: by_key[dep] for dep in spec.depends_on()},
+                    head_shards=head_shards(joint, placed),
+                ))
+                for key, spec in by_key.items()
+            }
+            for key, spec in by_key.items():
+                res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
+            for module in thinker.modules():
+                if hasattr(module, "bind_resources"):
+                    module.bind_resources(res)
+            res[THINKER_SHARD].min_tokens = 0 if split else 1 << 20
+            runner = StepRunner(res)
+            for rid in ("r0", "r1", "r2"):
+                runner.ingest_request(rid, {THINKER_KV: KVReqConfig(needed_labels=["main"])})
+            torch._dynamo.reset()
+            forward = torch.compile(thinker, backend="eager") if compiled else thinker
+            out = []
+            for rows, step_inputs in zip(steps, inputs, strict=True):
+                step = SubmoduleStep(
+                    segments=[Segment(rid, "main", span) for rid, span in rows],
+                    steps={
+                        THINKER_KV: KVStep(), THINKER_ATTN: AttentionStep(causal=True), THINKER_SHARD: SeqShardStep(),
+                    },
+                )
+                step.set_ctx(StepContext(request_ids=tuple(rid for rid, _ in rows), graph_walk="prefill_text",
+                                         slot=0, capture=False))
+                assert runner.admit(step).ok
+                runner.plan(step)
+                assert (res[THINKER_SHARD].split_range("main") is not None) == split
+                with torch.no_grad():
+                    hidden, layer_0, layer_n = forward(**step_inputs)
+                # what the Thinker samples a prefill from: each row's last token of the whole step
+                ends = torch.tensor([span for _, span in rows]).cumsum(0) - 1
+                torch.testing.assert_close(res[THINKER_ATTN].select_last_hidden(hidden), hidden[ends])
+                runner.commit(step)
+                out += [hidden, layer_0, layer_n]
+            return out
+
+        copied = run(split=False, compiled=False)
+        for compiled in (False, True):
+            for got, want in zip(run(split=True, compiled=compiled), copied, strict=True):
+                torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    finally:
+        group.device_group = None
+        dist.destroy_process_group()
+
+
+@THINKER_STORAGE
+def test_two_ranks_split_the_thinkers_steps_like_they_run_copied(tmp_path, placed, exchange):
+    mp.spawn(_thinker_over_ranks, args=(P, str(tmp_path / "store"), placed, exchange), nprocs=P)

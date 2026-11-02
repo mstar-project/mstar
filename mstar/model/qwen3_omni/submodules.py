@@ -39,6 +39,7 @@ from mstar.engine.resources import (
     PositionStep,
     SamplerStep,
     Segment,
+    SeqShardStep,
     SlotLease,
     SubmoduleStep,
 )
@@ -74,6 +75,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_SHARD,
     VISION_ATTN,
     Qwen3OmniModelConfig,
 )
@@ -735,7 +737,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 ),
                 THINKER_POS: PositionStep(
                     advance=pos_advance
-                )
+                ),
+                THINKER_SHARD: SeqShardStep(),
             },
 
         )
