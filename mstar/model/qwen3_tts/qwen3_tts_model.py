@@ -486,6 +486,7 @@ class Qwen3TTSModel(Model):
                 resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
                 enable_repetion_penalty=False,
+                fused_draw=True,
             ),
         ]
 
