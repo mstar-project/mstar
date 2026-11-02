@@ -40,7 +40,7 @@ def blackwell_path_measured(device: torch.device) -> bool:
     """Whether this GPU takes the two-token first depth pass. Nothing in it is
     specific to Blackwell, but it was measured only there, so older GPUs keep one
     token per pass until someone measures them."""
-    return device.type == "cuda" and current_platform.has_cuda_capability(10, 0, device)
+    return current_platform.has_cuda_capability(10, 0, device)
 
 
 # ---------------------------------------------------------------------------

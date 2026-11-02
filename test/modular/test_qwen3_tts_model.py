@@ -2113,7 +2113,9 @@ def test_qwen3_tts_fused_snake_channels_last_matches_the_contiguous_form():
         alpha=torch.randn(6) * 0.3, beta=torch.randn(6) * 0.3, no_div_by_zero=1e-9,
     )
     fused = FusedSnakeBeta(snake).cuda()
-    x = torch.randn(3, 6, 1000, device="cuda")
+    # large activations too, where an approximate hardware sine drifts from torch.sin
+    scale = torch.tensor([1.0, 1.0, 1.0, 50.0, 50.0, 300.0], device="cuda")[:, None]
+    x = torch.randn(3, 6, 1000, device="cuda") * scale
     channels_last = fused(x.unsqueeze(2).contiguous(memory_format=torch.channels_last))
     assert channels_last.is_contiguous(memory_format=torch.channels_last)
     assert torch.equal(channels_last.squeeze(2), fused(x))
