@@ -603,6 +603,58 @@ def test_a_conv_with_write_slots_leaves_the_read_slot_alone():
 
 
 @pytest.mark.parametrize("bucket", [False, True], ids=["eager", "bucket"])
+def test_twin_slots_take_a_mixed_step_as_in_place_does(bucket):
+    """Three steps of a split walk over both pools, a row turning from prompt to decode rows on the way: output, and
+    the state and conv tail in whichever slot now holds them, bit-equal. The kernels leave every slot that is neither
+    a decode row's two nor a prompt row's own, and a decode row's read slot, as they found them."""
+    split = CombinedSplit("mixed", prefill_walks=("prefill",))
+    plain_pool, plain = build(splits=(split,))
+    twin_pool, twin = build(splits=(split,), twin_slots=True)
+    twin.bind_dependencies({POOL: twin_pool})
+    w, conv = weights(), _conv_weights()
+    first = [("d0", 5), ("d1", 7)]
+    for pool, manager in ((plain_pool, plain), (twin_pool, twin)):
+        rstep, ctx = plan_step(pool, manager, first, walk="prefill")
+        _layer(manager, pool, inputs(12, seed=7), w, conv)
+        pool.commit(rstep, ctx)
+    torch.cuda.synchronize()
+
+    state, conv_block = twin_pool.block("state", 0), twin_pool.block("conv", 0)
+    script = [
+        [("d0", 1), ("p0", 23), ("d1", 1)],
+        [("d0", 1), ("p0", 1), ("p1", 9), ("d1", 1)],
+        [("d0", 1), ("p0", 1), ("p1", 1), ("d1", 1)],
+    ]
+    for i, rows in enumerate(script):
+        real = sum(s for _, s in rows)
+        lease, padding, width = None, (), real
+        if bucket:
+            lease = SlotLease(slot=0, bucket=BucketKey("mixed", bs=8, num_tokens=64))
+            padding, width = tuple(f"__cg_{j}" for j in range(8 - len(rows))), 64
+        x = inputs(real, seed=30 + i)
+        xin = {n: torch.cat((t, t.new_full((width - real, *t.shape[1:]), 1e4))) for n, t in x.items()}
+        rstep_p, ctx_p = plan_step(plain_pool, plain, rows, walk="mixed", lease=lease, padding=padding)
+        rstep_t, ctx_t = plan_step(twin_pool, twin, rows, walk="mixed", lease=lease, padding=padding)
+        assert isinstance(twin.current_plan(), GDNMixedWrapper)
+        reads = [
+            twin_pool._slots[r]["main"].index for r, s in rows
+            if s == 1 and twin_pool._slots[r]["main"].has_state
+        ]
+        before_state, before_conv = state[reads].clone(), conv_block[reads].clone()
+        qkv_p, out_p = _layer(plain, plain_pool, xin, w, conv)
+        qkv_t, out_t = _layer(twin, twin_pool, xin, w, conv)
+        torch.cuda.synchronize()
+        assert torch.equal(qkv_p[:real], qkv_t[:real]) and torch.equal(out_p[:real], out_t[:real])
+        assert torch.equal(state[reads], before_state) and torch.equal(conv_block[reads], before_conv)
+        plain_pool.commit(rstep_p, ctx_p)
+        twin_pool.commit(rstep_t, ctx_t)
+        for rid, _ in rows:
+            a, b = plain_pool._slots[rid]["main"], twin_pool._slots[rid]["main"]
+            for name in ("state", "conv"):
+                assert torch.equal(plain_pool.block(name, 0)[a.index], twin_pool.block(name, 0)[b.index]), (i, rid)
+
+
+@pytest.mark.parametrize("bucket", [False, True], ids=["eager", "bucket"])
 def test_a_split_walks_mixed_step_matches_the_reference(bucket):
     """Decode rows that carry a state beside fresh prompts, in one step of a
     split walk: the decode kernel takes the one-token rows, the prefill kernel

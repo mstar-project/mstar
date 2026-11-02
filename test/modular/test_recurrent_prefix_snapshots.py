@@ -631,7 +631,7 @@ def test_a_graph_for_a_walk_the_kv_cache_doesnt_key_writes_no_checkpoints():
 def test_a_graph_for_a_keyed_walk_writes_checkpoints(walk):
     gdn, plans = _gdn()
     _plan_gdn(gdn, walk, 2 * PAGE, captured=True)
-    (_, _, _, _, every, checkpoints), = plans
+    (_, _, _, _, every, checkpoints, *_), = plans
     assert every == PAGE and checkpoints is not None, "the graph can never save a snapshot of this walk"
 
 
