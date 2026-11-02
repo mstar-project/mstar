@@ -845,6 +845,10 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
         num_layers=2, num_kv_heads=2, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4, page_size=8,
     ))
     kv.bind_sequence_shard(shard)
+    kv.bind_sequence_shard(shard)
+    # a pool keeps one shard for its writes to check, so a second node's shard would misjudge them
+    with pytest.raises(ValueError, match="two sequence shards"):
+        kv.bind_sequence_shard(SequenceShard(("main",), 0, None, 0, _group(0, P)))
     ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
     shard.plan(SeqShardStep(segments=(Segment("r0", "main", 6),)), ctx)
     k = torch.zeros(3, 1, 2)

@@ -4477,7 +4477,13 @@ class KVManager(AttentionResource):
 
     def bind_sequence_shard(self, shard) -> None:
         """The sequence shard an attention over this pool exchanges split steps through
-        (`AttentionManager.bind_dependencies`): a write of a split label outside it raises."""
+        (`AttentionManager.bind_dependencies`): a write outside an exchange raises (`check_bypass`).
+        One per pool, since the writes check this one shard whichever node's step is running."""
+        if self._sequence_shard is not None and self._sequence_shard is not shard:
+            raise ValueError(
+                f"KV {self.name!r} serves nodes under two sequence shards: declare one SeqShardSpec "
+                "over every node of the pool"
+            )
         self._sequence_shard = shard
 
     @torch.compiler.disable

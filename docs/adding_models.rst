@@ -2418,7 +2418,7 @@ Splitting is declared in four places:
   a deployment's trade between the exchanges' cost and the split layers' saving. A captured step
   decides from its bucket's size, not its prompt's, so capture and replay split alike. Declare
   the spec over every node of the attention resources that depend on it: a resource spanning
-  nodes the shard doesn't cover is refused.
+  nodes the shard doesn't cover is refused, as is a KV pool whose attentions depend on two specs.
 - **Every** ``declare_step`` branch of the node puts a ``SeqShardStep`` in its step, at any SP size
   (at one rank its plan is a constant); the attention resources refuse a step without one, so a
   forgotten branch fails on one GPU. ``SubmoduleStep`` fills its segments and its
