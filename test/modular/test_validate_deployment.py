@@ -7,6 +7,7 @@ including the ones that used to fail on every worker after spawn, and two
 that several problems come back together. The input limit is checked
 against the Rust graph runtime's own compiler.
 """
+import dataclasses
 import re
 from dataclasses import dataclass, field
 
@@ -148,6 +149,11 @@ def test_missing_node_groups_is_refused(tmp_path):
     _refused(_Model(), str(cfg), r"must define `node_groups`")
 
 
+def test_unknown_autocast_dtype_is_refused(tmp_path):
+    """Each worker refused it after spawn."""
+    _refused(_Model(), _cfg(tmp_path, autocast_dtype="bf16"), r"autocast_dtype 'bf16' is not a torch dtype")
+
+
 @pytest.mark.parametrize("node_groups,pattern", [
     ([{"node_names": ["llm"]}], r"node_groups\[0\] needs a `node_names` list and a non-empty `ranks` list"),
     ([{"node_names": ["llm"], "ranks": []}], r"node_groups\[0\] needs a `node_names` list and a non-empty"),
@@ -279,6 +285,20 @@ def test_parallel_node_group_over_a_node_without_support_is_refused(axis, patter
     _refused(_Model(), cfg, pattern)
 
 
+def test_the_sp_checks_run_when_the_lora_specs_fail_to_build(tmp_path, monkeypatch):
+    """Both problems are reported, not the build failure alone."""
+    from mstar import validation
+
+    def refuse(specs):
+        raise ValueError("a LoRA spec left no targets")
+
+    monkeypatch.setattr(validation, "built_resources", refuse)
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
+    problems = _problems(_Model(), cfg)
+    assert any("building the node resources failed" in p for p in problems), problems
+    assert any("node 'llm' runs on 2 SP ranks but neither splits tokens" in p for p in problems), problems
+
+
 def _paged_llm(*extra, node="llm", kv_heads=2, **kw) -> _Model:
     """A model whose ``node`` holds a paged KV pool, and ``extra`` specs."""
     kv = KVSpec(resource_key="kv", nodes={node}, config=PagedKVConfig(
@@ -407,6 +427,23 @@ def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
     apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "none"}}})
     resolve_spec_dependencies(specs)
     assert sequence_parallel_refusals(specs, "llm", 1, 2, MoeParallelConfig(parallel="ep")) == []
+
+
+def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path):
+    """Engine.load_model raised this on the worker, after loading the weights: 'a' places its
+    positions over the SP ranks (heads over TP), 'b' splits its steps (heads over TP x SP)."""
+    def pool(key, node):
+        return KVSpec(resource_key=key, nodes={node}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
+        ))
+
+    specs = [pool("kv", "a"), pool("kv_b", "b"), _shard("b"),
+             AttentionSpec("attn", {"b"}, AttentionConfig(kv_cache="kv_b")), _Spec("shared", {"a", "b"})]
+    model = _Model(_a_then_b, specs=specs, kv_labels={"kv": {"main": KVLabel()}, "kv_b": {"main": KVLabel()}})
+    cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], "ranks": [0, 1], "sp_size": 2}],
+               resources={"kv": {"context_parallel": True}})
+    _refused(model, cfg, r"node_groups\[0\]: \['a'\] place their KV positions over the SP ranks and "
+                         r"\['b'\] keep KV by head over them, .* share resources \['shared'\]")
 
 
 def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
@@ -694,6 +731,71 @@ def test_prefix_stream_laying_out_an_undeclared_resource_is_refused(tmp_path):
         "_Model lays 'vk'/'main' out, but declares no resource 'vk'; its resources are ['kv']"
         in _problems(model, _cfg(tmp_path))
     )
+
+
+# -- LoRA ---------------------------------------------------------------------
+
+
+def _lora_spec(key="lora", nodes=("llm",)):
+    from test_lora_pool import make_spec  # skips the test without safetensors
+
+    return dataclasses.replace(make_spec({}), resource_key=key, nodes=set(nodes))
+
+
+class _LoraModel(_Model):
+    def __init__(self, lora, *args, **kw):
+        super().__init__(*args, **kw)
+        self._lora = lora
+
+    def get_lora_specs(self):
+        return list(self._lora)
+
+
+def test_a_lora_deployment_passes(tmp_path):
+    """The pass checks the specs the YAML turns on, as the workers build them: the
+    model's declaration alone has no `lora` resource for the block to override."""
+    _validate(_LoraModel([_lora_spec()]), _cfg(tmp_path, resources={"lora": {"max_slots": 2}}))
+
+
+@pytest.mark.parametrize("exchange", ["all_gather", "ring", None])
+def test_lora_over_kv_stored_by_position_is_refused_where_the_steps_split(exchange, tmp_path):
+    """Storing KV by position doesn't make a node's steps run copied: the attention's sp_exchange
+    decides, and a split step holds a shard of each row's tokens, which LoRA can't lay out."""
+    model = _paged_llm(_shard(), _attention())
+    model = _LoraModel([_lora_spec()], specs=model._specs, kv_labels=model._kv_labels)
+    resources = {"lora": {"max_slots": 2}, "kv": {"context_parallel": True}}
+    if exchange is not None:
+        resources["attn"] = {"sp_exchange": exchange}
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
+    if exchange is None:
+        assert _validate(model, cfg).worker_graphs
+    else:
+        _refused(model, cfg, r"node_groups\[0\]: LoRA resource 'lora' serves node 'llm', which splits tokens "
+                             r"over 2 SP ranks")
+
+
+@pytest.mark.parametrize("serves_lora, block, refusal", [
+    (True, {"max_slots": 0}, "resources.lora: max_slots must be an integer >= 1; got 0"),
+    # reported once, not again as an unknown resource
+    (False, {"max_slots": 0}, "declaring the LoRA specs failed: ValueError: the serving config "
+                              "has a `resources: lora:` block, but _LoraModel serves no LoRA adapters"),
+    (True, None, "declaring the LoRA specs failed: ValueError: `resources: lora:` must be a mapping; got None"),
+], ids=["bad_value", "no_lora_specs", "not_a_mapping"])
+def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_lora, block, refusal):
+    """The `lora:` block sizes every LoRA spec; a bad value there is one problem, and the
+    other resources' checks still run."""
+    cfg = _cfg(tmp_path, [
+        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["b"], "ranks": [2]},
+    ], resources={"lora": block})
+    model = _LoraModel(
+        [_lora_spec(nodes={"a"}), _lora_spec("lora_b", nodes={"b"})] if serves_lora else [],
+        _a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"],
+    )
+    assert _problems(model, cfg) == [
+        refusal,
+        "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
+    ]
 
 
 # -- every problem at once ----------------------------------------------------

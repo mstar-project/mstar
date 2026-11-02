@@ -15,6 +15,7 @@ from mstar.engine.chunking import ChunkRange
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 NODE, MIXED = "LLM", "mixed"
@@ -47,13 +48,16 @@ def _follower(head: ScheduleTPNode) -> Worker:
         get_spec_target=lambda *args: SimpleNamespace(node_name=NODE, graph_walk="decode"),
         prep_follow_spec_rids=prep,
     )
-    worker.tensor_manager = SimpleNamespace(get_tensor=lambda uuid: uuid)
+    worker.tensor_manager = SimpleNamespace(
+        get_tensor=lambda uuid: uuid, get_tensors=list,
+    )
     worker.request_state = SimpleNamespace(per_request_info={})
     worker._in_flight_rids = set()
     worker._poll_stream_buffers_for_speculation = lambda rid, node: []
     worker.assembled = {}
 
-    worker.streams = SimpleNamespace(poll_for=lambda rid, node: [])
+    # no connections: nothing to poll, and the step's edges read as they are
+    worker.streams = StreamBufferManager(worker.request_state, worker.tensor_manager, [])
 
     def assemble(pending, target, rid_to_wg, inputs, consumed, continuing, fresh_final, **kwargs):
         worker.assembled = dict(rid_to_wg=rid_to_wg, inputs=inputs, continuing=list(continuing), **kwargs)
