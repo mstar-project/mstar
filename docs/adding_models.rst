@@ -2207,8 +2207,8 @@ Each row assumes the node declares a ``SeqShardSpec`` and runs on ``sp_size`` ab
      - ``ring``
      - striped pass-Q ring, eager only
      - partials merged
-     - attention is the step's peak memory: past a per-model crossover (below), sooner for dense
-       models
+     - attention is the step's peak memory: past a per-model crossover (below, estimated and
+       unmeasured)
    * - cacheless (ragged)
      - ``"ulysses"`` (model)
      - Ulysses
@@ -2232,12 +2232,14 @@ then runs ``P`` rounds: rank ``r`` sends its queries to rank ``r + i``, attends 
 over its own slots (stored context and the step's tokens together, one causal call), sends the
 partial back, and merges what it gets in fp32. Its hops are synchronous for now. A captured step
 runs copied on a ring node (ring is eager only), so prefill buckets above ``min_tokens`` that
-all-gather would split run copied there. A step's peak memory is its resident tensors plus the
+all-gather would split run copied there. A step that combines labels (batched CFG's) has no
+stored positions to stripe by, so it fails at plan on a ring node. A step's peak memory is its resident tensors plus the
 larger of its attention and its MLP (or MoE) phase. All-gather's attention phase holds the
 whole step's q, k and v and ``P`` partials per query; ring's holds this rank's tokens alone. So
-ring lowers the peak only once attention outgrows the MLP phase: for the Thinker's geometry,
-from about ``P = 4`` (at ``P = 2`` the MoE phase is larger, and the peaks are equal), and sooner
-for dense models, whose MLP phase lacks the top-k expansion. Which is faster is unmeasured.
+ring lowers the peak only once attention outgrows the MLP phase. Estimated from allocation sites
+and unmeasured: for the Thinker's geometry from about ``P = 4`` (at ``P = 2`` the MoE phase is
+larger and the peaks equal), and sooner for dense models, whose MLP phase lacks the top-k
+expansion. Which is faster is unmeasured too.
 Chunked prefill stays off on SP ranks either way, so a long prompt prefills in one step.
 
 **Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
