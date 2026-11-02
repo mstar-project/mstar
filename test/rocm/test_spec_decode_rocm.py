@@ -194,7 +194,7 @@ def test_the_verify_kernel_replays_in_a_graph(twin):
     # the second row is a padding row from here on
     wrapper = manager._current["main"]
     wrapper._plan_state.slot_map[1] = -1
-    groups = [pool._slots[r]["main"].group for r in rids]
+    groups = [list(pool._slots[r]["main"].group) for r in rids]
     before = state.clone()
     eager = run(manager, pool, x, w).clone()
     after = state[groups[0]].clone()

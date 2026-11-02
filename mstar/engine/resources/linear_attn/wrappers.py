@@ -507,12 +507,12 @@ class GDNMixedWrapper(GDNWrapper):
     The chunked path over every row gathers and scatters each row's whole
     recurrent state (~1 MB a row at 16 heads x 128 x 128 fp32) and runs the
     chunked kernel on rows that need one recurrent update. Here the decode
-    kernel takes every row, updating the decode rows' state in place by slot
-    (the others point at the null slot, which it skips), and the prefill path
-    takes at most ``max_prefill_rows`` prompt rows, its tokens moved to the
-    front by a planned permutation. Both run over static shapes: the bucket's
-    rows and tokens, and ``max_prefill_rows`` sequences. Both halves run the
-    resource's ``GDNKernels``.
+    kernel takes every row, updating the decode rows' state by slot, in place or
+    into each row's twin (the others point at the null slot, which it skips), and
+    the prefill path takes at most ``max_prefill_rows`` prompt rows in place, its
+    tokens moved to the front by a planned permutation. Both run over static
+    shapes: the bucket's rows and tokens, and ``max_prefill_rows`` sequences. Both
+    halves run the resource's ``GDNKernels``.
 
     A one-token row without state (a one-token prompt) is a prompt row: the
     decode kernel reads the slot as it is, and a fresh slot is not cleared.
@@ -588,6 +588,7 @@ class GDNMixedWrapper(GDNWrapper):
         snapshots: Sequence[tuple[int, int, int]] = (),
         every: int = 0,
         checkpoints: torch.Tensor | None = None,
+        host_write_slots: Sequence[int] | None = None,
     ):
         null = self._null_slot_id
         span = np.asarray(spans, dtype=np.int64)
@@ -623,6 +624,11 @@ class GDNMixedWrapper(GDNWrapper):
         dec_dst[:rows] = np.where(decode, start, tokens)
         dec_slots[:rows] = np.where(decode, slot, null)
         pad = cap - len(prefill_rows)
+        dwrite_buf = None
+        if host_write_slots is not None:
+            dec_writes = np.full(bs, null, dtype=np.int64)
+            dec_writes[:rows] = np.where(decode, np.asarray(host_write_slots, dtype=np.int64), null)
+            dwrite_buf = self._buf("dec_writes", bs, torch.int32)
         pre_spans = span[prefill_rows].tolist() + [0] * pad
         pre_slots = np.concatenate([slot[prefill_rows], np.full(pad, null)])
         pre_has = np.concatenate([has[prefill_rows], np.zeros(pad, dtype=bool)])
@@ -638,6 +644,8 @@ class GDNMixedWrapper(GDNWrapper):
         self._stage.upload("dec_src", dec_src, src_buf)
         self._stage.upload("dec_dst", dec_dst, dst_buf)
         self._stage.upload("dec_slots", dec_slots, dslot_buf)
+        if dwrite_buf is not None:
+            self._stage.upload("dec_writes", dec_writes, dwrite_buf)
         self._stage.upload("pre_slots", pre_slots, pslot_buf)
         self._stage.upload("pre_has", pre_has, phas_buf)
         self._stage.end()
@@ -654,7 +662,7 @@ class GDNMixedWrapper(GDNWrapper):
         self._prefill.plan(
             pre_spans, pslot_buf[:cap], phas_buf[:cap], pre_snapshots, every, checkpoints,
         )
-        self._decode.plan([1] * bs, dslot_buf[:bs])
+        self._decode.plan([1] * bs, dslot_buf[:bs], None if dwrite_buf is None else dwrite_buf[:bs])
 
     def _split(self, x: torch.Tensor):
         """``x`` with its prompt tokens first, and each row's decode token."""

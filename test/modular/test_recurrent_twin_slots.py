@@ -96,14 +96,91 @@ def test_only_a_decode_step_writes_the_twin(rows, kw):
     assert pool._slots["a"]["main"].index == index
 
 
-def test_a_walk_held_in_place_never_swaps():
-    pool = _pool()
-    pool.keep_in_place(frozenset({"mixed"}))
-    step, ctx, addressing = _step(pool, [("a", 1)], walk="mixed")
+def _mixed_pool():
+    pool = _pool(max_slots=6)
+    pool.split_walks(frozenset({"mixed"}))
+    return pool
+
+
+def test_a_split_step_swaps_each_decode_row_once_and_leaves_its_prompt_rows():
+    pool = _mixed_pool()
+    # "a" and "b" hold a state; "c" and "d" start in this step
+    pool.commit(*_step(pool, [("a", 5), ("b", 3)], walk="prefill")[:2])
+    slots = pool._slots
+    a, b = slots["a"]["main"], slots["b"]["main"]
+    a0, a1, b0, b1 = a.index, a.twin[0], b.index, b.twin[0]
+
+    step, ctx, addressing = _step(pool, [("a", 1), ("c", 4), ("b", 1), ("d", 1)], walk="mixed")
+    c, d = slots["c"]["main"], slots["d"]["main"]
+    n = addressing.num_rows
+    assert addressing.slot_indices[:n].tolist() == [a0, c.index, b0, d.index]
+    # a row writes its twin only if it takes the decode kernel: "d" is a one-token prompt
+    assert addressing.host_write_slots == [a1, SINK_SLOT, b1, SINK_SLOT]
     assert addressing.write_slot_indices is None
+    c0, d0 = c.index, d.index
+    pool.commit(step, ctx)
+    assert (a.index, a.twin, a.swapped) == (a1, (a0,), True)
+    assert (b.index, b.twin, b.swapped) == (b1, (b0,), True)
+    assert (c.index, c.swapped, d.index, d.swapped) == (c0, False, d0, False)
+
+    # the next step finds every row where the last one left it, "c" and "d" now decode rows
+    step, ctx, addressing = _step(pool, [("a", 1), ("c", 1), ("d", 1)], walk="mixed")
+    assert addressing.slot_indices[:3].tolist() == [a1, c0, d0]
+    assert addressing.host_write_slots == [a0, c.twin[0], d.twin[0]]
+    pool.commit(step, ctx)
+    assert (a.index, c.swapped, d.swapped) == (a0, True, True)
+
+
+def test_a_split_step_keeps_padding_and_capture_rows_on_the_sink():
+    pool = _mixed_pool()
+    pool.commit(*_step(pool, [("a", 5)], walk="prefill")[:2])
+    lease = SlotLease(slot=0, bucket=BucketKey("mixed", bs=2, num_tokens=8))
+    step, ctx, addressing = _step(pool, [("a", 1)], walk="mixed", lease=lease, padding=("pad",))
+    assert addressing.host_write_slots == [pool._slots["a"]["main"].twin[0], SINK_SLOT]
+    pool.commit(step, ctx)
+
+    capture = _mixed_pool()
+    step, ctx, addressing = _step(capture, [("a", 1)], walk="mixed", capture=True, lease=lease, padding=("pad",))
+    assert addressing.host_write_slots == [SINK_SLOT, SINK_SLOT]
+    capture.commit(step, ctx)
+
+
+def test_a_split_step_over_a_pool_without_twins_writes_in_place():
+    pool = _pool(twin=False)
+    pool.split_walks(frozenset({"mixed"}))
+    pool.commit(*_step(pool, [("a", 5)], walk="prefill")[:2])
     index = pool._slots["a"]["main"].index
+    step, ctx, addressing = _step(pool, [("a", 1)], walk="mixed")
+    assert addressing.host_write_slots is None
     pool.commit(step, ctx)
     assert pool._slots["a"]["main"].index == index
+
+
+class _NoKernels:
+    def without_qk_l2norm(self):
+        return self
+
+    def captured_prefill(self, bs, num_tokens):
+        return SimpleNamespace(plan=lambda plan: None)
+
+    chunked_prefill = decode = lambda self, *args: SimpleNamespace(plan=lambda plan: None)
+
+
+def test_a_mixed_wrapper_hands_the_decode_kernel_each_rows_read_and_write():
+    from mstar.engine.resources.linear_attn.wrappers import GDNMixedWrapper
+
+    wrapper = GDNMixedWrapper(torch.device("cpu"), pad_slot_id=-1, null_slot_id=SINK_SLOT, kernels=_NoKernels())
+    # a decode row, a prompt, a decode row, a one-token prompt
+    spans, slots, has = [1, 3, 1, 1], (5, 7, 9, 11), (True, False, True, False)
+    wrapper.plan(spans, slots, has, host_write_slots=[6, SINK_SLOT, 10, SINK_SLOT])
+    plan = wrapper._decode._plan_state
+    assert plan.slots.tolist() == [5, SINK_SLOT, 9, SINK_SLOT]
+    assert plan.write_slots.tolist() == [6, SINK_SLOT, 10, SINK_SLOT]
+    # the prompt rows update in place, in their own slots
+    assert wrapper._prefill._plan_state.slots.tolist() == [7, 11]
+
+    wrapper.plan(spans, slots, has)
+    assert wrapper._decode._plan_state.write_slots is None
 
 
 def test_a_pool_without_twins_is_todays():
@@ -200,7 +277,7 @@ def test_twins_refuse_kernels_that_update_in_place():
     manager._kernels = SimpleNamespace(writes_snapshots=True, writes_twin_slots=True)
     manager._splits = {"mixed": object()}
     manager.bind_dependencies({"gdn_state": pool})
-    assert pool._in_place_walks == {"mixed"}
+    assert pool._split_walks == {"mixed"}
 
 
 def _rank_pool():
