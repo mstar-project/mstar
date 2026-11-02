@@ -419,6 +419,26 @@ def test_a_pre_planned_step_advances_its_rows_once(monkeypatch, both_passes):
     assert list(space.buffers[0].host[:2]) == [2, 2]
 
 
+class _Spans(_Toy):
+    """Rows that run different token counts, so a mismatched length shows."""
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
+        return NodeInputs(tensor_inputs={}, input_seq_len=10 + fwd_info.rid_handle)
+
+
+def test_a_step_put_in_row_order_keeps_each_row_s_length():
+    engine = _engine("cpu", sub=_Spans())
+    for rid in range(4):
+        engine.add_request(rid)
+    _step(engine, ROWS_WALK, [0, 1, 2, 3])
+    # the rows keep their slots, so this step runs in the order above
+    batch = _batch(ROWS_WALK, [3, 2, 1, 0])
+    engine.prepare_inputs(batch)
+    engine.exec_and_postprocess(batch)
+    assert batch.request_ids == [0, 1, 2, 3]
+    assert {rid: batch.seq_len_of(rid) for rid in range(4)} == {rid: 10 + rid for rid in range(4)}
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_a_request_moving_between_two_persistent_walks_carries_its_state(device):
     engine = _engine(device, sub=_Toy(walks=(ROWS_WALK, OTHER_WALK)))

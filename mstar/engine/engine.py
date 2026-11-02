@@ -902,6 +902,8 @@ class Engine:
             if batch.inputs is not None:
                 at = {rid: i for i, rid in enumerate(rids)}
                 batch.inputs = [batch.inputs[at[rid]] for rid in order]
+                # `seq_len_of` pairs these with the inputs
+                batch.prepared_rids = tuple(order)
             batch.request_ids = list(order)
         return batch.request_ids
 
