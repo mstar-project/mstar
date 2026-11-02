@@ -1,7 +1,8 @@
 """A Qwen3-Omni request with no audio output decodes on its own walk: its token loops back
 on the device, reaches the client inline and sends nothing to the Talker. A request with
 audio output keeps ``thinker_decode``. The Thinker declares the loop-back and the stop; the
-hooks behind them are ``ARNodeSubmodule``'s."""
+hooks behind them are ``ARNodeSubmodule``'s. A captured step of either walk embeds its ids
+and builds its rotary tables in the graph."""
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,8 +229,28 @@ def test_a_step_that_reads_its_inputs_is_not_input_free(thinker, walk):
 def test_a_loop_back_row_brings_no_token_and_a_routed_one_does(thinker):
     row = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {}, has_loopback=True)
     assert row.input_ids is None and row.input_embeds is None and row.input_seq_len == 1
-    routed = thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor(9)]})
-    assert routed.input_ids.tolist() == [9] and routed.input_embeds.shape == (1, HIDDEN)
+
+
+@pytest.mark.parametrize("walk", DECODE_WALKS)
+@pytest.mark.parametrize("token", [torch.tensor(9), torch.tensor([9])])
+def test_a_routed_decode_row_is_its_token_and_nothing_else(thinker, walk, token):
+    row = thinker.prepare_inputs(walk, None, {"text_inputs": [token]})
+    assert row.input_ids.tolist() == [9] and row.input_seq_len == 1
+    assert row.input_embeds is None and row.custom_pos_ids is None, "the graph builds both"
+
+
+def test_both_decode_captures_take_ids():
+    thinker = ThinkerSubmodule(_Body(), SimpleNamespace(
+        im_end_token_id=EOS, thinker_head_dim=128, thinker_hidden_size=HIDDEN,
+        thinker_text=SimpleNamespace(rope_theta=1e6),
+        vision=SimpleNamespace(deepstack_visual_indexes=[]),
+    ))
+    configs = {
+        config.capture_graph_walk: config for config in thinker.get_accelerator_graph_configs(torch.device("cpu"))
+    }
+    for walk in DECODE_WALKS:
+        row = configs[walk].single_request_inputs
+        assert row.input_ids.shape == (1,) and row.input_embeds is None and row.custom_pos_ids is None
 
 
 def test_a_decode_step_takes_each_rows_last_token_and_a_routed_row_keeps_its_own(thinker):
@@ -254,16 +275,18 @@ def test_a_step_of_routed_rows_alone_takes_their_tokens(thinker):
     assert out["input_ids"].tolist() == [3, 4]
 
 
-def test_a_captured_decode_step_builds_its_rotary_tables_in_the_graph(thinker):
+@pytest.mark.parametrize("walk", DECODE_WALKS)
+def test_a_captured_decode_step_builds_its_rotary_tables_in_the_graph(thinker, walk):
     planned = torch.tensor([4.0, 5.0, 6.0, 99.0])
     thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: planned)
     engine_inputs = _engine_inputs(["a", "b", "c"], [1, 2, 3], captured=True)
-    out = thinker.preprocess(THINKER_TEXT_DECODE, engine_inputs, [ARNodeInputs(input_seq_len=1)] * 3)
-    assert "cos_3d" not in out and "sin_3d" not in out
+    rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([t])) for t in (1, 2, 3)]
+    out = thinker.preprocess(walk, engine_inputs, rows)
+    assert set(out) == {"input_ids"} and out["input_ids"].tolist() == [1, 2, 3]
 
-    tokens = thinker.forward_batched(THINKER_TEXT_DECODE, engine_inputs, **out)
+    tokens = thinker.forward_batched(walk, engine_inputs, **out)
     call = thinker.model.calls[-1]
-    assert call["keep_states"] is False, "nothing reads the Talker's states on this walk"
+    assert call["keep_states"] is (walk == "thinker_decode"), "only the Talker reads the states"
     want = compute_3d_cos_sin(
         planned[:3].unsqueeze(0).expand(3, -1), thinker._get_inv_freq(torch.device("cpu")),
         mrope_section=thinker.MROPE_SECTION, target_dtype=torch.float32,
@@ -272,18 +295,45 @@ def test_a_captured_decode_step_builds_its_rotary_tables_in_the_graph(thinker):
     assert isinstance(tokens, BatchedModelOutput)
 
 
-def test_a_decode_step_reads_nothing_on_the_host(thinker):
+def test_a_captured_audio_decode_step_keeps_the_talkers_states_and_mask(thinker):
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0]))
+    engine_inputs = _engine_inputs(["a", "b"], [0, 0], captured=True)
+    rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([t])) for t in (3, 8)]
+    out = thinker.preprocess("thinker_decode", engine_inputs, rows)
+    out = thinker.forward_batched("thinker_decode", engine_inputs, **out)
+    assert set(out.row_outputs) == {"thinker_states", "new_token", "thinker_mask"}
+    assert out.row_outputs["thinker_states"][:, 0].tolist() == [3.0, 8.0], "the embeds the graph built, as layer 0"
+    assert not out.row_outputs["thinker_mask"].any() and out.row_outputs["thinker_mask"].shape == (2,)
+    assert set(out.check_stop_buffers) == {"new_token"}
+
+
+def test_an_eager_audio_decode_step_stages_its_tables_and_keeps_the_talkers_states(thinker):
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0]))
+    rows = [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([3]))]
+    single = _engine_inputs(["a"], [0])
+    out = thinker.preprocess("thinker_decode", single, rows)
+    assert out["cos_3d"].shape[0] == 1
+    outputs = thinker.forward("thinker_decode", single, **out)
+    assert set(outputs) == {"new_token", "thinker_states", "thinker_mask"}
+    assert outputs["thinker_states"][0][:, 0].tolist() == [3.0]
+    assert outputs["thinker_mask"][0].tolist() == [False]
+
+
+@pytest.mark.parametrize("walk", DECODE_WALKS)
+def test_a_decode_step_reads_nothing_on_the_host(thinker, walk):
     thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: torch.tensor([4.0, 5.0, 6.0]))
     rows = [
         ARNodeInputs(input_seq_len=1),
         thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {"text_inputs": [torch.tensor([7])]}, has_loopback=False),
         thinker.prepare_inputs(THINKER_TEXT_DECODE, None, {}, has_loopback=True),
+    ] if walk == THINKER_TEXT_DECODE else [
+        thinker.prepare_inputs(walk, None, {"text_inputs": [torch.tensor([t])]}) for t in (7, 8, 9)
     ]
     for captured in (False, True):
         engine_inputs = _engine_inputs(["a", "b", "c"], [11, 12, 13], captured=captured)
         with _HostReads() as reads:
-            out = thinker.preprocess(THINKER_TEXT_DECODE, engine_inputs, rows)
-            thinker.forward_batched(THINKER_TEXT_DECODE, engine_inputs, **out)
+            out = thinker.preprocess(walk, engine_inputs, rows)
+            thinker.forward_batched(walk, engine_inputs, **out)
         assert reads.reads == []
 
 
@@ -398,6 +448,23 @@ def test_a_mixed_step_embeds_its_loop_back_rows_beside_the_prompts(thinker):
     assert out["input_embeds"][:, 0].tolist() == [20.0, 20.0, 6.0, 9.0]
     assert out["seq_lens"] == [2, 1, 1]
     assert out["cos_3d"].shape[0] == 4
+
+
+def test_a_mixed_step_embeds_an_audio_decode_row_at_its_planned_position(thinker):
+    prompt = ARNodeInputs(input_seq_len=2, input_embeds=torch.full((2, HIDDEN), 20.0))
+    row = thinker.prepare_inputs("thinker_decode", None, {"text_inputs": [torch.tensor(9)]})
+    planned = torch.tensor([30.0, 31.0, 12.0])
+    thinker.node_resources[THINKER_POS] = SimpleNamespace(pos_ids=lambda label: planned)
+    # no loop-back row in this step, so nothing reads the sampler's slot masters
+    engine_inputs = _engine_inputs(["a", "b"], [5, 6])
+    engine_inputs.resources[THINKER_SAMPLER].loopback_tokens = None
+    out = thinker.preprocess(THINKER_MIXED, engine_inputs, [prompt, row])
+    assert out["input_embeds"][:, 0].tolist() == [20.0, 20.0, 9.0]
+    want = compute_3d_cos_sin(
+        planned.unsqueeze(0).expand(3, -1), thinker._get_inv_freq(torch.device("cpu")),
+        mrope_section=thinker.MROPE_SECTION, target_dtype=torch.float32,
+    )
+    assert torch.equal(out["cos_3d"], want[0]) and torch.equal(out["sin_3d"], want[1])
 
 
 def test_a_mixed_step_keeps_a_decode_rows_token_and_drops_a_mid_prompt_one(thinker):

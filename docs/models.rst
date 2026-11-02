@@ -603,7 +603,9 @@ Qwen3-Omni notes
 - A request with no audio output decodes on its own walk, ``thinker_text_decode``:
   its token stays on the device between steps and reaches the client inline, as
   Qwen3.5's does, and nothing goes to the Talker. A request with audio output
-  keeps ``thinker_decode``, which streams every step's states to the Talker.
+  keeps ``thinker_decode``, which streams every step's states to the Talker. A
+  captured step of either walk takes token ids and builds its embeds and rotary
+  tables in the graph.
 - The audio encoder is the AuT node Qwen3-ASR runs, fed the API server's
   log-mel features: a step's clips (up to 8 requests) go through one packed
   forward, up to 4096 tokens. A step over 4096 tokens runs its clips one by

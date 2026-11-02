@@ -498,39 +498,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
-        if graph_walk == THINKER_TEXT_DECODE:
+        if graph_walk in THINKER_DECODE_WALKS:
             if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
                 # read off the sampler's slot master in `preprocess`
                 return row
-            # the embeds are for a mixed step, which packs by embeds
-            token_id = inputs["text_inputs"][0].to(device).reshape(1)
-            return ARNodeInputs(
-                input_seq_len=1, input_ids=token_id, input_embeds=self.model.model.embed_tokens(token_id),
-            )
+            # the embeds and positions come later, in the graph or for a mixed step
+            return ARNodeInputs(input_seq_len=1, input_ids=inputs["text_inputs"][0].to(device).reshape(1))
         start_pos = self.node_resources[THINKER_POS].position(
             rid=fwd_info.rid_handle, label="main"
         )
-        if graph_walk == "thinker_decode":
-            # Get previous token ID from text_inputs
-            token_id = inputs["text_inputs"][0].to(device)  # (1,) or scalar
-            if token_id.dim() == 0:
-                token_id = token_id.unsqueeze(0)
-            embeds = self.model.model.embed_tokens(token_id)
-
-            # Next MRoPE position for all 3 components: read from the
-            # stream's position counter (advanced by the runner's commit
-            # of each declared step).
-            # Fill kernel, not ``torch.tensor(..., device=cuda)``: a pageable H2D
-            # syncs the stream, stalling prepare(N+1) until step N drains.
-            pos_ids = torch.full(
-                (3, 1), float(start_pos), dtype=torch.float, device=device,
-            )  # (3, 1)
-
-            return ARNodeInputs(
-                input_seq_len=1,
-                input_embeds=embeds,
-                custom_pos_ids=pos_ids,
-            )
 
         if graph_walk == "prefill_text":
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
@@ -755,8 +731,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         self.model.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
         device = self.get_device()
-        if graph_walk == THINKER_TEXT_DECODE:
-            return self._preprocess_text_decode(engine_inputs, inputs)
+        if graph_walk in THINKER_DECODE_WALKS:
+            return self._preprocess_decode(engine_inputs, inputs)
         # Concatenate across requests
         input_embeds = torch.cat(self._row_embeds(engine_inputs, inputs), dim=0)
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
@@ -817,18 +793,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def _row_embeds(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
     ) -> list[torch.Tensor]:
-        """Each row's embeds; a mixed step's loop-back rows embed their last
-        sampled token here."""
-        if all(inp.input_embeds is not None for inp in inputs):
-            return [inp.input_embeds for inp in inputs]
-        sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
-        embeds = self.model.model.embed_tokens(sampler.loopback_tokens(engine_inputs.request_ids))
-        return [
-            embeds[i:i + 1] if inp.input_embeds is None else inp.input_embeds
-            for i, inp in enumerate(inputs)
-        ]
+        """Each row's embeds; a mixed step's decode rows carry a token, routed
+        or on the sampler's slot master, and embed it here."""
+        embeds = [inp.input_embeds for inp in inputs]
+        decode = [i for i, row in enumerate(embeds) if row is None]
+        if not decode:
+            return embeds
+        masters = None
+        if any(inputs[i].input_ids is None for i in decode):
+            sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
+            masters = sampler.loopback_tokens(engine_inputs.request_ids)
+        tokens = self.model.model.embed_tokens(torch.cat([
+            masters[i:i + 1] if inputs[i].input_ids is None else inputs[i].input_ids for i in decode
+        ]))
+        for row, i in enumerate(decode):
+            embeds[i] = tokens[row:row + 1]
+        return embeds
 
-    def _preprocess_text_decode(
+    def _preprocess_decode(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
         if any(inp.input_ids is None for inp in inputs):
@@ -845,15 +827,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
         )
         return out
 
-    def _text_decode(
+    def _decode(
         self,
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
         cos_3d: torch.Tensor | None,
         sin_3d: torch.Tensor | None,
         num_valid_tokens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """One decode step of a request with no audio output: the sampled tokens."""
+        keep_states: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One decode step: the sampled tokens and, with ``keep_states``, the
+        layer-0 rows the Talker reads."""
         embeds = self.model.model.embed_tokens(input_ids)
         if cos_3d is None:
             # one token per row, at the position resource's planned positions
@@ -862,17 +846,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 pos.unsqueeze(0).expand(3, -1), self._get_inv_freq(embeds.device),
                 mrope_section=self.MROPE_SECTION, target_dtype=embeds.dtype,
             )
-        hidden, _, _ = self.model(
+        hidden, layer_0_embed, _ = self.model(
             input_embeds=embeds,
             cos_sin_3d=(cos_3d, sin_3d),
             mrope_section=self.MROPE_SECTION,
             label="main",
             num_valid_tokens=num_valid_tokens,
-            keep_states=False,
+            keep_states=keep_states,
         )
         return engine_inputs.resources[THINKER_SAMPLER].sample(
             engine_inputs.request_ids, logits=self.model.lm_head(hidden),
-        )
+        ), layer_0_embed
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
@@ -951,10 +935,20 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ``deepstack`` (used by prefill_vision) is reassembled from per-layer
         ``deepstack_<i>`` kwargs — see ``_collect_deepstack_kwargs``.
         """
-        if graph_walk == THINKER_TEXT_DECODE:
-            return {"new_token": [self._text_decode(
+        if graph_walk in THINKER_DECODE_WALKS:
+            new_token, layer_0_embed = self._decode(
                 engine_inputs, kwargs["input_ids"], cos_3d, sin_3d, kwargs.get("num_valid_tokens"),
-            )]}
+                keep_states=graph_walk == "thinker_decode",
+            )
+            if layer_0_embed is None:
+                return {"new_token": [new_token]}
+            # a decode token is text: its layer-0 row and ``[False]``, fresh
+            # each step, as ``forward_batched`` emits them
+            return {
+                "new_token": [new_token],
+                "thinker_states": [layer_0_embed],
+                "thinker_mask": [torch.zeros(1, dtype=torch.bool, device=layer_0_embed.device)],
+            }
         deepstack = self._collect_deepstack_kwargs(kwargs)
         request_info: CurrentForwardPassInfo = engine_inputs.single_request_info
         audio_output = request_info.step_metadata.get(
@@ -974,8 +968,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         result: NameToTensorList = {}
 
-        # Decode: produce logits for text token sampling
-        if graph_walk in THINKER_DECODE_WALKS or request_info.step_metadata.get("is_last_prefill", False):
+        # The last prefill samples the first token
+        if request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
             result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
                 engine_inputs.request_ids, logits=logits
@@ -984,12 +978,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Pack thinker_states for Talker conditioning ONLY when audio output
         # is requested.  For text-only requests we skip this entirely to
         # avoid sending hidden states the Talker will never consume.
-        if audio_output and graph_walk == "thinker_decode":
-            # a decode token is text: its layer-0 row and ``[False]``, fresh
-            # each step, as ``forward_batched`` emits them
-            result["thinker_states"] = [layer_0_embed]
-            result["thinker_mask"] = [torch.zeros(1, dtype=torch.bool, device=hidden.device)]
-        elif audio_output:
+        if audio_output:
             # Concatenate layer-0 embeddings and layer-N hidden states along
             # last dim -> (tokens, 2 * hidden_size)
             if layer_n_hidden is not None:
@@ -1027,30 +1016,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> list[AcceleratorGraphConfig]:
         vision_input = functools.partial(self._vision_capture_input, device)
         return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk=THINKER_TEXT_DECODE,
+            *(BatchedAcceleratorGraphConfig(
+                capture_graph_walk=walk,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1,
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
-            ),
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="thinker_decode",
-                single_request_inputs=ARNodeInputs(
-                    input_seq_len=1,
-                    input_embeds=torch.zeros(
-                        (1, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16
-                    ),
-                    custom_pos_ids=torch.tensor(
-                        [[0], [0], [0]],
-                        dtype=torch.float,
-                        device=device,
-                    ),
-                ),
-                capture_batch_sizes=[1, 2, 4, 8, 16, 32],
-            ),
+            ) for walk in (THINKER_TEXT_DECODE, "thinker_decode")),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text", "prefill_audio", THINKER_MIXED],
@@ -1151,20 +1124,32 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ``thinker_states`` for ``unpack_packed_outputs`` to cut and filter per
         request.
         """
-        if graph_walk == THINKER_TEXT_DECODE:
-            new_tokens = self._text_decode(
+        if graph_walk in THINKER_DECODE_WALKS:
+            new_tokens, layer_0_embed = self._decode(
                 engine_inputs, kwargs["input_ids"], cos_3d, sin_3d, kwargs.get("num_valid_tokens"),
+                keep_states=graph_walk == "thinker_decode",
             )
-            # Row i is request i: one clone and one D2H copy per step. The
-            # prefix cache keys a reply from this host copy, under `text_inputs`.
+            if layer_0_embed is None:
+                # Row i is request i: one clone and one D2H copy per step. The
+                # prefix cache keys a reply from this host copy, under `text_inputs`.
+                return BatchedModelOutput(
+                    row_outputs={"new_token": new_tokens},
+                    check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+                )
+            # Row i is request i: one clone per output and one host copy of the
+            # tokens per step. A decode token is text, so the Talker takes its
+            # layer-0 row as is and its Talker mask is ``[False]``; a row view of
+            # the step's clone, never one tensor shared by every row, which the
+            # RDMA/TCP store would register once per row at the same address.
+            # postprocess leaves both rows as they are, for the row-output store.
             return BatchedModelOutput(
-                row_outputs={"new_token": new_tokens},
-                check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+                row_outputs={
+                    "thinker_states": layer_0_embed,
+                    "new_token": new_tokens,
+                    "thinker_mask": torch.zeros_like(new_tokens, dtype=torch.bool),
+                },
+                check_stop_buffers={"new_token": new_tokens},
             )
-
-        is_prefill = graph_walk in (
-            "prefill_text", "prefill_audio", "prefill_vision", THINKER_MIXED,
-        )
 
         # prefill_vision: reassemble per-layer deepstack tensors from
         # ``deepstack_<i>`` kwargs into the list shape ``model.forward``
@@ -1185,44 +1170,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
         request_ids = engine_inputs.request_ids
         sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
 
-        if is_prefill:
-            last_hidden = attn_manager.select_last_hidden(hidden)
-            logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
-            new_tokens = sampler.sample(request_ids, logits)
-            if layer_n_hidden is not None:
-                thinker_states = torch.cat(
-                    [layer_0_embed, layer_n_hidden], dim=-1,
-                )  # (total_tokens, 2*hidden)
-            else:
-                thinker_states = torch.cat(
-                    [layer_0_embed, layer_0_embed], dim=-1,
-                )
-
-            return BatchedModelOutput(
-                packed_outputs={"__batched_thinker_states__": thinker_states},
-                row_outputs={"new_token": new_tokens},
-                # a mixed step's text-decode rows take the stop check and the
-                # inline emit off these, as in a step of their own walk
-                check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
+        last_hidden = attn_manager.select_last_hidden(hidden)
+        logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
+        new_tokens = sampler.sample(request_ids, logits)
+        if layer_n_hidden is not None:
+            thinker_states = torch.cat(
+                [layer_0_embed, layer_n_hidden], dim=-1,
+            )  # (total_tokens, 2*hidden)
+        else:
+            thinker_states = torch.cat(
+                [layer_0_embed, layer_0_embed], dim=-1,
             )
 
-        # thinker_decode (existing behavior)
-        logits = self.model.lm_head(hidden)  # (batch, vocab)
-        new_tokens = sampler.sample(request_ids, logits)
-
-        # Row i is request i: one clone per output and one host copy of the
-        # tokens per step. A decode token is text, so the Talker takes its
-        # layer-0 row as is and its Talker mask is ``[False]``; a row view of
-        # the step's clone, never one tensor shared by every row, which the
-        # RDMA/TCP store would register once per row at the same address.
-        # postprocess leaves both rows as they are, for the row-output store.
         return BatchedModelOutput(
-            row_outputs={
-                "thinker_states": layer_0_embed,
-                "new_token": new_tokens,
-                "thinker_mask": torch.zeros_like(new_tokens, dtype=torch.bool),
-            },
-            check_stop_buffers={"new_token": new_tokens},
+            packed_outputs={"__batched_thinker_states__": thinker_states},
+            row_outputs={"new_token": new_tokens},
+            # a mixed step's text-decode rows take the stop check and the
+            # inline emit off these, as in a step of their own walk
+            check_stop_buffers={"new_token": new_tokens, "text_inputs": new_tokens},
         )
 
     def unpack_packed_outputs(
