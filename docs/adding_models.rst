@@ -1310,10 +1310,10 @@ ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool's lock, so the main thread's ingests and removes go on
 meanwhile.
 
-A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
-out per request, while each SP rank holds a shard of the tokens, so building the pool
-refuses the deployment. A node whose KV pools place positions over its SP ranks (context
-parallelism) runs every row on every SP rank, so it serves LoRA.
+A node that runs its own sequence parallelism (in ``sp_enabled_nodes``, SP > 1) cannot serve
+LoRA yet: the pool lays rows out per request, while each SP rank holds a shard of the tokens,
+so building the pool refuses the deployment. A node whose KV pools place positions over its SP
+ranks instead (context parallelism) runs every row on every SP rank, so it serves LoRA.
 
 Step 3 — Declare the computation graph
 --------------------------------------

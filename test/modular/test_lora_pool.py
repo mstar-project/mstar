@@ -488,7 +488,7 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     assert asked and "No eviction candidate" in caplog.text
 
 
-def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
+def test_lora_under_sequence_parallelism(adapters):
     """LoRA rows are per request, not per SP shard: the build refuses SP > 1 at startup,
     and takes TP with SP 1, and a node that places its KV positions over its SP ranks
     (heads split over TP alone), which runs every row on every SP rank."""
@@ -506,6 +506,13 @@ def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
         build(sp2)
     assert build(CommGroup.trivial()).targets
     assert build(sp2, head_shards=1).targets
+
+
+def test_a_replicated_slice_that_does_not_split_evenly_is_refused():
+    """A column slice of fewer units (KV heads) than ranks is a config error unless they divide
+    the ranks, as for the base K/V projection."""
+    with pytest.raises(ValueError, match="do not split evenly"):
+        LoraTarget(in_features=HIDDEN, out_slices=(12,), parallel="column", slice_units=(3,)).shard(4)
 
 
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
