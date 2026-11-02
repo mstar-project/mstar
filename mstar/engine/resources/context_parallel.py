@@ -231,6 +231,7 @@ class RingAttentionWrapper:
         self._placement, self._page_size, self._dtype, self._device = placement, page_size, dtype, device
         self._paged = paged
         self._check = check
+        self._pinned = [_PinnedIndices(device) for _ in paged]
         # per partner, whether each of its queries' rows holds any of this rank's slots
         self._valid: list[torch.Tensor] = []
         self._counts: tuple[int, ...] = ()
@@ -258,6 +259,7 @@ class RingAttentionWrapper:
                     self._check(f"rank {rank}'s plan of partner {j}'s queries", queries)
         kvp = indptrs.paged_kv_indptr.numpy().astype(np.int64)
         indices = indptrs.paged_kv_indices.numpy()
+        pinned = indptrs.paged_kv_indices.is_pinned()
         self._valid = []
         for j in range(p):
             queries, ends, rows = _ring_rows(stored, lens, p, r, j, causal)
@@ -273,7 +275,12 @@ class RingAttentionWrapper:
             assert not causal or ((local.kv_lens.numpy() >= queries) | ~valid_rows).all(), (
                 "a causal row with more queries than keys"
             )
-            self._paged[j].plan(causal=causal, dtype=self._dtype, **local.to_kwargs_dict())
+            if pinned:
+                local = local._replace(paged_kv_indices=self._pinned[j].copy(local.paged_kv_indices))
+            try:
+                self._paged[j].plan(causal=causal, dtype=self._dtype, **local.to_kwargs_dict())
+            finally:
+                self._pinned[j].planned()
             self._valid.append(to_device_nonblocking(np.repeat(valid_rows, queries), self._device, torch.bool))
         self._counts = tuple(counts)
         self._qo_indptr_buf = to_device_nonblocking(qo.astype(np.int32), self._device, torch.int32)
@@ -323,6 +330,35 @@ def _unpack(packed: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, tor
 
 
 
+class _PinnedIndices:
+    """A page-locked copy of a plan's trimmed paged indices, so FlashInfer copies them
+    asynchronously, as the KV plan's own (MSTAR_KV_PINNED_INDPTRS), on every rank alike whichever
+    rows a rank trims. ``copy`` reuses the buffer once the last plan's non-blocking copies out of
+    it have landed (``planned`` marks them): a slot's step has retired before its next plan, but a
+    dropped pre-plan is replanned on the same slot at once."""
+
+    def __init__(self, device: torch.device):
+        self._device = device
+        self._buffer: torch.Tensor | None = None
+        self._done: torch.Event | None = None
+
+    def copy(self, indices: torch.Tensor) -> torch.Tensor:
+        if self._done is None:
+            self._done = torch.Event(device=self._device)
+        else:
+            self._done.synchronize()
+        n = len(indices)
+        if self._buffer is None or len(self._buffer) < n:
+            grown = 2 * (0 if self._buffer is None else len(self._buffer))
+            self._buffer = torch.empty(max(n, grown, 256), dtype=torch.int32, pin_memory=True)
+        return self._buffer[:n].copy_(indices)
+
+    def planned(self) -> None:
+        """After a plan read the copy, also one that raised: copies already issued still read it."""
+        if self._done is not None:
+            self._done.record()
+
+
 class ContextParallelWrapper:
     """A step's attention over a placed pool from a backend's two wrappers, exchanged and merged
     by ``ContextParallel.attend``. A one-token-a-row step attends the pages after its write
@@ -363,10 +399,8 @@ class ContextParallelWrapper:
         self._captured = captured_tokens > 0
         self._valid = torch.zeros(captured_tokens, dtype=torch.bool, device=device) if self._captured else None
         self._stager = PinnedStager(torch.bool)
-        # page-locked copy of the trimmed paged indices; one per wrapper, so per slot. The event
-        # follows the last plan's copies out of it
-        self._pinned_indices: torch.Tensor | None = None
-        self._pinned_done: torch.Event | None = None
+        # one per wrapper, so per slot
+        self._pinned = _PinnedIndices(device)
 
     @torch.compiler.disable
     def plan(self, kv_out, causal: bool = True):
@@ -384,15 +418,13 @@ class ContextParallelWrapper:
         if kv_out.cpu_indptrs.paged_kv_indices.is_pinned() and not local.paged_kv_indices.is_pinned():
             # page-locked plan indices (MSTAR_KV_PINNED_INDPTRS) stay page-locked once trimmed, so
             # FlashInfer copies them asynchronously on every rank alike, whichever rows a rank trims
-            local = local._replace(paged_kv_indices=self._pin(local.paged_kv_indices))
+            local = local._replace(paged_kv_indices=self._pinned.copy(local.paged_kv_indices))
         # not causal whatever the step: every query sees all of it (a one-token row's own key
         # included), and FA MLA's causal tile check reads each rank's KV lengths
         try:
             self.context.plan(causal=False, dtype=self._dtype, **local.to_kwargs_dict())
         finally:
-            # also on a raise: copies already issued still read the pinned buffer
-            if self._pinned_done is not None:
-                self._pinned_done.record()
+            self._pinned.planned()
         self._qo_indptr_buf = getattr(self.context, "_qo_indptr_buf", None)
         valid = np.repeat(valid_rows, np.diff(context.qo_indptr.numpy()))
         n = len(valid)
@@ -403,20 +435,6 @@ class ContextParallelWrapper:
         # a captured bucket's whole buffer, so its padding tokens read False rather than a stale flag;
         # an eager step reads its own tokens' alone
         self._stager.copy_(self._valid, valid, pad_value=False if self._captured else None)
-
-    def _pin(self, indices: torch.Tensor) -> torch.Tensor:
-        """``indices`` in this wrapper's page-locked buffer, once the last plan's non-blocking copies
-        out of it have landed: a slot's step has retired before its next plan, but a dropped pre-plan
-        is replanned on the same slot at once."""
-        if self._pinned_done is None:
-            self._pinned_done = torch.Event(device=self._device)
-        else:
-            self._pinned_done.synchronize()
-        n = len(indices)
-        if self._pinned_indices is None or len(self._pinned_indices) < n:
-            grown = 2 * (0 if self._pinned_indices is None else len(self._pinned_indices))
-            self._pinned_indices = torch.empty(max(n, grown, 256), dtype=torch.int32, pin_memory=True)
-        return self._pinned_indices[:n].copy_(indices)
 
     def attend(
         self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
