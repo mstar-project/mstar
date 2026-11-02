@@ -60,6 +60,16 @@ class _CounterRows(RowState):
 
         rows.on_commit(store_counts)
 
+    def lend(self, rows):
+        rows.copy_out(self.acc, rows.lent_slots, self.res.store, np.array(rows.lent_rids))
+        slots, rids = rows.lent_slots, rows.lent_rids
+
+        def store_counts(released):
+            for slot, rid in zip(slots.tolist(), rids, strict=True):
+                self.res.count[rid] = int(self.count.host[slot])
+
+        rows.on_commit(store_counts)
+
     def released(self, slots):
         self.released_slots.extend(slots.tolist())
 
@@ -256,7 +266,7 @@ def test_steps_read_each_request_s_own_state_across_walks_and_removals(device, s
             assert space.batch.n_held <= (max_live or MAX_ROWS)
             space.check_mirrors()
         else:
-            assert not any(space.holds(rid) for rid in rids)
+            assert not any(space.holds_live(rid) for rid in rids)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -452,13 +462,13 @@ def test_a_request_moving_between_two_persistent_walks_carries_its_state(device)
         engine.add_request(rid)
     seen, last = [], None
     for walk in (ROWS_WALK, OTHER_WALK, OTHER_WALK, ROWS_WALK, OTHER_WALK):
-        # a pre-plan waits for the check-in from the other walk
+        # a pre-plan waits for the lend from the other walk
         waits = last not in (None, walk)
         assert (engine._enter_rows(_batch(walk, [1]), preplan=True) is None) == waits
         _, s = _step(engine, walk, [1, 2])
         last = walk
         seen.append(s[1])
-        assert not node_rows.holds_any([1, 2], skip_walk=walk)
+        assert not node_rows.lends_any([1, 2], skip_walk=walk)
     assert seen == [(i, float(i)) for i in range(5)]
 
 

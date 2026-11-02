@@ -201,9 +201,10 @@ def test_a_rows_decode_step_crosses_held_rows_onto_their_streams_next_page(backe
     rows = np.concatenate([idx, [slots, slots]])
     assert out[:10].tolist() == [0, *np.cumsum(lens[rows] // page_size + 1).tolist()]
     assert out[10:].tolist() == (lens[rows] + 1).tolist()
+    # into the crossing row's place in the step
     want = {
-        (1 << 20) + 4 * max_pages * s + 4 * (lens[s] // page_size): streams[s][lens[s] // page_size]
-        for s in idx.tolist() if lens[s] % page_size == 0 and s not in skip.tolist()
+        (1 << 20) + 4 * max_pages * i + 4 * (lens[s] // page_size): streams[s][lens[s] // page_size]
+        for i, s in enumerate(idx.tolist()) if lens[s] % page_size == 0 and s not in skip.tolist()
     }
     block = np.zeros(stage.size(), np.uint8)
     placed = stage.pack(block, 0)

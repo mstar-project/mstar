@@ -4,23 +4,30 @@ A ``RowSpace`` owns one ``PersistentBatch`` and every ``RowBuffer`` the
 resources of its (node, walk) register. Each buffer has two levels on the
 device: resident rows, one slot per live request (``capacity`` of them, plus
 a padding slot and a trash slot), and a dense step view of ``max_rows`` rows
-at a fixed address, which the captured graphs read. Before a step's forward
-its rows are gathered into the dense view (``gather``); after it, what the
-forward changed is scattered back (``after_forward``). A step proposes its
-rows (``propose``), the resources say what joining rows hold and what changed
-(``StepRows``), and everything that changed reaches the device as one
-host-to-device copy of a segment table and its payload, which one copy
-kernel runs (two when leaving rows are read out); a step that changes
-nothing costs nothing.
+at a fixed address, which the captured graphs read and the forward updates
+in place. Row ``i`` of the dense view holds the request the last committed
+step ran at ``i``, and is that request's state; its resident slot is where
+the state waits while the request is out of the steps. So a step that runs
+the same requests in the same order moves nothing, and a step that changes
+some moves only those: a row whose request leaves its place goes back to
+its slot, and a request taking a place is copied in from its slot, or
+written whole if it joins. A step proposes its rows (``propose``), the
+resources say what joining rows hold and what changed (``StepRows``), and
+everything reaches the device as one host-to-device copy of segment tables
+and their payload, which a copy kernel a phase runs.
 
-A mirrored buffer's host copy is the truth: proposals are copy-on-write, so a
-step that is refused or goes stale leaves it untouched. The mirrored buffers
-share one slab, which a step that writes any of them uploads whole: it is a
-few bytes a row, and a whole copy costs less than working out which rows
-changed. Buffers without a mirror hold device state, moved row by row.
+A mirrored buffer's host copy, by slot, is the truth: proposals are
+copy-on-write, so a step that is refused or goes stale leaves it untouched.
+Buffers without a mirror hold device state.
+
+A step outside the walk that runs a held request (a mixed step, say) reads
+its state where it keeps it outside the rows: the request's row is lent
+(``lend``), its device state read back, and it keeps its slot and place
+until a step of the walk runs it again and writes it whole (a resync).
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 from collections import deque
@@ -31,13 +38,20 @@ import numpy as np
 import torch
 
 from mstar.engine.rows.batch import PersistentBatch, RowDiff
-from mstar.engine.rows.copy import RowTable, StagedTables, copy_segments, move_rows
+from mstar.engine.rows.copy import StagedTables, copy_segments
 from mstar.engine.rows.stage import new_stage, step_mirrors
 from mstar.utils.h2d import _H2D, _cuda_memcpy_async
 
 logger = logging.getLogger(__name__)
 
 _ALIGN = 16
+_NO_SLOTS = np.empty(0, dtype=np.int64)
+
+# a step's copy phases: rows leaving their place go back to their slots, then
+# rows taking a place come in and leaving or lent rows are read back, then the
+# host's writes (the last phase, where a stage puts them)
+_UNSEAT, _READ, _WRITE = 0, 1, 2
+_PHASES = 3
 
 
 def _round(n: int) -> int:
@@ -75,8 +89,9 @@ class RowBuffer:
         self.pad_bytes = pad_row.reshape(-1).view(torch.uint8).numpy().copy()
         self.row_bytes = self.pad_bytes.nbytes
         self._device: torch.Tensor | None = None  # the dense step view
+        self._dense_ptr = 0
         self._resident: torch.Tensor | None = None
-        self._ptr = 0  # the resident rows', which host writes and copies address
+        self._ptr = 0  # the resident rows'
         # the last store checked for this buffer (``_store_ptr``)
         self._store: torch.Tensor | None = None
         self._store_ptr = 0
@@ -133,22 +148,50 @@ class ElementWrites(NamedTuple):
 class StepRows:
     """One proposed step: its diff, and what the resources write for it.
 
-    Joining rows must be written in full (``write`` or ``copy_in``) for every
-    buffer; ``stage`` refuses a proposal that leaves one stale. Leaving rows
-    are read out with ``copy_out`` before anything overwrites their slots.
-    Slots are resident slots (``diff.join_slots``, ``slot_of``).
+    Joining rows (resyncing ones among them) must be written in full
+    (``write`` or ``copy_in``) for every buffer; ``stage`` refuses a proposal
+    that leaves one stale. Leaving rows are read out with ``copy_out`` before
+    anything overwrites them. Rows are named by resident slot
+    (``diff.join_slots``, ``slot_of``); a write lands where the row's state is
+    while the step runs it, its place in a moved buffer's dense view.
     """
 
-    def __init__(self, space: RowSpace, diff: RowDiff):
+    def __init__(
+        self, space: RowSpace, diff: RowDiff, lent: set[int] | frozenset = frozenset(), runs: bool = True,
+    ):
         self.space = space
+        # the batch's diff, which commits; ``diff`` is what the resources write
+        # from: resyncing rows join in place, and lent rows leave with nothing read out
+        self._batch_diff = diff
+        # the committed step's slots: what the dense rows hold now
+        self._base_idx = space.batch.idx
+        self._lends = space._lends
+        self._resync_rids: list[int] = []
+        if lent:
+            # a step that runs its rows (not a check-in or a lend) resyncs the lent ones
+            at = [i for i, rid in enumerate(diff.order) if rid in lent] if runs else []
+            left = frozenset(rid for rid in diff.leave_rids if rid in lent)
+            if at or left:
+                self._resync_rids = [diff.order[i] for i in at]
+                diff = dataclasses.replace(
+                    diff, join_rids=diff.join_rids + self._resync_rids,
+                    join_slots=np.concatenate([diff.join_slots, diff.idx[at]]),
+                    same_step=False, dropped=diff.dropped | left,
+                )
         self.diff = diff
+        # a lend's rows (``RowSpace.lend``): read back, keeping their slots
+        self.lent_rids: list[int] = []
+        self.lent_slots = _NO_SLOTS
+        self._pos: np.ndarray | None = None
+        self._kept: np.ndarray | None = None
+        self._resynced = False
+        self._applied = False
         # this step's mirrors: a private copy of the committed slab, made on
         # first write, and the forwards it had taken (``RowSpace._steps``)
         self._slab: np.ndarray | None = None
         self._slab_steps = 0
-        # the step's copies and unmirrored host writes, as registered: phase 0
-        # reads leaving rows out, phase 1 writes (possibly into the slots they left)
-        self._stage = new_stage(2)
+        # the step's copies and host writes, by phase (``_UNSEAT`` ...)
+        self._stage = new_stage(_PHASES)
         # rows written per buffer, for the check that every join was
         self._written: dict[RowBuffer, int] = {}
         # the separate tensors, alive until the copies are done (``_RingEntry.keep``)
@@ -172,6 +215,46 @@ class StepRows:
     def slot_of(self, rid: int) -> int:
         """The resident slot of a request this step runs."""
         return int(self.diff.idx[self.diff.order.index(rid)])
+
+    def _positions(self, slots: np.ndarray) -> np.ndarray:
+        """Where the rows of ``slots``, all run by this step, sit in its dense view."""
+        pos = self._pos
+        if pos is None:
+            pos = self._pos = np.full(self.space.capacity + 2, -1, np.int64)
+            pos[self.diff.idx] = np.arange(self.diff.n_active)
+        at = pos[slots]
+        if len(at) and at.min() < 0:
+            raise ValueError(f"slots {slots[at < 0].tolist()} are not rows of the step")
+        return at
+
+    def _write_to(self, buf: RowBuffer, slots: np.ndarray) -> tuple[int, np.ndarray]:
+        """Where writes into rows of the step land: a moved buffer's dense view
+        (the row's state while the step runs it), an unmoved one's slots."""
+        if buf.moved:
+            return buf._dense_ptr, self._positions(slots)
+        return buf._ptr, slots
+
+    def _read_from(self, buf: RowBuffer, slots: np.ndarray) -> list[tuple[int, np.ndarray, np.ndarray]]:
+        """Where rows are read back from, as ``(base, rows, which of slots)``:
+        the dense view for a row that keeps its place through the step (a lent
+        one), its slot otherwise, where a row leaving its place has gone by then."""
+        everything = np.arange(len(slots))
+        if not buf.moved:
+            return [(buf._ptr, slots, everything)]
+        kept = self._kept
+        if kept is None:
+            old, new = self._base_idx, self.diff.idx
+            m = min(len(old), len(new))
+            same = np.flatnonzero(old[:m] == new[:m])
+            kept = self._kept = np.full(self.space.capacity + 2, -1, np.int64)
+            kept[old[same]] = same
+        place = kept[slots]
+        dense = place >= 0
+        if not dense.any():
+            return [(buf._ptr, slots, everything)]
+        if dense.all():
+            return [(buf._dense_ptr, place, everything)]
+        return [(buf._dense_ptr, place[dense], everything[dense]), (buf._ptr, slots[~dense], everything[~dense])]
 
     def mirror(self, buf: RowBuffer) -> np.ndarray:
         """``buf``'s host rows as this step's dense view will hold them (before
@@ -213,72 +296,77 @@ class StepRows:
         self._written[buf] = self._written.get(buf, 0) + n
 
     def write(self, buf: RowBuffer, slots: np.ndarray, values: np.ndarray) -> None:
-        """Whole rows from the host: ``buf[slots[i]] = values[i]``."""
+        """Whole rows of the step from the host: ``buf[slots[i]] = values[i]``."""
         slots = np.ascontiguousarray(slots, dtype=np.int64)
         if buf.mirrored:
             self.space._host_view(buf, self._own())[slots] = values
-        else:
-            values = np.ascontiguousarray(values, dtype=buf.pad.dtype).reshape(len(slots), -1)
-            rb = buf.row_bytes
-            self._stage.write(buf._ptr, rb, slots, values.view(np.uint8), rb)
+        values = np.ascontiguousarray(
+            np.broadcast_to(np.asarray(values, dtype=buf.pad.dtype), (len(slots), *buf.shape)),
+        ).reshape(len(slots), -1)
+        rb = buf.row_bytes
+        base, at = self._write_to(buf, slots)
+        self._stage.write(base, rb, at, values.view(np.uint8), rb)
         self._count(buf, len(slots))
 
     def write_at(self, buf: RowBuffer, slots: np.ndarray, index: tuple, values) -> None:
-        """Single elements of rows: ``buf[slots[i], *index_i] = values[i]``,
+        """Single elements of rows of the step: ``buf[slots[i], *index_i] = values[i]``,
         with ``index`` a tuple of per-element index arrays over the row shape."""
         slots = np.ascontiguousarray(slots, dtype=np.int64)
         if buf.mirrored:
             self.space._host_view(buf, self._own())[(slots, *index)] = values
-            return
         flat = np.ravel_multi_index(tuple(np.asarray(i, dtype=np.int64) for i in index), buf.shape)
         values = np.ascontiguousarray(np.broadcast_to(values, slots.shape), dtype=buf.pad.dtype)
         size = buf.pad.itemsize
-        offsets = np.ascontiguousarray(flat * size, dtype=np.int64)
-        self._stage.write(buf._ptr, buf.row_bytes, slots, values.view(np.uint8), size, offsets)
+        offsets = np.ascontiguousarray(np.broadcast_to(flat * size, slots.shape), dtype=np.int64)
+        base, at = self._write_to(buf, slots)
+        self._stage.write(base, buf.row_bytes, at, values.view(np.uint8), size, offsets)
 
     def element_writes(self, buf: RowBuffer) -> ElementWrites:
         """Where a caller registers ``write_at``'s writes into ``buf`` itself
-        (`PageArena.decode_rows`, say): the step's stage and the buffer's rows."""
-        if buf.mirrored:
-            raise ValueError(f"{buf.name}: a mirrored buffer's rows are written through write_at")
-        return ElementWrites(self._stage, buf._ptr, buf.row_bytes)
+        (`PageArena.decode_rows`, say): the step's stage and the buffer's dense
+        view, whose rows are the step's, by position."""
+        if buf.mirrored or not buf.moved:
+            raise ValueError(f"{buf.name}: only a moved buffer without a mirror takes element writes")
+        return ElementWrites(self._stage, buf._dense_ptr, buf.row_bytes)
 
     def copy_in(self, buf: RowBuffer, slots: np.ndarray, src: torch.Tensor, src_rows: np.ndarray) -> None:
-        """Whole rows from a device store: ``buf[slots[i]] = src[src_rows[i]]``.
+        """Whole rows of the step from a device store: ``buf[slots[i]] = src[src_rows[i]]``.
         Only into a buffer with no host mirror, which would not see them."""
         if buf.mirrored:
             raise ValueError(f"{buf.name}: copy_in into a mirrored buffer; write its rows from the host")
         slots = np.ascontiguousarray(slots, dtype=np.int64)
         rb = buf.row_bytes
+        base, at = self._write_to(buf, slots)
         self._stage.copy_rows(
-            1, _store_ptr(buf, src), rb, np.ascontiguousarray(src_rows, dtype=np.int64), buf._ptr, rb, slots, rb,
+            _WRITE, _store_ptr(buf, src), rb, np.ascontiguousarray(src_rows, dtype=np.int64), base, rb, at, rb,
         )
         self._count(buf, len(slots))
 
     def copy_out(self, buf: RowBuffer, slots: np.ndarray, dst: torch.Tensor, dst_rows: np.ndarray) -> None:
-        """Leaving rows back to a device store: ``dst[dst_rows[i]] = buf[slots[i]]``,
+        """Leaving or lent rows back to a device store: ``dst[dst_rows[i]] = buf[slots[i]]``,
         read before this step writes anything."""
         rb = buf.row_bytes
-        self._stage.copy_rows(
-            0, buf._ptr, rb, np.ascontiguousarray(slots, dtype=np.int64),
-            _store_ptr(buf, dst), rb, np.ascontiguousarray(dst_rows, dtype=np.int64), rb,
-        )
+        dst_ptr, dst_rows = _store_ptr(buf, dst), np.ascontiguousarray(dst_rows, dtype=np.int64)
+        for base, at, which in self._read_from(buf, np.ascontiguousarray(slots, dtype=np.int64)):
+            self._stage.copy_rows(_READ, base, rb, at, dst_ptr, rb, np.ascontiguousarray(dst_rows[which]), rb)
 
     def copy_in_each(self, buf: RowBuffer, slots: np.ndarray, srcs: Sequence[torch.Tensor]) -> None:
-        """Whole rows from separate device tensors, one a row: ``buf[slots[i]] = srcs[i]``."""
+        """Whole rows of the step from separate device tensors, one a row: ``buf[slots[i]] = srcs[i]``."""
         slots = np.ascontiguousarray(slots, dtype=np.int64)
         ptrs = np.array([_tensor_ptr(buf, t) for t in srcs], dtype=np.int64)
         rb = buf.row_bytes
-        self._stage.copy_rows(1, 0, 1, ptrs, buf._ptr, rb, slots, rb)
+        base, at = self._write_to(buf, slots)
+        self._stage.copy_rows(_WRITE, 0, 1, ptrs, base, rb, at, rb)
         self._keep += srcs
         self._count(buf, len(slots))
 
     def copy_out_each(self, buf: RowBuffer, slots: np.ndarray, dsts: Sequence[torch.Tensor]) -> None:
-        """Leaving rows back to separate device tensors: ``dsts[i] = buf[slots[i]]``,
+        """Leaving or lent rows back to separate device tensors: ``dsts[i] = buf[slots[i]]``,
         read before this step writes anything."""
         ptrs = np.array([_tensor_ptr(buf, t) for t in dsts], dtype=np.int64)
         rb = buf.row_bytes
-        self._stage.copy_rows(0, buf._ptr, rb, np.ascontiguousarray(slots, dtype=np.int64), 0, 1, ptrs, rb)
+        for base, at, which in self._read_from(buf, np.ascontiguousarray(slots, dtype=np.int64)):
+            self._stage.copy_rows(_READ, base, rb, at, 0, 1, np.ascontiguousarray(ptrs[which]), rb)
         self._keep += dsts
 
     def on_commit(self, fn: Callable[[np.ndarray], None]) -> None:
@@ -291,8 +379,8 @@ class StepRows:
     def stage(self, in_graph: bool = False) -> None:
         """Upload what this step changes, on the current stream. Nothing for a
         step that changes nothing. ``in_graph``: the step replays a graph
-        captured with ``RowSpace.prologue``, which applies the upload and
-        gathers the rows itself, so ``apply`` and ``gather`` launch nothing."""
+        captured with ``RowSpace.prologue``, which applies the upload itself,
+        so ``apply`` launches nothing."""
         self._check_joins()
         with self.space._ring_lock:
             self._staged = self.space._stage(self, in_graph)
@@ -307,8 +395,10 @@ class StepRows:
 
     def apply(self) -> None:
         """Apply the staged change to the device rows, on the stream that
-        staged it: after the previous step's replay, before this one's."""
-        if self._staged is not None:
+        staged it: after the previous step's replay, before this one's. Once:
+        a move applied twice (two rows trading places) would undo itself."""
+        if self._staged is not None and not self._applied:
+            self._applied = True
             self.space._apply(self._staged)
 
     def apply_ahead(self) -> None:
@@ -320,9 +410,13 @@ class StepRows:
 
     @property
     def stale(self) -> bool:
-        """Something committed since this step was proposed, or a forward
-        stepped the rows since its mirrors were copied."""
-        return self.diff.base_version != self.space.batch.version or self._steps_moved()
+        """Something committed since this step was proposed, rows were lent
+        or resynced since, or a forward stepped the rows since its mirrors
+        were copied."""
+        return (
+            self.diff.base_version != self.space.batch.version or self._lends != self.space._lends
+            or self._steps_moved()
+        )
 
     def _steps_moved(self) -> bool:
         steps = self.space._steps
@@ -415,8 +509,11 @@ class RowSpace:
         self.trash_slot = self.capacity + 1
         self.buffers: list[RowBuffer] = []
         self._sealed = False
-        # the device rows may have missed a forward's step: upload the mirrors whole
+        # the device rows may have missed a forward's step: write the mirrors whole
         self._resync = False
+        # held requests whose rows are lent (``lend``), and lends and resyncs so far
+        self._lent: set[int] = set()
+        self._lends = 0
         # the committed state, against a step on another thread; reentrant
         # for the commit hooks, which read the mirrors
         self._lock = threading.RLock()
@@ -514,6 +611,7 @@ class RowSpace:
             buf._ptr = buf._resident.data_ptr()
             if buf.moved:
                 buf._device = torch.from_numpy(buf.pad).to(self.device).expand(rows, *buf.shape).contiguous()
+                buf._dense_ptr = buf._device.data_ptr()
 
         # the step header: its row count, then each dense row's slot to gather
         # from and to scatter to (padding rows: the pad and trash slots)
@@ -523,12 +621,7 @@ class RowSpace:
         self._n_active = self._header[0:1]
         self._gather_at = self._header[1:1 + rows]
         self._scatter_at = self._header[1 + rows:]
-        moved = [b for b in self.buffers if b.moved]
-        self._gather_table = RowTable([(b._resident, b._device) for b in moved], self.device)
-        # what a forward may change: device state, and stepped rows
-        self._scatter_table = RowTable(
-            [(b._resident, b._device) for b in moved if not b.mirrored or b.step], self.device,
-        )
+        self._moved = [b for b in self.buffers if b.moved]
 
         if self._memcpy is not None:
             self._tables = StagedTables(self._staged_bytes, self.device)
@@ -544,32 +637,21 @@ class RowSpace:
             self.capacity, len(self.buffers), resident / 2**20, rows,
         )
 
-    def gather(self, n: int) -> None:
-        """Fill the first ``n`` rows of every dense view from the slots of the
-        step being run, padding past its rows: once the step's rows are
-        applied and before its preprocess, which may read them (a loop-back
-        token) and overwrite some, outside the step's graph."""
-        move_rows(self._gather_table, self._gather_at, min(n, self.max_rows), gather=True)
-
     def after_forward(self) -> None:
         """What the walk's forward owes its rows, run after it, inside its
         graph when captured: each stepped buffer's ``step`` added to the
-        step's rows, then every row the forward may have changed back to its
-        slot. Never outside a forward of the walk."""
+        step's rows. Never outside a forward of the walk."""
         if self._stepped:
             torch.lt(self._arange, self._n_active, out=self._active)
             for buf in self._stepped:
                 buf._device.add_(self._active.view(-1, *(1,) * len(buf.shape)), alpha=buf.step)
-        move_rows(self._scatter_table, self._scatter_at, self.max_rows, gather=False)
 
-    def prologue(self, n: int) -> None:
+    def prologue(self) -> None:
         """What a captured step's graph runs before its forward: the step's
-        staged upload (``StepRows.stage(in_graph=True)``), then the gather of
-        its ``n`` rows."""
+        staged upload (``StepRows.stage(in_graph=True)``)."""
         if self._tables is None:
             raise RuntimeError("rows staged in a graph need CUDA")
         self._tables.apply()
-        self.gather(n)
 
     def owns(self, t: torch.Tensor) -> bool:
         """Whether ``t`` is (the start of) a dense step view: a captured graph
@@ -579,7 +661,7 @@ class RowSpace:
 
     def resync(self) -> None:
         """A step's rows committed but its forward may not have run: the next
-        step uploads the mirrors whole, which puts the device rows back."""
+        step writes the mirrors whole, which puts the device rows back."""
         if any(not b.mirrored for b in self._stepped):
             raise RuntimeError("device-only stepped rows can't be resynced from the host")
         self._resync = True
@@ -598,23 +680,44 @@ class RowSpace:
     def propose(self, rids: Sequence[int]) -> StepRows:
         self.seal()
         with self._lock:
-            return StepRows(self, self.batch.propose(rids))
+            return StepRows(self, self.batch.propose(rids), self._lent)
 
     def without(self, rids: Sequence[int]) -> StepRows:
         self.seal()
         with self._lock:
-            return StepRows(self, self.batch.without(rids))
+            return StepRows(self, self.batch.without(rids), self._lent, runs=False)
+
+    def lend(self, rids: Sequence[int]) -> StepRows | None:
+        """The step that lends the rows ``rids`` hold here and aren't lent
+        already (``StepRows.lent_rids``), for a step outside the walk that
+        runs them; None if there are none. Each keeps its slot and place, and
+        is written whole (resynced) by the next step of the walk that runs it."""
+        self.seal()
+        with self._lock:
+            batch, lent = self.batch, self._lent
+            rids = [rid for rid in rids if rid not in lent and batch.is_checked_out(rid)]
+            if not rids:
+                return None
+            rows = StepRows(self, batch.without(()), lent, runs=False)
+            rows.lent_rids = rids
+            rows.lent_slots = np.array([batch.slot_of(rid) for rid in rids], dtype=np.int64)
+            return rows
 
     def holds(self, rid: int) -> bool:
         """Whether ``rid`` is checked out here."""
         return self.batch.is_checked_out(rid)
 
+    def holds_live(self, rid: int) -> bool:
+        """Whether ``rid`` is checked out here and its row isn't lent."""
+        return rid not in self._lent and self.batch.is_checked_out(rid)
+
     def committed(self, buf: RowBuffer, rid: int) -> np.ndarray | None:
         """A copy of ``rid``'s row of ``buf``'s committed mirror, or None if
-        it holds none (a removed request's row, still to leave, names it no
-        longer); safe against a step committing on another thread."""
+        it holds none or its row is lent (a removed request's row, still to
+        leave, names it no longer); safe against a step committing on
+        another thread."""
         with self._lock:
-            if not self.batch.is_checked_out(rid):
+            if rid in self._lent or not self.batch.is_checked_out(rid):
                 return None
             return self._host_view(buf, self._host)[self.batch.slot_of(rid)].copy()
 
@@ -622,37 +725,85 @@ class RowSpace:
         """See ``PersistentBatch.forget``; safe against a step proposing or
         committing on another thread."""
         with self._lock:
+            if rid in self._lent:
+                self._lent.discard(rid)
+                self._lends += 1
             return self.batch.forget(rid)
 
     def check_mirrors(self) -> None:
-        """Raise if a mirrored buffer's resident rows (the trash slot aside)
-        differ from its mirror. Synchronizes: for tests and debugging only."""
+        """Raise if a mirrored buffer's device rows differ from its mirror:
+        the dense view's for the committed step's rows, the resident slots'
+        for the other held ones and the pad slot (lent rows aside, which are
+        stale by design). Synchronizes: for tests and debugging only."""
+        held = self.batch.held()
+        lent = {held[rid] for rid in self._lent if rid in held}
+        idx = self.batch.idx
+        seated = set(idx.tolist())
+        waiting = np.array(
+            sorted(s for s in held.values() if s not in seated and s not in lent) + [self.pad_slot], dtype=np.int64,
+        )
+        live = np.array([i for i, s in enumerate(idx.tolist()) if s not in lent], dtype=np.int64)
         for buf in self.buffers:
             if not buf.mirrored:
                 continue
-            device = buf.resident[:self.trash_slot].cpu().numpy()
-            host = buf.host[:self.trash_slot]
-            bad = np.flatnonzero((device != host).reshape(len(host), -1).any(axis=1))
-            if len(bad):
-                raise AssertionError(
-                    f"{buf.name}: device rows {bad.tolist()} differ from the mirror"
-                )
+            host = buf.host
+            checks = [("slots", waiting, buf.resident.cpu().numpy()[waiting], host[waiting])]
+            if buf.moved and len(live):
+                checks.append(("places", live, buf.device.cpu().numpy()[live], host[idx[live]]))
+            for what, at, device, mirror in checks:
+                bad = at[(device != mirror).reshape(len(at), -1).any(axis=1)]
+                if len(bad):
+                    raise AssertionError(f"{buf.name}: device {what} {bad.tolist()} differ from the mirror")
 
     # staging
 
     def _stage(self, step: StepRows, in_graph: bool) -> _Block | None:
-        d = step.diff
+        d = step._batch_diff
         stage = step._stage
-        if self._resync:
-            step._own()
-        # the mirrors straight to their rows, which only this stream's steps read
-        if step._slab is not None:
-            stage.put(step._slab, self._slab.data_ptr())
         if not d.same_step:
+            self._stage_moves(step)
             stage.header(d.idx, self.max_rows, self.pad_slot, self.trash_slot, self._header.data_ptr())
+        if self._resync:
+            # the step's rows from the mirrors in their places, the rest in their slots
+            step._resynced = True
+            slab = step._own()
+            stage.put(slab, self._slab.data_ptr())
+            if d.n_active:
+                at = np.arange(d.n_active)
+                for buf in self._moved:
+                    if buf.mirrored:
+                        rows = np.ascontiguousarray(self._host_view(buf, slab)[d.idx]).reshape(d.n_active, -1)
+                        stage.write(buf._dense_ptr, buf.row_bytes, at, rows.view(np.uint8), buf.row_bytes)
         if stage.is_empty():
             return None
         return self._upload(stage, step._keep, in_graph)
+
+    def _stage_moves(self, step: StepRows) -> None:
+        """The rows whose place changes: the committed step's row there goes
+        back to its slot, and the new one comes in from its slot, but for
+        joining and resyncing rows, which the resources write whole; places
+        the step leaves get the pad row back."""
+        old, new = step._base_idx, step._batch_diff.idx
+        m = min(len(old), len(new))
+        changed = np.flatnonzero(old[:m] != new[:m])
+        out = np.concatenate([changed, np.arange(m, len(old))])
+        into = np.concatenate([changed, np.arange(m, len(new))])
+        written = step.diff.join_slots
+        if len(written) and len(into):
+            into = into[~np.isin(new[into], written)]
+        pads = np.arange(len(new), len(old))
+        if not (len(out) or len(into)):
+            return
+        stage = step._stage
+        pad = np.full(len(pads), self.pad_slot, dtype=np.int64)
+        for buf in self._moved:
+            rb, dense, resident = buf.row_bytes, buf._dense_ptr, buf._ptr
+            if len(out):
+                stage.copy_rows(_UNSEAT, dense, rb, out, resident, rb, np.ascontiguousarray(old[out]), rb)
+            if len(into):
+                stage.copy_rows(_READ, resident, rb, np.ascontiguousarray(new[into]), dense, rb, into, rb)
+            if len(pads):
+                stage.copy_rows(_READ, resident, rb, pad, dense, rb, pads, rb)
 
     def _upload(self, stage, keep: list[torch.Tensor], in_graph: bool) -> _Block:
         """The stage's tables and payload to a device block, as one copy:
@@ -726,14 +877,23 @@ class RowSpace:
             # the copy (or the read) took every step committed before it: none may have since
             if step._steps_moved():
                 raise RuntimeError("a step's mirrors were copied before a forward that committed since")
-            d = step.diff
+            if step._lends != self._lends:
+                raise RuntimeError("a step proposed before rows were lent or resynced since")
+            d = step._batch_diff
             released = self.batch.commit(d)
             step.committed = True
             for fn in step._on_commit:
                 fn(released)
             if step._slab is not None:
                 self._host = step._slab
+            if step._resynced:
                 self._resync = False
+            lent = self._lent
+            if step.lent_rids or (lent and (step._resync_rids or d.leave_rids)):
+                lent.update(step.lent_rids)
+                lent.difference_update(step._resync_rids)
+                lent.difference_update(d.leave_rids)
+                self._lends += 1
             if forward:
                 self._steps += 1
                 if d.n_active and len(self._step_desc):

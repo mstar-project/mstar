@@ -1,6 +1,6 @@
 """Many small byte copies in one launch: how a persistent batch's diff reaches
-its rows, and how a step's rows move between their slots and the dense view
-its graph reads.
+its rows, among them the rows that move between their slots and the dense
+view its graph reads.
 
 A segment is ``(src, dst, nbytes)`` with raw addresses (``stage.py`` builds
 a step's). One kernel copies every segment of a phase; segments of one phase
@@ -59,8 +59,7 @@ if triton is not None:
 
 # (kernel, device, constexprs, pointer alignments) -> the kernel compiled for
 # them: launched directly, a launch costs a fraction of the jit's dispatch.
-# The alignments are the jit's own specialization (the gather and scatter
-# slots sit 4 bytes into the step header)
+# The alignments are the jit's own specialization
 _COMPILED: dict[tuple, object] = {}
 
 
@@ -108,7 +107,7 @@ class StagedTables:
     table word offset) pairs, then the tables and payload. Whoever applies it
     zeroes the counts, so a step that uploads nothing applies nothing."""
 
-    PHASES = 2
+    PHASES = 3
     HEADER = 2 * PHASES * 8  # bytes
     _PROGRAMS = 64
 
@@ -145,57 +144,3 @@ class StagedTables:
     def clear(self) -> None:
         """Drop whatever is staged (a step that never ran its graph)."""
         self.words[:2 * self.PHASES].zero_()
-
-
-class RowTable:
-    """Buffers whose rows move between their resident slots and their dense
-    step view as one launch (``move_rows``): ``(resident, dense, row bytes)``
-    per buffer, on the device for the kernel, beside the tensors for the
-    fallback."""
-
-    def __init__(self, pairs: list[tuple[torch.Tensor, torch.Tensor]], device: torch.device):
-        self.pairs = pairs
-        rows = [(r.data_ptr(), d.data_ptr(), r[0].numel() * r.element_size()) for r, d in pairs]
-        self.table = torch.tensor(rows, dtype=torch.int64).reshape(-1, 3).to(device)
-        self.longest = max((nbytes for _, _, nbytes in rows), default=0)
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-
-if triton is not None:
-    @triton.jit
-    def _move_rows_kernel(table_ptr, idx_ptr, GATHER: tl.constexpr, CHUNK: tl.constexpr):
-        buf = tl.program_id(0).to(tl.int64)
-        i = tl.program_id(1).to(tl.int64)
-        start = tl.program_id(2).to(tl.int64) * CHUNK
-        row = table_ptr + buf * 3
-        nbytes = tl.load(row + 2)
-        if start < nbytes:
-            slot = tl.load(idx_ptr + i).to(tl.int64)
-            resident = tl.load(row).to(tl.pointer_type(tl.uint8)) + slot * nbytes
-            dense = tl.load(row + 1).to(tl.pointer_type(tl.uint8)) + i * nbytes
-            offs = start + tl.arange(0, CHUNK)
-            mask = offs < nbytes
-            if GATHER:
-                tl.store(dense + offs, tl.load(resident + offs, mask=mask), mask=mask)
-            else:
-                tl.store(resident + offs, tl.load(dense + offs, mask=mask), mask=mask)
-
-
-def move_rows(table: RowTable, idx: torch.Tensor, n: int, gather: bool) -> None:
-    """For the first ``n`` dense rows of every buffer of ``table``: copy row
-    ``i`` from (``gather``) or to its resident slot ``idx[i]`` (``int32`` on
-    the device). Device-only, so it can be captured."""
-    if not len(table) or not n:
-        return
-    if idx.device.type == "cuda" and triton is not None:
-        grid = (len(table), n, -(-table.longest // _CHUNK))
-        _launch(_move_rows_kernel, grid, None, (table.table, idx), GATHER=gather, CHUNK=_CHUNK)
-        return
-    at = idx[:n].long()
-    for resident, dense in table.pairs:
-        if gather:
-            torch.index_select(resident, 0, at, out=dense[:n])
-        else:
-            resident.index_copy_(0, at, dense[:n])

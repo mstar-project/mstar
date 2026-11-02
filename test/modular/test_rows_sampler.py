@@ -297,7 +297,7 @@ def test_each_request_draws_from_its_own_state_across_rows_and_removals(seed, ca
         rids = rng.sample(list(live), rng.randint(1, min(MAX_ROWS, len(live))))
         batch, seen = _step(engine, walk, rids)
         if walk != ROWS_WALK:
-            assert not any(space.holds(rid) for rid in rids)
+            assert not any(space.holds_live(rid) for rid in rids)
             continue
         order = list(batch.request_ids)
         assert order == list(space.batch.order)

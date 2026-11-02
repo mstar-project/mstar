@@ -370,7 +370,7 @@ class PythonPageArena:
                     )
                 pages.append(held[at])
             stage.write(
-                pages_base, pages_row_bytes, cross, np.asarray(pages, np.int32).view(np.uint8), 4,
+                pages_base, pages_row_bytes, crossing.astype(np.int64), np.asarray(pages, np.int32).view(np.uint8), 4,
                 np.ascontiguousarray(4 * first, dtype=np.int64),
             )
         return bytearray(out)

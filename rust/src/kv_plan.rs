@@ -178,7 +178,8 @@ pub fn kv_packed_addressing(
 pub struct DecodeRows {
     /// `paged_kv_indptr (n + 1) | kv_lens (n)`, each row's stored length plus the step's token
     pub out: Vec<i32>,
-    pub cross_slots: Vec<i64>,
+    /// the crossing rows, by position in the step (where the step's page table holds them)
+    pub cross_rows: Vec<i64>,
     /// byte offsets in a row of the page table, `4 * page`
     pub cross_offsets: Vec<i64>,
     pub cross_pages: Vec<i32>,
@@ -205,7 +206,7 @@ pub fn decode_rows<'a>(
     let slot_at = |i: usize| if i < idx.len() { idx[i] } else { pad_slot };
     let mut out = vec![0i32; 2 * n + 1];
     let (indptr, kv_lens) = out.split_at_mut(n + 1);
-    let mut d = DecodeRows { out: Vec::new(), cross_slots: Vec::new(), cross_offsets: Vec::new(), cross_pages: Vec::new() };
+    let mut d = DecodeRows { out: Vec::new(), cross_rows: Vec::new(), cross_offsets: Vec::new(), cross_pages: Vec::new() };
     let mut k = 0i64;
     for i in 0..n {
         let slot = slot_at(i);
@@ -225,7 +226,7 @@ pub fn decode_rows<'a>(
         let page = *held.get(first as usize).ok_or_else(|| {
             format!("slot {slot}'s stream holds {} pages, not the page its token starts ({first})", held.len())
         })?;
-        d.cross_slots.push(slot);
+        d.cross_rows.push(i as i64);
         d.cross_offsets.push(4 * first);
         d.cross_pages.push(page);
     }
@@ -327,7 +328,7 @@ mod tests {
         let d = decode_rows(|s| Ok(&streams[s][..]), &lens, &sids, &[2, 0, 3], 4, 5, &[3], 4, 8).unwrap();
         assert_eq!(&d.out[..5], &[0, 3, 5, 7, 8]);
         assert_eq!(&d.out[5..], &[9, 6, 5, 1]);
-        assert_eq!((d.cross_slots, d.cross_offsets, d.cross_pages), (vec![2], vec![8], vec![22]));
+        assert_eq!((d.cross_rows, d.cross_offsets, d.cross_pages), (vec![0], vec![8], vec![22]));
     }
 
     #[test]

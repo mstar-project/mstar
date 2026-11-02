@@ -659,8 +659,8 @@ mod py {
 
         /// `kv_plan::decode_rows`: a persistent walk's decode step on rows.
         /// The pages its held rows cross onto go into ``stage`` as element
-        /// writes into the page table at ``pages_base`` (rows of
-        /// ``pages_row_bytes``); returns ``paged_kv_indptr (n + 1) | kv_lens
+        /// writes into the step's page table at ``pages_base`` (rows of
+        /// ``pages_row_bytes``, in step order); returns ``paged_kv_indptr (n + 1) | kv_lens
         /// (n)`` as int32 bytes.
         #[allow(clippy::too_many_arguments)]
         fn decode_rows<'py>(
@@ -694,13 +694,13 @@ mod py {
                 )
                 .map_err(PyValueError::new_err)?
             };
-            if !d.cross_slots.is_empty() {
+            if !d.cross_rows.is_empty() {
                 // SAFETY: plain i32 data viewed as its native-endian bytes
                 let pages = unsafe { std::slice::from_raw_parts(d.cross_pages.as_ptr() as *const u8, 4 * d.cross_pages.len()) };
                 stage
                     .borrow_mut()
                     .inner
-                    .write(pages_base, pages_row_bytes, &d.cross_slots, pages, 4, Some(&d.cross_offsets))
+                    .write(pages_base, pages_row_bytes, &d.cross_rows, pages, 4, Some(&d.cross_offsets))
                     .map_err(PyValueError::new_err)?;
             }
             // SAFETY: as above

@@ -803,13 +803,11 @@ class SamplerResource(Resource):
             for dst, src in updates:
                 dst.index_copy_(0, index, src.to(dst.dtype))
             return
-        # on persistent rows the slots take them too: a replay gathers its
-        # rows from them in its graph, over the dense view written here, once
+        # on persistent rows the dense view is the rows' state, written once
         # the step's upload (a joining row's check-out) has landed
-        row_state, _ = self._row_step
         step_rows = self._step_rows
         if step_rows is None:
-            # a capture: its rows are dummies, which the graph's prologue gathers over
+            # a capture: its rows are dummies
             return
         # a padding row (a copy of a real row's inputs) reads the pad slot, whatever it brought
         if rows[-1] >= step_rows.n_active:
@@ -819,9 +817,7 @@ class SamplerResource(Resource):
             rows = rows[:n]
             updates = tuple((dst, src[:n]) for dst, src in updates)
         step_rows.apply_ahead()
-        index = torch.empty(2 * n, dtype=torch.long, device=updates[0][0].device)
-        self._row_stager.copy_(index, [*rows, *step_rows.diff.idx[rows].tolist()])
+        index = torch.empty(n, dtype=torch.long, device=updates[0][0].device)
+        self._row_stager.copy_(index, rows)
         for dst, src in updates:
-            src = src.to(dst.dtype)
-            dst.index_copy_(0, index[:n], src)
-            row_state.buffer_of(dst).resident.index_copy_(0, index[n:], src)
+            dst.index_copy_(0, index, src.to(dst.dtype))

@@ -1,6 +1,6 @@
 """Persistent rows over many steps: after each step's diff and replay, the
 dense view holds the step's rows in its order and padding past them, every
-resident row its request's state, and each mirror its device rows."""
+other held row's slot its request's state, and each mirror its device rows."""
 import random
 
 import numpy as np
@@ -32,9 +32,8 @@ class _Sim:
         self.truth_state: dict[int, np.ndarray] = {}
 
     def forward(self):
-        """A step's forward: the engine gathers its rows, it advances the
-        device state, and the engine steps the rows and scatters them back."""
-        self.space.gather(MAX_ROWS)
+        """A step's forward: it advances the device state in place, and the
+        engine steps the rows."""
         self.state.device[:] += self._active_state()
         self.space.after_forward()
 
@@ -49,8 +48,7 @@ class _Sim:
                 self.truth_len[rid] = rng.randrange(1, 5)
                 self.truth_table[rid] = [rng.randrange(100) for _ in range(PAGES)]
                 self.truth_state[rid] = np.zeros(STATE, dtype=np.float32)
-        if d.leave_rids:
-            rows.copy_out(self.state, d.leave_slots, self.store, np.array(d.leave_rids))
+        self._read_back(rows)
         if d.join_rids:
             rows.write(self.lens, d.join_slots, np.array([self.truth_len[r] for r in d.join_rids], np.int32))
             rows.write(self.table, d.join_slots, np.array([self.truth_table[r] for r in d.join_rids], np.int32))
@@ -76,6 +74,29 @@ class _Sim:
             self.truth_state[rid] += 1
         return rows
 
+    def _read_back(self, rows):
+        d = rows.diff
+        keep = [i for i, rid in enumerate(d.leave_rids) if rid not in d.dropped]
+        if keep:
+            rows.copy_out(self.state, d.leave_slots[keep], self.store, np.array(d.leave_rids)[keep])
+
+    def lend(self, rids):
+        """A step outside the walk runs ``rids``: their rows are lent, then
+        it advances their truth and their store's state, as a mixed step's
+        resources would."""
+        rows = self.space.lend(rids)
+        if rows is not None:
+            self._read_back(rows)
+            rows.copy_out(self.state, rows.lent_slots, self.store, np.array(rows.lent_rids))
+            rows.stage()
+            rows.commit(forward=False)
+            rows.apply()
+        for rid in rids:
+            self.truth_len[rid] += 1
+            self.truth_state[rid] += 1
+            self.store[rid] += 1
+        return rows
+
     def check(self):
         space = self.space
         order = list(space.batch.order)
@@ -86,35 +107,42 @@ class _Sim:
         table = self.table.device.cpu().numpy()
         state = self.state.device.cpu().numpy()
         for i, rid in enumerate(order):
+            if rid in space._lent:
+                continue  # stale until the walk runs it again
             assert lens[i] == self.truth_len[rid]
             assert table[i].tolist() == self.truth_table[rid]
             np.testing.assert_array_equal(state[i], self.truth_state[rid])
         assert (lens[n:] == 0).all() and (table[n:] == -1).all() and (state[n:] == 0).all()
-        # every held row, run by the last step or not, holds its request's state
+        # every other held row's slot holds its request's state
         held = space.batch.held()
+        lent = space._lent
         lens, table = self.lens.resident.cpu().numpy(), self.table.resident.cpu().numpy()
         state = self.state.resident.cpu().numpy()
         for rid, slot in held.items():
+            if rid in order or rid in lent:
+                continue
             assert lens[slot] == self.truth_len[rid]
             assert table[slot].tolist() == self.truth_table[rid]
             np.testing.assert_array_equal(state[slot], self.truth_state[rid])
-        # the pad slot, which padding rows gather, stays pad
+        # the pad slot, which places past a step's rows come back to, stays pad
         pad = space.pad_slot
         assert lens[pad] == 0 and (table[pad] == -1).all() and (state[pad] == 0).all()
         space.check_mirrors()
-        # a request that left has its device state back in the store
+        # a request that left, or whose row is lent, has its device state back in the store
         store = self.store.cpu().numpy()
         for rid, truth in self.truth_state.items():
-            if rid not in held:
+            if rid not in held or rid in lent:
                 np.testing.assert_array_equal(store[rid], truth)
 
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("seed", range(6))
 @pytest.mark.parametrize("capacity", [MAX_ROWS, CAPACITY])
-def test_random_steps_keep_rows_and_mirrors_exact(device, seed, capacity):
+@pytest.mark.parametrize("lends", [False, True])
+def test_random_steps_keep_rows_and_mirrors_exact(device, seed, capacity, lends):
     """More live requests than a step runs, so steps rotate through them,
-    and rows are evicted when the slots run out."""
+    and rows are evicted when the slots run out; with ``lends``, steps
+    outside the walk run some of them between."""
     rng = random.Random(seed)
     sim = _Sim(device, capacity)
     live, next_rid = [], 0
@@ -132,28 +160,34 @@ def test_random_steps_keep_rows_and_mirrors_exact(device, seed, capacity):
                 break
         if not live:
             continue
+        ran = [rid for rid in live if rid in sim.truth_len]
+        if lends and ran and rng.random() < 0.3:
+            sim.lend(rng.sample(ran, rng.randint(1, len(ran))))
+            sim.check()
         sim.step(rng.sample(live, min(len(live), rng.randint(1, MAX_ROWS))), rng)
         sim.check()
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_a_rotation_with_room_uploads_only_its_step(device):
-    """Once two alternating steps' rows have all joined, a step stages one
-    segment, its header, and no row moves."""
+def test_a_rotation_moves_only_the_rows_that_change_places(device):
+    """Once two alternating steps' rows have all joined, a step that keeps two
+    places and changes two moves only those two out to their slots and the
+    other two in, per buffer, besides its header."""
     rng = random.Random(0)
     sim = _Sim(device)
-    halves = [[1, 2, 3, 4], [5, 6, 7, 8]]
-    for half in halves:
-        sim.step(half, rng)
+    steps = [[1, 2, 3, 4], [1, 2, 5, 6]]
+    for rids in steps:
+        sim.step(rids, rng)
     for k in range(6):
-        rows = sim.space.propose(halves[k % 2])
+        rows = sim.space.propose(steps[k % 2])
         assert not rows.diff.join_rids and not rows.diff.leave_rids
         rows.stage()
-        assert [count for _, count, _ in rows._staged.phases] == [1]
+        moved = 2 * len(sim.space.buffers)
+        assert [count for _, count, _ in rows._staged.phases] == [moved, moved, 1]
         rows.commit()
         rows.apply()
         sim.forward()
-        for rid in halves[k % 2]:
+        for rid in steps[k % 2]:
             sim.truth_len[rid] += 1
             sim.truth_state[rid] += 1
         sim.check()
@@ -241,7 +275,7 @@ def test_a_join_left_unwritten_is_refused():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
 def test_a_captured_step_steps_the_rows_active_at_replay():
-    """The gather, forward and ``after_forward`` captured once: the replay steps the rows
+    """The forward and ``after_forward`` captured once: the replay steps the rows
     active when it runs, not those active at capture."""
     rng = random.Random(0)
     sim = _Sim("cuda")
@@ -264,7 +298,7 @@ def _captured_prologue(sim):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph):
-        sim.space.prologue(MAX_ROWS)
+        sim.space.prologue()
         sim.state.device[:] += sim._active_state()
         sim.space.after_forward()
     torch.cuda.current_stream().wait_stream(stream)
@@ -275,7 +309,7 @@ def _captured_prologue(sim):
 @pytest.mark.parametrize("staged_bytes", [256 << 10, 64])
 def test_a_replay_applies_the_upload_staged_for_it(staged_bytes):
     """A step staged for its graph uploads into the block the graph's prologue
-    applies before gathering; one too large for it is applied before the
+    applies before its forward; one too large for it is applied before the
     replay instead. A repeated step stages nothing, and its replay applies
     nothing again."""
     rng = random.Random(1)
@@ -344,8 +378,8 @@ def test_a_row_buffer_needs_a_dtype_numpy_has():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_an_unmoved_buffer_is_addressed_by_slot(device):
-    """Wide rows a step changes in part stay resident: the step's gather and
-    scatter leave them, and its slots say which resident row each dense row is."""
+    """Wide rows a step changes in part stay resident: no step moves them, and
+    its slots say which resident row each dense row is."""
     space = RowSpace(4, device)
     lens = space.buffer("lens", (), torch.int32, step=1)
     wide = space.buffer("wide", (6,), torch.bool, pad=False, mirrored=False, moved=False)
@@ -358,7 +392,6 @@ def test_an_unmoved_buffer_is_addressed_by_slot(device):
     rows.stage()
     rows.commit()
     rows.apply()
-    space.gather(4)
     # the forward sets element 5 of every row it runs, padding rows into the trash slot
     wide.resident.view(-1).scatter_(0, space.scatter_slots.long() * 6 + 5, True)
     space.after_forward()
@@ -372,4 +405,71 @@ def test_an_unmoved_buffer_is_addressed_by_slot(device):
     for j, rid in enumerate(d.join_rids):
         assert resident[held[rid]].tolist() == [k in (j, 5) for k in range(6)]
     assert not resident[space.pad_slot].any()
-    assert lens.resident.cpu()[[held[5], held[6]]].tolist() == [2, 3]
+    # a moved buffer's rows of the step are its dense view's
+    assert lens.device.cpu()[:2].tolist() == [2, 3]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_lent_row_keeps_its_slot_and_place_and_resyncs_when_run_again(device):
+    """A step outside the walk runs two of the rows: they are read back and
+    lent, keeping their slots and places, and the next step of the walk
+    writes them whole in place, moving nothing."""
+    rng = random.Random(0)
+    sim = _Sim(device)
+    sim.step([1, 2, 3, 4], rng)
+    slots = dict(sim.space.batch.held())
+    sim.lend([2, 4])
+    assert sim.space._lent == {2, 4} and dict(sim.space.batch.held()) == slots
+    assert not sim.space.holds_live(2) and sim.space.holds(2)
+    assert sim.space.committed(sim.lens, 2) is None
+    sim.check()
+    rows = sim.step([1, 2, 3, 4], rng)
+    assert rows.diff.join_rids == [2, 4] and rows.diff.join_slots.tolist() == [slots[2], slots[4]]
+    assert not len(rows._batch_diff.join_rids) and dict(sim.space.batch.held()) == slots
+    assert [count for _, count, _ in rows._staged.phases] == [2 * len(sim.space.buffers)]
+    assert not sim.space._lent
+    sim.check()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_lent_row_that_leaves_reads_nothing_back(device):
+    """The store, not the stale row, holds a lent request's state: an
+    eviction or a later step without it leaves the store as the lend and
+    the step outside left it."""
+    rng = random.Random(0)
+    sim = _Sim(device, capacity=MAX_ROWS)
+    sim.step([1, 2, 3], rng)
+    sim.lend([2])
+    rows = sim.space.without([2])
+    assert rows.diff.dropped == {2} and not len(rows._batch_diff.dropped)
+    sim._read_back(rows)
+    rows.stage()
+    rows.commit(forward=False)
+    rows.apply()
+    assert not sim.space._lent and not sim.space.holds(2)
+    sim.check()
+    sim.step([2, 3], rng)
+    sim.check()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_proposal_from_before_a_lend_is_stale(device):
+    rng = random.Random(0)
+    sim = _Sim(device)
+    sim.step([1, 2], rng)
+    ahead = sim.space.propose([1, 2])
+    sim.lend([2])
+    assert ahead.stale
+    with pytest.raises(RuntimeError, match="lent"):
+        ahead.commit()
+    sim.step([1, 2], rng)
+    sim.check()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_a_lend_of_lent_or_unheld_rows_is_nothing(device):
+    rng = random.Random(0)
+    sim = _Sim(device)
+    sim.step([1, 2], rng)
+    assert sim.lend([2]) is not None
+    assert sim.space.lend([2, 9]) is None

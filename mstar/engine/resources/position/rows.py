@@ -35,8 +35,15 @@ class PositionRows(RowState):
 
     def check_in(self, rows: StepRows) -> None:
         d = rows.diff
-        leaving = [(rid, slot) for rid, slot in zip(d.leave_rids, d.leave_slots.tolist(), strict=True)
-                   if rid not in d.dropped]
+        self._write_back(rows, [
+            (rid, slot) for rid, slot in zip(d.leave_rids, d.leave_slots.tolist(), strict=True)
+            if rid not in d.dropped
+        ])
+
+    def lend(self, rows: StepRows) -> None:
+        self._write_back(rows, list(zip(rows.lent_rids, rows.lent_slots.tolist(), strict=True)))
+
+    def _write_back(self, rows: StepRows, leaving: list[tuple[int, int]]) -> None:
         if not leaving:
             return
 

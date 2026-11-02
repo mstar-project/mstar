@@ -83,14 +83,13 @@ def _decode_ctx(space: RowSpace, rids: tuple[int, ...], preplan: bool = False):
 
 def _run(kv: KVManager, space: RowSpace, rids: tuple[int, ...]) -> None:
     """One decode step, as the engine drives it: admit, plan, the rows'
-    upload, commit and gather, the forward's length step, then KV's commit."""
+    upload and commit, the forward's length step, then KV's commit."""
     step, ctx = _decode_ctx(space, rids)
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
     ctx.rows.stage()
     ctx.rows.commit()
     ctx.rows.apply()
-    space.gather(len(rids))
     space.after_forward()
     kv.commit(step, ctx)
 
@@ -106,14 +105,19 @@ def _check_rows(kv: KVManager, space: RowSpace, rids, when: str) -> None:
     """Each row holds its stream: the stored length, on the mirror and the
     device, and every page."""
     lens, pages = kv._kv_rows["decode"].labels["main"]
+    # the last step's rows hold their state in their places in the dense view
+    order = list(space.batch.order)
     for rid in rids:
         stream = kv._streams[rid]["main"]
-        slot = space.batch.slot_of(rid)
         held = stream.page_indices.tolist()
-        row = pages.resident[slot, :len(held)].tolist()
+        if rid in order:
+            at, where = order.index(rid), (pages.device, lens.device)
+        else:
+            at, where = space.batch.slot_of(rid), (pages.resident, lens.resident)
+        row = where[0][at, :len(held)].tolist()
         assert row == held, f"{when}: row {rid} holds pages {row}, its stream {held}"
         assert SINK_PAGE not in row
-        assert int(lens.resident[slot]) == stream.stored_len, f"{when}: row {rid}'s device length"
+        assert int(where[1][at]) == stream.stored_len, f"{when}: row {rid}'s device length"
         assert int(space.committed(lens, rid)) == stream.stored_len, f"{when}: row {rid}'s mirror length"
 
 

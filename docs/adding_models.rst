@@ -2011,21 +2011,26 @@ is not named):
    def persistent_row_walks(self):
        return {DECODE_WALK: RowWalk(labels={KV_CACHE: ("main",)})}
 
-A request keeps its slot until it runs a step of another walk or is evicted,
-either of which checks its row in first, or until it is removed, when the row
-leaves at the walk's next step. There are ``max(max_batch_size, max_concurrent_requests)`` slots. When a request
-joins with every slot taken, the row that ran least recently and isn't in the
-step is checked in, so without ``max_concurrent_requests`` a scheduler that
-rotates more live requests than a step runs keeps moving rows. The engine
-runs the step in row order (``request_ids`` is a permutation of the batch the
-worker scheduled) and gathers its rows into dense views; the step's graph
-scatters what the forward changed back. A captured step's graph applies the
-step's row changes and gathers the views itself, before its forward, so in
-``preprocess`` a view (``sampler.loopback_tokens``, say) holds the rows of an
-earlier step: hand it on to the forward as it is, at capture as at replay
-(take the loop-back path even when every capture row brings its ids), and put
-values a row brings over it with ``sampler.overwrite_rows``, which writes the
-row too. The graph runner refuses a view going into a graph input the capture
+A request keeps its slot until it is evicted, which checks its row in first,
+or removed, when the row leaves at the walk's next step. A step of another
+walk (a mixed step, say) that runs it lends its row instead: the row's device
+state goes back where that step reads it, and the next step of the walk that
+runs the request writes its row whole, in the same slot. There are
+``max(max_batch_size, max_concurrent_requests)`` slots. When a request joins
+with every slot taken, the row that ran least recently and isn't in the step
+is checked in, so without ``max_concurrent_requests`` a scheduler that rotates
+more live requests than a step runs keeps moving rows.
+
+The step's dense views are the state of the rows it runs: row ``i`` holds the
+request the last step ran at ``i``, and the forward updates it in place. A
+step that runs the same requests in the same order moves nothing; otherwise
+only the rows whose place changes move, a leaving one back to its slot and a
+coming one in from its slot. A captured step's graph applies the step's row
+changes itself, before its forward, so in ``preprocess`` a view
+(``sampler.loopback_tokens``, say) holds the rows of an earlier step: hand it
+on to the forward as it is, at capture as at replay (take the loop-back path
+even when every capture row brings its ids), and put values a row brings over
+it with ``sampler.overwrite_rows``. The graph runner refuses a view going into a graph input the capture
 took a tensor of its own for. Anything computed from a view in ``preprocess``
 reads stale rows: compute it in the forward.
 
@@ -2035,9 +2040,11 @@ buffers with ``space.buffer(...)``: a ``mirrored`` one keeps a host copy that
 is the truth for its rows, and one with a ``step`` (a position, a length)
 gains it on every active row with each forward, on the device inside the
 graph and on the mirror as the step commits. It returns a ``RowState``:
-``check_out`` writes joining rows, ``check_in`` reads leaving rows back (host
-state in an ``on_commit`` hook, so a proposal that never commits changes
-nothing), and ``released`` frees what a removed request's row held. The base
+``check_out`` writes joining rows (a lent row the walk runs again among them),
+``check_in`` reads leaving rows back (host state in an ``on_commit`` hook, so a
+proposal that never commits changes nothing), ``lend`` reads lent rows back the
+same way but keeps what they hold, and ``released`` frees what a removed
+request's row held. The base
 ``RowState()`` keeps nothing. While planning, a resource writes the step's
 other changes through ``ctx.rows`` (``write_at``). A pre-planned step is
 planned again at exec, with the same ``ctx.rows`` or, if the pre-plan was

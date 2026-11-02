@@ -213,7 +213,7 @@ class _Harness:
         padded = tuple(order) + tuple(-1 - i for i in range(BUCKET - len(order)))
         ctx.set_padded_rids(padded)
         step = self._plan(ctx, padded)
-        # the replay applies the upload and gathers the rows in its prologue
+        # the replay applies the upload in its prologue
         ctx.rows.stage(in_graph=True)
         self.node_rows.commit(WALK, ctx.rows)
         for t in (self.q, self.k, self.v):
@@ -238,7 +238,6 @@ class _Harness:
         ctx.rows.stage()
         self.node_rows.commit(WALK, ctx.rows)
         ctx.rows.apply()
-        self.node_rows.gather(WALK, n)
         q, k, v = (torch.randn(n, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda") for _ in range(3))
         self.kv.write_kv(k, v, layer_idx=0, label=LABEL)
         out = self.attn.run(q, LABEL, self.kv.layer_view(0))
@@ -261,7 +260,7 @@ class _Harness:
 @pytest.mark.parametrize("max_live", [None, 8])
 def test_replays_write_and_attend_each_rows_own_stream(monkeypatch, tensor_cores, seed, max_live):
     """Rows a step doesn't run stay resident while there is room (a step's
-    rows without ``max_live``), and the steps gather the rows they run."""
+    rows without ``max_live``), and the steps move in the rows they run."""
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     rng = random.Random(seed)
     h = _Harness(tensor_cores, max_live)

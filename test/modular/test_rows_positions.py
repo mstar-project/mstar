@@ -42,7 +42,7 @@ def _step(pos, node_rows, walk, rids, spans=None):
         ctx.request_ids = tuple(rids)
         spans = {(rid, label): 1 for rid in rids for label in LABELS}
     else:
-        node_rows.check_in(rids)
+        node_rows.lend(rids)
     ctx.plan_results[KV] = KVPlanOutputs({
         label: KVPlanOutput(
             None, rows=[(rid, label, spans[rid, label]) for rid in rids], decode=walk == ROWS_WALK,
@@ -57,7 +57,6 @@ def _step(pos, node_rows, walk, rids, spans=None):
         ctx.rows.stage()
         node_rows.commit(walk, ctx.rows)
         ctx.rows.apply()
-        node_rows.gather(walk, len(rids))  # what the step's graph runs before its forward
     read = {rid: {} for rid in rids}
     for label in LABELS:
         flat = ids[label].tolist()
@@ -99,7 +98,7 @@ def test_each_request_reads_and_reports_its_own_positions(device, seed):
         else:
             spans = {(rid, label): rng.randrange(1, 4) for rid in rids for label in LABELS}
             read = _step(pos, node_rows, OTHER_WALK, rids, spans)
-            assert not any(space.holds(rid) for rid in rids)
+            assert not any(space.holds_live(rid) for rid in rids)
         for rid in rids:
             assert read[rid] == truth[rid], rid
             for label in LABELS:
@@ -138,7 +137,6 @@ def test_a_check_in_does_not_land_on_a_recycled_handle():
     ctx.rows.stage()
     node_rows.commit(ROWS_WALK, ctx.rows)
     ctx.rows.apply()
-    node_rows.gather(ROWS_WALK, 1)
     node_rows.after_forward(ROWS_WALK)
     pos.commit(step, ctx)
     assert pos.position(1, "main") == 0

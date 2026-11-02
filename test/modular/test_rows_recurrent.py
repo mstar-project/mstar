@@ -49,7 +49,7 @@ def _step(pool, node_rows, walk, rids, spans=None):
         ctx.request_ids = tuple(rids)
         spans = dict.fromkeys(rids, 1)
     else:
-        node_rows.check_in(rids)
+        node_rows.lend(rids)
     step = RecurrentStep(segments=tuple(Segment(rid, "main", spans[rid]) for rid in rids))
     assert pool.admit(step, ctx).ok
     addressing = pool.plan(step, ctx)["main"]
@@ -59,7 +59,6 @@ def _step(pool, node_rows, walk, rids, spans=None):
         ctx.rows.stage()
         node_rows.commit(walk, ctx.rows)
         ctx.rows.apply()
-        node_rows.gather(walk, len(rids))  # what the step's graph runs before its forward
     slots = addressing.slot_indices[: len(rids)].tolist()
     state = pool.gather("s")
     pool.scatter_("s", state + 1)
@@ -95,7 +94,7 @@ def test_each_request_resumes_its_own_state(device, seed):
             read, slots = _step(pool, node_rows, ROWS_WALK, rids)
         else:
             read, slots = _step(pool, node_rows, OTHER_WALK, rids, {rid: rng.randrange(1, 4) for rid in rids})
-            assert not any(space.holds(rid) for rid in rids)
+            assert not any(space.holds_live(rid) for rid in rids)
         for rid in rids:
             assert slots[rid] == pool._slots[rid]["main"].index, rid
             assert read[rid] == truth[rid], rid
@@ -150,7 +149,6 @@ def test_a_held_row_addresses_a_label_it_takes_later(device):
         ctx.rows.stage()
         node_rows.commit(ROWS_WALK, ctx.rows)
         ctx.rows.apply()
-        node_rows.gather(ROWS_WALK, 1)
         for label in labels:
             assert addressing[label].slot_indices[:1].tolist() == [pool._slots[0][label].index], label
         node_rows.after_forward(ROWS_WALK)

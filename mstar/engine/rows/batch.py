@@ -97,6 +97,11 @@ class PyPersistentBatch:
         """The committed step's requests, in step order."""
         return self._order
 
+    @property
+    def idx(self) -> np.ndarray:
+        """The committed step's slots, in step order."""
+        return self._idx
+
     def slot_of(self, rid: int) -> int | None:
         return self._slot_of.get(rid)
 
@@ -252,6 +257,10 @@ class RustPersistentBatch:
     @property
     def order(self) -> Sequence[int]:
         return self._order
+
+    @property
+    def idx(self) -> np.ndarray:
+        return self._idx
 
     def slot_of(self, rid: int) -> int | None:
         return self._core.slot_of(rid)

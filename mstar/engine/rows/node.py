@@ -35,13 +35,21 @@ class RowState:
 
     def check_out(self, rows: StepRows) -> None:
         """Write every joining row (``rows.diff.join_rids`` into
-        ``join_slots``) from the request's state, on every buffer registered."""
+        ``join_slots``) from the request's state, on every buffer registered.
+        A lent row the step runs again joins too, in the slot it kept."""
 
     def check_in(self, rows: StepRows) -> None:
         """Read every leaving row back (``rows.diff.leave_rids`` from
-        ``leave_slots``, skipping ``rows.diff.dropped``): device state with
-        ``copy_out``, host state from the committed mirror in an
-        ``on_commit`` hook, so a step that never commits changes nothing."""
+        ``leave_slots``, skipping ``rows.diff.dropped``, which lent rows are
+        among): device state with ``copy_out``, host state from the committed
+        mirror in an ``on_commit`` hook, so a step that never commits changes
+        nothing."""
+
+    def lend(self, rows: StepRows) -> None:
+        """Read every lent row back (``rows.lent_rids`` from ``lent_slots``)
+        as ``check_in`` does, for a step outside the walk that runs them, but
+        keep what the rows hold for them: they stay checked out, and join
+        again from the request's state when the walk next runs them."""
 
     def released(self, slots: np.ndarray) -> None:
         """Rows of removed requests left ``slots``: free what was kept for them.
@@ -157,6 +165,15 @@ class NodeRows:
             for rid in rids
         )
 
+    def lends_any(self, rids: Sequence[int], skip_walk: str | None = None) -> bool:
+        """Whether a step outside every walk but ``skip_walk`` running ``rids``
+        has rows to lend first (``lend``)."""
+        return any(
+            w.space.holds_live(rid) for walk, w in self._walks.items()
+            if walk != skip_walk and w.space.batch.n_held
+            for rid in rids
+        )
+
     def begin(self, walk: str, rids: Sequence[int]) -> StepRows:
         """Propose a step of ``walk`` over ``rids``, with every resource's
         joining and leaving rows written. Commits nothing."""
@@ -182,9 +199,27 @@ class NodeRows:
             for state in self._walks[walk].states:
                 state.released(released)
 
+    def lend(self, rids: Sequence[int], skip_walk: str | None = None) -> None:
+        """Lend the rows of ``rids`` every walk but ``skip_walk`` holds, on the
+        current stream, for a step that reads their state elsewhere: each
+        keeps its slot and place until its walk runs it again."""
+        for walk, w in self._walks.items():
+            if walk == skip_walk or not w.space.batch.n_held:
+                continue
+            rows = w.space.lend(rids)
+            if rows is None:
+                continue
+            if rows.diff.leave_rids:
+                for state in w.states:
+                    state.check_in(rows)
+            for state in w.states:
+                state.lend(rows)
+            rows.stage()
+            self.commit(walk, rows, forward=False)
+
     def check_in(self, rids: Sequence[int], skip_walk: str | None = None) -> None:
         """Check ``rids`` in from every walk but ``skip_walk``, on the current
-        stream, for a step that reads their state elsewhere."""
+        stream: they leave their rows (an evicted request, say)."""
         for walk, w in self._walks.items():
             if walk == skip_walk or not w.space.batch.n_held:
                 continue
@@ -199,20 +234,16 @@ class NodeRows:
 
     def before_forward(self, walk: str, lease: SlotLease) -> None:
         """Before the forward of the graph captured for ``walk`` on ``lease``:
-        the rows' prologue (the step's upload applied, its rows gathered),
-        then every state's ``before_forward``, which builds from them."""
+        the rows' prologue (the step's upload applied), then every state's
+        ``before_forward``, which builds from them."""
         w = self._walks[walk]
-        w.space.prologue(lease.bucket.bs)
+        w.space.prologue()
         for state in w.states:
             state.before_forward(lease)
 
     def owns(self, walk: str, t: torch.Tensor) -> bool:
         """Whether ``t`` is a dense view of ``walk``'s rows (``RowSpace.owns``)."""
         return self._walks[walk].space.owns(t)
-
-    def gather(self, walk: str, n: int) -> None:
-        """A step of ``walk`` over ``n`` rows, once its rows are applied: see ``RowSpace.gather``."""
-        self._walks[walk].space.gather(n)
 
     def after_forward(self, walk: str) -> None:
         """After a forward of ``walk``: see ``RowSpace.after_forward``."""

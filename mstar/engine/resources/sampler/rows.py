@@ -4,11 +4,11 @@ Each row holds its request's settings (temperature, top-k, ...), mirrored
 from the host masters, and its RNG offset, last token and declared loop-back
 states, checked out of the slot masters; with a repetition penalty, also its
 seen-token mask, checked out of the request's own. The walk's sampler reads
-and advances them in place, so a step that changes no rows gathers and
-scatters nothing; the masters are only read when a row joins and written when
-it leaves. The vocabulary-wide masks stay resident (``moved=False``): the
-sampler reads them by slot and sets one token a row, where a dense copy would
-move every row's whole mask in and out each step.
+and advances them in place, so a step that changes no rows moves nothing; the
+masters are only read when a row joins and written when it leaves or is lent.
+The vocabulary-wide masks stay resident (``moved=False``): the sampler reads
+them by slot and sets one token a row, where a dense copy would move a row's
+whole mask each time it changes places.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from mstar.engine.resources.sampler.utils import (
     FilterOrder,
     SamplerBuffers,
 )
-from mstar.engine.rows import RowBuffer, RowSpace, RowState, StepRows
+from mstar.engine.rows import RowSpace, RowState, StepRows
 
 
 class SamplerRows(RowState):
@@ -88,34 +88,33 @@ class SamplerRows(RowState):
 
     def check_in(self, rows: StepRows) -> None:
         d = rows.diff
-        bufs = self._buffers()
         masters = self.master_slot.host[d.leave_slots]
         keep = [i for i, rid in enumerate(d.leave_rids) if rid not in d.dropped]
         if keep:
-            slots, dst = d.leave_slots[keep], masters[keep]
-            rows.copy_out(self.offset, slots, bufs.offset.master, dst)
-            rows.copy_out(self.last_token, slots, bufs.last_token.master, dst)
-            for name, row in self.loopback.items():
-                rows.copy_out(row, slots, bufs.loopback[name].master, dst)
-            if self.seen is not None:
-                masks = [self._seen_mask(d.leave_rids[i]) for i in keep]
-                back = [i for i, m in enumerate(masks) if m is not None]
-                if back:
-                    rows.copy_out_each(self.seen, slots[back], [masks[i] for i in back])
+            self._read_back(rows, d.leave_slots[keep], masters[keep], [d.leave_rids[i] for i in keep])
         # every leaving row, removed or not: the slot of a removed request is
         # freed only now, after its check-in was queued
+        bufs = self._buffers()
         rows.on_commit(lambda released: bufs.drop_slots(masters))
 
-    def buffer_of(self, view: torch.Tensor) -> RowBuffer:
-        """The loop-back buffer (last token or a declared state) whose dense
-        view ``view`` is."""
-        for buf in (self.last_token, *self.loopback.values()):
-            if buf.device.data_ptr() == view.data_ptr():
-                return buf
-        raise ValueError("not a dense view of the sampler's loop-back rows")
+    def lend(self, rows: StepRows) -> None:
+        self._read_back(rows, rows.lent_slots, self.master_slot.host[rows.lent_slots], rows.lent_rids)
+
+    def _read_back(self, rows: StepRows, slots: np.ndarray, masters: np.ndarray, rids: list[int]) -> None:
+        """The device state of the rows in ``slots`` back to their masters."""
+        bufs = self._buffers()
+        rows.copy_out(self.offset, slots, bufs.offset.master, masters)
+        rows.copy_out(self.last_token, slots, bufs.last_token.master, masters)
+        for name, row in self.loopback.items():
+            rows.copy_out(row, slots, bufs.loopback[name].master, masters)
+        if self.seen is not None:
+            masks = [self._seen_mask(rid) for rid in rids]
+            back = [i for i, m in enumerate(masks) if m is not None]
+            if back:
+                rows.copy_out_each(self.seen, slots[back], [masks[i] for i in back])
 
     def sampler_for(self, bs: int, slot: int | None) -> AcceleratorGraphableSampler:
-        """A sampler over the first ``bs`` rows, cached: the rows never move.
+        """A sampler over the first ``bs`` rows, cached: the dense views never move.
         Its log-probs land in the leased ``slot``'s row, as on the slot path,
         or in a new tensor per eager step."""
         key = (bs, slot)

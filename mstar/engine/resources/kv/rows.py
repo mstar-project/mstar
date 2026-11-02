@@ -171,8 +171,9 @@ class KVRows(RowFills):
         """A step of ``n`` rows (its own, then padding): FlashInfer's
         ``paged_kv_indptr`` and the kv lengths, each row's stored length plus
         its token, and for each held row whose token starts a page, that page,
-        from its stream; not for the slots in ``skip``, which have none (a
-        padding row) or hold all theirs (a joining one).
+        from its stream, written into the row's place; not for the slots in
+        ``skip``, which have none (a padding row) or hold all theirs (a
+        joining one).
 
         Derived from the committed length rather than from what this step's
         admit reserved: a discarded pre-plan of the step reserved the page

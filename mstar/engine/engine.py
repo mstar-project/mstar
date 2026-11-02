@@ -878,9 +878,9 @@ class Engine:
 
     def _enter_rows(self, batch: ExecutingBatch, preplan: bool = False) -> Sequence[int] | None:
         """The step's rids, in the order it runs: a persistent walk's step is
-        proposed over its rows in the batch's order. On the gpu thread, check
-        in the rows any other step of the node runs. None for a pre-plan that
-        has to wait for that check-in."""
+        proposed over its rows in the batch's order. On the gpu thread, lend
+        the rows any other step of the node runs. None for a pre-plan that
+        has to wait for that lend."""
         node_rows = self._rows.get(batch.node_name)
         if node_rows is None:
             return batch.request_ids
@@ -888,18 +888,18 @@ class Engine:
         walk = ctx.graph_walk
         if not node_rows.persistent(walk):
             if preplan:
-                # the check-in lands in stream order on the gpu thread, and
-                # this step's plan reads what it writes back
-                return None if node_rows.holds_any(batch.request_ids) else batch.request_ids
-            node_rows.check_in(batch.request_ids)
+                # the lend lands in stream order on the gpu thread, and this
+                # step's plan reads what it writes back
+                return None if node_rows.lends_any(batch.request_ids) else batch.request_ids
+            node_rows.lend(batch.request_ids)
             return batch.request_ids
         rids = batch.request_ids
         # a request may hold a row of another persistent walk of the node
         if preplan:
-            if node_rows.holds_any(rids, skip_walk=walk):
+            if node_rows.lends_any(rids, skip_walk=walk):
                 return None
         else:
-            node_rows.check_in(rids, skip_walk=walk)
+            node_rows.lend(rids, skip_walk=walk)
         rows = ctx.rows
         if rows is None or rows.stale or tuple(rows.order) != tuple(rids):
             ctx.rows = node_rows.begin(walk, rids)
@@ -1592,9 +1592,13 @@ class Engine:
                 batch.preplanned_rids = None
             rows = batch.step_context.rows
             if rows is not None:
-                rows.space.drop_staged()
                 if rows.committed:
+                    # its moves are the committed rows' places: they land
+                    # whether or not its replay ran (which applies them once)
+                    rows.apply_ahead()
                     rows.space.resync()
+                else:
+                    rows.space.drop_staged()
             batch.step_context.rows = None
             raise
         finally:
@@ -2013,12 +2017,10 @@ class Engine:
             # after every resource planned, so one upload carries all their
             # writes; committed before the launch releases the main thread,
             # which may then remove a request this step checked in. A replay
-            # applies the upload and gathers the rows in its graph's prologue;
-            # an eager step gathers them before preprocess, which reads them
+            # applies the upload in its graph's prologue; an eager step
+            # before preprocess, which reads the rows
             rows.stage(in_graph=lease is not None)
             self._rows[batch.node_name].commit(ctx.graph_walk, rows)
-            if lease is None:
-                self._rows[batch.node_name].gather(ctx.graph_walk, len(ctx.padded_request_ids))
             phase_end("engine.rows", t0)
 
         laps = PhaseLaps("engine.")
