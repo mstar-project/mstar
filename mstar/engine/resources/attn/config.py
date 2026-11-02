@@ -108,8 +108,8 @@ class AttentionSpec(NodeResourceSpec):
 
         problems = take_shard_edge(self, specs)
         self.split_exchange = self.resolve_exchange(specs)
-        # a deployment's own setting, so refused at every SP size: where nothing would read it
-        # (also at one SP rank, `sequence_parallel_refusals`), and against the pool's storage
+        # a deployment's own setting, so refused at every SP size where nothing reads it (one SP
+        # rank: `sequence_parallel_refusals`) or it doesn't match the pool's storage
         if self.sp_exchange is not None and self.shard_key is None:
             problems.append(
                 f"sp_exchange {self.sp_exchange!r} picks how a split step reaches it, and its nodes declare no "
