@@ -86,26 +86,24 @@ def _shipped_prefill_ladders():
     return ladders
 
 
-def _prefill_capture(model, buckets):
-    """The token ladder ``model``'s prefill capture is built on, given ``buckets``."""
-    if model.startswith("qwen3_5"):
-        from mstar.model.qwen3_5.submodules import LLMSubmodule
-        node = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
-    elif model == "qwen3_omni":
+@pytest.mark.parametrize("config", _configs_with_prefill_ladders())
+def test_every_shipped_prefill_ladder_reaches_its_model(config):
+    """The model a config serves takes ``prefill_token_buckets`` as its own
+    argument rather than dropping it into ``**kwargs``; Qwen3-Omni's Thinker
+    then captures its prefill on the ladder (Qwen3.5's, by the tests below)."""
+    import inspect
+
+    from mstar.model.registry import get_model_class
+    model, buckets = _configs_with_prefill_ladders()[config]
+    assert "prefill_token_buckets" in inspect.signature(get_model_class(model).__init__).parameters
+    if model == "qwen3_omni":
         from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
         node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
+        ladders = {c.capture_graph_walk: c.capture_token_lengths
+                   for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
+        assert ladders["prefill_text"] == sorted(buckets)
     else:
-        raise AssertionError(f"a {model} config sets prefill_token_buckets, which this test doesn't check")
-    configs = node.get_accelerator_graph_configs(torch.device("cpu"))
-    return next(c.capture_token_lengths for c in configs if c.capture_graph_walk == "prefill_text")
-
-
-@pytest.mark.parametrize("config", _configs_with_prefill_ladders())
-def test_every_shipped_prefill_ladder_is_its_models_capture(config):
-    """A config's ladder is valid for the model it serves, which captures its
-    prefill on it rather than on the class default."""
-    model, buckets = _configs_with_prefill_ladders()[config]
-    assert _prefill_capture(model, buckets) == sorted(buckets)
+        assert model.startswith("qwen3_5"), f"a {model} config sets prefill_token_buckets, which no test checks"
 
 
 @pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
