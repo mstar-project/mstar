@@ -624,7 +624,7 @@ class RecurrentStatePool(Resource):
     def _writes_twins(self, step: RecurrentStep, ctx: StepContext) -> bool:
         """Whether this step's rows read one twin and write the other, the same
         answer at capture, plan and commit: a replay runs what its capture
-        recorded, and commit must swap exactly what the kernels wrote."""
+        recorded, and commit must swap what the kernels wrote and nothing else."""
         if not self.config.twin_slots or ctx.force_prefill:
             return False
         walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
@@ -683,7 +683,7 @@ class RecurrentStatePool(Resource):
     ) -> None:
         """Copy one slot onto its fork target.
 
-        A real copy, not page aliasing: the state is mutated in place, so two
+        A real copy, not page aliasing: the state is mutated every step, so two
         labels cannot share it.
         """
         with self._lock:

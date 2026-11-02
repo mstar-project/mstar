@@ -1,5 +1,5 @@
-"""``causal_conv1d_decode`` against ``causal_conv1d_update``, its general kernel: output and state bit-equal at decode's
-shapes, null slots and strided rows included, eager and from a captured replay."""
+"""``causal_conv1d_decode`` against ``causal_conv1d_update``, its general kernel: output and state bit-equal at decode
+sizes, null slots and strided rows included, eager and from a captured replay."""
 
 import pytest
 import torch

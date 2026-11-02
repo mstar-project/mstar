@@ -348,7 +348,8 @@ class GDNManager(LinearAttnManager):
 
         ``q``/``k`` are ``[total_tokens, H, K]``, ``v`` ``[total_tokens, HV,
         V]``, and the return ``[total_tokens, HV, V]``. ``state_layer`` is this
-        layer's ``[max_slots, HV, V, K]`` view of the pool, updated in place.
+        layer's ``[slots, HV, V, K]`` view of the pool, updated in place, or under
+        twin slots written to each row's other slot on a decode step.
 
         ``a``/``b`` are the raw gate projections, not the decay and learning
         rate. q and k are L2-normalized here only where the kernel will not do
@@ -381,9 +382,9 @@ class GDNManager(LinearAttnManager):
 
         ``x`` is ``[total_tokens, conv_dim]``, ``weight``
         ``[conv_dim, kernel_size]``, and ``conv_layer`` this layer's
-        ``[max_slots, conv_dim, width]`` view of the pool's conv block, updated
-        in place. Padding rows carry the pool's null slot, which both conv
-        kernels skip.
+        ``[slots, conv_dim, width]`` view of the pool's conv block, updated in
+        place or, like the state, written to a row's other twin. Padding rows
+        carry the pool's null slot, which both conv kernels skip.
         """
         return self.current_plan(label).run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
