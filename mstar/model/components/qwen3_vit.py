@@ -18,6 +18,8 @@ from typing import Protocol
 import torch
 from torch import nn
 
+from mstar.platforms import current_platform
+
 
 class ViTConfig(Protocol):
     """What the shared modules read off a tower's config."""
@@ -160,12 +162,24 @@ class VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, config: ViTConfig):
         super().__init__()
-        spatial_dim = config.head_dim // 2
-        inv_freq = 1.0 / (
-            config.rope_theta
-            ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim)
+        self.spatial_dim = config.head_dim // 2
+        self.theta = config.rope_theta
+        self.register_buffer("inv_freq", self._inv_freq(), persistent=False)
+
+    def _inv_freq(self, device: torch.device | None = None) -> torch.Tensor:
+        return 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.spatial_dim, 2, dtype=torch.float, device=device) / self.spatial_dim)
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse)
+        # The cast to the model's dtype rounds this buffer too, and upstream
+        # keeps it in fp32. The angle error grows with the distance between
+        # two patches.
+        if current_platform.is_rocm():
+            self.inv_freq = self._inv_freq(device=self.inv_freq.device)
+        return result
 
     @torch.no_grad()
     def forward(
