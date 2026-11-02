@@ -60,8 +60,41 @@ def _sysfs(tmp_path, gpus=GPUS, nodes=NODES) -> Path:
     return root
 
 
-def _plan(setting, addresses, mask, root, usable=None):
-    return deployment_plan(setting, addresses, mask=mask, usable=usable or len(mask), pci_root=root, siblings=smt)
+def _idle(tmp_path, cpus_, states) -> Path:
+    """A fake /sys/devices/system/cpu: ``states`` is (name, exit latency, disabled) per state of each CPU."""
+    root = tmp_path / "cpu"
+    for cpu in cpus_:
+        for i, (name, latency, disabled) in enumerate(states):
+            d = root / f"cpu{cpu}" / "cpuidle" / f"state{i}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "name").write_text(name + "\n")
+            (d / "latency").write_text(f"{latency}\n")
+            (d / "disable").write_text(f"{int(disabled)}\n")
+    return root
+
+
+XEON = [("POLL", 0, False), ("C1", 1, False), ("C1E", 2, False), ("C6", 170, False), ("C6P", 210, False)]
+SIERRA = [("POLL", 0, False), ("C1", 1, False), ("C1E", 2, False), ("C6S", 270, False), ("C6SP", 310, False)]
+VM = [("POLL", 0, False), ("C1", 2, False)]
+
+
+@pytest.fixture(autouse=True)
+def _deep_idle_host(tmp_path_factory, monkeypatch):
+    """``devices_plan`` reads the idle states of the process mask: hosts here have deep ones unless a test says
+    otherwise, whether or not the machine running the tests exposes cpuidle."""
+    monkeypatch.setattr(cpus, "_CPU_ROOT", _idle(tmp_path_factory.mktemp("sysfs"), [min(cpus.process_mask())], XEON))
+
+
+def one_cpu_cluster(cpu: int) -> frozenset[int]:
+    """An L2 per core, as on a P-core Xeon."""
+    return frozenset({cpu})
+
+
+def _plan(setting, addresses, mask, root, usable=None, idle=None, reachable=(), siblings=smt, cluster=one_cpu_cluster):
+    # placement is what most of this file is about, so a host with deep idle unless a test says otherwise
+    cpu_root = idle if idle is not None else _idle(root.parent / "deep", [min(mask)], XEON)
+    return deployment_plan(setting, addresses, mask=mask, usable=usable or len(mask), pci_root=root,
+                           siblings=siblings, cluster=cluster, cpu_root=cpu_root, reachable=reachable)
 
 
 def _one(cpu) -> StepCpus:
@@ -83,6 +116,21 @@ def test_the_hosts_gpus_are_the_functions_of_one_vendor_and_class_by_address(tmp
     assert gpus[1] == cpus.HostGpu("0000:40:00.0", "0", NODES[0])
     assert cpus.host_gpus("0000:ff:00.0", root) == []   # no such device
     assert cpus.host_gpus("0000:40:00.0", tmp_path / "absent") == []
+
+
+def test_reachable_gpus_are_the_ones_with_a_device_node(tmp_path):
+    proc, dev = tmp_path / "gpus", tmp_path / "dev"
+    dev.mkdir()
+    for address, minor in (("0000:9a:00.0", 4), ("0000:f3:00.0", 6), ("0000:fa:00.0", 7)):
+        (proc / address).mkdir(parents=True)
+        (proc / address / "information").write_text(f"Model: \t B300\nDevice Minor: \t {minor}\nGPU Excluded:\t No\n")
+    (proc / "0000:01:00.0").mkdir()    # a function without its information file
+    (dev / "nvidia6").touch()
+    (dev / "nvidia7").touch()
+    (dev / "nvidiactl").touch()
+    assert interface._nvidia_reachable(proc, dev) == {"0000:f3:00.0", "0000:fa:00.0"}
+    assert interface._nvidia_reachable(tmp_path / "absent", dev) == frozenset()
+    assert CpuPlatform().reachable_pci_addresses() == frozenset()
 
 
 def test_pci_addresses_come_from_torch_on_cuda_and_rocm(monkeypatch):
@@ -124,7 +172,7 @@ def test_auto_takes_the_cores_at_the_gpus_rank_on_its_node(tmp_path):
 def test_two_servers_one_per_gpu_under_one_taskset_take_different_cpus(tmp_path, mask, a, b):
     """Each server knows only its own GPU, and no two pick a CPU in common."""
     root = _sysfs(tmp_path)
-    first, second = _plan("auto", [a], mask, root), _plan("auto", [b], mask, root)
+    first, second = _plan("always", [a], mask, root), _plan("always", [b], mask, root)
     assert first.pinned and second.pinned
     assert not first.pinned & second.pinned
 
@@ -132,7 +180,7 @@ def test_two_servers_one_per_gpu_under_one_taskset_take_different_cpus(tmp_path,
 def test_a_vm_without_numa_nodes_still_ranks_its_gpus(tmp_path):
     root = _sysfs(tmp_path, gpus={"0000:07:00.0": -1, "0000:08:00.0": -1})
     mask = parse_cpu_list("0-39")
-    one, two = (_plan("auto", [a], mask, root) for a in ("0000:07:00.0", "0000:08:00.0"))
+    one, two = (_plan("always", [a], mask, root) for a in ("0000:07:00.0", "0000:08:00.0"))
     assert (_cpus(one), one.result, _cpus(two), two.result) == ([0], 39, [1], 38)
 
 
@@ -145,22 +193,22 @@ def test_workers_of_one_server_on_one_gpu_take_distinct_cores(tmp_path):
 
 def test_a_mask_off_the_gpus_node_falls_back_to_its_rank_among_the_gpus_off_theirs(tmp_path):
     root = _sysfs(tmp_path)
-    plan = _plan("auto", ["0000:40:00.0"], parse_cpu_list("32-47"), root)
+    plan = _plan("always", ["0000:40:00.0"], parse_cpu_list("32-47"), root)
     # node 1's two GPUs would take 32, 33, 46 and 47; six GPUs have no allowed
     # CPU on their node, and the second of them takes from 34-45
     assert _cpus(plan) == [35] and plan.result == 44
     assert "no allowed CPU on its NUMA node, so GPU 2 of 6 without one" in plan.workers[0].why
     # a device sysfs doesn't place (a CPU worker) takes the mask from the bottom
-    plan = _plan("auto", [None, None], parse_cpu_list("32-39"), root)
+    plan = _plan("always", [None, None], parse_cpu_list("32-39"), root)
     assert _cpus(plan) == [32, 33] and plan.result == 39
 
 
 def test_auto_pins_nothing_when_the_mask_is_too_small(tmp_path):
     root = _sysfs(tmp_path)
-    plan = _plan("auto", [None], {32, 33}, root)   # a worker and the API server would take both
+    plan = _plan("always", [None], {32, 33}, root)   # a worker and the API server would take both
     assert plan.workers == () and plan.result is None
     assert plan.why.startswith("not pinned: ") and "leaving none for the rest" in plan.why
-    plan = _plan("auto", [None] * 3, {32, 33, 34}, root)
+    plan = _plan("always", [None] * 3, {32, 33, 34}, root)
     assert plan.pinned == frozenset() and "more cores than the mask has" in plan.why
 
 
@@ -181,11 +229,11 @@ def test_auto_pins_nothing_with_fewer_than_two_cores_per_gpu_in_a_pool(tmp_path,
 
 def test_two_cores_per_gpu_is_enough(tmp_path):
     root = _sysfs(tmp_path)
-    assert _plan("auto", ["0000:62:00.0"], parse_cpu_list("32-35"), root).pinned == {32, 35}
-    assert _plan("auto", ["0000:73:00.0"], parse_cpu_list("32-35"), root).pinned == {33, 34}
+    assert _plan("always", ["0000:62:00.0"], parse_cpu_list("32-35"), root).pinned == {32, 35}
+    assert _plan("always", ["0000:73:00.0"], parse_cpu_list("32-35"), root).pinned == {33, 34}
     # 12 cores left for the 6 GPUs off their nodes
-    assert _plan("auto", ["0000:1a:00.0"], parse_cpu_list("32-47"), root).pinned == {34, 45}
-    assert _plan("auto", ["0000:fa:00.0"], parse_cpu_list("32-47"), root).pinned == {39, 40}
+    assert _plan("always", ["0000:1a:00.0"], parse_cpu_list("32-47"), root).pinned == {34, 45}
+    assert _plan("always", ["0000:fa:00.0"], parse_cpu_list("32-47"), root).pinned == {39, 40}
 
 
 @pytest.mark.parametrize("mask", [
@@ -195,7 +243,7 @@ def test_two_cores_per_gpu_is_enough(tmp_path):
 def test_no_two_gpus_of_the_host_share_a_cpu_under_one_mask(tmp_path, mask):
     """Whichever GPU a server gets, and whichever others are in use."""
     root = _sysfs(tmp_path)
-    plans = [_plan("auto", [address], mask, root) for address in GPUS]
+    plans = [_plan("always", [address], mask, root) for address in GPUS]
     for i, one in enumerate(plans):
         for other in plans[i + 1:]:
             assert not one.pinned & other.pinned
@@ -205,19 +253,295 @@ def test_workers_that_outgrow_their_pool_pin_nothing_rather_than_wrap(tmp_path):
     root = _sysfs(tmp_path)
     mask = parse_cpu_list("32-39")
     # GPU 1 of 2 on the node: 32, 34 and 36, then 38 is the other GPU's API server
-    assert _cpus(_plan("auto", ["0000:62:00.0"] * 3, mask, root)) == [32, 34, 36]
-    plan = _plan("auto", ["0000:62:00.0"] * 4, mask, root)
+    assert _cpus(_plan("always", ["0000:62:00.0"] * 3, mask, root)) == [32, 34, 36]
+    plan = _plan("always", ["0000:62:00.0"] * 4, mask, root)
     assert plan.pinned == frozenset() and "more cores than the mask has" in plan.why
 
 
 def test_a_worker_takes_both_hardware_threads_of_its_core(tmp_path):
     root = _sysfs(tmp_path)
     mask = parse_cpu_list("32-35,160-163")
-    plan = _plan("auto", [None, None], mask, root)
+    plan = _plan("always", [None, None], mask, root)
     assert [w.cpus for w in plan.workers] == [{32, 160}, {33, 161}] and plan.result == 35
     assert plan.pinned == {32, 33, 35, 160, 161} and plan.left == 3
     # a mask with one hardware thread of the core: that one
-    assert [w.cpus for w in _plan("auto", [None], parse_cpu_list("32-35"), root).workers] == [{32}]
+    assert [w.cpus for w in _plan("always", [None], parse_cpu_list("32-35"), root).workers] == [{32}]
+
+
+# ── a container given a few of the host's GPUs ──────────────────────────────
+
+POD = ("0000:40:00.0", "0000:fa:00.0")     # both off the node of the mask below
+
+
+@pytest.mark.parametrize("address", POD)
+def test_a_mask_too_small_for_the_host_fits_the_gpus_a_container_can_open(tmp_path, address):
+    """Eight cores can't give each of the host's GPUs two, but this container
+    has two GPUs, so nothing else can take a core from them."""
+    root = _sysfs(tmp_path)
+    mask = parse_cpu_list("32-39")
+    assert _plan("always", [address], mask, root).pinned == frozenset()
+    plan = _plan("always", [address], mask, root, reachable=POD)
+    assert plan.pinned and "of 2 without one" in plan.workers[0].why
+
+
+def test_the_gpus_of_one_container_stay_apart_under_one_small_mask(tmp_path):
+    root = _sysfs(tmp_path)
+    mask = parse_cpu_list("32-39")
+    first, second = (_plan("always", [a], mask, root, reachable=POD) for a in POD)
+    assert first.pinned == {32, 39} and second.pinned == {33, 38}
+    # the same mask with the siblings: each worker gets its core's two hardware threads
+    mask = parse_cpu_list("32-39,160-167")
+    first, second = (_plan("always", [a], mask, root, reachable=POD) for a in POD)
+    assert first.workers[0].cpus == {32, 160} and first.result == 39
+    assert second.workers[0].cpus == {33, 161} and second.result == 38
+    # and on the GPUs' own node, the same with a sibling in the mask
+    mask = parse_cpu_list("0-7,128-135")
+    first = _plan("always", ["0000:40:00.0"], mask, root, reachable=("0000:1a:00.0", "0000:40:00.0"))
+    assert first.pinned and _cpus(first) == [1]
+
+
+def test_a_mask_that_fits_the_host_places_as_before_whatever_the_container_can_open(tmp_path):
+    root = _sysfs(tmp_path)
+    mask = parse_cpu_list("32-47")
+    assert _plan("always", ["0000:40:00.0"], mask, root, reachable=POD).pinned == {35, 44}
+    assert _plan("always", ["0000:40:00.0"], mask, root).pinned == {35, 44}
+
+
+def test_a_mask_too_small_for_the_container_too_says_what_it_needs(tmp_path):
+    root = _sysfs(tmp_path)
+    plan = _plan("auto", [POD[0]], parse_cpu_list("32-34"), root, reachable=POD)
+    assert plan.pinned == frozenset() and "for 2 GPU(s), and each needs two; widen the mask" in plan.why
+    # every GPU reachable (bare metal): the host's rule, unchanged
+    plan = _plan("auto", [POD[0]], parse_cpu_list("32-39"), root, reachable=tuple(GPUS))
+    assert plan.pinned == frozenset() and "for 6 GPU(s), and each needs two" in plan.why
+
+
+# ── a host without SMT ──────────────────────────────────────────────────────
+
+# 2x96 E-cores, four to an L2 cluster, no SMT, four GPUs a socket
+ECORE_NODES = [parse_cpu_list("0-95"), parse_cpu_list("96-191")]
+ECORE_GPUS = {"0000:1a:00.0": 0, "0000:5d:00.0": 0, "0000:76:00.0": 0, "0000:7d:00.0": 0,
+              "0000:9a:00.0": 1, "0000:da:00.0": 1, "0000:f3:00.0": 1, "0000:fa:00.0": 1}
+ECORE_POD = ("0000:f3:00.0", "0000:fa:00.0")
+
+
+def no_smt(cpu: int) -> frozenset[int]:
+    return frozenset({cpu})
+
+
+def four_to_a_cluster(cpu: int) -> frozenset[int]:
+    return frozenset(range(cpu - cpu % 4, cpu - cpu % 4 + 4))
+
+
+def _ecore(setting, address, mask, tmp_path, reachable=ECORE_POD):
+    root = tmp_path / "pci"
+    if not root.exists():
+        _sysfs(tmp_path, gpus=ECORE_GPUS, nodes=ECORE_NODES)
+    return _plan(setting, [address], mask, root, reachable=reachable, siblings=no_smt, cluster=four_to_a_cluster)
+
+
+def test_without_smt_a_worker_takes_two_cores_of_one_cluster(tmp_path):
+    mask = parse_cpu_list("96-103")
+    first = _ecore("auto", ECORE_POD[0], mask, tmp_path)
+    assert first.workers[0].cpus == {96, 97} and first.result == 102
+    assert four_to_a_cluster(96) >= first.workers[0].cpus
+    second = _ecore("auto", ECORE_POD[1], mask, tmp_path)
+    assert second.workers[0].cpus == {98, 99} and second.result == 100
+    assert not first.pinned & second.pinned
+
+
+def test_pairs_stay_inside_a_cluster(tmp_path):
+    cores = [(c,) for c in (98, 99, 100, 101, 102)]
+    assert cpus._paired(cores, four_to_a_cluster) == [(98, 99), (100, 101), (102,)]
+    # two hardware threads already make the pair; a lone core keeps its one CPU
+    assert cpus._paired([(1, 129), (2,)], four_to_a_cluster) == [(1, 129), (2,)]
+
+
+def test_a_mask_with_a_core_short_of_its_sibling_and_no_cluster_stays_on_one_cpu(tmp_path):
+    root = _sysfs(tmp_path)
+    plan = _plan("always", [POD[0]], parse_cpu_list("32-39"), root, reachable=POD)
+    assert [w.cpus for w in plan.workers] == [{32}] and plan.result == 39
+
+
+def test_bare_metal_counts_pairs_against_every_gpu_of_the_node(tmp_path):
+    plan = _ecore("auto", ECORE_POD[0], parse_cpu_list("96-103"), tmp_path, reachable=tuple(ECORE_GPUS))
+    assert plan.pinned == frozenset() and "4 core(s) there for 4 GPU(s), and each needs two" in plan.why
+    assert _ecore("auto", ECORE_POD[0], parse_cpu_list("96-111"), tmp_path, reachable=tuple(ECORE_GPUS)).pinned
+
+
+def test_a_cpu_number_keeps_to_one_core_without_smt(tmp_path):
+    root = _sysfs(tmp_path, gpus=ECORE_GPUS, nodes=ECORE_NODES)
+    plan = _plan(98, [None], parse_cpu_list("96-103"), root, siblings=no_smt, cluster=four_to_a_cluster)
+    assert plan.workers[0].cpus == {98} and plan.result == 103
+
+
+# ── every shipped config ────────────────────────────────────────────────────
+
+SHIPPED = sorted((REPO / "configs").glob("*.yaml"))
+
+
+def _shipped_addresses(path: Path, gpus) -> list[str]:
+    config = yaml.safe_load(path.read_text())
+    host = list(gpus)
+    return [host[int(device.partition(":")[2] or 0) % len(host)]
+            for device in deployment_workers(config, "cuda").devices]
+
+
+@pytest.mark.parametrize("path", SHIPPED, ids=lambda p: p.name)
+def test_a_shipped_config_gets_a_sound_plan_on_each_host(path, tmp_path):
+    """``auto`` reaches every deployment, so no config may stop a server or
+    put two threads' CPUs in one place, on a host with SMT or without, under a
+    wide or a tight mask."""
+    addresses = _shipped_addresses(path, GPUS)
+    smt_root = _sysfs(tmp_path)
+    (tmp_path / "e").mkdir()
+    ecore_root = _sysfs(tmp_path / "e", gpus=ECORE_GPUS, nodes=ECORE_NODES)
+    cases = [(HOST, smt_root, smt, one_cpu_cluster, addresses),
+             (parse_cpu_list("32-39,160-167"), smt_root, smt, one_cpu_cluster, addresses),
+             (parse_cpu_list("0-191"), ecore_root, no_smt, four_to_a_cluster, _shipped_addresses(path, ECORE_GPUS)),
+             (parse_cpu_list("96-103"), ecore_root, no_smt, four_to_a_cluster, _shipped_addresses(path, ECORE_GPUS))]
+    for mask, root, siblings, cluster, placed in cases:
+        plan = _plan("auto", placed, mask, root, siblings=siblings, cluster=cluster)
+        if not plan.pinned:
+            assert plan.why.startswith("not pinned: ")
+            continue
+        steps = [w.cpus for w in plan.workers]
+        assert len(steps) == len(placed)
+        assert sum(map(len, steps)) == len(frozenset().union(*steps)), "two workers share a CPU"
+        assert plan.result not in frozenset().union(*steps)
+        assert plan.pinned <= mask and len(plan.pinned) < len(mask)
+    # and on a host without deep idle states, nothing at all
+    idle = _idle(tmp_path / "vm", [32], VM)
+    assert _plan("auto", addresses, parse_cpu_list("32"), smt_root, idle=idle).shallow
+
+
+# ── auto reads the host's idle states ───────────────────────────────────────
+
+@pytest.mark.parametrize("states", [XEON, SIERRA, [("C1", 1, False), ("C6", 100, False)]])
+def test_auto_pins_where_an_idle_state_reaches_the_threshold(tmp_path, states):
+    mask = parse_cpu_list("32-47,160-175")
+    root, idle = _sysfs(tmp_path), _idle(tmp_path, mask, states)
+    assert _plan("auto", ["0000:62:00.0"], mask, root, idle=idle).pinned
+
+
+@pytest.mark.parametrize(("states", "why"), [
+    (VM, "the deepest idle state is C1 at 2 µs"),
+    ([("C1", 1, False), ("C6", 99, False)], "the deepest idle state is C6 at 99 µs"),
+    ([("C1E", 2, False), ("C6", 170, True), ("C6P", 210, True)], "the deepest idle state is C1E at 2 µs"),  # disabled
+    ([], "sysfs lists no idle state"),
+])
+def test_auto_pins_nothing_on_a_host_without_deep_idle_and_says_why(tmp_path, states, why):
+    mask = parse_cpu_list("32-47")
+    root, idle = _sysfs(tmp_path), _idle(tmp_path, mask, states)
+    plan = _plan("auto", ["0000:62:00.0"], mask, root, idle=idle)
+    assert plan.pinned == frozenset() and plan.workers == () and plan.shallow
+    assert plan.why.startswith("not pinned: " + why)
+    assert "on CPUs 32-47" in plan.why and "always pins anyway" in plan.why
+    assert plan.left == len(mask)
+    # the same host under always: what auto used to do on any host
+    assert _plan("always", ["0000:62:00.0"], mask, root, idle=idle).pinned == {32, 47}
+
+
+def test_auto_refuses_a_worker_one_cpu_and_names_the_mask_it_needs(tmp_path):
+    """Three step threads queue on one CPU, which costs Qwen3-TTS its TTFA."""
+    root = _sysfs(tmp_path)
+    plan = _plan("auto", [POD[0]], parse_cpu_list("32-39"), root, reachable=POD)
+    assert plan.pinned == frozenset() and not plan.shallow
+    assert "one CPU to queue on" in plan.why and "try 32-39,160" in plan.why
+    # always keeps the old placement, and the siblings it names are enough for auto
+    assert _plan("always", [POD[0]], parse_cpu_list("32-39"), root, reachable=POD).workers[0].cpus == {32}
+    assert _plan("auto", [POD[0]], parse_cpu_list("32-39,160"), root, reachable=POD).workers[0].cpus == {32, 160}
+
+
+def test_auto_without_smt_or_a_partner_says_what_it_needs(tmp_path):
+    (tmp_path / "e").mkdir()
+    root = _sysfs(tmp_path / "e", gpus=ECORE_GPUS, nodes=ECORE_NODES)
+    # a core per cluster: no pair anywhere in the mask
+    plan = _plan("auto", [ECORE_POD[0]], parse_cpu_list("96,100,104,108"), root, reachable=ECORE_POD,
+                 siblings=no_smt, cluster=four_to_a_cluster)
+    assert plan.pinned == frozenset() and "give it two cores of one L2 cluster" in plan.why
+
+
+def test_auto_only_reads_the_servers_cpus(tmp_path):
+    root, idle = _sysfs(tmp_path), _idle(tmp_path, range(0, 32), XEON)
+    assert _plan("auto", ["0000:62:00.0"], parse_cpu_list("32-47,160-175"), root, idle=idle).shallow
+    assert _plan("auto", ["0000:62:00.0"], parse_cpu_list("31-47,160-175"), root, idle=idle).pinned
+
+
+def test_a_host_auto_leaves_alone_never_asks_for_device_addresses(tmp_path, monkeypatch):
+    def boom(devices):
+        raise AssertionError("auto on a shallow host asked torch about its devices")
+    monkeypatch.setattr(cpus, "device_addresses", boom)
+    monkeypatch.setattr(cpus, "_CPU_ROOT", _idle(tmp_path, cpus.process_mask(), VM))
+    # deployment_plan's own default is the real sysfs, so read the shallow one there too
+    real = deployment_plan
+    monkeypatch.setattr(cpus, "deployment_plan", lambda s, a: real(s, a, cpu_root=cpus._CPU_ROOT))
+    plan = cpus.devices_plan("auto", ["cuda:0"])
+    assert plan.shallow and plan.pinned == frozenset()
+
+
+def test_one_cpu_with_a_deep_state_is_enough(tmp_path):
+    mask = parse_cpu_list("32-47,160-175")
+    root, idle = _sysfs(tmp_path), _idle(tmp_path, range(32, 47), VM)
+    _idle(tmp_path, [47], XEON)
+    assert _plan("auto", ["0000:62:00.0"], mask, root, idle=idle).pinned
+
+
+def test_the_real_sysfs_reader_tolerates_a_host_without_cpuidle(tmp_path):
+    assert cpus.deepest_idle([0, 1], tmp_path / "nothing") is None
+    root = _idle(tmp_path, [0], [("C6", 170, False)])
+    (root / "cpu0" / "cpuidle" / "state0" / "latency").write_text("not a number\n")
+    assert cpus.deepest_idle([0], root) is None
+
+
+# ── the PM QoS hold ─────────────────────────────────────────────────────────
+
+@pytest.fixture
+def idle_hold():
+    yield
+    if cpus._idle_hold_fd is not None:
+        os.close(cpus._idle_hold_fd)
+    cpus._idle_hold_fd = None
+
+
+def test_the_hold_writes_the_latency_and_keeps_the_fd_open(tmp_path, idle_hold):
+    device = tmp_path / "cpu_dma_latency"
+    device.write_bytes(b"")
+    said = cpus.hold_idle(device)
+    assert int.from_bytes(device.read_bytes(), sys.byteorder) == cpus.IDLE_HOLD_US == 10
+    assert len(device.read_bytes()) == 4, "the device takes a 32-bit value"
+    assert f"holding {device} at 10 µs" in said
+    fd = cpus._idle_hold_fd
+    assert os.readlink(f"/proc/self/fd/{fd}") == str(device), "the request lasts as long as the fd"
+    assert "already holding" in cpus.hold_idle(device) and cpus._idle_hold_fd == fd
+
+
+def test_the_hold_says_when_the_device_is_absent(tmp_path, idle_hold):
+    device = tmp_path / "cpu_dma_latency"
+    said = cpus.hold_idle(device)
+    assert "nothing held" in said and "is absent" in said and cpus._idle_hold_fd is None
+
+
+def test_the_hold_says_when_the_device_is_not_writable(tmp_path, idle_hold, monkeypatch):
+    def refuse(*args):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(cpus.os, "open", refuse)
+    said = cpus.hold_idle(tmp_path / "cpu_dma_latency")
+    assert "nothing held" in said and "Permission denied" in said and cpus._idle_hold_fd is None
+
+
+def test_a_refused_write_closes_the_fd(tmp_path, idle_hold, monkeypatch):
+    device = tmp_path / "cpu_dma_latency"
+    device.write_bytes(b"")
+    closed = []
+    real_close = os.close
+
+    def refuse(*args):
+        raise OSError(22, "Invalid argument")
+    monkeypatch.setattr(cpus.os, "write", refuse)
+    monkeypatch.setattr(cpus.os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    said = cpus.hold_idle(device)
+    assert "nothing held" in said and "Invalid argument" in said and cpus._idle_hold_fd is None and closed
 
 
 # ── a CPU number, and off ───────────────────────────────────────────────────
@@ -357,8 +681,9 @@ def test_the_api_server_and_the_conductors_workers_build_one_plan(
     at = {f"cuda:{i}": address for i, address in enumerate(list(GPUS)[:4])}
     plan = deployment_plan
 
-    def placed(setting, addresses):
-        return plan(setting, addresses, mask=HOST, usable=len(HOST), pci_root=root, siblings=smt)
+    def placed(setting, addresses, reachable=()):
+        return plan(setting, addresses, mask=HOST, usable=len(HOST), pci_root=root, siblings=smt,
+                    cluster=one_cpu_cluster, cpu_root=_idle(root.parent / "deep", [0], XEON), reachable=reachable)
 
     monkeypatch.setattr(cpus, "device_addresses", lambda ds: [at[d] for d in ds])
     monkeypatch.setattr(cpus, "deployment_plan", placed)
@@ -499,8 +824,9 @@ def api_plan(tmp_path, monkeypatch):
     root = _sysfs(tmp_path)
     plan = deployment_plan
 
-    def placed(setting, addresses):
-        return plan(setting, addresses, mask=parse_cpu_list("32-47,160-175"), usable=32, pci_root=root, siblings=smt)
+    def placed(setting, addresses, reachable=()):
+        return plan(setting, addresses, mask=parse_cpu_list("32-47,160-175"), usable=32, pci_root=root, siblings=smt,
+                    cluster=one_cpu_cluster, cpu_root=_idle(root.parent / "deep", [32], XEON), reachable=reachable)
 
     monkeypatch.setattr(cpus, "device_addresses", lambda devices: [A] * len(devices))
     monkeypatch.setattr(cpus, "deployment_plan", placed)
@@ -535,6 +861,33 @@ def test_the_first_server_pins_and_the_second_pins_nothing_with_a_warning(other_
     assert worker._step_cpus.cpus == {35, 163}
 
 
+def test_always_takes_the_lock_too(other_server, api_plan):
+    other, claimed = other_server(A)
+    assert claimed == "None"
+    os.environ["MSTAR_STEP_THREAD_CORE"] = "always"
+    assert api_plan().pinned == frozenset()
+    assert os.environ["MSTAR_STEP_THREAD_CORE"] == "off", "its workers read the knob"
+    other.communicate("")
+
+
+def test_a_host_without_deep_idle_says_so_in_one_line(monkeypatch, caplog, tmp_path):
+    """No warning: nothing is wrong with the deployment, and the workers stay quiet."""
+    from api_server_helpers import make_test_api_server
+
+    mask = parse_cpu_list("32-39")
+    shallow = CpuPlan(mask, 8, why="not pinned: sysfs lists no idle state", shallow=True)
+    monkeypatch.setattr(cpus, "_plan", shallow)
+    monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "auto")
+    with caplog.at_level(logging.INFO):
+        make_test_api_server()._take_result_cpu()
+        worker = _bare_worker("worker_0", "cuda:0")
+        monkeypatch.setattr(cpus, "devices_plan", lambda setting, devices: shallow)
+        worker._plan_step_cpus(["worker_0"], ["cuda:0"])
+    lines = [r for r in caplog.records if "not pinned" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO
+    assert "sysfs lists no idle state" in lines[0].getMessage()
+
+
 def test_only_an_auto_plan_that_pins_takes_the_lock(api_plan, monkeypatch, gpu_locks):
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "off")
     assert api_plan().pinned == frozenset()
@@ -543,7 +896,8 @@ def test_only_an_auto_plan_that_pins_takes_the_lock(api_plan, monkeypatch, gpu_l
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "auto")
     monkeypatch.setattr(cpus, "device_addresses", lambda devices: ["0000:ff:00.0"] * len(devices))
     real = cpus.deployment_plan
-    monkeypatch.setattr(cpus, "deployment_plan", lambda s, a: CpuPlan(frozenset({32}), 1, why="not pinned: too small"))
+    refused = CpuPlan(frozenset({32}), 1, why="not pinned: too small")
+    monkeypatch.setattr(cpus, "deployment_plan", lambda s, a, reachable=(): refused)
     assert api_plan().pinned == frozenset()
     monkeypatch.setattr(cpus, "deployment_plan", real)
     assert cpus._gpu_locks == {} and not list(gpu_locks.glob("mstar-gpu-*"))
@@ -564,8 +918,9 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     root = _sysfs(tmp_path)
     addresses = {"cuda:0": "0000:1a:00.0", "cuda:1": "0000:40:00.0", "cuda:2": "0000:62:00.0"}
 
-    def plan(setting, addrs):
-        return deployment_plan(setting, addrs, mask=HOST, usable=54, pci_root=root, siblings=smt)
+    def plan(setting, addrs, **kw):
+        return deployment_plan(setting, addrs, mask=HOST, usable=54, pci_root=root, siblings=smt,
+                               cluster=one_cpu_cluster, cpu_root=_idle(root.parent / "deep", [0], XEON), **kw)
 
     monkeypatch.setattr(worker_mod.cpus, "device_addresses", lambda devices: [addresses.get(d) for d in devices])
     monkeypatch.setattr(worker_mod.cpus, "deployment_plan", plan)

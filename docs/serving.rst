@@ -381,9 +381,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold`` and
        ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       ``auto``, the default, ``off``, ``always`` or a CPU number, and ``idle_hold``
+       ``off``, the default, or ``qos``; see :ref:`host-idle`). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
@@ -720,6 +721,77 @@ concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a 
 path and copy a warm cache in at job start.
 
 .. _tensor-transport:
+
+.. _host-idle:
+
+Host idle states
+----------------
+
+A decode step hands work between a worker's main, GPU and plan threads several
+times, and every step's tokens go from the API server's message thread to the
+frontend. On a host whose idle cores drop into deep C-states each handoff to a
+sleeping core waits for it to wake, and a core that sleeps between handoffs stays
+at a low clock under the ``powersave`` governor, so a small model's step is mostly
+host time spent waking CPUs. Two knobs deal with it:
+
+- ``step_thread_core`` keeps those threads on one core's two hardware threads, or
+  two cores of an L2 cluster where there is no SMT. ``auto`` pins only where sysfs
+  shows an enabled idle state of 100 µs or more on the server's CPUs, and logs one
+  line when it doesn't, so a VM without deep idle states keeps its threads free.
+  ``always`` pins on any host, ``off`` never does, a number names the CPU.
+- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
+  through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
+  containers hide, and it logs what it got.
+
+Measured with ``benchmark.runner`` and the speech and ASR benches at ``-O2``, a server
+``taskset`` to 8 cores (with their siblings where the CPU has SMT), median of the server sessions:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Host
+     - Cell
+     - no pin
+     - ``auto``
+     - every core held out of idle
+   * - 2x B300, Xeon 6740E (no SMT, C6S 270 µs, wake 110 µs across L2 clusters, 26 µs within)
+     - Qwen3.5-0.8B c=1 / 8 / 16 / 64, tok/s
+     - 371 / 2688 / 5026 / 13738
+     - 527 / 3635 / 6565 / 16869
+     - 636 / 4251 / 7830 / 20242
+   * -
+     - Qwen3-TTS 1.7B c=1 TTFA p50 / p95, ms; c=8 audio-s/s
+     - 23.6 / 38.2; 51.6
+     - 24.9 / 28.1; 55.1
+     - 18.4 / 21.3; 56.2
+   * -
+     - Whisper large-v3-turbo c=1 / 8, RTFx
+     - 103 / 471
+     - 133 / 495
+     - 162 / 523
+   * - 2x B300, Xeon 6767P (SMT, C6 170 µs, wake 160 µs)
+     - Qwen3.5-0.8B c=1 / 8, tok/s
+     - 444 / 3178
+     - 670 / 4800 (16-core mask)
+     - +50% / +35%
+   * - H100 VM without deep idle states (a handoff 22 µs)
+     - Qwen3.5-0.8B c=1 / 16, tok/s
+     - 529 / 6520
+     - not pinned; ``always`` 419 / 5526
+     - not measured
+
+The last column is a ``SCHED_IDLE`` spinner on each server core, a stand-in for
+``idle_hold: qos`` where the device is hidden: the hold itself has not been measured. With the
+spinner on, pinning gives nothing back (0.8B c=1 636 tok/s without a pin, 513 with), so a
+deployment that can hold idle probably wants ``step_thread_core: off``.
+
+``auto`` has costs. It raises 0.8B's time to first token at high concurrency (c=64 67 → 86 ms on
+the 6740E) while raising its throughput, and FLUX.2 klein at c=1 loses about 12% on that host
+(c=8 is level; Wan2.2 is level at c=1 and c=4). A low-duty model with eager host work can set
+``step_thread_core: off`` in its config.
+
+Details, including what mask ``auto`` needs, are in
+:doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
 
 Tensor transport
 ----------------
