@@ -225,8 +225,8 @@ def sampled(video: torch.Tensor, fps: float, video_processor) -> tuple[torch.Ten
 
 
 def an_image() -> torch.Tensor:
-    # what the data worker sends: (C, H, W) float32 in [0, 1]
-    return torch.rand(3, 40, 56, generator=torch.Generator().manual_seed(1))
+    # what the data worker sends (`load_image`): uint8 (C, H, W)
+    return torch.randint(0, 256, (3, 40, 56), dtype=torch.uint8, generator=torch.Generator().manual_seed(1))
 
 
 LAYOUTS = {
@@ -273,14 +273,17 @@ def run_both(model, processor, layout: str):
     return parts, out, ref
 
 
-def rebuild_ids(model, parts, tensors, groups) -> torch.Tensor:
+def rebuild_ids(model, parts, out, groups) -> torch.Tensor:
     """The full prompt from mstar's pieces: text spans, and each span's
     sentinels around one pad per merged token, as transformers writes it."""
+    from mstar.model.qwen3_5.qwen3_5_model import IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY
+
     specs = model._placeholder_specs()
     merge = model.vision_config.spatial_merge_size ** 2
     owners = group_owners(groups)
-    texts = iter(tensors["text_inputs"])
-    image_grids = iter(tensors.get("image_grid_thw", []))
+    texts = iter(out.new_input_tensors["text_inputs"])
+    image_grids = iter(out.metadata[IMAGE_GRIDS_KEY])
+    video_grids = out.metadata[VIDEO_GRIDS_KEY]
     out = []
     for step in prefill_plan(expand_video_parts(parts, groups)):
         if step.modality == TEXT:
@@ -288,10 +291,11 @@ def rebuild_ids(model, parts, tensors, groups) -> torch.Tensor:
             continue
         start, pad, end = specs[step.modality]
         if step.modality == VIDEO:
-            _, h, w = tensors["video_grid_thw"][owners[step.index]].tolist()
+            _, h, w = video_grids[owners[step.index]]
             n = h * w // merge
         else:
-            n = int(next(image_grids).prod()) // merge
+            t, h, w = next(image_grids)
+            n = t * h * w // merge
         out.append(torch.tensor([start] + [pad] * n + [end]))
     return torch.cat(out)
 
@@ -341,13 +345,26 @@ def test_video_plan_puts_text_around_every_group():
 # ---------------------------------------------------------------------------
 
 
+def normalized(model, patches: torch.Tensor) -> torch.Tensor:
+    """`process_prompt` ships byte patches; the vision encoder normalizes them
+    on the device into the processor's pixels."""
+    from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
+
+    encoder = VisionEncoderSubmodule.__new__(VisionEncoderSubmodule)
+    encoder._pixel_normalizer = model.pixel_normalizer()
+    assert patches.dtype == torch.uint8
+    return VisionEncoderSubmodule._normalize(encoder, patches)
+
+
 @needs_new_layout
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_prompt_ids_match_processor(model, processor, layout):
+    from mstar.model.qwen3_5.qwen3_5_model import VIDEO_GRIDS_KEY
+
     parts, out, ref = run_both(model, processor, layout)
-    tensors, groups = out.new_input_tensors, out.metadata["video_groups"]
-    assert groups == [int(g[0]) for g in tensors.get("video_grid_thw", [])]
-    assert torch.equal(rebuild_ids(model, parts, tensors, groups), ref["input_ids"][0])
+    groups = out.metadata["video_groups"]
+    assert groups == [g[0] for g in out.metadata[VIDEO_GRIDS_KEY]]
+    assert torch.equal(rebuild_ids(model, parts, out, groups), ref["input_ids"][0])
 
 
 def test_an_attachment_prompt_keys_nothing_for_the_prefix_cache(model, processor):
@@ -361,13 +378,15 @@ def test_an_attachment_prompt_keys_nothing_for_the_prefix_cache(model, processor
 
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_patches_and_grids_match_processor(model, processor, layout):
+    from mstar.model.qwen3_5.qwen3_5_model import IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY
+
     _, out, ref = run_both(model, processor, layout)
     tensors = out.new_input_tensors
-    assert torch.equal(torch.stack(tensors["video_grid_thw"]), ref["video_grid_thw"])
-    assert torch.equal(torch.cat(tensors["pixel_values_videos"]), ref["pixel_values_videos"])
-    if "image_grid_thw" in tensors:
-        assert torch.equal(torch.stack(tensors["image_grid_thw"]), ref["image_grid_thw"])
-        assert torch.equal(torch.cat(tensors["pixel_values"]), ref["pixel_values"])
+    assert torch.equal(torch.tensor(out.metadata[VIDEO_GRIDS_KEY]), ref["video_grid_thw"])
+    assert torch.equal(normalized(model, torch.cat(tensors["pixel_values_videos"])), ref["pixel_values_videos"])
+    if out.metadata[IMAGE_GRIDS_KEY]:
+        assert torch.equal(torch.tensor(out.metadata[IMAGE_GRIDS_KEY]), ref["image_grid_thw"])
+        assert torch.equal(normalized(model, torch.cat(tensors["pixel_values"])), ref["pixel_values"])
     # the raw frames are not kept past preprocessing
     assert tensors["video_inputs"] == []
 
@@ -387,18 +406,26 @@ class _Embed(nn.Module):
 IMAGE_MARK, VIDEO_MARK = -1.0, -2.0
 
 
+def _host_grids(out) -> dict:
+    """The host grids `process_prompt` hands the conductor, as the schedule gets them."""
+    from mstar.model.qwen3_5.qwen3_5_model import IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY
+
+    return {key: out.metadata.get(key) for key in (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)}
+
+
 @needs_new_layout
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout):
     """The schedule and the LLM's `prefill_vision` row, against transformers:
     the row's token order and its 3D positions, plus where decode resumes."""
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
+    from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     _, out, ref = run_both(model, processor, layout)
     tensors = out.new_input_tensors
     modalities, _ = LAYOUTS[layout]
-    (step,) = model._prefill_schedule(modalities, tensors, out.metadata["video_groups"])
+    (step,) = model._prefill_schedule(modalities, tensors, out.metadata["video_groups"], _host_grids(out))
     assert step.walk == "prefill_vision"
 
     # the encoder gets each image and video once, in prompt order
@@ -417,17 +444,16 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
 
     merge = model.vision_config.spatial_merge_size ** 2
     marks = [
-        torch.full((int(g.prod()) // merge, 1), VIDEO_MARK if by_id[id(p)] < 0 else IMAGE_MARK)
-        for g, p in zip(
-            step.input_tensors["image_grid_thw"], step.input_tensors["pixel_values"], strict=True,
-        )
+        torch.full((t * h * w // merge, 1), VIDEO_MARK if by_id[id(p)] < 0 else IMAGE_MARK)
+        for (t, h, w), p in zip(step.image_grids, step.input_tensors["pixel_values"], strict=True)
     ]
     llm = LLMSubmodule(_Embed(len(model.tokenizer)), model.config, model.vision_config)
     llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
-    fwd_info = SimpleNamespace(request_id="r", step_metadata={"prefill_order": step.order})
+    fwd_info = SimpleNamespace(
+        request_id="r", step_metadata={"prefill_order": step.order, STEP_GRIDS_KEY: step.image_grids},
+    )
     row = llm._vision_inputs(fwd_info, {
         "text_inputs": step.input_tensors["text_inputs"],
-        "image_grid_thw": step.input_tensors["image_grid_thw"],
         "vision_embeds": [torch.cat(marks)],
     })
 
@@ -466,15 +492,17 @@ def test_mp4_matches_processor(model, processor, tmp_path):
             container.mux(stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")))
         container.mux(stream.encode())
 
+    from mstar.model.qwen3_5.qwen3_5_model import VIDEO_GRIDS_KEY
+
     loaded = model.load_video(str(path), "cpu")
     out = model.process_prompt(
         "What happens?", ["video", "text"], ["text"],
         tensors={"video_inputs": [loaded.data]},
         input_metadata={"video_inputs": [loaded.metadata]},
-    ).new_input_tensors
+    )
     ref = processor.video_processor(videos=[str(path)], return_tensors="pt")
-    assert torch.equal(out["video_grid_thw"][0], ref["video_grid_thw"][0])
-    assert torch.equal(out["pixel_values_videos"][0], ref["pixel_values_videos"])
+    assert torch.equal(torch.tensor(out.metadata[VIDEO_GRIDS_KEY][0]), ref["video_grid_thw"][0])
+    assert torch.equal(normalized(model, out.new_input_tensors["pixel_values_videos"][0]), ref["pixel_values_videos"])
 
 
 # ---------------------------------------------------------------------------
@@ -485,10 +513,11 @@ def test_mp4_matches_processor(model, processor, tmp_path):
 def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
     """Many tiny frame groups fit the top patch bucket but overflow a replay's
     segment ceiling; the encoder runs them eagerly, so intake takes them."""
+    from mstar.model.qwen3_5.qwen3_5_model import VIDEO_GRIDS_KEY
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     (spec,) = model._vision_resources()
-    limit = spec.config.max_segments_per_request
+    limit = spec.config.max_segments_per_step
     n = 2 * (limit + 1)
     video = torch.randint(0, 256, (n, 3, 32, 32), dtype=torch.uint8)
     frames, metadata = sampled(video, 2.0, model.video_processor)
@@ -497,9 +526,9 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
         tensors={"video_inputs": [frames]},
         input_metadata={"video_inputs": [metadata]},
     )
-    (grid,) = out.new_input_tensors["video_grid_thw"]
-    assert int(grid[0]) > limit
-    assert int(grid.prod()) <= VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
+    (grid,) = out.metadata[VIDEO_GRIDS_KEY]
+    assert grid[0] > limit
+    assert grid[0] * grid[1] * grid[2] <= VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
 
 
 def _encoder(max_segments: int):
@@ -512,9 +541,28 @@ def _encoder(max_segments: int):
         patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
         num_position_embeddings=16, out_hidden_size=64,
     )
-    encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config)
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_request=max_segments)}
+    encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, (torch.zeros(1), torch.ones(1)))
+    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
     return encoder
+
+
+def test_the_vision_compile_regions_take_their_start_up_examples():
+    """The engine compiles and warms `compile_regions` with these calls at
+    start-up, on an accelerator only. Run eagerly here: a call a region
+    refuses would first fail a GPU worker's boot, and a merger row unlike the
+    block loop's output would compile again on the first image."""
+    from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
+    from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
+
+    config = _encoder(max_segments=4).config
+    encoder = VisionEncoderSubmodule(Qwen3_5VisionModel(config), config, (torch.zeros(1), torch.ones(1)))
+    regions = encoder.compile_regions()
+    assert set(regions) == {"model.embed", "model.encode", "model.merger"}
+    with torch.no_grad():
+        hidden, _, _ = encoder.model.embed(*regions["model.embed"][0])
+        (rows,) = regions["model.merger"][0]
+        assert rows.shape == hidden.shape and rows.dtype == hidden.dtype
+        encoder.model.merger(rows)
 
 
 def test_vision_block_loop_leases_only_what_a_replay_holds():
@@ -534,6 +582,10 @@ def test_vision_block_loop_leases_only_what_a_replay_holds():
     assert config.lease_before_step
     assert config.can_lease([request(4)])
     assert not config.can_lease([request(5)])
+    # a batched step replays as one row, so its requests share the ceiling
+    assert config.one_row_per_step
+    assert config.can_lease([request(2), request(2)])
+    assert not config.can_lease([request(2), request(3)])
 
 
 def test_vision_block_loop_replays_exactly_when_leased():
@@ -563,6 +615,56 @@ def test_vision_block_loop_replays_exactly_when_leased():
     assert not hasattr(runner, "ran")
     assert replay({VISION_BLOCK_LOOP: object()}) == "replayed"
     assert runner.ran["seq_lens"] == [4, 4]
+
+
+def test_vision_batch_that_overflows_one_replay_runs_request_by_request():
+    """Requests that fit a replay alone but not together are not packed into
+    one eager step: ``can_batch`` refuses, and each replays on its own."""
+    from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    encoder = _encoder(max_segments=4)
+    top = VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
+
+    def request(patches: int, segments: int = 1) -> NodeInputs:
+        return NodeInputs(input_seq_len=patches, tensor_inputs={"seq_lengths": (patches // segments,) * segments})
+
+    assert encoder.can_batch(None, [request(top // 2), request(top // 2)])
+    assert not encoder.can_batch(None, [request(top // 2), request(top // 2 + 256)])
+    assert not encoder.can_batch(None, [request(64, 2), request(64, 3)])
+
+
+def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
+    """The scheduler groups vision requests by `cg_key_info`: requests that fit
+    a replay alone share steps, and one past the top patch bucket or the
+    segment ceiling is a group of its own, so a long video's embeddings are
+    not held back for its batch's others. The engine splits a node whose only
+    capture is a piecewise region."""
+    from mstar.engine.engine import Engine
+    from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY
+
+    encoder = _encoder(max_segments=4)
+
+    def info(*grid):
+        return SimpleNamespace(step_metadata={STEP_GRIDS_KEY: list(grid)})
+
+    image, video, frames = info((1, 16, 16)), info((2, 128, 128)), info((5, 16, 16))
+    assert encoder.cg_key_info("prefill_vision", {1: image}) is None
+    assert encoder.cg_key_info("prefill_vision", {2: video}) == (2,)
+    assert encoder.cg_key_info("prefill_vision", {3: frames}) == (3,)
+
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"vision_encoder": SimpleNamespace(
+        submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
+    )}
+    assert engine.splits_by_capture_key("vision_encoder", "prefill_vision")
+    assert engine.capture_group("vision_encoder", "prefill_vision", 2, video) == (2,)
+    assert engine.capture_group("vision_encoder", "prefill_vision", 1, image) is None
+
+
+def test_vision_encoder_refuses_patches_it_would_not_normalize():
+    with pytest.raises(ValueError, match="uint8"):
+        _encoder(max_segments=4)._normalize(torch.zeros(2, 3))
 
 
 def test_a_bad_layout_is_refused_before_the_video_is_preprocessed(model, monkeypatch):
@@ -656,6 +758,22 @@ def test_a_video_with_no_frame_size_is_refused(model, tmp_path, monkeypatch):
     assert decoded == []
 
 
+def test_the_vision_node_boots_on_an_image_processor_the_video_one_disagrees_with(tmp_path):
+    """Only a video needs the video processor: a checkpoint whose image
+    processor normalizes otherwise than its video processor (one with no video
+    config gets the class defaults) still builds the vision node's normalizer,
+    and refuses a video."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    root = write_synthetic_checkpoint(tmp_path)
+    (root / "preprocessor_config.json").write_text(json.dumps({**PREPROCESSOR_CONFIG, "image_mean": [0.4] * 3}))
+    model = Qwen3_5DenseModel(str(root))
+    mean, _ = model.pixel_normalizer()
+    assert torch.allclose(mean, torch.full_like(mean, 0.4 * 255))
+    with pytest.raises(ValueError, match="image_mean"):
+        _ = model.video_processor
+
+
 def test_still_refuses_audio(model):
     with pytest.raises(ValueError, match="no audio path"):
         model.process_prompt(
@@ -677,7 +795,7 @@ def test_schedule_and_prompt_share_the_plan(model, processor):
     groups = out.metadata["video_groups"]
     plan = prefill_plan(expand_video_parts(parts, groups))
     tensors = out.new_input_tensors
-    (step,) = model._prefill_schedule(["video", "image", "video", "text"], tensors, groups)
+    (step,) = model._prefill_schedule(["video", "image", "video", "text"], tensors, groups, _host_grids(out))
     kinds = {TEXT: 0, "image": 1, VIDEO: 2}
     assert step.order == tuple(kinds[p.modality] for p in plan)
     assert len(step.input_tensors["text_inputs"]) == len(tensors["text_inputs"])

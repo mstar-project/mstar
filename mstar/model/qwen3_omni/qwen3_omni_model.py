@@ -72,6 +72,7 @@ from mstar.model.base import (
     TensorAndMetadata,
 )
 from mstar.model.components import MoeParallelConfig
+from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -85,7 +86,6 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.config import (
     AUDIO_ATTN,
     CODE_PRED_SAMPLER,
@@ -392,11 +392,6 @@ class Qwen3OmniModel(Model):
     def checkpoint_path(self) -> str:
         return self.local_dir
 
-    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
-
-        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
-
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
@@ -471,10 +466,9 @@ class Qwen3OmniModel(Model):
         prefill_audio = Sequential([
             GraphNode(
                 name="audio_encoder",
-                # audio_seqlens carries the original (pre-padding) length of
-                # each audio clip, used by the encoder to compute attention
-                # masks and output position IDs.
-                input_names=["audio_features", "audio_seqlens"],
+                # a clip's unpadded log-mel features: its frame count is the
+                # tensor's last dim
+                input_names=["audio_features"],
                 outputs=[GraphEdge(next_node="Thinker", name="audio_embeds")],
             ),
             GraphNode(
@@ -836,10 +830,7 @@ class Qwen3OmniModel(Model):
     # tensor first, then that encoder's auxiliary tensors. Video rides the
     # vision encoder, so its tensors arrive under the vision input names.
     _MM_WALKS: dict[str, tuple[str, dict[str, str]]] = {
-        "audio": ("prefill_audio", {
-            "audio_features": "audio_features",
-            "audio_seqlens": "audio_seqlens",
-        }),
+        "audio": ("prefill_audio", {"audio_features": "audio_features"}),
         "image": ("prefill_vision", {
             "pixel_values": "pixel_values",
             "image_grid_thw": "image_grid_thw",
@@ -897,7 +888,7 @@ class Qwen3OmniModel(Model):
 
         Each schedule entry maps an ``(walk_name, {input_name: tensor_info})``.
         We emit one GraphEdge per input so that auxiliary tensors like
-        ``audio_seqlens`` and ``image_grid_thw`` reach the encoder node
+        ``image_grid_thw`` reach the encoder node
         alongside the primary feature tensor.
         """
         schedule = metadata.kwargs["prefill_schedule"]
@@ -1002,7 +993,7 @@ class Qwen3OmniModel(Model):
             # Still in prefill -- delegate to _get_thinker_prefill_inputs
             # which handles the (walk_name, {input_name: tensor_info}) schedule
             # entry format and emits one GraphEdge per input (so auxiliary
-            # tensors like image_grid_thw / audio_seqlens reach the encoder
+            # tensors like image_grid_thw reach the encoder
             # alongside the primary feature tensor).
             schedule = metadata.kwargs["prefill_schedule"]
             step = metadata.kwargs["prefill_step"]
@@ -1198,7 +1189,7 @@ class Qwen3OmniModel(Model):
            assistant response.
         3. Run the image_processor / feature_extractor on the raw modality
            tensors to produce ``pixel_values`` / ``image_grid_thw`` /
-           ``audio_features`` / ``audio_seqlens``.
+           ``audio_features``.
         4. Expand the single ``<|image_pad|>`` / ``<|audio_pad|>`` /
            ``<|video_pad|>`` placeholder in the tokenized text to N copies
            where N = number of patches after spatial merge (this is what
@@ -1293,7 +1284,6 @@ class Qwen3OmniModel(Model):
 
         result["pixel_values"] = []
         result["image_grid_thw"] = []
-        result["audio_seqlens"] = []
         result["audio_features"] = []
         result["video_second_per_grid"] = []
         result["video_grid_thw"] = []
@@ -1321,9 +1311,6 @@ class Qwen3OmniModel(Model):
                 aud_out["input_features"]
                 .permute(0, 2, 1)[aud_out["attention_mask"].bool()]
                 .permute(1, 0)
-            )
-            result["audio_seqlens"].append(
-                aud_out["attention_mask"].sum(-1).to(torch.long)
             )
             result["audio_features"].append(
                 aud_out["input_features"]
@@ -1369,7 +1356,8 @@ class Qwen3OmniModel(Model):
                 kept = int(talker_text_mask(ids, self.config).sum())
             elif step.modality == "audio":
                 # the encoder's rows between two sentinels
-                rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
+                frames = tensors["audio_features"][step.index].shape[-1]
+                rows = self.config.audio_encoder.tokens_for_frames(frames) + 2
                 span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
                 kept = rows
             elif step.modality == "image":
@@ -1699,8 +1687,15 @@ class Qwen3OmniModel(Model):
         )
         talker_model.eval()
 
+        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
         with torch.device("meta"):
-            code_predictor = Qwen3OmniCodePredictor(self.config)
+            # its inputs and codec embeddings are in the Talker's width, which
+            # Qwen3-Omni's code predictor shares (it has no input projection)
+            # the frame's embedding sum accumulates in fp32, rounded once
+            code_predictor = ResidualCodePredictor(
+                self.config.code_predictor, self.config.code_predictor.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
+                embed_sum_dtype=torch.float32,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:
@@ -1714,7 +1709,6 @@ class Qwen3OmniModel(Model):
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
 
-        from mstar.model.qwen3_omni.submodules import TalkerSubmodule
         talker_sub = TalkerSubmodule(
             talker_model=talker_model,
             code_predictor=code_predictor,

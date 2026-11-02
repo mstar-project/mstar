@@ -46,10 +46,10 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     ModelInputsFromEngine,
     NodeInputs,
     TokenStop,
-    device_loopback_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,9 +126,6 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
     # Prefill and decode are graph replays. The compiled path only served the
     # uncaptured shapes and recompiled per request id (see the encoder).
     disable_torch_compile = True
-    # The decode walk reads its last token off the sampler's slot masters and
-    # its client token rides inline (see ``device_loopback_signals``).
-    reads_device_loopback = True
 
     def __init__(self, llm: Qwen3DenseLM, config: Qwen3ASRModelConfig):
         super().__init__()
@@ -137,6 +134,11 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=config.stop_token_ids,
             sampler=self.SAMPLER, walk=DECODE_WALK, prefill_walks=frozenset({PREFILL_WALK}),
+        )
+        # decode reads its last token off the sampler's slot masters, and its
+        # client token rides inline
+        self.device_loopback = DeviceLoopback(
+            walk=DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
         )
 
     def get_accelerator_graph_configs(
@@ -180,10 +182,10 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
-        if graph_walk == DECODE_WALK and kwargs.get("has_loopback") and self._device_loopback():
+        if (row := self.uniform_row_inputs(graph_walk, kwargs.get("has_loopback", False))) is not None:
             # one token per row, read off the sampler's slot master in
             # `preprocess`; the routed signal is empty here
-            return ARNodeInputs(input_seq_len=1)
+            return row
         device = self.get_device()
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
         if graph_walk == DECODE_WALK:
@@ -218,25 +220,6 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
             },
         )
 
-    def uniform_row_inputs(self, graph_walk: str, has_loopback: bool = False) -> ARNodeInputs | None:
-        # the loop-back decode row above, built once for the step's rows
-        if graph_walk == DECODE_WALK and has_loopback and self._device_loopback():
-            return ARNodeInputs(input_seq_len=1)
-        return None
-
-    def _device_loopback(self) -> bool:
-        return device_loopback_enabled() and self.node_resources[SAMPLER].has_slot_masters
-
-    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        if graph_walk == DECODE_WALK and self._device_loopback():
-            return frozenset({"text_inputs"})
-        return frozenset()
-
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        # the decode loop's client edge carries the token the stop check
-        # already has on the host; prefill's new_token edge is persisted
-        return {"text_inputs": "new_token"} if graph_walk == DECODE_WALK else {}
-
     def preprocess(
         self,
         graph_walk: str,
@@ -246,14 +229,8 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         if graph_walk == DECODE_WALK:
             if any(inp.input_ids is None for inp in inputs):
                 # device loop-back: every row is its request's last sampled
-                # token, read by slot (padding rows read slot 0)
-                sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-                ids = sampler.loopback_tokens(engine_inputs.request_ids)
-                # rows whose last step ran elsewhere brought their token
-                routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
-                if routed:
-                    sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
-                return {"input_ids": ids}
+                # token, read by slot
+                return self.loopback_inputs(engine_inputs, inputs)
             return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}
 

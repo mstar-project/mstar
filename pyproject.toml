@@ -83,6 +83,8 @@ command_a_plus = [
 dev = [
     "ruff<=0.16",
     "pytest>=9.0.3",
+    "pydub",  # the OmniVoice silence trim's test oracle
+    "audioop-lts; python_version >= '3.13'",  # pydub imports audioop, gone in 3.13
 ]
 
 # Optional: non-WAV audio containers (mp3/flac/...) for the OpenAI audio API

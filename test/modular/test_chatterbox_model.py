@@ -49,7 +49,7 @@ from mstar.model.chatterbox.submodules import (
     VoiceCache,
 )
 from mstar.model.registry import HF_MODELS, get_model_class, model_init_kwargs
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -734,8 +734,8 @@ class _TinyT3(torch.nn.Module):
         parts = [cond_emb, text, bos] + ([bos] if self.config.duplicate_bos_in_prefill else [])
         return torch.cat(parts)
 
-    def embed_speech(self, ids, positions):
-        return self.speech_emb(ids) + self.speech_pos_emb(positions)
+    def embed_speech(self, ids, position):
+        return self.speech_emb(ids) + self.speech_pos_emb.weight[position]
 
 
 def _t3_submodule(variant="chatterbox"):
@@ -908,10 +908,11 @@ def test_sampler_min_p_goes_through_the_resource():
     assert _sampler_spec(turbo).enable_min_p is False
 
 
-def test_t3_stop_on_eos_and_token_budget():
+def test_t3_stop_on_eos():
     sub = _t3_submodule()
     info = _fwd_info("a", max_new=3)
     sub.prepare_inputs("prefill", info, {TEXT_INPUTS: [torch.tensor([255, 0])]})
+    info.graph_walk = "decode"
     out = {SPEECH_TOKENS: [torch.tensor([12])]}
     sub.postprocess("a", info, out)
     assert torch.equal(out[PREV_TOKEN][0], out[SPEECH_TOKENS][0])
@@ -922,8 +923,13 @@ def test_t3_stop_on_eos_and_token_budget():
     info.resource_configs[T3_SAMPLER].ignore_eos = True
     assert sub.check_stop("a", info, eos) == set()
     sub.postprocess("a", info, out)
-    assert sub.check_stop("a", info, out) == {"decode_loop"}  # 3 generated >= max_new 3
+    # 3 generated of max_new 3: the budget is the loop cap's to end
+    assert sub.check_stop("a", info, out) == set()
     sub.cleanup_request("a")
+    # a stop token at prefill ends the partition: there is no decode loop yet
+    prefill = SimpleNamespace(**{**vars(_fwd_info("b")), "graph_walk": "prefill"})
+    assert sub.check_stop("b", prefill, eos) == {END_PARTITION}
+    sub.cleanup_request("b")
     assert not sub.request_states
 
 

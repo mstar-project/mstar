@@ -30,6 +30,7 @@ from torch import nn
 
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components import RMSNorm
+from mstar.model.components.masking import length_mask
 from mstar.model.components.mlp import GatedMLP
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
 from mstar.model.nemotron_duplex.config import TALKER_ATTN, TALKER_KV, TALKER_POS, EarTTSConfig
@@ -407,7 +408,7 @@ class EmbedSubword(nn.Module):
         mean-pool over valid chars, and project. ``char_ids`` [N, Lc],
         ``char_lengths`` [N] -> ``[N, H]``."""
         n, lc = char_ids.shape
-        char_mask = torch.arange(lc, device=char_ids.device)[None, :] < char_lengths[:, None]  # [N, Lc]
+        char_mask = length_mask(char_lengths, lc)  # [N, Lc]
         char_embeds = self.embed_tokens(char_ids)  # [N, Lc, H]
 
         cos, sin = _rope_cos_sin(

@@ -56,6 +56,7 @@ from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
+from mstar.engine.fp32_precision import cudnn_benchmark
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
@@ -3106,7 +3107,7 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         if not self.config.vae_decode_cudnn_benchmark:
             return super()._decode_pixels(latents)
-        with _wan_vae().cudnn_benchmark(True):
+        with cudnn_benchmark(True):
             return super()._decode_pixels(latents)
 
     def _decode_stream(self, latents: torch.Tensor, feat_cache: list, clip_start: bool) -> torch.Tensor:
@@ -3120,7 +3121,7 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         per_call = 1 if clip_start else int(self.config.windowed_decode_latents_per_call)
         with (
             torch.autocast(device_type="cuda", enabled=False),
-            wan_vae.cudnn_benchmark(self.config.vae_decode_cudnn_benchmark),
+            cudnn_benchmark(self.config.vae_decode_cudnn_benchmark),
         ):
             decoded = wan_vae.decode_causal(
                 self.vae, z, feat_cache, self._step, clip_start=clip_start, latents_per_call=per_call,

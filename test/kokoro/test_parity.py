@@ -94,7 +94,9 @@ def config() -> KokoroModelConfig:
 def ours(config) -> KokoroTTS:
     model = KokoroTTS(config)
     load_kokoro_weights(model, SNAPSHOT / config.weights_file)
-    return model.to(DEVICE).eval()
+    model = model.to(DEVICE).eval()
+    model.fuse_lstm_directions()
+    return model
 
 
 @pytest.fixture(scope="module")

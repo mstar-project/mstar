@@ -10,6 +10,11 @@ class ColumnParallelLinear(nn.Module):
 
     The linear layer is defined as Y = XA + b. A is parallelized along
     its second dimension as A = [A_1, ..., A_p].
+
+    ``output_start``: outputs below it are never computed and read ``-inf``,
+    for an LM head whose low vocab rows a model never samples. Each rank
+    computes its shard's part of the window, so the result does not depend on
+    the TP size.
     """
 
     def __init__(
@@ -20,7 +25,8 @@ class ColumnParallelLinear(nn.Module):
         bias: bool = False,
         gather_output: bool = False,
         skip_bias_add: bool = False,
-        dtype: torch.dtype | None = None
+        dtype: torch.dtype | None = None,
+        output_start: int = 0,
     ):
         super().__init__()
         # Divide the weight matrix along the last dimension.
@@ -29,6 +35,11 @@ class ColumnParallelLinear(nn.Module):
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
+        # the first of this rank's rows inside the window
+        self._local_output_start = min(
+            max(output_start - self.tp_rank * self.output_size_per_partition, 0),
+            self.output_size_per_partition,
+        )
 
         self.weight = nn.Parameter(
             torch.empty(self.output_size_per_partition, self.input_size_per_partition, dtype=dtype)
@@ -98,7 +109,16 @@ class ColumnParallelLinear(nn.Module):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = torch.nn.functional.linear(input_, self.weight, bias)
+        start = self._local_output_start
+        if start:
+            output_parallel = torch.nn.functional.pad(
+                torch.nn.functional.linear(
+                    input_, self.weight[start:], None if bias is None else bias[start:],
+                ),
+                (start, 0), value=float("-inf"),
+            )
+        else:
+            output_parallel = torch.nn.functional.linear(input_, self.weight, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.

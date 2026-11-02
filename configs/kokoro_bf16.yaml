@@ -1,0 +1,13 @@
+# configs/kokoro.yaml with the vocoder trunk in bfloat16 (model_kwargs decoder_dtype;
+# the harmonic source and the STFT head stay float32). On an H200 it served
+# +20% audio-s/s at concurrency 32 and +25% at 64 with the same Whisper WER over
+# 156 clips (1.24%) and the same waveform agreement with the float32 path as two
+# float32 runs have with each other; float32 stays the parity-tested default.
+model: "kokoro"
+max_seq_len: 512
+node_groups:
+  - node_names: [kokoro]
+    ranks: [0]
+    graph_walks: [synth]
+model_kwargs:
+  decoder_dtype: "bfloat16"

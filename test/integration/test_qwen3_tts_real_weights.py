@@ -14,8 +14,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.model.components.code_predictor_kernels import cp_attention
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-from mstar.utils.attention import apply_rope_pos_ids, decode_attn_nhd
+from mstar.utils.attention import apply_rope_pos_ids
 
 HF_REPO = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
@@ -149,7 +150,8 @@ def test_code_predictor_decode_attention_matches_sdpa(cache_len: int):
         is_causal=False,
         enable_gqa=True,
     ).transpose(1, 2)
-    actual = decode_attn_nhd(q, k_cache, v_cache, cache_len)
+    # the query is depth position cache_len - 1, attending over every position up to it
+    actual = cp_attention(q, k_cache, v_cache, cache_len - 1)
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
 

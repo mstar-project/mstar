@@ -20,12 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.chatterbox.config import S3GenConfig, S3GenEncoderConfig
-
-
-def lengths_to_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
-    """``[B, max_len]`` bool, True where ``t < lengths[b]``."""
-    positions = torch.arange(max_len, device=lengths.device)
-    return positions[None, :] < lengths[:, None].long()
+from mstar.model.components.masking import length_mask
 
 
 class RelPositionalEncoding(nn.Module):
@@ -199,7 +194,7 @@ class UpsampleConformerEncoder(nn.Module):
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """``[B, T, D]`` -> (``[B, stride*T, D]``, mask ``[B, 1, stride*T]`` bool)."""
-        masks = lengths_to_mask(xs_lens, xs.size(1)).unsqueeze(1)
+        masks = length_mask(xs_lens, xs.size(1)).unsqueeze(1)
         xs, pos_emb = self.embed(xs)
         # The look-ahead convolution reads three frames to the right. Zero the
         # padding first so a request batched with longer ones sees the same
@@ -211,7 +206,7 @@ class UpsampleConformerEncoder(nn.Module):
 
         xs = self.up_layer(xs.transpose(1, 2).contiguous()).transpose(1, 2).contiguous()
         xs_lens = xs_lens * self.up_layer.stride
-        masks = lengths_to_mask(xs_lens, xs.size(1)).unsqueeze(1)
+        masks = length_mask(xs_lens, xs.size(1)).unsqueeze(1)
         xs, pos_emb = self.up_embed(xs)
         for layer in self.up_encoders:
             xs = layer(xs, masks, pos_emb)
@@ -233,7 +228,7 @@ class FlowTokenEncoder(nn.Module):
         return self.spk_embed_affine_layer(F.normalize(embedding, dim=1))
 
     def forward(self, tokens: torch.Tensor, token_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mask = lengths_to_mask(token_lens, tokens.size(1)).unsqueeze(-1).to(self.input_embedding.weight.dtype)
+        mask = length_mask(token_lens, tokens.size(1)).unsqueeze(-1).to(self.input_embedding.weight.dtype)
         h = self.input_embedding(tokens.long()) * mask
         h, h_masks = self.encoder(h, token_lens)
         mu = self.encoder_proj(h).transpose(1, 2).contiguous()

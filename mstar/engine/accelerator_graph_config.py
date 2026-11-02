@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 import torch
 
-from mstar.engine.resources import SubmoduleStep
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 # A compile mode of the engine's own rather than torch.compile's: Inductor's
@@ -335,6 +335,11 @@ class PiecewiseAcceleratorGraphConfig(ABC):
                 "with capture_batch_sizes=[1]"
             )
 
+    def region_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep | None:
+        """This region's step over the padded batch (``declare_step``); None
+        for a region that declares none."""
+        return None if self.declare_step is None else self.declare_step(request_ids, seq_lens)
+
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:
         ...
@@ -392,6 +397,30 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
     replay.
     """
     total_tokens: list[int]  # token-count buckets to capture
+    # The attention resource of a region whose rows each attend within
+    # themselves. Set with `declare_step` left None, the region declares one
+    # non-causal "main" segment per row on it; a `one_row_per_step` region's
+    # lengths are all segments of its one row.
+    attn_key: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.attn_key is not None and self.declare_step is not None:
+            raise ValueError("attn_key declares the region's step; leave declare_step None")
+
+    def region_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep | None:
+        if self.attn_key is None:
+            return super().region_step(request_ids, seq_lens)
+        if self.one_row_per_step:
+            (rid,) = request_ids
+            request_ids = [rid] * len(seq_lens)
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=n)
+                for rid, n in zip(request_ids, seq_lens, strict=True)
+            ],
+            steps={self.attn_key: AttentionStep(causal=False)},
+        )
 
     def get_config_type(self) -> PiecewiseConfigType:
         return PiecewiseConfigType.PACKED

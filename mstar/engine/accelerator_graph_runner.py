@@ -1726,12 +1726,12 @@ class PiecewiseAcceleratorGraphRunner:
         """A region has no pre-plan path, so a second slot buys nothing unless a
         resource its step touches stages into a reused host buffer behind an
         async H2D (see ``Resource.force_double_buffer``)."""
-        if self._max_slots <= 1 or self._config.declare_step is None:
+        if self._max_slots <= 1:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
             # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
-            step = self._config.declare_step(
+            step = self._config.region_step(
                 self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
@@ -1768,9 +1768,9 @@ class PiecewiseAcceleratorGraphRunner:
         """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
-            if shapes and self._config.declare_step is not None:
+            if shapes:
                 shape = shapes[0]
-                step = self._config.declare_step(
+                step = self._config.region_step(
                     self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                     list(shape.seq_lens),
                 )
@@ -2089,9 +2089,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        if self._config.declare_step is None:
-            return None
-        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        step = self._config.region_step(list(request_ids), list(seq_lens))
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs

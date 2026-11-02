@@ -45,9 +45,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.snake import snake
+
 
 class Snake1d(nn.Module):
-    """``x + sin(alpha * x)^2 / alpha``, per channel."""
+    """``x + sin(alpha * x)^2 / alpha``, per channel: the shared Snake kernel
+    (``mstar.model.components.snake``), every intermediate in fp32."""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -55,9 +58,8 @@ class Snake1d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
-        x = x.reshape(shape[0], shape[1], -1)
-        x = x + (self.alpha + 1e-9).reciprocal() * torch.sin(self.alpha * x).pow(2)
-        return x.reshape(shape)
+        alpha = self.alpha.reshape(-1).float()
+        return snake(x.reshape(shape[0], shape[1], -1), alpha, (alpha + 1e-9).reciprocal()).reshape(shape)
 
 
 class VectorQuantize(nn.Module):
