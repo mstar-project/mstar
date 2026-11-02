@@ -228,8 +228,8 @@ class RingAttentionWrapper:
     Eager only: a striped shard plans a leased step copied. Partner plans differ by rank, so a
     backend with a plan check (``_plan_check``) would have to check every rank's before planning."""
 
-    # the step attends its own tokens from the pages, which it writes first (`sequence_shard.ring`)
-    reads_step_kv = True
+    # the step attends its own tokens from the pages, written first (`AttentionManager.reads_step_kv`)
+    reads_step_kv = False
 
     def __init__(
         self, placement: ContextParallel, page_size: int, dtype: torch.dtype, paged: list, device: torch.device,
@@ -247,22 +247,20 @@ class RingAttentionWrapper:
     @torch.compiler.disable
     def plan(self, kv_out, counts: tuple[int, ...], causal: bool = True) -> None:
         """``kv_out``: the step's logical ``KVPlanOutput`` for the label; ``counts``: each partner's
-        queries, as the sequence shard striped them (``SeqRange.counts``), which this checks
-        against the pool's plan; ``causal``: the step's."""
+        queries, as the sequence shard striped them from the same plan (``SeqRange.counts``);
+        ``causal``: the step's."""
         p, r = self._placement.size, self._placement.index
         indptrs = kv_out.cpu_indptrs
         qo = indptrs.qo_indptr.numpy().astype(np.int64)
         lens = np.diff(qo)
         stored = indptrs.kv_lens.numpy().astype(np.int64) - lens
-        assert tuple(np.bincount(stripe_owners(qo, stored, p), minlength=p).tolist()) == tuple(counts), (
-            f"the sequence shard striped {counts} queries over the partners, and KV's plan stripes otherwise"
-        )
         kvp = indptrs.paged_kv_indptr.numpy().astype(np.int64)
         indices = indptrs.paged_kv_indices.numpy()
         pinned = indptrs.paged_kv_indices.is_pinned()
         self._valid = []
         for j in range(p):
             queries, ends, rows = _ring_rows(stored, lens, p, r, j, causal)
+            assert queries.sum() == counts[j], f"partner {j} holds {counts[j]} queries and plans {queries.sum()}"
             pages = -(-ends // self._page_size)
             kv_indptr, ids = token_runs(kvp[rows], pages)
             logical = PagedIndptrs(

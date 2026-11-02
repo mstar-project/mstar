@@ -448,7 +448,8 @@ class AttentionManager(AttentionResource):
         """Whether this step's ``run`` under ``label`` attends the ``k``/``v`` it is passed rather
         than only the pages (whether the layer writes them is ``requires_kv_write``). A layer whose
         fused kernel writes the K/V but leaves ``k`` unrotated rotates it in place first when this
-        is True.
+        is True. (Where ``splits``, it doesn't fuse the write at all: the call goes through the
+        exchange, which writes this rank's share.)
 
         Every step of a backend that takes the fresh K/V straight into the kernel; on a paged
         backend over a context-parallel pool, a step that attends its own tokens apart from the
