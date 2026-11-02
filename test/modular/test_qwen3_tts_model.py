@@ -14,6 +14,7 @@ import yaml
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
+from mstar.engine.resources.attn import prologue
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
@@ -32,6 +33,7 @@ from mstar.model.qwen3_tts.config import (
     REF_CLIP_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
+    TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
@@ -49,6 +51,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     StopCheck,
 )
+from mstar.platforms.depth_decoder_ops import _norm_rope
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -2379,6 +2382,84 @@ def test_codec_captures_the_sizes_a_deployment_asks_for():
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config, capture_batch_sizes=list(reversed(sizes)))
     configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
     assert configs and all(c.capture_batch_sizes == sizes for c in configs)
+
+
+def _talker_language_model(comm_world_size=1):
+    config = _tiny_model_config()
+    model = Qwen3TTSTalkerModel(config).model
+    if comm_world_size != 1:
+        model.comm_group = SimpleNamespace(world_size=comm_world_size)
+    for layer in model.layers:
+        layer.self_attn.attend = SimpleNamespace(enable=lambda: True)
+    return config, model
+
+
+def test_the_talker_takes_the_packed_prologue_on_one_rank_with_the_kernel():
+    assert _talker_language_model()[1].packed_prologue
+    assert not _talker_language_model(comm_world_size=2)[1].packed_prologue
+    _, model = _talker_language_model()
+    model.layers[0].self_attn.attend = SimpleNamespace(enable=lambda: False)
+    assert not model.packed_prologue
+
+
+@pytest.mark.parametrize("walk, leased, packed, expect", [
+    ("talker_decode", True, True, True),
+    ("talker_prefill", True, True, False),  # flat write slots are staged for decode only
+    ("talker_decode", False, True, False),  # an eager step
+    ("talker_decode", True, False, False),  # a platform or rank layout without the kernel
+])
+def test_which_steps_take_the_packed_prologue(walk, leased, packed, expect):
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    submodule.model.model._packed = packed
+    pos = torch.arange(8)
+    engine_inputs = SimpleNamespace(
+        step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=object() if leased else None)),
+        resources={TALKER_POS: SimpleNamespace(pos_ids=lambda label: pos)},
+    )
+    positions = submodule._packed_positions(walk, engine_inputs, torch.zeros(3, 16))
+    assert (positions is not None) == expect
+    if expect:
+        assert positions.tolist() == [0, 1, 2]
+
+
+def test_a_packed_prologue_does_what_a_layers_unfused_attention_does():
+    """Through the prologue's torch reference: norm, rotation from the tables, and the cache write."""
+    config = _tiny_model_config()
+    talker = config.talker
+    model = Qwen3TTSTalkerModel(config).model
+    attn = model.layers[0].self_attn
+    with torch.no_grad():
+        for norm in (attn.q_norm, attn.k_norm):
+            torch.nn.init.normal_(norm.weight, 1.0, 0.1)
+    cos, sin = model.rope_tables()
+    tokens, heads, kv_heads, dim = 3, attn.num_heads, attn.num_kv_heads, attn.head_dim
+    assert cos.shape == (talker.max_position_embeddings, dim // 2) and cos.dtype == torch.float32
+    qkv = torch.randn(tokens, (heads + 2 * kv_heads) * dim, generator=torch.Generator().manual_seed(0))
+    positions = torch.tensor([0, 5, 1000])
+    q_gamma, k_gamma = attn.prologue_gammas()
+    assert torch.allclose(q_gamma + 1.0, attn.q_norm.weight.float())
+    pages = torch.zeros(4, 2, 8, kv_heads, dim)
+    slots = torch.tensor([0, 9, 17])
+    eps = attn.q_norm.variance_epsilon
+    q, _, k, v = prologue._reference(
+        qkv, q_gamma, k_gamma, cos, sin, positions, pages[:, 0], pages[:, 1], slots, heads, kv_heads, dim, eps, False,
+    )
+    want_q, want_k, want_v = qkv.split([heads * dim, kv_heads * dim, kv_heads * dim], dim=-1)
+
+    def norm_rope(x, shape, weight):
+        rows = [
+            _norm_rope(row, weight, eps, int(p), float(attn.rope_theta))
+            for row, p in zip(x.reshape(shape).detach(), positions, strict=True)
+        ]
+        return torch.stack(rows)
+
+    want_q = norm_rope(want_q, (tokens, heads, dim), attn.q_norm.weight.detach())
+    want_k = norm_rope(want_k, (tokens, kv_heads, dim), attn.k_norm.weight.detach())
+    assert torch.allclose(q, want_q, rtol=2e-3, atol=2e-3)
+    assert torch.allclose(k, want_k, rtol=2e-3, atol=2e-3)
+    assert torch.equal(v, want_v.reshape(tokens, kv_heads, dim))
+    assert torch.equal(pages[1, 0, 1], k[1]) and torch.equal(pages[1, 1, 1], v[1]) and torch.equal(pages[2, 0, 1], k[2])
 
 
 def test_talker_cap_sets_its_capture_sizes():

@@ -576,8 +576,22 @@ class TalkerSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
+    def _packed_positions(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """This step's positions when its layers take the packed prologue: a
+        decode step replayed on a leased slot, or being captured for one, whose
+        layers all can. Its flat write slots are staged for no other step."""
+        if graph_walk != "talker_decode" or not self.model.model.packed_prologue:
+            return None
+        ctx = getattr(getattr(engine_inputs, "step", None), "ctx", None)
+        if ctx is None or getattr(ctx, "slot_lease", None) is None:
+            return None
+        return engine_inputs.resources[TALKER_POS].pos_ids("main")[:input_embeds.shape[0]]
+
     def _run_frame(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
@@ -591,7 +605,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine-owned static buffers, so this single path serves eager execution
         and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
         """
-        hidden = self.model(input_embeds, label="main")
+        hidden = self.model(
+            input_embeds, label="main", positions=self._packed_positions(graph_walk, engine_inputs, input_embeds),
+        )
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.model.codec_head(last_hidden)
         logits = self._mask_invalid_logits(logits, suppress_eos)
@@ -692,7 +708,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         del kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_eos
+            graph_walk, engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         request_id = engine_inputs.request_ids[0]
         return {
@@ -712,7 +728,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, NameToTensorList] | BatchedModelOutput:
         del kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_eos
+            graph_walk, engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         if graph_walk == "talker_prefill_clone":
             # a request's stream can start with several frames
@@ -851,6 +867,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         del tp_world_size
         dtype = self.model.model.codec_embedding.weight.dtype
         hidden = self.talker_config.hidden_size
+        if self.model.model.packed_prologue:
+            # built here, before any capture, so no replay rebuilds them
+            self.model.model.rope_tables()
+            for layer in self.model.model.layers:
+                layer.self_attn.prologue_gammas()
 
         def prefill_input(num_tokens: int) -> ARNodeInputs:
             return ARNodeInputs(
