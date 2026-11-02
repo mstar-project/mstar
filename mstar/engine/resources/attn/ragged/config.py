@@ -200,9 +200,8 @@ class RaggedAttentionSpec(_RaggedSpecBase):
 
         return take_shard_edge(self, specs)
 
-    @property
-    def attends_split_steps(self) -> bool:
-        return self.sp_exchange == "ulysses"
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> Literal["none", "ulysses"]:
+        return self.sp_exchange
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         cfg = self.config

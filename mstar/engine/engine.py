@@ -44,7 +44,7 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
-from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -632,7 +632,7 @@ class Engine:
                 raise ValueError("; ".join(refusals))
             placed = sp > 1 and any(position_pools(specs, node).values())
             shards[node] = head_shards(group, placed)
-            if sp > 1 and any(spec.splits_steps and node in spec.nodes for spec in specs):
+            if sp > 1 and any(isinstance(spec, SeqShardSpec) and spec.splits and node in spec.nodes for spec in specs):
                 splitting.add(node)
 
         for spec in specs:

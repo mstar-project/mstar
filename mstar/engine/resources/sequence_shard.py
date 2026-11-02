@@ -106,10 +106,6 @@ class SeqShardSpec(NodeResourceSpec):
     def resource_class(self) -> type[Resource]:
         return SequenceShard
 
-    @property
-    def splits_steps(self) -> bool:
-        return self.splits
-
     def depends_on(self) -> set[str]:
         # a striped step plans from each row's stored length, which the pool's plan holds. A
         # dependency of the shard, not of the pool, so the pool's prefix cache stays open
@@ -118,16 +114,9 @@ class SeqShardSpec(NodeResourceSpec):
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         # from raw fields alone, so it doesn't matter which spec derives first
-        from mstar.engine.resources.attn.config import AttentionSpec
-
-        attentions = [spec for spec in specs.values() if spec.nodes & self.nodes and spec.attends_split_steps]
-        # a kind that takes split steps; a paged one's unset sp_exchange follows its pool's storage
-        exchanges = {
-            spec.resource_key: spec.resolve_exchange(specs) if isinstance(spec, AttentionSpec) else spec.sp_exchange
-            for spec in attentions
-        }
-        self.splits = any(exchange != "none" for exchange in exchanges.values())
-        pools = sorted({spec.config.kv_cache for spec in attentions if exchanges[spec.resource_key] == "ring"})
+        exchanges = [(spec, spec.resolve_exchange(specs)) for spec in specs.values() if spec.nodes & self.nodes]
+        self.splits = any(exchange != "none" for _, exchange in exchanges)
+        pools = sorted({spec.config.kv_cache for spec, exchange in exchanges if exchange == "ring"})
         self.stripe_pool = pools[0] if len(pools) == 1 else None
         if len(pools) > 1:
             return [f"its ring attentions read KV pools {pools}, whose stored positions would stripe a step two ways"]

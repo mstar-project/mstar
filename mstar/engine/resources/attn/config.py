@@ -123,16 +123,10 @@ class AttentionSpec(NodeResourceSpec):
 
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
         """``sp_exchange``, or where unset its pool's storage's default: ``ulysses`` by head, and
-        ``none`` by position, where splitting a step's tokens is the deployment's to opt into.
-        From raw fields, so the sequence shard's ``derive`` can ask in any order."""
+        ``none`` by position, where splitting a step's tokens is the deployment's to opt into."""
         if self.sp_exchange is not None:
             return self.sp_exchange
         return "none" if specs[self.config.kv_cache].places_positions else "ulysses"
-
-    @property
-    def attends_split_steps(self) -> bool:
-        # a kind that can; `sp_exchange` none turns it off (`SeqShardSpec.derive`)
-        return True
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         # a paged pool serves whatever labels a step declares, so nothing rules out a split one
