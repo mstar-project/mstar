@@ -330,6 +330,23 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
     assert w.lockstep.pending_follow_count("X") == 0
 
 
+@pytest.mark.parametrize("known_rids", [(), ("X",)], ids=["never-admitted", "removed"])
+@pytest.mark.parametrize("source", [MessageSource.CONDUCTOR, MessageSource.TP_RANK_0])
+@pytest.mark.parametrize("is_follower", [False, True], ids=["leader", "follower"])
+def test_late_drain_does_not_recreate_removed_request_state(known_rids, source, is_follower):
+    w = _worker(known_rids=known_rids, is_follower=is_follower)
+    _remove(w, request_id="X", source=MessageSource.TP_RANK_0)
+    assert "X" in w.lifecycle._removed
+    assert "X" not in w.lifecycle.arrivals
+    _drain(w, request_id="X", source=source)
+
+    assert not w.lifecycle.draining
+    assert not w.lifecycle.pending_drains
+    assert not w.lifecycle._reads_done_sent
+    assert not w.lifecycle.teardowns_pending()
+    assert not _reads_done(w)
+
+
 def test_drain_deferred_behind_inflight_gpu_step():
     w = _worker(in_flight=("X",))
     _drain(w, request_id="X")
