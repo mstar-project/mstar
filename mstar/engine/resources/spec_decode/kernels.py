@@ -24,15 +24,18 @@ from mstar.kernels.registry import KernelOp, ShapePolicy
 @triton.jit
 def _verify_inputs_kernel(
     rows_ptr, real_ptr, seq_len_ptr, num_acc_ptr, tokens_ptr, block_table_ptr,
-    ids_ptr, positions_ptr, slots_ptr, pages_ptr, offsets_ptr, kv_lens_ptr, num_accepted_ptr,
+    ids_ptr, positions_ptr, slots_ptr, pages_ptr, offsets_ptr, kv_lens_ptr, num_accepted_ptr, read_columns_ptr,
     registers, table_stride, page_size, T,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr, COLUMN_OFFSET: tl.constexpr,
 ):
     r = tl.program_id(0)
     row = tl.load(rows_ptr + r)
     real = tl.load(real_ptr + r) != 0
     base = tl.where(real, tl.load(seq_len_ptr + row), 0)
-    tl.store(num_accepted_ptr + r, tl.where(real, tl.load(num_acc_ptr + row), 1))
+    accepted = tl.where(real, tl.load(num_acc_ptr + row), 1)
+    tl.store(num_accepted_ptr + r, accepted)
+    if COLUMN_OFFSET:
+        tl.store(read_columns_ptr + r, accepted + COLUMN_OFFSET)
     tl.store(kv_lens_ptr + r, base + T)
 
     slot = tl.arange(0, BLOCK)
@@ -50,25 +53,27 @@ def _verify_inputs_kernel(
 
 def _verify_inputs(
     rows, real, seq_len, num_acc, tokens, block_table, page_size, ids, positions, slots,
-    write_pages, write_offsets, kv_lens, num_accepted,
+    write_pages, write_offsets, kv_lens, num_accepted, read_columns, column_offset,
 ) -> None:
     b, t = rows.shape[0], tokens.shape[0]
     _verify_inputs_kernel[(b,)](
         rows, real, seq_len, num_acc, tokens, block_table,
-        ids, positions, slots, write_pages, write_offsets, kv_lens, num_accepted,
+        ids, positions, slots, write_pages, write_offsets, kv_lens, num_accepted, read_columns,
         tokens.shape[1], block_table.stride(0), page_size, t,
-        BLOCK=triton.next_power_of_2(t), num_warps=1,
+        BLOCK=triton.next_power_of_2(t), COLUMN_OFFSET=column_offset, num_warps=1,
     )
 
 
 def _verify_inputs_reference(
     rows, real, seq_len, num_acc, tokens, block_table, page_size, ids, positions, slots,
-    write_pages, write_offsets, kv_lens, num_accepted,
+    write_pages, write_offsets, kv_lens, num_accepted, read_columns, column_offset,
 ) -> None:
     b, t = rows.shape[0], tokens.shape[0]
     rows_l, real_b = rows.long(), real.bool()
     base = torch.where(real_b, seq_len[rows_l], 0)
     num_accepted.copy_(torch.where(real_b, num_acc[rows_l], 1))
+    if column_offset:
+        read_columns.copy_(num_accepted + column_offset)
     kv_lens.copy_(base + t)
     position = base[:, None] + torch.arange(t, dtype=base.dtype, device=base.device)[None, :]
     page = torch.div(position, page_size, rounding_mode="floor")
@@ -108,14 +113,15 @@ def _verify_inputs_args(shape, dtype, device, generator=None):
     return (rows, real, seq_len, num_acc, tokens, block_table, page_size,
             torch.zeros(b * t, **long), torch.zeros(b * t, **long), torch.zeros(b * t, **long),
             torch.zeros(b * t, **long), torch.zeros(b * t, **long),
-            torch.zeros(b, dtype=torch.int32, device=device), torch.zeros(b, dtype=torch.int32, device=device))
+            torch.zeros(b, dtype=torch.int32, device=device), torch.zeros(b, dtype=torch.int32, device=device),
+            torch.zeros(b, dtype=torch.int32, device=device), t)
 
 
 SPEC_VERIFY_INPUTS = KernelOp(
     "spec_verify_inputs",
     "(Tensor rows, Tensor real, Tensor seq_len, Tensor num_acc, Tensor tokens, Tensor block_table, int page_size, "
     "Tensor(a!) ids, Tensor(b!) positions, Tensor(c!) slots, Tensor(d!) write_pages, Tensor(e!) write_offsets, "
-    "Tensor(f!) kv_lens, Tensor(g!) num_accepted) -> ()",
+    "Tensor(f!) kv_lens, Tensor(g!) num_accepted, Tensor(h!) read_columns, int column_offset) -> ()",
     fake=_verify_inputs_fake,
     reference=_verify_inputs_reference,
     impls={"rocm": lambda: _verify_inputs},

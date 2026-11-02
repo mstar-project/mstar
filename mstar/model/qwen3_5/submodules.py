@@ -623,7 +623,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     (rid, "main"): -given for rid, given in retract.items()
                 }),
                 ATTN: AttentionStep(causal=True, row_queries=span),
-                GDN_STATE: RecurrentStep(),
+                GDN_STATE: RecurrentStep(verify=True),
                 LINEAR_ATTN: LinearAttnStep(),
                 SPEC_DECODE: SpecDecodeStep(phase=SpecPhase.VERIFY, retract=retract),
             },

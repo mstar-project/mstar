@@ -559,7 +559,7 @@ def test_twin_slots_replay_a_captured_decode_without_touching_other_slots():
         x = inputs(bs, seed=step)
         for name, t in static.items():
             t.copy_(x[name])
-        held = {pool._slots[r]["main"].index for r in rows} | {pool._slots[r]["main"].extra[0] for r in rows}
+        held = {pool._slots[r]["main"].index for r in rows} | {pool._slots[r]["main"].twin[0] for r in rows}
         before = pool.block("state", 0).clone()
         graphs[step % 2].replay()
         refs = _layer(plain, plain_pool, {k: v[: len(rows)] for k, v in x.items()}, w, conv)[1]

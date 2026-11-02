@@ -127,8 +127,11 @@ class Harness:
     """One node's resources and a fake two-layer token cache (layer 0 the
     target's, layer 1 the draft head's)."""
 
-    def __init__(self, k: int, *, stop_at: int | None = None, wrong: frozenset[int] = frozenset()):
+    def __init__(
+        self, k: int, *, stop_at: int | None = None, wrong: frozenset[int] = frozenset(), twin: bool = False,
+    ):
         self.k, self.t = k, k + 1
+        self.twin = twin
         self.stop_at = stop_at
         # absolute token positions the toy draft guesses wrong
         self.wrong = wrong
@@ -153,7 +156,10 @@ class Harness:
             },
             max_slots=1 + 8 * (k + 1),
             spec_tokens=k,
+            twin_slots=twin,
         ))
+        if twin:
+            self.spec.read_columns_past(self.t)
         self.gdn: dict = {}
         self.cache = torch.full((NUM_PAGES, PAGE, 2), -1, dtype=torch.long)
         self.slot = 0
@@ -234,7 +240,7 @@ class Harness:
         ctx = self._ctx(rids, padded if pad else None, "decode", bucket)
         lease = ctx.slot_lease
         kv_step = KVStep(segments=segs, commit_adjust={(r, "main"): -g for r, g in retract.items()})
-        pool_step = RecurrentStep(segments=segs)
+        pool_step = RecurrentStep(segments=segs, verify=True)
         spec_step = SpecDecodeStep(segments=segs, phase=SpecPhase.VERIFY, retract=retract)
         assert self.kv.admit(kv_step, ctx).ok and self.pool.admit(pool_step, ctx).ok
         assert self.spec.admit(spec_step, ctx).ok
@@ -244,9 +250,12 @@ class Harness:
         plan = self.spec.plan(spec_step, ctx)
         wrapper = self.gdn.setdefault(lease is not None, GDNVerifyWrapper(
             CPU, pad_slot_id=-1, tokens_per_row=t, bs=len(padded) if pad else None,
-            accelerator_graph=lease is not None, null_slot_id=SINK_SLOT, kernels=_NoKernels(),
+            accelerator_graph=lease is not None, null_slot_id=SINK_SLOT, kernels=_NoKernels(), twin_slots=self.twin,
         ))
-        wrapper.plan(addressing["main"].host_slot_groups, plan.num_accepted)
+        wrapper.plan(
+            addressing["main"].host_slot_groups, plan.num_accepted, addressing["main"].host_twin_groups,
+            plan.read_columns,
+        )
 
         ids, positions = self.spec.verify_inputs()
         b = len(padded)
@@ -336,7 +345,7 @@ class Harness:
             row = plan.slot_map[r]
             if int(row[0]) < 0:
                 continue
-            h = float(state[int(row[int(plan.num_accepted[r]) - 1]), 0])
+            h = float(state[int(row[int(plan.read_columns[r]) - 1]), 0])
             for i in range(self.t):
                 h = ToyState.step(h, int(ids[r * self.t + i]))
                 state[int(row[i]), 0] = h
@@ -625,6 +634,80 @@ def test_an_fp8_head_keeps_a_clear_argmax(monkeypatch):
     logits = head(x.to(torch.bfloat16))
     assert logits.shape == (2, 256) and logits.dtype == torch.bfloat16
     assert logits.argmax(dim=-1).tolist() == [3, 200]
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+@pytest.mark.parametrize("lag", [0, 1])
+def test_twin_groups_reproduce_greedy_with_rejected_drafts(k, lag):
+    """`run` checks after every step that a request's next start holds the state of what it accepted."""
+    budget = 23
+    h = Harness(k, wrong=frozenset(range(9, 200, 5)), twin=True)
+    emitted, history = run(h, PROMPTS, budget, lag)
+    for rid, prompt in PROMPTS.items():
+        assert emitted[rid] == greedy(prompt, budget), rid
+        assert any(a <= k for a in history[rid])
+
+
+def test_twin_groups_leave_padding_rows_on_the_sink():
+    h = Harness(2, wrong=frozenset(range(12, 200, 4)), twin=True)
+    emitted, _ = run(h, PROMPTS, 17, lag=1, pad=2)
+    for rid, prompt in PROMPTS.items():
+        assert emitted[rid] == greedy(prompt, 17), rid
+    assert h.pool.block("state", 0)[[g for s in h.pool._slots.values() for g in s["main"].held]].abs().sum() > 0
+
+
+def test_a_verify_step_swaps_its_group_once_whatever_its_tokens():
+    k = 3
+    h = Harness(k, twin=True)
+    h.prefill({0: PROMPTS[0]}, {0: 30})
+    slot = h.pool._slots[0]["main"]
+    # the prompt's state stays where the prefill wrote it, in the first slot of the first group
+    first, second = slot.group, slot.twin
+    assert len(first) == len(second) == k + 1 and not set(first) & set(second)
+    for step in range(4):
+        h.verify([0])
+        assert slot.group == (second if step % 2 == 0 else first)
+        assert slot.twin == (first if step % 2 == 0 else second)
+        assert slot.swapped == (step % 2 == 0)
+
+
+def test_a_rejected_draft_resumes_from_the_group_the_step_wrote():
+    k = 2
+    h = Harness(k, wrong=frozenset({len(PROMPTS[0]) + 1}), twin=True)
+    first = h.prefill({0: PROMPTS[0]}, {0: 30})
+    start_group = h.pool._slots[0]["main"].group
+    before = h.pool.block("state", 0)[list(start_group), 0].clone()
+    tokens, accepted, _ = h.verify([0])
+    assert int(accepted[0]) == 1
+    slot = h.pool._slots[0]["main"]
+    # the step read the first group and left it alone; the row resumes in what it wrote
+    assert torch.equal(h.pool.block("state", 0)[list(start_group), 0], before)
+    assert slot.twin == start_group
+    emitted = first + [int(x) for x in tokens[0] if int(x) >= 0]
+    expect = 0.0
+    for tok in PROMPTS[0] + emitted[:-1]:
+        expect = ToyState.step(expect, tok)
+    assert h.current_state(0) == pytest.approx(expect)
+
+
+def test_a_prompt_as_long_as_a_verify_row_stays_in_place():
+    k = 3
+    h = Harness(k, twin=True)
+    h.prefill({0: [1, 2, 3, 4]}, {0: 4})
+    slot = h.pool._slots[0]["main"]
+    assert not slot.swapped
+
+
+def test_twin_groups_double_a_requests_slots_and_return_them():
+    k = 2
+    h = Harness(k, twin=True)
+    free = h.pool.num_free_slots
+    assert free == 2 * 8 * (k + 1)
+    h.prefill({0: PROMPTS[0]}, {0: 4})
+    assert h.pool.num_free_slots == free - 2 * (k + 1)
+    h.verify([0])
+    h.pool.remove_request(0)
+    assert h.pool.num_free_slots == free
 
 
 def test_requests_hold_slot_groups_and_return_them():

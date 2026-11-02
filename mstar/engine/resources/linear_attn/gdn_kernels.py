@@ -70,18 +70,21 @@ class GDNDecodePlan:
 class GDNVerifyPlan:
     """A speculative verify step: every row is ``tokens_per_row`` tokens.
 
-    Row ``i`` starts from the state in ``slot_map[i, num_accepted[i] - 1]``
+    Row ``i`` starts from the state in ``slot_map[i, read_columns[i] - 1]``
     and leaves the state after its token ``t`` in ``slot_map[i, t]``; -1 rows
     are skipped. ``num_accepted`` is filled on the device by the speculative
-    resource before the layers run.
+    resource before the layers run. So is ``read_columns``, the same counts, or
+    with twin slots those past ``tokens_per_row``: the map then holds the slots
+    the row writes, then the slots the last step wrote.
     """
 
-    slot_map: torch.Tensor      # [n, tokens_per_row] int32
-    conv_slots: torch.Tensor    # [n] int32, each row's conv window
+    slot_map: torch.Tensor      # [n, tokens_per_row or 2 * tokens_per_row] int32
+    conv_slots: torch.Tensor    # [n] int32, each row's conv window; [n, 2] (read, write) with twin slots
     cu_seqlens: torch.Tensor    # [n + 1] int32
     num_accepted: torch.Tensor  # [n] int32
     num_rows: int
     tokens_per_row: int
+    read_columns: torch.Tensor | None = None  # [n] int32
 
 
 def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
