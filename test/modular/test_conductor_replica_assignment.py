@@ -377,6 +377,7 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors(plan):
     conductor._status_interval_s = None
     conductor._loop_max_iters = {}
     conductor._walk_inputs = {"prefill": []}
+    conductor.producer_triggered_partitions = set()
     conductor._kv_labels = {"kv": ("main",)}
     conductor._build_request_sharding_config = lambda workers: None
     refused = []

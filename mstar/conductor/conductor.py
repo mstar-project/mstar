@@ -1301,10 +1301,11 @@ class Conductor:
                 p.name, body.initial_input_modalities, body.initial_output_modalities,
                 body.initial_signals, model_kwargs,
             )
+            stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key
             # that isn't an input of the step's walk. A model bug, so a 500.
-            for step in pstate.plan:
+            for k, step in enumerate(pstate.plan):
                 if step.walk not in p.graph_walks:
                     raise HTTPException(status_code=500, detail=(
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} runs {step.walk!r}, "
@@ -1316,6 +1317,19 @@ class Conductor:
                         f"{type(self.model).__name__}'s plan binds {unknown} on {step.walk!r}, which are not "
                         f"inputs of that walk; its inputs are {sorted(inputs)}"
                     ))
+                # the conductor moves a worker onto a later step only by sending it inputs
+                if k and not stream_moved and not inputs:
+                    raise HTTPException(status_code=500, detail=(
+                        f"{type(self.model).__name__}'s plan for partition {p.name!r} moves on to {step.walk!r}, "
+                        "which takes no input the conductor sends, so its worker would never run it"
+                    ))
+            # a stream-moved partition advances on every report, so a last step run
+            # once per chunk would end at its first chunk
+            if stream_moved and pstate.plan and pstate.plan[-1].walk in self._repeating_walks:
+                raise HTTPException(status_code=500, detail=(
+                    f"{type(self.model).__name__}'s plan for partition {p.name!r}, whose walk a stream moves, "
+                    f"ends on {pstate.plan[-1].walk!r}, which runs once per chunk"
+                ))
             pstate.is_done = not pstate.plan
         if all(pstate.is_done for pstate in partition_states.values()):
             # no worker would ever report, so nothing would end the request

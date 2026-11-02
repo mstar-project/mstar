@@ -463,26 +463,45 @@ def test_a_walk_plan_sends_each_steps_inputs_and_releases_their_last_read(tmp_pa
         "the plan's last step did not end the request"
 
 
+def _tok_stream(consumer_walk=None):
+    return [Connection("A", "B", "tok", lambda: FixedChunkPolicy(chunk_size=1), consumer_walk=consumer_walk)]
+
+
+_STREAMED = {"A": ["a"], "B": ["b", "c"]}
 _REFUSED = {
     # no worker would ever report on it, so nothing would end it; the request's
     # content can lead there (a model with no walk for its modalities)
-    "no partition has a walk": ({"default": []}, None, 400, "no walk to run"),
+    "no partition has a walk": ({"default": []}, None, (), 400, "no walk to run"),
     # a model bug: a walk the model doesn't have fails the same check
-    "a walk of another partition": ({"A": [WalkStep("b")], "B": []}, {"A": ["a"], "B": ["b"]}, 500,
+    "a walk of another partition": ({"A": [WalkStep("b")], "B": []}, {"A": ["a"], "B": ["b"]}, (), 500,
                                     "not one of its walks"),
-    "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None, 500,
+    "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None, (), 500,
                                          "not inputs of that walk"),
+    # nothing tells B's worker its walk changed
+    "a later step only a stream feeds": ({"A": [WalkStep("a")], "B": [WalkStep("b"), WalkStep("c")]}, _STREAMED,
+                                         _tok_stream(), 500, "takes no input the conductor sends"),
+    # the stream's walk moves on each report, so its first chunk would end B
+    "a stream-moved plan ending on a chunk step": ({"A": [WalkStep("a")], "B": [WalkStep("c")]}, _STREAMED,
+                                                  _tok_stream(lambda ctx: "c"), 500, "runs once per chunk"),
 }
 
 
 @pytest.mark.parametrize("case", list(_REFUSED))
 def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog, case):
     """Before any worker hears of the request: a 400 when the request leads
-    there, a 500 whose text only the log has when the model's plan is wrong."""
-    plans, groups, status, message = _REFUSED[case]
+    there, a 500 whose text only the log has when the model's plan is wrong.
+    With ``connections``, A's walk streams ``tok`` to B's walk ``c``, a bare
+    node run once per chunk."""
+    plans, groups, connections, status, message = _REFUSED[case]
     walks = {name: GraphNode(name=f"n{name}", input_names=["x"], outputs=[]) for name in ("a", "b")}
-    c = _conductor(_ToyModel(walks, plans, groups), [{"node_names": ["na", "nb"], "ranks": [0]}], tmp_path,
-                   monkeypatch)
+    if connections:
+        walks["a"] = GraphNode(name="na", input_names=["x"], outputs=[
+            StreamingGraphEdge(next_node="nc", name="tok", target_partition="B"),
+        ])
+        walks["c"] = GraphNode(name="nc", input_names=["tok"], outputs=[])
+    nodes = sorted({n for w in walks.values() for n in w.get_nodes()})
+    c = _conductor(_ToyModel(walks, plans, groups, connections=connections),
+                   [{"node_names": nodes, "ranks": [0]}], tmp_path, monkeypatch)
     _run(c, [[_new_request("r", {"x": [_info(PROMPT)]})]])
 
     failed = [m.body for _, m in c.comm.sent if getattr(m, "message_type", None) == "request_failed"]

@@ -877,8 +877,10 @@ class Model(ABC):
         once per chunk until the worker reports the stream's final chunk. A
         ``ValueError`` refuses the request with a 400, and so does a plan of
         ``[]`` for every partition. A plan the conductor can't run is a model
-        bug, refused with a 500: a step whose walk is not the partition's, or a
-        ``bind`` key that is not an input of the step's walk.
+        bug, refused with a 500: a step whose walk is not the partition's, a
+        ``bind`` key that is not an input of the step's walk, a later step whose
+        walk takes no input the conductor sends, and, in a partition a stream
+        moves, a last step that runs once per chunk.
         """
 
     @abstractmethod
