@@ -22,6 +22,7 @@ from mstar.engine.resources.linear_attn.gdn_kernels import (
     GDNPrefillPlan,
     GDNVerifyPlan,
 )
+from mstar.platforms import current_platform
 from mstar.utils.h2d import H2DMirror, PinnedStager
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
@@ -449,8 +450,9 @@ class GDNDecodeWrapper(GDNWrapper):
         bias: torch.Tensor | None = None,
         activation: str | None = "silu",
     ):
-        from mstar.utils.causal_conv1d import causal_conv1d_update
-        return causal_conv1d_update(
+        from mstar.utils.causal_conv1d import causal_conv1d_decode, causal_conv1d_update
+        conv = causal_conv1d_decode if current_platform.is_rocm() else causal_conv1d_update
+        return conv(
             x=x,
             conv_state=conv_layer,
             weight=weight,
