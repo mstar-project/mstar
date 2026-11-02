@@ -522,6 +522,8 @@ def _sequence_parallel(
 ) -> Iterator[str]:
     """What a node group's SP ranks do (`positions_over_sp`, which the engine manager checks
     again at load), and whether each KV pool placed over a group's ranks can stripe over them.
+    No resource may span nodes that split heads different ways, nor put LoRA on a node running
+    its own SP: the engine and `LoraAdapterPool.build` refuse both at load.
     Without ``specs`` (the model's resources failed to resolve, which is reported apart) there is
     nothing to check this against."""
     enabled = model.get_default_sharding_config().sp_enabled_nodes
@@ -546,7 +548,7 @@ def _sequence_parallel(
                 over[node] = positions_over_sp(specs, node, sp, enabled)
             except ValueError as e:
                 yield f"node_groups[{i}]: {e}"
-        # a resource is sized by one head-shard count, which Engine.load_model checks again
+        mixed = []
         for spec in specs:
             own_sp = sorted(node for node in spec.nodes if over.get(node) is False)
             if isinstance(spec, LoraSpec) and own_sp:
@@ -555,10 +557,11 @@ def _sequence_parallel(
                     "their own sequence parallelism: LoRA lays its rows out per request, while each SP "
                     "rank holds a shard of the tokens"
                 )
-            split = {node: over[node] for node in sorted(spec.nodes & over.keys())}
-            if len(set(split.values())) > 1:
-                yield (
-                    f"node_groups[{i}]: resource {spec.resource_key!r} serves nodes that split heads "
-                    f"different ways: {[n for n, o in split.items() if o]} place their KV positions over "
-                    f"the SP ranks, {[n for n, o in split.items() if not o]} run their own sequence parallelism"
-                )
+            if len({over[node] for node in spec.nodes & over.keys()}) > 1:
+                mixed.append(spec.resource_key)
+        if mixed:
+            yield (
+                f"node_groups[{i}]: {sorted(n for n, o in over.items() if o)} place their KV positions over "
+                f"the SP ranks and {sorted(n for n, o in over.items() if not o)} run their own sequence "
+                f"parallelism, so they split heads different ways, yet share resources {sorted(mixed)}"
+            )

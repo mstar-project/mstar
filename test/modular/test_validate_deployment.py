@@ -325,8 +325,8 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path)
                    sp_enabled_nodes=["b"])
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], "ranks": [0, 1], "sp_size": 2}],
                resources={"kv": {"context_parallel": True}})
-    _refused(model, cfg, r"node_groups\[0\]: resource 'shared' serves nodes that split heads different ways: "
-                         r"\['a'\] place .* \['b'\] run their own")
+    _refused(model, cfg, r"node_groups\[0\]: \['a'\] place their KV positions over the SP ranks and "
+                         r"\['b'\] run their own sequence parallelism, .* share resources \['shared'\]")
 
 
 def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):

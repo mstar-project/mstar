@@ -2374,8 +2374,8 @@ page. Attention runs on each rank's slots and merges the partials across the par
   and the node loads without its SP group, so every layer but attention runs replicated across
   SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
   node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials.
-  Chunked prefill stays off on SP ranks, so SP mode prefills a prompt in one step: a known limit
-  until chunks over a placed pool are checked on a GPU, as for any node on SP ranks.
+  Chunked prefill stays off on SP ranks, as for the model's own SP, so SP mode prefills a prompt
+  in one step: chunked prefill over a placed pool is not supported yet.
 
 A page's tokens (``page_size``, 128 when it is unset) must be divisible by ``P``; the conductor
 checks these rules against ``node_groups`` before it starts a worker. ``max_num_pages`` counts
