@@ -1705,9 +1705,9 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
-   FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
-   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
+   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
+   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
+   replayable.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -1722,24 +1722,24 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    is a graph break, so this is a latency-for-exactness trade:
 
    * The norms alone make the transformer bit-exact with eager (measured on klein-4B and
-     9B while the q/k norms were graph breaks). Klein's per-head q/k norms (1-D
-     ``RMSNorm``) run as an op the compiled graph keeps whole. On NVIDIA GPUs that op is
-     a Triton replica of torch's kernel with the same arithmetic order: bit-identical and
-     ~4x faster than torch's one-block-per-row launch. Kept norms of one class share a
-     class-level forward, so the blocks share one compiled frame: with a forward per
-     module, dynamo hit its recompile limit and the small batches ran the blocks eagerly
-     (klein-4B 2.86 / 3.10 / 3.69 against 3.33 / 3.75 / 3.80 img/s at concurrency
-     1 / 4 / 16, H200). Before the q/k op the shipped ``[norms]`` cost klein-4B 4% of
-     its B=1 latency (0.371 vs 0.356 s). Keeping the activations too adds cost and
-     nothing else.
-   * Z-Image's 180 norms per step cost 45% (1.25 vs 0.86 s at B=1), so it ships ``false``
+     9B while the q/k norms were graph breaks), so klein-4B and 9B ship ``[norms]``.
+     Klein's per-head q/k norms (1-D ``RMSNorm``) run as an op the compiled graph keeps
+     whole. On NVIDIA GPUs that op is a Triton replica of torch's kernel with the same
+     arithmetic order: bit-identical and faster than torch's one-block-per-row launch.
+     Kept norms of one class share a class-level forward, so the blocks share one
+     compiled frame: with a forward per module, dynamo hit its recompile limit and the
+     small batches ran the blocks eagerly (klein-4B 2.86 / 3.10 / 3.69 against 3.33 /
+     3.75 / 3.80 img/s at concurrency 1 / 4 / 16, H200). Keeping the activations too
+     adds cost and nothing else.
+   * Z-Image's 180 norms per step cost 45% of its B=1 latency, so it ships ``false``
      and lands at a median 34 dB (the ``false`` figures were measured before its compiled
      forward fused the q/k norms and rotary into one kernel). ``[norms]``, which keeps
      that fusion off, turns it reference-faithful (at least 55.9 dB on every prompt).
-   * Without it, the plain compile — even with eager rounding — lands at a median 35 to
-     38 dB PSNR from eager over the 100 protocol prompts, because a 4- or 8-step
-     distilled sampler amplifies the last bit of inductor's own reductions and activation
-     decompositions.
+   * Without ``[norms]``, the plain compile — even with eager rounding — lands at a
+     median 37.6 dB (klein-4B) and 35.6 dB (9B) PSNR from eager over the 100 protocol
+     prompts (measured with the earlier compiled VAE decode), because a 4- or 8-step
+     distilled sampler amplifies the last bit of inductor's own reductions and
+     activation decompositions.
 
 ``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``
@@ -1787,8 +1787,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 With the klein defaults every served image was within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it was bit-exact; both were measured while
 the q/k norms were graph breaks, and the 53 dB before the folded, split-GroupNorm VAE decode.
-For scale, the served images of the other engines are 10 to 16 dB from the diffusers
-reference for the same seeds.
+For scale, SGLang 0.5.22's images sit at a median 23.8 dB (minimum 13.1) on klein-4B and
+24.0 dB (14.5) on 9B from klein's output at the same seeds.
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or

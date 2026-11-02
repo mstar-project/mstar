@@ -6,18 +6,16 @@ model: "flux2_klein_9b"
 max_seq_len: 512
 
 model_kwargs:
-  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
-  # reference kernel; flashinfer stays available
+  # sdpa (cuDNN on H100) is the reference kernel; flashinfer stays available
   attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
-  # transformer still lands at a median 35.6 dB from the eager path over the 100 protocol prompts (81 of 100 below 40 dB)
+  # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
   compile_eager_rounding: true
-  # op classes kept on the eager result inside the compiled forward. Measured before the exact q/k RMSNorm op (the q/k
-  # norms were graph breaks) and the folded/split-GroupNorm VAE: with the norms kept the compiled transformer was
-  # bit-exact with the eager one (the activations add nothing but graph breaks); every served image >= 53 dB from the
-  # eager path on all 100 protocol prompts (the compiled VAE); true: 0.654 s at B=1 vs 0.608 plain; 0.785 without
-  # compile; [norms] pending measurement
+  # op classes kept on the eager result inside the compiled forward: with the norms kept the compiled
+  # transformer was bit-exact with the eager one (measured while the q/k norms were graph breaks; the
+  # activations add nothing but graph breaks), and with vae_compile: false so was every served image
+  # (see compile_exact_ops in docs/models.rst)
   compile_exact_ops: [norms]
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
