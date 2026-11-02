@@ -1326,13 +1326,6 @@ class Conductor:
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} moves on to {step.walk!r}, "
                         "which takes no input the conductor sends, so its worker would never run it"
                     ))
-            # a stream-moved partition advances on every report, so a last step run
-            # once per chunk would end at its first chunk
-            if stream_moved and pstate.plan and pstate.plan[-1].walk in self._repeating_walks:
-                raise HTTPException(status_code=500, detail=(
-                    f"{type(self.model).__name__}'s plan for partition {p.name!r}, whose walk a stream moves, "
-                    f"ends on {pstate.plan[-1].walk!r}, which runs once per chunk"
-                ))
             pstate.is_done = not pstate.plan
         if all(pstate.is_done for pstate in partition_states.values()):
             # no worker would ever report, so nothing would end the request

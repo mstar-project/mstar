@@ -879,9 +879,10 @@ class Model(ABC):
         ``ValueError`` refuses the request with a 400, and so does a plan of
         ``[]`` for every partition. A plan the conductor can't run is a model
         bug, refused with a 500: a step whose walk is not the partition's, a
-        ``bind`` key that is not an input of the step's walk, a later step whose
-        walk takes no input the conductor sends, and, in a partition a stream
-        moves, a last step that runs once per chunk.
+        ``bind`` key that is not an input of the step's walk, or a later step
+        whose walk takes no input the conductor sends. In a partition a stream
+        moves, the partition ends on its last step's first report, so that step
+        must run once.
         """
 
     @abstractmethod

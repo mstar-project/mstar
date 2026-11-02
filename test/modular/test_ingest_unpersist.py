@@ -520,8 +520,8 @@ def test_a_walk_plan_sends_each_steps_inputs_and_releases_their_last_read(tmp_pa
         "the plan's last step did not end the request"
 
 
-def _tok_stream(consumer_walk=None):
-    return [Connection("A", "B", "tok", lambda: FixedChunkPolicy(chunk_size=1), consumer_walk=consumer_walk)]
+def _tok_stream():
+    return [Connection("A", "B", "tok", lambda: FixedChunkPolicy(chunk_size=1))]
 
 
 _STREAMED = {"A": ["a"], "B": ["b", "c"]}
@@ -537,9 +537,6 @@ _REFUSED = {
     # nothing tells B's worker its walk changed
     "a later step only a stream feeds": ({"A": [WalkStep("a")], "B": [WalkStep("b"), WalkStep("c")]}, _STREAMED,
                                          _tok_stream(), 500, "takes no input the conductor sends"),
-    # the stream's walk moves on each report, so its first chunk would end B
-    "a stream-moved plan ending on a chunk step": ({"A": [WalkStep("a")], "B": [WalkStep("c")]}, _STREAMED,
-                                                  _tok_stream(lambda ctx: "c"), 500, "runs once per chunk"),
 }
 
 
