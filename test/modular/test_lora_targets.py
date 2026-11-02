@@ -28,11 +28,14 @@ from safetensors.torch import save_file  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.distributed.utils import split_tensor_along_last_dim  # noqa: E402
+from mstar.engine.resources.attn.config import AttentionStep  # noqa: E402
+from mstar.engine.resources.lora import LoraStep  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file  # noqa: E402
 from mstar.engine.resources.lora.config import describe_load_error  # noqa: E402
 from mstar.engine.resources.lora.ops import lora_gather_shrink  # noqa: E402
 from mstar.engine.resources.lora.serving import declared_lora_specs  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_adapter, inspect_keys  # noqa: E402
+from mstar.engine.resources.step import Segment, SubmoduleStep  # noqa: E402
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding  # noqa: E402
 from mstar.model.components.distributed.linear import (  # noqa: E402
     ColumnParallelLinear,
@@ -52,6 +55,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
     module_lora_spec,
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
+from mstar.model.submodule_base import NodeSubmodule, engine_step  # noqa: E402
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -144,8 +148,6 @@ class _Root(nn.Module):
 
 
 class _Node(nn.Module):  # a node submodule holding the root, as binding sees it
-    lora_segment_rows = True
-
     def __init__(self, root: nn.Module):
         super().__init__()
         self.inner = root
@@ -445,7 +447,7 @@ def test_unbound_module_runs_the_pre_lora_forward(name):
 
 # --- what binding refuses ------------------------------------------------------------------
 
-def test_binding_refuses_a_second_delta_a_silent_node_and_a_split_target(tmp_path):
+def test_binding_refuses_a_second_delta_and_a_split_target(tmp_path):
     case = CASES["qkv"]
     paths, _ = _adapters(case, tmp_path)
     spec = serve(_spec(case), paths)
@@ -457,17 +459,56 @@ def test_binding_refuses_a_second_delta_a_silent_node_and_a_split_target(tmp_pat
     with pytest.raises(ValueError, match="already holds a LoRA delta"):
         bind_module_lora(node, {"other": pool(spec)})
 
-    # a node that does not say how its rows meet the pool's segments
-    silent, root = nn.Module(), _build(case, CommGroup.trivial(), weights)
-    silent.inner = root
-    with pytest.raises(ValueError, match="lora_segment_rows"):
-        bind_module_lora(silent, {"lora": pool(spec)})
-    assert type(root.layers[0].qkv_proj) is QKVParallelLinear
-
     # a target the pool splits over 2 ranks, on a module built whole: wrong columns
+    root = _build(case, CommGroup.trivial(), weights)
     with pytest.raises(ValueError, match="whole on every rank"):
         bind_module_lora(_Node(root), {"lora": pool(spec, rank=0, world=2)})
     assert type(root.layers[0].qkv_proj) is QKVParallelLinear
+
+
+class _Declaring(NodeSubmodule):
+    """A node holding the root, whose ``declare_step`` returns ``steps[graph_walk]``."""
+
+    def __init__(self, root: nn.Module, steps: dict):
+        super().__init__()
+        self.inner, self.steps = root, steps
+
+    def prepare_inputs(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs):
+        return self.steps[graph_walk]
+
+
+def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
+    """From the step's segments, under each pool bound to the node's modules; a step's own
+    LoraStep is kept, and a step that is None or declares no segments gets none, so an
+    adapted module run under it refuses."""
+    case = CASES["linear"]
+    paths, _ = _adapters(case, tmp_path)
+    segments = [Segment("r0", "main", 3), Segment("r0", "uncond", 3), Segment("r1", "main", 2)]
+    own = LoraStep(segments=(Segment("r0", "main", 6),))
+    node = _Declaring(_build(case, CommGroup.trivial(), _weights(case)), {
+        "packed": SubmoduleStep(segments=segments, steps={"attn": AttentionStep(causal=False)}),
+        "own": SubmoduleStep(segments=segments, steps={"lora": own}),
+        "none": None,
+        "unsegmented": SubmoduleStep(steps={"attn": AttentionStep(segments=segments, causal=False)}),
+    })
+    node.bind_node_resources({"lora": pool(serve(_spec(case), paths))})
+    assert node.lora_keys == ("lora",)
+
+    def declared(walk):
+        return engine_step(node, graph_walk=walk, request_ids=["r0", "r1"], inputs=[])
+
+    assert declared("packed").steps["lora"].segments == tuple(segments)
+    assert declared("own").steps["lora"] is own
+    assert declared("none") is None
+    assert set(declared("unsegmented").steps) == {"attn"}
+    with pytest.raises(RuntimeError, match="no planned step"):
+        node.inner.layers[0].fc(rand(1, HIDDEN, seed=0))
 
 
 def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_where_specs_are_declared():

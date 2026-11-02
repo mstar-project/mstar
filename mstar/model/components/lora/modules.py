@@ -461,10 +461,8 @@ def _check(module: LoraCapable, declared: LoraTarget, shard: LoraTarget, path: s
 def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tuple[str, ...]:
     """Bind every module a ``module_lora_spec`` placed to its delta, for each LoRA pool
     among ``resources``; returns those pools' keys (empty, and nothing touched, when the
-    node serves no adapters).
-
-    The node must have said how its rows meet the pool's segments (``lora_segment_rows``), since
-    a step's ``LoraStep`` is what addresses each row to its adapter."""
+    node serves no adapters). The engine adds each pool's ``LoraStep`` to the node's
+    steps (``lora_rows``)."""
     from mstar.engine.resources.lora.pool import LoraAdapterPool
 
     pools: list[tuple[str, LoraAdapterPool]] = [
@@ -472,13 +470,6 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tupl
     ]
     if not pools:
         return ()
-    if not getattr(submodule, "lora_segment_rows", False):
-        raise ValueError(
-            f"{type(submodule).__name__} serves LoRA adapters but does not say how its rows "
-            "meet them: set `lora_segment_rows = True` when `declare_step`'s segments are, in "
-            "order, the rows its linears see (each a request's span of tokens), and the "
-            "engine adds the LoraStep"
-        )
     for key, pool in pools:
         spec = pool.spec
         module_map: ModuleLoraMap = spec.module_map

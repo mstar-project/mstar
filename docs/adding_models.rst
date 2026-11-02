@@ -1117,9 +1117,6 @@ weights root. For an autoregressive LLM node such as Orpheus's:
            embeddings=True,                # every embedding call is in the forward
        )]
 
-   class OrpheusLLMSubmodule(ARNodeSubmodule):
-       lora_segment_rows = True  # declare_step's segments lay out the rows its linears see
-
 The weights root states how the checkpoint lands on it once
 (``checkpoint_rules() -> CheckpointRules``: a prefix, a remap, the stacked-shard
 rules); its weight loader and ``module_lora_spec`` both use them, so adapters are
@@ -1173,12 +1170,13 @@ placed exactly as weights are.
 - **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module
   under ``root_path``, after checking it is the declared target and that the pool's
   shard is its rank-local shape (a module built whole on a TP node fails here, not in a
-  forward). It requires ``lora_segment_rows = True``: ``declare_step``'s segments are, in
-  order, the rows its linears see (a request may have several: Chatterbox's cond and
-  uncond copies), and the engine (``engine_step``) adds each pool's ``LoraStep`` from
-  them (Qwen3.5's vision encoder: one segment per frame, the merger's rows folding
-  them). A node whose step is ``None`` declares no rows, so one that serves adapters
-  returns a step with its segments even when nothing else needs one.
+  forward). The engine (``engine_step``) adds each pool's ``LoraStep`` to the node's
+  step from its segments, which are, in order, the rows its linears see (a request may
+  have several: Chatterbox's cond and uncond copies; Qwen3.5's vision encoder: one
+  segment per frame, the merger's rows folding them). A step that lays its rows out
+  otherwise declares its own ``LoraStep`` under the pool's key, which the engine keeps. A
+  step that is ``None`` or declares no segments gets none, and an adapted module it runs
+  refuses, so a node serving adapters returns a step with its segments wherever one runs.
 - **Only inside the step.** The pool holds a step's addressing from its plan to its
   commit (or rollback), for the thread that planned it, so a delta called outside a step
   (``prepare_inputs``, which the async worker runs on the main thread while the GPU

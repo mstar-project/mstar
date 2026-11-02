@@ -767,8 +767,8 @@ class Model(ABC):
         Built only when the deployment's YAML has a ``resources: lora:`` block (see
         ``serving_resources``): a deployment without one builds exactly what it did
         before. Usually by ``module_lora_spec`` from each node's weights root, whose
-        LoRA-capable modules the node then binds itself (``lora_segment_rows``). The conductor
-        opens each request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
+        LoRA-capable modules the node then binds itself. The conductor opens each
+        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
         """
         return []
 

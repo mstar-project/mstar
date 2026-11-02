@@ -845,15 +845,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
-    # A node serving LoRA from its modules (``module_lora_spec``) must say how its rows
-    # meet the pool: True when ``declare_step``'s segments are, in order, the rows its
-    # adapted linears see, each a request's span of tokens (a request may have several,
-    # as CFG's cond and uncond copies); ``engine_step`` then adds the pools'
-    # ``LoraStep``. A piecewise region that runs adapted modules must declare its rows in
-    # its own step too (a ``LoraStep`` per pool): nothing checks one that does not, whose
-    # deltas read whichever plan is current (an earlier capture's, the enclosing step's).
-    lora_segment_rows: bool = False
-    # the LoRA pools bound to this node's modules; set by `bind_node_resources`
+    # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
+    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step
+    # (``lora_rows``) from its segments: in order, the rows the adapted linears see, each
+    # a request's span of tokens (a request may have several, as CFG's cond and uncond
+    # copies). A step that lays its rows out otherwise declares its own ``LoraStep``
+    # under the pool's key.
     lora_keys: tuple[str, ...] = ()
 
     def __init__(self):
@@ -1456,30 +1453,23 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self.request_states.pop(request_id, None)
 
 
-def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
-    """What the engine calls for a node's step: its ``declare_step``, plus the LoRA
-    pools' steps for a node whose segments lay out its rows (``lora_segment_rows``), so
-    a model declaring LoRA from its modules writes no LoRA step."""
-    step = submodule.declare_step(*args, **kwargs)
-    # the engine drives duck-typed submodules too; one with pools bound is a NodeSubmodule,
-    # whose binding required lora_segment_rows
-    keys = getattr(submodule, "lora_keys", ())
-    if step is None or not keys:
-        return step
-    if step.segments is None:
-        raise ValueError(
-            f"{type(submodule).__name__} has lora_segment_rows but its step declares "
-            "no SubmoduleStep.segments to lay its LoRA rows out from"
-        )
-    segments = tuple(step.segments)
-    for key in keys:
-        if key in step.steps:
-            raise ValueError(
-                f"{type(submodule).__name__} declares its own step under {key!r}, which "
-                "engine_step adds from its segments"
-            )
-        step.steps[key] = LoraStep(segments=segments)
+def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
+    """``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare
+    itself, its rows the step's segments. A step without segments gets none: an adapted
+    module it runs refuses for want of a plan (``LoraLayerDelta``)."""
+    if lora_keys and step is not None and step.segments is not None:
+        segments = tuple(step.segments)
+        for key in lora_keys:
+            step.steps.setdefault(key, LoraStep(segments=segments))
     return step
+
+
+def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
+    """What the engine calls for a node's step: its ``declare_step``, with the LoRA
+    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
+    no LoRA step."""
+    # the engine drives duck-typed submodules too
+    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
 
 
 class ARNodeSubmodule(NodeSubmodule):
