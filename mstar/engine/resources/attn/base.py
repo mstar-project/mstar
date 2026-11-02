@@ -55,9 +55,14 @@ class AttentionManager(AttentionResource):
     # (`ContextParallelWrapper`'s ``check``)
     _plan_check = None
     # the sequence shard over its node (`AttentionSpec.derive`), set by `build`; and the shard
-    # itself where it can split (`bind_dependencies`), which sends `AttentionCallable` through `exchange`
+    # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
     _shard: SequenceShard | None = None
+
+    @property
+    def splits(self) -> bool:
+        """Whether this node's steps may split over SP ranks, so a call goes through `exchange`."""
+        return self._shard is not None
 
     # Remains abstract except for build; will build based
     # on the attention backend
