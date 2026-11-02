@@ -13,8 +13,9 @@ the renormalised rest, ties included. The noise is ``unfiltered._gumbel``'s, so
 rows draw independently of their position in the batch. A row at temperature 0
 takes the first index of the max, as the full sampler's greedy rows do.
 
-A node opts in with ``SamplerSpec.fused_draw``. Only ROCm has an implementation,
-so elsewhere the node samples as before.
+A node opts in with ``SamplerSpec.fused_draw``, up to ``FUSED_FILTER_MAX_VOCAB``,
+past which a row no longer fits a program's registers. Only ROCm has an
+implementation, so elsewhere the node samples as before.
 """
 
 from __future__ import annotations
@@ -28,8 +29,6 @@ from mstar.engine.resources.sampler.utils import _kth_largest_bits
 from mstar.kernels.numerics import Tolerance
 from mstar.kernels.registry import KernelOp, ShapePolicy
 
-# A program holds a row in registers (see ``FUSED_FILTER_MAX_VOCAB``)
-MAX_VOCAB = 16384
 _WARPS = 4
 
 
