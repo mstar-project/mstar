@@ -33,10 +33,10 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
     device_loopback_enabled,
 )
 from mstar.model.whisper.components import alignment
@@ -253,8 +253,8 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
     Not an ``EncoderDecoderNode`` like Canary's decoder: that node writes the
     context inside the prefill forward and captures only decode, while this
     one writes it eagerly in ``preprocess`` so the prefill walk can replay a
-    graph sized by the prompt alone. The token feedback, batch caps and
-    base stop condition are ``TokenStepNode``'s.
+    graph sized by the prompt alone. The token feedback and batch caps are
+    ``TokenStepNode``'s; the base stop condition is its ``token_stop``.
     """
 
     SAMPLER = SAMPLER
@@ -284,7 +284,10 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        self.stop_token_ids = frozenset({config.eos_token_id})
+        self.token_stop = TokenStop(
+            loop=self.DECODE_LOOP, buffer="new_token",
+            stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+        )
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
         self._language_mask: torch.Tensor | None = None
@@ -752,18 +755,18 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
             rows["ts_rules"] = next_rules
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
-    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
-        """The shared stop condition (EOS or the token cap) on a decode step's
-        token; a prompt walk's token never stops the loop. Either way the token
+    def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
+        """The shared stop condition (EOS) on a decode row's token; a prompt
+        walk's token never stops the loop. Either way the token
         is kept for the align walk first."""
-        if request_info.graph_walk != DECODE_WALK:
-            self._record_prompt_token(request_info, token)
+        if info.graph_walk != DECODE_WALK:
+            self._record_prompt_token(info, token)
             return False
-        self._record(request_info, token)
-        if super()._stops(token, request_info):
-            self.request_state(request_info.rid_handle).add("stopped", True)
-            return True
-        return False
+        self._record(info, token)
+        if not super()._token_stops(request_id, token, info):
+            return False
+        self.request_state(info.rid_handle).add("stopped", True)
+        return True
 
     def _record_prompt_token(self, info: CurrentForwardPassInfo, token: int) -> None:
         """For a word-timestamp request, keep what the align walk needs off a
@@ -795,21 +798,3 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         ):
             decoded.append(token)
 
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != DECODE_WALK:
-            # as check_stop: a prompt walk's token never stops the loop, and
-            # only a word-timestamp request keeps it
-            request_ids = [rid for rid in request_ids if request_infos[rid].step_metadata.get("word_timestamps")]
-            if not request_ids:
-                return {}
-        pairs = host_rows.first_values("new_token", request_ids)
-        if pairs is None:
-            return None
-        return {rid: {DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}

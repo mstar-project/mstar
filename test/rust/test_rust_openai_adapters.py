@@ -56,6 +56,7 @@ NOT_PORTED = {
     ("KokoroAdapter", "speech"),
     ("OmniVoiceAdapter", "speech"),
     ("Qwen3TTSAdapter", "speech"),
+    ("VoxCPM2Adapter", "speech"),
     ("DiffusionImageAdapter", "images"),
     ("LTX25Adapter", "videos"),
     ("Wan22Adapter", "videos"),

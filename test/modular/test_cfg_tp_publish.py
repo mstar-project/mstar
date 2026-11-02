@@ -77,16 +77,19 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
 
 
 def _tp2_manager(rank: int, entity_id: str, shm_dir: str) -> KVManager:
+    cfg = PagedKVConfig(
+        num_layers=1,
+        num_kv_heads=2,
+        num_qo_heads=2,
+        head_dim=1,
+        max_seq_len=16,
+        max_num_pages=8,
+        page_size=4,
+    )
+    # one rank's head, as ``KVManager.build`` shards it
+    cfg.shard(2)
     return KVManager(
-        cfg=PagedKVConfig(
-            num_layers=1,
-            num_kv_heads=2,
-            num_qo_heads=2,
-            head_dim=1,
-            max_seq_len=16,
-            max_num_pages=8,
-            page_size=4,
-        ),
+        cfg=cfg,
         name="kv",
         joint_comm_group=SimpleNamespace(rank=rank, world_size=2),
         transfer_engine_info=TransferEngineInfo(

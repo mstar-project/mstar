@@ -13,7 +13,15 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
@@ -23,9 +31,12 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopKind,
+    StopPolicy,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -54,6 +65,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MAX_BATCH_TOKENS = 512
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -95,6 +107,19 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if "text_inputs" not in inputs:
+            return None
+        return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def declare_step(
         self, graph_walk: str,
@@ -191,8 +216,13 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             engine_inputs=engine_inputs,
             text_inputs=text_inputs
         )
-        # row i is request i; a per-rid dict here would guard the compiled frame on the ids
-        return BatchedModelOutput(row_outputs={"new_token": new_tokens})
+        # Row i is request i; a per-rid dict here would guard the compiled frame
+        # on the ids. As the stop buffers too, the stop check reads one host
+        # copy of the rows, and the declared stop policies run in the runtime.
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self, request_id: str,
@@ -205,6 +235,12 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy]:
+        # check_stop's EOS / token-budget test, on every walk
+        return {"decode_loop": StopPolicy(
+            StopKind.AR, token_signal="new_token", eos_tokens=(self.config.stop_token_id,), sampler=SAMPLER,
+        )}
 
     def check_stop(
         self, request_id: str,

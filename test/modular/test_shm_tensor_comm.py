@@ -42,6 +42,12 @@ class MockCommunicator(BaseCommunicator):
     def get_all_new_messages(self) -> list:
         return []
 
+    def register_event_for_poll(self, event):
+        pass
+
+    def poll_for_messages(self, timeout_ms=20):
+        return False
+
 
 def _store_on_edges(mgr, rid, tensors, edges):
     """Store ``tensors`` and fill in the edges that carry them, holding one

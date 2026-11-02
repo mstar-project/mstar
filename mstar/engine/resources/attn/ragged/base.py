@@ -7,6 +7,8 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
+import itertools
+import weakref
 from collections.abc import Iterable
 
 import torch
@@ -39,8 +41,10 @@ def resolve_ragged_attn_backend(
 def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
     joint = info.joint_comm_group
-    if joint is not None:
-        config.shard(joint.world_size if config.shard_over_sp else joint.tp_group.world_size)
+    if config.shard_over_sp or joint is None:
+        config.shard(info.head_shards)
+    else:
+        config.shard(joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
@@ -48,7 +52,9 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
             "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
             "(the engine has no KV dtype to fall back on)."
         )
-    return manager_cls(device=info.device, dtype=dtype, config=config, **kwargs)
+    return manager_cls(
+        device=info.device, dtype=dtype, config=config, key=spec.resource_key, **kwargs,
+    )
 
 
 def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):
@@ -154,6 +160,34 @@ class RaggedBlockCausalAttnManager(AttentionResource):
         raise ValueError(f"Unknown ragged block-causal attention backend {backend!r}")
 
 
+# Live managers by op key, which is how the custom op below names one: an op
+# takes tensors and scalars, not objects. The op key is the resource key plus a
+# number unique in the process, so two engines in one process (tests,
+# harnesses) never reach each other's plans. Weak, so an entry goes with the
+# engine's last reference to it.
+_MANAGERS: weakref.WeakValueDictionary[str, "_RaggedManagerBase"] = weakref.WeakValueDictionary()
+_MANAGER_NUMBERS = itertools.count()
+
+
+@torch.library.custom_op("mstar::ragged_attention", mutates_args=())
+def ragged_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, key: str, label: str | None,
+) -> torch.Tensor:
+    """``_MANAGERS[key].run(q, k, v, label)`` as one node of a compiled graph.
+
+    Contract: returns a fresh tensor shaped like ``q`` in the manager's dtype,
+    and mutates no argument. Every backend's wrapper output is a new allocation,
+    or a clone of the graph-mode buffer the next call overwrites, so it aliases
+    neither an input nor anything a later call writes.
+    """
+    return _MANAGERS[key]._run(q, k, v, label)
+
+
+@ragged_attention.register_fake
+def _(q, k, v, key, label):
+    return q.new_empty(q.shape, dtype=_MANAGERS[key]._dtype)
+
+
 class _RaggedManagerBase:
     """What the self- and cross-attention managers share: persistent wrappers per
     (bucket, slot, label) and per (label, slot), the preplan protocol, and ``run``.
@@ -167,7 +201,10 @@ class _RaggedManagerBase:
         device: torch.device,
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
+        key: str,
     ):
+        self._key = f"{key}#{next(_MANAGER_NUMBERS)}"
+        _MANAGERS[self._key] = self
         self._config = config
         self._device = device
         self._dtype = dtype
@@ -318,6 +355,10 @@ class _RaggedManagerBase:
         self._preplanned = ctx.is_preplan
 
     def clear_preplan(self):
+        # The dropped plan's H2Ds went on the plan stream, and the step that runs
+        # instead waits on no event from it, so it must stage its layout itself.
+        for wrapper in self._preplan_states.values():
+            wrapper.forget_plan()
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
@@ -343,7 +384,6 @@ class _RaggedManagerBase:
             )
         return wrapper
 
-    @torch.compiler.disable
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         label: str | None = None, return_lse: bool = False,
@@ -352,11 +392,18 @@ class _RaggedManagerBase:
         also the log-sum-exp ``[total_tokens, H]`` (fp32, natural log), for merging
         attentions over disjoint key sets. The plan is the same either way.
 
-        Not behind a custom op, unlike the paged backend's ``run``: the ragged
-        caller (an encoder tower) has no per-layer KV write to keep in the same
-        graph, so the break this costs is one per layer of a region that is
-        CUDA-graph captured rather than compiled.
+        Traced by ``torch.compile`` with ``config.compile_op``, this is the
+        ``mstar::ragged_attention`` op: the region keeps one graph, and Inductor
+        fuses the pointwise work on either side of the attention. Otherwise, and
+        with ``return_lse`` (the op returns only the output), a compiled caller
+        breaks here, and an eager one calls the kernel directly.
         """
+        if self._config.compile_op and not return_lse and torch.compiler.is_compiling():
+            return ragged_attention(q, k, v, self._key, label)
+        return self._run(q, k, v, label, return_lse)
+
+    @torch.compiler.disable
+    def _run(self, q, k, v, label, return_lse=False):
         if return_lse:
             return self._wrapper(label).run(q, k, v, return_lse=True)
         return self._wrapper(label).run(q, k, v)
@@ -373,7 +420,6 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
             wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
-            # TODO: cache the latest plan state
             wrapper.plan(cu_seqlens=self._cu_seqlens(segments), causal=step.causal)
             plan_states[label] = wrapper
 

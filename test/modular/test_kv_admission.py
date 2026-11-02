@@ -36,6 +36,7 @@ from test_kv_prefix_lease import (
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.arena import PageArena
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -47,7 +48,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.keys import chain, fingerprint
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -513,6 +514,7 @@ def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None
         return "rolled back"
     kv.plan(step, ctx)
     kv.commit(step, ctx)
+    kv.after_output_copy(step)
     return "committed"
 
 
@@ -592,11 +594,14 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _manager(max_num_pages=20)
     kv._cpu_pool = host._HostPool(64)
+    # the stub comes after `enable_prefix_cache`, so open the writes here
+    kv._open_host_writes()
 
     log = _drive(kv, random.Random(SEED), ops=10_000)
 
     for op in ("committed", "rolled back", "dropped", "refused", "reset", "offload", "reload", "remove"):
         assert sum(line.startswith(op) for line in log) >= 10, f"seed {SEED}: too few {op!r} to say anything"
+    assert kv._cpu_pool.written >= 10, f"seed {SEED}: too few pages written ahead of eviction to say anything"
     for rid in list(kv._streams):
         _remove(kv, rid)
     host._land(kv)

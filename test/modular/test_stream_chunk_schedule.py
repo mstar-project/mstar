@@ -153,10 +153,18 @@ def test_primed_stream_delivers_its_lead_as_first_window_context():
 
 
 def test_prime_is_bounded_and_only_for_context_policies():
-    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3)
+    # the first chunk may lead with more context than later ones carry (a
+    # stateful consumer warming up once, with no context after)
+    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=0)
+    policy.prime(4)
+    assert policy.window_size() == 5 and policy.next_chunk_size(5) == 5
+    policy.register_chunk(5)
+    assert policy.window_size() == 2
     with pytest.raises(ValueError):
-        policy.prime(4)
-    policy.prime(0)
+        policy.prime(1)   # only before the first chunk
+    with pytest.raises(ValueError):
+        ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3).prime(-1)
+    ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3).prime(0)
     with pytest.raises(NotImplementedError):
         FixedChunkPolicy(chunk_size=3).prime(1)
     FixedChunkPolicy(chunk_size=3).prime(0)

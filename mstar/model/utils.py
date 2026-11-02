@@ -5,10 +5,12 @@ import re
 from collections.abc import Container
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
-from safetensors.torch import safe_open
+
+# safetensors is imported where it is used: mstar.model.base imports this
+# module, and safetensors is not a core dependency.
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,8 @@ def load_weights_from_file(
     modules: list[ModuleAndPrefix],
     device: str = "cpu",
 ):
+    from safetensors.torch import safe_open
+
     # Precompute expected keys for each module
     module_key_maps = []
     for mod in modules:
@@ -253,6 +257,8 @@ def load_weights_from_hf_shards(
     ``model.safetensors`` (no index — e.g. whisper-large-v3) are handled by
     treating that one file as the whole weight map.
     """
+    from safetensors.torch import safe_open
+
     repo_dir = Path(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
@@ -374,6 +380,14 @@ class ByteLevelDetokenizer:
                 continue
             if decoded == text:
                 self.verbatim[i] = text.encode("utf-8")
+        self._token_bytes: dict[int, bytes] = {}
+
+    def token_bytes(self, token_id: int) -> bytes:
+        """``to_bytes([token_id])``, memoized: a decode step's chunk is one token."""
+        data = self._token_bytes.get(token_id)
+        if data is None:
+            data = self._token_bytes[token_id] = self.to_bytes([token_id])
+        return data
 
     def _byte_map(self, token: str) -> bytes:
         try:
@@ -419,7 +433,7 @@ class TextChunkDetokenizer:
     per-step ``decode``.
     """
 
-    __slots__ = ("tokenizer", "_bytes")
+    __slots__ = ("tokenizer", "_bytes", "_decoded")
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -427,11 +441,31 @@ class TextChunkDetokenizer:
             ByteLevelDetokenizer(tokenizer, keep_special=True)
             if ByteLevelDetokenizer.is_byte_level(tokenizer) else None
         )
+        self._decoded: dict[int, bytes] = {}
 
     def to_bytes(self, token_ids: list[int]) -> bytes:
         if self._bytes is None:
             return self.tokenizer.decode(token_ids).encode("utf-8")
         return self._bytes.to_bytes(token_ids)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        """``to_bytes([token_id])``, memoized."""
+        if self._bytes is not None:
+            return self._bytes.token_bytes(token_id)
+        data = self._decoded.get(token_id)
+        if data is None:
+            data = self._decoded[token_id] = self.to_bytes([token_id])
+        return data
+
+
+class TextOutput(NamedTuple):
+    """How a model's text output, token ids, becomes bytes: ``Model.text_output``
+    declares it, and ``Model.postprocess`` and ``Model.postprocess_inline``
+    derive their text paths from it."""
+
+    detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer
+    # ids that end a reply, dropped unless the request sets ``ignore_eos``
+    stop_token_ids: Container[int] = frozenset()
 
 
 def drop_stop_tokens(
@@ -542,6 +576,7 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     queues the rest. Warnings go to the model's ``log``.
     """
     from mstar.engine.resources import KVSpec, PagedKVConfig
+    from mstar.engine.resources.spec import apply_yaml_overrides
 
     cap = config.get("max_concurrent_requests")
     if cap is None:
@@ -553,22 +588,27 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
         raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-    overrides = config.get("resources") or {}
-    for spec in model.get_node_resources():
+    specs = model.get_node_resources()
+    try:
+        # as a server builds them: the deployment's overrides, and what the pools derive
+        apply_yaml_overrides(specs, config)
+    except ValueError:
+        return  # a `resources:` block the validation's resource checks report
+    for spec in specs:
         # paged caches only: a ring buffer is sized by its window, not by requests
         if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
             continue
-        kv, override = spec.config, overrides.get(spec.resource_key) or {}
-        page_size = int(override.get("page_size", kv.page_size))
-        max_seq_len = int(override.get("max_seq_len", kv.max_seq_len))
-        max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
-        need = kv_pages(max_seq_len, page_size, cap)
-        if need > max_num_pages:
+        kv = spec.config
+        # in arena pages: a request at full length holds every token of every group, a window's
+        # too, since a one-step prefill keeps its whole prompt until it commits
+        per_request = sum(-(-kv.max_seq_len // group.page_size) for group in kv.groups)
+        need = 1 + cap * per_request
+        if need > kv.num_units:
             raise ValueError(
                 f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                f"need {need} pages of resources.{spec.resource_key} "
-                f"({-(-max_seq_len // page_size)} per request and the sink page), "
-                f"which has {max_num_pages}; raise max_num_pages or lower "
+                f"need {kv.pages_of(need, round_up=True)} pages of resources.{spec.resource_key} "
+                f"({kv.pages_of(per_request, round_up=True)} per request and the sink page), "
+                f"which has {kv.max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
 

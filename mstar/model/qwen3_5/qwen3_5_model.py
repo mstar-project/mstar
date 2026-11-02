@@ -82,8 +82,8 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
-from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.model.utils import TextOutput
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -166,8 +166,6 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
 
-    _text_detokenizer: TextChunkDetokenizer | None = None
-
     def __init__(
         self,
         model_path_hf: str,
@@ -237,6 +235,7 @@ class Qwen3_5DenseModel(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(_MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
@@ -305,6 +304,16 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
@@ -585,7 +594,8 @@ class Qwen3_5DenseModel(Model):
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(
@@ -597,18 +607,18 @@ class Qwen3_5DenseModel(Model):
         return self._resolve_weights()
 
 
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._chunk_detokenizer(), self.config.stop_token_ids)
+
     def postprocess(
-            self,
-            output: torch.Tensor,
-            modality: str,
-            request_kwargs: dict | None = None,
-        ) -> bytes:
-            if modality == "text":
-                ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                    self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-                return self._text_detokenizer.to_bytes(ids)
-            raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+        self,
+        output: torch.Tensor,
+        modality: str,
+        request_kwargs: dict | None = None,
+    ) -> bytes:
+        if modality == "text":
+            return super().postprocess(output, modality, request_kwargs)
+        raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass args
@@ -794,8 +804,8 @@ class Qwen3_5DenseModel(Model):
             edge.tensor_info = persist_signals.get("new_token", [])
             inputs = [edge]
         else:
-            # decode stops via `LLMSubmodule.check_stop`; reaching here again
-            # after it fires means the request is finished
+            # decode stops via `LLMSubmodule.check_stop` or the loop cap;
+            # reaching here again after either means the request is finished
             metadata.kwargs["decode_finished"] = True
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -825,7 +835,9 @@ class Qwen3_5DenseModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
+        keys = [
+            "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos", "return_logprobs", "logprobs_mode",
+        ]
         return {
             SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs[k] for k in keys if k in model_kwargs}

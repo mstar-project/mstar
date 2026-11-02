@@ -20,7 +20,7 @@ import pytest
 import torch
 from test_ingest_unpersist import _conductor, _ToyModel
 
-from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
@@ -99,6 +99,10 @@ class _Model:
     def max_input_files(self):
         return {}
 
+    def checkpoint_path(self):
+        # a model that names no checkpoint and sets no salt keys nothing
+        return "/a/checkpoint"
+
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},
@@ -131,7 +135,10 @@ def _worker(model, model_config: dict | None) -> PreprocessWorkerThread:
 
 
 def _deployment(page_size: int = PAGE_SIZE) -> dict:
-    return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
+    return {
+        "model": "stub", "resources": {"kv": {"page_size": page_size}},
+        "node_groups": [{"node_names": ["LLM"], "ranks": [0]}],
+    }
 
 
 def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
@@ -329,6 +336,30 @@ def test_each_resource_config_is_handed_only_its_own_chain():
     )
     assert configs["other_kv"].prefix_keys is None, (
         "a resource was handed another resource's chain"
+    )
+
+
+def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
+    class _Thinker:
+        """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
+
+        def get_node_resources(self):
+            return [KVSpec("kv", {"Thinker"}, PagedKVConfig(
+                num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=PAGE_SIZE,
+            ))]
+
+        def checkpoint_path(self):
+            return "/a/checkpoint"
+
+    # qwen3omni_thinker_tp2's placement: rank 2 holds none of the cache's nodes
+    config = {"node_groups": [
+        {"node_names": ["Thinker"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["audio_encoder", "vision_encoder"], "ranks": [0]},
+        {"node_names": ["Talker"], "ranks": [2]},
+        {"node_names": ["Code2Wav"], "ranks": [2]},
+    ]}
+    assert _kv_page_sizes(_Thinker(), config) == {}, (
+        "every prompt was keyed and its media hashed for a cache no engine opens"
     )
 
 

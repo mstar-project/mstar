@@ -16,9 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from api_server_helpers import StandInSocket
 
-from mstar.api_server.data_worker import PreprocessWorker
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import ResultTensors, ResultTokens
+from mstar.communication.event import EventWakeup
 from mstar.communication.tensor_store import TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.conductor import Conductor, RequestData
@@ -164,10 +166,7 @@ def api_server() -> PreprocessWorker:
 def deliver(worker: PreprocessWorker, chunk) -> None:
     """One chunk message as the API server's message loop hands it over."""
     if isinstance(chunk, ResultTokens):
-        for i, rid in enumerate(chunk.request_ids):
-            worker.new_result_token(
-                rid, chunk.values[i], chunk.loop_indices[i], chunk.signal, chunk.modality,
-            )
+        worker.new_result_tokens(chunk.request_ids, chunk.values, chunk.signal, chunk.modality)
     else:
         assert isinstance(chunk, ResultTensors)
         worker.new_result_tensors(chunk)
@@ -248,12 +247,13 @@ def test_request_is_held_until_its_last_chunk(shape, inline):
     assert_holds_until_last_chunk(recorder.chunks(), recorder.reports())
 
 
-class _ScriptedApiComm:
+class _ScriptedApiComm(StandInSocket):
     """The API server's inbox: one scripted batch per loop pass, stopping the
     loop when the script runs out. Records whether the client had been
     released before each pass."""
 
     def __init__(self, server, batches, req):
+        super().__init__()
         self.server, self.batches, self.req = server, list(batches), req
         self.released_before = []
 
@@ -294,10 +294,14 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline):
     worker.profile_queue = queue.Queue()
     worker.reads_done_queue = queue.Queue()
     worker._signal = lambda: None
-    # the data worker's thread, collapsed: a queued read completes at once
-    worker.result_tensor_input_queue = SimpleNamespace(put=lambda item: worker.output_queue.put(
-        ResultChunk(request_id=item.request_id, modality="text", data=b"x", metadata={}),
-    ))
+    worker.results_wakeup = EventWakeup()
+
+    # the data worker's thread, collapsed: a queued read completes at once, and
+    # a frame's inline values (one InlineTokens per frame) give a chunk per request
+    def complete_at_once(item):
+        for rid in item.request_ids if isinstance(item, InlineTokens) else [item.request_id]:
+            worker.output_queue.put(ResultChunk(request_id=rid, modality="text", data=b"x", metadata={}))
+    worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
     server.running = True
@@ -324,9 +328,9 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline):
 
     assert req.event.is_set() and req.error is None
     assert len(req.chunks) == len(chunks)
-    # Not released until the pass after the one that read the last chunk (the
-    # loop prunes at the top of a pass); before the fix it was released right
-    # after request_complete.
+    # Released by the pass that read the last chunk (the loop prunes at the
+    # end of a pass), so the next pass is the first to see it; before the fix
+    # it was released right after request_complete.
     released = server.communicator.released_before
     last_chunk_pass = len(batches) - 2
     assert released.index(True) == last_chunk_pass + 1, released

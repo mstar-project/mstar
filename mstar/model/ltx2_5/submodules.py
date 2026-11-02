@@ -35,7 +35,6 @@ from mstar.engine.resources import (
     SubmoduleStep,
     cross_label,
 )
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
@@ -341,15 +340,15 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         self._attends = None  # the memoized callables hold the old resources
 
     def attends(self) -> LTX2Attends:
-        """The six attentions' callables, built once per resource binding: a compiled
-        region guards on their identity (see ``DenoiseLoopSubmodule.ragged_for``)."""
+        """The six attentions' callables, built once per resource binding rather than
+        per step."""
         if self._attends is None:
             def on(key, label):
                 resource = self.node_resources.get(key) if self.use_ragged_attention else None
                 if resource is None:
                     return sdpa_attention
                 # every row has the bucket's spans, so [B, L, H, D] packs per request
-                return functools.partial(joint_attention, ragged=RaggedAttentionCallable(resource, label))
+                return functools.partial(joint_attention, ragged=functools.partial(resource.run, label=label))
             self._attends = LTX2Attends(
                 video_self=on(VIDEO_ATTN, VIDEO_SPAN),
                 audio_self=on(AUDIO_ATTN, AUDIO_SPAN),
@@ -492,9 +491,11 @@ class _WarmedDecoder(nn.Module):
 
 
 class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
-    """Packed fp32 video latents ``[Lv, 128]`` -> uint8 frames ``[3, F, H, W]``, through the
-    convolutional VAE. The reference casts the final latents to bf16 before
-    denormalizing; quantizing at the worker boundary keeps the edge one byte per channel."""
+    """Packed fp32 video latents ``[Lv, 128]`` -> uint8 rgb24 frames ``[F, H, W, 3]``, through
+    the convolutional VAE. The reference casts the final latents to bf16 before
+    denormalizing; quantizing at the worker boundary keeps the edge one byte per channel,
+    and laying the frames out on the GPU as PyAV encodes them saves the API server a
+    host copy out of a strided view."""
 
     disable_torch_compile = True
     output_keys = (VIDEO_OUTPUT,)
@@ -562,7 +563,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         self.vae.use_tiling = self._tiled(shape)
         video = self.vae.decode(x, None, return_dict=False)[0]
         frames = ((video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
-        return {VIDEO_OUTPUT: frames}
+        return {VIDEO_OUTPUT: frames.permute(0, 2, 3, 4, 1).contiguous()}
 
 
 class LTXAudioDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):

@@ -14,6 +14,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.kokoro.components import KokoroTTS  # noqa: E402
@@ -69,6 +70,7 @@ def _engine(submodule: KokoroSynthSubmodule) -> Engine:
     engine._submodules = {SYNTH_NODE: type("Mgmt", (), {"submodule": submodule, "resources": {}})()}
     engine._enable_nvtx = False
     engine._loopback_steps = {}
+    engine._chunking = ChunkingManagement(engine._submodules)
     return engine
 
 

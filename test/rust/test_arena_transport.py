@@ -36,12 +36,13 @@ class _NullCommunicator:
         return []
 
 
-def _manager(entity, tmp_path):
+def _manager(entity, tmp_path, copy_workers=1):
     os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
     os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
     return ArenaShmCommunicationManager(
         my_entity_id=entity, hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+        copy_workers=copy_workers,
     )
 
 
@@ -899,12 +900,18 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
 
 
+@pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
-def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, dtype):
+def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel):
     """A CPU consumer's tensor is a copy: the producer reclaiming the slot and
-    staging another tensor into it must not change what was read."""
+    staging another tensor into it must not change what was read. ``parallel``
+    takes the copier's sliced path, which a video read uses."""
+    from mstar.utils import host_copy
+
+    monkeypatch.setattr(host_copy, "MIN_SLICE_BYTES", 1)
     prod = _manager("w0", tmp_path)
-    cons = _manager("w1", tmp_path)
+    cons = _manager("w1", tmp_path, copy_workers=4 if parallel else 1)
+    assert cons._host_copier.slices(1152) == (4 if parallel else 1)
     original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
         torch.arange(3 * 16 * 24) % 251).to(dtype)
     original = original.reshape(1, 3, 16, 24)

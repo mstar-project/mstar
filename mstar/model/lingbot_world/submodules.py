@@ -38,7 +38,6 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
-from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.lingbot_world.components.camera import plucker_embedding
@@ -50,7 +49,7 @@ from mstar.model.lingbot_world.components.dit import (
 )
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule, StepOrder
 from mstar.model.wan22.submodules import _SingleRequestMixin
 
 logger = logging.getLogger(__name__)
@@ -235,6 +234,12 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         # float frames in the request state.
         self.keep_chunk_outputs = False
 
+    def step_order(self, graph_walk: str) -> StepOrder:
+        """Every rollout chunk emits frames to the client, so a session's
+        stream keeps moving while others run."""
+        del graph_walk
+        return StepOrder.TURNS
+
     def bind_node_resources(self, resources) -> None:
         super().bind_node_resources(resources)
         self._attention = None
@@ -252,7 +257,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
                 self._attention = REFERENCE_ATTENTION
             else:
                 def on(kv_label):
-                    ragged = RaggedAttentionCallable(resource, cross_label(CHUNK_SPAN, kv_label))
+                    ragged = functools.partial(resource.run, label=cross_label(CHUNK_SPAN, kv_label))
                     return functools.partial(joint_attention, ragged=ragged)
                 self._attention = DitAttention(window=on(WINDOW_SPAN), text=on(TEXT_SPAN))
         return self._attention
