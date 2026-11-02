@@ -11,7 +11,6 @@ consumer can rely on it instead of re-deriving the policy's schedule.
 import pytest
 import torch
 
-from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import (
     FixedChunkPolicy,
     LeftContextChunkPolicy,
@@ -124,9 +123,9 @@ def test_returned_streaming_edge_keeps_its_chunk_info():
     buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker",
                           policy=FixedChunkPolicy(chunk_size=3))
     info = StreamChunkInfo(start_offset=7, context_items=3, num_items=12, is_final=True)
-    edge = GraphEdge(next_node="Codec", name="codec_tokens", _final_stream_chunk=True)
-    buffer.store_uningested_edge(StreamingEdge(edge, info))
-    assert buffer.pop_waiting_edge() == (edge, info)
+    edge = StreamingEdge("codec_tokens", "Codec", [7, 8, 9], info)
+    buffer.store_uningested_edge(edge)
+    assert buffer.pop_waiting_edge() == edge
     assert buffer.pop_waiting_edge() is None
 
 
@@ -153,10 +152,18 @@ def test_primed_stream_delivers_its_lead_as_first_window_context():
 
 
 def test_prime_is_bounded_and_only_for_context_policies():
-    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3)
+    # the first chunk may lead with more context than later ones carry (a
+    # stateful consumer warming up once, with no context after)
+    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=0)
+    policy.prime(4)
+    assert policy.window_size() == 5 and policy.next_chunk_size(5) == 5
+    policy.register_chunk(5)
+    assert policy.window_size() == 2
     with pytest.raises(ValueError):
-        policy.prime(4)
-    policy.prime(0)
+        policy.prime(1)   # only before the first chunk
+    with pytest.raises(ValueError):
+        ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3).prime(-1)
+    ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3).prime(0)
     with pytest.raises(NotImplementedError):
         FixedChunkPolicy(chunk_size=3).prime(1)
     FixedChunkPolicy(chunk_size=3).prime(0)

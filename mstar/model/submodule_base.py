@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -72,6 +72,10 @@ class TokenStop(NamedTuple):
     # for a prompt prefilled over several passes: the ``step_metadata`` flag of
     # the pass whose token is the reply's (earlier passes' tokens are not)
     last_prefill_flag: str | None = None
+    # the graph runtime checks ``walk``'s stop ids itself, without calling
+    # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
+    # check_stop, which can end the partition
+    runtime_check: bool = False
 
 
 class StopCheck(NamedTuple):
@@ -129,6 +133,76 @@ class InputMetadata(NamedTuple):
 
 
 EMPTY_INPUT_METADATA = InputMetadata()
+
+
+class StopKind(Enum):
+    """How a loop's stop is decided after each step (``StopPolicy``)."""
+    # the sampled token is one of the policy's EOS ids (unless the request
+    # ignores EOS), or the loop reached the request's iteration limit
+    AR = "ar"
+    # only the iteration limit
+    ITER = "iter"
+    # only the EOS ids: the loop's cap (``Model.get_loop_caps``) is its budget
+    EOS = "eos"
+
+
+class StopLimits(NamedTuple):
+    """One request's limits under a ``StopPolicy``."""
+    # None: no iteration limit (``StopKind.EOS``)
+    max_iters: int | None
+    ignore_eos: bool
+
+
+@dataclass(frozen=True)
+class StopPolicy:
+    """A loop's stop check, declared so the graph runtime can run it without
+    calling ``check_stop`` (``NodeSubmodule.get_stop_policies``).
+
+    A row stops the loop when ``stops`` says so, given the loop's iteration
+    count as of the step (what ``check_stop`` reads as
+    ``dynamic_loop_iter_counts.get(loop, 0)``) and, for ``AR`` and ``EOS``,
+    the row's ``token_signal`` value.
+    """
+    kind: StopKind
+    # AR, EOS: the output signal carrying the sampled token, read off the host
+    # rows; the first value of the row
+    token_signal: str | None = None
+    # any iterable of ids; held as a frozenset
+    eos_tokens: frozenset[int] = frozenset()
+    # AR, EOS: the resource label whose request config carries ``ignore_eos``;
+    # None means EOS is never ignored
+    sampler: str | None = None
+    # the request's iteration limit for this loop; evaluated once per request
+    # and walk, not per step. None is ``info.max_tokens``.
+    max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
+
+    def __post_init__(self):
+        if self.reads_token and self.token_signal is None:
+            raise ValueError(f"a {self.kind.name} StopPolicy needs a token_signal")
+        object.__setattr__(self, "eos_tokens", frozenset(self.eos_tokens))
+
+    @property
+    def reads_token(self) -> bool:
+        return self.kind is not StopKind.ITER
+
+    def limits(self, info: CurrentForwardPassInfo) -> StopLimits:
+        """One request's limits, from its forward-pass info."""
+        max_iters = None
+        if self.kind is not StopKind.EOS:
+            max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
+        ignore_eos = False
+        if self.reads_token and self.sampler is not None:
+            config = info.resource_configs.get(self.sampler)
+            ignore_eos = bool(getattr(config, "ignore_eos", False))
+        return StopLimits(max_iters, ignore_eos)
+
+    def stops(self, count: int, token: int | None, limits: StopLimits) -> bool:
+        """Whether a row with the loop at ``count`` and sampled ``token``
+        stops it: the count plus one reaches the limit, or (``AR``, ``EOS``)
+        the token is an EOS id the request does not ignore."""
+        return (limits.max_iters is not None and count + 1 >= limits.max_iters) or (
+            self.reads_token and not limits.ignore_eos and token in self.eos_tokens
+        )
 
 
 @dataclass
@@ -332,6 +406,16 @@ class NodeInputs:
     # The request's real walk, stamped by the engine; None on capture templates
     graph_walk: str | None = None
 
+    # Set by the engine on a chunk of a split input: where it starts, and the
+    # whole input's length. None means not chunked.
+    chunk_start: int = 0
+    chunk_total: int | None = None
+
+    @property
+    def is_final_chunk(self) -> bool:
+        return self.chunk_total is None or \
+            self.chunk_start + self.input_seq_len >= self.chunk_total
+
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
 
@@ -382,6 +466,89 @@ def _split_pos_ids(
             "cannot be told apart; override `split_inputs`"
         )
     return pos_ids[..., start:end]
+
+
+@dataclass(frozen=True)
+class ChunkingPolicy:
+    """How a walk's prefill may be split across steps; the default is not at all.
+
+    ``walks``: the walks this policy covers. Declared per node on the model
+    (``Model.get_chunking_policies``) rather than on the submodule, because
+    the graph build needs it: a chunkable node is wrapped in a Loop for
+    exactly these walks, and a chunk is one iteration of it.
+
+    ``accumulated_outputs``: output edges a consumer needs every chunk of,
+    gathered on the Loop and handed over as one item per chunk when the
+    prompt finishes. A streamed edge's consumer gets them joined into one item
+    by its ``StreamBuffer`` (``Connection.join_dim``). An edge not named here
+    or in ``per_chunk_outputs`` carries the final chunk's tensors alone.
+
+    ``per_chunk_outputs``: streaming output edges sent on every chunk as it
+    runs, each chunk's piece an item of its own, for a consumer that can
+    start on a prefix (``ChunkPolicy.allow_partial_input``, checked at load).
+    Disjoint from ``accumulated_outputs``.
+
+    ``reserve_whole_prefill``: whether a first chunk reserves the KV the
+    whole prefill needs, so a part-done row cannot wedge on a full arena.
+    Counted in tokens, so a walk whose KV grows by something else sets False
+    and reserves per chunk.
+    """
+    walks: tuple[str, ...] = ()
+    # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
+    chunkable: bool = False
+    accumulated_outputs: frozenset[str] = frozenset()
+    per_chunk_outputs: frozenset[str] = frozenset()
+    # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
+    max_batch_tokens: int | None = None
+    # whether a row may start past its cached prefix, asked before prepare; None is always
+    reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
+    reserve_whole_prefill: bool = True
+
+    def __post_init__(self):
+        both = self.accumulated_outputs & self.per_chunk_outputs
+        if both:
+            raise ValueError(
+                f"outputs {sorted(both)} are both gathered and sent per chunk; name each in one"
+            )
+
+
+NO_CHUNKING = ChunkingPolicy()
+
+
+# A chunk Loop's count before its prompt's first chunk sets the real cap (the
+# prompt's length), and the stride of a row that runs whole: it ends the Loop.
+# Within the u32 the runtime holds loop counters in.
+CHUNK_LOOP_END = 2**31 - 1
+
+
+def chunk_loop_name(node_name: str, graph_walk: str) -> str:
+    """The Loop a chunkable ``(node, walk)``'s prefill runs as.
+
+    Derived rather than declared so the graph build, the engine's stop check
+    and the startup validation all name the same loop without passing it
+    around. Per walk, not per node: a node can chunk under several walks and
+    each has its own loop state.
+    """
+    return f"chunk_loop:{node_name}:{graph_walk}"
+
+
+def chunk_tick_name(node_name: str, graph_walk: str) -> str:
+    """The chunk Loop's loop-back signal, carrying nothing.
+
+    Speculation offers a next-iteration target only for a node that routes an
+    edge back to itself, so without this a chunk-only step is a pipeline
+    bubble. The node declares it as an input too -- an edge it does not read is
+    no loop-back, just an output nobody consumes -- which leaves it unready for
+    its FIRST chunk, so the conductor seeds one with the request's inputs.
+    """
+    return f"{chunk_loop_name(node_name, graph_walk)}.next_chunk"
+
+
+class InputSeqLenInfo(NamedTuple):
+    """A row's token count before ``prepare_inputs``, for admission."""
+    seq_len: int
+    # leading tokens the prefix cache already holds, not counted in ``seq_len``
+    cached_prefix: int = 0
 
 
 @dataclass
@@ -554,6 +721,11 @@ class ModelInputsFromEngine:
     # ``sampler``). Empty when the submodule opts into no piecewise graphs or
     # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
     piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
+    # label -> the slot this step leased on that region (``lease_before_step``
+    # regions). A forward replays such a region exactly when its label is
+    # here: a bucket that fits is not enough, since ``can_lease`` may have
+    # refused the batch, and the step declared its own attention instead.
+    piecewise_leases: "Mapping[str, SlotLease]" = field(default_factory=dict)
 
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
@@ -693,6 +865,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
         None (the default) means the walk has a single capture.
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
+        return None
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        """This row's token count, read from input shapes alone; None when the
+        walk does not declare one. A chunkable walk's prompts are cut into
+        chunks by it, so it must equal ``prepare_inputs().input_seq_len`` of the
+        whole input (before any cached prefix is removed), or the row fails
+        at its first chunk."""
+        del graph_walk, fwd_info, inputs, kwargs
         return None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
@@ -872,6 +1056,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         declaring and admitting a second time."""
         del graph_walk
         return False
+
+    def speculative_input_seq_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        prev_seq_len: int,
+    ) -> int | None:
+        """The span of a row continuing from the step in flight, estimated
+        before that step's outputs reach it. ``prev_seq_len`` is its span in
+        that step, or -1 if it ran on another node. The default repeats the
+        last span on this node and has no estimate otherwise; a walk that
+        fixes its span (one token a decode step) should say so. Only an
+        estimate, which sizes the token budget left for the rows merged in
+        beside it."""
+        del graph_walk, fwd_info
+        return prev_seq_len if prev_seq_len >= 0 else None
 
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
         """Loop-back input signals of this walk whose per-row value the node
@@ -1141,6 +1339,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return set()
 
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        """The stop check ``check_stop`` amounts to on ``graph_walk``, per
+        loop it can stop, if it is only these, so the graph runtime can run
+        them without calling it.
+
+        None (the default) means ``check_stop`` decides; an empty dict means
+        it never stops a loop on this walk. Asked once per walk, at startup.
+        Every policy must agree with ``check_stop`` for every row.
+        """
+        return None
+
     def check_stop_batched(
         self, request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
@@ -1180,6 +1389,17 @@ class ARNodeSubmodule(NodeSubmodule):
     # Set (in ``__init__``, where the stop ids are known) by a submodule whose
     # sampled token ends a dynamic loop; the stop checks below follow from it.
     token_stop: TokenStop | None = None
+
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        stop = self.token_stop
+        if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
+            return super().get_stop_policies(graph_walk)
+        if stop.walk is not None and graph_walk != stop.walk:
+            return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
+        # the budget is the loop's cap, which the runtime enforces
+        return {stop.loop: StopPolicy(
+            StopKind.EOS, token_signal=stop.buffer, eos_tokens=stop.stop_ids, sampler=stop.sampler,
+        )}
 
     def check_stop(
         self, request_id: str,
