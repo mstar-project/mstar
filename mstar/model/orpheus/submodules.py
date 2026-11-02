@@ -13,7 +13,15 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
@@ -23,6 +31,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -31,6 +40,15 @@ from mstar.model.submodule_base import (
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
+
+
+def token_stop(stop_token_id: int) -> TokenStop:
+    """The decode loop's stop id, checked by the graph runtime on every walk;
+    the loop's cap is the token budget."""
+    return TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER,
+        runtime_check=True,
+    )
 
 
 class OrpheusLLMSubmodule(ARNodeSubmodule):
@@ -52,10 +70,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
         self.config = config
-        self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token",
-            stop_ids=frozenset({config.stop_token_id}), sampler=SAMPLER,
-        )
+        self.token_stop = token_stop(config.stop_token_id)
         # The LM head computes the custom-token rows alone and reads -inf for
         # the text rows (``output_start``), so the stop token must be one of them.
         if config.stop_token_id < config.custom_token_base_id:
@@ -63,6 +78,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MAX_BATCH_TOKENS = 512
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -104,6 +120,19 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if "text_inputs" not in inputs:
+            return None
+        return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def declare_step(
         self, graph_walk: str,
@@ -200,9 +229,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             engine_inputs=engine_inputs,
             text_inputs=text_inputs
         )
-        # row i is request i; a per-rid dict here would guard the compiled frame on the ids.
-        # As stop buffers too, the stop check reads one host copy of the rows
-        # instead of one per request.
+        # Row i is request i; a per-rid dict here would guard the compiled frame
+        # on the ids. As the stop buffers too, the stop check reads one host
+        # copy of the rows, and the declared stop policies run in the runtime.
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
             check_stop_buffers={"new_token": new_tokens},
@@ -219,7 +248,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-
 
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz streaming decoder submodule.

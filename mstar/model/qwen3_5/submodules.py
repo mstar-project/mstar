@@ -17,6 +17,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
+    DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
@@ -71,15 +72,32 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
     TokenStop,
 )
 from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 logger = logging.getLogger(__name__)
+
+
+def token_stop(stop_token_ids) -> TokenStop:
+    """The LLM's stop: a decode row's stop id, checked by the graph runtime."""
+    return TokenStop(
+        loop="decode_loop", buffer="new_token", stop_ids=frozenset(stop_token_ids),
+        sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
+        last_prefill_flag="last_prefill", runtime_check=True,
+    )
+
+
+def _mixed_token_buckets(prefill_buckets) -> list[int]:
+    """The prefill ladder up to 2176, then its powers of two (see
+    ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
+    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
 
 
 class LLMSubmodule(ARNodeSubmodule):
@@ -87,14 +105,23 @@ class LLMSubmodule(ARNodeSubmodule):
     # graph per (bucket, batch size). A prompt past the top bucket prefills
     # eagerly, and an eager 8k prefill is launch-bound (~1,100 kernel
     # launches, the GPU idle half the time: 78 ms of wall for 36 ms of kernels
-    # on 0.8B), so the ladder runs to 8192. A deployment sets its own with
+    # on 0.8B), so the ladder runs past 8192. The powers of two stay, since a
+    # batch of prompts up to a power of two long fills one exactly. 2176, 4352
+    # and 8704 add 1/16 above them for the decode rows a mixed step carries
+    # beside four prompts and for batches a few tokens over, which would
+    # otherwise pad to twice the width. A deployment sets its own with
     # `model_kwargs.prefill_token_buckets` (static buffers are sized by the
     # largest bucket).
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]
+    # Four prompts and their decode rows reach 2176, the only slack bucket a
+    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
+    # the forward all these captures share, and past Dynamo's limit the buckets
+    # compiled last run uncompiled inside their graphs.
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -131,14 +158,12 @@ class LLMSubmodule(ARNodeSubmodule):
         prefill_token_buckets: list[int] | None = None,
     ):
         super().__init__(prefill_token_buckets)
+        # follows a deployment's own prefill ladder
+        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
         self.model = model
         self.config = config
         self.vision_config = vision_config
-        self.token_stop = TokenStop(
-            loop="decode_loop", buffer="new_token", stop_ids=config.stop_token_ids,
-            sampler=SAMPLER, walk="decode", prefill_walks=frozenset({"prefill_text", "prefill_vision"}),
-            last_prefill_flag="last_prefill",
-        )
+        self.token_stop = token_stop(config.stop_token_ids)
         # the decode walk reads its input ids off the sampler's slot masters
         self.device_loopback = DeviceLoopback(
             walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
@@ -178,31 +203,41 @@ class LLMSubmodule(ARNodeSubmodule):
                 },
             )
 
+        # Prefill loses nothing to deterministic mode and compiles faster.
+        # Decode keeps its tuned kernels, which win at one row, unless the
+        # deployment asks for output that reproduces across processes: both
+        # the cost and that guarantee sit on this graph.
+        decode_compile_mode = DETERMINISTIC_COMPILE_MODE if compile_deterministic() else None
+
         return [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=dummy(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                compile_mode=decode_compile_mode,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=LLM_MIXED,
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                capture_token_lengths=self.MIXED_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
                 # the layout its GDN splits; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_vision",
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 make_node_input=vision_dummy,
                 capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
+                compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
         ]
 
@@ -315,6 +350,23 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
+    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
+    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
+    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        # a vision row's length depends on its image grids; it is admitted whole
+        if graph_walk == "decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        return None
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -334,9 +386,15 @@ class LLMSubmodule(ARNodeSubmodule):
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     @staticmethod
-    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
-        """A decode step replayed on a leased slot, or being captured for one."""
-        return graph_walk == "decode" and engine_inputs.captured
+    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A step of a text walk replayed on a leased slot, or being captured
+        for one, whose rotary tables come from the planned positions inside
+        the graph: always for decode, with ``ingraph_decode_rope`` on for text
+        prefill and mixed steps. Only ``prefill_vision`` rows bring their own
+        3D positions."""
+        if not engine_inputs.captured:
+            return False
+        return graph_walk == "decode" or (graph_walk in ("prefill_text", LLM_MIXED) and ingraph_decode_rope())
 
     def _decode_cos_sin(
         self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
@@ -356,6 +414,34 @@ class LLMSubmodule(ARNodeSubmodule):
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
 
+    @staticmethod
+    def _splice_row_ids(
+        ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool,
+    ) -> torch.Tensor:
+        """``ids`` (one loop-back token per row) with each row that brought
+        its own ids taking them instead, in row order: a mixed step's prompt
+        rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+        rows go in as one slice each, and the splice is device ops only: an
+        index built from a host list would be a synchronous copy behind the
+        step in flight. A decode step keeps the slot's padding rows past
+        ``inputs``, so its length stays the captured one."""
+        pieces: list[torch.Tensor] = []
+        run = None
+        for i, inp in enumerate(inputs):
+            if inp.input_ids is None or (decode and not inp.input_seq_len):
+                if run is None:
+                    run = i
+                continue
+            if run is not None:
+                pieces.append(ids[run:i])
+                run = None
+            pieces.append(inp.input_ids.to(ids.dtype))
+        if run is not None:
+            pieces.append(ids[run:len(inputs)])
+        if decode and ids.shape[0] > len(inputs):
+            pieces.append(ids[len(inputs):])
+        return torch.cat(pieces) if len(pieces) > 1 else pieces[0]
+
     def preprocess(
         self,
         graph_walk: str,
@@ -363,37 +449,42 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
-        captured = self._captured_decode(engine_inputs, graph_walk)
+        in_graph = self._rope_in_graph(engine_inputs, graph_walk)
         first = inputs[0]
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
         ):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
+            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
-            if graph_walk == "decode":
-                out.update(self.loopback_inputs(engine_inputs, inputs))
-            else:
-                # a mixed step packs its decode rows' single tokens beside the
-                # prompts: each row takes its own ids, or its loop-back token
-                sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-                ids = sampler.loopback_tokens(engine_inputs.request_ids)
-                out["input_ids"] = torch.cat([
-                    inp.input_ids.to(ids.dtype) if inp.input_ids is not None
-                    else ids[i:i + 1]
-                    for i, inp in enumerate(inputs)
-                ])
+            laps = PhaseLaps("engine.preprocess.loopback.")
+            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            laps.lap("tokens")
+            decode = graph_walk == "decode"
+            # rows whose last step ran elsewhere brought their token
+            if not decode or any(
+                inp.input_ids is not None and inp.input_seq_len for inp in inputs
+            ):
+                ids = self._splice_row_ids(ids, inputs, decode)
+            laps.lap("splice")
+            out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
+            if in_graph:
+                # the captured forward builds the rotary tables itself
+                return out
         elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
+            if in_graph:
+                assert all(inp.custom_pos_ids is None for inp in inputs), (
+                    "a text walk's rows take the planned 1D positions"
+                )
+                return out
         else:
             out["input_embeds"] = torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0,
             )
-        if captured:
-            # the captured forward builds the rotary tables itself
-            return out
 
         laps = PhaseLaps("engine.preprocess.")
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
@@ -487,12 +578,11 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        captured = self._captured_decode(engine_inputs, graph_walk)
         if input_ids is None and input_embeds is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        if captured or cos_3d is None or sin_3d is None:
-            # A captured decode builds its tables from the planned positions,
-            # inside the graph, off the per-step critical path; the static
+        if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
+            # the tables come from the planned positions, inside the graph
+            # (off a captured decode's per-step critical path); the static
             # cos/sin stay unread
             num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
@@ -596,6 +686,10 @@ class LLMSubmodule(ARNodeSubmodule):
         # feed `prefill_tokens` from the inputs
         return graph_walk == "decode"
 
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
 
 # The vision tower's block loop, as a piecewise capture region
@@ -829,13 +923,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         sin: torch.Tensor,
         seq_lengths: tuple[int, ...],
     ) -> torch.Tensor | None:
-        """The block loop replayed once for the whole step, or None if the step
-        did not lease it."""
-        runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
-        if runner is None:
+        """The block loop replayed once for the whole step, or None if not leased."""
+        if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
         # one replay for every image, not one each: a second plan overwrites the schedule a queued replay still reads
-        return runner.run(
+        return engine_inputs.piecewise_runners[VISION_BLOCK_LOOP].run(
             static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
             request_ids=engine_inputs.request_ids,
             seq_lens=list(seq_lengths),

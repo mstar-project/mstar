@@ -16,7 +16,7 @@ import yaml
 
 sys.path.insert(0, ".")
 
-from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
+from mstar.engine.resources import KVSpec, RaggedAttentionSpec, SlotLease  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.aut_submodule import AUT_ENCODE  # noqa: E402
@@ -350,10 +350,11 @@ def test_packed_clips_split_by_the_encoder_s_own_window(leased):
     windows = [segment.span for segment in sub.declare_step(PREFILL_WALK, rids, rows).segments]
     sub.bind_node_resources({AUDIO_ATTN: _WindowedAttention(windows)})
     runner = _Replay(sub)
-    # the engine hands a forward the runner only on a step that leased it
+    # the forward replays the region only on a step that leased it
     engine_inputs = _engine_inputs(rids)
+    engine_inputs.piecewise_runners[AUT_ENCODE] = runner
     if leased:
-        engine_inputs.piecewise_runners[AUT_ENCODE] = runner
+        engine_inputs.piecewise_leases = {AUT_ENCODE: SlotLease(slot=0, bucket=None)}
     with torch.no_grad():
         packed = sub.forward_batched(PREFILL_WALK, engine_inputs, **sub.preprocess(PREFILL_WALK, engine_inputs, rows))
         alone = [hf(clip, feature_lens=torch.tensor([clip.shape[-1]])).last_hidden_state for clip in clips]
@@ -366,6 +367,36 @@ def test_packed_clips_split_by_the_encoder_s_own_window(leased):
     )
     for rid, ref in zip(rids, alone, strict=True):
         torch.testing.assert_close(packed[rid]["audio_embeds"][0], ref, rtol=1e-4, atol=1e-4)
+
+
+def test_encoder_replays_exactly_when_leased():
+    """The forward replays when its step leased the region and runs eagerly
+    otherwise, whatever the runner's buckets allow: ``can_lease`` may have
+    refused a batch that fits one."""
+    from types import SimpleNamespace
+
+    from mstar.model.components.aut_submodule import AUT_ENCODE
+
+    class Runner:
+        def can_run(self, batch_size, total_tokens):
+            return True
+
+        def run(self, **kwargs):
+            self.ran = kwargs
+            return {"embeds": "replayed"}
+
+    sub, runner = object.__new__(Qwen3ASREncoderSubmodule), Runner()
+
+    def replay(leases):
+        engine_inputs = SimpleNamespace(
+            piecewise_runners={AUT_ENCODE: runner}, piecewise_leases=leases, request_ids=["a", "b"],
+        )
+        return sub._replay_encode(engine_inputs, torch.zeros(12, 8), [4, 8])
+
+    assert replay({}) is None
+    assert not hasattr(runner, "ran")
+    assert replay({AUT_ENCODE: object()}) == "replayed"
+    assert runner.ran["seq_lens"] == [4, 8] and runner.ran["real_bs"] == 2
 
 
 def test_encoder_packs_a_step_only_up_to_its_largest_capture():

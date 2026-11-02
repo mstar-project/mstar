@@ -39,7 +39,6 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
@@ -87,6 +86,7 @@ class Wan22Model(Model):
         cache_dir: str | None = None,
         variant: str = WAN22_VARIANT_TI2V_5B,
         compile_dit_sizes: tuple[str, ...] | None = None,
+        dit_max_batch_size: int = Wan22Config.dit_max_batch_size,
         max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
@@ -103,6 +103,7 @@ class Wan22Model(Model):
         self.cache_dir = cache_dir
         self.config = Wan22Config(
             variant=variant, compile_dit_sizes=compile_dit_sizes,
+            dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
             attention_backend=attention_backend,
@@ -152,36 +153,12 @@ class Wan22Model(Model):
                     head_dim=cfg.attention_head_dim,
                     # one segment per guidance branch
                     max_segments_per_request=2,
-                    # CFG-parallel: the dit's SP ranks split guidance branches, not
-                    # heads, so each keeps every head (TP still splits them)
-                    shard_over_sp=False,
                     # the DiT is compiled, not captured: keep attention in its graph
                     compile_op=True,
                     dtype=torch.bfloat16,
                 ),
             ),
         ]
-
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a dit lockstep instance (``sp_size``) of any size but 1 or 2:
-        the dit splits its two CFG branches over the instance and nothing else,
-        so more ranks would only recompute the same step."""
-        for group in config.get("node_groups") or []:
-            size = group.get("sp_size", 1)
-            if "dit" in group.get("node_names", []) and size not in (1, 2):
-                raise ValueError(
-                    f"Wan2.2 runs its dit on one rank or CFG-parallel on two (sp_size: 2); "
-                    f"got sp_size: {size!r} in {config_path}."
-                )
-
-    def get_default_sharding_config(self) -> ShardingConfig:
-        # CFG-parallel, through the sp slot: the dit's lockstep group (sp_size) is
-        # used for guidance, each of two ranks running one CFG branch and
-        # all-gathering the two noise predictions (see Wan22DitSubmodule). Nothing
-        # splits the sequence, and signals stay replicated: no shard_dim entries.
-        return ShardingConfig(
-            groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={"dit"},
-        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -730,17 +707,18 @@ class Wan22Model(Model):
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype`` exists for interface parity only: weights load in the
-        # checkpoint's own dtypes. ``sp_group`` reaches the dit only.
+        # ``autocast_dtype`` and ``sp_group`` exist for interface parity only.
+        # Weights load in the checkpoint's own dtypes, and wan22 declares no
+        # sp-enabled nodes.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, sp_group=sp_group)
+        submodule = self._create_submodule(node_name, device)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu", sp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -777,7 +755,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config, sp_group=sp_group)
+            return Wan22DitSubmodule(transformer, self.config)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 
@@ -804,7 +782,7 @@ class Wan22Model(Model):
         """
         from diffusers import UniPCMultistepScheduler
 
-        from mstar.model.wan22.components.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
+        from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
 
         scheduler_config = UniPCMultistepScheduler.load_config(
             self.model_path_hf, subfolder="scheduler", cache_dir=self.cache_dir,
