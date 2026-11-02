@@ -1,8 +1,9 @@
 """Deterministic CPU reproduction of the extra-read completion race.
 
 The tensor managers, async reader, conductor barrier and worker drain/removal
-methods are real. A checked host-memory engine substitutes for network transfers;
-model execution and scheduling are stubbed. The extra read models an erroneous
+methods are real. A checked host-memory engine holds a submitted transfer;
+real Mooncake TCP, when installed, holds a queued read before submission.
+Model execution and scheduling are stubbed. The extra read models an erroneous
 output at completion, without assuming that a production model emits one.
 """
 
@@ -87,6 +88,29 @@ class _CheckedCopyEngine(tensors.LocalTransferEngine):
         return 1
 
 
+class _RecordingTcpEngine(tensors.MooncakeTransferEngine):
+    """Real TCP, recording successful registrations to check cleanup."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.regions = {}
+        self.started = Event()
+        self.resume = Event()
+        self.copied = None
+
+    def register_memory(self, ptr, nbytes):
+        result = super().register_memory(ptr, nbytes)
+        if result == 0:
+            self.regions[ptr] = nbytes
+        return result
+
+    def unregister_memory(self, ptr):
+        result = super().unregister_memory(ptr)
+        if result == 0:
+            self.regions.pop(ptr)
+        return result
+
+
 class _Recorder:
     def __init__(self):
         self.sent = []
@@ -153,15 +177,21 @@ def _conductor():
 @pytest.mark.parametrize("teardown_order", [("w0", "w1"), ("w1", "w0")])
 @pytest.mark.parametrize("read_timing", ["normal", "stray", "client-stream"])
 @pytest.mark.parametrize("bookkeeping_type", ["python", "rust"])
+@pytest.mark.parametrize("transport", ["checked", "tcp"])
 def test_successful_cleanup_does_not_invalidate_a_read(
-    monkeypatch, teardown_order, read_timing, bookkeeping_type,
+    monkeypatch, teardown_order, read_timing, bookkeeping_type, transport,
 ):
     bookkeeping = PythonTensorBookkeeping
     if bookkeeping_type == "rust":
         pytest.importorskip("mstar_rust")
         bookkeeping = RustTensorBookkeeping
-    peers = {}
-    monkeypatch.setattr(tensors, "MooncakeTransferEngine", lambda **kw: _CheckedCopyEngine(peers=peers, **kw))
+    if transport == "tcp":
+        if tensors.MOONCAKE_IMPORT_ERROR is not None:
+            pytest.skip(f"Mooncake unavailable: {tensors.MOONCAKE_IMPORT_ERROR}")
+        monkeypatch.setattr(tensors, "MooncakeTransferEngine", _RecordingTcpEngine)
+    else:
+        peers = {}
+        monkeypatch.setattr(tensors, "MooncakeTransferEngine", lambda **kw: _CheckedCopyEngine(peers=peers, **kw))
     managers, workers, tables = {}, {}, {}
     for entity_id in ("w0", "w1"):
         table = tables[entity_id] = RidTable()
@@ -170,7 +200,7 @@ def test_successful_cleanup_does_not_invalidate_a_read(
         handle = table.intern("request")
         manager = managers[entity_id] = tensors.MooncakeCommunicationManager(
             my_entity_id=entity_id, hostname="localhost", device="cpu",
-            communicator=_Recorder(), protocol=CommProtocol.TCP,
+            communicator=_Recorder(), protocol=CommProtocol.TCP, tcp_transfer_device="lo",
         )
         manager.tensor_store = TensorStore(bookkeeping=bookkeeping())
         manager.rid_to_str = table.name
@@ -188,6 +218,18 @@ def test_successful_cleanup_does_not_invalidate_a_read(
     producer.increment_ref(info.uuid)
     producer.register_for_send(producer_rid, [info])
     engine = receiver.transfer_engine
+    if transport == "tcp":
+        read = receiver._async_reader._read
+
+        def paused_read(read_info):
+            engine.started.set()
+            assert engine.resume.wait(5), "queued read was never released"
+            read(read_info)
+            engine.copied = ctypes.string_at(read_info[0].local_ptr, read_info[0].nbytes)
+
+        # Hold the queued read before its first transfer, independently of
+        # tensor size and network speed. The real TCP read runs when released.
+        monkeypatch.setattr(receiver._async_reader, "_read", paused_read)
     edge = GraphEdge(
         name="extra", next_node="already_finished_node", tensor_info=[info],
         _total_fanin=1, _shard_dim=None,
@@ -281,9 +323,10 @@ def test_successful_cleanup_does_not_invalidate_a_read(
         try:
             future.result(timeout=5)
         except RuntimeError as exc:
-            pytest.fail(f"Race reproduced: cleanup invalidated {engine.invalid_endpoints} before read finished: {exc}")
+            pytest.fail(f"Read did not survive request completion: {exc}")
         assert engine.copied == payload.numpy().tobytes()
-        assert engine.invalid_endpoints == []
+        if transport == "checked":
+            assert engine.invalid_endpoints == []
         assert receiver.get_ready_tensors() == {}
         assert not producer.tensor_store.check_uuid_presence(info.uuid)
         assert not receiver.tensor_store.check_uuid_presence(info.uuid)
