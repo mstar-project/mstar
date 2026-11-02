@@ -14,7 +14,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.qwen3_5.components.rope import compute_inv_freq
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+from mstar.platforms import current_platform
 
 # ----------------------------------------------------------------------------
 # Grid helpers
@@ -130,12 +132,22 @@ class VisionRotaryEmbedding(nn.Module):
 
     def __init__(self, config: Qwen3_5VisionConfig):
         super().__init__()
-        spatial_dim = config.head_dim // 2
-        inv_freq = 1.0 / (
-            config.rope_theta
-            ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim)
+        self.spatial_dim = config.head_dim // 2
+        self.theta = config.rope_theta
+        self.register_buffer(
+            "inv_freq", compute_inv_freq(self.spatial_dim, self.theta), persistent=False,
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse)
+        # The cast to the model's dtype rounds this buffer too, and upstream
+        # keeps it in fp32. The angle error grows with the distance between
+        # two patches.
+        if current_platform.is_rocm():
+            self.inv_freq = compute_inv_freq(
+                self.spatial_dim, self.theta, device=self.inv_freq.device,
+            )
+        return result
 
     @torch.no_grad()
     def forward(
