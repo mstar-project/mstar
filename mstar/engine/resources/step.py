@@ -172,7 +172,8 @@ class SubmoduleStep:
     # it gets this list
     segments: list[Segment] | None = None
     # the labels this step's forward packs together, declared once here: every ResourceStep
-    # that doesn't set its own gets it, so the KV plan and the sequence shard agree
+    # that doesn't set its own gets it, and one that sets a different one is refused, so the KV
+    # plan and the sequence shard agree
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True)
 
     # Matches additional_key_info in CudaGraphConfig
@@ -183,11 +184,18 @@ class SubmoduleStep:
     def __post_init__(self):
         if self.segments is None and not self.combined_labels:
             return
-        for step in self.steps.values():
+        for key, step in self.steps.items():
             if step.segments is None and self.segments is not None:
                 object.__setattr__(step, "segments", self.segments)
-            if self.combined_labels and not step.combined_labels:
+            if not self.combined_labels:
+                continue
+            if not step.combined_labels:
                 object.__setattr__(step, "combined_labels", self.combined_labels)
+            elif step.combined_labels != self.combined_labels:
+                raise ValueError(
+                    f"step {key!r} declares combined_labels {step.combined_labels}, its submodule step "
+                    f"{self.combined_labels}: declare them once, on the SubmoduleStep"
+                )
 
     @property
     def ctx(self):

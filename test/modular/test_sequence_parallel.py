@@ -271,6 +271,10 @@ def test_a_split_step_refuses_what_it_cant_range():
         _split(_shard(labels=("cond",)), [("r0", "cond", 5), ("r0", "text", 5)], combined={("cond", "text"): "cfg"})
     with pytest.raises(ValueError, match="rows must be one length"):
         _split(_shard(labels=("video",), axis=1), [("r0", "video", 5), ("r1", "video", 6)])
+    # a resource step can't group the step's labels differently from the shard
+    with pytest.raises(ValueError, match="declare them once"):
+        SubmoduleStep(combined_labels={("cond", "uncond"): "cfg"},
+                      steps={"shard": SeqShardStep(), "kv": KVStep(combined_labels={("cond",): "c"})})
     shard = _shard()
     x = torch.arange(10.0)
     _split(shard, [("r0", "main", 10)])
