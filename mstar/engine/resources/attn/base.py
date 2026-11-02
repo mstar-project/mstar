@@ -100,23 +100,13 @@ class AttentionManager(AttentionResource):
         kv.bind_sequence_shard(shard)
         split = self._split_exchange
         if split == "ring":
-            self._warm_ring(shard.group)
+            # every rank binds the same resources in the same order
+            shard.group.connect_pairs(self._device)
         logger.info(
             "attention over KV %r takes split steps over %d SP ranks: split labels by %s, copied ones %s",
             self._kv_cache_name, shard.group.world_size, split,
             "by head slice" if placement is None else "over the placed pool",
         )
-
-    def _warm_ring(self, group) -> None:
-        """One one-element hop per ring offset, at bind: NCCL connects a pair of ranks on its first
-        exchange, which here comes before warmup and the capture plan read free memory, and a
-        routing fault hangs at startup rather than in a request. Every rank binds the same
-        resources in the same order."""
-        from mstar.engine.resources.context_parallel import ring_hop
-
-        one = torch.zeros(1, device=self._device)
-        for i in range(1, group.world_size):
-            group.all_to_all_rows(one, *ring_hop(group.world_size, group.rank, i, 1, 1))
 
     @torch.compiler.disable
     def exchange(self, run, q, k, v, label: str | None = None):
@@ -199,25 +189,6 @@ class AttentionManager(AttentionResource):
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens, check=self._plan_check,
         )
-
-    def _ring_wrapper(self, label: str, slot: int):
-        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under
-        ``sp_exchange`` ring: one context wrapper per partner, over the label's workspace (they run
-        one after another on one stream)."""
-        from mstar.engine.resources.context_parallel import RingAttentionWrapper
-
-        key = EagerSlotKey(label=label, slot=slot, ring=True)
-        wrapper = self._eager_plan_states.get(key)
-        if wrapper is None:
-            workspace = self._workspaces.get(label, slot)
-            paged = [
-                self._context_wrapper(workspace, False, dict(self._wrapper_kv_kwargs), None)
-                for _ in range(self._placement.size)
-            ]
-            wrapper = self._eager_plan_states[key] = RingAttentionWrapper(
-                self._placement, self._kv_config.tokens_per_page, self._dtype, paged, self._device,
-            )
-        return wrapper
 
     @torch.compiler.disable
     def _attend_placed(

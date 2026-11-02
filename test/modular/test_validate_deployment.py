@@ -359,8 +359,8 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
      r"resources.attn: sp_exchange must be one of none, ulysses, all_gather, ring; got 'zigzag'"),
     # a deployment's sp_exchange where the node's steps never split would be silently ignored
     ([_attention()], dict(sp_size=2), {"kv": {"context_parallel": True}, "attn": {"sp_exchange": "all_gather"}},
-     r"resources.attn: sp_exchange 'all_gather' picks how a split step reaches it, and its nodes declare no "
-     r"SeqShardSpec"),
+     r"node_groups\[0\]: node 'llm' declares no SeqShardSpec, so its steps never split, and attention 'attn' "
+     r"sets sp_exchange 'all_gather'"),
     ([_shard(), _attention()], dict(sp_size=1), {"attn": {"sp_exchange": "ulysses"}},
      r"node_groups\[0\]: node 'llm' runs on one SP rank, so its steps never split, and attention 'attn' sets "
      r"sp_exchange 'ulysses'"),

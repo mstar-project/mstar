@@ -23,7 +23,7 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel
+from mstar.engine.resources.context_parallel import ContextParallel, RingAttentionWrapper
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
@@ -231,6 +231,24 @@ class FlashInferManager(AttentionManager):
             device=self._device,
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
+
+    def _ring_wrapper(self, label: str, slot: int):
+        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under
+        ``sp_exchange`` ring: one context wrapper per partner, over the label's workspace (they run
+        one after another on one stream). FlashInfer is the one backend that takes both split
+        steps and a placed pool, which a ring needs."""
+        key = EagerSlotKey(label=label, slot=slot, ring=True)
+        wrapper = self._eager_plan_states.get(key)
+        if wrapper is None:
+            workspace = self._workspaces.get(label, slot)
+            paged = [
+                self._context_wrapper(workspace, False, dict(self._wrapper_kv_kwargs), None)
+                for _ in range(self._placement.size)
+            ]
+            wrapper = self._eager_plan_states[key] = RingAttentionWrapper(
+                self._placement, self._kv_config.tokens_per_page, self._dtype, paged, self._device,
+            )
+        return wrapper
 
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int

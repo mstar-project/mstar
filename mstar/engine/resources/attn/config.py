@@ -108,13 +108,8 @@ class AttentionSpec(NodeResourceSpec):
 
         problems = take_shard_edge(self, specs)
         self.split_exchange = self.resolve_exchange(specs)
-        # a deployment's own setting, so refused at every SP size where nothing reads it (one SP
-        # rank: `sequence_parallel_refusals`) or it doesn't match the pool's storage
-        if self.sp_exchange is not None and self.shard_key is None:
-            problems.append(
-                f"sp_exchange {self.sp_exchange!r} picks how a split step reaches it, and its nodes declare no "
-                "SeqShardSpec, so their steps never split: drop it"
-            )
+        # a deployment's own setting, so refused at every SP size where it doesn't match the pool's
+        # storage, and where nothing reads it (`sequence_parallel_refusals`)
         by_position = {"ulysses": False, "all_gather": True, "ring": True}.get(self.sp_exchange)
         if by_position is not None and bool(specs[self.config.kv_cache].places_positions) != by_position:
             storage = "by position (context_parallel: true)" if by_position else "by head (context_parallel off)"

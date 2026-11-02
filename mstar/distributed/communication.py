@@ -265,6 +265,18 @@ class CommGroup:
         )
         return recv
 
+    def connect_pairs(self, device: torch.device) -> None:
+        """One one-element exchange per rank offset, so every pair of ranks has exchanged once:
+        NCCL connects a pair on its first exchange, which for a ring's point-to-point hops would
+        come in its first request, after warmup and the capture plan read free memory, and a
+        routing fault would hang there rather than at startup. Collective: every member calls it
+        at the same point."""
+        one = torch.zeros(1, device=device)
+        for offset in range(1, self.world_size):
+            send, recv = [0] * self.world_size, [0] * self.world_size
+            send[(self.rank + offset) % self.world_size] = recv[(self.rank - offset) % self.world_size] = 1
+            self.all_to_all_rows(one, send, recv)
+
     def all_to_all(
         self,
         input_: torch.Tensor | Sequence[torch.Tensor],

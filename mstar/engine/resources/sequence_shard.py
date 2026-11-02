@@ -609,30 +609,33 @@ def sequence_parallel_refusals(
     moe_parallel: MoeParallelConfig | None = None,
 ) -> list[str]:
     """What ``node``, on ``tp`` TP and ``sp`` SP ranks, declares that its SP ranks can't run; each
-    a sentence. At one SP rank, only an ``sp_exchange`` set there. Each resource answers for itself
-    (``NodeResourceSpec.split_step_refusals``); the checks on built objects
-    (``supports_split_steps``, ``check_captures``) are the engine's."""
+    a sentence. At one SP rank or with no ``SeqShardSpec``, also an ``sp_exchange`` set there. Each
+    resource answers for itself (``NodeResourceSpec.split_step_refusals``); the checks on built
+    objects (``supports_split_steps``, ``check_captures``) are the engine's."""
     specs = [spec for spec in specs if node in spec.nodes]
-    if sp == 1:
+    shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
+    refusals = []
+    if sp == 1 or shard is None:
         from mstar.engine.resources.attn.config import AttentionSpec
 
-        # a deployment's sp_exchange would be silently ignored here (`AttentionSpec.derive` refuses it
-        # without a shard)
-        return [
-            f"node {node!r} runs on one SP rank, so its steps never split, and attention {spec.resource_key!r} "
-            f"sets sp_exchange {spec.sp_exchange!r}, which picks how a split step reaches it: drop it"
+        # the node's steps never split, so a deployment's sp_exchange would be silently ignored
+        never = "runs on one SP rank" if sp == 1 else "declares no SeqShardSpec"
+        refusals = [
+            f"node {node!r} {never}, so its steps never split, and attention {spec.resource_key!r} sets "
+            f"sp_exchange {spec.sp_exchange!r}, which picks how a split step reaches it: drop it"
             for spec in specs if isinstance(spec, AttentionSpec) and spec.sp_exchange is not None
         ]
+    if sp == 1:
+        return refusals
     try:
         placed = any(position_pools(specs, node).values())
     except ValueError as e:
-        return [str(e)]
-    shard = next((spec for spec in specs if isinstance(spec, SeqShardSpec)), None)
+        return [*refusals, str(e)]
     if shard is None or not shard.splits:
         # as a node without a shard: its steps run copied (`SeqShardSpec.splits`), so a model's
         # shard is a no-op where no attention takes split steps
         if placed:
-            return []
+            return refusals
         if shard is not None:
             return [
                 f"node {node!r} runs on {sp} SP ranks, and no attention there takes split steps (a paged one "
@@ -641,10 +644,10 @@ def sequence_parallel_refusals(
                 "it on TP ranks"
             ]
         return [
+            *refusals,
             f"node {node!r} runs on {sp} SP ranks but neither splits tokens (a SeqShardSpec) nor stores "
-            "KV by position (context_parallel on its paged KV pools)"
+            "KV by position (context_parallel on its paged KV pools)",
         ]
-    refusals = []
     for spec in specs:
         refusals += spec.split_step_refusals(node, shard, tp, sp)
     if moe_parallel is not None and moe_parallel.parallel == "ep":

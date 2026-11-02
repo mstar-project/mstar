@@ -213,8 +213,8 @@ class RingAttentionWrapper:
     striped over the partners by KV position (``stripe_owners``), so each rank holds the queries
     whose K/V it writes into its own slots. In round ``i`` a rank attends partner ``(r - i) % P``'s
     queries over its slots, the stored context and the step's own tokens together, with one call
-    (``_ring_rows``); the partial goes back to that partner, which merges it in place
-    (``merge_into``).
+    (``_ring_rows``); the partial goes back to that partner, which merges it into its running
+    result (``merge``).
 
     One causal call is exact because a partner's queries in a row sit at KV positions ``p0 + aP``,
     and this rank's keys at or below ``p`` number ``(p - r) // P + 1``: one more per query, so the
@@ -304,10 +304,8 @@ class RingAttentionWrapper:
             part = _masked(*self._paged[j].run(queries, kv_cache_layer, return_lse=True), self._valid[j])
             if i:
                 part = _unpack(group.all_to_all_rows(_pack(*part), back, to), part[0].dtype)
-            if out is None:
-                out, lse = part[0].float(), part[1]
-            else:
-                merge_into(out, lse, *part)
+            # one partial at a time, so the ring holds two, not P
+            out, lse = part if out is None else _merged((out, part[0]), torch.stack([lse, part[1]]), with_lse=True)
         return out.to(q.dtype)
 
 
@@ -690,20 +688,6 @@ def _merged(
         out.addcmul_(weight.unsqueeze(-1), part)
     out.div_(total.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1))
     return out, total.log_().add_(top) if with_lse else None
-
-
-def merge_into(out: torch.Tensor, lse: torch.Tensor, part: torch.Tensor, part_lse: torch.Tensor) -> None:
-    """``merge`` one partial at a time, in place: ``out`` (fp32 ``[..., D]``) and ``lse`` (fp32
-    natural-log ``[...]``) become the attention over their keys and ``part``'s. A row neither
-    has a key for stays 0, -inf. ``_merged``'s math, kept apart because its batched form takes
-    every partial at once and allocates its output, where the ring merges each round's partial
-    into one accumulator as it arrives."""
-    top = torch.maximum(lse, part_lse).clamp_min_(torch.finfo(torch.float32).min)
-    mine, theirs = (lse - top).exp_(), (part_lse - top).exp_()
-    total = mine + theirs
-    scale = total.clamp_min(torch.finfo(torch.float32).tiny)
-    out.mul_((mine / scale).unsqueeze(-1)).addcmul_((theirs / scale).unsqueeze(-1), part)
-    lse.copy_(total.log_().add_(top))
 
 
 @torch.compiler.disable

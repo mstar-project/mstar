@@ -684,8 +684,8 @@ def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(
         return paged(self, qo_indptr, *args, seq_lens=seq_lens, causal=causal, **kwargs)
 
     monkeypatch.setattr(sys.modules["flashinfer"].BatchPrefillWithPagedKVCacheWrapper, "plan", planned)
-    # the ranks are planned in one process, with no group to warm
-    monkeypatch.setattr(AttentionManager, "_warm_ring", lambda self, group: None)
+    # the ranks are planned in one process, with no group to connect
+    monkeypatch.setattr(CommGroup, "connect_pairs", lambda self, device: None)
     world = 4
     case = _Case.build(((0, 6), (0, 1)), CPU, torch.float32)
     for rank in range(world):
@@ -873,8 +873,8 @@ def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_
     """sp_exchange ring makes the sequence shard depend on the pool whose stored positions it
     stripes by: the engine takes that edge to a pool stored by position, and plans the pool
     first whatever the keys' order."""
-    # one rank of the two, with no group to warm
-    monkeypatch.setattr(AttentionManager, "_warm_ring", lambda self, group: None)
+    # one rank of the two, with no group to connect
+    monkeypatch.setattr(CommGroup, "connect_pairs", lambda self, device: None)
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
     specs = [
