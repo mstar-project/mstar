@@ -3498,8 +3498,8 @@ impl GraphRuntime {
             let info = self.requests[rid as usize].as_mut().expect("checked");
             if stop.later_than(info.loop_stop_times.get(&sym), sym) {
                 newer.push(name.clone());
+                info.loop_stop_times.insert(sym, stop);
             }
-            info.loop_stop_times.insert(sym, stop);
         }
         if !newer.is_empty() {
             // No last_node_run and no fan-out: the originating rank took the

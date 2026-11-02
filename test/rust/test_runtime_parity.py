@@ -567,6 +567,24 @@ def test_a_loop_a_peer_stopped_is_not_speculated(pair):
     assert out.ready_rids == [], "the runtime would speculate an iteration of a loop a peer stopped"
 
 
+def test_an_older_peer_stop_does_not_replace_a_newer_one(pair):
+    """Peer stops can arrive out of order, so each runtime keeps the newest
+    one per loop. If an older one replaced it, a repeat of the newer stop
+    would look new and stop a loop that has restarted since."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+
+    def at(fwd):
+        return NestedLoopIndices(
+            loop_name_order=["ar_loop"], loop_indices={"ar_loop": 0},
+            wg_fwd_pass_idx=fwd,
+        )
+
+    rt.apply_peer_loop_stops(rid, "default", {"ar_loop": at(3)})
+    rt.apply_peer_loop_stops(rid, "default", {"ar_loop": at(1)})
+    assert rt._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 3
+
+
 def test_cleanup_agrees(pair):
     rt, book, store = pair
     rid = _admit(rt)
