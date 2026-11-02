@@ -119,23 +119,14 @@ class OrpheusModelConfig:
         )
 
     def snac_window_frames(self) -> list[int]:
-        """Every window size, in frames, a stream can hand the decoder.
+        """Every window size, in frames, a stream can hand the decoder: every
+        width from one frame to the widest window the schedule pops.
 
-        The schedule's windows and every final flush: the policy runs over
-        each stream length until the windows repeat. The windows do not depend
-        on when tokens arrive, only on how many there are. A window shorter
-        than a frame (a stream shorter than a frame, or a final flush holding
-        only the EOS token) decodes one silent frame, as in ``prepare_inputs``.
+        A final flush can stop anywhere inside a chunk's window, and each
+        chunk's context is at most the previous window, so the flushes fill
+        every width below the widest. A window shorter than a frame (a stream
+        shorter than a frame, or a final flush holding only the EOS token)
+        decodes one silent frame, as in ``prepare_inputs``.
         """
-        tpf = self.tokens_per_frame
-        steady = self.snac_left_context_frames + self.snac_right_context_frames + self.snac_chunk_frames
-        sizes = {1}
-        for frames in range(1, sum(self.snac_chunk_schedule) + 2 * steady + 1):
-            policy, left = self.snac_chunk_policy(), frames * tpf + 1  # the EOS token streams last
-            while policy.is_ready(left):
-                sizes.add(policy.window_size() // tpf)
-                stride = policy.next_chunk_size(left)
-                policy.register_chunk(stride)
-                left -= stride
-            sizes.add(max(left // tpf, 1))
-        return sorted(sizes)
+        widest = max(self.snac_chunk_policy().window_sizes()) // self.tokens_per_frame
+        return list(range(1, widest + 1))
