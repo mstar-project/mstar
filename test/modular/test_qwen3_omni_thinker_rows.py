@@ -12,7 +12,7 @@ from torch._dynamo.convert_frame import register_bytecode_hook
 from mstar.engine.engine import Engine
 from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_SAMPLER
 from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput, ModelInputsFromEngine
 
 HIDDEN = 4
 VOCAB = 16
@@ -186,6 +186,47 @@ def test_a_request_that_leaves_mid_batch_takes_only_its_own_row():
     assert out.pop(5) is None
     assert out.per_rid_outputs[4]["new_token"][0].tolist() == [1]
     assert out.per_rid_outputs[6]["new_token"][0].tolist() == [3]
+
+
+def _eager_forward(thinker, walk, rid, embeds, audio=True):
+    """What the engine holds after the unbatched forward, the path of a step no capture fits."""
+    inputs = _engine_inputs([rid])
+    inputs.per_request_info = {rid: SimpleNamespace(step_metadata={"audio_output": audio})}
+    return BatchedModelOutput.coerce({rid: thinker.forward(walk, inputs, input_embeds=embeds)})
+
+
+def test_the_eager_decode_forward_gets_its_mask_from_the_same_place():
+    thinker = _thinker()
+    embeds = _rows([3])
+
+    out = _collect(thinker, _eager_forward(thinker, "thinker_decode", 9, embeds), [9], _decode_inputs(1))
+
+    row = out.per_rid_outputs[9]
+    assert row["new_token"][0].tolist() == [3]
+    assert torch.equal(row["thinker_states"][0], torch.cat([embeds, embeds + 100], dim=-1))
+    assert torch.equal(row["thinker_mask"][0], DECODE_MASK)
+
+
+def test_the_eager_prefill_forward_sends_its_first_token_embed_and_masks():
+    thinker = _thinker()
+    inputs = _prefill_inputs([2])
+
+    out = _collect(thinker, _eager_forward(thinker, "prefill_text", 9, _rows([0, 4])), [9], inputs)
+
+    row = out.per_rid_outputs[9]
+    assert row["new_token"][0].tolist() == [4]
+    assert row["thinker_states"][0].shape[0] == 2
+    assert row["thinker_mask"][0] is inputs[0].tensor_inputs["masks_for_talker"]
+    assert "first_token_embed" in row
+
+
+def test_the_eager_forward_of_a_text_only_request_sends_the_talker_nothing():
+    thinker = _thinker()
+
+    raw = _eager_forward(thinker, "prefill_text", 9, _rows([4]), audio=False)
+    out = _collect(thinker, raw, [9], _prefill_inputs([1]), audio={9: False})
+
+    assert set(out.per_rid_outputs[9]) == {"new_token"}
 
 
 class _Compiles:
