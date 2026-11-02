@@ -8,6 +8,7 @@ model never imports a sibling model.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Iterable, Sequence
 
@@ -60,6 +61,18 @@ def exclude_from_compile(transformer: nn.Module, types: Sequence[type] = EXACT_O
     return count
 
 
+def _recompile_limit_kwargs(recompile_limit: int | None) -> dict[str, int | None]:
+    """``torch.compile``'s per-compile limit where it has one. torch 2.10, the oldest this package
+    supports, doesn't: the forward then stays under the process-wide limit."""
+    params = inspect.signature(torch.compile).parameters
+    if "recompile_limit" in params or any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return {"recompile_limit": recompile_limit}
+    if recompile_limit is not None:
+        logger.warning("torch %s has no per-compile recompile limit: this forward keeps the process-wide one, not %d",
+                       torch.__version__, recompile_limit)
+    return {}
+
+
 def compile_transformer_forward(
     transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False,
     recompile_limit: int | None = None,
@@ -78,8 +91,9 @@ def compile_transformer_forward(
     The ``dit_exact_ops`` knob (off by default on AMD GPUs) drops ``exact_ops``, so a model
     config can keep its CUDA setting while each platform decides whether it applies.
 
-    ``recompile_limit`` replaces the process-wide limit for this forward only. Past the limit a
-    frame silently runs uncompiled, inside the captured graphs too."""
+    ``recompile_limit`` replaces the process-wide limit for this forward only, on a torch whose
+    ``torch.compile`` takes one. Past the limit a frame silently runs uncompiled, inside the
+    captured graphs too."""
     if exact_ops and not knobs.dit_exact_ops():
         logger.info("compile_exact_ops %s not applied: the dit_exact_ops knob is off (`knobs: dit_exact_ops: "
                     "true` keeps those modules eager)", exact_ops)
@@ -90,7 +104,7 @@ def compile_transformer_forward(
         logger.info("compiled transformer keeps %d modules (%s) on the eager kernels", excluded,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
     transformer.forward = with_inductor_rounding(
-        torch.compile(transformer.forward, fullgraph=False, dynamic=False, recompile_limit=recompile_limit),
+        torch.compile(transformer.forward, fullgraph=False, dynamic=False, **_recompile_limit_kwargs(recompile_limit)),
         eager_rounding=bool(eager_rounding),
     )
 
