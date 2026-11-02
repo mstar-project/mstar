@@ -4,13 +4,30 @@
 FlashInfer wrappers live here; FA3 is in ``dense_wrappers.py``.
 """
 
+import functools
+import logging
 from abc import ABC, abstractmethod
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 # Head dims the FlashInfer prefill kernels are instantiated for. An unsupported
 # one fails to BUILD (SM90: static_assert in hopper/prefill_sm90.cuh).
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
+
+# FlashInfer ragged backends that read q/k/v by their row and head strides (FA2:
+# csrc/batch_prefill.cu, FA3: csrc/batch_prefill_sm90.cu). The others get contiguous
+# copies: cuDNN, which ``auto`` can pick on Blackwell, reads such views wrong.
+STRIDED_QKV_BACKENDS = frozenset({"fa2", "fa3"})
+
+
+@functools.cache
+def _note_strided_copy(backend: str | None) -> None:
+    logger.info(
+        "FlashInfer ragged backend %r is handed strided q/k/v as contiguous copies; "
+        "the %s backends read them in place", backend, "/".join(sorted(STRIDED_QKV_BACKENDS)),
+    )
 
 
 def padded_head_dim(head_dim: int) -> int:
@@ -317,9 +334,15 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             self._out_buf[total_tokens:].zero_()
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
-        if t.shape[-1] == self.padded_head_dim:
-            return t.contiguous()
-        return torch.nn.functional.pad(t, (0, self.padded_head_dim - t.shape[-1]))
+        if t.shape[-1] != self.padded_head_dim:
+            return torch.nn.functional.pad(t, (0, self.padded_head_dim - t.shape[-1]))
+        # the backend the last plan resolved, ``auto`` included; FlashInfer keeps it private
+        backend = getattr(self.attn_wrapper, "_backend", None)
+        if t.is_contiguous() or (t.stride(-1) == 1 and backend in STRIDED_QKV_BACKENDS):
+            return t
+        if backend not in STRIDED_QKV_BACKENDS:
+            _note_strided_copy(backend)
+        return t.contiguous()
 
     @torch.compiler.disable
     def run(

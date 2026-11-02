@@ -23,6 +23,7 @@ at the model boundary uses the same split.
 """
 from __future__ import annotations
 
+import math
 from typing import Callable
 
 import torch
@@ -100,15 +101,62 @@ def ulysses_attention(
     its sequence and head dims (``[B, seq/P, H, D]`` is ``seq_dim=1,
     head_dim=2``). The head counts must be divisible by ``sp`` (Ulysses shards
     heads). When the group is trivial this is a passthrough — byte-identical to
-    the non-SP path."""
+    the non-SP path.
+
+    For one sequence (only ones before ``seq_dim``, the head dim right after it),
+    ``run_attention`` gets q, k and v as strided views of the buffer they arrive
+    in, with a dense head dim; the engine's attention resources take them. A batch
+    interleaves its rows on arrival, so each tensor is gathered contiguous. The
+    path depends only on the layout, so every rank of the group takes the same one."""
     if sp_group.world_size == 1:
         return run_attention(q=q, k=k, v=v)
+    seq_dim %= q.dim()
+    head_dim %= q.dim()
+    if head_dim == seq_dim + 1 and math.prod(q.shape[:seq_dim]) == 1:
+        return _ulysses_one_sequence(sp_group, q, k, v, run_attention, seq_sizes, seq_dim)
     # scatter heads, gather sequence: [seq/P, H, D] -> [seq, H/P, D], q, k and v in one
     # exchange (the exchanges are latency-bound at small sizes)
     q, k, v = sp_group.all_to_all((q, k, v), scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=seq_sizes)
     out = run_attention(q=q, k=k, v=v)
     # scatter sequence, gather heads: [seq, H/P, D] -> [seq/P, H, D]
     return sp_group.all_to_all(out, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=seq_sizes)
+
+
+def _ulysses_one_sequence(
+    sp_group: CommGroup,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    run_attention: Callable[..., torch.Tensor],
+    seq_sizes: list[int] | None,
+    seq_dim: int,
+) -> torch.Tensor:
+    """:func:`ulysses_attention` for one sequence, one copy each way. q, k and v leave
+    in one buffer laid out by destination rank, then row, then head, and the blocks
+    arrive in rank order, which is sequence order, so q, k and v are views of the
+    received buffer. The output's row block for each rank goes back as it lies."""
+    world, head_dim = sp_group.world_size, seq_dim + 1
+    lead, rows, tail = q.shape[:seq_dim], q.shape[seq_dim], q.shape[head_dim + 1:]
+    sizes = [rows] * world if seq_sizes is None else seq_sizes
+    even = len(set(sizes)) == 1
+    heads = [t.shape[head_dim] // world for t in (q, k, v)]
+    send = q.new_empty(world, *lead, rows, sum(heads), *tail)
+    for piece, t, n in zip(send.split(heads, dim=head_dim + 1), (q, k, v), heads, strict=True):
+        piece.copy_(t.unflatten(head_dim, (world, n)).movedim(head_dim, 0))
+    row = sum(heads) * math.prod(tail)
+    recv = sp_group.all_to_all_single(
+        send, send.new_empty(*lead, sum(sizes), sum(heads), *tail),
+        None if even else [rows * row] * world, None if even else [n * row for n in sizes],
+    )
+    q, k, v = recv.split(heads, dim=head_dim)
+    out = run_attention(q=q, k=k, v=v).contiguous()
+    row = math.prod(out.shape[head_dim:])
+    back = sp_group.all_to_all_single(
+        out, out.new_empty(world, *lead, rows, *out.shape[head_dim:]),
+        None if even else [n * row for n in sizes], None if even else [rows * row] * world,
+    )
+    # [P, .., rows, H/P, ..] -> [.., rows, H, ..]: rank r attended heads r*H/P .. (r+1)*H/P
+    return back.movedim(0, head_dim).flatten(head_dim, head_dim + 1)
 
 
 @torch.compiler.disable

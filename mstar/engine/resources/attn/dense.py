@@ -24,8 +24,12 @@ try:
 except Exception as _fa3_exc:  # noqa: BLE001
     flash_attn_varlen_func = None
     _VARLEN_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
+    VARLEN_READS_STRIDES = False
 else:
     _VARLEN_IMPORT_ERROR = None
+    # FA3 reads q/k/v by their strides (its interface only densifies the head dim);
+    # AITER's kernel, below, is unverified with views and gets contiguous inputs
+    VARLEN_READS_STRIDES = True
 
 # ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
 # there instead of degrading to the paged backend
