@@ -467,8 +467,10 @@ class LLMSubmodule(ARNodeSubmodule):
         out: dict[str, torch.Tensor | Any] = {}
         in_graph = self._rope_in_graph(engine_inputs, graph_walk)
         first = inputs[0]
+        # on persistent rows always, so a capture takes the rows' views as its inputs
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
+            or (graph_walk == "decode" and engine_inputs.resources[SAMPLER].loopback_on_rows)
         ):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)

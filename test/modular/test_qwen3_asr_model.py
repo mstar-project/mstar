@@ -356,7 +356,12 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
 
     decode_row = sub.prepare_inputs(DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
     assert decode_row.input_seq_len == 1 and decode_row.input_embeds is None
-    assert sub.preprocess(DECODE_WALK, _engine_inputs("r"), [decode_row])["input_ids"].tolist() == [42]
+    from mstar.model.qwen3_asr.config import SAMPLER
+
+    off_rows = type("S", (), {"loopback_on_rows": False})()
+    assert sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
+        request_ids=["r"], per_request_info={}, resources={SAMPLER: off_rows},
+    ), [decode_row])["input_ids"].tolist() == [42]
     step = sub.declare_step(PREFILL_WALK, ["r"], [row])
     assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
     (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
@@ -628,6 +633,7 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     sampler = type("S", (), {
         "loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13])),
         "overwrite_rows": SamplerResource.overwrite_rows, "_row_stager": None,
+        "loopback_on_rows": False, "_row_step": None,
     })()
     ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
         request_ids=["a", "b", "c"], per_request_info={}, resources={SAMPLER: sampler},

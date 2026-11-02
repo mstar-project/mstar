@@ -244,10 +244,11 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         if graph_walk == DECODE_WALK:
-            if any(inp.input_ids is None for inp in inputs):
+            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            # on persistent rows always, so a capture takes the rows' views as its inputs
+            if sampler.loopback_on_rows or any(inp.input_ids is None for inp in inputs):
                 # device loop-back: every row is its request's last sampled
                 # token, read by slot (padding rows read slot 0)
-                sampler: SamplerResource = engine_inputs.resources[SAMPLER]
                 ids = sampler.loopback_tokens(engine_inputs.request_ids)
                 # rows whose last step ran elsewhere brought their token
                 routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]

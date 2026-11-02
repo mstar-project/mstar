@@ -581,6 +581,8 @@ class SamplerResource(Resource):
         self._cg_sampler = rows.sampler_for(bs, ctx.slot_lease.slot if ctx.slot_lease is not None else None)
         self._step_slot = None
         self._row_step = (rows, bs)
+        if ctx.rows is None and not ctx.capture:
+            raise RuntimeError(f"a step of walk {ctx.graph_walk!r} without its persistent rows")
         self._step_rows = ctx.rows
 
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
@@ -807,7 +809,8 @@ class SamplerResource(Resource):
         row_state, _ = self._row_step
         step_rows = self._step_rows
         if step_rows is None:
-            raise RuntimeError("a captured step's rows bring no values of their own")
+            # a capture: its rows are dummies, which the graph's prologue gathers over
+            return
         # a padding row (a copy of a real row's inputs) reads the pad slot, whatever it brought
         if rows[-1] >= step_rows.n_active:
             n = bisect.bisect_left(rows, step_rows.n_active)

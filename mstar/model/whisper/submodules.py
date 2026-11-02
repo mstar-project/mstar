@@ -562,7 +562,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 "encoder_states": inp.tensor_inputs["encoder_states"],
                 "audio_frames": inp.kwargs["audio_frames"],
             }
-        if graph_walk == DECODE_WALK and any(inp.input_ids is None for inp in inputs):
+        # on persistent rows always, so a capture takes the rows' views as its inputs
+        if graph_walk == DECODE_WALK and (
+            engine_inputs.resources[SAMPLER].loopback_on_rows
+            or any(inp.input_ids is None for inp in inputs)
+        ):
             return self._loopback_inputs(engine_inputs, inputs)
         rows = [self._row_ids(inp) for inp in inputs]
         device = rows[0].device

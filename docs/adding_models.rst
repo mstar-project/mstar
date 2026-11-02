@@ -2018,8 +2018,16 @@ joins with every slot taken, the row that ran least recently and isn't in the
 step is checked in, so without ``max_concurrent_requests`` a scheduler that
 rotates more live requests than a step runs keeps moving rows. The engine
 runs the step in row order (``request_ids`` is a permutation of the batch the
-worker scheduled) and gathers its rows into a dense view before
-``preprocess``; the step's graph scatters what the forward changed back.
+worker scheduled) and gathers its rows into dense views; the step's graph
+scatters what the forward changed back. A captured step's graph applies the
+step's row changes and gathers the views itself, before its forward, so in
+``preprocess`` a view (``sampler.loopback_tokens``, say) holds the rows of an
+earlier step: hand it on to the forward as it is, at capture as at replay
+(take the loop-back path even when every capture row brings its ids), and put
+values a row brings over it with ``sampler.overwrite_rows``, which writes the
+row too. The graph runner refuses a view going into a graph input the capture
+took a tensor of its own for. Anything computed from a view in ``preprocess``
+reads stale rows: compute it in the forward.
 
 Each resource of the node opts in through ``Resource.row_state(space,
 node_name, graph_walk)``, called once before capture. It registers its

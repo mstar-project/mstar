@@ -127,6 +127,9 @@ class _Captured(_Toy):
         # set: preprocess hands on a copy of the ids instead of the view
         self.copy_ids = False
 
+    # set: so it does while capturing (every row a dummy) only
+    copy_at_capture = False
+
     def get_accelerator_graph_configs(self, device, tp_world_size=1):
         return [BatchedAcceleratorGraphConfig(
             capture_graph_walk=ROWS_WALK,
@@ -153,7 +156,8 @@ class _Captured(_Toy):
                 (acc, torch.tensor([v[1] for v in values], device="cuda")),
             )
         self.routed = {}
-        return {"ids": ids.clone() if self.copy_ids else ids, "acc": acc}
+        copy = self.copy_ids or (self.copy_at_capture and all(rid < 0 for rid in rids))
+        return {"ids": ids.clone() if copy else ids, "acc": acc}
 
     def forward_batched(self, graph_walk, engine_inputs, ids=None, acc=None, **kwargs):
         if graph_walk != ROWS_WALK:
@@ -487,4 +491,14 @@ def test_a_replay_refuses_a_rows_input_its_preprocess_replaced():
     _step(engine, ROWS_WALK, [1])
     engine._submodules[NODE].submodule.copy_ids = True
     with pytest.raises(RuntimeError, match="fills itself"):
+        _step(engine, ROWS_WALK, [1])
+
+
+def test_a_replay_refuses_a_rows_view_its_capture_took_a_copy_of(monkeypatch):
+    """A capture that took its own tensor for an input would have the replay
+    copy the view into it before the graph fills the rows."""
+    monkeypatch.setattr(_Captured, "copy_at_capture", True)
+    engine = _engine(captured=True)
+    engine.add_request(1, {"sampler": _config(1, 1)})
+    with pytest.raises(RuntimeError, match="took a tensor of its own"):
         _step(engine, ROWS_WALK, [1])

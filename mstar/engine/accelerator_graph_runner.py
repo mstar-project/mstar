@@ -754,6 +754,8 @@ class AcceleratorGraphRunner:
         self._owned_inputs: dict[str, Callable[[torch.Tensor], bool]] = {}
         # (config_idx, key) of the inputs that are
         self._aliased_inputs: set[tuple[int, str]] = set()
+        # per config of such a walk, its ``owns``
+        self._owns_by_config: dict[int, Callable[[torch.Tensor], bool]] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
@@ -1162,6 +1164,8 @@ class AcceleratorGraphRunner:
             # Intern before capture so every bucket of this config records the
             # same GPU addresses; replay writes real values into them.
             owns = self._owned_inputs.get(walk)
+            if owns is not None:
+                self._owns_by_config[spec.config_idx] = owns
             for key, value in list(static_inputs.items()):
                 if isinstance(value, torch.Tensor) and owns is not None and owns(value):
                     self._aliased_inputs.add((spec.config_idx, key))
@@ -1559,6 +1563,7 @@ class AcceleratorGraphRunner:
         the plan's indptrs keep attention off them.
         """
         slot = self.slot_for(lease)
+        owns = self._owns_by_config.get(slot.config_idx)
         for key in slot.static_input_keys:
             value = preprocessed.get(key)
             if not isinstance(value, torch.Tensor):
@@ -1571,6 +1576,13 @@ class AcceleratorGraphRunner:
                 raise RuntimeError(
                     f"{key!r} is a graph input the replay fills itself; a step's "
                     "preprocess must hand it on as it got it"
+                )
+            if owns is not None and owns(value):
+                # a copy now would be of the rows before the graph fills them
+                raise RuntimeError(
+                    f"{key!r} is a step view of the rows, but the capture took a "
+                    "tensor of its own for it; a step's preprocess must hand it on "
+                    "at capture as at replay"
                 )
             seq_dim = self._static_buffer_seq_dims.get((slot.config_idx, key), 0)
             static_buf.narrow(seq_dim, 0, value.shape[seq_dim]).copy_(value)

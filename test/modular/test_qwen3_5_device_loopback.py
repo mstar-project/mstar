@@ -15,6 +15,10 @@ class _Sampler:
     # the real row override: a routed row's token over the master's
     overwrite_rows = SamplerResource.overwrite_rows
 
+    # not on persistent rows: the slot path
+    loopback_on_rows = False
+    _row_step = None
+
     def __init__(self, masters=True, tokens=None):
         self.has_slot_masters = masters
         self.tokens = tokens
