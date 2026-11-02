@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import repeat
 from pathlib import Path
@@ -69,6 +69,7 @@ from mstar.model.submodule_base import (
     StepOrder,
     StopCheck,
     StopPolicy,
+    engine_step,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -126,6 +127,16 @@ def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None
         yield
     finally:
         torch.cuda.set_per_process_memory_fraction(previous, device)
+
+
+@contextmanager
+def _outside_steps(submodule_mgmt) -> Iterator[None]:
+    """A node's forwards run outside any step (compile warm-ups), with each of its LoRA
+    pools as in a base-only step (``LoraAdapterPool.base_only``)."""
+    with ExitStack() as stack:
+        for pool in submodule_mgmt.lora_pools:
+            stack.enter_context(pool.base_only())
+        yield
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -778,7 +789,7 @@ class Engine:
                 setattr(owner, name, with_inductor_overrides(torch.compile(target, dynamic=True)))
                 with torch.no_grad(), fp32_precision_scope(submodule_mgmt.fp32_precision), autocast_scope(
                     self._autocast_dtype_for(node_name), self._device.type, node_name,
-                ):
+                ), _outside_steps(submodule_mgmt):
                     for args in examples:
                         getattr(owner, name)(*args)
                 logger.info("Engine: torch.compile applied to %s.%s", node_name, path)
@@ -868,7 +879,7 @@ class Engine:
         # graph runner compiles internally
         self._compile_submodules()
         for submodule_mgmt in self._submodules.values():
-            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+            with fp32_precision_scope(submodule_mgmt.fp32_precision), _outside_steps(submodule_mgmt):
                 submodule_mgmt.submodule.warmup_compiles()
 
         for resource in self._resources.values():
@@ -996,6 +1007,7 @@ class Engine:
                 node_name=node_name,
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
+                lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
             )
             runners[label] = runner
         return runners
@@ -1815,7 +1827,8 @@ class Engine:
                 range_push("engine.declare_step")
             t0 = phase_start()
             try:
-                step = submodule.declare_step(
+                step = engine_step(
+                    submodule,
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
                     piecewise_leases=ctx.piecewise_leases,
@@ -1889,7 +1902,7 @@ class Engine:
         leases = {}
         for label, runner in runners.items():
             # a batch the region refuses runs it eagerly, with no slot
-            if not runner.lease_before_step or not runner.can_lease(inputs):
+            if not runner.lease_before_step or not runner.can_lease(inputs, ctx.request_ids):
                 continue
             lease = runner.lease_slot(bs, total_tokens)
             if lease is not None:
@@ -2876,7 +2889,8 @@ class Engine:
         )
         laps.lap("pad")
         t0 = phase_start()
-        step = submodule_mgmt.submodule.declare_step(
+        step = engine_step(
+            submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
