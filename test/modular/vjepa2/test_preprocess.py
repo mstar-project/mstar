@@ -9,6 +9,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import TensorPointerInfo
+from mstar.model.vjepa2 import vjepa2_model
 from mstar.model.vjepa2.submodules import VJepa2EncoderSubmodule
 from mstar.model.vjepa2.vjepa2_model import _IMAGENET_MEAN, _IMAGENET_STD, VJepa2ACModel, _preprocess_video
 
@@ -80,14 +81,18 @@ def _pointer(tensor: torch.Tensor) -> TensorPointerInfo:
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_ac_rollout_request_replays_the_encoder_capture(stream):
+def test_ac_rollout_request_replays_the_encoder_capture(stream, monkeypatch):
     """An AC rollout clip goes through the request's own trim and crop and lands
     on the encoder capture's key; a clip of any other shape runs eager without a
     word, so a change to either would quietly drop the capture."""
+    # the frames load_video sampled, decoded by index as the request's decode does
+    clip = torch.randint(0, 256, (16, 3, 180, 320), dtype=torch.uint8)
+    monkeypatch.setattr(vjepa2_model, "decode_frames_at", lambda src, idx, transform: transform(clip[idx]))
     model = VJepa2ACModel("unused", skip_weight_loading=True)
     kwargs = {"actions": [[0.1] * 7] * 4, "states": [[0.2] * 7] * 4, "rollout_horizon": 4, "stream_rollout": stream}
     out = model.process_prompt(
-        None, ["video"], ["embedding"], tensors={"video_inputs": [torch.rand(16, 3, 180, 320)]}, **kwargs,
+        None, ["video"], ["embedding"], tensors={"video_inputs": [torch.zeros(1, dtype=torch.uint8)]},
+        input_metadata={"video_inputs": [{"sampled_indices": list(range(16))}]}, **kwargs,
     ).new_input_tensors
     signals = {name: [_pointer(t) for t in tensors] for name, tensors in out.items()}
     args = model.get_initial_forward_pass_args("p0", ["video"], ["embedding"], signals, kwargs)

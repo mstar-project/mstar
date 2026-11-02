@@ -102,15 +102,11 @@ def _shape_key(tensor: torch.Tensor | None) -> tuple | None:
 class VJepa2EncoderSubmodule(NodeSubmodule):
     """ViT 3D-patch video encoder.
 
-    Supports cross-request batching: requests with identical
-    ``video_frames`` shapes are stacked on dim 0 and run in a single
-    encoder forward.  Shape-heterogeneous batches fall through to the
-    engine's sequential path (one forward per request).
-
-    Because ``VJepa2Model.process_prompt`` always resizes + center-crops to
-    ``(crop_size, crop_size)`` and uniformly samples to ``frames_per_clip``,
-    concurrent requests hitting the same serving config are shape-homogeneous
-    by construction.  Cross-config deployments (rare) naturally fall back.
+    Batches across requests only for V-JEPA 2-AC: requests with identical
+    ``video_frames`` shapes are stacked on dim 0 and run in a single encoder
+    forward, and a shape-heterogeneous batch falls through to the engine's
+    sequential path. A masked-model clip runs one request per step (see
+    :meth:`can_batch`).
     """
 
     def __init__(self, encoder: VJEPA2Encoder, config: VJepa2Config):
@@ -130,6 +126,11 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
         # capture replays its ``forward_batched`` graph at any batch size, B=1
         # included, whatever this returns.
         if len(batch.request_ids) < 2:
+            return False
+        if self.config.predictor_kind != "ac":
+            # A 64-frame clip is 8192 tokens, enough to fill the GPU alone, so
+            # batching buys no throughput, while each new batch size cost a
+            # recompile that stalled the step 10-60 s.
             return False
         shapes: set[tuple] = {
             tuple(inp.tensor_inputs["video_frames"].shape) for inp in model_inputs
@@ -345,42 +346,13 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
     absent, falls back to full-context / full-target defaults.  Output is
     the predicted hidden tensor at the target positions.
 
-    Supports cross-request batching when ``encoder_hidden`` shapes agree
-    across the batch AND (if provided) mask shapes agree.  All-defaults is
-    the common case — the full-context / full-target masks are derived from
-    ``encoder_hidden.shape`` and so are trivially homogeneous when the
-    encoder outputs are.
+    Runs one request per step: see VJepa2EncoderSubmodule.can_batch.
     """
 
     def __init__(self, predictor: VJEPA2Predictor, config: VJepa2Config):
         super().__init__()
         self.predictor = predictor
         self.config = config
-
-    def can_batch(
-        self,
-        batch: ExecutingBatch,
-        model_inputs: list[ARNodeInputs],
-    ) -> bool:
-        # B=1 → sequential forward; see VJepa2EncoderSubmodule.can_batch
-        # for the full justification (AC warm-latency regression on
-        # forward_batched when it's the only path).
-        if len(batch.request_ids) < 2:
-            return False
-        enc_shapes: set[tuple] = {
-            _shape_key(inp.input_embeds) for inp in model_inputs
-        }
-        ctx_shapes: set[tuple | None] = {
-            _shape_key(inp.tensor_inputs.get("context_mask")) for inp in model_inputs
-        }
-        tgt_shapes: set[tuple | None] = {
-            _shape_key(inp.tensor_inputs.get("target_mask")) for inp in model_inputs
-        }
-        return (
-            len(enc_shapes) == 1
-            and len(ctx_shapes) == 1
-            and len(tgt_shapes) == 1
-        )
 
     def prepare_inputs(
         self,
@@ -419,7 +391,6 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        # Sequential (len == 1) and batched (len > 1) share this path.
         encoder_hidden = torch.cat([
             inp.input_embeds for inp in inputs
         ], dim=0)
@@ -462,30 +433,6 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
         predicted = self.predictor(encoder_hidden, ctx_list, tgt_list)
         logger.info("VJepa2PredictorSubmodule.forward: output shape=%s", tuple(predicted.shape))
         return {"predicted_hidden": [predicted]}
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        encoder_hidden: torch.Tensor,
-        context_mask: torch.Tensor | None = None,
-        target_mask: torch.Tensor | None = None,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-
-        ctx_list = [context_mask]
-        tgt_list = [target_mask]
-        logger.info(
-            "VJepa2PredictorSubmodule.forward_batched: encoder_hidden=%s rids=%d",
-            tuple(encoder_hidden.shape),
-            len(request_ids),
-        )
-        predicted = self.predictor(encoder_hidden, ctx_list, tgt_list)  # [B, N_pred, D]
-        return {
-            rid: {"predicted_hidden": [predicted[i : i + 1]]}
-            for i, rid in enumerate(request_ids)
-        }
 
 
 class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
@@ -749,7 +696,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str]:
         iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
         horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
@@ -1327,7 +1274,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str]:
         horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
         iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)

@@ -13,9 +13,11 @@ model_kwargs:
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer still lands at a median 35.6 dB from the eager path over the 100 protocol prompts (81 of 100 below 40 dB)
   compile_eager_rounding: true
-  # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
-  # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
-  # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — true: 0.654 s at B=1 vs 0.608 plain; 0.785 without compile; [norms] pending measurement
+  # op classes kept on the eager result inside the compiled forward. Measured before the exact q/k RMSNorm op (the q/k
+  # norms were graph breaks) and the folded/split-GroupNorm VAE: with the norms kept the compiled transformer was
+  # bit-exact with the eager one (the activations add nothing but graph breaks); every served image >= 53 dB from the
+  # eager path on all 100 protocol prompts (the compiled VAE); true: 0.654 s at B=1 vs 0.608 plain; 0.785 without
+  # compile; [norms] pending measurement
   compile_exact_ops: [norms]
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
@@ -23,8 +25,9 @@ model_kwargs:
   # max_batch_size, then max_batch_size)
   capture_batch_sizes: [1, 2, 3, 4]
   max_batch_size: 4
-  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
-  # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
+  # compiled VAE decode (max-autotune), not bit-exact with the eager decode: before the folded upsample and split
+  # GroupNorm it was 3x faster at 1024^2 and ~56 dB from eager, and the autotuner may pick other conv kernels in another
+  # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)

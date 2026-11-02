@@ -1684,16 +1684,25 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``compile_exact_ops``
    ``true``, or a list of op classes among ``norms`` and ``activations``: those modules
-   stay on the eager kernels inside the compiled forward, so inductor only fuses the
-   chains around the GEMMs and attention. Each excluded module is a graph break, so this
-   is a latency-for-exactness trade:
+   keep the eager result inside the compiled forward, so inductor only fuses the chains
+   around the GEMMs and attention. Each kept module other than a 1-D ``torch.nn.RMSNorm``
+   is a graph break, so this is a latency-for-exactness trade:
 
    * The norms alone make the transformer bit-exact with eager (measured on klein-4B and
-     9B). The shipped ``[norms]`` costs klein-4B 4% of its B=1 latency (0.371 vs
-     0.356 s); excluding the activations too adds cost and nothing else.
+     9B while the q/k norms were graph breaks). Klein's per-head q/k norms (1-D
+     ``RMSNorm``) run as an op the compiled graph keeps whole. On NVIDIA GPUs that op is
+     a Triton replica of torch's kernel with the same arithmetic order: bit-identical and
+     ~4x faster than torch's one-block-per-row launch. Kept norms of one class share a
+     class-level forward, so the blocks share one compiled frame: with a forward per
+     module, dynamo hit its recompile limit and the small batches ran the blocks eagerly
+     (klein-4B 2.86 / 3.10 / 3.69 against 3.33 / 3.75 / 3.80 img/s at concurrency
+     1 / 4 / 16, H200). Before the q/k op the shipped ``[norms]`` cost klein-4B 4% of
+     its B=1 latency (0.371 vs 0.356 s). Keeping the activations too adds cost and
+     nothing else.
    * Z-Image's 180 norms per step cost 45% (1.25 vs 0.86 s at B=1), so it ships ``false``
-     and lands at a median 34 dB. ``[norms]`` turns it reference-faithful (at least
-     55.9 dB on every prompt).
+     and lands at a median 34 dB (the ``false`` figures were measured before its compiled
+     forward fused the q/k norms and rotary into one kernel). ``[norms]``, which keeps
+     that fusion off, turns it reference-faithful (at least 55.9 dB on every prompt).
    * Without it, the plain compile — even with eager rounding — lands at a median 35 to
      38 dB PSNR from eager over the 100 protocol prompts, because a 4- or 8-step
      distilled sampler amplifies the last bit of inductor's own reductions and activation
@@ -1724,10 +1733,12 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    Rows batched per denoise step.
 
 ``vae_compile``
-   ``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms at 1024² on
-   an H100. Its fused reductions move the image by about 55 dB PSNR from the eager decode
-   on every prompt, and the autotuner may pick different conv kernels in another server
-   process, so set it to ``false`` for bit-exact, repeatable output — which is how the
+   ``torch.compile`` of the VAE decode with inductor autotuning, each nearest-x2 upsample
+   folded into its conv and the GroupNorms (with their SiLU) on a split-reduction kernel.
+   Before those two it measured 89 to 29 ms at 1024² on an H100 and about 55 dB PSNR from
+   the eager decode on every prompt; neither figure is re-measured since. The compiled
+   decode is not bit-exact, and the autotuner may pick different conv kernels in another
+   server process, so set it to ``false`` for bit-exact, repeatable output — which is how the
    parity suite runs. The compiled decode is warmed at load for the ``capture_sizes``
    grids and the decode batch sizes; any other latent shape decodes eagerly rather than
    paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
@@ -1740,10 +1751,11 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    are rejected with a 400 before scheduling instead of occupying the worker for minutes
    (an 8192² request means 262k tokens of quadratic attention).
 
-With the klein defaults every served image is within 53 dB of the eager path on all 100
-protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
-images of the other engines are 10 to 16 dB from the diffusers reference for the same
-seeds.
+With the klein defaults every served image was within 53 dB of the eager path on all 100
+protocol prompts, and with ``vae_compile: false`` it was bit-exact; both were measured while
+the q/k norms were graph breaks, and the 53 dB before the folded, split-GroupNorm VAE decode.
+For scale, the served images of the other engines are 10 to 16 dB from the diffusers
+reference for the same seeds.
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
