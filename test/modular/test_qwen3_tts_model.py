@@ -41,7 +41,14 @@ from mstar.model.qwen3_tts.config import (
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, clip_digest
 from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine, StopCheck
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    BatchedModelOutput,
+    HostRows,
+    InputMetadata,
+    ModelInputsFromEngine,
+    StopCheck,
+)
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -940,12 +947,12 @@ def test_qwen3_tts_clone_prefill_streams_reference_frames_first():
     # (all a window can use as context) ahead of the first generated frame.
     reference = torch.arange(12).view(3, 4)
     submodule.request_state("clone").add("reference_frames", reference)
-    frame = torch.tensor([9, 9, 9, 9])
+    frame = torch.tensor([[9, 9, 9, 9]])
     items = submodule._codec_stream_items("talker_prefill_clone", "clone", frame)
-    assert [item.tolist() for item in items] == [[4, 5, 6, 7], [8, 9, 10, 11], [9, 9, 9, 9]]
+    assert [item.tolist() for item in items] == [[[4, 5, 6, 7]], [[8, 9, 10, 11]], [[9, 9, 9, 9]]]
     submodule.request_state("short").add("reference_frames", reference[:1])
     assert [item.tolist() for item in submodule._codec_stream_items("talker_prefill_clone", "short", frame)] == [
-        [0, 1, 2, 3], [9, 9, 9, 9],
+        [[0, 1, 2, 3]], [[9, 9, 9, 9]],
     ]
     # Only the clone prefill leads with the reference; decode never does.
     assert submodule._codec_stream_items("talker_decode", "clone", frame) == [frame]
@@ -2245,6 +2252,82 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     assert encoder.calls == 3 and len(submodule._conditioning) == 2
     encode("a4", clip_a, 7)   # evicted, so encoded again
     assert encoder.calls == 4
+
+
+def _talker_with_frame(config, rows):
+    """A Talker whose frame step returns recognizable rows, with no model run."""
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    frame = {
+        "talker_input_embeds": torch.arange(rows * 2, dtype=torch.float32).view(rows, 2),
+        "codec_tokens": torch.arange(rows * 4).view(rows, 4),
+        "new_token": torch.arange(rows),
+    }
+    submodule._run_frame = lambda *args: frame
+    return submodule, frame
+
+
+def test_talker_steps_hand_back_rows_and_one_stop_buffer():
+    config = _tiny_model_config()
+    submodule, frame = _talker_with_frame(config, 3)
+    engine_inputs = SimpleNamespace(request_ids=["a", "b", "c"])
+    for walk in ("talker_decode", "talker_prefill"):
+        out = submodule.forward_batched(
+            walk, engine_inputs, input_embeds=None, last_token_indices=None, suppress_eos=None,
+        )
+        assert isinstance(out, BatchedModelOutput) and not out.per_rid_outputs
+        assert set(out.row_outputs) == {"talker_input_embeds", "codec_tokens", "new_token"}
+        assert out.check_stop_buffers["new_token"] is frame["new_token"]
+
+
+def test_talker_clone_prefill_keeps_its_per_request_stream():
+    config = _tiny_model_config()
+    submodule, _ = _talker_with_frame(config, 2)
+    submodule.request_state("a").add("reference_frames", torch.arange(8).view(2, 4))
+    out = submodule.forward_batched(
+        "talker_prefill_clone", SimpleNamespace(request_ids=["a", "b"]),
+        input_embeds=None, last_token_indices=None, suppress_eos=None,
+    )
+    # both reference frames, then the frame of a's row; one frame for the request without any
+    assert [item.tolist() for item in out["a"]["codec_tokens"]] == [[[0, 1, 2, 3]], [[4, 5, 6, 7]], [[0, 1, 2, 3]]]
+    assert [item.tolist() for item in out["b"]["codec_tokens"]] == [[[4, 5, 6, 7]]]
+
+
+def test_talker_batched_stop_check_matches_the_per_request_one():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config)
+    eos = config.talker.codec_eos_token_id
+    infos = {
+        "eos": SimpleNamespace(max_tokens=50, resource_configs={}),
+        "ignored": SimpleNamespace(max_tokens=50, resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=True)}),
+        "limit": SimpleNamespace(max_tokens=2, resource_configs={}),
+        "running": SimpleNamespace(max_tokens=50, resource_configs={}),
+    }
+    tokens = {"eos": eos, "ignored": eos, "limit": 3, "running": 4}
+    for rid in infos:
+        submodule.request_state(rid).add("generated_frames", 2)
+    rids = list(infos)
+    rows = HostRows(tuple(rids), {"new_token": torch.tensor([tokens[rid] for rid in rids])})
+    batched = submodule.check_stop_batched(rids, infos, rows)
+    for rid in rids:
+        single = submodule.check_stop(rid, infos[rid], {"layer0_codes": [torch.tensor(tokens[rid])]})
+        stops, withheld = (single.stops, single.withheld) if isinstance(single, StopCheck) else (single, ())
+        assert batched.stops.get(rid, set()) == stops
+        assert batched.withheld.get(rid, ()) == withheld
+    # no stop buffer: the engine falls back to the per-request check
+    assert submodule.check_stop_batched(rids, infos, HostRows(tuple(rids), {})) is None
+
+
+def test_codec_reads_a_window_of_collated_row_items():
+    config = _tiny_model_config()
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
+    groups = config.num_code_groups
+    fwd = SimpleNamespace(request_id="r", rid_handle="r")
+    chunk = StreamChunkInfo(0, 0, 3, False)
+    rows = torch.arange(3 * groups).view(3, 1, groups)  # three [1, groups] items, stacked
+    meta = InputMetadata(stream_chunks={"codec_tokens": chunk})
+    from_rows = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [rows]}, input_metadata=meta)
+    flat = submodule.prepare_inputs("codec_chunk", fwd, {"codec_tokens": [rows.view(3, groups)]}, input_metadata=meta)
+    assert torch.equal(from_rows.tensor_inputs["codec_tokens"], flat.tensor_inputs["codec_tokens"])
 
 
 def test_talker_cap_sets_its_capture_sizes():
