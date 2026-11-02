@@ -153,12 +153,17 @@ class CpuPlan:
         MB."""
         return max(1, min(4, self.left // 4))
 
+    def prepare_workers(self, threads: int) -> int:
+        """Requests the data worker prepares at once, for a model that
+        declares ``PREPROCESS_PARALLEL``, when each runs on ``threads``
+        intra-op threads: at most 8, and the pool times the threads stays
+        within the CPUs left."""
+        return max(1, min(8, self.left // max(1, threads)))
+
     @property
     def preprocess_workers(self) -> int:
-        """Requests the data worker prepares at once, for a model that
-        declares ``PREPROCESS_PARALLEL``. Each runs ``preprocess_threads`` of
-        its own, so the pool times that stays within the CPUs left."""
-        return max(1, min(8, self.left // self.preprocess_threads))
+        """``prepare_workers`` at the default thread count."""
+        return self.prepare_workers(self.preprocess_threads)
 
     @property
     def png_threads(self) -> int:

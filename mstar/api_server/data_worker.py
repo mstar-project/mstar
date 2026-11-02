@@ -744,7 +744,11 @@ class PreprocessWorkerThread:
         if not getattr(self.model, "PREPROCESS_PARALLEL", False) or self._client_edges:
             return 1
         workers = (self._model_config or {}).get("preprocess_workers")
-        return cpus.plan().preprocess_workers if workers is None else int(workers)
+        if workers is not None:
+            return int(workers)
+        # each request runs on this process's intra-op pool, which the config
+        # or the model may size above the plan's default
+        return cpus.plan().prepare_workers(torch.get_num_threads())
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.

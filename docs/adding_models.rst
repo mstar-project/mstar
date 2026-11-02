@@ -2051,7 +2051,9 @@ The data worker prepares one request at a time on its own thread, so a request's
 decode holds up every request behind it and the output chunks of the ones running. A model
 whose ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt`` keep no shared
 state sets ``PREPROCESS_PARALLEL = True``, and requests then prepare on a pool sized to the
-CPUs left (``CpuPlan.preprocess_workers``: at most 8, each with its own intra-op threads).
+CPUs left (``CpuPlan.prepare_workers``: at most 8, and the pool times the process's intra-op
+thread count stays within the CPUs left, so a higher ``preprocess_torch_threads`` means fewer
+workers).
 Tensors are still stored and requests still reach the conductor from the data worker's thread,
 in arrival order. A deployment sets the pool at the top level of its config; 1 turns it off:
 

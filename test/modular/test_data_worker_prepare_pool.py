@@ -162,12 +162,31 @@ def test_the_pool_times_its_intra_op_threads_fits_the_cpus(usable, workers):
     assert workers * plan.preprocess_threads <= usable
 
 
+@pytest.mark.parametrize(("usable", "threads", "workers"), [(8, 4, 2), (8, 8, 1), (16, 1, 8), (40, 4, 8), (3, 0, 3)])
+def test_a_higher_thread_count_shrinks_the_pool(usable, threads, workers):
+    plan = cpus.CpuPlan(frozenset(range(256)), usable)
+    assert plan.prepare_workers(threads) == workers
+    assert workers * max(1, threads) <= usable
+
+
 def test_only_a_model_that_declares_it_gets_a_pool(monkeypatch):
     monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 2)
     serial, parallel = _thread(_Serial()), _thread(_Model())
     assert serial._prepare_pool is None
     assert parallel._prepare_workers == 4 and parallel._prepare_pool is not None
     parallel._prepare_pool.shutdown()
+
+
+def test_the_pool_follows_the_threads_this_process_runs(monkeypatch):
+    # ``preprocess_torch_threads`` may set the intra-op pool above the plan's default
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 4)
+    wt = _thread(_Model())
+    assert wt._prepare_workers == 2
+    wt._prepare_pool.shutdown()
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 8)
+    assert _thread(_Model())._prepare_pool is None
 
 
 def test_one_cpu_prepares_inline(monkeypatch):
