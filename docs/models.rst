@@ -1331,8 +1331,14 @@ with each other. Short answers (128 tokens) came out identical in 8 of 8 runs;
 into one denoise pass too, which is the same maths but not the same bf16
 arithmetic — under classifier-free guidance the branch rounding is amplified,
 so an image or clip produced alongside other requests differs from its solo
-result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
-request at a time when outputs must be bitwise repeatable.
+result at the kernel-drift level (~30 dB PSNR at guidance 6). A generation
+step whose requests total more than ``max_batched_vision_tokens`` (a
+``model_kwargs`` key, 16384 by default: at 832x480, more than 42 latent frames
+across the step's requests, e.g. two clips of 85 or more frames each; a windowed
+request counts its current window) runs every request in it alone, since
+batching such steps cost more than it saved on an H100, so those outputs match
+their solo results. Serve with one request at a time
+when outputs must be bitwise repeatable.
 
 The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
 mode by default (``denoise_compile_mode: deterministic``, the engine's compile
@@ -1461,7 +1467,9 @@ own ``window_decoder`` partition; a request opts in per call:
 The schedule is padded up to whole windows and the video trimmed back to
 ``num_frames``; a seeded request is deterministic end to end (later windows draw
 their noise from the same generator). Windowed requests batch with each other
-and with plain requests at the same walk. ``gen_capture_video`` lists (height,
+and with plain requests at the same walk, under the same 16384-vision-token
+cap on the step (each windowed request counts its current window).
+``gen_capture_video`` lists (height,
 width, frames) tiers whose denoise steps replay a per-step CUDA graph (one graph per
 latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2v and
 ``chained`` windows, never ``kv`` windows). It is empty by default: at 832x480 the
