@@ -491,6 +491,11 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    def seal_capture_buffers(self) -> None:
+        """Every bucket on the device has been sized and none captured yet: from here on,
+        what a captured graph reads keeps its address. Called once, by the engine."""
+        return
+
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical

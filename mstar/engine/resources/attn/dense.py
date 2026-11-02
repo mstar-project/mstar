@@ -7,9 +7,10 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, workspace_bytes
+from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
+from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
@@ -209,7 +210,8 @@ class DenseAttentionManager(AttentionManager):
             # plan: it is scratch during `run` only (a plan writes the wrapper's
             # own buffers), and the runs are serialized on the node's stream.
             workspace = (
-                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda else None
+                Workspace(torch.empty(workspace_bytes(), dtype=torch.uint8, device=device), kv_cache)
+                if self._on_cuda else None
             )
             self._wrapper_kwargs.update(workspace_buffer=workspace, backend=flashinfer_backend)
             if self._on_cuda:

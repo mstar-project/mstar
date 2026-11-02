@@ -8,10 +8,10 @@ from mstar.engine.resources.attn.base import (
     AttentionManager,
     AttentionWrapper,
     EagerSlotKey,
-    WorkspacePool,
     captured_page_capacity,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
@@ -89,10 +89,13 @@ class FlashInferManager(AttentionManager):
             and fmha_decode_applies(device)
         )
 
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def seal_capture_buffers(self) -> None:
+        self._workspaces.seal()
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
@@ -134,7 +137,7 @@ class FlashInferManager(AttentionManager):
             return wrapper
 
         bucket = lease.bucket
-        buffer = self._workspaces.get(label, lease.slot)
+        workspace = self._workspaces.get(label, lease.slot)
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
             "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
@@ -156,8 +159,8 @@ class FlashInferManager(AttentionManager):
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
-            wrapper = self._fmha_wrapper(buffer, num_rows) or FlashInferDecodeWrapper(
-                workspace_buffer=buffer,
+            wrapper = self._fmha_wrapper(workspace, num_rows) or FlashInferDecodeWrapper(
+                workspace_buffer=workspace,
                 batch_size=num_rows,
                 accelerator_graph=True,
                 use_tensor_cores=self._decode_tensor_cores,
@@ -165,7 +168,7 @@ class FlashInferManager(AttentionManager):
             )
         else:
             wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=buffer,
+                workspace_buffer=workspace,
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 accelerator_graph=True,
@@ -174,7 +177,7 @@ class FlashInferManager(AttentionManager):
         self._cg_plan_states[key] = wrapper
         return wrapper
 
-    def _fmha_wrapper(self, workspace: torch.Tensor, num_rows: int) -> FmhaDecodeWrapper | None:
+    def _fmha_wrapper(self, workspace: Workspace, num_rows: int) -> FmhaDecodeWrapper | None:
         """The fmha decode wrapper for a capture at ``num_rows``, or None to
         stay on the paged decode kernel (not asked for, or none for this geometry)."""
         if not self._decode_fmha:

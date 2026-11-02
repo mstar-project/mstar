@@ -614,6 +614,15 @@ Worker scheduling
        page unindexed. The default ``1`` extends on every step: ``16``
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
+   * - ``MSTAR_WORKSPACE_BUFFER_MB``
+     - ``512``
+     - The size each FlashInfer attention workspace starts at, per (plan label, slot), read
+       by ``workspace_bytes`` (``mstar/engine/resources/attn/workspace.py``). A floor: a plan
+       at startup that asks for more grows that workspace to what it asked for. Raise it for
+       an eager step that wants more than startup's plans left it, which raises with the bytes
+       it asked for, since a captured graph holds the workspace's address by then. Where a
+       ragged resource declares ``workspace_mb`` the larger of the two applies; with this
+       unset, the declaration does.
    * - ``MSTAR_KV_PINNED_INDPTRS``
      - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,

@@ -9,7 +9,6 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
-    WorkspacePool,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -18,6 +17,7 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
     refuse_context_only,
 )
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -134,7 +134,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             backend=backend
         )
 
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -142,6 +142,9 @@ class FlashInferCrossManager(CrossAttentionManager):
         if self._query_kv_cache_name is None:
             return {self._kv_cache_name}
         return {self._kv_cache_name, self._query_kv_cache_name}
+
+    def seal_capture_buffers(self) -> None:
+        self._workspaces.seal()
 
     @property
     def context_cache_key(self) -> str:
@@ -407,7 +410,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._eager_plan_states[key] = wrapper
         return key, wrapper
 
-    def _decode_wrapper(self, workspace: torch.Tensor, **kwargs) -> FlashInferDecodeWrapper:
+    def _decode_wrapper(self, workspace: Workspace, **kwargs) -> FlashInferDecodeWrapper:
         kv = self._wrapper_kv_kwargs
         return FlashInferDecodeWrapper(
             workspace_buffer=workspace,

@@ -2,7 +2,6 @@
 
 import torch
 
-from mstar.engine.resources.attn.base import WorkspacePool
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.ragged.base import (
     RaggedBlockCausalAttnManager,
@@ -17,6 +16,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedPrefillWrapper,
     _RaggedPrefillBase,
 )
+from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.step import StepContext
 
 
@@ -32,8 +32,11 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         key: str,
     ):
         super().__init__(device=device, dtype=dtype, config=config, key=key)
-        self._workspaces = WorkspacePool(device, config.workspace_mb)
+        self._workspaces = WorkspacePool(device, config.workspace_mb, owner=key)
         self._kwargs["backend"] = config.flashinfer_backend
+
+    def seal_capture_buffers(self) -> None:
+        self._workspaces.seal()
 
     def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
         return super()._build_wrapper(
