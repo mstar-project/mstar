@@ -257,11 +257,11 @@ than overriding it.
 
 ``postprocess(self, output, modality, request_kwargs=None) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, and so on. The default encodes text through ``text_output`` and mono audio
-   as headerless 16-bit PCM (a float waveform in [-1, 1] is scaled and truncated;
+   images, and so on. The default encodes text through ``text_output`` and audio as
+   headerless 16-bit PCM, a ``[channels, samples]`` output interleaved for
+   ``get_output_audio_channels`` (a float waveform in [-1, 1] is scaled and truncated;
    integer samples are cast), and raises ``ValueError`` for any other modality. Override
-   it for those, or for audio with more than one channel, and hand the rest to
-   ``super().postprocess``.
+   it for those, and hand the rest to ``super().postprocess``.
 
 ``postprocess_inline(self, values, modality, request_kwargs) -> list[bytes]``
    ``postprocess`` for one decode step's inline values (one sampled token id per

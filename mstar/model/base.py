@@ -1024,10 +1024,10 @@ class Model(ABC):
         - text: utf-8; a chunk may end inside a character, since the API
           server joins a request's text chunks before decoding them
         - image: png
-        - audio: headerless 16-bit PCM at ``get_output_sample_rate``. The
-          default encodes mono: a float waveform in [-1, 1] is scaled and
-          truncated, integer samples are cast. A model with more channels
-          overrides it.
+        - audio: headerless 16-bit PCM at ``get_output_sample_rate``,
+          ``get_output_audio_channels`` interleaved from a ``[channels,
+          samples]`` output. A float waveform in [-1, 1] is scaled and
+          truncated, integer samples are cast.
         """
         text = self.text_output() if modality == TEXT else None
         if text is not None:
@@ -1038,7 +1038,8 @@ class Model(ABC):
             if pcm.is_floating_point():
                 # in fp32: bf16 and fp16 round 32767 up to 32768, which wraps
                 pcm = pcm.float().clamp(-1, 1) * 32767
-            return pcm.to(torch.int16).numpy().tobytes()
+            pcm = pcm.to(torch.int16).reshape(self.get_output_audio_channels(modality), -1)
+            return pcm.T.contiguous().numpy().tobytes()
         raise ValueError(f"{type(self).__name__} has no {modality!r} output")
 
     def postprocess_inline(

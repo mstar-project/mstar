@@ -285,7 +285,8 @@ def test_postprocess_audio_is_interleaved_pcm16():
     model = _make_model()
     wave = torch.stack([torch.full((5,), 0.5), torch.full((5,), -1.5)])
     pcm = torch.frombuffer(bytearray(model.postprocess(wave, "audio")), dtype=torch.int16).view(5, 2)
-    assert pcm[:, 0].tolist() == [16384] * 5 and pcm[:, 1].tolist() == [-32767] * 5
+    # truncated, as the default encodes every model's audio
+    assert pcm[:, 0].tolist() == [16383] * 5 and pcm[:, 1].tolist() == [-32767] * 5
     assert model.get_output_sample_rate() == 48000 and model.get_output_audio_channels() == 2
 
 
