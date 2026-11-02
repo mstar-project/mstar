@@ -1,7 +1,9 @@
 """The Qwen3.5 graph-bucket ladders: the decode one from the environment, the
-prefill one from the deployment's model_kwargs."""
+prefill one from the deployment's model_kwargs; and every prefill ladder a
+shipped config sets, for whichever model it serves."""
 import ast
 import importlib
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,16 +65,47 @@ def test_prefill_buckets_hold_near_power_of_two_batches(monkeypatch):
     assert {256, 512, 1024, 2048, 4096, 8192} <= set(buckets)
 
 
+def _configs_with_prefill_ladders():
+    """``{config: (model class, ladder)}`` for every shipped config that sets
+    ``model_kwargs.prefill_token_buckets``."""
+    import yaml
+
+    from mstar.model.registry import get_model_class
+    ladders = {}
+    for path in sorted((Path(__file__).resolve().parents[2] / "configs").rglob("*.yaml")):
+        config = yaml.safe_load(path.read_text())
+        buckets = (config.get("model_kwargs") or {}).get("prefill_token_buckets")
+        if buckets is not None:
+            ladders[path.name] = (get_model_class(config["model"]), buckets)
+    return ladders
+
+
 def _shipped_prefill_ladders():
     """None (the default) and every ``prefill_token_buckets`` a Qwen3.5 config sets."""
-    import yaml
-    configs = sorted((Path(__file__).resolve().parents[2] / "configs").glob("qwen3_5*.yaml"))
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     ladders = {str(None): None}
-    for path in configs:
-        buckets = (yaml.safe_load(path.read_text()).get("model_kwargs") or {}).get("prefill_token_buckets")
-        if buckets is not None:
-            ladders[path.name] = buckets
+    for name, (cls, buckets) in _configs_with_prefill_ladders().items():
+        if cls is Qwen3_5DenseModel:
+            ladders[name] = buckets
     return ladders
+
+
+@pytest.mark.parametrize("config", _configs_with_prefill_ladders())
+def test_every_shipped_prefill_ladder_is_a_model_argument(config):
+    """A config's ladder is a named argument of its model, not lost in ``**kwargs``;
+    Qwen3-Omni's Thinker captures its prefill on it."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+    cls, buckets = _configs_with_prefill_ladders()[config]
+    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel), (
+        f"a {cls.__name__} config sets prefill_token_buckets, which no test checks")
+    assert "prefill_token_buckets" in inspect.signature(cls.__init__).parameters, (
+        f"prefill_token_buckets isn't a named argument of {cls.__name__}.__init__")
+    if cls is Qwen3OmniModel:
+        from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+        node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
+        configs = {c.capture_graph_walk: c for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
+        assert configs["prefill_text"].capture_token_lengths == sorted(buckets)
 
 
 @pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())

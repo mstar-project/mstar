@@ -42,6 +42,8 @@ from mstar.model.loader import LLAMA_STACKED_PARAMS
 
 
 class CosyVoice3LM(nn.Module):
+    lora_unservable = {"llm_decoder": "run as F.linear over its float32 weight (logits), never its own forward"}
+
     def __init__(self, config: LMConfig, comm_group: CommGroup | None = None):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
