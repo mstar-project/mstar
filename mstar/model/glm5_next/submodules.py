@@ -34,6 +34,7 @@ from mstar.engine.resources.dsa.paged import attn_lens_device
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.model.glm5_next.components.attention import HOLE_KPE
 from mstar.model.glm5_next.config import (
     ATTN,
     DSA,
@@ -64,8 +65,6 @@ logger = logging.getLogger(__name__)
 PREFILL_TOKEN_BUCKETS = (*range(128, 1024, 128), *range(1024, 2049, 64), *range(2304, 4097, 256))
 PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
-# The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
-HOLE_KPE = -1.0e4
 _VERDICT_TIMEOUT_S = 120.0
 
 

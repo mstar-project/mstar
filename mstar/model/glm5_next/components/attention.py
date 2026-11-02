@@ -14,6 +14,10 @@ from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm5_next.config import ATTN, DSA, KV_CACHE, LABEL, Glm5NextModelConfig
 
+# The rope slot of a row no query may see (a rejected draft, a later draft's own row): against a
+# query rope part of ones, a -6.4e5 score term.
+HOLE_KPE = -1.0e4
+
 # the reference indexer's k_norm is LayerNorm(head_dim, eps=1e-6) with a bias, not rms_norm_eps
 _INDEXER_K_NORM_EPS = 1e-6
 
@@ -80,6 +84,10 @@ class Glm5NextMLAAttention(MLAAttention):
             # plan's padding) carry a very negative rope slot: a query rope part of ones adds 0
             # to a real key (its slot is 0).
             self.kpe_query_fill = 1.0
+        # index_share_for_mtp_iteration: an MTP draft pass attends what the step's first pass
+        # attended, the cache before the step's block, so no draft sees its own or an earlier
+        # draft's row (``_draft_row_entry``)
+        self.share_mtp_indices = config.mtp_num_draft_tokens > 0 and config.index_share_for_mtp_iteration
         # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
         # dsa_long_context: this layer's index plane (its latent plane's, on the same pages; the
@@ -135,6 +143,13 @@ class Glm5NextMLAAttention(MLAAttention):
         return paged.select(qs.view(n * block, *q.shape[1:]), ws.view(n * block, -1),
                             self._kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
                             self.dsa_group)
+
+    def _draft_row_entry(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self.share_mtp_indices:
+            return latent
+        hole = latent.clone()
+        hole[:, self.kv_lora_rank:] = HOLE_KPE
+        return hole
 
     def forward_block_row(
         self, hidden_states: torch.Tensor, row: int, latents: torch.Tensor,
