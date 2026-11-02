@@ -40,8 +40,15 @@ from mstar.engine.resources.draft_verify.config import (
     TapStep,
     VerifyStep,
     with_draft_verify,
+    with_mixed_verify,
 )
-from mstar.engine.resources.draft_verify.drafter import Drafter, Drafts, draft_verify_step
+from mstar.engine.resources.draft_verify.drafter import (
+    Drafter,
+    Drafts,
+    draft_verify_mixed_step,
+    draft_verify_step,
+    leading_rows,
+)
 from mstar.engine.resources.draft_verify.taps import TapSpec
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
@@ -156,8 +163,11 @@ __all__ = [
     "VerifyStep",
     "apply_yaml_overrides",
     "cross_label",
+    "draft_verify_mixed_step",
     "draft_verify_step",
+    "leading_rows",
     "resolve_spec_dependencies",
     "topo_sort",
     "with_draft_verify",
+    "with_mixed_verify",
 ]

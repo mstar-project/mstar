@@ -9,7 +9,9 @@ target's taps, rewound with the target's KV. The trained drafter has to keep dra
 happens when its taps, context and block positions are the ones it was trained on.
 
 A draft model (Qwen3-0.6B) takes the same surface (``mstar.model.components.drafters``), and
-must emit what plain greedy emits too.
+must emit what plain greedy emits too. So must DSpark with new prompts joining the decode loop
+inside its verify steps (the text LM's ``mixed`` walk), each prompt prefilled in the step that
+verifies the running requests' drafts.
 
 Needs CUDA, FlashInfer and the cached Qwen/Qwen3-8B and deepseek-ai/dspark_qwen3_8b_block7
 (and Qwen/Qwen3-0.6B for the draft model's case).
@@ -82,10 +84,18 @@ class _Groups:
 
 @pytest.fixture(scope="module", autouse=True)
 def _small_ladder():
-    saved = TextLMSubmodule.DECODE_CAPTURE_BATCH_SIZES
+    saved = (
+        TextLMSubmodule.DECODE_CAPTURE_BATCH_SIZES, TextLMSubmodule.MIXED_CAPTURE_BATCH_SIZES,
+        TextLMSubmodule.MIXED_PROMPT_TOKENS,
+    )
     TextLMSubmodule.DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    TextLMSubmodule.MIXED_CAPTURE_BATCH_SIZES = [2, 4]
+    TextLMSubmodule.MIXED_PROMPT_TOKENS = [64, 128]
     yield
-    TextLMSubmodule.DECODE_CAPTURE_BATCH_SIZES = saved
+    (
+        TextLMSubmodule.DECODE_CAPTURE_BATCH_SIZES, TextLMSubmodule.MIXED_CAPTURE_BATCH_SIZES,
+        TextLMSubmodule.MIXED_PROMPT_TOKENS,
+    ) = saved
 
 
 class _Serve:
@@ -115,40 +125,49 @@ class _Serve:
         self.next: dict[int, torch.Tensor] = {}
         self.leases = []
 
+    def _ingest(self, rid: int, text: str) -> torch.Tensor:
+        out = self.model.process_prompt(
+            text, ["text"], ["text"], enable_thinking=False, max_output_tokens=MAX_TOKENS,
+        )
+        (ids,) = out.new_input_tensors["text_inputs"]
+        configs = {SAMPLER: SamplingReqConfig(temperature=0.0)}
+        for key, layouts in out.metadata["kv_layout"].items():
+            kv = KVReqConfig(needed_labels=["main"])
+            kv.apply_conductor_config(
+                kv_layout={label: layout.row() for label, layout in layouts.items()},
+                loop_caps=self.model.get_loop_caps(max_output_tokens=MAX_TOKENS),
+            )
+            configs[key] = kv
+        self.eng.add_request(rid, configs)
+        self.infos[rid] = CurrentForwardPassInfo(
+            request_id=f"r{rid}", rid_handle=rid, graph_walk="prefill", fwd_index=0,
+            random_seed=0, max_tokens=MAX_TOKENS, resource_configs=configs,
+        )
+        return ids.to(GPU)
+
     def add(self, prompts: list[str]) -> None:
-        inputs = {}
-        for rid, text in enumerate(prompts):
-            out = self.model.process_prompt(
-                text, ["text"], ["text"], enable_thinking=False, max_output_tokens=MAX_TOKENS,
-            )
-            (ids,) = out.new_input_tensors["text_inputs"]
-            configs = {SAMPLER: SamplingReqConfig(temperature=0.0)}
-            for key, layouts in out.metadata["kv_layout"].items():
-                kv = KVReqConfig(needed_labels=["main"])
-                kv.apply_conductor_config(
-                    kv_layout={label: layout.row() for label, layout in layouts.items()},
-                    loop_caps=self.model.get_loop_caps(max_output_tokens=MAX_TOKENS),
-                )
-                configs[key] = kv
-            self.eng.add_request(rid, configs)
-            self.infos[rid] = CurrentForwardPassInfo(
-                request_id=f"r{rid}", rid_handle=rid, graph_walk="prefill", fwd_index=0,
-                random_seed=0, max_tokens=MAX_TOKENS, resource_configs=configs,
-            )
-            inputs[rid] = ids.to(GPU)
+        inputs = {rid: self._ingest(rid, text) for rid, text in enumerate(prompts)}
         out = self._step("prefill", inputs)
         for rid in inputs:
-            self.emitted[rid] = out[rid]["new_token"][0].reshape(-1).tolist()
-            # a draft model's decode loop starts from the prompt's last token and the sample
-            self.next[rid] = out[rid].get("decode_input", out[rid]["new_token"])[0]
-            self.infos[rid].graph_walk = "decode"
+            self._prefilled(rid, out[rid])
 
-    def _step(self, walk: str, inputs: dict[int, torch.Tensor]):
+    def _prefilled(self, rid: int, out: dict) -> None:
+        self.emitted[rid] = out["new_token"][0].reshape(-1).tolist()
+        # a draft model's decode loop starts from the prompt's last token and the sample
+        self.next[rid] = out.get("decode_input", out["new_token"])[0]
+        self.infos[rid].graph_walk = "decode"
+
+    def _step(self, walk: str, inputs: dict[int, torch.Tensor], walks: dict[int, str] | None = None):
         rids = list(inputs)
+        if walks:
+            # as the worker's batch: a mixed verify step runs its verify rows first
+            rids = self.eng.order_split_rows(LLM_NODE, walk, rids, walks)
         batch = ExecutingBatch(
             node_name=LLM_NODE,
             per_request_info={rid: self.infos[rid] for rid in rids},
-            step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False),
+            step_context=StepContext(
+                request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False, request_walks=walks or {},
+            ),
             per_request_input_tensors={rid: {"text_inputs": [inputs[rid]]} for rid in rids},
         )
         self.eng.prepare_inputs(batch)
@@ -156,18 +175,44 @@ class _Serve:
         assert batch.admit_error is None, batch.admit_error
         self.leases.append(batch.step_context.slot_lease)
         self.stops = self.eng.check_stop_for_batch(batch, outputs.per_rid_outputs)
-        return outputs.per_rid_outputs
+        return self._stored(outputs, rids)
 
-    def run(self, max_steps: int = 400) -> dict[int, list[int]]:
+    @staticmethod
+    def _stored(outputs, rids) -> dict:
+        """What the worker's store sends on: a batch's row views ahead of its per-request outputs."""
+        out = {rid: dict(outputs.per_rid_outputs.get(rid, {})) for rid in rids}
+        order = list(outputs.row_request_ids or rids)
+        for name, views in (outputs.row_views or {}).items():
+            for rid, view in zip(order, views, strict=False):
+                if rid in out:
+                    out[rid][name] = [view]
+        return out
+
+    def run(self, max_steps: int = 400, joins: dict[int, dict[int, str]] | None = None) -> dict[int, list[int]]:
+        """Decode until every request stops; ``joins``: step -> the prompts (rid -> text) that
+        join the loop in that step, prefilled inside it (the ``mixed`` walk)."""
         # a stop sampled at the prefill ends the request there, as the runtime ends its partition
         prefill_stops = self.stops or {}
         live = [rid for rid in self.emitted if END_PARTITION not in prefill_stops.get(rid, ())]
-        for _ in range(max_steps):
-            if not live:
+        joins = dict(joins or {})
+        for step in range(max_steps):
+            if not live and not joins:
                 break
-            out = self._step("decode", {rid: self.next[rid] for rid in live})
+            joining = {rid: self._ingest(rid, text) for rid, text in joins.pop(step, {}).items()}
+            inputs = {rid: self.next[rid] for rid in live}
+            if joining:
+                walks = {**dict.fromkeys(inputs, "decode"), **dict.fromkeys(joining, "prefill")}
+                out = self._step("mixed", {**inputs, **joining}, walks)
+                for rid in joining:
+                    self._prefilled(rid, out[rid])
+                    if END_PARTITION not in (self.stops or {}).get(rid, ()):
+                        live.append(rid)
+            elif live:
+                out = self._step("decode", inputs)
+            else:
+                continue
             stopped = set(self.stops or ())
-            for rid in live:
+            for rid in inputs:
                 tokens = out[rid]["new_token"][0].reshape(-1).tolist()
                 self.emitted[rid] += tokens
                 if self.drafting:
@@ -183,10 +228,15 @@ class _Serve:
         return dict(self.emitted)
 
 
-def _decode(draft, captured):
+def _decode(draft, captured, join: bool = False):
     serve = _Serve(draft, captured)
-    serve.add(PROMPTS)
-    out = serve.run()
+    if join:
+        # two prompts start the loop; the others join it in its second and fourth steps
+        serve.add(PROMPTS[:2])
+        out = serve.run(joins={1: {2: PROMPTS[2]}, 3: {3: PROMPTS[3]}})
+    else:
+        serve.add(PROMPTS)
+        out = serve.run()
     dv = serve.eng._resources[DRAFT_VERIFY] if draft is not None else None
     stats = None if dv is None else (dv.stats(), dv.rows_verified, dv.drafts_accepted)
     # the prefill's, then the decode steps'
@@ -252,3 +302,24 @@ def test_a_draft_model_through_the_shared_surface_emits_what_plain_greedy_emits(
         else:
             assert margins[rid][apart] <= TIE, (rid, apart, margins[rid][apart], stats)
     assert rows and accepted > 0.5 * rows, stats
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
+def test_dspark_prompts_joining_inside_verify_steps_emit_what_plain_greedy_emits(captured, plain):
+    streams, margins = plain
+    draft = {"method": "dspark", "model": DRAFTER, "max_drafts": 7, "sampled_verify": False}
+    out, (stats, rows, accepted), leases = _decode(draft, captured, join=True)
+    print(f"[dspark mixed captured={captured}] {stats}")
+    if captured:
+        # the steps the prompts joined replayed a mixed capture, the drafts' verify and both prefills
+        assert all(lease is not None and lease.bucket is not None for lease in leases)
+        assert sum(lease.bucket.graph_walk == "mixed" for lease in leases) == 2
+    for rid, want in streams.items():
+        got = out[rid]
+        apart = next((i for i, (a, b) in enumerate(zip(got, want, strict=False)) if a != b), None)
+        if apart is None:
+            assert got == want, (rid, stats)
+        else:
+            assert margins[rid][apart] <= TIE, (rid, apart, margins[rid][apart], stats)
+    assert rows and accepted > 1.5 * rows, stats
+

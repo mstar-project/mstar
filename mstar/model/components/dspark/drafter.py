@@ -50,6 +50,7 @@ from mstar.engine.resources import (
     PositionStep,
     TapSpec,
     TapStep,
+    leading_rows,
 )
 from mstar.engine.resources.step import ResourceStep
 from mstar.model.base import KVLabel, LabelLayout, Span
@@ -188,6 +189,23 @@ class DSpark:
             steps[keys.attn] = AttentionStep(causal=causal, hide_last=0 if causal else 1)
         return steps
 
+    def mixed_steps(self, verify_rids: Sequence[int]) -> dict[str, ResourceStep]:
+        """The drafter's part of a step mixing verify rows with prompt rows
+        (``with_mixed_verify``): its KV and positions over every row, a block's rows and a
+        prompt's context alike, and its block attention, whose placeholder row is hidden on the
+        verify rows only (a prompt row's queries are run, and never read)."""
+        keys = self.keys
+        causal = self.config.causal
+        return {
+            keys.kv: KVStep(), keys.pos: PositionStep(),
+            keys.attn: AttentionStep(
+                causal=causal, hide_last=0 if causal else 1, hide_rows=None if causal else frozenset(verify_rids),
+            ),
+        }
+
+    # a mixed verify step proposes over its packed rows (`DSparkDrafter.propose_packed`)
+    mixes_prompts = True
+
     def carry_width(self) -> int:
         """Tokens a verify step's input carries: the last one kept."""
         return 1
@@ -253,6 +271,11 @@ class DSparkDrafter(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         self.taps = resources.get(DRAFT_TAPS)
 
+    def block_inputs(self, anchors: torch.Tensor) -> torch.Tensor:
+        """``[n, L + 1]``: each row's anchor ``[n, 1]`` and the placeholders the block drafts
+        into, a mixed verify step's packed rows (`propose_packed`)."""
+        return torch.cat([anchors.to(torch.long), self._mask.expand(anchors.shape[0], self.decl.max_drafts)], 1)
+
     def reset_buffers(self) -> None:
         """The buffers ``to_empty`` leaves unset."""
         self._mask.fill_(self.decl.config.mask_token_id)
@@ -316,6 +339,27 @@ class DSparkDrafter(nn.Module):
         lm = self.backbone
         hidden = lm(lm.embed(block.reshape(-1)), label="main").view(n, L + 1, -1)[:, :L]
         base = lm.logits(hidden.reshape(n * L, -1)).float().view(n, L, -1)
+        return self._heads(anchor, base, dv, request_ids)
+
+    def propose_packed(self, ids: torch.Tensor, dv: DraftVerifyResource, request_ids: list[int]) -> Drafts:
+        """``propose`` over a mixed verify step's packed tokens ``ids``, whose verify rows lead
+        as ``[anchor, mask x L]``: one backbone pass over every token (a prompt's ids run too,
+        and their K/V make way for its context, `observe`), the heads over the first
+        ``L + 1`` tokens of each of the step's rows."""
+        L = self.decl.max_drafts
+        n = len(request_ids)
+        lm = self.backbone
+        hidden = lm(lm.embed(ids), label="main")
+        lead = leading_rows(hidden, n, L + 1)[:, :L]
+        base = lm.logits(lead.reshape(n * L, -1)).float().view(n, L, -1)
+        anchor = leading_rows(ids, n, L + 1)[:, 0].to(torch.long)
+        return self._heads(anchor, base, dv, request_ids)
+
+    def _heads(
+        self, anchor: torch.Tensor, base: torch.Tensor, dv: DraftVerifyResource, request_ids: list[int],
+    ) -> Drafts:
+        """The Markov heads left to right over the backbone's base logits ``[n, L, V]``."""
+        L = self.decl.max_drafts
         prev = anchor
         tokens, dists = [], []
         for i in range(L):

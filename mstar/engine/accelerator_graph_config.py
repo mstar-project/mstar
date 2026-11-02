@@ -233,6 +233,52 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             self.make_node_input(n) for n in seq_lens
         ]
 
+class MixedVerifyGraphConfig(PackedAcceleratorGraphConfig):
+    """A packed capture of a step that runs verify rows of ``block`` tokens, first, beside prompt
+    rows (``with_mixed_verify``). For each batch bucket of ``bs`` rows, buckets of
+    ``block * (bs - 1) + p`` tokens for each prompt part ``p`` in ``prompt_tokens``, captured as
+    ``bs - 1`` verify rows and a prompt of ``p``; a replay holds any rows that fit, padding rows
+    taking no tokens. ``make_node_input(n, verify)`` makes a row of ``n`` tokens, a verify row's
+    when ``verify``."""
+
+    def __init__(
+        self,
+        capture_graph_walk: str,
+        block: int,
+        prompt_tokens: list[int],
+        make_node_input: Callable[[int, bool], NodeInputs],
+        capture_batch_sizes: list[int],
+        **kwargs,
+    ):
+        if block < 2 or not prompt_tokens or min(prompt_tokens) < 1:
+            raise ValueError("a mixed verify capture needs a block of at least 2 tokens and prompt parts of >= 1")
+        if min(capture_batch_sizes) < 2:
+            raise ValueError("a mixed verify step holds a verify row and a prompt: batch buckets of 2 or more")
+        self.block = block
+        self.prompt_tokens = sorted(prompt_tokens)
+        self.make_row = make_node_input
+        tokens = sorted({block * (bs - 1) + p for bs in capture_batch_sizes for p in self.prompt_tokens})
+        super().__init__(
+            capture_graph_walk=capture_graph_walk,
+            capture_token_lengths=tokens,
+            make_node_input=lambda n: make_node_input(n, False),
+            capture_batch_sizes=capture_batch_sizes,
+            **kwargs,
+        )
+
+    def get_total_tokens(self, bs: int) -> list[int]:
+        return [self.block * (bs - 1) + p for p in self.prompt_tokens]
+
+    def get_node_inputs(self, bs: int, num_tokens: int):
+        if num_tokens == 0:
+            # a replay's padding rows
+            return [self.make_row(0, False) for _ in range(bs)]
+        prompt = num_tokens - self.block * (bs - 1)
+        if prompt < 1:
+            raise ValueError(f"a mixed verify bucket of {bs} rows holds more than {num_tokens} tokens")
+        return [self.make_row(self.block, True) for _ in range(bs - 1)] + [self.make_row(prompt, False)]
+
+
 class PiecewiseConfigType(Enum):
     BATCHED = "batched"
     PACKED = "packed"

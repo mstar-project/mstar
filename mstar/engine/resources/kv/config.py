@@ -762,6 +762,9 @@ class KVStep(ResourceStep):
     # a draft-verify block (``with_draft_verify`` sets it): every row spans the same few
     # tokens, whose write slots a leased step computes on the host
     verify: bool = False
+    # with ``verify``: the step mixes verify rows with prompt rows of any span
+    # (``with_mixed_verify``), of which a device rewind moves only the blocks
+    mixed: bool = False
     # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
     # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
     commits: int = field(default=0, init=False, compare=False, repr=False)

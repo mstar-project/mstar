@@ -274,6 +274,9 @@ class AttentionStep(ResourceStep):
     hide_last: int = 0
     # a draft-verify block (``with_draft_verify`` sets it): every row spans the same few tokens
     verify: bool = False
+    # the requests whose segments ``hide_last`` applies to; None is every one (a step that
+    # mixes a drafter's blocks with prompt rows hides the blocks' rows only)
+    hide_rows: frozenset | None = None
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:

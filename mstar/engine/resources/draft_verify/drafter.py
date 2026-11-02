@@ -78,3 +78,57 @@ def draft_verify_step(
     if observe is not None:
         observe(block, verdict)
     return drafter.next_inputs(block, verdict)
+
+
+class PackedDrafter(Protocol):
+    """A drafter that can propose over a step mixing verify rows with prompt rows."""
+
+    def propose_packed(self, ids: torch.Tensor, dv: DraftVerifyResource, request_ids: list[int]) -> Drafts:
+        """``k`` drafts for each of the step's rows from its packed tokens ``ids``, the verify
+        rows leading with ``k + 1`` tokens each (the anchor, then placeholders). A prompt or
+        padding row's drafts are never read. Capturable."""
+        ...
+
+
+def leading_rows(x: torch.Tensor, rows: int, width: int) -> torch.Tensor:
+    """``[rows, width, ...]``: the first ``rows * width`` rows of ``x``, zero-padded when a
+    bucket holds fewer (a mixed step's last rows are prompts, shorter than a block)."""
+    need = rows * width
+    if x.shape[0] < need:
+        x = torch.cat([x, x.new_zeros((need - x.shape[0], *x.shape[1:]))])
+    return x[:need].view(rows, width, *x.shape[1:])
+
+
+def draft_verify_mixed_step(
+    dv: DraftVerifyResource,
+    request_ids: list[int],
+    ids: torch.Tensor,
+    hidden: Callable[[torch.Tensor], torch.Tensor],
+    logits: Callable[[torch.Tensor], torch.Tensor],
+    last_hidden: Callable[[torch.Tensor], torch.Tensor],
+    sample: Callable[[torch.Tensor], torch.Tensor],
+    drafter: PackedDrafter,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One step of verify rows and prompt rows (``with_mixed_verify``), the target run once over
+    both. ``ids`` are the step's packed tokens, the verify rows first, ``k + 1`` each; the step's
+    ``n`` rows include its prompts and padding, and everything per verify row runs over all
+    ``n``, so only the bucket's ``(rows, tokens)`` shape the graph. ``hidden`` is the target over
+    packed ids, ``logits`` its head, ``last_hidden`` each row's last token's hidden state and
+    ``sample`` the sampler over one row each. Returns the next step's inputs ``[n, 1]`` (the
+    verify rows') and a token per row (the prompt rows' first). Capturable."""
+    dv.apply_previous()
+    n = len(request_ids)
+    drafts = drafter.propose_packed(ids, dv, request_ids)
+    width = drafts.tokens.shape[1] + 1
+    block = dv.block_ids(leading_rows(ids, n, width)[:, 0], dv.agree(drafts.tokens))
+    states = hidden(dv.place_block(ids, block))
+    # one pass of the head over the blocks' rows and each row's last token: it reads its weights once
+    scores = logits(torch.cat([leading_rows(states, n, width).reshape(n * width, -1), last_hidden(states)]))
+    verdict = dv.verify(request_ids, block, scores[: n * width], drafts.probs)
+    first = sample(scores[n * width:])
+    # the drafter keeps the verified blocks' context and the prompts' alike, from the taps
+    observe = getattr(drafter, "observe", None)
+    if observe is not None:
+        observe(block, verdict)
+    return drafter.next_inputs(block, verdict), first
+

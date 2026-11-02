@@ -104,10 +104,14 @@ class DraftVerifySpec(NodeResourceSpec):
 
 @dataclass(frozen=True)
 class VerifyStep(ResourceStep):
-    """A verify step: each segment is a row of ``drafts + 1`` tokens."""
+    """A verify step: each segment is a row of ``drafts + 1`` tokens. A step that mixes verify
+    rows with prompt rows (``with_mixed_verify``) names its verify rows in ``rows``, which come
+    first; the other segments are the prompts."""
     drafts: int = 0
     # the key of the sampler step ``with_draft_verify`` added beside it
     sampler: str = "sampler"
+    # the requests whose rows verify; None is every row
+    rows: frozenset | None = None
 
 
 def with_draft_verify(
@@ -153,10 +157,54 @@ def with_draft_verify(
     return SubmoduleStep(steps=steps, segments=segments, cg_key_info=step.cg_key_info)
 
 
+def with_mixed_verify(
+    step: SubmoduleStep, policy: DraftPolicy, verify_rids, key: str = DRAFT_VERIFY, sampler: str = "sampler",
+) -> SubmoduleStep:
+    """``step``, a step that runs prompt rows beside a verify step's rows, as one: the rows of
+    ``verify_rids`` span ``policy.block`` tokens and come first (the engine orders a mixed
+    verify step's rows so), the others are prompts. ``VerifyStep(rows=...)`` is added under
+    ``key``; ``sampler`` stays the submodule's own step, which samples the prompts' first tokens
+    (``kept_rids``: the prompt rows) while the verify rows' tokens come from the verdict. As
+    ``with_draft_verify``, each other step with a ``verify`` field gets it set, and the target's
+    taps are added. Only for a walk without an engine-side proposer."""
+    segments = step.segments
+    if segments is None:
+        raise ValueError("with_mixed_verify needs the step's segments on the SubmoduleStep")
+    if policy.proposer is not None:
+        raise ValueError("a step mixing verify rows with prompts drafts in the forward; this policy names a proposer")
+    if sampler not in step.steps:
+        raise ValueError(f"a mixed verify step samples its prompt rows with the submodule's step under {sampler!r}")
+    rows = frozenset(verify_rids)
+    prompts = False
+    for segment in segments:
+        if segment.request_id not in rows:
+            prompts = True
+        elif prompts:
+            raise ValueError(f"a mixed verify step runs its verify rows first; {segment.request_id} follows a prompt")
+        elif segment.span != policy.block:
+            raise ValueError(
+                f"a verify row spans the block of {policy.block} tokens, but {segment.request_id} spans {segment.span}"
+            )
+    steps = {
+        name: _as_mixed(s) if name != sampler and _has_verify_field(type(s)) else s
+        for name, s in step.steps.items()
+    }
+    steps[key] = VerifyStep(drafts=policy.max_drafts, sampler=sampler, rows=rows)
+    if policy.taps and DRAFT_TAPS not in steps:
+        steps[DRAFT_TAPS] = TapStep()
+    return SubmoduleStep(steps=steps, segments=segments, cg_key_info=step.cg_key_info)
+
+
 @cache
 def _has_verify_field(step_type: type) -> bool:
     # once per step type, not per step
     return dataclasses.is_dataclass(step_type) and any(f.name == "verify" for f in dataclasses.fields(step_type))
+
+
+def _as_mixed(step: ResourceStep) -> ResourceStep:
+    """A step with a ``verify`` field, as a mixed verify step's: and ``mixed`` where it has one."""
+    mixed = any(f.name == "mixed" for f in dataclasses.fields(type(step)))
+    return dataclasses.replace(step, verify=True, **({"mixed": True} if mixed else {}))
 
 
 @dataclass(frozen=True)

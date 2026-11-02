@@ -1646,7 +1646,7 @@ in place declares ``RewindKind.DEVICE``: ``verify`` hands it each row's accepted
 the step's label inside the forward (``Resource.settle_verify``), after the target has run
 over the block, so a captured step records the settle too. ``with_draft_verify`` sets
 ``verify=True`` on every step of the submodule's with a ``verify`` field. A resource that declares no ``rewind_kind`` keeps the node from loading, as does a
-combined walk over the verifying walk, a prefix-cache key on its labels, a paged KV pool that
+combined walk over the verifying walk unless it can mix (below), a prefix-cache key on its labels, a paged KV pool that
 keeps a window of some layers (a rewind would have to give back pages its commit released), or a
 node that reads its sampled tokens back on the device (``reads_device_loopback``: a verify step
 writes none of the sampler's last-token rows, nor moves the in-graph scatter's offsets), a
@@ -1685,6 +1685,23 @@ its pages and last page; a captured plan's KV chunks are planned again in the gr
 shortened lengths. The attention spec's ``rewind_kernel`` picks one: ``auto`` (the default:
 paged FA3 where it runs, else FA2), ``fa3`` (refused at the first verify plan, so at load,
 where it can't run) or ``fa2``.
+A walk taken back on the device can also verify inside a combined walk with prompt walks, so a
+new prompt prefills in the step that verifies the running requests' drafts rather than in a step
+of its own that every decoding row waits for (the text LM's ``mixed`` walk under DSpark). The
+engine runs such a step's verify rows first, a block each, so every per-row plan finds them where
+a verify step of as many rows has them; ``declare_step`` wraps the step in
+``with_mixed_verify(step, policy, verify_rids)``, which names the verify rows on the
+``VerifyStep`` and leaves the submodule's own ``SamplerStep`` to sample the prompts' first tokens
+(``kept_rids``: the prompt rows); and the forward is ``draft_verify_mixed_step``, which drafts
+over the step's packed tokens, writes the drafts into the verify rows' positions
+(``DraftVerifyResource.place_block``), runs the target once over every token, verifies the
+first ``n * (k + 1)`` and samples each row's last. Under device rewind a prompt row takes nothing
+back (``Rejected.span`` is None: counts per token), every step of the walk plans FA2 (paged FA3 plans one block a row), and the
+engine stops the prompt rows through ``check_stop``. A packed capture of it is
+``MixedVerifyGraphConfig``. Such a combined walk is refused unless its verify walk is taken back
+on the device, drafts in the forward, settles nothing in place and verifies by argmax (a mixed
+step's sampler commits draws for its prompt rows only).
+
 Two kinds of drafter need no drafting code of the model's own, and a verify step's forward
 runs either through one helper, ``draft_verify_step(dv, request_ids, inputs, target,
 drafter=None)``: the drafts, ``agree``, ``target`` (the block's ids, flat, to the target's

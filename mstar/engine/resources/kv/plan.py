@@ -112,12 +112,18 @@ def context_only_views(
     return out
 
 
-def hide_tail_views(views: list[SequenceView], hide: int, page_size: int) -> list[SequenceView]:
+def hide_tail_views(
+    views: list[SequenceView], hide: int, page_size: int, rows: frozenset | None = None,
+) -> list[SequenceView]:
     """The views of a step's streams with each one's last ``hide`` rows out of its keys (the
     pages past the shorter length dropped); ``to_compute``, the row's queries, unchanged.
-    For a step whose trailing rows no query attends to (``AttentionStep.hide_last``)."""
+    For a step whose trailing rows no query attends to (``AttentionStep.hide_last``). With
+    ``rows``, only those requests' views."""
     out = []
     for view in views:
+        if rows is not None and view.request_id not in rows:
+            out.append(view)
+            continue
         length = view.length - hide
         if length < 1 or view.to_compute < hide:
             raise ValueError(f"hide_last={hide} on a row of {view.to_compute} new tokens and {view.length} in all")

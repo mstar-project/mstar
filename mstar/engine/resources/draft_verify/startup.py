@@ -26,6 +26,8 @@ class VerifyWalk(NamedTuple):
     policy: DraftPolicy
     # the sampler's resource key, under which a request's config carries ignore_eos
     sampler: str
+    # under a combined walk, the walk whose rows verify (the others are prompts); None: every row
+    rows_walk: str | None = None
 
 
 def verify_walk(
@@ -82,9 +84,9 @@ def verify_walk(
                 f"{DRAFT_TAPS!r} with those layers (the node's taps {have})"
             )
     if walk in combined_walks:
-        raise ValueError(
-            f"{where}, which a combined walk batches with others; a verify row needs a step of its own walk"
-        )
+        problem = _mixing_problem(policy, proposer, sampler, resources)
+        if problem is not None:
+            raise ValueError(f"{where}, which a combined walk batches with prompt rows, but {problem}")
     if submodule.device_loopback_signals(walk):
         raise ValueError(f"{where}, whose emitted tokens are cut on the host, so its outputs can't stay on the device")
     if getattr(submodule, "reads_device_loopback", False):
@@ -116,6 +118,11 @@ def verify_walk(
         )
         if proposer is None and not unable:
             dv.enable_device_rewind([res for res in resources.values() if res.plan_reads_lengths])
+        elif walk in combined_walks:
+            raise ValueError(
+                f"{where}, which a combined walk batches with prompt rows, but {unable} can't "
+                "correct a plan on the device"
+            )
         else:
             # waits for each verdict before the step after it, which is correct, just slower
             logger.info(
@@ -127,3 +134,44 @@ def verify_walk(
         dv.bind_proposer(proposer)
         proposer.bind_verifier(dv)
     return VerifyWalk(dv, policy, dv.sampler_key)
+
+
+def _mixing_problem(
+    policy: DraftPolicy, proposer: DraftProposer | None, sampler: SamplerResource,
+    resources: Mapping[str, Resource],
+) -> str | None:
+    """Why a walk's verify rows can't share a step with prompt rows (`with_mixed_verify`), or
+    None. Such a step runs its prompts through the sampler and plans them with the verify rows,
+    so nothing may wait for a verdict on the host or touch state a prompt row holds."""
+    if proposer is not None:
+        return "an engine-side proposer drafts it"
+    if sampler.sampled_verify:
+        return "its sampler verifies by rejection sampling, whose draws a mixed step commits for its prompt rows only"
+    settle = sorted(key for key, res in resources.items() if res.rewind_kind is RewindKind.DEVICE)
+    if settle:
+        return f"{settle} settle in place"
+    if not policy.device_rewind:
+        return "its verdicts come back on the host"
+    return None
+
+
+def mixed_verify_walk(
+    node: str, combined: str, members: Collection[str], walks: Mapping[str, VerifyWalk | None],
+    resources: Mapping[str, Resource],
+) -> VerifyWalk | None:
+    """A combined walk's ``VerifyWalk`` from its members' (``walks``): a step of it verifies the
+    rows of its one member that verifies, run first, beside the others' prompt rows; None when no
+    member verifies. Binds the attention resources that correct their plans on the device to
+    plan its steps for that (FA2 at any span)."""
+    verifying = sorted(walk for walk in members if walks.get(walk) is not None)
+    if not verifying:
+        return None
+    if len(verifying) > 1:
+        raise ValueError(f"node {node!r}: combined walk {combined!r} batches walks {verifying} that each verify drafts")
+    found = walks[verifying[0]]
+    for res in resources.values():
+        bind = getattr(res, "correct_mixed_walk", None)
+        if bind is not None and res.device_correct:
+            bind(combined)
+    return found._replace(rows_walk=verifying[0])
+

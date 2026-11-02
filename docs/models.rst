@@ -449,7 +449,9 @@ drafts its block (7) in one pass every step, and its KV pool is ``resources:
 dspark_kv``. Its verify steps take the last verdict back on the device, and on an H100/H200
 attend with FlashAttention-3's paged kernel when the ``flash_attn_3`` wheel is installed
 (see :doc:`installation`), else FlashInfer's FA2, about twice as slow on a verify step's
-attention at 32 rows. Under any method ``repetition_penalty`` and ``min_tokens`` are
+attention at 32 rows. With ``sampled_verify: false`` a new prompt prefills inside the step
+that verifies the running requests' drafts (captured for up to 512 prompt tokens
+beside up to 63 verify rows), rather than in a step of its own. Under any method ``repetition_penalty`` and ``min_tokens`` are
 refused, prefix caching is off on the node, and a draft model needs a prompt of
 at least two tokens.
 

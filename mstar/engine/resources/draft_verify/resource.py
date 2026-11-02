@@ -77,12 +77,14 @@ class VerdictTensors(NamedTuple):
 class Rejected(NamedTuple):
     """A verify step's rows' rejected counts from their last step, on the device, as
     ``Resource.correct_on_device`` takes them: per row (the step's segment order), per token, and
-    each token's row and place in its row; every row runs ``span`` tokens."""
+    each token's row and place in its row. Every row runs ``span`` tokens, or with ``span`` None
+    the step mixes verify rows with prompt rows, whose tokens count 0 (as do the tokens of a
+    bucket's tail, which belong to no row)."""
     rows: torch.Tensor  # [n] int32
-    tokens: torch.Tensor  # [n * span] int64
-    token_rows: torch.Tensor  # [n * span]
-    offsets: torch.Tensor  # [n * span]
-    span: int
+    tokens: torch.Tensor  # [tokens] int64
+    token_rows: torch.Tensor  # [tokens]
+    offsets: torch.Tensor  # [tokens]
+    span: int | None
 
 
 class EmittedRows(NamedTuple):
@@ -194,10 +196,20 @@ class DraftVerifyResource(Resource):
         self._current_src: torch.Tensor | None = None
         # (rows, span) -> each token's row and its place in the row, on the device
         self._grids: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # A step mixing verify rows with prompts (`VerifyStep.rows`): each token's row, its place
+        # in the row, whether its row verifies and whether it is a draft's position, [4, tokens]
+        # on the device (`_stage_layout`), in a capture slot's buffer when leased.
+        self._layout: dict[int, torch.Tensor] = {}
+        self._layout_stager = None
+        self._current_layout: torch.Tensor | None = None
+        self._cg_tokens = 0
         # steps committed since the last `emitted_rows`
         self._steps: list[_StepRecord] = []
         self.rows_verified = 0
         self.drafts_accepted = 0
+        # verify steps that carried prompt rows (`VerifyStep.rows`), and those prompts
+        self.mixed_steps = 0
+        self.mixed_prompts = 0
         # rows by how many drafts they accepted, which separates a weak first draft from a
         # chain that degrades
         self.accepted_hist = np.zeros(1, dtype=np.int64)
@@ -264,8 +276,9 @@ class DraftVerifyResource(Resource):
         self.remove_request(rid)
 
     def build_accelerator_graph_buffers(self, slots, max_bs: int, max_seq_len: int) -> None:
-        del slots, max_seq_len
+        del slots
         self._cg_rows = max(self._cg_rows, max_bs)
+        self._cg_tokens = max(self._cg_tokens, max_seq_len)
 
     def cleanup(self):
         if self.rows_verified:
@@ -299,7 +312,48 @@ class DraftVerifyResource(Resource):
         applied: frozenset = frozenset()
         if self.device_rewind:
             applied = self._stage_previous(step, ctx)
+        self._current_layout = None if step.rows is None else self._stage_layout(step, ctx)
         self._planned = _Planned(self._seq, slot, step.drafts, label, applied, self._committed_seq)
+
+    def _stage_layout(self, step: VerifyStep, ctx: StepContext) -> torch.Tensor:
+        """A mixed step's per-token layout, ``[4, tokens]``: each token's row (in the step's
+        segment order), its place in the row, 1 where its row verifies, and 1 at a verify row's
+        draft positions (all but its first token). A captured step's covers its bucket's tokens,
+        the tail past the real ones zero."""
+        spans = np.fromiter((segment.span for segment in step.segments or ()), np.int64)
+        verifies = np.fromiter(
+            (segment.request_id in step.rows for segment in step.segments or ()), bool, spans.shape[0],
+        )
+        lease = ctx.slot_lease
+        total = int(spans.sum())
+        width = total if lease is None else int(lease.bucket.num_tokens)
+        if width < total:
+            raise ValueError(f"draft-verify: a mixed step of {total} tokens on a bucket of {width}")
+        rows = np.repeat(np.arange(spans.shape[0]), spans)
+        starts = np.repeat(np.cumsum(spans) - spans, spans)
+        host = np.zeros((4, width), dtype=np.int64)
+        host[0, :total] = rows
+        host[1, :total] = np.arange(total) - starts
+        host[2, :total] = verifies[rows]
+        host[3, :total] = host[2, :total] * (host[1, :total] > 0)
+        if lease is None:
+            from mstar.utils.h2d import to_device_nonblocking
+
+            return to_device_nonblocking(torch.from_numpy(host), self._device)
+        buffer = self._layout.get(lease.slot)
+        if buffer is None:
+            buffer = self._layout[lease.slot] = torch.zeros(
+                (4, max(self._cg_tokens, width)), dtype=torch.long, device=self._device,
+            )
+        if self._layout_stager is None:
+            from mstar.utils.h2d import PinnedStager
+
+            self._layout_stager = PinnedStager(torch.int64)
+        view = buffer[:, :width]
+        # the whole buffer row by row would be four copies; a [4, width] view of it is not contiguous
+        for i in range(4):
+            self._layout_stager.copy_(view[i], host[i])
+        return view
 
     def _stage_previous(self, step: VerifyStep, ctx: StepContext) -> frozenset:
         """Under device rewind: where each of the step's rows (in its segment order, the order
@@ -311,7 +365,12 @@ class DraftVerifyResource(Resource):
         if n > _MAX_ROWS:
             raise ValueError(f"draft-verify: a step of {n} rows; device rewind takes {_MAX_ROWS} at most")
         last = {} if ctx.capture else self._last_rows
-        src = [last.get(rid, -1) if not ctx.is_padding_row(rid) else -1 for rid in rows]
+        verifying = step.rows
+        # a mixed step's prompt rows take nothing back: they ran no verify step
+        src = [
+            last.get(rid, -1) if not ctx.is_padding_row(rid) and (verifying is None or rid in verifying) else -1
+            for rid in rows
+        ]
         if self._src_stager is None:
             from mstar.utils.h2d import PinnedStager
 
@@ -343,8 +402,9 @@ class DraftVerifyResource(Resource):
         rows: list[int] = []
         positions: list[int] = []
         with self._lock:
+            verifying = step.rows
             for row, rid in enumerate(ctx.padded_request_ids):
-                if ctx.is_padding_row(rid):
+                if ctx.is_padding_row(rid) or (verifying is not None and rid not in verifying):
                     continue
                 if rid in applied:
                     # Its verdict from the last committed step, which this step took back on the
@@ -365,6 +425,9 @@ class DraftVerifyResource(Resource):
                 rows.append(rid)
                 positions.append(row)
             self._steps.append(_StepRecord(seq, slot, tuple(rows), tuple(positions)))
+            if verifying is not None:
+                self.mixed_steps += 1
+                self.mixed_prompts += len(ctx.request_ids) - len(rows)
             self._committed_seq = seq
             if self.device_rewind:
                 # the rows the next step takes this step's verdicts back from
@@ -394,9 +457,29 @@ class DraftVerifyResource(Resource):
             raise RuntimeError("DraftVerifyResource.apply_previous outside a planned verify step")
         src = self._current_src
         rows = torch.where(src >= 0, self._last_rej.index_select(0, src.clamp(min=0)), 0)
-        rejected = self._rejected(rows, self._planned.drafts + 1)
+        layout = self._current_layout
+        if layout is None:
+            rejected = self._rejected(rows, self._planned.drafts + 1)
+        else:
+            token_rows = layout[0]
+            tokens = rows.index_select(0, token_rows).to(torch.long) * layout[2]
+            rejected = Rejected(rows, tokens, token_rows, layout[1], None)
         for resource in self._correctors:
             resource.correct_on_device(rejected)
+
+    @torch.compiler.disable
+    def place_block(self, ids: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
+        """``ids``, a mixed step's packed tokens, with each verify row's drafts in place: the
+        verify rows lead, so ``block`` ``[n, k + 1]`` (the step's ``n`` rows, padding and
+        prompts included, of which only the verify rows' are written) covers its first
+        ``n * (k + 1)`` tokens. Capturable."""
+        layout = self._current_layout
+        if layout is None:
+            raise RuntimeError("DraftVerifyResource.place_block outside a planned mixed verify step")
+        m = min(ids.shape[0], block.numel())
+        out = ids.clone()
+        out[:m] = torch.where(layout[3, :m].bool(), block.reshape(-1)[:m].to(ids.dtype), ids[:m])
+        return out
 
     def _rejected(self, rows: torch.Tensor, span: int) -> Rejected:
         n = rows.shape[0]
@@ -620,10 +703,11 @@ class DraftVerifyResource(Resource):
         rates = " ".join(
             f"{reached[i] / reached[i - 1]:.2f}" if reached[i - 1] else "-" for i in range(1, len(reached))
         )
+        mixed = f"; {self.mixed_steps} steps carried {self.mixed_prompts} prompts" if self.mixed_steps else ""
         return (
             f"{self.rows_verified} verify rows, {mean:.2f} drafts accepted per row "
             f"({mean + 1:.2f} tokens per step); accepted by position {rates or '-'}; "
-            f"rows by drafts accepted {' '.join(str(int(x)) for x in self.accepted_hist)}"
+            f"rows by drafts accepted {' '.join(str(int(x)) for x in self.accepted_hist)}{mixed}"
         )
 
     # ── mirrors ──

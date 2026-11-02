@@ -62,6 +62,8 @@ class FlashInferManager(AttentionManager):
         self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
         self._window_left = -1 if sliding_window is None else sliding_window - 1
+        # walks whose steps mix verify rows with prompt rows (`correct_mixed_walk`)
+        self._mixed_walks: frozenset[str] = frozenset()
         # The index of the group of the pool's layers this reads (`PagedKVConfig.groups`): the
         # group of the layers it declares, else the first, the layers no window is kept for.
         groups = kv_config.groups
@@ -181,7 +183,7 @@ class FlashInferManager(AttentionManager):
                 use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
-        elif (backend := self._prefill_backend(bucket.num_tokens, num_rows, verify)) == _FA3_PAGED:
+        elif (backend := self._prefill_backend(bucket.num_tokens, num_rows, verify, bucket.graph_walk)) == _FA3_PAGED:
             wrapper = self._fa3_wrapper(num_rows)
         else:
             kv_kwargs["backend"] = backend
@@ -213,10 +215,13 @@ class FlashInferManager(AttentionManager):
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
-    def _prefill_backend(self, tokens: int, rows: int, verify: bool = False) -> str:
-        """The prefill wrapper's backend under device rewind: paged FA3 for a verify step where
-        it runs (`_verify_on_fa3`), else FA2 for a short block (`_SHORT_BLOCK`); else the
-        configured one."""
+    def _prefill_backend(self, tokens: int, rows: int, verify: bool = False, walk: str | None = None) -> str:
+        """The prefill wrapper's backend under device rewind: FA2 for every step of a walk that
+        mixes verify rows with prompts (`correct_mixed_walk`: paged FA3 plans one block a row),
+        paged FA3 for a verify step where it runs (`_verify_on_fa3`), else FA2 for a short block
+        (`_SHORT_BLOCK`); else the configured one."""
+        if self.device_correct and walk in self._mixed_walks:
+            return "fa2"
         if self.device_correct and verify and self._verify_on_fa3():
             return _FA3_PAGED
         if self.device_correct and tokens <= _SHORT_BLOCK * rows:
@@ -252,6 +257,11 @@ class FlashInferManager(AttentionManager):
             page_size=self._group.page_size, max_seq_len=kv.max_seq_len, device=self._device,
             batch_size=num_rows, accelerator_graph=num_rows is not None,
         )
+
+    def correct_mixed_walk(self, walk: str) -> None:
+        """Steps of ``walk`` carry verify rows beside prompt rows, whose lengths the device
+        corrects whatever the step's tokens a row: plan them FA2. Bound by the engine at load."""
+        self._mixed_walks = self._mixed_walks | {walk}
 
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int, backend: str | None = None,
@@ -300,7 +310,8 @@ class FlashInferManager(AttentionManager):
         if not step.hide_last:
             return kv_out.cpu_indptrs
         page_size = self._group.page_size
-        return build_paged_indptrs(hide_tail_views(kv_out.views, step.hide_last, page_size), page_size)
+        views = hide_tail_views(kv_out.views, step.hide_last, page_size, step.hide_rows)
+        return build_paged_indptrs(views, page_size)
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only:
@@ -352,7 +363,7 @@ class FlashInferManager(AttentionManager):
                 is_decode = not ctx.force_prefill and not self.device_correct and tokens == rows
                 wrapper = self._eager_wrapper(
                     label, is_decode, ctx.slot,
-                    None if is_decode else self._prefill_backend(tokens, rows, step.verify),
+                    None if is_decode else self._prefill_backend(tokens, rows, step.verify, ctx.graph_walk),
                 )
 
             kwargs = indptrs.to_kwargs_dict()

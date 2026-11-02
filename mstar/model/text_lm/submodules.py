@@ -1,6 +1,7 @@
 """The text LM node: a packed prefill that samples each prompt's first token, then one token per
 request per decode step; or, under a ``DraftConfig``, a verify step per decode step that keeps
-the drafts the target agrees with (``draft_verify_step``)."""
+the drafts the target agrees with (``draft_verify_step``), and with a drafter that mixes them,
+new prompts run inside the verify steps (``MIXED_WALK``, ``draft_verify_mixed_step``)."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -14,6 +15,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    MixedVerifyGraphConfig,
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.resources import (
@@ -27,18 +29,30 @@ from mstar.engine.resources import (
     Segment,
     SlotLease,
     SubmoduleStep,
+    draft_verify_mixed_step,
     draft_verify_step,
     with_draft_verify,
+    with_mixed_verify,
 )
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     TokenStop,
 )
-from mstar.model.text_lm.config import ATTN, DECODE_LOOP, DECODE_WALK, KV_CACHE, PREFILL_WALK, ROPE, SAMPLER
+from mstar.model.text_lm.config import (
+    ATTN,
+    DECODE_LOOP,
+    DECODE_WALK,
+    KV_CACHE,
+    MIXED_WALK,
+    PREFILL_WALK,
+    ROPE,
+    SAMPLER,
+)
 
 _MAIN = "main"
 
@@ -54,6 +68,11 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
     # prefill's batch is capped by its captures (and uncapped eager)
     MAX_PREFILL_BATCH_SIZE = None
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    # A step mixing verify rows with prompts is captured for these rows, at these prompt tokens
+    # beside a verify row in every row but one (`MixedVerifyGraphConfig`); more runs eager. (Finer
+    # and larger prompt buckets, 32-2,048, measured 2-5% slower at c=8 and no faster at c=32.)
+    MIXED_CAPTURE_BATCH_SIZES = [2, 4, 8, 16, 32, 64]
+    MIXED_PROMPT_TOKENS = [64, 128, 256, 512]
     # Only the eager forwards skip torch.compile: the decode capture compiles at the deployment's
     # level (`mstar serve -O`), and the prefill captures replay eager kernels.
     disable_torch_compile = True
@@ -68,6 +87,7 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         draft: DraftConfig | None = None,
         drafter: nn.Module | None = None,
         drafter_decl=None,
+        mixes_prompts: bool = False,
     ):
         super().__init__()
         self.lm = lm
@@ -91,12 +111,28 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         self._policy = None if draft is None else draft.policy(stop_ids=self.stop_token_ids, loop=DECODE_LOOP, **fields)
         # the tokens a verify step's input carries
         self._carry = 1 if drafter_decl is None else drafter_decl.carry_width()
+        # new prompts ride in verify steps (the model's MIXED_WALK)
+        self._mixes = bool(mixes_prompts and self._policy is not None)
 
     def get_draft_policy(self, graph_walk: str):
         return self._policy if graph_walk == DECODE_WALK else None
 
     def _verifies(self, graph_walk: str) -> bool:
         return self._policy is not None and graph_walk == DECODE_WALK
+
+    def get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None:
+        # what a mixed step's token budget reads: a prompt's ids, a verify row's block
+        if not self._mixes:
+            return None
+        if graph_walk == DECODE_WALK:
+            return InputSeqLenInfo(self._policy.block)
+        ids = inputs.get("text_inputs") if graph_walk == PREFILL_WALK else None
+        return InputSeqLenInfo(int(ids[0].numel())) if ids else None
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len) -> int | None:
+        if self._mixes and graph_walk == DECODE_WALK:
+            return self._policy.block
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -115,6 +151,17 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             )]
+        if self._mixes:
+            configs.append(MixedVerifyGraphConfig(
+                capture_graph_walk=MIXED_WALK, block=self._policy.block,
+                prompt_tokens=self.MIXED_PROMPT_TOKENS, capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
+                make_node_input=lambda n, verify: ARNodeInputs(
+                    input_seq_len=n, graph_walk=DECODE_WALK if verify else PREFILL_WALK,
+                    input_ids=torch.zeros(self._carry if verify else n, dtype=torch.long, device=device),
+                ),
+                # compiled at the deployment's level, as the verify capture it extends: eager, its
+                # unfused activations and draft heads cost a third of what the prompt adds
+            ))
         if self.prefill_token_buckets:
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
@@ -148,6 +195,15 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         rows = list(zip(request_ids, inputs, strict=True))
         segments = [Segment(request_id=rid, label=_MAIN, span=inp.input_seq_len) for rid, inp in rows]
         steps = {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True), ROPE: PositionStep()}
+        if graph_walk == MIXED_WALK:
+            # the verify rows lead (the engine orders them); the others are prompts, whose
+            # first tokens the sampler keeps
+            verify = [rid for rid, inp in rows if inp.graph_walk == DECODE_WALK]
+            prompts = frozenset(rid for rid, inp in rows if inp.graph_walk != DECODE_WALK)
+            steps[SAMPLER] = SamplerStep(apply_penalty=False, kept_rids=prompts)
+            steps.update(self.drafter_decl.mixed_steps(verify))
+            step = SubmoduleStep(segments=segments, steps=steps)
+            return with_mixed_verify(step, self._policy, verify, DRAFT_VERIFY, SAMPLER)
         if self._policy is None:
             # the prompt's ids count toward a repetition penalty
             steps[SAMPLER] = SamplerStep(
@@ -174,6 +230,14 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
     ) -> dict[str, Any]:
         if self._verifies(graph_walk):
             return {"input_ids": torch.stack([inp.input_ids for inp in inputs])}
+        if graph_walk == MIXED_WALK:
+            # packed: each verify row's anchor and the drafter's placeholders, then the prompts
+            verify = [inp for inp in inputs if inp.graph_walk == DECODE_WALK]
+            parts = [inp.input_ids for inp in inputs[len(verify):]]
+            if verify:
+                anchors = torch.stack([inp.input_ids[-1:] for inp in verify])
+                parts.insert(0, self.drafter.block_inputs(anchors).reshape(-1))
+            return {"input_ids": torch.cat(parts)}
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         if self.drafter_decl is not None and graph_walk == PREFILL_WALK:
             # what the drafter's prefill takes beside the target's
@@ -205,6 +269,21 @@ class TextLMSubmodule(TokenStepNode, ARNodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         drafter_inputs: dict | None = None, **kwargs,
     ) -> BatchedModelOutput:
+        if graph_walk == MIXED_WALK:
+            # the verify rows' next inputs, and each prompt's first token (the engine emits the
+            # verify rows' kept tokens as their new_token)
+            attn = engine_inputs.resources[ATTN]
+            carry, first = draft_verify_mixed_step(
+                engine_inputs.resources[DRAFT_VERIFY], list(engine_inputs.request_ids), input_ids,
+                hidden=lambda ids: self.lm(self.lm.embed(ids), label=_MAIN),
+                logits=self.lm.logits,
+                last_hidden=lambda states: attn.select_last_hidden(states, label=_MAIN),
+                sample=lambda logits: self._draw(engine_inputs, logits),
+                drafter=self.drafter,
+            )
+            # no row-addressed stop buffer: a verify row's tokens are the engine's, so the stop
+            # check and the store read this step per request
+            return BatchedModelOutput(row_outputs={"text_inputs": carry, "new_token": first})
         if self._verifies(graph_walk):
             # the next step's inputs; the engine emits the kept tokens as new_token
             carry = draft_verify_step(

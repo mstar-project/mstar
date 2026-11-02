@@ -227,6 +227,11 @@ class SamplerResource(Resource):
     def verifies_drafts(self) -> bool:
         return self._draft_verify
 
+    @property
+    def sampled_verify(self) -> bool:
+        """Verifies drafts by rejection sampling (``enable_sampled_verify``), not an argmax."""
+        return self._sampled_verify
+
     def build_accelerator_graph_buffers(
         self, slots, max_bs: int, max_seq_len: int
     ):

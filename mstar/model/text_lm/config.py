@@ -11,6 +11,8 @@ LLM_NODE = "LLM"
 PREFILL_WALK = "prefill"
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
+# a step that verifies the decode loop's drafts beside new prompts (a drafter that mixes them)
+MIXED_WALK = "mixed"
 
 KV_CACHE = "kv_cache"
 ATTN = "attn"

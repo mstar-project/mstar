@@ -47,7 +47,7 @@ from mstar.model.base import (
 )
 from mstar.model.components.drafters import TargetInfo, in_node_drafter
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.text_lm.config import (
     ATTN,
     DECODE_LOOP,
@@ -55,6 +55,7 @@ from mstar.model.text_lm.config import (
     KV_CACHE,
     LLM_NODE,
     LM_FAMILIES,
+    MIXED_WALK,
     PREFILL_WALK,
     ROPE,
     SAMPLER,
@@ -238,6 +239,30 @@ class TextLMModel(Model):
     # -------------------------------------------------------------------
     # graph: prefill, then a decode loop
     # -------------------------------------------------------------------
+
+    # most tokens a step mixing verify rows with prompts runs: room for any prompt beside a full
+    # verify batch, so a prompt never waits out the decode chain for an exclusive step
+    MIXED_MAX_BATCH_TOKENS = 8192
+
+    def mixes_prompts(self) -> bool:
+        """New prompts ride in the decode loop's verify steps (``MIXED_WALK``) rather than in
+        steps of their own: a drafter that proposes over a mixed step (DSpark), verified by
+        argmax (a mixed step commits its sampler's draws for the prompts only)."""
+        return (
+            self.draft is not None and not self.draft.sampled_verify
+            and getattr(self.drafter, "mixes_prompts", False)
+        )
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        if not self.mixes_prompts():
+            return {}
+        return {LLM_NODE: {MIXED_WALK: {PREFILL_WALK, DECODE_WALK}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        if not self.mixes_prompts():
+            return {}
+        # a budget on the mixed walk is what merges a ready prompt into the decode chain's step
+        return {LLM_NODE: (ChunkingPolicy(walks=(MIXED_WALK,), max_batch_tokens=self.MIXED_MAX_BATCH_TOKENS),)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         carry = self._decode_carries()
@@ -436,7 +461,7 @@ class TextLMModel(Model):
         return TextLMSubmodule(
             lm, stop_token_ids=self.stop_token_ids, accelerator_graph=self.accelerator_graph,
             prefill_token_buckets=self.prefill_token_buckets, draft=self.draft, drafter=drafter,
-            drafter_decl=self.drafter,
+            drafter_decl=self.drafter, mixes_prompts=self.mixes_prompts(),
         )
 
 

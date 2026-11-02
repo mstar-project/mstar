@@ -3043,7 +3043,7 @@ class KVManager(AttentionResource):
         for g, outputs in enumerate(res.groups):
             self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
         if self.device_correct:
-            self._stage_fixes(res if step.verify else {}, ctx)
+            self._stage_fixes(res if step.verify else {}, ctx, mixed=step.mixed)
         laps.lap("setup_states")
         if readonly:
             self._readonly_plans[slot] = (key, epochs, res)
@@ -3209,28 +3209,39 @@ class KVManager(AttentionResource):
 
     corrects_on_device = True
 
-    def _stage_fixes(self, res: dict[str, KVPlanOutput], ctx: StepContext) -> None:
+    def _stage_fixes(self, res: dict[str, KVPlanOutput], ctx: StepContext, mixed: bool = False) -> None:
         """Under device rewind, what `correct_on_device` readdresses a verify step's writes
         from, for each label: each row's planned first position (its stream's length before
         the step), the first page a rewind of up to ``span - 1`` rows can move it to, and the
         row's pages from that one on (`_FIX_PAGES`, padded with SINK_PAGE). Every row of a
-        verify step runs one block. A pool that verifies drafts has one group (`require_lookahead`)."""
+        verify step runs one block; a step mixing verify rows with prompt rows (``mixed``) has
+        rows of any span, of which only the blocks' are ever moved. A pool that verifies drafts
+        has one group (`require_lookahead`)."""
         fixes = self._preplan_fixes if ctx.is_preplan else self._current_fixes
         fixes.clear()
         page_size = self._groups[0].page_size
         lease = ctx.slot_lease
+        reach_max = (_FIX_PAGES - 2) * page_size // 2
         for label, out in res.items():
             ind = out.cpu_indptrs
-            spans = np.diff(ind.qo_indptr.numpy())
+            spans = np.diff(ind.qo_indptr.numpy()).astype(np.int64)
             if not spans.size:
                 continue
-            span = int(spans[0])
-            if (spans != span).any() or ind.kv_lens is None:
-                raise ValueError(f"KV {self.name}: a step taken back on the device runs one block a row; got {spans}")
-            if 2 * span - 2 > (_FIX_PAGES - 2) * page_size:
-                raise ValueError(f"KV {self.name}: a block of {span} spans more pages than a device rewind stages")
-            start = ind.kv_lens.numpy().astype(np.int64) - span
-            first = np.maximum(start - (span - 1), 0) // page_size
+            if ind.kv_lens is None:
+                raise ValueError(f"KV {self.name}: a step taken back on the device needs its rows' lengths")
+            if not mixed:
+                span = int(spans[0])
+                if (spans != span).any():
+                    raise ValueError(
+                        f"KV {self.name}: a step taken back on the device runs one block a row; got {spans}"
+                    )
+                if 2 * span - 2 > (_FIX_PAGES - 2) * page_size:
+                    raise ValueError(f"KV {self.name}: a block of {span} spans more pages than a device rewind stages")
+            start = ind.kv_lens.numpy().astype(np.int64) - spans
+            # how far back a rewind can move the row's first write: a block's drafts; a prompt row
+            # (longer than any block) is never moved
+            reach = np.where(spans - 1 <= reach_max, np.maximum(spans - 1, 0), 0)
+            first = np.maximum(start - reach, 0) // page_size
             indptr = ind.paged_kv_indptr.numpy().astype(np.int64)
             indices = ind.paged_kv_indices.numpy().astype(np.int64)
             held = indptr[1:] - indptr[:-1]
@@ -3261,14 +3272,24 @@ class KVManager(AttentionResource):
             state = self._current_plan_states[label, 0]
             rows = rejected.token_rows
             tokens = rows.shape[0]
-            if fix.shape[0] * rejected.span != tokens:
+            if fix.shape[0] != rejected.rows.shape[0]:
                 raise RuntimeError(
                     f"KV {self.name}: {label!r} plans {fix.shape[0]} rows; the verdicts are for "
-                    f"{tokens // rejected.span}"
+                    f"{rejected.rows.shape[0]}"
                 )
             position = fix[:, 0].index_select(0, rows) - rejected.tokens + rejected.offsets
             page_no = torch.div(position, page_size, rounding_mode="floor")
             column = page_no - fix[:, 1].index_select(0, rows) + 2
+            if rejected.span is None:
+                # a mixed step: a prompt row's tokens (and a bucket's tail) stay where planned,
+                # and only a moved token's column, inside its row's window, is read
+                moved = rejected.tokens > 0
+                column = column.clamp(2, fix.shape[1] - 1)
+                pages = torch.where(moved, fix[rows, column], state.token_to_page[:tokens])
+                offsets = torch.where(moved, position - page_no * page_size, state.token_to_cache[:tokens])
+                state.token_to_page[:tokens].copy_(pages)
+                state.token_to_cache[:tokens].copy_(offsets)
+                continue
             state.token_to_page[:tokens].copy_(fix[rows, column])
             state.token_to_cache[:tokens].copy_(position - page_no * page_size)
 

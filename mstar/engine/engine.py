@@ -39,7 +39,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
-from mstar.engine.resources.draft_verify.startup import VerifyWalk, verify_walk
+from mstar.engine.resources.draft_verify.startup import VerifyWalk, mixed_verify_walk, verify_walk
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -374,6 +374,8 @@ class ExecutingBatch:
     failed_resource: str | None = None
     # a verify step's stops, settled with its emitted tokens (see `Engine._emit_verified`)
     verify_stops: dict[int, set[str]] | None = None
+    # a mixed verify step's verify rows; its other rows' stops are the submodule's
+    verify_rids: frozenset | None = None
     # under device rewind, a verify step whose tokens and stops the stop check reads
     # (`Engine._emit_record`)
     verify_record: VerifyRecord | None = None
@@ -689,8 +691,11 @@ class Engine:
         the step's forward."""
         if model is None:
             return
-        for node, walk in model.combined_walk_of():
+        # node -> combined walk -> its walks
+        combined_of: dict[str, dict[str, set[str]]] = {}
+        for (node, walk), combined in model.combined_walk_of().items():
             self._combined_members.setdefault(node, set()).add(walk)
+            combined_of.setdefault(node, {}).setdefault(combined, set()).add(walk)
         walks: dict[str, list[str]] = {}
         for walk, graph in model.get_graph_walk_graphs().items():
             for node in graph.get_nodes():
@@ -699,6 +704,18 @@ class Engine:
             if mgmt.declares_drafts:
                 for walk in walks.get(node, ()):
                     self._verify_walk(node, mgmt, walk)
+        for node, combined in combined_of.items():
+            mgmt = self._submodules.get(node)
+            if mgmt is None or not mgmt.declares_drafts:
+                continue
+            for name, members in combined.items():
+                found = mgmt.verify_walks[name] = mixed_verify_walk(
+                    node, name, members, mgmt.verify_walks, mgmt.resources,
+                )
+                if found is not None:
+                    # a mixed verify step runs its verify rows first, a block each, so every
+                    # resource finds them where a verify step of as many rows has them
+                    self._split_prompt_walks[(node, name)] = frozenset(set(members) - {found.rows_walk})
 
     def _verify_walk(self, node: str, mgmt: SubmoduleManagement, walk: str) -> VerifyWalk | None:
         """The walk's `VerifyWalk`, asked of the submodule once per walk."""
@@ -1527,7 +1544,7 @@ class Engine:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
-                batch.verify_stops = None
+                batch.verify_stops = batch.verify_rids = None
                 if verifying is not None and batch.admit_error is None:
                     self._emit_verified(batch, verifying)
             laps = PhaseLaps("engine.exec.")
@@ -1556,6 +1573,19 @@ class Engine:
         stops. Waits for the step's verdict, which the next step's rewinds wait for too; under
         device rewind the stop check emits them instead (`_emit_record`)."""
         rids = batch.request_ids
+        if verifying.rows_walk is not None:
+            # A mixed step: its verify rows, which lead (`order_split_rows`). Its row outputs
+            # carry the prompt rows' first tokens under the emit signal, a value no verify row
+            # emits, so the verify rows drop it and the store reads every row per request,
+            # where the verify rows' tokens land at the stop check.
+            walk_of = batch.step_context.walk_of
+            rids = [rid for rid in rids if walk_of(rid) == verifying.rows_walk]
+            emit = verifying.policy.emit
+            per_rid = batch.outputs.per_rid_outputs
+            for rid in rids:
+                per_rid.get(rid, {}).pop(emit, None)
+            batch.outputs.row_views = None
+        batch.verify_rids = None if verifying.rows_walk is None else frozenset(rids)
         info = batch.per_request_info_wrapped
         dv = verifying.resource
         batch.verify_record = None
@@ -2213,10 +2243,29 @@ class Engine:
         if getattr(batch, "verify_record", None) is not None:
             self._emit_record(batch)
         stops = getattr(batch, "verify_stops", None)
-        if stops is not None:
+        verify_rids = getattr(batch, "verify_rids", None)
+        if stops is not None and verify_rids is None:
             # settled with the step's emitted tokens; the engine owns a verify step's stop
             return {rid: stops[rid] for rid in batch.request_ids if rid in stops}
         submodule = self._submodules[batch.node_name].submodule
+        if stops is not None:
+            # a mixed step: its verify rows' stops are the engine's, its prompt rows' the
+            # submodule's (a first-token stop), checked row by row
+            merged = {rid: stops[rid] for rid in batch.request_ids if rid in stops}
+            for rid in batch.request_ids:
+                rid_outputs = outputs.get(rid)
+                if rid in verify_rids or not rid_outputs:
+                    continue
+                try:
+                    rid_stops = submodule.check_stop(rid, batch.per_request_info_wrapped[rid], rid_outputs)
+                except Exception as error:
+                    batch.register_failure(rid, error)
+                    continue
+                if isinstance(rid_stops, StopCheck):
+                    rid_stops = rid_stops.stops
+                if rid_stops:
+                    merged[rid] = rid_stops
+            return merged
         if host_rows is not None:
             try:
                 batched = submodule.check_stop_batched(
