@@ -186,9 +186,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
         def media(n: int) -> ARNodeInputs:
             # every encoder's buffer, `n` rows: a step without that medium
-            # leaves it stale, and no pad reads it
+            # leaves it stale, and no pad reads it. A row advances the position
+            # counter by its own length, so a replay's padding row (n = 0)
+            # moves nothing beside real rows that place their own positions.
             return ARNodeInputs(
                 input_seq_len=n,
+                resource_step_info=n,
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
                 tensor_inputs={
                     e.output: torch.zeros(

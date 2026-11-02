@@ -236,6 +236,31 @@ def test_a_media_prompt_hands_its_advance_and_ids_to_the_resources():
         .steps[ROPE].advance is None
 
 
+def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
+    """A replay pads a 3-row media batch to the 4-row capture with the
+    capture's own rows; those advance by their (zero) length beside real rows
+    that place their own positions."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.engine.resources.step import BucketKey, SlotLease
+    from mstar.model.submodule_base import ARNodeInputs
+
+    llm = _qwen_llm()
+    (config,) = [
+        c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
+        if c.capture_graph_walk == "prefill_vision"
+    ]
+    rows = [
+        ARNodeInputs(input_seq_len=n, input_ids=torch.full((n,), IMAGE_PAD), resource_step_info=advance)
+        for n, advance in ((10, 6), (4, 4), (7, 5))
+    ]
+    bucket = BucketKey("prefill_vision", bs=4, num_tokens=32)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._buckets = {bucket: SimpleNamespace(config=config)}
+    padded = runner.pad_inputs(SlotLease(slot=0, bucket=bucket), rows)
+    step = llm.declare_step("prefill_vision", [0, 1, 2, 3], padded)
+    assert step.steps[ROPE].advance == (6, 4, 5, 0)
+
+
 def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     """Checked on host values: the media tensor's shape against the layout."""
     llm = _qwen_llm((AUDIO,))
