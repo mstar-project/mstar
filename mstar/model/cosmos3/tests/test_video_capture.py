@@ -17,6 +17,7 @@ from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+from mstar.model.cosmos3.tests.stubs import StubSampler
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -87,16 +88,18 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
         list(range(7)), list(range(9)), 64, 64, 3, 24.0,
         has_image_condition=False, cond_units=1, device="cpu", first_window=False,
     )
-    sched = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0, 100.0]), step_index=None)
+    sub._solver_state = ()
     st = sub.request_state("r")
     st.add_all(
-        cond=cond, uncond=uncond, gs=6.0, guidance_interval=None, scheduler=sched,
+        cond=cond, uncond=uncond, gs=6.0, guidance_interval=None,
+        scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0])),
         latent_shape=(1, ch, 3, 4, 4), ar_schedule=WindowSchedule(6, 3, overlap_units=1),
         ar_steps=3, ar_iters_per_window=3, ar_total_iters=9, ar_kv_mode=False,
     )
     x = torch.zeros(1, ch, 3, 4, 4)
-    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0)
-    ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x], "time_index": [torch.tensor([4])]})
+    counts = {"video_gen_ar_loop": 4}
+    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0, dynamic_loop_iter_counts=counts)
+    ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x]})
     t = ni.tensor_inputs
     assert torch.equal(t["noisy_token_mask"], torch.tensor([0.0] * 4 + [1.0] * 8))
     assert t["vision_timesteps"].shape == (12,) and torch.all(t["vision_timesteps"] == 500.0)  # window 1, step 1
@@ -105,7 +108,8 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
     assert torch.equal(sub._noisy_masks(st, "cpu")[1].flatten(), torch.tensor([0.0, 1.0, 1.0]))
     # A kv request at the same shape stages no captured inputs (it never leases).
     st.add("ar_kv_mode", True)
-    ni_kv = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x], "time_index": [torch.tensor([1])]})
+    counts["video_gen_ar_loop"] = 1
+    ni_kv = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x]})
     assert "noisy_token_mask" not in ni_kv.tensor_inputs and ni_kv.resource_step_info.capture_key is None
 
 
@@ -117,8 +121,8 @@ def test_postprocess_captured_video_step(monkeypatch) -> None:
     # No VAE here: the next window's head is the raw tail (test_windowed pins the real head).
     sub._window_head = lambda w, units: w[:, :, -units:]
     ch = sub.config.latent_channel
-    sched = SimpleNamespace(timesteps=torch.tensor([900.0, 500.0]),
-                            step=lambda v, t, lat, return_dict=False: (lat - v,))
+    sched = StubSampler(torch.tensor([900.0, 500.0]))
+    sub._solver_state = ()
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: sched)
     monkeypatch.setattr(sub, "_window_statics_for", lambda st, plan, dev: (st["cond"], st["uncond"]))
     cond = {"vision_token_shapes": [(3, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([1, 2])],
@@ -135,22 +139,22 @@ def test_postprocess_captured_video_step(monkeypatch) -> None:
     )
     lat = torch.zeros(1, ch, 3, 4, 4)  # the loop's latents carry the batch dim, like the velocities
     velocity = torch.ones(1, ch, 3, 4, 4)
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK)
+    counts = {"video_gen_ar_loop": 0}
+    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts=counts)
     # Window 0, step 0 (global 0): frame 0 keeps the pinned latents, noisy
     # frames move by the velocity.
     out = {"cond_v": [velocity], "uncond_v": [velocity]}
-    step0 = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": torch.tensor([0])})
-    sub.postprocess("r", info, out, inputs=step0)
+    sub.postprocess("r", info, out, inputs=ARNodeInputs(tensor_inputs={"latents": lat}))
     new = out["latents"][0]  # [1, C, T, H, W]
     assert new.shape == (1, ch, 3, 4, 4)
     assert torch.all(new[:, :, 0] == 7.0) and torch.all(new[:, :, 1:] == -1.0)
-    assert "window_latents" not in out and int(out["time_index"][0]) == 1
+    assert "window_latents" not in out
     # Window 0, step 1 (global 1) is the window's last step: emits the window
     # and stages the next one.
     out = {"cond_v": [velocity], "uncond_v": [velocity]}
-    step1 = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": torch.tensor([1])})
-    sub.postprocess("r", info, out, inputs=step1)
-    assert "window_latents" in out and int(out["time_index"][0]) == 2
+    counts["video_gen_ar_loop"] = 1
+    sub.postprocess("r", info, out, inputs=ARNodeInputs(tensor_inputs={"latents": lat}))
+    assert "window_latents" in out
     assert out["latents"][0].shape == (1, ch, 3, 4, 4)
 
 

@@ -5,7 +5,7 @@ description: Building an image/video flow or diffusion model on M*'s DiT scaffol
 
 # The DiT scaffold
 
-`mstar/model/components/diffusion/` holds what every text → flow transformer → VAE model shares: sigma schedules and the Euler step (`flow_match`), multi-axis RoPE, joint attention, compile and decode wrappers, weight streaming, and the `DenoiseLoopSubmodule` that runs as the body of a model's `Loop("denoise_loop", dit)`. `flux2_klein` and `z_image` are built on it and are the references to read. `cosmos3` and `wan22` predate it; don't copy their single-request, self-compiled, uncaptured loop.
+`mstar/model/components/diffusion/` holds what every text → flow transformer → VAE model shares: sigma schedules and the Euler step (`flow_match`), multi-axis RoPE, joint attention, compile and decode wrappers, weight streaming, and the `DenoiseLoopSubmodule` that runs as the body of a model's `Loop("denoise_loop", dit)`. `flux2_klein` and `z_image` are built on it and are the references to read, and `wan22` runs on it without capture. `cosmos3` predates it; don't copy its self-compiled, uncaptured loop.
 
 Read the module docstring of `denoise_loop.py` first. Its two-column table is the contract: on the left what the base does (step index from the engine's loop counter, per-request schedule and seeded noise, overshoot veto, equal-key batching, stop at the request's own step count, per-key graph buckets, the ragged step declaration), on the right the hooks a model implements. This skill covers the decisions behind those hooks and what has gone wrong.
 
@@ -26,7 +26,7 @@ Batching rarely buys throughput for a large video DiT: one 544×960×121 row is 
 - `schedule_for` returns a `FlowMatchSchedule`; the base stages its tensors on the device once per request, and `STEP_SCALARS` slices `sigma`, `sigma_next` and `timestep` out per step as `[1]` device tensors. Rows at different steps therefore share one forward, and a captured graph reads them from staged buffers. A scheduler that needs another per-step value (a guidance scale) adds a `StepScalar` entry instead of overriding `prepare_inputs`.
 - **Match the reference's RNG exactly.** `seed_latents` draws from a CPU generator the base seeds per request; draw the same shapes in the same order and dtype as the reference pipeline, or the comparison against the oracle is meaningless from step 0. A recipe that draws more than once (a second stage's noise) has to continue the same generator, not reseed.
 - Seeded noise and the schedule reach the device through `to_device_nonblocking` (`mstar/utils/h2d.py`: one memcpy into pinned memory, one non-blocking copy); `tensor.to(device)` from pageable memory blocks the GPU thread and stalls the pre-plan.
-- `SOLVER_STATE` names extra loop-back edges for a multi-step scheduler (wan22's UniPC); `seed_loop_back` supplies iteration 0's values and `denoise` returns them alongside the sample.
+- `SOLVER_STATE` names extra loop-back edges for a multi-step scheduler; `seed_loop_back` supplies iteration 0's values and `denoise` returns them alongside the sample. For UniPC, subclass `UniPCDenoiseLoopSubmodule` and implement `model_output`: the base carries the state and steps each row by the loop counter from its own tables. `components/diffusion/unipc.py` is the one port of the scheduler; cosmos3 calls it too. Keep its host sigma in `unipc_convert_model_output`: a 0-dim device tensor would round the multiply in the operand's dtype.
 
 ## Multi-stage recipes
 

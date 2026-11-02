@@ -303,7 +303,7 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # all, beyond fitting a captured bucket. For a limit the bucket key does
     # not express, such as how many attention segments a replay's plan holds.
     # A batch it rejects gets no lease, so its forward runs the region eagerly
-    # (`ModelInputsFromEngine.step` is the declaration that tells it so).
+    # (`ModelInputsFromEngine.piecewise_leases` is what tells it so).
     # None: every batch that fits a bucket.
     can_lease: Callable[[list[NodeInputs]], bool] | None = None
     # The region replays a whole step as ONE row, however many requests the

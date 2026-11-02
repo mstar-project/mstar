@@ -33,7 +33,15 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.aut_encoder import AuTEncoder
@@ -74,6 +82,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -284,20 +293,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         sin: torch.Tensor,
         seq_lengths: tuple[int, ...],
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
-        """The block loop replayed once per request, or None if not leased.
-
-        A leased step declares nothing of its own (`declare_step`), so
-        ``engine_inputs.step`` is None; a bucket that fits is not enough, as
-        ``can_lease`` may have refused the batch. The bucket check keeps a
-        forward driven outside the engine (no declaration either) eager.
-        """
-        runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
-        if runner is None or engine_inputs.step is not None or not runner.can_run(
-            len(engine_inputs.request_ids), int(hidden.shape[0]),
-        ):
+        """The block loop replayed once per request, or None if not leased."""
+        if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
         # one replay for every frame: a second plan overwrites the schedule a queued replay still reads
-        out = runner.run(
+        out = engine_inputs.piecewise_runners[VISION_BLOCK_LOOP].run(
             static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
             request_ids=[engine_inputs.request_ids[0]],
             seq_lens=list(seq_lengths),
@@ -473,6 +473,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_embeds,
             self._vision_eos_embed
         ], dim=0)
+
+    # multimodal spans carry a start and an end sentinel around the embeds
+    _EMBED_INPUTS = {"prefill_audio": "audio_embeds", "prefill_vision": "vision_embeds"}
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if graph_walk == "thinker_decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        name = self._EMBED_INPUTS.get(graph_walk)
+        if name is not None and name in inputs:
+            # the attachment's row carries the text around it (`_spliced_row`)
+            around = sum(text.shape[0] for text in inputs.get("text_inputs", ()))
+            return InputSeqLenInfo(inputs[name][0].shape[0] + 2 + around)
+        return None
 
     def prepare_inputs(
         self,
@@ -662,6 +680,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             },
         )
 
+    MAX_BATCH_TOKENS = 1024
+
     def split_inputs(
         self,
         graph_walk: str,
@@ -671,6 +691,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         end: int,
     ) -> ARNodeInputs:
         tensors = inputs.tensor_inputs
+        # a key not cut here would be dropped from the chunk
+        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance", "text_token_ids"}
+        if unknown:
+            raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
         cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
         if graph_walk == "prefill_vision":
@@ -710,9 +734,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
             # A vision row's 3D-grid MRoPE span differs from its token count, and
             # a cut row moves past its whole walk, so each advances the counter
-            # by its own `mrope_pos_advance`.
+            # by its own `mrope_pos_advance`. That value is the WHOLE row's, and
+            # a chunk's positions were cut from it, so a chunked row applies it
+            # once, on its final chunk. A row without one advances by the span
+            # it just ran, which is per chunk.
             pos_advance = tuple(
-                int(inp.tensor_inputs.get("mrope_pos_advance", inp.input_seq_len))
+                (int(inp.tensor_inputs["mrope_pos_advance"]) if inp.is_final_chunk else 0)
+                if "mrope_pos_advance" in inp.tensor_inputs else inp.input_seq_len
                 for inp in inputs
             )
         return SubmoduleStep(
@@ -1186,8 +1214,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        return_token = request_info.graph_walk == "thinker_decode" or \
+        return_token = request_info.graph_walk == "thinker_decode" or (
             request_info.step_metadata.get("is_last_prefill", False)
+        )
         if not return_token:
             outputs.pop("new_token", None)
 
@@ -1217,8 +1246,15 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 selected = torch.where(
                     multimodal_mask.unsqueeze(-1), layer_n, layer_0,
                 )                              # (seq_len, hidden)
-                outputs["thinker_states"] = [selected[inclusion_mask]]
-                outputs["thinker_mask"] = [multimodal_mask[inclusion_mask]]
+                kept = selected[inclusion_mask]
+                if kept.shape[0]:
+                    outputs["thinker_states"] = [kept]
+                    outputs["thinker_mask"] = [multimodal_mask[inclusion_mask]]
+                else:
+                    # A chunk of only system prompt or earlier turns gives the
+                    # Talker nothing to write; unsent, it runs no empty prefill.
+                    outputs.pop("thinker_states")
+                    outputs.pop("thinker_mask")
 
         if "new_token" not in outputs:
             return
@@ -1441,6 +1477,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
 
         if graph_walk == "talker_prefill":
+            # The Thinker's walk, or one chunk of it when its prefill is chunked
             selected_hidden = inputs["thinker_states"][0].to(device)
             multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(
