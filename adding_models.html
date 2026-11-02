@@ -1163,7 +1163,10 @@ another walk ends them, and the rest of the label is computed, never served.</p>
 request that re-sends the reply matches it too.</p></li>
 </ul>
 <p>The keys cover the label’s first <code class="docutils literal notranslate"><span class="pre">keyed_spans</span></code> spans. An ids span is keyed by its
-token ids, a digest span by its file.</p>
+token ids, a digest span by its file. Each span is its own step unless it sets
+<code class="docutils literal notranslate"><span class="pre">opens_step=False</span></code>, which puts it in one row with the span before it: a match cuts the
+row, and the row keeps placing its own positions, so its walk declares the advance of the
+whole row whatever the cut left (Qwen3-Omni’s prefill of text around an attachment).</p>
 <p>BAGEL keys its text and ViT walks and the decode that follows them:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">return</span> <span class="p">{</span><span class="s2">"kv"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"main"</span><span class="p">:</span> <span class="n">KVLabel</span><span class="p">(</span>
     <span class="n">growth</span><span class="o">=</span><span class="p">((</span><span class="n">DECODE</span><span class="p">,</span> <span class="s2">"decode_loop"</span><span class="p">),),</span>

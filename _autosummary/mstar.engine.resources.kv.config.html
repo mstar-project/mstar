@@ -781,6 +781,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.digest"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.digest</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.end_key"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.end_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.length"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.length</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.opens_step"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.opens_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.scratch"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.scratch</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.walk"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.walk</span></code></a></li>
 </ul>
@@ -1636,13 +1637,14 @@ DEFAULT_PAGE_SIZE, or with a window the smallest page whole for both groups
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PrefixSpan">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">PrefixSpan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">length</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">advance</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scratch</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PrefixSpan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PrefixSpan" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.config.</span></span><span class="sig-name descname"><span class="pre">PrefixSpan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">length</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">advance</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scratch</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">digest</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">opens_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PrefixSpan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PrefixSpan" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One write to a keyed stream, as the preprocess worker laid it out.</p>
 <p><code class="docutils literal notranslate"><span class="pre">length</span></code> is how many slots the write fills and <code class="docutils literal notranslate"><span class="pre">advance</span></code> is how far it
 moves the position counter. <code class="docutils literal notranslate"><span class="pre">digest</span></code> is an item’s digest, and None for
 ids. <code class="docutils literal notranslate"><span class="pre">end_key</span></code> is set for an item that ends inside a page, and keys that
-page up to the item’s end.</p>
+page up to the item’s end. <code class="docutils literal notranslate"><span class="pre">opens_step</span></code> is False for a span the step of the
+span before it writes too, in one row.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1652,6 +1654,7 @@ page up to the item’s end.</p>
 <li><p><strong>scratch</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>end_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>opens_step</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1673,6 +1676,11 @@ page up to the item’s end.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PrefixSpan.length">
 <span class="sig-name descname"><span class="pre">length</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PrefixSpan.length" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PrefixSpan.opens_step">
+<span class="sig-name descname"><span class="pre">opens_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.PrefixSpan.opens_step" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -2210,6 +2218,7 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.digest"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.digest</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.end_key"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.end_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.length"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.length</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.opens_step"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.opens_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.scratch"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.scratch</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PrefixSpan.walk"><code class="docutils literal notranslate"><span class="pre">PrefixSpan.walk</span></code></a></li>
 </ul>

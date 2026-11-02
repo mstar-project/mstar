@@ -1351,14 +1351,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``length`` is how many slots the write fills and ``advance`` is how far it</span>
 <span class="sd">    moves the position counter. ``digest`` is an item's digest, and None for</span>
 <span class="sd">    ids. ``end_key`` is set for an item that ends inside a page, and keys that</span>
-<span class="sd">    page up to the item's end.</span>
+<span class="sd">    page up to the item's end. ``opens_step`` is False for a span the step of the</span>
+<span class="sd">    span before it writes too, in one row.</span>
 <span class="sd">    """</span>
     <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">advance</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">end_key</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">end_key</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">opens_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span></div>
 
 
 
