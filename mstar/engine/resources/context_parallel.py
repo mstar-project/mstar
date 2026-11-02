@@ -701,7 +701,9 @@ def _merged(
 def merge_into(out: torch.Tensor, lse: torch.Tensor, part: torch.Tensor, part_lse: torch.Tensor) -> None:
     """``merge`` one partial at a time, in place: ``out`` (fp32 ``[..., D]``) and ``lse`` (fp32
     natural-log ``[...]``) become the attention over their keys and ``part``'s. A row neither
-    has a key for stays 0, -inf."""
+    has a key for stays 0, -inf. ``_merged``'s math, kept apart because its batched form takes
+    every partial at once and allocates its output, where the ring merges each round's partial
+    into one accumulator as it arrives."""
     top = torch.maximum(lse, part_lse).clamp_min_(torch.finfo(torch.float32).min)
     mine, theirs = (lse - top).exp_(), (part_lse - top).exp_()
     total = mine + theirs
