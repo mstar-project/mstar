@@ -147,7 +147,7 @@ def test_the_thinker_declares_its_loop_back_and_its_stop(thinker):
     stop = thinker.token_stop
     assert (stop.loop, stop.buffer, stop.sampler) == ("thinker_decode_loop", "new_token", THINKER_SAMPLER)
     assert stop.stop_ids == frozenset({EOS})
-    assert stop.walk is None, "both decode walks end the loop"
+    assert stop.walk == frozenset(DECODE_WALKS), "both decode walks end the loop, and no prefill"
     assert not stop.prefill_walks, "a stop at prefill ending the partition isn't this model's behaviour"
     for hook in (
         "uniform_row_inputs", "device_loopback_signals", "inline_client_signals",
@@ -363,27 +363,26 @@ def _runtime(model: Qwen3OmniModel, walk: str):
     return runtime, rid
 
 
-@pytest.mark.parametrize(("walk", "stops"), [
-    *((walk, True) for walk in DECODE_WALKS),
-    *((walk, False) for walk in PREFILL_WALKS),
-])
-def test_only_a_decode_walk_has_the_loop_a_stop_id_ends(thinker, walk, stops):
-    """A prefill row can sample the stop id too, and the check names the loop for it. No prefill
-    walk carries the loop, so the runtime has nothing to stop: decode still runs."""
-    model = _model()
-    model.config = SimpleNamespace(
-        thinker_text=SimpleNamespace(max_position_embeddings=64),
-        talker_text=SimpleNamespace(max_position_embeddings=64),
-    )
+@pytest.mark.parametrize("walk", DECODE_WALKS)
+def test_the_runtime_stops_the_loop_on_either_decode_walk(thinker, walk):
     named = thinker.check_stop_batched(["r"], {"r": _info(walk)}, HostRows(("r",), {"new_token": torch.tensor([EOS])}))
     assert named == {"r": {"thinker_decode_loop"}}
 
-    runtime, rid = _runtime(model, walk)
+    runtime, rid = _runtime(_model(), walk)
     stopped = runtime.stop_loops_batched(
         partition="Thinker", graph_walk=walk, last_node_run="Thinker",
         loop_names=ParallelList([rid], [sorted(named["r"])]),
     )
-    assert stopped == ([rid] if stops else [])
+    assert stopped == [rid]
+
+
+@pytest.mark.parametrize("walk", PREFILL_WALKS)
+def test_a_prefill_rows_stop_id_names_no_loop(thinker, walk):
+    """A prefill row samples the stop id often (a prompt section ends a user turn) and is not in
+    the loop yet. Naming the loop there would reach the runtime's model-bug path."""
+    token = torch.tensor([EOS])
+    assert thinker.check_stop_batched(["r"], {"r": _info(walk)}, HostRows(("r",), {"new_token": token})) == {}
+    assert thinker.check_stop("r", _info(walk), {"new_token": [token]}) == set()
 
 
 # ---- a mixed step ----
@@ -429,7 +428,7 @@ def test_a_mixed_steps_text_decode_rows_get_their_stop_and_inline_rows_and_no_ta
 
     assert set(out.check_stop_buffers) == {"new_token", "text_inputs"}
     assert set(out.row_outputs) == {"new_token"}
-    host = HostRows(tuple(rids), {"new_token": torch.tensor([EOS, 2])})
+    host = HostRows(tuple(rids), {"new_token": torch.tensor([EOS, EOS])})
     assert thinker.check_stop_batched(rids, infos, host) == {"text": {"thinker_decode_loop"}}
 
     unpacked = thinker.unpack_packed_outputs(out.packed_outputs, rids, [1, 2], inputs, infos)

@@ -399,12 +399,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         super().__init__()
         self.model = thinker_model  # Qwen3OmniThinkerModel
         self.config = config
-        # Either decode walk's token ends the loop. A prefill row may sample the
-        # stop id as well, but no prefill walk carries this loop, so the graph
-        # runtime has nothing to stop for it.
+        # only a decode row's token ends the loop; a prefill is not in it yet
         self.token_stop = TokenStop(
             loop="thinker_decode_loop", buffer="new_token", stop_ids=frozenset({config.im_end_token_id}),
-            sampler=THINKER_SAMPLER,
+            sampler=THINKER_SAMPLER, walk=THINKER_DECODE_WALKS,
         )
         # thinker_text_decode reads its input ids off the sampler's slot masters
         self.device_loopback = DeviceLoopback(
