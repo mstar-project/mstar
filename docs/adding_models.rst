@@ -1312,7 +1312,8 @@ meanwhile.
 
 A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
 out per request, while each SP rank holds a shard of the tokens, so building the pool
-refuses the deployment.
+refuses the deployment. A node whose KV pools place positions over its SP ranks (context
+parallelism) runs every row on every SP rank, so it serves LoRA.
 
 Step 3 — Declare the computation graph
 --------------------------------------

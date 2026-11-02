@@ -490,18 +490,22 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
 
 def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
     """LoRA rows are per request, not per SP shard: the build refuses SP > 1 at startup,
-    and takes TP with SP 1."""
+    and takes TP with SP 1, and a node that places its KV positions over its SP ranks
+    (heads split over TP alone), which runs every row on every SP rank."""
     from mstar.distributed.communication import CommGroup, JointGroups
 
     _, paths = adapters
+    sp2 = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
 
-    def build(sp_group):
+    def build(sp_group, head_shards=None):
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group)
-        return LoraAdapterPool.build(make_spec(paths), EngineResourceInfo(device=CPU, joint_comm_group=groups))
+        info = EngineResourceInfo(device=CPU, joint_comm_group=groups, head_shards=head_shards)
+        return LoraAdapterPool.build(make_spec(paths), info)
 
     with pytest.raises(ValueError, match=r"sequence parallelism \(SP=2\)"):
-        build(CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
+        build(sp2)
     assert build(CommGroup.trivial()).targets
+    assert build(sp2, head_shards=1).targets
 
 
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):

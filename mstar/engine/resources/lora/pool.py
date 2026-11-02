@@ -284,7 +284,9 @@ class LoraAdapterPool(Resource):
         rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
-            if joint.sp_group.world_size > 1:
+            # a node whose pools place positions over its SP ranks runs replicated over
+            # them, heads split over TP alone (`head_shards`), so every rank sees every row
+            if info.head_shards != joint.tp_group.world_size:
                 raise ValueError(
                     f"LoRA resource {spec.resource_key!r} serves a node that runs sequence "
                     f"parallelism (SP={joint.sp_group.world_size}), which LoRA does not "
