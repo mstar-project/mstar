@@ -35,5 +35,6 @@
    openai
    request_types
    rust_frontend
+   served_models
    streaming_response
 

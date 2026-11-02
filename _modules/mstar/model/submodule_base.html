@@ -614,6 +614,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
@@ -1935,6 +1936,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># setting, so a new eager shape never searches.</span>
     <span class="n">capture_cudnn_benchmark</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
+    <span class="c1"># the LoRA pools among this node's resources; set by `bind_node_resources`</span>
+    <span class="n">lora_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="c1"># Per-request state store. prepare_inputs-time code (no engine inputs</span>
@@ -1965,7 +1969,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">module</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">modules</span><span class="p">():</span>
             <span class="n">bind</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"bind_resources"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">bind</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">module</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">self</span><span class="p">:</span>
-                <span class="n">bind</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span></div>
+                <span class="n">bind</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraAdapterPool</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora_keys</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">LoraAdapterPool</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.cg_key_info">
@@ -2444,7 +2451,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        precision; the node's resources are bound but nothing is admitted or</span>
 <span class="sd">        planned, so it must not read or change resource state. On a lockstep</span>
 <span class="sd">        node every rank calls it in the same order, so it may run the</span>
-<span class="sd">        collectives its forward runs. Default: nothing."""</span></div>
+<span class="sd">        collectives its forward runs. It runs outside a planned step, so a</span>
+<span class="sd">        node serving LoRA adapters runs no adapted linear here: an eager delta</span>
+<span class="sd">        refuses the call, and a compiled one would read another step's</span>
+<span class="sd">        addressing. Default: nothing."""</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.can_use_accelerator_graphs">

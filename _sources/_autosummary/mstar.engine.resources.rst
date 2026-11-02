@@ -34,6 +34,7 @@ mstar.engine.resources
    dsa
    kv
    linear_attn
+   lora
    position
    recurrent
    rms_norm

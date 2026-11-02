@@ -261,6 +261,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
@@ -2507,7 +2508,9 @@ BFL-layout safetensors), so a styled deployment runs at the base model’s speed
 own scaling follows PEFT: an <code class="docutils literal notranslate"><span class="pre">alpha</span></code> key in the weights, else the <code class="docutils literal notranslate"><span class="pre">lora_alpha</span></code> (and
 <code class="docutils literal notranslate"><span class="pre">use_rslora</span></code>) of an <code class="docutils literal notranslate"><span class="pre">adapter_config.json</span></code> / <code class="docutils literal notranslate"><span class="pre">config.json</span></code> next to them, else <code class="docutils literal notranslate"><span class="pre">alpha</span> <span class="pre">=</span> <span class="pre">r</span></code>;
 <code class="docutils literal notranslate"><span class="pre">scale</span></code> multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers’
-fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
+fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
+A DoRA adapter (PEFT’s <code class="docutils literal notranslate"><span class="pre">lora_magnitude_vector</span></code> or Kohya’s <code class="docutils literal notranslate"><span class="pre">dora_scale</span></code>) is refused,
+since its magnitudes would be dropped from the merge.</p>
 </section>
 </section>
 

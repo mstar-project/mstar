@@ -261,6 +261,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
@@ -723,6 +724,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.model_config"><code class="docutils literal notranslate"><span class="pre">ModelCard.model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.object"><code class="docutils literal notranslate"><span class="pre">ModelCard.object</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.owned_by"><code class="docutils literal notranslate"><span class="pre">ModelCard.owned_by</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.parent"><code class="docutils literal notranslate"><span class="pre">ModelCard.parent</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelList"><code class="docutils literal notranslate"><span class="pre">ModelList</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -813,7 +815,7 @@ built as plain dicts in the serving handlers to keep the multimodal shapes
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.ImageGenerationRequest" title="mstar.api_server.openai.protocol.ImageGenerationRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ImageGenerationRequest</span></code></a>(*, prompt[, model, ...])</p></td>
 <td><p>OpenAI <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.ModelCard" title="mstar.api_server.openai.protocol.ModelCard"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ModelCard</span></code></a>(*, id[, object, created, owned_by])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.ModelCard" title="mstar.api_server.openai.protocol.ModelCard"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ModelCard</span></code></a>(*, id[, object, created, ...])</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.ModelList" title="mstar.api_server.openai.protocol.ModelList"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ModelList</span></code></a>(*[, object, data])</p></td>
@@ -1017,7 +1019,7 @@ built as plain dicts in the serving handlers to keep the multimodal shapes
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.openai.protocol.ModelCard">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.protocol.</span></span><span class="sig-name descname"><span class="pre">ModelCard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">object</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'model'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">created</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">owned_by</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'mstar'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/protocol.html#ModelCard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.protocol.ModelCard" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.protocol.</span></span><span class="sig-name descname"><span class="pre">ModelCard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">object</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'model'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">created</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">owned_by</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'mstar'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parent</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/protocol.html#ModelCard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.protocol.ModelCard" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseModel</span></code></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1026,6 +1028,7 @@ built as plain dicts in the serving handlers to keep the multimodal shapes
 <li><p><strong>object</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>created</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>owned_by</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>parent</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1053,6 +1056,11 @@ built as plain dicts in the serving handlers to keep the multimodal shapes
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.openai.protocol.ModelCard.owned_by">
 <span class="sig-name descname"><span class="pre">owned_by</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.openai.protocol.ModelCard.owned_by" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.ModelCard.parent">
+<span class="sig-name descname"><span class="pre">parent</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.openai.protocol.ModelCard.parent" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1473,6 +1481,7 @@ video-to-video. Extra knobs (<code class="docutils literal notranslate"><span cl
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.model_config"><code class="docutils literal notranslate"><span class="pre">ModelCard.model_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.object"><code class="docutils literal notranslate"><span class="pre">ModelCard.object</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.owned_by"><code class="docutils literal notranslate"><span class="pre">ModelCard.owned_by</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelCard.parent"><code class="docutils literal notranslate"><span class="pre">ModelCard.parent</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.ModelList"><code class="docutils literal notranslate"><span class="pre">ModelList</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
