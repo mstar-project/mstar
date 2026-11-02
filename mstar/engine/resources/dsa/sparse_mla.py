@@ -106,15 +106,23 @@ class SparseGraphPlan:
             workspace, use_cuda_graph=True, qo_indptr=self._qo, kv_indptr=self._kv,
             kv_indices=self.indices, kv_len_arr=self._lens, backend="auto")
         self._planned: torch.cuda.Event | None = None
+        self._plan_key: tuple | None = None
 
     def plan(self, lens: list[int], heads: int, kv_lora_rank: int, kpe: int,
              sm_scale: float) -> None:
         assert len(lens) == self.rows
+        lens = _lens(lens, self.width)
+        key = (tuple(lens), heads, kv_lora_rank, kpe, sm_scale)
+        if key == self._plan_key:
+            # Unchanged (a decode row's length stops growing at the width): the wrapper's
+            # buffers still hold this plan. It reads only the lengths; _pack rewrites the
+            # index entries in the graph every replay.
+            return
         if self._planned is not None:
             # the last plan's copy out of the wrapper's pinned buffer may still be queued
             self._planned.synchronize()
-        _plan(self.wrapper, self.indices, _lens(lens, self.width), heads, kv_lora_rank, kpe,
-              sm_scale)
+        _plan(self.wrapper, self.indices, lens, heads, kv_lora_rank, kpe, sm_scale)
+        self._plan_key = key
         self._planned = torch.cuda.Event()
         self._planned.record()
 
