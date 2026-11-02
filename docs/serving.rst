@@ -381,10 +381,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``resident_planning``
-       and ``resident_slots`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number, ``resident_planning``
-       ``auto``, the default, or ``off``). Each one's environment variable
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``compile_deterministic``,
+       ``resident_planning`` and ``resident_slots`` (``true``/``false`` or an integer;
+       ``step_thread_core`` takes ``off``, the default, ``auto`` or a CPU number,
+       ``resident_planning`` ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
+       Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
@@ -406,7 +407,7 @@ them by that name:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
                                 # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
-       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_tokens_per_request, flashinfer_backend
 
@@ -509,9 +510,10 @@ Loading fails if a node is not in any node group, if a walk is one the model nev
 the model sets no budget for that walk, or if the walk is inside a combined walk and its
 node does not set ``can_override_mixed_max_tokens``: there the budget would do nothing.
 
-Chunked prefill is not supported under tensor or sequence parallelism yet. A node whose
-node group spans more than one rank runs its prefills whole, whatever the model and these
-budgets say, and logs a warning at load.
+Under tensor parallelism the leader rank cuts the chunks and the other ranks run the same
+ones. Chunked prefill is not supported under sequence parallelism yet: a node with an SP
+degree above one runs its prefills whole, whatever the model and these budgets say, and
+logs a warning at load.
 
 **Data-parallel routing.** A node group whose ``ranks`` hold several lockstep instances
 (``tp_size * sp_size`` ranks each, or one rank) runs each request on one of them, its

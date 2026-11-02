@@ -84,7 +84,10 @@ def _worker(scheduler, runtime):
         worker_id="w0",
         scheduler=scheduler,
         _graph_runtime=runtime,
-        tensor_manager=SimpleNamespace(get_tensor=lambda uuid: torch.tensor([uuid])),
+        tensor_manager=SimpleNamespace(
+            get_tensor=lambda uuid: torch.tensor([uuid]),
+            get_tensors=lambda uuids: [torch.tensor([u]) for u in uuids],
+        ),
         request_state=SimpleNamespace(
             per_request_info={rid: stream_state() for rid in fwd},
             get_fwd_info=lambda rid, partition: fwd[rid],
@@ -158,6 +161,7 @@ def _follower_speculation(final: bool):
     head = SimpleNamespace(
         speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
+        chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,

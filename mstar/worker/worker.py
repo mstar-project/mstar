@@ -32,6 +32,7 @@ from mstar.communication.tensors import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -44,7 +45,6 @@ from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
-    EdgeSpec,
     GraphRuntime,
     InlineColumn,
     PostprocessNeed,
@@ -110,6 +110,8 @@ from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_execu
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
     ScheduledBatch,
+    tp_chunk_ranges,
+    unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs
@@ -140,6 +142,9 @@ _ADMIT_FENCE_WARN_S = 10.0
 # reads both late still matches them. Every submission has its own key, so a
 # remembered key never gets another NEW_REQUEST.
 _REMOVED_RIDS_KEEP = 4096
+
+# a ScheduleTPNode row the leader did not chunk
+_UNCHUNKED = ChunkRange(-1, -1, -1, -1)
 
 
 # worker_phases span per message type handled in _process_message_list
@@ -1450,7 +1455,9 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         # Every ready chunk is popped first and ingested in one call (and one
         # Python <> Rust roundtrip)
+        laps = PhaseLaps("worker.main.poll_stream_buffers.")
         polled = self.streams.poll()
+        laps.lap("scan_and_pop")
         if not polled:
             return
 
@@ -1461,7 +1468,7 @@ class Worker:
         # in _postprocess_batch — NOT here, where an earlier in-flight pass's
         # WGD could read it before the final output chunk is emitted.
         refused = set(self._graph_runtime.ingest_inputs_batch(
-            self._edge_block((rid, [se.edge]) for rid, se in polled),
+            self.streams.edge_block(polled),
             # important: only ingest for this loop iter!
             can_buffer=False,
             is_streaming=True,
@@ -1472,6 +1479,7 @@ class Worker:
                 self.streams.return_edge(rid, se)
             else:
                 self.streams.mark_ingested(rid, se)
+        laps.lap("ingest")
 
 
     # ------------------------------------------------------------------
@@ -1746,8 +1754,8 @@ class Worker:
         # sessions for one bad chunk. Take out just that rid and report it, so
         # the failure is attributed and loud.
         per_request_inputs, final_edges, unresolved = (
-            batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            self.streams.input_tensors(
+                batch.input_edges, batch.node_name, batch.request_to_worker_graph,
                 skip_missing=True,
             )
         )
@@ -1828,6 +1836,18 @@ class Worker:
                 node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
             )
             walks, walk_idx = rows.walks, rows.walk_idx
+        # the leader alone cuts chunks: a follower's own cut could differ
+        chunk_starts: list[int] = []
+        chunk_ends: list[int] = []
+        chunk_totals: list[int] = []
+        chunk_strides: list[int] = []
+        if node_batch.chunk_ranges:
+            for rid in node_batch.request_ids:
+                start, end, total, stride = node_batch.chunk_ranges.get(rid, _UNCHUNKED)
+                chunk_starts.append(start)
+                chunk_ends.append(end)
+                chunk_totals.append(total)
+                chunk_strides.append(stride)
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -1845,6 +1865,10 @@ class Worker:
                         prefix_hits=prefix_hits,
                         page_trails=page_trails,
                         read_check=read_check,
+                        chunk_starts=chunk_starts,
+                        chunk_ends=chunk_ends,
+                        chunk_totals=chunk_totals,
+                        chunk_strides=chunk_strides,
                     )
                 )
             )
@@ -2916,8 +2940,8 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs, fresh_final, _ = fresh_batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor,
+            fresh_inputs, fresh_final, _ = self.streams.input_tensors(
+                fresh_batch.input_edges, spec_node_name,
                 fresh_batch.request_to_worker_graph,
             )
             in_flight = set(continuing)
@@ -3108,6 +3132,8 @@ class Worker:
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.
         head_rids = self.scheduler.tp_rids(head)
+        # before anything is popped: lists that do not match the rows raise
+        chunk_ranges = tp_chunk_ranges(head, head_rids)
         # rows whose input read failed here: built without, as on the serial path
         unread = self.scheduler.unread_rows(head, head_rids)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
@@ -3115,7 +3141,12 @@ class Worker:
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N
         in_n = [r for r in head_rids if r in in_batch]
-        continuing = [r for r in in_n if r not in unread]
+        # N's rows mid-prefill loop back on nothing of N's: as on the leader,
+        # their next chunk is cut from the input held since their first. N's
+        # chunks came from the leader, so every rank splits these out alike.
+        held = batch_N.incomplete_node_rids
+        mid_prefill = {r for r in in_n if r in held} if held else set()
+        continuing = [r for r in in_n if r not in unread and r not in mid_prefill]
         fresh = [r for r in head_rids if r not in in_batch and r not in unread]
         if not in_n:
             return None
@@ -3169,13 +3200,7 @@ class Worker:
             graph_walk=spec_walk,
             rids=continuing,
             room_for_continuing=None,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=self.streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
         ))
         if prep is None:
@@ -3199,12 +3224,11 @@ class Worker:
         # Both seeded with their rid lists, so the `in prep_inputs` test below
         # still separates prepped rids from fresh ones -- a ready rid with no
         # prepped edge gets an empty mapping, as a zero-length slice used to.
-        get_tensor = self.tensor_manager.get_tensor
-        prep_inputs = prep.input_edges.to_input_tensors(
-            get_tensor, prep.ready_rids,
+        prep_inputs = self.streams.input_tensors(
+            prep.input_edges, head.node_name, prep.ready_rids,
         ).by_rid
-        fresh_inputs, fresh_final_edges, _ = fresh_edges.to_input_tensors(
-            get_tensor, list(fresh_wg),
+        fresh_inputs, fresh_final_edges, _ = self.streams.input_tensors(
+            fresh_edges, head.node_name, list(fresh_wg),
         )
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
@@ -3215,6 +3239,9 @@ class Worker:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
             elif rid in unread:
+                per_request_inputs[rid] = {}
+            elif rid in mid_prefill:
+                new_request_to_worker_graph[rid] = in_batch[rid]
                 per_request_inputs[rid] = {}
             else:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
@@ -3245,11 +3272,20 @@ class Worker:
         speculation = self._spec_builder.assemble(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, in_n, fresh_final_edges,
+            consumed_streaming_edges,
+            [r for r in in_n if r not in mid_prefill] if mid_prefill else in_n,
+            fresh_final_edges,
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
             request_walks=request_walks,
+            chunk_ranges=chunk_ranges,
+            incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
-        if head.read_check and speculation is not None:
+        # N's rows, as on the leader: N's settle readies them, not a cleared speculation
+        speculation.continuing_rids.update(mid_prefill)
+        if chunk_ranges:
+            # a fresh row's first chunk caps its Loop, as the leader's merge did
+            self.scheduler.cap_chunk_loops(speculation.scheduled_batch)
+        if head.read_check:
             speculation.node_batch.read_check_rids = tuple(head_rids)
         return speculation
 
@@ -3751,7 +3787,7 @@ class Worker:
         # trustworthy stop decision: routing it would either run its loop
         # forever or end it early. Only ever the ones this stop stage just
         # added: the caller already reported (and cleared) the rids that
-        # failed in prepare_inputs / postprocess.
+        # failed in prepare_inputs / their forward / postprocess.
         failed = dict(batch_N.node_batch.failed_requests)
         self._drop_failed_rids(batch_N, outputs, failed)
         self._fail_requests(failed)
@@ -3922,22 +3958,19 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
-        # Before the local-streaming dereference below: numel() needs the
-        # tensors, and a new_token whose only other destination is a local
-        # stream holds a single reference, which that dereference drops to zero
-        # -- collecting the tensor this count is about to read.
+        laps = PhaseLaps("worker.postprocess.stream_send.")
         new_token_counts = self._count_new_tokens(
             route_output.new_token_output_idxs,
             stored.flat_rids, stored.flat_uuids, signals, stored.signal_idxs,
         )
+        laps.lap("count_tokens")
 
         # Before the sends below: remote consumers read the walks off the
         # fwd_info that rides with the streamed edges.
         self._assign_consumer_walks(batch_N)
 
-        # Local streaming stays here: a StreamBuffer holds real tensors, so it
-        # cannot move behind the runtime's contract.
-        streamed: list[int] = []
+        # The buffer holds each item by its uuid, taking over the routing
+        # reference the runtime counted for the local stream destination.
         for signal, per_signal in route_output.local_streaming_by_signal.items():
             consumer = self._walk_driven_edges.get(signal)
             by_rid: dict[int, list[int]] = {}
@@ -3951,12 +3984,8 @@ class Worker:
                     uuids, walks.get(consumer) if consumer else None,
                 )
                 for uuid in uuids:
-                    tensor = self.tensor_manager.get_tensor(uuid)
-                    stream_buf.put(uuid, tensor.clone())
-                    streamed.append(uuid)
-        # After the loop: one crossing for the batch rather than one per
-        # streamed tensor.
-        self.tensor_manager.dereference_batch_uniform(streamed)
+                    stream_buf.put(uuid, uuid)
+        laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
         needs_info = route_output.rids_needing_request_info
@@ -3982,6 +4011,7 @@ class Worker:
                         rid, batch_N.partition, published,
                     )
                     buffered_publish.add(rid)
+        laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
         # new-token counts (the inline token is not counted) and no stream
         # buffers, and an empty entry per rid cost a dict each to build and to
@@ -3989,6 +4019,7 @@ class Worker:
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         consumed = self.streams.consumption_batch(send_rids)
+        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -4445,14 +4476,15 @@ class Worker:
     ) -> None:
         """Excise ``failed_requests`` (rids, or a rid -> error map) from a finished batch.
 
-        A rid that raised in ``postprocess`` is still carried in the batch (the
-        engine only recorded the error), and one that raised in
-        ``prepare_inputs`` is already out of ``node_batch.request_ids`` but not
-        out of the worker-side ``ScheduledBatch``. Either way we must not route
-        its outputs or mark its node complete — that's how a request that blew
-        up mid-walk ends up reported to the client as a successful empty
-        response. ``_postprocess_batch`` reconciles the remaining structures
-        from ``node_batch.request_ids``.
+        A rid that raised in its per-request forward or in ``postprocess`` is
+        still carried in the batch (the engine only recorded the error), and one
+        that raised in ``prepare_inputs`` is already out of
+        ``node_batch.request_ids`` but not out of the worker-side
+        ``ScheduledBatch``. Either way we must not route its outputs or mark its
+        node complete — that's how a request that blew up mid-walk ends up
+        reported to the client as a successful empty response.
+        ``_postprocess_batch`` reconciles the remaining structures from
+        ``node_batch.request_ids``.
         """
         for rid in failed_requests:
             outputs.pop(rid, None)
@@ -5079,11 +5111,12 @@ class Worker:
                         )
 
                     if pending.node_batch.failed_requests:
-                        # A per-rid stage (prepare_inputs / postprocess) blamed
-                        # specific requests. Drop the speculation: it was built
-                        # from pending's rids and may thread outputs that the
-                        # failed rids never produced. The rest of the batch
-                        # still post-processes and routes normally below.
+                        # A per-rid stage (prepare_inputs, a per-request
+                        # forward, postprocess) blamed specific requests. Drop
+                        # the speculation: it was built from pending's rids and
+                        # may thread outputs that the failed rids never
+                        # produced. The rest of the batch still post-processes
+                        # and routes normally below.
                         _maybe_clear_spec()
                         failed = dict(pending.node_batch.failed_requests)
                         self._drop_failed_rids(pending, outputs, failed)
