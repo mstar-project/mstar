@@ -2028,7 +2028,8 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   ``declare_step`` then receives ``[first_rid]`` with every request's ``seq_lens``, so the
   whole step's segments count against that one request's ``max_segments_per_request``,
   which for this region is a per-step ceiling. Pair it with a ``can_lease`` that refuses a
-  step with more.
+  step with more. Such a region cannot declare a LoRA step, which would address every
+  request's tokens to the first request's adapter; capture refuses it.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is

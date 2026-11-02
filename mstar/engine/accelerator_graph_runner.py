@@ -27,7 +27,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.engine.resources.lora.config import LoraBaseOnly
+from mstar.engine.resources.lora.config import LoraBaseOnly, LoraStep
 from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.platforms import current_platform
@@ -1783,6 +1783,16 @@ class PiecewiseAcceleratorGraphRunner:
                     self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                     list(shape.seq_lens),
                 )
+                if self._config.one_row_per_step and step is not None and any(
+                    isinstance(work, LoraStep) for work in step.steps.values()
+                ):
+                    # its replay names only the step's first request
+                    raise ValueError(
+                        f"piecewise region {self._label!r} of node {self._node_name!r} "
+                        "declares a LoRA step but replays one row per step "
+                        "(one_row_per_step): every request's tokens would take the "
+                        "first request's adapter"
+                    )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
                     logger.error(
