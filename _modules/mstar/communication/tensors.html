@@ -586,6 +586,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.edge_items.html">mstar.communication.edge_items</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
@@ -992,7 +993,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Iterable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">CancelledError</span><span class="p">,</span> <span class="n">Future</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">nullcontext</span> <span class="k">as</span> <span class="n">_nullcontext</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
@@ -1811,10 +1812,15 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_status</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">read_finished</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># req_id -&gt; {(producer uuid, offset, nbytes, dims) -&gt; local uuid} for</span>
-        <span class="c1"># the received slices ``_take_cached_read`` re-pointed, and req_id -&gt;</span>
-        <span class="c1"># {local uuid -&gt; producer uuid} so their acks name the producer's.</span>
+        <span class="c1"># the received slices ``_take_cached_read`` re-pointed, and local uuid</span>
+        <span class="c1"># -&gt; producer uuid so their acks name the producer's. Local uuids are</span>
+        <span class="c1"># minted here, so one map serves every request's acks.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">slice_uuids</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># req_id -&gt; locals a later re-read of the same slice replaced. Their</span>
+        <span class="c1"># origins go at the request's teardown with the current ones, so an</span>
+        <span class="c1"># ack never outlives its origin whatever order acks and frees run in.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">replaced_slice_uuids</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">req_rx_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="n">SourceAndEdgeToRxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">req_tx_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="n">EdgeNameToTxInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -2618,7 +2624,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">([</span><span class="n">new_uuid</span><span class="p">])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_take_cached_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">TensorPointerInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_take_cached_read</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">TensorPointerInfo</span><span class="p">,</span>
+        <span class="n">staged</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">TensorPointerInfo</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">again</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether an earlier edge already read the bytes ``info`` names, in</span>
 <span class="sd">        which case this edge's ref on them is taken here.</span>
 
@@ -2629,26 +2638,44 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        producer's uuid (``_collect_and_send_acks``). A slice is matched by its</span>
 <span class="sd">        dims as well as its bytes: rows of zero bytes (a ``[4, 0]`` tensor) give</span>
 <span class="sd">        every slice offset 0 and nbytes 0.</span>
+
+<span class="sd">        ``staged``: reads earlier in the caller's batch, by uuid, not yet in</span>
+<span class="sd">        the store. They count as read; the ref on one is appended to ``again``</span>
+<span class="sd">        for the caller to take after its put.</span>
 <span class="sd">        """</span>
         <span class="n">store</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">):</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">held</span><span class="p">(</span><span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TensorPointerInfo</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">staged</span> <span class="ow">and</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">staged</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">staged</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span>
+            <span class="k">return</span> <span class="n">store</span><span class="o">.</span><span class="n">get_info</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span> <span class="k">if</span> <span class="n">store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">take</span><span class="p">(</span><span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">staged</span> <span class="ow">and</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">staged</span><span class="p">:</span>
+                <span class="n">again</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+
+        <span class="n">stored</span> <span class="o">=</span> <span class="n">held</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">stored</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
-        <span class="n">stored</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">get_info</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
         <span class="n">dims</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">stored</span><span class="o">.</span><span class="n">offset</span> <span class="o">==</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span> <span class="ow">and</span> <span class="n">stored</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">==</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span>
                 <span class="ow">and</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">stored</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span> <span class="o">==</span> <span class="n">dims</span><span class="p">):</span>
-            <span class="n">store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">take</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
             <span class="k">return</span> <span class="kc">True</span>
         <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">dims</span><span class="p">)</span>
         <span class="n">slices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_uuids</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="p">{})</span>
         <span class="n">local</span> <span class="o">=</span> <span class="n">slices</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">local</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">local</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">local</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">held</span><span class="p">(</span><span class="n">local</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="o">=</span> <span class="n">local</span>
-            <span class="n">store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">local</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="n">take</span><span class="p">(</span><span class="n">local</span><span class="p">)</span>
             <span class="k">return</span> <span class="kc">True</span>
+        <span class="k">if</span> <span class="n">local</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">replaced_slice_uuids</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">local</span><span class="p">)</span>
         <span class="n">local</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_minter</span><span class="o">.</span><span class="n">mint</span><span class="p">()</span>
         <span class="n">slices</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">local</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="p">{})[</span><span class="n">local</span><span class="p">]</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="p">[</span><span class="n">local</span><span class="p">]</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
         <span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="o">=</span> <span class="n">local</span>
         <span class="k">return</span> <span class="kc">False</span>
 
@@ -2662,6 +2689,20 @@ window.runMermaid = runMermaid;</script>
         <span class="o">...</span></div>
 
 
+<div class="viewcode-block" id="TensorCommunicationManager.start_read_tensors_multi">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.start_read_tensors_multi">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">start_read_tensors_multi</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">reads</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Future</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""``start_read_tensors`` for several requests' edges at once (a</span>
+<span class="sd">        EDGE_ITEMS frame); a transport with per-call setup overrides it to</span>
+<span class="sd">        pay that once."""</span>
+        <span class="n">futures</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Future</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span> <span class="ow">in</span> <span class="n">reads</span><span class="p">:</span>
+            <span class="n">futures</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">start_read_tensors</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">futures</span></div>
+
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_cleanup_by_uuid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">registered</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""``registered`` is the transport's ``mem_registered`` flag, passed in</span>
 <span class="sd">        by a batched dereference that has already dropped the record it lives</span>
@@ -2671,14 +2712,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># ---- shared: polling &amp; ACKs ----</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_collect_and_send_acks</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
-        <span class="n">wire_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="p">):</span>
-<span class="w">        </span><span class="sd">"""``wire_request_id`` overrides ``rid_to_str(request_id)``, for a</span>
-<span class="sd">        request that no longer has a handle."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_collect_and_send_acks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]):</span>
+<span class="w">        </span><span class="sd">"""One TENSOR_RECEIVED per producer for the tensors of ``graph_edges``,</span>
+<span class="sd">        whichever requests they belong to."""</span>
         <span class="n">acks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="n">origins</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+        <span class="n">origins</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span>
         <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">graph_edges</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                 <span class="n">uuid</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
@@ -2691,14 +2729,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">source_entity</span><span class="p">,</span> <span class="n">tensors</span> <span class="ow">in</span> <span class="n">acks</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
                 <span class="k">continue</span>
-            <span class="k">if</span> <span class="n">wire_request_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">wire_request_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rid_to_str</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">communicator</span><span class="o">.</span><span class="n">send</span><span class="p">(</span>
                 <span class="n">source_entity</span><span class="p">,</span>
                 <span class="n">WorkerMessage</span><span class="p">(</span>
                     <span class="n">message_type</span><span class="o">=</span><span class="n">WorkerMessageType</span><span class="o">.</span><span class="n">TENSOR_RECEIVED</span><span class="p">,</span>
                     <span class="n">body</span><span class="o">=</span><span class="n">TensorReceived</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="o">=</span><span class="n">wire_request_id</span><span class="p">,</span>
                         <span class="n">successful_tensors</span><span class="o">=</span><span class="n">tensors</span><span class="p">,</span>
                         <span class="n">failed_tensor_ids</span><span class="o">=</span><span class="p">[],</span>
                     <span class="p">),</span>
@@ -2707,16 +2742,13 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="TensorCommunicationManager.ack_unread_tensors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">ack_unread_tensors</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
-    <span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ack_unread_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]):</span>
 <span class="w">        </span><span class="sd">"""Ack tensors for an already-removed request without reading them.</span>
 
 <span class="sd">        The producer holds these buffers until it gets the TENSOR_RECEIVED ack;</span>
-<span class="sd">        emit it here so it can reclaim them. ``request_id`` is the wire string:</span>
-<span class="sd">        a removed request has no handle on a worker.</span>
+<span class="sd">        emit it here so it can reclaim them.</span>
 <span class="sd">        """</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">,</span> <span class="n">wire_request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">graph_edges</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="TensorCommunicationManager.enable_transfer_metrics">
@@ -2750,18 +2782,25 @@ window.runMermaid = runMermaid;</script>
             <span class="n">stats</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">seconds</span> <span class="o">*</span> <span class="n">row</span><span class="p">[</span><span class="n">col</span><span class="p">]</span> <span class="o">/</span> <span class="n">total</span><span class="p">)</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_poll_read</span><span class="p">(</span><span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_poll_read</span><span class="p">(</span>
+        <span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">,</span>
+        <span class="n">settled</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""``(done, error)`` for a read. A read that finished cleanly drops its</span>
 <span class="sd">        future, so later polls of it (it can wait behind an earlier read of</span>
-<span class="sd">        its request) query nothing."""</span>
-        <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+<span class="sd">        its request) query nothing. ``settled`` caches the answer per future</span>
+<span class="sd">        for one pass, since a batch of reads shares one."""</span>
+        <span class="n">fut</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span>
+        <span class="k">if</span> <span class="n">fut</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
-            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="kc">None</span>
-        <span class="n">error</span> <span class="o">=</span> <span class="n">_read_error</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">state</span> <span class="o">=</span> <span class="n">settled</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="nb">id</span><span class="p">(</span><span class="n">fut</span><span class="p">))</span> <span class="k">if</span> <span class="n">settled</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">state</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">state</span> <span class="o">=</span> <span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="n">_read_error</span><span class="p">(</span><span class="n">fut</span><span class="p">))</span> <span class="k">if</span> <span class="n">fut</span><span class="o">.</span><span class="n">done</span><span class="p">()</span> <span class="k">else</span> <span class="p">(</span><span class="kc">False</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">settled</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">settled</span><span class="p">[</span><span class="nb">id</span><span class="p">(</span><span class="n">fut</span><span class="p">)]</span> <span class="o">=</span> <span class="n">state</span>
+        <span class="k">if</span> <span class="n">state</span> <span class="o">==</span> <span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
             <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="n">error</span>
+        <span class="k">return</span> <span class="n">state</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_drop_failed_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Retire a finished read that will not be delivered.</span>
@@ -2773,7 +2812,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        one completed, so it is acked and its buffers go with the request.</span>
 <span class="sd">        """</span>
         <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
@@ -2904,8 +2943,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># that is done waits for the ones started before it: a streamed token</span>
         <span class="c1"># must not reach the client ahead of the one before it</span>
         <span class="n">waiting</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">Rid</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="c1"># a batch of reads shares one future: ask it once</span>
+        <span class="n">settled</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">:</span>
-            <span class="n">done</span><span class="p">,</span> <span class="n">error</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_poll_read</span><span class="p">(</span><span class="n">ep</span><span class="p">)</span>
+            <span class="n">done</span><span class="p">,</span> <span class="n">error</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_poll_read</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">settled</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="p">(</span><span class="n">done</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_drop_failed_read</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">error</span><span class="p">)</span>
                 <span class="k">continue</span>
@@ -2926,9 +2967,12 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">still_pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ep</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="n">still_pending</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">e</span> <span class="k">for</span> <span class="n">edges</span> <span class="ow">in</span> <span class="n">ready</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">edges</span><span class="p">)</span>
         <span class="n">final_ready</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># the transit references, dropped in one call (a buffered shard edge</span>
+        <span class="c1"># drops the ones before it first, as it may release them)</span>
+        <span class="n">transit</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">req_id</span><span class="p">,</span> <span class="n">edges</span> <span class="ow">in</span> <span class="n">ready</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="n">edges</span><span class="p">)</span>
             <span class="n">seen_uuids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">read_finished</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="nb">set</span><span class="p">())</span>
             <span class="n">rx_infos</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">req_rx_info</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="p">{})</span>
             <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">edges</span><span class="p">:</span>
@@ -2980,21 +3024,22 @@ window.runMermaid = runMermaid;</script>
                             <span class="n">shards</span><span class="o">=</span><span class="p">{},</span>
                         <span class="p">)</span>
 
-                <span class="n">tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
                 <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                     <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">seen_uuids</span><span class="p">:</span>
                         <span class="c1"># a first read holds a transit ref; a reused one does not</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">dereference</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                        <span class="n">transit</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
                         <span class="n">seen_uuids</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
                     <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
                     <span class="k">else</span><span class="p">:</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-                    <span class="n">tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">))</span>
                 <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">([</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">])</span>
 
                 <span class="k">if</span> <span class="n">buf_key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="p">{}):</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">(</span><span class="n">transit</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                    <span class="n">transit</span> <span class="o">=</span> <span class="p">[]</span>
+                    <span class="n">tensors</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span> <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">]</span>
                     <span class="n">buf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="p">[</span><span class="n">req_id</span><span class="p">][</span><span class="n">buf_key</span><span class="p">]</span>
                     <span class="n">buf</span><span class="o">.</span><span class="n">shards</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span>
                         <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">source_tp_rank</span><span class="p">,</span> <span class="p">[]</span>
@@ -3036,6 +3081,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="c1"># else: still waiting on more shards; don't emit yet</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">final_ready</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">edge</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">transit</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">(</span><span class="n">transit</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">final_ready</span></div>
 
 
@@ -3285,9 +3332,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="k">continue</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">ack_edges</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">slice_uuids</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">ack_edges</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">local</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">slice_uuids</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">local</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">local</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">replaced_slice_uuids</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="p">()):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">local</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="TensorCommunicationManager.force_cleanup_request">

@@ -22,6 +22,7 @@ mstar.utils.ipc\_format
       ConductorMessage
       ConductorMessageType
       DrainRequest
+      EdgeItems
       EnableMetrics
       FailRequests
       InputSignals

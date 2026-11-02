@@ -233,6 +233,7 @@
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.communication.arena</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.edge_items.html">mstar.communication.edge_items</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.event.html">mstar.communication.event</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
@@ -692,6 +693,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stamps_shm_placement</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors_multi"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors_multi()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stats_summary()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
@@ -859,6 +861,13 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors_multi">
+<span class="sig-name descname"><span class="pre">start_read_tensors_multi</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">reads</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.start_read_tensors_multi"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors_multi" title="Link to this definition">#</a></dt>
+<dd><p>One stream context, peer sweep, event and wake for every request’s
+reads, not one each.</p>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.stats_summary">
 <span class="sig-name descname"><span class="pre">stats_summary</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.stats_summary"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary" title="Link to this definition">#</a></dt>
 <dd><p>Occupancy/fragmentation snapshot (named apart from the raw
@@ -944,6 +953,7 @@ gone, and unlinks any segment grown after this call.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stamps_shm_placement</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors_multi"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors_multi()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stats_summary()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>

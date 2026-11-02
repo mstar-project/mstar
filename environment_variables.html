@@ -233,6 +233,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.edge_items.html">mstar.communication.edge_items</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
@@ -878,6 +879,21 @@ system-wide). Node-wide pinned demand is approx
 <code class="docutils literal notranslate"><span class="pre">PIN_MAX_MB</span> <span class="pre">x</span> <span class="pre">num_entities</span></code> — a consumer pins peer segments too,
 so one process can pin more than its own arena holds. Segments
 past the budget stay unpinned: copies work, without async overlap.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_GATHER_MAX_BYTES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16384</span></code></p></td>
+<td><p>Largest item (bytes) a consumer gathers with others of the same
+shape, dtype and segment into one pinned buffer and one H2D copy,
+instead of a copy per item (<code class="docutils literal notranslate"><span class="pre">_read_many_from_arena</span></code>). The default
+is the crossover measured on an H200 host; <code class="docutils literal notranslate"><span class="pre">0</span></code> disables the
+gather. Read in <code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.__init__</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
+<td><p>Up to this item size (bytes, 8-byte aligned) the gather indexes
+8-byte words in one pass; larger items are copied one slice each.
+Measured on an H200 host. Read in
+<code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.__init__</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SLOT_TTL_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>

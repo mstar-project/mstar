@@ -30,6 +30,7 @@
    arena
    codec
    communicator
+   edge_items
    event
    rust_communicator
    tensor_store

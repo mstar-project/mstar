@@ -229,6 +229,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.arena.html">mstar.communication.arena</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.edge_items.html">mstar.communication.edge_items</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.event.html">mstar.communication.event</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
@@ -697,22 +698,25 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.communicator.html#module-mstar.communication.communicator" title="mstar.communication.communicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">communicator</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.event.html#module-mstar.communication.event" title="mstar.communication.event"><code class="xref py py-obj docutils literal notranslate"><span class="pre">event</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.edge_items.html#module-mstar.communication.edge_items" title="mstar.communication.edge_items"><code class="xref py py-obj docutils literal notranslate"><span class="pre">edge_items</span></code></a></p></td>
+<td><p>EDGE_ITEMS: a step's streamed tensors to one peer worker, as columns.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.event.html#module-mstar.communication.event" title="mstar.communication.event"><code class="xref py py-obj docutils literal notranslate"><span class="pre">event</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.rust_communicator.html#module-mstar.communication.rust_communicator" title="mstar.communication.rust_communicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rust_communicator</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.rust_communicator.html#module-mstar.communication.rust_communicator" title="mstar.communication.rust_communicator"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rust_communicator</span></code></a></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ZMQCommunicator</span></code> over the Rust transport vendored in <code class="docutils literal notranslate"><span class="pre">rust/</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar_rust.ZmqCommunicator</span></code>) — drop-in for the pyzmq class: same constructor, methods, endpoints, and wire, so wrapped and unwrapped entities interoperate and migration can proceed one process at a time.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.tensor_store.html#module-mstar.communication.tensor_store" title="mstar.communication.tensor_store"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensor_store</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.tensor_store.html#module-mstar.communication.tensor_store" title="mstar.communication.tensor_store"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensor_store</span></code></a></p></td>
 <td><p>Tensor storage, split so the bookkeeping half can have a Rust backend.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.tensor_uuid.html#module-mstar.communication.tensor_uuid" title="mstar.communication.tensor_uuid"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensor_uuid</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.tensor_uuid.html#module-mstar.communication.tensor_uuid" title="mstar.communication.tensor_uuid"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensor_uuid</span></code></a></p></td>
 <td><p>Tensor uuids as integers.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.tensors.html#module-mstar.communication.tensors" title="mstar.communication.tensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensors</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.tensors.html#module-mstar.communication.tensors" title="mstar.communication.tensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tensors</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.communication.wire.html#module-mstar.communication.wire" title="mstar.communication.wire"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wire</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.communication.wire.html#module-mstar.communication.wire" title="mstar.communication.wire"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wire</span></code></a></p></td>
 <td><p>Typed msgpack encoding for everything that crosses a communicator edge.</p></td>
 </tr>
 </tbody>

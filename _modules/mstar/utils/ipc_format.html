@@ -586,6 +586,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.edge_items.html">mstar.communication.edge_items</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
@@ -1027,6 +1028,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">DRAIN_REQUEST</span> <span class="o">=</span> <span class="s2">"drain_request"</span>
     <span class="n">REMOVE_REQUEST</span> <span class="o">=</span> <span class="s2">"remove_request"</span>
     <span class="n">INPUT_SIGNALS</span> <span class="o">=</span> <span class="s2">"input_signals"</span>
+    <span class="n">EDGE_ITEMS</span> <span class="o">=</span> <span class="s2">"edge_items"</span>
     <span class="n">UNPERSIST_TENSORS</span> <span class="o">=</span> <span class="s2">"unpersist"</span>
     <span class="n">TENSOR_RECEIVED</span> <span class="o">=</span> <span class="s2">"tensor_received"</span>
     <span class="n">SCHEDULE_TP</span> <span class="o">=</span> <span class="s2">"schedule_tp"</span>
@@ -1103,11 +1105,57 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="EdgeItems">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.EdgeItems">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EdgeItems</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One step's streamed tensors from a producer worker to one consumer</span>
+<span class="sd">    worker, as columns: a row per (request, streaming edge), and per row its</span>
+<span class="sd">    items, row-major. It carries what one INPUT_SIGNALS per (request, worker)</span>
+<span class="sd">    did for an edge that is nothing but streamed tensors -- unsharded, no</span>
+<span class="sd">    forward-pass info -- so the receiver decodes, reads and routes a step's</span>
+<span class="sd">    tokens once instead of once per request.</span>
+
+<span class="sd">    The fields above the columns are shared by every item: a row whose</span>
+<span class="sd">    tensors differ in them goes as INPUT_SIGNALS instead.</span>
+<span class="sd">    """</span>
+
+    <span class="n">partition_name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">source_session_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">source_entity</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">tp_rank</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">source_node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># signal, node, walk and arena segment names the columns index</span>
+    <span class="n">names</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># per row</span>
+    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">signal_idx</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">next_node_idx</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">walk_idx</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">num_items</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># per item</span>
+    <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">addresses</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">nbytes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">offsets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">ndims</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">dims_flat</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">stride_flat</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">dtype_idx</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">dtype_names</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># the arena segment each item is in (an index into names), -1 for none</span>
+    <span class="n">shm_segment_idx</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">shm_offsets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="TensorReceived">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.TensorReceived">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">TensorReceived</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
-    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># Keyed by uuid, which is global, so one ack covers every request whose</span>
+    <span class="c1"># reads from this producer finished together.</span>
     <span class="n">successful_tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="c1"># uuid -&gt; graph edge count</span>
     <span class="n">failed_tensor_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="c1"># uuids</span></div>
 
