@@ -1743,20 +1743,27 @@ window.runMermaid = runMermaid;</script>
         <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">nbytes</span><span class="p">:</span>
-                <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
+                <span class="n">flat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">[</span><span class="n">seg</span><span class="p">][</span><span class="n">off</span><span class="p">:</span><span class="n">off</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">],</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span>
-                <span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+                <span class="p">)</span>
                 <span class="c1"># Async D2H into the pinned segment when a copy stream exists</span>
                 <span class="c1"># (the caller's single sync covers the batch); blocking</span>
                 <span class="c1"># otherwise, so the descriptor can never ship ahead of the bytes.</span>
                 <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">:</span>
-                    <span class="n">host</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+                    <span class="n">flat</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
+                        <span class="n">t</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
                     <span class="n">queued</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="k">elif</span> <span class="n">t</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cpu"</span><span class="p">:</span>
+                    <span class="c1"># A stored host copy: one memcpy, nothing for the stream</span>
+                    <span class="c1"># sync to wait on. numpy, not Tensor.copy_: torch splits a</span>
+                    <span class="c1"># CPU copy of more than 32K elements over its intra-op</span>
+                    <span class="c1"># OpenMP pool, whose threads then spin on the cores the</span>
+                    <span class="c1"># worker's own threads need.</span>
+                    <span class="n">np</span><span class="o">.</span><span class="n">copyto</span><span class="p">(</span><span class="n">flat</span><span class="o">.</span><span class="n">numpy</span><span class="p">(),</span>
+                              <span class="n">t</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">())</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="c1"># a stored host copy: a memcpy, nothing for the stream</span>
-                    <span class="c1"># sync to wait on</span>
-                    <span class="n">host</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
+                    <span class="n">flat</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
         <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
