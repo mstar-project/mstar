@@ -719,7 +719,7 @@ class WaypointVaeEncoderSubmodule(_FunctionalAeMixin, NodeSubmodule):
         """The captured (H, W) bucket for this batch's seed, or None for eager.
 
         The seed shape isn't on ``model_inputs`` at lease time, so it is read
-        off ``step_metadata["seed_hw"]``, set by ``get_initial_forward_pass_args``."""
+        off ``step_metadata["seed_hw"]``, set by ``WaypointModel.walk_plan``."""
         del per_request_input_metadata, kwargs
         if graph_walk != PRIME_WALK:
             return None

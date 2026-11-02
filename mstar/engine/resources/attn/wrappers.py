@@ -145,6 +145,7 @@ class FlashInferPrefillWrapper:
         accelerator_graph: bool = False,
         enable_nvtx: bool = False,
         backend: str = "auto",
+        sm_scale: float | None = None,
     ):
         check_flashinfer_head_dim(head_dim, device)
         self.device = device
@@ -152,6 +153,7 @@ class FlashInferPrefillWrapper:
         self.enable_nvtx = enable_nvtx
         self.batch_size = batch_size
         self.max_total_tokens = max_total_tokens
+        self.sm_scale = sm_scale
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -305,6 +307,7 @@ class FlashInferPrefillWrapper:
             page_size=self.page_size,
             causal=causal,
             q_data_type=dtype,
+            sm_scale=self.sm_scale,
             # host lengths, so plan neither rebuilds them nor copies pageable ones
             seq_lens=kv_lens,
             window_left=window_left,
@@ -451,12 +454,14 @@ class FlashInferDecodeWrapper:
         enable_nvtx: bool = False,
         backend: str = "auto",
         use_tensor_cores: bool = True,
+        sm_scale: float | None = None,
     ):
         check_flashinfer_head_dim(head_dim, device)
         self.device = device
         self.accelerator_graph = accelerator_graph
         self.enable_nvtx = enable_nvtx
         self.batch_size = batch_size
+        self.sm_scale = sm_scale
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -556,6 +561,7 @@ class FlashInferDecodeWrapper:
                 head_dim=self.head_dim,
                 page_size=self.page_size,
                 q_data_type=dtype,
+                sm_scale=self.sm_scale,
                 # host lengths, so plan skips rebuilding them (`get_seq_lens`)
                 seq_lens=kv_lens,
                 window_left=window_left,
@@ -803,6 +809,7 @@ class FlashInferMixedWrapper:
         backend: str = "auto",
         use_tensor_cores: bool = True,
         decode_wrapper: "FmhaDecodeWrapper | None" = None,
+        sm_scale: float | None = None,
     ):
         from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -815,6 +822,7 @@ class FlashInferMixedWrapper:
         kv = dict(
             num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
             head_dim=head_dim, page_size=page_size, device=device, backend=backend,
+            sm_scale=sm_scale,
         )
         self._tensor_cores = use_tensor_cores and decode_wrapper is None
         if decode_wrapper is not None:

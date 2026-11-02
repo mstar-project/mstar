@@ -24,10 +24,16 @@ from torch.distributed import ReduceOp
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfigType,
+    PiecewiseConfigType,
+    PiecewisePackedConfig,
+)
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
+    PiecewiseAcceleratorGraphRunner,
+    PiecewiseGraphData,
     capture_into_graph,
     fail_if_graphs_required,
 )
@@ -455,3 +461,60 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [1.0] * 4
+
+
+@pytest.mark.parametrize(
+    ("value_dtype", "buffer_dtype", "refused"),
+    [
+        (torch.float32, torch.bfloat16, True),
+        (torch.int64, torch.float32, True),
+        (torch.int32, torch.int64, False),
+    ],
+    ids=["narrowing", "int_into_float", "widening"],
+)
+def test_piecewise_replay_refuses_an_input_its_buffer_may_round(value_dtype, buffer_dtype, refused):
+    """The replay copies each input into its buffer, which casts silently: an
+    fp32 residual stream into a bf16 buffer, or int64 ids above 2**24 into an
+    fp32 one, would be rounded, so such an input is refused; a widening copy
+    (an eager sampler's int32 tokens into an int64 buffer) loses nothing and
+    replays."""
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._label, runner._current_slot = "region", 0
+    replays = []
+    runner._config = SimpleNamespace(get_config_type=lambda: PiecewiseConfigType.BATCHED)
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids: None)
+    buffer = torch.zeros(2, dtype=buffer_dtype)
+    runner._resolve = lambda bs, total_tokens: PiecewiseGraphData(
+        graph=SimpleNamespace(replay=lambda: replays.append(1)), static_inputs={"x": buffer},
+        static_outputs={"y": buffer}, dummy_rids=[], shape=SimpleNamespace(bs=2), bucket=None,
+    )
+    # a value each narrowing would round
+    value = torch.full((2,), 1 + 2**-10 if value_dtype.is_floating_point else 2**24 + 1, dtype=value_dtype)
+    if refused:
+        with pytest.raises(ValueError, match="buffer 'x'"):
+            runner.run(static_inputs={"x": value}, real_bs=2)
+        assert not replays
+    else:
+        runner.run(static_inputs={"x": value}, real_bs=2)
+        assert replays == [1]
+        assert torch.equal(buffer, value.to(buffer_dtype))
+
+
+def test_a_packed_replay_pads_each_label_s_spans_as_its_seq_lens():
+    """A region planning several ragged layouts gets each label's spans with
+    the padding rows' zero-length spans, as ``seq_lens`` has them."""
+    declared = []
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._label, runner._current_slot = "region", 0
+    runner._config = PiecewisePackedConfig(
+        capture_fn=lambda call: {}, make_static_inputs=lambda shape: {}, total_tokens=[8],
+        declare_step=lambda rids, seq_lens, label_seq_lens=None: declared.append((seq_lens, label_seq_lens)),
+    )
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids: None)
+    runner._resolve = lambda bs, total_tokens: PiecewiseGraphData(
+        graph=SimpleNamespace(replay=lambda: None), static_inputs={}, static_outputs={},
+        dummy_rids=[100, 101], shape=SimpleNamespace(bs=2), bucket=None,
+    )
+    runner.run(static_inputs={}, request_ids=[7], seq_lens=[3, 2], real_bs=1,
+               label_seq_lens={"window": [1, 2, 2], "full": [5]})
+    assert declared == [([3, 2, 0], {"window": [1, 2, 2, 0], "full": [5, 0]})]

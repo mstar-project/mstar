@@ -12,12 +12,10 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardPassInfo
+from mstar.conductor.request_info import DEFAULT_PARTITION, FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, SamplingReqConfig
-from mstar.graph.base import GraphEdge
-from mstar.graph.graph_io import WorkerGraphIO
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import MAX_OUTPUT_TOKENS
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.config import (
@@ -26,51 +24,58 @@ from mstar.model.command_a_plus.config import (
     LOCAL_ATTN,
     ROPE,
     SAMPLER,
-    CommandAPlusConfig,
 )
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, CommandAPlusVisionSubmodule
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import MEDIA_LAYOUT, PromptPart
 from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
 
-def info(walk="prefill", max_tokens=6, ignore_eos=False, index=0):
+def info(walk="prefill", max_tokens=6, ignore_eos=False, index=0, layout=None):
     return CurrentForwardPassInfo(
         request_id="a", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=max_tokens,
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": index} if walk == "decode" else {},
+        # the conductor marks the prefill, the step before decode, as the reply's first token's
+        step_metadata={
+            **({} if walk == "decode" else {FINAL_PREFILL: True}), **({} if layout is None else {MEDIA_LAYOUT: layout}),
+        },
     )
 
 
 class ToyLM(nn.Module):
+    """The decoder contract over one-hot embeddings: a row's hidden state is its embedding."""
+
     def __init__(self, vocab):
         super().__init__()
-        self.model = nn.Module()
-        self.model.embed_tokens = nn.Embedding.from_pretrained(torch.eye(vocab))
-        self.model.embed = self.model.embed_tokens
+        self.embed = nn.Embedding.from_pretrained(torch.eye(vocab))
 
     def forward(self, x, *, label):
         assert label == "main"
         return x
 
-    def compute_logits(self, x):
+    def logits(self, x):
         return x
+
+
+def toy_node(model):
+    return CommandAPlusLLMSubmodule(ToyLM(model.config.vocab_size), model.config, (model.image_encoder,))
 
 
 class NodeTests(unittest.TestCase):
     def setUp(self):
-        config = CommandAPlusConfig.from_json(FIXTURE)
-        self.config = config.text_config
-        self.node = CommandAPlusLLMSubmodule(
-            ToyLM(self.config.vocab_size), self.config, config.vision_config.image_token_id,
-        )
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        shutil.copyfile(FIXTURE, Path(directory) / "config.json")
+        self.model = CommandAPlusModel(directory)
+        self.config = self.model.config
+        self.node = toy_node(self.model)
 
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
         sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
-        attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x, label: x[[2, 4]]))
+        attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x: x[[2, 4]]))
         engine = ModelInputsFromEngine(["a", "b"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
         for walk, rows, expected in (
             ("prefill", [[2, 5, 7], [11, 13]], [7, 13]),
@@ -87,72 +92,29 @@ class NodeTests(unittest.TestCase):
             tracked = step.steps[SAMPLER].prefill_tracked_tokens
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
-            self.assertEqual([output[rid]["new_token"][0].item() for rid in engine.request_ids], expected)
+            self.assertEqual(output.row_outputs["new_token"].tolist(), expected)
             self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
         attention.select_last_hidden.assert_called_once()
 
-    def test_prefill_publishes_a_decode_seed_without_reading_the_token(self):
-        for maximum, continues in ((1, False), (2, True)):
-            output = {"new_token": [torch.tensor([3])]}
-            self.node.postprocess("a", info(max_tokens=maximum), output)
-            self.assertEqual("decode_input" in output, continues)
-            self.assertIn("new_token", output)
+    def test_its_eos_ends_either_prefill_and_the_decode_loop(self):
+        """A prefill row ends the partition on EOS or a one-token budget; decode
+        stops on EOS alone, since the loop cap is its budget."""
+        eos, other = self.config.eos_token_id, self.config.eos_token_id + 1
+        for walk, stop in (("prefill", END_PARTITION), (self.model.image_walk, END_PARTITION),
+                           ("decode", "decode_loop")):
+            for token, max_tokens, ignore_eos, stops in (
+                (eos, 6, False, True), (eos, 6, True, False), (other, 6, False, False),
+                (other, 1, False, walk != "decode"),
+            ):
+                with self.subTest(walk=walk, token=token, max_tokens=max_tokens, ignore_eos=ignore_eos):
+                    request = info(walk, max_tokens=max_tokens, ignore_eos=ignore_eos)
+                    output = {"new_token": [torch.tensor([token])]}
+                    self.assertEqual(self.node.check_stop("a", request, output), {stop} if stops else set())
 
-    def test_eos_from_prefill_ends_the_partition(self):
-        for ignore_eos, stop in ((False, {END_PARTITION}), (True, set())):
-            with self.subTest(ignore_eos=ignore_eos):
-                prefill = {"new_token": [torch.tensor([3])]}
-                self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), stop)
-
-    def test_decode_stops_on_eos_unless_ignore_eos(self):
-        # a row at its token budget goes on: the loop's cap ends it
-        for token, maximum, index, ignore_eos, stops in (
-            (3, 5, 0, False, True), (3, 5, 0, True, False), (7, 2, 0, False, False),
-        ):
-            with self.subTest(token=token, maximum=maximum, index=index, ignore_eos=ignore_eos):
-                request = info("decode", maximum, ignore_eos, index)
-                output = {"new_token": [torch.tensor([token])]}
-                self.node.postprocess("a", request, output)
-                self.assertIs(output["text_inputs"], output["new_token"])
-                self.assertEqual(self.node.check_stop("a", request, output), {"decode_loop"} if stops else set())
-        self.node.request_state("a").kwargs["example"] = True
-        self.node.cleanup_request("a")
-        self.assertNotIn("a", self.node.request_states)
-
-    def test_image_prefill_places_encoder_output_at_image_tokens(self):
-        image = self.node.image_token_id
-        ids = torch.tensor([2, image, image, 5])
-        image_embeds = torch.stack([torch.arange(128.0), -torch.arange(128.0)]) / 128
-        inputs = self.node.prepare_inputs(
-            "prefill_image", info("prefill_image"), {"text_inputs": [ids], "image_embeds": [image_embeds]},
-        )
-        eye = torch.eye(self.config.vocab_size)
-        torch.testing.assert_close(inputs.input_embeds[[0, 3]], eye[[2, 5]])
-        torch.testing.assert_close(inputs.input_embeds[[1, 2]], image_embeds)
-        # a chunked prefill cuts the embeddings with the ids
-        cut = self.node.split_inputs("prefill_image", info("prefill_image"), inputs, 1, 3)
-        torch.testing.assert_close(cut.input_embeds, image_embeds)
-        self.assertEqual(cut.input_ids.tolist(), [image, image])
-
-        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
-        attention = SimpleNamespace(select_last_hidden=lambda x, label: x[-1:])
-        engine = ModelInputsFromEngine(["a"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
-        step = self.node.declare_step("prefill_image", ["a"], [inputs])
-        self.assertEqual(step.steps[SAMPLER].prefill_tracked_tokens["a"].tolist(), ids.tolist())
-        output = self.node.forward_batched(
-            "prefill_image", engine, **self.node.preprocess("prefill_image", engine, [inputs]),
-        )
-        self.assertEqual(output["a"]["new_token"][0].item(), 5)
-
-    def test_invalid_inputs_fail_before_cache_planning(self):
-        for walk, tensor in (
-            ("other", torch.tensor([2])), ("decode", torch.tensor([2, 3])),
-            ("prefill", torch.tensor([], dtype=torch.long)),
-            ("prefill", torch.tensor([[2, 3]])), ("prefill", torch.tensor([2.0])),
-        ):
-            with self.subTest(walk=walk, shape=tensor.shape):
-                with self.assertRaises(ValueError):
-                    self.node.prepare_inputs(walk, info(walk), {"text_inputs": [tensor]})
+    def test_only_decode_captures_and_it_runs_uncompiled(self):
+        """Prefill CUDA graphs are unmeasured on this model, and torch.compile is off."""
+        (config,) = self.node.get_accelerator_graph_configs(torch.device("cpu"))
+        self.assertEqual((config.capture_graph_walk, config.compile), ("decode", False))
 
 
 class ModelIntegrationTests(unittest.TestCase):
@@ -161,7 +123,7 @@ class ModelIntegrationTests(unittest.TestCase):
         shutil.copyfile(FIXTURE, Path(self.directory) / "config.json")
         self.model = CommandAPlusModel(self.directory)
 
-    def test_graph_resources_and_prefill_decode_transition(self):
+    def test_graph_and_resources(self):
         model = self.model
         resources = {r.resource_key: r for r in model.get_node_resources()}
         self.assertEqual(resources[LOCAL_ATTN].config.sliding_window, 4)
@@ -174,30 +136,22 @@ class ModelIntegrationTests(unittest.TestCase):
         walks = model.get_graph_walk_graphs()
         self.assertEqual(model.nodes, ["LLM", "vision_encoder"])
         self.assertEqual(len(model.get_partitions()), 1)
-        output_edges = walks["prefill"].outputs
-        self.assertTrue(any(e.name == "new_token" and e.next_node == EMIT_TO_CLIENT and e.conductor_new_token
-                            for e in output_edges))
-        self.assertTrue(any(e.name == "decode_input" and e.next_node == EMPTY_DESTINATION and e.persist
-                            for e in output_edges))
+        (output,) = walks["prefill"].outputs
+        self.assertEqual((output.name, output.next_node, output.conductor_new_token, output.persist),
+                         ("new_token", EMIT_TO_CLIENT, True, True))
         self.assertEqual(walks["decode"].name, "decode_loop")
-        seed = object()  # Metadata only; no tensor transfer in this test.
-        first = model.get_initial_forward_pass_args(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [seed]})
-        self.assertEqual(first.full_metadata.graph_walk, "prefill")
-        next_ = model.get_partition_forward_pass_args(DEFAULT_PARTITION, first.full_metadata, {"decode_input": [seed]})
-        self.assertEqual(next_.full_metadata.graph_walk, "decode")
-        self.assertEqual(next_.inputs[0].tensor_info, [seed])
-        self.assertEqual(next_.unpersist_tensors, [seed])
-        self.assertTrue(model.get_partition_forward_pass_args(DEFAULT_PARTITION, next_.full_metadata, {}).request_done)
-        first = model.get_initial_forward_pass_args(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [seed]})
-        self.assertTrue(model.get_partition_forward_pass_args(DEFAULT_PARTITION, first.full_metadata, {}).request_done)
-        cfg = model.get_request_resource_configs({}, {"temperature": 0})[SAMPLER]
+        self.assertEqual({e.name for e in walks["decode"].section.outputs}, {"new_token", "text_inputs"})
+        plan = model.walk_plan(DEFAULT_PARTITION, ["text"], ["text"], {"text_inputs": [object()]}, {})
+        self.assertEqual([(step.walk, dict(step.bind)) for step in plan],
+                         [("prefill", {}), ("decode", {"text_inputs": "new_token"})])
+        cfg = model.get_request_resource_configs([], [], {"temperature": 0})[SAMPLER]
         self.assertEqual((cfg.temperature, cfg.top_p, cfg.repetition_penalty), (0, 0.95, 1.04))
 
     def test_local_checkpoint_node_runs_prefill_and_four_decode_steps(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.float32)
-        kv, pos, local, global_ = bind_test_resources(node.language_model.model, self.model.config)
-        local.select_last_hidden = lambda hidden, label: hidden[-1:]
+        kv, pos, local, global_ = bind_test_resources(node.model.model, self.model.config)
+        local.select_last_hidden = lambda hidden: hidden[-1:]
         sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
         node.bind_node_resources(resources)
@@ -213,26 +167,21 @@ class ModelIntegrationTests(unittest.TestCase):
                 self.assertEqual(declaration.segments[0].span, len(tokens))
                 pos.positions["main"] = torch.arange(offset, offset + len(tokens))
                 offset += len(tokens)
-                result = node.forward_batched(walk, engine, **node.preprocess(walk, engine, inputs))["a"]
-                node.postprocess("a", request, result)
-                tokens = result["decode_input" if step == 0 else "text_inputs"][0]
+                result = node.forward_batched(walk, engine, **node.preprocess(walk, engine, inputs))
+                tokens = result.row_outputs["new_token"]
                 self.assertEqual(tokens.shape, (1,))
         self.assertTrue(all(len(k) == 9 for k, v in kv.cache.values()))
         self.assertEqual(len(kv.writes), 20)
 
     def test_image_requests_take_the_image_walk(self):
-        text, pixels = object(), object()
-        first = self.model.get_initial_forward_pass_args(
-            DEFAULT_PARTITION, ["text", "image"], ["text"], {"text_inputs": [text], "pixel_values": [pixels]},
+        layout = {"offset": [3], "tokens": [4], "output": ["image_embeds"], "grid": [[]]}
+        plan = self.model.walk_plan(
+            DEFAULT_PARTITION, ["text", "image"], ["text"], {"text_inputs": [object()], "pixel_values": [object()]},
+            {MEDIA_LAYOUT: layout},
         )
-        self.assertEqual(first.full_metadata.graph_walk, "prefill_image")
-        self.assertEqual({(e.next_node, e.name) for e in first.inputs},
-                         {("LLM", "text_inputs"), ("vision_encoder", "pixel_values")})
-        self.assertEqual(first.unpersist_tensors, [text, pixels])
-        next_ = self.model.get_partition_forward_pass_args(
-            DEFAULT_PARTITION, first.full_metadata, {"decode_input": [text]},
-        )
-        self.assertEqual(next_.full_metadata.graph_walk, "decode")
+        self.assertEqual([step.walk for step in plan], ["prefill_image", "decode"])
+        # what the LLM checks the encoder's rows against
+        self.assertEqual(plan[0].step_metadata[MEDIA_LAYOUT], layout)
 
     def test_vision_node_loads_from_the_checkpoint_and_encodes_tiles(self):
         from mstar.model.command_a_plus.tests.test_vision import checkpoint_name, tiny_encoder
@@ -276,30 +225,6 @@ class ModelIntegrationTests(unittest.TestCase):
             self.model.get_submodule("LLM", sp_group=CommGroup(0, 0, [0, 1]))
         with self.assertRaisesRegex(ValueError, "local checkpoint"):
             CommandAPlusModel("unavailable/repository")
-
-    def test_real_graph_loop_stops_after_total_token_budget(self):
-        graph = WorkerGraphIO(self.model.get_graph_walk_graphs()["decode"])
-        # the request's caps, as the worker applies them when the request arrives
-        for name, cap in self.model.get_loop_caps(max_output_tokens=3).items():
-            graph.loops[name].max_iters = min(graph.loops[name].max_iters, cap)
-        node = CommandAPlusLLMSubmodule(
-            ToyLM(self.model.config.vocab_size), self.model.config, self.model.vision_config.image_token_id,
-        )
-        graph.ingest_input(GraphEdge(name="text_inputs", next_node="LLM"))
-        iterations = 0
-        while not graph.wg_state_registry.is_done and iterations < 10:
-            self.assertIn("LLM", graph.ready_node_names)
-            graph.ready_node_names.discard("LLM")
-            request = info("decode", max_tokens=3, index=graph.get_loop_indices()["decode_loop"])
-            for loop in node.check_stop("a", request, {"new_token": [torch.tensor([7])]}):
-                graph.register_loop_finish_signal(loop)
-            completion = graph.mark_node_complete("LLM")
-            for edge in completion.output_edges:
-                if edge.next_node == "LLM" and (edge.name, edge.next_node) not in completion.filtered_signals:
-                    graph.ingest_input(edge)
-            iterations += 1
-        self.assertTrue(graph.wg_state_registry.is_done)
-        self.assertEqual(iterations, 2)  # One prefill token + two decode tokens.
 
     def test_two_walks_construct_one_tp8_node_group(self):
         import yaml
@@ -390,6 +315,24 @@ class ModelIntegrationTests(unittest.TestCase):
         torch.testing.assert_close(result["pixel_values"], [t.to(torch.bfloat16) for t in tiles])
         (span,) = metadata["kv_layout"]["kv_cache"]["main"].spans
         self.assertEqual((span.kind, span.walk, span.length), ("rows", "prefill_image", len(result["text_inputs"][0])))
+        # one run of pads a tile, and the node splices the tower's rows into exactly those
+        layout = metadata[MEDIA_LAYOUT]
+        self.assertEqual((layout["offset"], layout["tokens"]), ([2, 7, 15], [4, 4, 4]))
+        node = toy_node(self.model)
+        ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
+        engine = ModelInputsFromEngine(["a"], {}, {
+            LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x: x),
+            SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+        })
+        inputs = node.prepare_inputs(
+            "prefill_image", info("prefill_image", layout=layout), {"text_inputs": [ids], "image_embeds": [rows]},
+        )
+        hidden = node.forward_batched(
+            "prefill_image", engine, **node.preprocess("prefill_image", engine, [inputs]),
+        ).row_outputs["new_token"]
+        pads = ids == image
+        torch.testing.assert_close(hidden[pads], rows)
+        torch.testing.assert_close(hidden[~pads], torch.eye(self.model.config.vocab_size)[ids[~pads]])
         torch.testing.assert_close(processor.call_args_list[0].kwargs["images"][0],
                                    (photos[0] * 255).round().to(torch.uint8))
         with self.assertRaisesRegex(ValueError, "2 image placeholders for 1 images"):

@@ -26,12 +26,11 @@ import logging
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
@@ -166,40 +165,17 @@ class ParakeetModel(Model):
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=WALK,
-            is_prefill=True,
-        )
-        audio = GraphEdge(next_node="audio_encoder", name="audio")
-        audio.tensor_info = input_signals.get("audio", [])
-        model_kwargs = model_kwargs or {}
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=[audio],
-            unpersist_tensors=list(audio.tensor_info),
-            # host values the decode steps read: the capture's bucket, Nemotron's prompt
-            step_metadata={key: model_kwargs.get(key) for key in self.INTERNAL_KWARGS},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        # the one walk returned: the decode loop's cursor passed the last frame
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one walk, until the decode loop's cursor passes the last frame; it carries the
+        # host values the decode steps read: the capture's bucket, Nemotron's prompt
+        return [WalkStep(WALK, step_metadata={key: model_kwargs.get(key) for key in self.INTERNAL_KWARGS})]
 
     def process_prompt(
         self,

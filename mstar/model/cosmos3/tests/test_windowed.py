@@ -60,10 +60,8 @@ def _dit(cfg=None):
 
 
 def test_windowed_gen_params_and_walk_selection() -> None:
-    """Windowed knobs quantize to latent units, the AR walk is selected at the
-    prefill transition, and every rejection fires at request resolution."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
-
+    """Windowed knobs quantize to latent units, the plan runs the AR walk after
+    the prefill, and every rejection fires at request resolution."""
     model = _windowed_model()
     p = model._resolve_gen_params(
         {"window_mode": "chained", "num_frames": 189, "size": "832x480"}, [], ["video"],
@@ -75,31 +73,12 @@ def test_windowed_gen_params_and_walk_selection() -> None:
     assert p["num_frames"] == 189
     assert p["flow_shift"] == C.V2V_DEFAULT_FLOW_SHIFT
 
-    md = CurrentForwardConductorMetadata(
-        input_modalities=[], output_modalities=["video"],
-        graph_walk=C.PREFILL_WALK, is_prefill=True, kwargs=p,
-    )
-    args = model.get_partition_forward_pass_args("default", md, {})
-    assert args.full_metadata.graph_walk == C.VIDEO_GEN_AR_WALK
-    assert [e.name for e in args.inputs] == ["latents", "unipc_model_outputs", "unipc_last_sample", "cond_latents"]
-    done = model.get_partition_forward_pass_args("default", args.full_metadata, {})
-    assert done.request_done
-
-    dec = model.get_partition_forward_pass_args(
-        C.WINDOW_DECODER_PARTITION,
-        CurrentForwardConductorMetadata(
-            input_modalities=[], output_modalities=["video"],
-            graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs=p,
-        ),
-        {},
-    )
-    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert not dec.request_done and dec.inputs == []
-    init = model.get_initial_forward_pass_args(
+    plan = model.walk_plan("default", [], ["video"], {}, {"window_mode": "chained", "num_frames": 189})
+    assert [step.walk for step in plan] == [C.PREFILL_WALK, C.VIDEO_GEN_AR_WALK]
+    (dec,) = model.walk_plan(
         C.WINDOW_DECODER_PARTITION, ["text"], ["video"], {}, {"window_mode": "kv", "num_frames": 61},
     )
-    assert init.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert init.step_metadata["num_windows"] == 2 and init.inputs == []
+    assert dec.walk == C.VIDEO_DECODE_AR_WALK and dec.step_metadata["num_windows"] == 2
 
     for bad in (
         {"window_mode": "bogus", "num_frames": 189},

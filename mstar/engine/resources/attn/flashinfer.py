@@ -22,6 +22,7 @@ from mstar.engine.resources.attn.wrappers import (
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -42,6 +43,7 @@ class FlashInferManager(AttentionManager):
         sliding_window: int | None = None,
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
+        sm_scale: float | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -81,13 +83,15 @@ class FlashInferManager(AttentionManager):
             page_size=self._group.page_size,
             max_num_pages=kv_config.num_units,
             device=device,
-            backend=backend
+            backend=backend,
+            sm_scale=sm_scale,
         )
         self._decode_tensor_cores = decode_tensor_cores
         self._decode_fmha = (
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
             and fmha_decode_applies(device)
         )
+        self._sm_scale = sm_scale
 
         self._workspaces = WorkspacePool(device)
 
@@ -108,6 +112,12 @@ class FlashInferManager(AttentionManager):
     def set_default_layer_idx(self, layer_idx: int) -> None:
         self._check_layer(layer_idx)
         self._default_layer_idx = layer_idx
+
+    def fingerprint(self) -> bytes:
+        if self._window_left == -1 and self._sm_scale is None:
+            return super().fingerprint()
+        # the window and scale shape every later layer's K/V
+        return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
@@ -305,10 +315,11 @@ class FlashInferManager(AttentionManager):
         from prefill.
         """
         if label not in self._current_plan_states:
-            raise RuntimeError(f"FlashInfer: no plan for label {label!r} to select last tokens by")
+            raise ValueError(f"select_last_hidden: no plan for label {label!r}")
         qo_indptr_buf = self.qo_indptr_buf(label)
         if qo_indptr_buf is None:
-            # planned as a decode: one token per row, so every token is a row's last
+            # an eager step of one-token rows plans the decode wrapper, which
+            # keeps no qo_indptr: each row is its own last token
             return hidden
         last_token_indices = (qo_indptr_buf[1:] - 1).long()
         return hidden.index_select(0, last_token_indices)

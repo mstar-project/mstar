@@ -23,7 +23,7 @@ Request state machine:
     Codec:  waits for streamed frames -> codec_chunk -> emits audio -> waits
 
 This class runs in the API/conductor side. It owns request validation, graph
-and partition declarations, state-machine transitions, sampling defaults, and
+and partition declarations, walk plans, sampling defaults, and
 lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 """
 
@@ -41,11 +41,7 @@ import torch
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -68,7 +64,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata, WalkStep
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -870,121 +866,32 @@ class Qwen3TTSModel(Model):
             )
 
     # -----------------------------------------------------------------------
-    # Conductor partition state machine
+    # Walk plan
     # -----------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        """Create each partition's initial state.
-
-        Talker starts immediately from API tensors; a request that carries a
-        reference clip takes the clone prefill, whose RefEncoder runs first.
-        Codec has no direct API inputs and remains dormant until its incoming
-        streaming connection has enough frames to schedule its chunk walk.
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """Talker prefills (a request with a reference clip takes the clone
+        prefill, whose RefEncoder runs first), then decodes. Codec has no API
+        inputs: it runs its chunk walk whenever the stream has a window ready.
         """
-        model_kwargs = model_kwargs or {}
-        clone = "audio" in input_modalities
         if partition_name == "Talker":
-            walk = "talker_prefill_clone" if clone else "talker_prefill"
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk=walk,
-                is_prefill=True,
-            )
-            routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
-            step_metadata = {key: model_kwargs[key] for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY)}
+            clone = "audio" in input_modalities
+            prompt = {key: model_kwargs[key] for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY)}
             if clone:
-                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
-                step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
-            inputs = []
-            for name, node in routes:
-                edge = GraphEdge(next_node=node, name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                unpersist_tensors=sum(
-                    [edge.tensor_info for edge in inputs], start=[]
-                ),
-                request_done="audio" not in output_modalities,
-                step_metadata=step_metadata,
-            )
-
+                prompt[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
+            if "audio" not in output_modalities:
+                return []
+            prefill = WalkStep("talker_prefill_clone" if clone else "talker_prefill", step_metadata=prompt)
+            return [prefill, WalkStep("talker_decode")]
         if partition_name == "Codec":
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="codec_chunk",
-                is_prefill=False,
-            )
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done="audio" not in output_modalities,
-            )
-        raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Advance Talker prefill/decode and re-arm the streaming Codec.
-
-        Loop iterations are executed inside the ``talker_decode`` graph walk,
-        so the conductor sees that walk once after its loop stops. Codec is
-        rescheduled by connection readiness rather than an internal walk
-        transition.
-        """
-        del incoming_connections
-        if partition_name == "Talker":
-            if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
-                partition_metadata.graph_walk = "talker_decode"
-                partition_metadata.is_prefill = False
-                edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
-                edge.tensor_info = persist_signals.get("talker_input_embeds", [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                )
-            if partition_metadata.graph_walk == "talker_decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-            raise ValueError(
-                "Talker entered an unexpected graph walk: "
-                f"{partition_metadata.graph_walk!r}"
-            )
-
-        if partition_name == "Codec":
-            partition_metadata.graph_walk = "codec_chunk"
-            return ForwardPassArgs(
-                full_metadata=partition_metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                step_metadata={
-                    "codec_chunk_frames": self.config.codec.chunk_frames,
-                    "codec_left_context_frames": (
-                        self.config.codec.left_context_frames
-                    ),
-                    "codec_chunk_schedule": list(self.config.codec.chunk_schedule),
-                },
-            )
+            return [WalkStep("codec_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
 
     # -----------------------------------------------------------------------
@@ -992,14 +899,13 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
         The CodePredictor's ``subtalker_*`` knobs drive its own sampler
         resource; ``*_dosample=False`` maps to temperature 0 (greedy)."""
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         generation = self.config.generation
         do_sample = model_kwargs.get("do_sample", generation.do_sample)
@@ -1259,4 +1165,3 @@ class Qwen3TTSModel(Model):
             codec_encoder,
             self.config,
         )
-

@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.request_info import FINAL_PREFILL
+from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, HostRows
@@ -15,15 +17,19 @@ EOS = 7
 def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=False):
     return SimpleNamespace(
         graph_walk=walk,
-        step_metadata={"last_prefill": last_prefill},
+        # the conductor marks the step before decode
+        step_metadata={FINAL_PREFILL: last_prefill},
         resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": done},
         max_tokens=max_tokens,
     )
 
 
+VISION = MediaEncoder("vision", "vision_encoder", ("pixel_values",), "image_embeds", (5,))
+
+
 def _sub():
-    return LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset({EOS, 9})))
+    return LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset({EOS, 9})), encoders=(VISION,))
 
 
 @pytest.mark.parametrize("shape", ["flat", "column"])
@@ -58,18 +64,23 @@ def test_batched_agrees_with_per_request(shape):
 @pytest.mark.parametrize("mixed", [True, False], ids=["mixed", "prefill"])
 def test_a_last_prefill_stop_token_ends_the_partition(mixed):
     """The last prefill's token comes before decode_loop exists, so its stop
-    ends the partition; an earlier chunk's token is not the request's."""
+    ends the partition, on the text walk and on a media walk alike; an earlier
+    chunk's token is not the request's."""
     infos = {
         "early": _info(walk="prefill_text"),                   # not the last prefill
         "last": _info(walk="prefill_text", last_prefill=True),
+        "media": _info(walk="prefill_vision", last_prefill=True),
         "ignored": _info(walk="prefill_text", last_prefill=True, ignore_eos=True),
         "one": _info(walk="prefill_text", last_prefill=True, max_tokens=1),  # a one-token budget
     }
     if mixed:
         infos["dec"] = _info()
-    tokens = torch.tensor([EOS, EOS, EOS, 3, EOS][:len(infos)])
+    tokens = torch.tensor([EOS, EOS, EOS, EOS, 3, EOS][:len(infos)])
     got = LLMSubmodule.check_stop_batched(_sub(), list(infos), infos, HostRows(tuple(infos), {"new_token": tokens}))
-    assert got == {"last": {END_PARTITION}, "one": {END_PARTITION}, **({"dec": {"decode_loop"}} if mixed else {})}
+    assert got == {
+        "last": {END_PARTITION}, "media": {END_PARTITION}, "one": {END_PARTITION},
+        **({"dec": {"decode_loop"}} if mixed else {}),
+    }
     for i, (rid, info) in enumerate(infos.items()):
         per_request = LLMSubmodule.check_stop(_sub(), rid, info, {"new_token": [tokens[i:i + 1]]})
         assert per_request == got.get(rid, set())

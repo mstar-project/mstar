@@ -15,11 +15,10 @@ import pytest
 import mstar.conductor.conductor as conductor_mod
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
     PartitionState,
+    WalkStep,
 )
-from mstar.model.base import ForwardPassArgs
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -37,24 +36,9 @@ class _StopLoop(BaseException):
     error handling must let it through."""
 
 
-class _Model:
-    """Raises for a request whose metadata asks it to, as a model does on a
-    kwarg it only reads at the second step or on a bug in its transition."""
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata,
-                                        persist_signals, incoming_connections):
-        raise_ = partition_metadata.kwargs.get("raise")
-        if raise_ is not None:
-            raise raise_("model rejected this request's step")
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                graph_walk="decode", is_prefill=False,
-            ),
-            inputs=[], unpersist_tensors=[], request_done=True,
-        )
-
-
 def _request(raise_=None) -> RequestData:
+    """A request on its plan's one step; with ``raise_``, moving its plan on
+    raises that, as a plan whose next walk the model doesn't have does."""
     rd = RequestData(
         persist_signals={}, persist_signal_ref_cnt={},
         worker_graph_to_workers={0: ["worker_0"]}, all_worker_graph_ids={0},
@@ -66,11 +50,8 @@ def _request(raise_=None) -> RequestData:
     }
     rd.partition_states = {
         "default": PartitionState(
-            partition_name="default",
-            metadata=CurrentForwardConductorMetadata(
-                graph_walk="decode", is_prefill=False, kwargs={"raise": raise_},
-            ),
-            current_worker_graph_ids={0},
+            partition_name="default", graph_walk="decode", current_worker_graph_ids={0},
+            plan=[WalkStep("decode", step_metadata={"raise": raise_})],
         ),
     }
     return rd
@@ -100,7 +81,16 @@ def _conductor(*ticks, requests):
         send=lambda entity, msg: c.sent.append((entity, msg)),
         get_all_new_messages=lambda: batches.pop(0) if batches else [],
     )
-    c.model = _Model()
+    c._walk_inputs = {"decode": ()}
+    c._repeating_walks = frozenset()
+
+    def _next_plan_args(request_data, partition_name, done):
+        pstate = request_data.partition_states[partition_name]
+        raise_ = pstate.plan[pstate.cursor].step_metadata["raise"]
+        if raise_ is not None:
+            raise raise_("this request's step failed")
+        return Conductor._next_plan_args(c, request_data, partition_name, done)
+    c._next_plan_args = _next_plan_args
     c.enable_nvtx = False
     c.enable_prof = False
     c._startup_message_backlog = []
@@ -116,7 +106,6 @@ def _conductor(*ticks, requests):
     c._drain_ttl_s = 120.0
     c.worker_graphs = {0: SimpleNamespace(graph_walks={"decode"})}
     c.producer_triggered_partitions = set()
-    c._stream_fed_partitions = set()
     c._client_streams = {}
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}}
     c._wait_for_workers_ready = lambda: None
@@ -187,7 +176,7 @@ def test_the_failing_request_gets_an_error_and_frees_its_slot():
     c._admit_request = lambda body: admitted.append(body.request_id)
     _run(c)
     failed = _to_client(c, "request_failed")
-    assert "model rejected this request's step" in failed["bad"].error_message
+    assert "this request's step failed" in failed["bad"].error_message
     assert failed["bad"].status == 500
     assert "bad" not in c.requests and "bad" not in c.draining
     # The freed slot goes to the request that was waiting for it.
@@ -293,7 +282,7 @@ def test_a_drain_send_that_raises_is_finished_by_the_drain_ttl(monkeypatch):
     clock[0] = c._drain_ttl_s
     c._sweep_expiry()
     failed = _to_client(c, "request_failed")
-    assert "model rejected this request's step" in failed["bad"].error_message
+    assert "this request's step failed" in failed["bad"].error_message
     assert "bad" not in c.requests and "bad" not in c.draining
     assert ("worker_0", "bad") in [
         (entity, m.body.request_id) for entity, m in c.sent

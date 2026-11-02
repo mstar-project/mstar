@@ -31,35 +31,6 @@ def _stops_after(check_stop, loop: str, walk: str, max_iters: int, outputs: dict
     return max_iters
 
 
-def _orpheus():
-    from mstar.model.orpheus.config import OrpheusModelConfig
-    from mstar.model.orpheus.orpheus_model import OrpheusModel
-
-    model = object.__new__(OrpheusModel)
-    model.config = OrpheusModelConfig()
-    model.tokenizer = lambda text, return_tensors=None: SimpleNamespace(
-        input_ids=torch.tensor([[ord(c) for c in text]], dtype=torch.long),
-    )
-    return model
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
-
-    model = _orpheus()
-    llm = OrpheusLLMSubmodule(
-        language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=None), lm_head=None), config=model.config,
-    )
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 def _bagel():
     from test_multimodal_ordering import _StubTokenizer
 
@@ -123,19 +94,10 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     cfg = model.config
     images = [torch.rand(3, 480, 640)] if "image" in input_modalities else []
     out = model.process_prompt(prompt, input_modalities, output_modalities, tensors={"image_inputs": images}, **kwargs)
-    tensors = {"text_inputs": out.new_input_tensors.get("text_inputs", []),
-               "image_inputs": out.new_input_tensors.get("image_inputs", images)}
+    tensors = out.new_input_tensors
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
-    fwd = model.get_initial_forward_pass_args(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
-    metadata = fwd.full_metadata
-    by_uuid = {id(t): t for by_name in tensors.values() for t in by_name}
-    later = []
-    while not model.get_partition_forward_pass_args(DEFAULT_PARTITION, metadata, {}).request_done:
-        if not metadata.is_prefill:
-            later.append(metadata.graph_walk)
-            if metadata.graph_walk in ("image_gen", "image_gen_cfg"):
-                break
-    config = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, kwargs)["kv"]
+    plan = model.walk_plan(DEFAULT_PARTITION, input_modalities, output_modalities, signals, kwargs)
+    config = model.get_request_resource_configs(input_modalities, output_modalities, kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
     config.apply_conductor_config(
         kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"]["kv"].items()},
@@ -145,27 +107,31 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
         SimpleNamespace(posterior_noise=lambda *args, **kw: None), None, None, None, latent_patch_size=1,
         latent_channel=16, latent_downsample=cfg.latent_downsample, max_latent_size=cfg.max_latent_size,
     )
-    preprocess = metadata.kwargs["image_preprocess"]
+    params = plan[0].step_metadata
+    preprocess = params["image_preprocess"]
+    latents = (params["height"] // cfg.latent_downsample) * (params["width"] // cfg.latent_downsample)
     walks = []
-    for walk, info in metadata.kwargs["prefill_schedule"]:
-        tensor = by_uuid[info.uuid]
-        if walk == "prefill_text":
-            walks.append((walk, tensor.numel()))
-        elif walk == "prefill_vit":
+    for step in plan:
+        if step.walk == "decode":
+            walks += [(step.walk, 1)] * cap
+            continue
+        if step.walk in ("image_gen", "image_gen_cfg"):
+            walks += [(step.walk, latents + IMAGE_SENTINELS)] * 3
+            continue
+        (tensor,) = tensors[next(iter(step.bind.values()))]
+        if step.walk == "prefill_text":
+            walks.append((step.walk, tensor.numel()))
+        elif step.walk == "prefill_vit":
             patches = vit_patches(
                 *tensor.shape[-2:], vit_preprocess(preprocess), cfg.vit_config.patch_size,
                 cfg.vit_max_num_patch_per_side,
             )
-            walks.append((walk, patches + IMAGE_SENTINELS))
+            walks.append((step.walk, patches + IMAGE_SENTINELS))
         else:
             info = SimpleNamespace(step_metadata={"image_preprocess": preprocess}, random_seed=0)
-            encoded = vae.prepare_inputs(walk, info, {"image_inputs": [tensor]})
-            walks.append((walk, encoded.kwargs["h"] * encoded.kwargs["w"] + IMAGE_SENTINELS))
-    height, width = metadata.kwargs["height"], metadata.kwargs["width"]
-    latents = (height // cfg.latent_downsample) * (width // cfg.latent_downsample)
-    for walk in later:
-        walks += [(walk, 1)] * cap if walk == "decode" else [(walk, latents + IMAGE_SENTINELS)] * 3
-    return config, metadata.kwargs["requires_cfg"], walks
+            encoded = vae.prepare_inputs(step.walk, info, {"image_inputs": [tensor]})
+            walks.append((step.walk, encoded.kwargs["h"] * encoded.kwargs["w"] + IMAGE_SENTINELS))
+    return config, params["requires_cfg"], walks
 
 
 class _BagelPool:
@@ -307,7 +273,7 @@ def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
     output = model.process_prompt("hello", ["text", "audio"] if clip else ["text"], ["audio"],
                                   tensors=tensors, cfg_weight=cfg_weight)
 
-    opened = model.get_request_resource_configs({}, {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
+    opened = model.get_request_resource_configs([], [], {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
     assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
 
 
@@ -320,24 +286,6 @@ class _Cosmos3Tokenizer:
 
     def convert_tokens_to_ids(self, token):
         return 2
-
-
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.submodules import REASONER_DECODE_LOOP, Cosmos3ReasonerSubmodule
-
-    reasoner = SimpleNamespace(eos_token_id=None)
-
-    def check_stop(request_id, request_info, outputs):
-        return Cosmos3ReasonerSubmodule.check_stop(reasoner, request_id, request_info, outputs)
-
-    cap = Cosmos3Model.get_loop_caps(object.__new__(Cosmos3Model), max_output_tokens=max_tokens)[REASONER_DECODE_LOOP]
-
-    assert cap == _stops_after(
-        check_stop, REASONER_DECODE_LOOP, "reasoner_decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end the reasoner's decode on different iterations"
 
 
 _COSMOS3_COMMITS = {
@@ -362,10 +310,10 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
     dit._new_scheduler = lambda *args, **kw: SimpleNamespace(timesteps=torch.arange(4))
 
     output = model.process_prompt(prompt, ["text"], outputs, tensors={}, **kwargs)
-    args = model.get_initial_forward_pass_args("default", ["text"], outputs, {"text_inputs": []}, kwargs)
-    walk = args.full_metadata.graph_walk
+    prefill = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)[0]
+    walk = prefill.walk
     info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=1,
-                                  rid_handle="r", step_metadata=args.step_metadata)
+                                  rid_handle="r", step_metadata=dict(prefill.step_metadata))
     dit.prepare_inputs(walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
 
     state, layout = dit.request_states["r"], output.metadata["kv_layout"]["kv"]
@@ -428,33 +376,50 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     assert span.length == prefill.shape[0], "the layout and the prefill disagree on its rows"
 
 
-def _higgs():
+@pytest.mark.parametrize("thinking", [False, True])
+def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
+    """The reference's prompt as one row, each piece tokenized on its own:
+    the instruction, the clip's pads where its embeddings go (one per row the
+    encoder keeps of each 4 s chunk), and the turn close. The layout's one
+    span is that row, on a walk of the graph."""
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.multimodal import MEDIA_LAYOUT
+    from mstar.model.multimodal_decoder import MediaIntake
 
     model = object.__new__(HiggsAudioModel)
-    model.config = HiggsAudioModelConfig()
+    model.config = cfg = HiggsAudioModelConfig()
     model.tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens=False: [ord(c) for c in text])
     model.feature_extractor = lambda chunks, **kwargs: {
         "input_features": torch.zeros(len(chunks), 128, 3000),
         "attention_mask": torch.stack([torch.arange(3000) < len(chunk) // 160 for chunk in chunks]),
     }
-    return model
+    pad = cfg.audio_in_token_idx
+    model.media = (MediaIntake("audio", audio_encoder(pad), pad, model._audio_intake),)
+    # two whole chunks of 50 rows and a 1.5 s one of 19
+    clip = torch.zeros(int(9.5 * cfg.sampling_rate))
 
+    out = model.process_prompt(
+        "say it", ["text", "audio"], ["text"], {"audio_inputs": [clip]}, enable_thinking=thinking,
+    )
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-
-    model = _higgs()
-    llm = HiggsAudioLLMSubmodule(None, model.config)
-
-    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
-
-    assert cap == _stops_after(
-        llm.check_stop, "decode_loop", "decode", 1024,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
+    enc = model.tokenizer.encode
+    before = enc("<|im_start|>user\n") + enc("say it") + enc("<|audio_bos|>")
+    after = enc("<|audio_eos|>") + enc("<|im_end|>\n<|im_start|>assistant\n")
+    if not thinking:
+        after += enc("<think>\n\n</think>\n\n")
+    [ids] = out.new_input_tensors["text_inputs"]
+    assert ids.tolist() == before + [pad] * 119 + after
+    assert out.new_input_tensors["audio_feature_lens"][0].tolist() == [400, 400, 150]
+    layout = out.metadata[MEDIA_LAYOUT]
+    assert (layout["offset"], layout["tokens"], layout["output"]) == ([len(before)], [119], ["audio_embeds"])
+    [span] = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    assert (span.kind, span.walk, span.length) == ("rows", "prefill_audio", ids.numel())
+    assert span.walk in model.get_graph_walk_graphs()
+    # every prompt carries the clip: no text walk, mixed step or prefix keys
+    assert "prefill_text" not in model.get_graph_walk_graphs() and model.get_combined_graph_walks() == {}
+    assert model.kv_labels()[KV_CACHE]["main"].keys is None
 
 
 def _omni_submodule():
@@ -578,7 +543,8 @@ def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
 
     model = _vjepa2()
     kwargs = {"rollout_horizon": horizon}
-    step_metadata = model.get_initial_forward_pass_args("p0", ["video"], ["video"], {}, kwargs).step_metadata
+    [step] = model.walk_plan("p0", ["video"], ["video"], {"video_frames": [_pointer(torch.zeros(1))]}, kwargs)
+    step_metadata = step.step_metadata
 
     assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
         VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",
@@ -608,6 +574,60 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     assert rollout[KV_CACHE]["main"].growth == (("rollout_loop", step.input_seq_len),)
     assert once[KV_CACHE]["main"] == LabelLayout(), "a walk that never runs the rollout is laid out"
     assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
+
+
+
+def _token_decoder(name: str):
+    """A token decoder model (one whose LLM node is a ``TokenStepNode``) whose
+    ``get_loop_caps`` reads nothing but its config."""
+    if name == "whisper":
+        return _whisper()
+    if name == "canary":
+        from mstar.model.canary.canary_model import CanaryModel
+
+        model = object.__new__(CanaryModel)
+        model.config = SimpleNamespace(max_position_embeddings=1024)
+        return model
+    if name == "glm52":
+        from mstar.model.glm52.glm52_model import Glm52Model
+
+        return Glm52Model(model_path_hf="", tokenizer_mode="byte")
+    if name == "cosmos3":
+        from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+        return object.__new__(Cosmos3Model)
+    if name == "qwen3_asr":
+        from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
+        from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
+
+        model = object.__new__(Qwen3ASRModel)
+        model.config = Qwen3ASRModelConfig()
+        return model
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+    from mstar.model.orpheus.orpheus_model import OrpheusModel
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    classes = {"canary_qwen": CanaryQwenModel, "command_a_plus": CommandAPlusModel, "higgs": HiggsAudioModel,
+               "orpheus": OrpheusModel, "qwen3_5": Qwen3_5DenseModel}
+    return object.__new__(classes[name])
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "canary", "canary_qwen", "command_a_plus", "cosmos3", "glm52", "higgs", "orpheus", "qwen3_5", "qwen3_asr",
+        "whisper",
+    ],
+)
+@pytest.mark.parametrize("max_tokens", [2, 64])
+def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
+    """The prefill samples the first token and the decode loop's cap runs the
+    rest: the stop check counts no budget of its own, so the cap alone must
+    leave max_tokens tokens (a budget of 1 ends at the prefill)."""
+    loop = "reasoner_decode_loop" if name == "cosmos3" else "decode_loop"
+    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
 
 
 def _whisper():

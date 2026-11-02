@@ -315,7 +315,7 @@ class Qwen3_5_Dense(Model):
         return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
 
     def get_model_kwargs(self, request_type: RequestType):
-        # Greedy everywhere (mstar's sampler defaults to 0.6), and the same prompt
+        # Greedy everywhere (mstar's default sampling isn't greedy), and the same prompt
         # render: mstar opens a <think> block by default, while the 0.8B/2B templates
         # only do when asked. mstar reads the flat enable_thinking and vLLM/SGLang
         # read chat_template_kwargs.
@@ -326,6 +326,35 @@ class Qwen3_8_Dense(Qwen3_5_Dense):
     """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
 
     DEFAULT_MODEL_ID = "Qwen/Qwen3.8-27B"
+
+
+class MuseGlimmer(Model):
+    """Muse Glimmer 30B (text + image in, text out) benchmark metadata."""
+
+    HF_URL = "meta-models/Muse-Glimmer-30B"
+
+    def get_hf_url(self):
+        return self.HF_URL
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T, RequestType.I2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # the checkpoint samples at temperature 1 by default; every engine
+        # decodes greedily here, so they generate the same tokens
+        return {"temperature": 0.0}
+
+    def get_tokenizer(self):
+        # tokenizer_config.json is in a format older transformers cannot read
+        if self._tokenizer is None:
+            from huggingface_hub import snapshot_download
+
+            from mstar.model.muse.processing import load_tokenizer
+
+            self._tokenizer = load_tokenizer(snapshot_download(
+                self.HF_URL, allow_patterns=["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"],
+            ))
+        return self._tokenizer
 
 
 class Qwen3TTS1p7B(Qwen3TTS):
@@ -495,6 +524,7 @@ class ModelType(Enum):
     NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
+    MUSE_GLIMMER = "muse_glimmer"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -539,4 +569,6 @@ class ModelType(Enum):
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:
             return Qwen3_8_Dense(**kwargs)
+        if self == ModelType.MUSE_GLIMMER:
+            return MuseGlimmer(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

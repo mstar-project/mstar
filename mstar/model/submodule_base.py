@@ -1174,9 +1174,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
-        allocate the hidden-state buffer in the dtype the captured region runs
-        under (avoids a copy-time upcast at replay).
+        ``disable_autocast``, passed so a config's ``make_static_inputs`` can
+        allocate each input buffer in the dtype the eager path hands the region,
+        often that one. The replay copies into the buffer and refuses a value the
+        buffer may round.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the
@@ -1326,10 +1327,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``END_PARTITION`` ends the request's partition after this pass, so
         the conductor starts no further walk: e.g. a prefill whose sampled
         token is a stop token, before its decode loop exists. Return it only
-        from a row outside any loop: from inside one, the request fails with
-        an internal error. Use it only when nothing else must run for the
-        partition (a later walk, a loop's final-only publication); the
-        model's transition still decides those.
+        from a row outside any loop, a chunked prefill's included (its chunk
+        Loop ends on the final chunk's pass, and a row mid-prefill decides no
+        stop): from inside another loop, the request fails with an internal
+        error. Use it only when nothing else must run for the
+        partition (a later step of its walk plan, a loop's final-only
+        publication): it ends the partition whatever the plan has left.
 
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold

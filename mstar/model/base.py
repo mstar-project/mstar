@@ -13,9 +13,8 @@ from mstar.api_server import media_io
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     DEFAULT_PARTITION,
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
-    StreamingConnectionState,
+    WalkStep,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
@@ -278,6 +277,14 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
     return keyed
 
 
+def growth_walks(model: "Model") -> frozenset[str]:
+    """The walks that grow a KV label: the conductor marks the plan step before
+    one `FINAL_PREFILL`."""
+    return frozenset(
+        walk for labels in model.kv_labels().values() for label in labels.values() for walk, _ in label.growth
+    )
+
+
 def names_checkpoint(model: "Model") -> bool:
     """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
     which may download the checkpoint (BAGEL's does)."""
@@ -516,22 +523,18 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
-@dataclass
-class ForwardPassArgs:
-    # full_metadata is at the conductor level
-    full_metadata: CurrentForwardConductorMetadata
-    inputs: list[GraphEdge]
-
-    # de_persist_tensors are tensors that will be used for the final time and
-    # not go into future graph nodes
-    unpersist_tensors: list[TensorPointerInfo]
-
-    # e.g., saw EOS or max tokens. Is used to end the request
-    request_done: bool = False
-
-    # step_metadata is at the engine / worker level; and
-    # is passed into the fwd pass
-    step_metadata: dict = field(default_factory=dict)
+def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set[tuple[str, str]]:
+    """The ``(name, node)`` inputs of ``graph_walk`` that a stream feeds: an
+    edge of a connection into the walk's partition (the client's included),
+    at each node of the walk that takes it. The worker graphs and the
+    conductor's walk plans both read this, so they agree on what is streamed."""
+    partition = next(
+        (part.name for part in model.get_partitions() if graph_walk in part.graph_walks), DEFAULT_PARTITION,
+    )
+    names = {conn.edge_name for conn in model.get_partition_topology().connections if conn.to_partition == partition}
+    return {
+        (name, node.name) for node in graph.get_nodes().values() for name in names & set(node.input_names)
+    }
 
 
 class Model(ABC):
@@ -588,22 +591,12 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = DEFAULT_PARTITION
-        for part in self.get_partitions():
-            if graph_walk in part.graph_walks:
-                partition = part.name
-                break
-        input_streams = set()
-        for conn in self.get_partition_topology().connections:
-            if conn.to_partition == partition:
-                input_streams.add(conn.edge_name)
-
         return _divide_into_worker_graphs(
             graph,
             graph_walk=graph_walk,
             node_to_group_idx=node_to_group_idx,
             node_groups=node_groups,
-            input_streams=input_streams,
+            input_streams={name for name, _ in streamed_inputs(self, graph_walk, graph)},
         )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
@@ -764,16 +757,18 @@ class Model(ABC):
 
     def get_request_resource_configs(
         self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
-        CFG, retention. The conductor resolves this once per request and the
+        CFG, retention. The conductor resolves this once per request, from the
+        request's modalities and kwargs as `walk_plan` gets them, and the
         engine hands each config to its resource at ingest.
         """
-        del model_kwargs, partition_fwd_args
+        del input_modalities, output_modalities, model_kwargs
         return {}
 
     def get_sampling_config(
@@ -862,15 +857,27 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        pass
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The walks ``partition_name`` runs for this request, in order, decided
+        at ingest; ``[]`` when the request doesn't use the partition.
+
+        The conductor runs the plan: it sends each step's inputs from the walk's
+        graph (see `WalkStep`), releases a persisted tensor once no later step
+        reads it, sets `FINAL_PREFILL` on the step before a walk that grows a KV
+        label, and ends the partition after the last step reports. A step whose
+        walk a stream feeds, and that is a bare node (or its chunk loop), runs
+        once per chunk until the worker reports the stream's final chunk. A
+        ``ValueError`` refuses the request with a 400, and so do a plan of
+        ``[]`` for every partition, a step whose walk is not the partition's,
+        and a ``bind`` key that is not an input of the step's walk.
+        """
 
     @abstractmethod
     def process_prompt(
@@ -1192,23 +1199,3 @@ class Model(ABC):
                 graph_walks=walks,
             )
         ]
-
-    @abstractmethod
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> "ForwardPassArgs":
-        """Return the next forward pass arguments for a specific partition.
-
-        Called by the conductor after each completed forward pass to determine
-        the next graph walk, inputs, and whether the request is done.
-
-        ``incoming_connections`` contains streaming-specific state (token counts,
-        producer_done) for consumer partitions, one per stream from another
-        partition; a client stream has no entry. For single-partition models,
-        this will be ``None`` or an empty list.
-        """
-        pass

@@ -489,17 +489,21 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
 
 class Qwen3_5Adapter(OpenAIAdapter):
-    """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
+    """The VLM chat models (Qwen3.5, Qwen3.8 and Muse Glimmer): text, image and
+    video chat (``image_url`` / ``video_url`` parts, as the model takes them),
+    text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
     ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus
-    non-OpenAI fields via ``extra_body``:
+    non-OpenAI fields via ``extra_body``, which the model reads:
 
-    * ``top_k``; ``min_p`` is refused (the sampler has no min-p filter).
+    * ``top_k`` and ``min_p``; a ``min_p`` above 0 is refused unless the
+      checkpoint's generation_config sets one.
     * ``repetition_penalty`` — counts the prompt's tokens as well as the
       generated ones unless ``penalize_prompt`` is false.
-    * ``enable_thinking`` (default true) — the chat template opens a
-      ``<think>`` block. Set it false for short answers.
+    * ``enable_thinking`` (default true) — Qwen's template opens a
+      ``<think>`` block; for Muse Glimmer false means reasoning strength low.
+    * ``reasoning_effort`` — Muse Glimmer's reasoning strength.
     """
 
     supports_chat = True
@@ -1678,6 +1682,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
+    # chat with images; reasoning_effort and the sampling defaults are the model's
+    "muse_glimmer": Qwen3_5Adapter(),
 }
 
 # One key per size; every size takes the same adapter.

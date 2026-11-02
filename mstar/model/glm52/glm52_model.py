@@ -8,7 +8,6 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -26,7 +25,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -255,11 +254,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget is the loop cap
-            # (get_loop_caps), set from the request's max_tokens. Sized to the most
-            # decode steps any prompt can take before the context guard, not
-            # to the default budget: at the default, every request asking for
-            # more was cut short at 1025 tokens with no error.
+            # The window every request's loop cap (get_loop_caps) must fit: the
+            # most decode steps a one-token prompt can take before the context guard.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -267,70 +263,18 @@ class Glm52Model(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
-            request_done = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        unpersist_tensors = list(graph_edge.tensor_info)
-        inputs = [graph_edge]
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -394,10 +338,9 @@ class Glm52Model(Model):
         return input_ids[0]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
@@ -517,7 +460,7 @@ class Glm52Model(Model):
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model, self.config)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:

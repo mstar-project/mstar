@@ -25,13 +25,13 @@ import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.communication import wire  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.conductor.request_info import (  # noqa: E402
-    CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
     PartitionDefinition,
+    WalkStep,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
-from mstar.model.base import ForwardPassArgs, Model  # noqa: E402
+from mstar.model.base import Model  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 from mstar.streaming.topology import (  # noqa: E402
@@ -102,13 +102,8 @@ class _DuplexToy(Model):
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
         ])
 
-    def get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities,
-                                      input_signals, model_kwargs=None):
-        return _fwd()
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals,
-                                        incoming_connections=None):
-        return _fwd()
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        return [WalkStep("listen")]
 
     def process_prompt(self, *a, **k):
         return {}
@@ -121,13 +116,6 @@ class _DuplexToy(Model):
 
     def get_submodule(self, *a, **k):
         return None
-
-
-def _fwd():
-    return ForwardPassArgs(
-        full_metadata=CurrentForwardConductorMetadata(graph_walk="listen", is_prefill=False),
-        inputs=[], unpersist_tensors=[],
-    )
 
 
 def _conductor(tmp_path, monkeypatch, model=None, **config) -> Conductor:

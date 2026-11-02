@@ -1,12 +1,13 @@
 from dataclasses import dataclass, field
 
+from mstar.model import keys
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 
-# Constants
-KV_CACHE = "kv_cache"
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
-SAMPLER = "sampler"
-ROPE = "rope"
+SAMPLER = keys.SAMPLER
+ROPE = keys.ROPE
 
 # SNAC captures one CUDA graph per window size at every capture batch size,
 # and every size from 1 frame up to the widest window occurs (final flushes),
@@ -39,7 +40,8 @@ class OrpheusModelConfig:
     # Special token IDs
     start_token_id: int = 128259
     end_token_ids: list[int] = field(default_factory=lambda: [128009, 128260, 128261, 128257])
-    stop_token_id: int = 128258
+    # end of speech
+    stop_token_ids: frozenset[int] = frozenset({128258})
     pad_token_id: int = 128263
     custom_token_base_id: int = 128256  # vocab_id of <custom_token_0>
 

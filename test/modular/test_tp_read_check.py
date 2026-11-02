@@ -9,9 +9,9 @@ rows to take out. Those rows never run, so nothing of them is computed,
 committed or sent, and every rank runs the same collectives.
 
 - The two-rank runs reuse the acceptance harness
-  (``test_tp_read_failure_acceptance.py``) with a ``prepare_inputs`` that runs a
-  collective per text part, as Qwen3.5's vocab-parallel embedding does, and
-  with a step whose every row failed.
+  (``test_tp_read_failure_acceptance.py``) with an embedding that runs a
+  collective per row inside the step, as Qwen3.5's vocab-parallel embedding
+  does in its forward, and with a step whose every row failed.
 - TP4 and TP2 x SP2: four real gloo ranks run the check itself.
 - The follower's scheduling (serial and ``MSTAR_TP_ASYNC_SCHED``) and rank 0's
   marking run the real ``MicroScheduler`` and ``Worker`` methods on stubs.
@@ -51,10 +51,9 @@ from mstar.worker.worker import Speculation, Worker
 
 def _vocab_parallel_submodule_class(harness_class):
     """The harness's Qwen3.5 LLM submodule, with an embedding that all-reduces
-    over the TP group as ``VocabParallelEmbedding`` does. Qwen3.5's
-    ``prefill_vision`` embeds each text part (and its vision sentinels) inside
-    ``prepare_inputs``, so a rank that prepares a row another rank does not
-    runs a collective with no partner."""
+    over the TP group as ``VocabParallelEmbedding`` does. Qwen3.5 embeds a
+    row's ids inside the step, the harness once per row, so a rank whose step
+    holds a row another rank's does not runs a collective with no partner."""
     base = harness_class()
 
     class _Embedding(torch.nn.Module):
@@ -119,10 +118,11 @@ def _rank_main_every_row_fails(rank, scenario, inbox, outbox):
 
 
 @pytest.mark.parametrize("kind", acc.KINDS)
-def test_a_prepare_that_runs_a_collective_per_row_stays_in_step(tmp_path, monkeypatch, kind):
-    """With the embedding all-reducing inside ``prepare_inputs``, r1's failed
-    follower read still fails only r1, and r0's outputs equal a run with no
-    failure: no rank prepares r1, so no rank runs r1's embedding collectives."""
+def test_a_step_that_runs_a_collective_per_row_stays_in_step(tmp_path, monkeypatch, kind):
+    """With the embedding all-reducing once per row inside the step, r1's
+    failed follower read still fails only r1, and r0's outputs equal a run
+    with no failure: the check takes r1 out of every rank's step before any
+    rank runs it, so no rank runs r1's embedding collectives."""
     monkeypatch.setattr(acc, "_rank_main", _rank_main_vocab_parallel)
     clean = acc._run(tmp_path / "clean", acc.Scenario(kind=kind, fail=False))
     acc._healthy_ok(clean)

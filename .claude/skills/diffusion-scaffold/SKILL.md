@@ -34,7 +34,6 @@ A recipe such as LTX-2.5's two-stage distilled one (half-resolution denoise → 
 
 - **The schedule is per (request, walk).** A request returns to the node on a new walk with a different schedule; cache keyed by the request alone and the second stage runs the first stage's sigmas.
 - **Iteration 0 of a later stage is not fresh noise**: it is the previous stage's output (upsampled) blended with noise at the stage's first sigma. That is a seeding hook, not model code in `denoise`: `initial_loop_back(fwd_info, inputs, bucket_key, generator)`, which defaults to `seed_loop_back` (added in #373).
-- **Keep request-level facts away from step-metadata names.** The conductor merges each pass's `step_metadata` into `metadata.kwargs`, so a stage-1 `height` sent as step metadata overwrites the request's `height` before stage 2 reads it. Nest request facts under their own key.
 
 ## Attention
 

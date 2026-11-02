@@ -14,8 +14,7 @@ Graph walks:
     image_gen     Loop("denoise_loop", dit{text_embeds, latents}) -> vae_decoder -> EMIT image
     image_edit    same, with ref_latents as an extra dit input
 
-The walk sequence is fixed at admission from the input modalities and stepped
-through ``metadata.kwargs["walk_step"]``:
+The walk plan (``walk_plan``) is fixed at admission from the input modalities:
 
     T2I:  encode_text -> image_gen
     edit: encode_text -> encode_image -> image_edit
@@ -39,11 +38,10 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
@@ -340,86 +338,27 @@ class Flux2KleinModel(Model):
         ids, mask = self.tokenize(prompt)
         return {TEXT_INPUTS: [ids], TEXT_MASK: [mask]}
 
-    # --------------------------------------------------------- state machine
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
-        return {
-            "height": kw["height"], "width": kw["width"],
-            "num_inference_steps": kw["num_inference_steps"],
-            "ref_grids": kw["ref_grids"],
-        }
-
-    def get_initial_forward_pass_args(
+    # ------------------------------------------------------------ walk plan
+    def walk_plan(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
+        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict,
+    ) -> list[WalkStep]:
         if not input_signals.get(TEXT_INPUTS):
             raise ValueError("FLUX.2 klein requires a text prompt (text_inputs)")
-        ref_infos = input_signals.get(IMAGE_INPUTS) or []
-        ref_dims = [(int(info.dims[-2]), int(info.dims[-1])) for info in ref_infos]
+        ref_dims = [(int(info.dims[-2]), int(info.dims[-1])) for info in input_signals.get(IMAGE_INPUTS) or []]
         height, width = self._resolve_size(model_kwargs, ref_dims)
-        edit = bool(ref_infos)
-        schedule = [ENCODE_TEXT_WALK] + ([ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK] if edit else [IMAGE_GEN_WALK])
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
+        request = {
             "height": height,
             "width": width,
             "num_inference_steps": self._resolve_steps(model_kwargs),
             "ref_grids": [list(self.config.latent_grid(h, w)) for h, w in ref_dims],
         }
         logger.info(
-            "FLUX.2 klein request: %dx%d steps=%d refs=%s seed=%s", width, height, kwargs["num_inference_steps"],
-            kwargs["ref_grids"] or "-", model_kwargs.get("seed", "auto"),
+            "FLUX.2 klein request: %dx%d steps=%d refs=%s seed=%s", width, height, request["num_inference_steps"],
+            request["ref_grids"] or "-", model_kwargs.get("seed", "auto"),
         )
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities, output_modalities=output_modalities,
-            graph_walk=schedule[0], is_prefill=True, kwargs=kwargs,
-        )
-        inputs = []
-        for name in (TEXT_INPUTS, TEXT_MASK):
-            edge = GraphEdge(next_node="text_encoder", name=name)
-            edge.tensor_info = input_signals[name]
-            inputs.append(edge)
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata),
-        )
-
-    def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        inputs: list[GraphEdge] = []
-        request_done = step >= len(schedule)
-        if not request_done:
-            metadata.kwargs["walk_step"] = step
-            walk = schedule[step]
-            metadata.graph_walk = walk
-            metadata.is_prefill = walk == ENCODE_IMAGE_WALK
-            if walk == ENCODE_IMAGE_WALK:
-                edge = GraphEdge(next_node="vae_encoder", name=IMAGE_INPUTS)
-                edge.tensor_info = persist_signals.get(IMAGE_INPUTS, [])
-                inputs.append(edge)
-            else:
-                persisted = [TEXT_EMBEDS] + ([REF_LATENTS] if walk == IMAGE_EDIT_WALK else [])
-                for name in persisted:
-                    edge = GraphEdge(next_node="dit", name=name)
-                    edge.tensor_info = persist_signals.get(name, [])
-                    inputs.append(edge)
-                # the loop-back edge arrives empty; the dit seeds it at iteration 0
-                inputs.append(GraphEdge(next_node="dit", name=LATENTS))
-        return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
-            step_metadata=self._step_metadata(metadata), request_done=request_done,
-        )
+        walks = [ENCODE_TEXT_WALK] + ([ENCODE_IMAGE_WALK, IMAGE_EDIT_WALK] if ref_dims else [IMAGE_GEN_WALK])
+        return [WalkStep(walk, step_metadata=request) for walk in walks]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "image":

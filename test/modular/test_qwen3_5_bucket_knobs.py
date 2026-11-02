@@ -60,13 +60,16 @@ def test_default_ladders_stay_inside_dynamos_recompile_limit(monkeypatch):
     compiles = (
         len(s.DECODE_CAPTURE_BATCH_SIZES) + len(s.PREFILL_TOKEN_BUCKETS)
         + pairs(s.MIXED_CAPTURE_BATCH_SIZES, s.MIXED_TOKEN_BUCKETS)
-        + pairs(s.PREFILL_VISION_CAPTURE_BATCH_SIZES, s.PREFILL_VISION_TOKEN_BUCKETS)
+        + pairs(s.PREFILL_MEDIA_CAPTURE_BATCH_SIZES, s.PREFILL_MEDIA_TOKEN_BUCKETS)
     )
     assert compiles < recompile_limit()
 
 
 def _compile_modes(m):
+    from mstar.model.multimodal import vision_encoder
+
     submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
+    submodule._encoders = (vision_encoder((5,)),)
     configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
     return {c.capture_graph_walk: c.compile_mode for c in configs}
 
@@ -110,4 +113,4 @@ def test_only_qwen3_5_text_walks_read_the_switch():
         for fn in cls.body if isinstance(fn, ast.FunctionDef)
         and any(isinstance(n, ast.Name) and n.id == "compile_deterministic" for n in ast.walk(fn))
     ]
-    assert methods == ["LLMSubmodule.get_accelerator_graph_configs"]
+    assert methods == ["LLMSubmodule.capture_compile_mode"]

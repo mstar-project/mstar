@@ -67,6 +67,13 @@ def add_rms_norm(
     return rms_norm(r, weight, eps, gemma_mode), r
 
 
+def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm with no scale over the last dim: the variance in fp32, the
+    product promoted to fp32, then back to the input dtype."""
+    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    return (x * torch.rsqrt(variance + eps)).to(x.dtype)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm with optional Gemma-style ``(1 + weight)`` scaling.
 

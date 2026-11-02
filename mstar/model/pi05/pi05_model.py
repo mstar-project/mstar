@@ -30,10 +30,6 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -52,7 +48,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
@@ -562,69 +558,22 @@ class Pi05Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
-            is_prefill=True,
-            kwargs={},
-        )
-
-        inputs = []
-        if "image_inputs" in input_signals:
-            edge = GraphEdge(next_node="vit_encoder", name="image_inputs")
-            edge.tensor_info = input_signals["image_inputs"]
-            inputs.append(edge)
-        if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
-            edge.tensor_info = input_signals["text_inputs"]
-            inputs.append(edge)
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            request_done=request_done,
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """The prefill over the camera images and the prompt, then the action
+        flow, whose first iteration the LLM submodule seeds (Gaussian noise and
+        timestep 0)."""
+        # The prefill's LLM waits on the images' embeddings, so a request without
+        # them could never finish. process_prompt always emits the prompt's tokens.
+        if not input_signals.get("image_inputs"):
+            raise ValueError("Pi0.5 requires camera images (image_inputs)")
+        return [WalkStep(self.PREFILL_WALK), WalkStep(self.ACTION_GEN_WALK)]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

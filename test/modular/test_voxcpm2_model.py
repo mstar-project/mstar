@@ -308,8 +308,7 @@ def _request(model, text: str, clip: torch.Tensor | None = None, **kwargs) -> tu
     edges, metadata = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
     if clip is not None:
         edges = {**edges, "audio_inputs": [clip]}
-    args = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=metadata)
-    return edges, args.step_metadata
+    return edges, dict(model.walk_plan("Talker", modalities, ["audio"], {}, metadata)[0].step_metadata)
 
 
 def _info(rid: str, seed: int = 0, step_metadata: dict | None = None) -> SimpleNamespace:
@@ -400,12 +399,9 @@ def test_a_one_patch_request_ends_after_prefill(model, budget, done):
     """Prefill has no loop for the Talker's stop to end, so a request whose
     budget the prefill patch spends goes straight to done instead of a decode
     step that would only veto itself."""
-    args = model.get_initial_forward_pass_args(
-        "Talker", ["text"], ["audio"], {}, model_kwargs={PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
-    )
-    nxt = model.get_partition_forward_pass_args("Talker", args.full_metadata, {"latent_patch": []})
-    assert nxt.request_done is done
-    assert nxt.full_metadata.graph_walk == ("talker_prefill" if done else "talker_decode")
+    kwargs = {PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
+    plan = model.walk_plan("Talker", ["text"], ["audio"], {}, kwargs)
+    assert [step.walk for step in plan] == ["talker_prefill"] + ([] if done else ["talker_decode"])
 
 
 @pytest.mark.parametrize("budget", [2, 5])
@@ -465,11 +461,11 @@ def test_process_prompt_lays_out_the_rows_the_talker_prefill_writes(model, ref_t
         prepared = ref.prepare_inputs(walk, info, {"audio_inputs": [clip]})
         with torch.inference_mode():
             edges.update(ref.forward(walk, None, **prepared.tensor_inputs, **prepared.kwargs))
-    step = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=meta).step_metadata
+    step = dict(model.walk_plan("Talker", modalities, ["audio"], {}, meta)[0].step_metadata)
     prefill = talker.prepare_inputs(walk, _info("r", 0, step), edges)
     assert span.length == prefill.input_seq_len, "the layout and the prefill disagree on its rows"
 
-    configs = model.get_request_resource_configs({}, meta)
+    configs = model.get_request_resource_configs([], [], meta)
     for key in ("base_kv", "res_kv"):
         configs.setdefault(key, KVReqConfig(needed_labels=["main"]))
     refuse_undeclared_labels("VoxCPM2Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
@@ -581,24 +577,19 @@ def test_build_prompt_matches_the_reference_layout():
     assert torch.equal(audio, ref[0])
 
 
-def test_initial_args_route_reference_audio(model):
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
+def test_walk_plan_clones_through_the_ref_encoder(model):
     _, metadata = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}
     )
-    talker = model.get_initial_forward_pass_args(
-        "Talker", ["text", "audio"], ["audio"], signals, model_kwargs={**metadata, "unrelated": 1}
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    routes = sorted((edge.next_node, edge.name) for edge in talker.inputs)
-    assert routes == [("RefEncoder", "audio_inputs"), ("Talker", "gen_params"), ("Talker", "text_inputs")]
+    talker = model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {**metadata, "unrelated": 1})
+    assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # the prompt facts ride step metadata to the Talker partition's nodes
     keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
-    assert talker.step_metadata == {key: metadata[key] for key in keys}
+    assert [dict(step.step_metadata) for step in talker] == [{key: metadata[key] for key in keys}, {}]
     _, zero_shot = model.process_prompt("hello", ["text"], ["audio"])
-    plain = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals, model_kwargs=zero_shot)
-    assert plain.full_metadata.graph_walk == "talker_prefill"
-    assert {edge.next_node for edge in plain.inputs} == {"Talker"}
+    plain = model.walk_plan("Talker", ["text"], ["audio"], {}, zero_shot)
+    assert [step.walk for step in plain] == ["talker_prefill", "talker_decode"]
+    assert [step.walk for step in model.walk_plan("VAEDecoder", ["text"], ["audio"], {}, zero_shot)] == ["vae_chunk"]
 
 
 @pytest.mark.parametrize("ref_text", ["", "world"])
@@ -606,22 +597,20 @@ def test_the_talker_walk_follows_the_prompt_mode_not_input_modalities(model, ref
     """``/generate`` takes ``input_modalities`` from the client: a clip sent with
     ``["text"]`` builds a cloning prompt, so the conductor must run the
     RefEncoder walk for it too, or the Talker has no reference latents."""
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
     _, metadata = model.process_prompt(
         "hello", ["text"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}, ref_text=ref_text
     )
     assert metadata[PROMPT_MODE_KEY] != MODE_ZERO_SHOT
-    talker = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals, model_kwargs=metadata)
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    assert ("RefEncoder", "audio_inputs") in {(edge.next_node, edge.name) for edge in talker.inputs}
-    assert talker.step_metadata[PROMPT_MODE_KEY] == metadata[PROMPT_MODE_KEY]
+    prefill = model.walk_plan("Talker", ["text"], ["audio"], {}, metadata)[0]
+    assert prefill.walk == "talker_prefill_clone"
+    assert prefill.step_metadata[PROMPT_MODE_KEY] == metadata[PROMPT_MODE_KEY]
 
 
 def test_the_talker_walk_needs_the_prompt_mode(model):
     """Only process_prompt sets the mode (INTERNAL_KWARGS drops a client's), so
     a request without one never reached it; refuse it rather than guess."""
     with pytest.raises(ValueError, match=PROMPT_MODE_KEY):
-        model.get_initial_forward_pass_args("Talker", ["text", "audio"], ["audio"], {}, model_kwargs={})
+        model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {})
 
 
 

@@ -238,7 +238,7 @@ class MStarTalkerDriver:
 
     def open_request(self, rid: str, model_kwargs: dict[str, Any], prompt: dict[str, Any]) -> CurrentForwardPassInfo:
         """``prompt`` is ``process_prompt``'s metadata, which the prefill reads as step metadata."""
-        configs = self.model.get_request_resource_configs({}, model_kwargs)
+        configs = self.model.get_request_resource_configs([], [], model_kwargs)
         for config in configs.values():
             config.apply_conductor_config(seed=1234)
         self.runner.ingest_request(rid, configs)

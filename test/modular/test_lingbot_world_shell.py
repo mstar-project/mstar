@@ -16,7 +16,7 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
-from mstar.graph.base import GraphNode, Loop  # noqa: E402
+from mstar.graph.base import GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     REFERENCE_ATTENTION,
@@ -108,6 +108,23 @@ def test_walks_run_text_then_a_chunk_loop_that_emits_frames(model):
     emits = [e for e in node.outputs if e.next_node == EMIT_TO_CLIENT]
     assert [(e.name, e.output_modality) for e in emits] == [("video_output", "video_frame")]
     assert any(e.next_node == "dit" and e.name == "clock" for e in node.outputs)
+
+
+def _pointer(*dims: int) -> TensorPointerInfo:
+    return TensorPointerInfo(dims=list(dims), dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
+                             source_session_id="", source_entity="")
+
+
+def test_the_plan_runs_both_walks_with_the_rollouts_chunk_count(model):
+    signals = {"text_inputs": [_pointer(512)], "image_inputs": [_pointer(3, 480, 832)],
+               "camera_poses": [_pointer(8, 6, 60, 104)], "intrinsics": [_pointer(4)]}
+    plan = model.walk_plan("default", ["text", "image"], ["video_frame"], signals, {})
+    assert [step.walk for step in plan] == ["encode_text", ROLLOUT_WALK] and not any(step.bind for step in plan)
+    chunks = 8 // model.config.chunk_size
+    assert all(step.step_metadata == {"guidance_scale": 1.0, "num_latent_frames": 8, "num_chunks": chunks}
+               for step in plan)
+    with pytest.raises(ValueError, match="intrinsics"):
+        model.walk_plan("default", ["text", "image"], ["video_frame"], {**signals, "intrinsics": []}, {})
 
 
 def _info(num_chunks: int, done: int) -> CurrentForwardPassInfo:

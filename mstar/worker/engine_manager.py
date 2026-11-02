@@ -12,7 +12,8 @@ from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs
+from mstar.model.base import Model, growth_walks, node_moe_parallel_configs
+from mstar.model.components.token_step import TokenStepNode
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
@@ -59,6 +60,20 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
             raise ValueError(
                 f"{type(model).__name__}: {node!r} splits its combined walk "
                 f"{combined!r} by capture key"
+            )
+
+
+def _refuse_ungrown_decode_walks(submodules: dict, model: Model) -> None:
+    """The conductor marks a request's first-token step `FINAL_PREFILL` only
+    before a walk that grows a KV label, and a `TokenStepNode` stops on that
+    step only when it is marked, so its decode walk must grow one."""
+    grown = growth_walks(model)
+    for name, submodule in submodules.items():
+        if isinstance(submodule, TokenStepNode) and submodule.DECODE_WALK not in grown:
+            raise ValueError(
+                f"{type(model).__name__}: {name!r} decodes in {submodule.DECODE_WALK!r}, which grows no "
+                f"KV label (`kv_labels`), so a stop on its prefill would end nothing; the walks that "
+                f"grow one are {sorted(grown)}"
             )
 
 
@@ -189,6 +204,7 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
+        _refuse_ungrown_decode_walks(submodules, model)
         no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
         engine = Engine(

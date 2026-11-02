@@ -77,7 +77,7 @@ class _PromptPackedConfig(PackedAcceleratorGraphConfig):
 # Walks that run the encoder and hand the decoder its output.
 ENCODER_WALKS = (PREFILL_WALK, DETECT_LANGUAGE_WALK)
 # Walks whose sampled token is the first transcript token, subject to the
-# begin-suppression rules.
+# begin-suppression rules; a stop id there ends the request.
 FIRST_TOKEN_WALKS = (PREFILL_WALK, PREFILL_PROMPT_WALK)
 
 
@@ -284,9 +284,11 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        # a stop on the first transcript token ends the partition (`_token_stops`)
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token",
             stop_ids=frozenset({config.eos_token_id}), sampler=self.SAMPLER,
+            prefill_walks=frozenset(FIRST_TOKEN_WALKS),
         )
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
@@ -756,12 +758,19 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
     def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
-        """The shared stop condition (EOS) on a decode row's token; a prompt
-        walk's token never stops the loop. Either way the token
-        is kept for the align walk first."""
-        if info.graph_walk != DECODE_WALK:
+        """A stop id on a decode row's token, or on the first transcript token,
+        where it ends the request (an empty transcript has no words to align).
+        No budget check at the prompt walk: the loop cap ends decode, and the
+        walk plan skips decode for a one-token budget, so a word-timestamp
+        request still aligns that token. Either way the token is kept for the
+        align walk first."""
+        walk = info.graph_walk
+        if walk != DECODE_WALK:
             self._record_prompt_token(info, token)
-            return False
+            return (
+                walk in FIRST_TOKEN_WALKS and token in self.token_stop.stop_ids
+                and not info.resource_configs[SAMPLER].ignore_eos
+            )
         self._record(info, token)
         if not super()._token_stops(request_id, token, info):
             return False

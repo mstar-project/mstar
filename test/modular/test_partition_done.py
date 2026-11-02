@@ -4,11 +4,9 @@ The worker sets ``partition_done`` on the worker-graphs-done report of the pass
 that consumed a stream's final chunk, or whose stop check returned
 ``END_PARTITION`` (a prefill that sampled a stop token). The conductor must
 treat that as the partition's ``request_done`` (so ``producer_done`` reaches
-its downstream connections) even when the model reports the partition as not
-done: the model only sees connection counters, and ``consumed_count`` counts
-chunks popped for execution as reported by every colocated worker-graphs-done
-message, so a counter-based end can fire while the partition's last step is
-still running.
+its downstream connections) whatever is left of its plan: a stream consumer's
+step runs once per chunk and never ends on its own, and a prefill's plan still
+has its decode step.
 """
 from dataclasses import dataclass, field
 
@@ -16,26 +14,12 @@ import pytest
 
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
     PartitionDefinition,
     PartitionState,
     StreamingConnectionState,
+    WalkStep,
 )
-from mstar.model.base import ForwardPassArgs
 from mstar.utils.ipc_format import WorkerGraphsDone
-
-
-class _StubModel:
-    """Never ends a partition on its own; records what it was asked."""
-
-    def __init__(self):
-        self.calls = []
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals,
-                                        incoming_connections=None):
-        self.calls.append((partition_name, [c.edge_name for c in incoming_connections or []]))
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[],
-                               request_done=False)
 
 
 @dataclass
@@ -46,16 +30,20 @@ class _Recorder:
 
 def _conductor(rid="r"):
     c = object.__new__(Conductor)
-    c.model = _StubModel()
-    c._stream_fed_partitions = {"B", "C"}
     c._client_streams = {}
     rec = _Recorder()
     c._send_producer_done = lambda request_id, frm, to: rec.producer_done.append((request_id, frm, to))
-    c._send_partition_inputs = lambda request_id, pname, fwd_args: rec.partition_inputs.append(pname)
+    c._send_inputs = lambda request_id, pname, inputs, walk, step_metadata: rec.partition_inputs.append(pname)
     c._un_persist_tensors = lambda request_id, tensors: None
     c._set_partition_worker_graph_ids = lambda request_id, pname, walk: None
     c.producer_triggered_partitions = set()
-    meta = lambda walk: CurrentForwardConductorMetadata(graph_walk=walk, is_prefill=False)  # noqa: E731
+    # A prefills, then decodes from the token it persists; B and C consume streams, one pass a chunk
+    c._walk_inputs = {"a": (), "a_decode": (("text_inputs", "llm"),), "b": (), "c": ()}
+    c._walk_persists = dict.fromkeys(c._walk_inputs, frozenset())
+    c._repeating_walks = frozenset({"b", "c"})
+    c._growth_walks = frozenset()
+    plans = {"A": [WalkStep("a"), WalkStep("a_decode", bind={"text_inputs": "new_token"})],
+             "B": [WalkStep("b")], "C": [WalkStep("c")]}
     conns = {
         "A->B": StreamingConnectionState(from_partition="A", to_partition="B", edge_name="tok"),
         "B->C": StreamingConnectionState(from_partition="B", to_partition="C", edge_name="codes"),
@@ -63,7 +51,7 @@ def _conductor(rid="r"):
     req = RequestData(
         persist_signals={}, persist_signal_ref_cnt={}, worker_graph_to_workers={}, all_worker_graph_ids=set(),
         max_output_tokens=10_000, random_seed=0, resource_configs={},
-        partition_states={p: PartitionState(partition_name=p, metadata=meta(p.lower())) for p in "ABC"},
+        partition_states={p: PartitionState(partition_name=p, graph_walk=p.lower(), plan=plans[p]) for p in "ABC"},
         partition_definitions={p: PartitionDefinition(name=p, graph_walks={p.lower()}) for p in "ABC"},
         streaming_connections=conns,
     )
@@ -85,7 +73,6 @@ def test_worker_final_chunk_signal_ends_the_partition_and_propagates_producer_do
     assert req.streaming_connections["B->C"].producer_done is True
     assert rec.producer_done == [("r", "B", "C")]
     assert all_done is False          # A and C are still running
-    assert c.model.calls == [("B", ["tok"])]
 
 
 def test_counter_heuristics_are_not_needed_and_an_ordinary_pass_does_not_end_it():
@@ -144,16 +131,14 @@ def test_two_passes_reported_in_one_cycle_end_the_partition_once():
     for name in queued:
         c._process_done_forward("r", name)
     assert pstate.is_done is True
-    assert c.model.calls == [("B", ["tok"])], "the done partition is not advanced again"
+    assert pstate.fwd_pass_number == 1, "the done partition is not advanced again"
     assert rec.producer_done == [("r", "B", "C")]
 
 
 def test_chain_closes_partition_by_partition():
     c, req, rec = _conductor()
-    c.model.get_partition_forward_pass_args = lambda partition_name, partition_metadata, persist_signals, \
-        incoming_connections=None: ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[],
-                                                   request_done=partition_name == "A")
-    assert c._process_done_forward("r", "A") is False           # A ends itself (its own stream input is exhausted)
+    req.partition_states["A"].plan = [WalkStep("a")]
+    assert c._process_done_forward("r", "A") is False           # A ends itself: its plan has run
     assert req.streaming_connections["A->B"].producer_done is True
     assert _done_forward(c, req, "B", partition_done=True) is False
     assert _done_forward(c, req, "C", partition_done=True) is True   # every partition done

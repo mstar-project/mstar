@@ -1624,43 +1624,18 @@ def _pointer_info(dims: list[int]) -> TensorPointerInfo:
     )
 
 
-def test_the_required_prime_walk_addresses_the_seed_to_the_encoder(model):
-    """The seed clip is addressed to the vae_encoder. The
-    controller streams stay addressed to the dit on both walks: they are read
-    once per frame for the whole rollout, and the encoder never sees them."""
+@pytest.mark.parametrize("dims", [[720, 1280, 3], [4, 720, 1280, 3]], ids=["image", "clip"])
+def test_the_plan_primes_then_rolls_out_with_the_seed_hw_off_the_signal_dims(model, dims):
     signals = {name: [object()] for name in ("mouse", "button", "scroll")}
 
-    seeded = model.get_initial_forward_pass_args(
-        "p", ["image"], ["video_frame"],
-        {**signals, "image_inputs": [_pointer_info([720, 1280, 3])]}, {"num_steps": 2},
+    plan = model.walk_plan(
+        "p", ["image"], ["video_frame"], {**signals, "image_inputs": [_pointer_info(dims)]}, {"num_steps": 2},
     )
 
-    assert seeded.full_metadata.kwargs["walk_schedule"] == [PRIME_WALK, ROLLOUT_WALK]
-    assert seeded.full_metadata.graph_walk == PRIME_WALK
-    assert seeded.full_metadata.is_prefill is True
-    assert [(e.name, e.next_node) for e in seeded.inputs] == [
-        ("image_inputs", VAE_ENCODER_NODE),
-        ("mouse", DIT_NODE), ("button", DIT_NODE), ("scroll", DIT_NODE),
-    ]
-
+    assert [step.walk for step in plan] == [PRIME_WALK, ROLLOUT_WALK] and not any(step.bind for step in plan)
+    assert all(step.step_metadata == {"num_steps": 2, "seed_hw": (720, 1280)} for step in plan)
     with pytest.raises(ValueError, match="required seed clip"):
-        model.get_initial_forward_pass_args(
-            "p", ["tensor"], ["video_frame"], signals, {"num_steps": 2},
-        )
-    # Nothing is unpersisted: the streams are re-read every frame, and the seed
-    # clip goes with the request.
-    assert seeded.unpersist_tensors == []
-
-
-def test_get_initial_forward_pass_args_reads_the_seed_hw_off_the_signal_dims(model):
-    signals = {name: [object()] for name in ("mouse", "button", "scroll")}
-
-    for dims in ([720, 1280, 3], [4, 720, 1280, 3]):
-        fwd_args = model.get_initial_forward_pass_args(
-            "p", ["image"], ["video_frame"],
-            {**signals, "image_inputs": [_pointer_info(dims)]}, {"num_steps": 2},
-        )
-        assert fwd_args.step_metadata["seed_hw"] == (720, 1280)
+        model.walk_plan("p", ["tensor"], ["video_frame"], signals, {"num_steps": 2})
 
 
 def test_postprocess_emits_the_step_s_frames_as_raw_rgb_bytes(model, config):

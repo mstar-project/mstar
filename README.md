@@ -117,6 +117,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Qwen3.5 0.8B–27B](https://huggingface.co/Qwen/Qwen3.5-4B) / [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Vision-language model | text, image → text (hybrid gated-DeltaNet attention) | `/v1/chat/completions`, `/generate` |
+| [Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) *(Beta)* | Vision-language model | text, image → text (sliding-window and NoPE attention layers 3:1) | `/v1/chat/completions`, `/generate` |
 | [Nemotron VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B) *(Beta)* | Full-duplex speech LM | speech → text, speech (streamed) | `/generate` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
 | [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |

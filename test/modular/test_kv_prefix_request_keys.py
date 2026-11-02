@@ -23,14 +23,13 @@ from test_ingest_unpersist import _conductor, _ToyModel
 from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
+from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     PrefixKeys,
@@ -405,10 +404,7 @@ class _Talking(_ToyModel):
         ])
         super().__init__(
             {"prefill": llm(), "prefill_image": Sequential([vit, llm()]), "talk": talker}, None,
-            partitions=[
-                PartitionDefinition("LLM", {"prefill", "prefill_image"}),
-                PartitionDefinition("Talker", {"talk"}),
-            ],
+            groups={"LLM": ["prefill", "prefill_image"], "Talker": ["talk"]},
         )
 
     def get_node_resources(self):
@@ -419,18 +415,10 @@ class _Talking(_ToyModel):
     def kv_labels(self):
         return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill", "prefill_image")))}}
 
-    def get_initial_forward_pass_args(
-        self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None,
-    ):
-        walk = "prefill" if partition_name == "LLM" else "talk"
-        return ForwardPassArgs(
-            full_metadata=CurrentForwardConductorMetadata(
-                input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk=walk, is_prefill=True,
-            ),
-            inputs=[], unpersist_tensors=[],
-            request_done=partition_name == "Talker" and "audio" not in output_modalities,
-        )
+    def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
+        if partition_name == "LLM":
+            return [WalkStep("prefill")]
+        return [WalkStep("talk")] if "audio" in output_modalities else []
 
 
 def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
@@ -458,8 +446,8 @@ def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
 class _SamplerOnlyModel(_Model):
     """Declares a stream and asks for no config of its own, as Orpheus did."""
 
-    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-        del partition_fwd_args, model_kwargs
+    def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
+        del input_modalities, output_modalities, model_kwargs
         return {"sampler": SamplingReqConfig()}
 
 
@@ -469,7 +457,7 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     each handed its own chain."""
     declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model, _kv_labels=declared), model_kwargs or {}, {},
+        SimpleNamespace(model=model, _kv_labels=declared), ["text"], ["text"], model_kwargs or {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)
