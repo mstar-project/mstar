@@ -143,6 +143,10 @@ class GDNManager(LinearAttnManager):
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
 
+    def resident_refusal(self) -> str | None:
+        # decode addresses the pool by slot alone, which the pool's table holds
+        return None
+
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._pool = resources.get(self._pool_key)
 
@@ -157,6 +161,9 @@ class GDNManager(LinearAttnManager):
             "linear-attn preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # a replayed decode wrapper reads only the pool's slots, which its graph fills
+            return self._current
         self.reset_default_cursors()
         if self._preplanned:
             self._current = self._cached_plan_output

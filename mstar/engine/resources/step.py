@@ -117,6 +117,11 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # the node's `ResidentPlanner` when this step's capture reads the resident
+    # tables: a resource then stages nothing per row (see `resources/resident.py`)
+    resident: Any = None
+    # what that planner staged for this step
+    resident_plan: Any = None
     # rid -> input tokens a chunked row runs after this step
     chunk_tokens_after: Mapping[int, int] = field(default_factory=dict)
     # the rows whose walk grows its state by those tokens, so a resource may

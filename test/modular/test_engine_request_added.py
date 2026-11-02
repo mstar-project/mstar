@@ -43,7 +43,7 @@ def _engine(*submodules):
     engine._loopback_steps = {}
     engine._chunking = ChunkingManagement({})
     engine._submodules = {
-        name: SimpleNamespace(submodule=_Submodule(log, name, raises)) for name, raises in submodules
+        name: SimpleNamespace(submodule=_Submodule(log, name, raises), resident=None) for name, raises in submodules
     }
     return engine, log
 

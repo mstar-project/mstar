@@ -27,6 +27,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.resident import ResidentPlanner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
@@ -683,10 +684,12 @@ class AcceleratorGraphRunner:
         num_slots: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
+        resident: ResidentPlanner | None = None,
     ):
         self._submodule_name = submodule_name
         self._submodule = submodule
         self._comm_group = joint_comm_group
+        self._resident = resident
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
@@ -1168,13 +1171,24 @@ class AcceleratorGraphRunner:
             )
 
             forward = self._forward_for(spec)
+            planner = self._resident
+            resident = (
+                planner.capture_step(spec.bucket, spec.slot, step)
+                if planner is not None and planner.covers(spec.bucket)
+                else None
+            )
 
             def run_forward():
-                return forward(
+                if resident is not None:
+                    planner.gather(resident)
+                out = forward(
                     graph_walk=walk,
                     engine_inputs=engine_inputs,
                     **static_inputs,
                 )
+                if resident is not None:
+                    planner.commit_in_graph(resident)
+                return out
 
             self._graph_backend.set_device()
             self._graph_backend.synchronize()

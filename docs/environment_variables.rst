@@ -621,6 +621,20 @@ Worker scheduling
        allocating. ``50000`` removed them on Qwen3.5 0.8B at c=128 (an 8%
        shorter decode step), at the cost of holding at most that many young
        objects between collections. Read by ``knobs.gc_gen0_threshold``.
+   * - ``MSTAR_RESIDENT_PLANNING``
+     - config's ``knobs: resident_planning``, else ``auto``
+     - ``auto`` runs a node's captured decode steps off per-request tables on
+       the device where the submodule names resident walks
+       (``NodeSubmodule.resident_walks``) and every resource of the node can
+       (``Resource.resident_refusal``); the worker log says why a node that
+       names walks stays on the host. ``off`` plans every step on the host.
+       Read by ``knobs.resident_planning``.
+   * - ``MSTAR_RESIDENT_SLOTS``
+     - config's ``knobs: resident_slots``, else ``4096``
+     - Request rows of those tables, allocated at startup because a captured
+       graph holds their addresses; a step that needs a row past the last
+       fails. Each row costs a cell per page of ``max_seq_len`` plus a few, 8
+       bytes each. Read by ``knobs.resident_slots``.
    * - ``MSTAR_KV_PLAN_CACHE``
      - config's ``knobs: kv_plan_cache``, else ``0``
      - The KV manager plans a captured decode step off the previous step's

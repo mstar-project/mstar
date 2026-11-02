@@ -31,6 +31,10 @@ Prototype a new kernel standalone against a dense reference before writing the r
 
 **`supports_preplan` pays off even with no kernel-side plan to hoist.** Host work counts. On Whisper, building a page table inline cost 0.052 ms on the critical path, while promoting a pre-planned one cost 0.009 ms.
 
+## Resident planning
+
+A walk a submodule names in `resident_walks` runs its captured steps off per-request tables on the device (`resources/resident.py`): `plan` stages nothing per row, and kernels recorded around the forward fill the buffers the forward reads. A resource joins by overriding `resident_refusal` and keeping a table; the base refuses, so a new resource is host-planned on its node until then. Anything that changes a row other than a resident commit has to reach `ResidentPlanner.mark_stale`, or the next step reads the old row. In `KVManager` that is what `_touch_plan_cache(rid)` does. Writes to a table stay on the node's stream, in step order: the plan stream only writes the step's own staging.
+
 ## Stateful resources move together
 
 KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-request state. A lifecycle feature added to one usually needs its analogue in the other. Forking for a request that branches, offload/reload, what a partially-run (chunked) step leaves behind: when you change one, check the others. Recurrent forking was initially missed when KV forking learned chunked-prefill semantics.
