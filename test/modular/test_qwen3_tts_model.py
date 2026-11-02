@@ -2462,6 +2462,12 @@ def test_a_packed_prologue_does_what_a_layers_unfused_attention_does():
     assert torch.equal(pages[1, 0, 1], k[1]) and torch.equal(pages[1, 1, 1], v[1]) and torch.equal(pages[2, 0, 1], k[2])
 
 
+def test_only_the_code_predictor_sampler_takes_the_fused_draw():
+    specs = {spec.resource_key: spec for spec in _make_model().get_node_resources()}
+    assert specs[CODE_PRED_SAMPLER].fused_draw
+    assert not specs[TALKER_SAMPLER].fused_draw
+
+
 def test_talker_cap_sets_its_capture_sizes():
     config = _tiny_model_config()
     talker, predictor = Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config)
