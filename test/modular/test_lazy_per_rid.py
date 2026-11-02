@@ -94,7 +94,11 @@ def test_a_host_transport_gets_each_routed_output_in_one_copy(host_transport):
         graph_walk="w", future=Future(),
     )
     with pytest.raises(_ReachedStoreError):
-        worker._store_and_route(pending, BatchedModelOutput(per_rid_outputs=source), [1, 2], ["w"], None, lazy)
+        worker._store_outputs(
+            pending, BatchedModelOutput(per_rid_outputs=source),
+            SimpleNamespace(output_signals=["new_token", "latents"], graph_walk="w", walks=None),
+            SimpleNamespace(wg_ids=SimpleNamespace(keys=[1, 2]), rid_walk_idx=None), lazy,
+        )
     names = ["new_token", "latents"] if host_transport else ["new_token"]
     assert copied == names, "a name is copied once"
     assert {rid: list(row) for rid, row in landed.items()} == {1: names, 2: names}

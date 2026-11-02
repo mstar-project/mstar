@@ -1,25 +1,33 @@
-"""Inline UniPC (bh2, order 2, flow prediction) for the Wan2.2 denoise loop.
+"""UniPC (bh2, order 2, flow prediction) as a scaffold scheduler.
 
-Exact port of diffusers 0.39.0 ``UniPCMultistepScheduler``, restricted to this
-checkpoint's scheduler config. Any deviation from the reference is a bug, not a
-choice; the port is asserted in lockstep against it per step.
+Port of diffusers ``UniPCMultistepScheduler`` for the config Wan2.2 and Cosmos3
+ship: ``solver_type="bh2"``, ``solver_order=2``, ``predict_x0``,
+``prediction_type="flow_prediction"``, ``lower_order_final``, no thresholding, no
+disabled corrector. Any deviation from the reference is a bug, not a choice; the
+port is asserted in lockstep against it per step.
 
-The reference scheduler keeps state across ``step()`` calls, but the denoise loop
-is stateless per iteration, so that state is split in two: per-request *tables*
-(``make_unipc_tables``), derivable from the step count and recomputed each
-iteration, and *loop-carried tensors* (``UniPCState``), routed through the graph's
-loop-back edges. All solver math runs float32 on the sample's device, as the
-reference does.
+The reference scheduler keeps state across ``step()`` calls, but a denoise loop is
+stateless per iteration, so that state is split in two: per-request *tables* (the
+sigmas, staged on the device once and read by the loop counter's step index) and
+*loop-carried tensors* (``UniPCState``), routed through the graph's loop-back edges
+(``DenoiseLoopSubmodule.SOLVER_STATE``, named by :data:`SOLVER_STATE`). All solver
+math runs on the sample's device in the sample's dtype, as the reference does, and
+none of it reads a device value on the host: a step queues behind the one still
+running.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
-# The Wan2.2-TI2V-5B checkpoint's scheduler config (scheduler_config.json).
 SOLVER_ORDER = 2
 NUM_TRAIN_TIMESTEPS = 1000
+
+# The loop-back edges of a loop on this scheduler, beside the sample.
+MODEL_OUTPUTS, LAST_SAMPLE = "unipc_model_outputs", "unipc_last_sample"
+SOLVER_STATE = (MODEL_OUTPUTS, LAST_SAMPLE)
 
 # Nudge sigmas[0] off exactly 1.0 so lambda stays finite at the first step.
 _SIGMA_ONE_EPS = 1e-6
@@ -39,13 +47,30 @@ class UniPCState:
     last_sample: torch.Tensor
 
 
+class UniPCStep(NamedTuple):
+    """One step's result: the next sample and the state its loop-back edges carry."""
+
+    sample: torch.Tensor
+    model_outputs: torch.Tensor
+    last_sample: torch.Tensor
+
+
+def initial_state(sample: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Iteration 0's solver state for ``sample``, by edge name: all zeros, which the
+    order ramp never reads."""
+    return {
+        MODEL_OUTPUTS: torch.zeros((SOLVER_ORDER, *sample.shape), dtype=sample.dtype, device=sample.device),
+        LAST_SAMPLE: torch.zeros_like(sample),
+    }
+
+
 def make_unipc_tables(num_inference_steps: int, flow_shift: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-request sigma and timestep tables.
+    """Per-request sigma and timestep tables for the plain flow grid (Wan2.2).
 
     Returns sigmas float32 ``[N+1]`` with the terminal zero appended, and timesteps
     int64 ``[N]``. Sigmas are computed float64 and cast at the end, and the
-    timesteps are truncated by the int64 cast — both as the reference does, and both
-    load-bearing for bit-exactness.
+    timesteps are truncated by the int64 cast, both as the reference does: either
+    change moves bits.
     """
     sigmas = np.linspace(1, 1 / NUM_TRAIN_TIMESTEPS, num_inference_steps + 1)[:-1]
     sigmas = flow_shift * sigmas / (1 + (flow_shift - 1) * sigmas)
@@ -76,8 +101,7 @@ def unipc_convert_model_output(
     CPU scalar takes the CUDA kernel's full-precision Scalar path; a device 0-dim
     tensor would instead be type-promoted to the bf16 operand's dtype before the
     multiply. That is a bitwise difference, and it breaks lockstep with the
-    reference. (It is also why this node cannot be compiled — see
-    ``Wan22DitSubmodule``.)
+    reference, and it is why a forward that holds this step cannot be compiled whole.
     """
     sigma_t = sigmas[step_index]
     return sample - sigma_t * model_output
@@ -192,3 +216,33 @@ def unipc_corrector_step(
     x_t_ = sigma_t / sigma_s0 * state.last_sample - alpha_t * h_phi_1 * m0
     x_t = x_t_ - alpha_t * b_h * (corr_res + rhos_c[-1] * d1_t)
     return x_t.to(this_sample.dtype)
+
+
+def unipc_step(
+    model_output: torch.Tensor,
+    sample: torch.Tensor,
+    state: UniPCState,
+    host_sigmas: torch.Tensor,
+    sigmas: torch.Tensor,
+    step_index: int,
+    num_steps: int,
+) -> UniPCStep:
+    """One ``UniPCMultistepScheduler.step``: conversion, corrector, predictor.
+
+    ``sample`` and ``model_output`` carry a leading batch dim of 1 and ``state`` the
+    tensors of :func:`initial_state` over that sample. ``host_sigmas`` is the CPU
+    table (see :func:`unipc_convert_model_output`), ``sigmas`` the same table staged
+    on the sample's device.
+    """
+    converted = unipc_convert_model_output(model_output, sample, host_sigmas, step_index)
+    if step_index > 0:
+        sample = unipc_corrector_step(
+            state, this_model_output=converted, this_sample=sample, sigmas=sigmas,
+            step_index=step_index, order=unipc_effective_order(step_index - 1, num_steps),
+        )
+    model_outputs = torch.stack([state.model_outputs[1], converted])
+    next_sample = unipc_predictor_step(
+        UniPCState(model_outputs=model_outputs, last_sample=sample), sample=sample, sigmas=sigmas,
+        step_index=step_index, order=unipc_effective_order(step_index, num_steps),
+    )
+    return UniPCStep(next_sample, model_outputs, sample)

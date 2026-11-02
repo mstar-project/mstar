@@ -137,6 +137,9 @@ class RaggedBlockCausalWrapper:
         # bucket's worst case so a small first plan can't cap it.
         self.plan([max_total_tokens])
 
+    def forget_plan(self) -> None:
+        """Every ``plan`` stages its layout here, so there is nothing to forget."""
+
     @property
     def num_segments(self) -> int:
         """Real (unpadded) segment count from the most recent ``plan``."""

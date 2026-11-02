@@ -329,11 +329,11 @@ class DenseAttentionManager(AttentionManager):
             max_q = max(max_q, view.to_compute)
             max_k = max(max_k, view.length)
 
-        # An unchanged layout is not replanned (`_RaggedPrefillBase._plan`).
+        # Fresh pinned host layouts per step: the FA3 wrapper H2Ds them non-blocking
+        # (from pageable memory that copy would sync the stream), FlashInfer's plan
+        # reads them on the host, and neither happens when the wrapper already
+        # holds this layout.
         wrapper = self._wrapper(slot_key.label, slot_key.slot)
-        # Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them
-        # non-blocking (from pageable memory that copy would sync the
-        # stream), FlashInfer's plan reads them on the host.
         pin = self._on_cuda
         wrapper.plan(
             torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),

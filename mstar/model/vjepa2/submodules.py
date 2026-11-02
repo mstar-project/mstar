@@ -1129,6 +1129,13 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
         return out
 
+    @staticmethod
+    def _leased_runner(engine_inputs: ModelInputsFromEngine) -> PiecewiseAcceleratorGraphRunner | None:
+        """The block loop's runner when this step leased it, else None."""
+        if BLOCK_LOOP_REGION not in engine_inputs.piecewise_leases:
+            return None
+        return engine_inputs.piecewise_runners[BLOCK_LOOP_REGION]
+
     @torch.compiler.disable
     def _rollout_step(
         self,
@@ -1142,8 +1149,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         """One AC rollout step using either the CUDA-graph or eager path.
 
-        The CUDA-graph path (``runner``: the step leased the ``block_loop``
-        region, so its own step was declared and planned):
+        The CUDA-graph path (``runner``, when the step leased the ``block_loop``
+        region):
           1. Preamble (predictor_embed + action/state concat) runs eagerly.
           2. Position tensors are computed eagerly (hoisted out of the graph).
           3. Block loop replays the captured graph.
@@ -1211,7 +1218,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             t_0=request_info.dynamic_loop_iter_counts.get("rollout_loop", 0),
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
-            runner=engine_inputs.piecewise_runners.get(BLOCK_LOOP_REGION),
+            runner=self._leased_runner(engine_inputs),
         )
 
         logger.info(
@@ -1253,7 +1260,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             t_0=iter_idx,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
-            runner=engine_inputs.piecewise_runners.get(BLOCK_LOOP_REGION),
+            runner=self._leased_runner(engine_inputs),
         )
 
         return {

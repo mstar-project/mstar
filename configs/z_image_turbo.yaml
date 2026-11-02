@@ -27,17 +27,18 @@ model_kwargs:
   # be padded up into a wider bucket without changing the image. A cap_len with no
   # captured graph falls back to the eager batched path.
   #
-  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes) graphs.
-  # Every batch size up to max_batch_size is captured: with only [1, 2, 4, 8], a step of
-  # 3 / 5-7 rows replayed the next size with dummy rows, and under concurrency (requests at
-  # different steps, one or two outside the dit) that padding cost more than batching saved.
+  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes) graphs,
+  # 16 here. A step of 3 or 5-7 rows replays the next captured size with dummy rows.
+  # Capturing every batch size up to max_batch_size (the commented line) skips that padding,
+  # which pays under concurrency (requests at different steps, one or two outside the dit).
   # H200, 1024^2, 8 steps, 2 rounds: c=4 1.05-1.08 -> 1.22 images/s, c=8 1.12-1.14 -> 1.21-1.22,
-  # c=16 1.17-1.19 -> 1.23, c=1 unchanged, same peak VRAM. Each graph is a compile of its own: 32 graphs start
-  # ~100 s slower than 16 on a warm Inductor cache, ~8 min slower on a cold one.
+  # c=16 1.17-1.19 -> 1.23, c=1 unchanged, same peak VRAM. But each graph is a compile of its own:
+  # 32 graphs start ~100 s slower than 16 on a warm Inductor cache, ~8 min slower on a cold one.
   # The text encoder captures its own geometric_batch_sizes: powers of two below max_batch_size,
   # then max_batch_size (4 graphs here, any caption length).
   capture_caption_lengths: [32, 64, 96, 128]
-  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+  capture_batch_sizes: [1, 2, 4, 8]
+  # capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]  # for deployments that batch 3, 5, 6 or 7
   max_batch_size: 8
   # compiled VAE decode (max-autotune), not bit-exact with the eager decode: before the folded upsample and split
   # GroupNorm it was 3x faster at 1024^2 and ~56 dB from eager, and the autotuner may pick other conv kernels in another
