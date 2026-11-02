@@ -15,6 +15,13 @@ from mstar.platforms import RocmPlatform, rocm_gemm
 from mstar.platforms.rocm_gemm import SkinnyGemmPass, SkinnyLinearPrePass
 
 
+@pytest.fixture(autouse=True)
+def _aiter_installed(monkeypatch):
+    """Nothing here runs a kernel, so what the passes rewrite is checked the same on a host without AITER, where
+    every linear would stay on hipBLASLt. test_aiter_missing_leaves_its_shapes_on_hipblaslt covers that route."""
+    monkeypatch.setattr(rocm_gemm, "_have_aiter", lambda: True)
+
+
 def _linear_graph(rows, n=64, k=32, bias=False, dtype=torch.bfloat16, w_t=False):
     x = torch.randn(rows, k, dtype=dtype)
     w = torch.randn(k, n, dtype=dtype).T if w_t else torch.randn(n, k, dtype=dtype)
