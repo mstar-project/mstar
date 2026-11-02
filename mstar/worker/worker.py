@@ -22,6 +22,8 @@ from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import (
     LocalTransferEngine,
@@ -45,7 +47,6 @@ from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
-    EdgeSpec,
     GraphRuntime,
     InlineColumn,
     PostprocessNeed,
@@ -78,6 +79,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
+    EdgeItems,
     FailRequests,
     InputSignals,
     MessageSource,
@@ -548,6 +550,7 @@ class Worker:
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
+        topology = model.get_partition_topology() if model else None
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
@@ -560,6 +563,10 @@ class Worker:
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
+            walk_driven_signals=frozenset(
+                conn.edge_name for conn in topology.connections
+                if conn.consumer_walk is not None
+            ) if topology is not None else frozenset(),
         )
 
         self.engine_manager = EngineManager.build(
@@ -712,7 +719,7 @@ class Worker:
         self.streaming_buffers: dict[int, dict[str, list[torch.Tensor]]] = {}
 
         # New streaming path: PartitionTopology + StreamBuffer on consumer worker
-        self.partition_topology = model.get_partition_topology() if model else None
+        self.partition_topology = topology
 
         # Determine which partition this worker serves (by checking which node names
         # appear in my_worker_graphs vs the topology connections)
@@ -991,9 +998,7 @@ class Worker:
             self.worker_id, message.message_type.value, message.body.request_id,
         )
         if message.message_type == WorkerMessageType.INPUT_SIGNALS:
-            self.tensor_manager.ack_unread_tensors(
-                message.body.request_id, message.body.inputs,
-            )
+            self.tensor_manager.ack_unread_tensors(message.body.inputs)
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -1260,14 +1265,7 @@ class Worker:
             if edge.is_streaming and edge.tensor_info:
                 (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
         if unbuffered:
-            # Nothing here will consume it: ack it unread so the producer frees
-            # it. Expected when the request's ingest failed on this worker.
-            if request_id not in self.scheduler.failed_rids:
-                logger.warning(
-                    "Worker %s: no stream buffer for %s of request %s; dropping it",
-                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
-                )
-            self.tensor_manager.ack_unread_tensors(body.request_id, unbuffered)
+            self._ack_unbuffered(request_id, body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
@@ -1294,7 +1292,9 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
-        # Start RDMA reads for non-streaming edges with tensor_info
+        # Start RDMA reads for non-streaming edges with tensor_info; a
+        # streamed row of an EDGE_ITEMS replayed from the park has none, and
+        # no forward-pass info either
         if non_streaming:
             futures = self.tensor_manager.start_read_tensors(
                 request_id, non_streaming,
@@ -1307,7 +1307,9 @@ class Worker:
                 request_id, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
-            # a client stream's chunks come with no forward-pass info, and drive no walk
+            # no forward-pass info comes with a client stream's chunks, nor with
+            # a stream whose walk the producer does not decide (see
+            # `walk_driven_signals`)
             walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
@@ -1330,6 +1332,49 @@ class Worker:
             )
         if self.enable_nvtx:
             range_pop()
+
+    def _process_edge_items(self, frame: EdgeItems) -> None:
+        """A step's streamed tensors from one producer (EDGE_ITEMS): each
+        row is what one INPUT_SIGNALS of a single streamed edge did, and the
+        frame's reads start in one call."""
+        reads: list[tuple[int, list[GraphEdge]]] = []
+        dtypes = frame_dtypes(frame)
+        for row in stream_rows(frame):
+            rid = self._rid(row.request_id)
+            if rid is None or rid not in self.request_state.per_request_info:
+                # not here yet, or removed: parked or dropped as the
+                # INPUT_SIGNALS it replaces
+                self._process_message_list([WorkerMessage(
+                    message_type=WorkerMessageType.INPUT_SIGNALS,
+                    body=row_input_signals(frame, row),
+                )])
+                continue
+            if not self._takes_input(row.request_id):
+                continue  # as _process_new_inputs: nothing read after READS_DONE
+            edge = GraphEdge(
+                next_node=row.next_node, name=row.signal,
+                tensor_info=row_infos(frame, row, dtypes), is_streaming=True,
+            )
+            stream_buf = self.request_state.per_request_info[rid].stream_buffers.get(row.signal)
+            if stream_buf is None:
+                self._ack_unbuffered(rid, row.request_id, [edge])
+                continue
+            # a row is one edge's items: a chunked producer's pieces join
+            stream_buf.pre_read_register_joined(frame.uuids[row.start:row.start + row.count])
+            reads.append((rid, [edge]))
+        if reads:
+            self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
+
+    def _ack_unbuffered(self, rid: int, request_id: str, edges: list[GraphEdge]) -> None:
+        """Streamed edges of a known request with no stream buffer here:
+        nothing will consume them, so ack them unread for the producer to
+        free. Expected when the request's ingest failed on this worker."""
+        if rid not in self.scheduler.failed_rids:
+            logger.warning(
+                "Worker %s: no stream buffer for %s of request %s; dropping it",
+                self.worker_id, [edge.name for edge in edges], request_id,
+            )
+        self.tensor_manager.ack_unread_tensors(edges)
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
@@ -1385,6 +1430,8 @@ class Worker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
+            elif message.message_type == WorkerMessageType.EDGE_ITEMS:
+                self._process_edge_items(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 self._handle_tensor_received(message.body)
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
@@ -1455,7 +1502,9 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         # Every ready chunk is popped first and ingested in one call (and one
         # Python <> Rust roundtrip)
+        laps = PhaseLaps("worker.main.poll_stream_buffers.")
         polled = self.streams.poll()
+        laps.lap("scan_and_pop")
         if not polled:
             return
 
@@ -1466,7 +1515,7 @@ class Worker:
         # in _postprocess_batch — NOT here, where an earlier in-flight pass's
         # WGD could read it before the final output chunk is emitted.
         refused = set(self._graph_runtime.ingest_inputs_batch(
-            self._edge_block((rid, [se.edge]) for rid, se in polled),
+            self.streams.edge_block(polled),
             # important: only ingest for this loop iter!
             can_buffer=False,
             is_streaming=True,
@@ -1477,6 +1526,7 @@ class Worker:
                 self.streams.return_edge(rid, se)
             else:
                 self.streams.mark_ingested(rid, se)
+        laps.lap("ingest")
 
 
     # ------------------------------------------------------------------
@@ -1751,8 +1801,8 @@ class Worker:
         # sessions for one bad chunk. Take out just that rid and report it, so
         # the failure is attributed and loud.
         per_request_inputs, final_edges, unresolved = (
-            batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            self.streams.input_tensors(
+                batch.input_edges, batch.node_name, batch.request_to_worker_graph,
                 skip_missing=True,
             )
         )
@@ -2937,8 +2987,8 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs, fresh_final, _ = fresh_batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor,
+            fresh_inputs, fresh_final, _ = self.streams.input_tensors(
+                fresh_batch.input_edges, spec_node_name,
                 fresh_batch.request_to_worker_graph,
             )
             in_flight = set(continuing)
@@ -3197,13 +3247,7 @@ class Worker:
             graph_walk=spec_walk,
             rids=continuing,
             room_for_continuing=None,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=self.streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
         ))
         if prep is None:
@@ -3227,12 +3271,11 @@ class Worker:
         # Both seeded with their rid lists, so the `in prep_inputs` test below
         # still separates prepped rids from fresh ones -- a ready rid with no
         # prepped edge gets an empty mapping, as a zero-length slice used to.
-        get_tensor = self.tensor_manager.get_tensor
-        prep_inputs = prep.input_edges.to_input_tensors(
-            get_tensor, prep.ready_rids,
+        prep_inputs = self.streams.input_tensors(
+            prep.input_edges, head.node_name, prep.ready_rids,
         ).by_rid
-        fresh_inputs, fresh_final_edges, _ = fresh_edges.to_input_tensors(
-            get_tensor, list(fresh_wg),
+        fresh_inputs, fresh_final_edges, _ = self.streams.input_tensors(
+            fresh_edges, head.node_name, list(fresh_wg),
         )
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
@@ -3962,22 +4005,19 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
-        # Before the local-streaming dereference below: numel() needs the
-        # tensors, and a new_token whose only other destination is a local
-        # stream holds a single reference, which that dereference drops to zero
-        # -- collecting the tensor this count is about to read.
+        laps = PhaseLaps("worker.postprocess.stream_send.")
         new_token_counts = self._count_new_tokens(
             route_output.new_token_output_idxs,
             stored.flat_rids, stored.flat_uuids, signals, stored.signal_idxs,
         )
+        laps.lap("count_tokens")
 
         # Before the sends below: remote consumers read the walks off the
         # fwd_info that rides with the streamed edges.
         self._assign_consumer_walks(batch_N)
 
-        # Local streaming stays here: a StreamBuffer holds real tensors, so it
-        # cannot move behind the runtime's contract.
-        streamed: list[int] = []
+        # The buffer holds each item by its uuid, taking over the routing
+        # reference the runtime counted for the local stream destination.
         for signal, per_signal in route_output.local_streaming_by_signal.items():
             consumer = self._walk_driven_edges.get(signal)
             by_rid: dict[int, list[int]] = {}
@@ -3991,12 +4031,8 @@ class Worker:
                     uuids, walks.get(consumer) if consumer else None,
                 )
                 for uuid in uuids:
-                    tensor = self.tensor_manager.get_tensor(uuid)
-                    stream_buf.put(uuid, tensor.clone())
-                    streamed.append(uuid)
-        # After the loop: one crossing for the batch rather than one per
-        # streamed tensor.
-        self.tensor_manager.dereference_batch_uniform(streamed)
+                    stream_buf.put(uuid, uuid)
+        laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
         needs_info = route_output.rids_needing_request_info
@@ -4022,6 +4058,7 @@ class Worker:
                         rid, batch_N.partition, published,
                     )
                     buffered_publish.add(rid)
+        laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
         # new-token counts (the inline token is not counted) and no stream
         # buffers, and an empty entry per rid cost a dict each to build and to
@@ -4029,6 +4066,7 @@ class Worker:
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         consumed = self.streams.consumption_batch(send_rids)
+        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(

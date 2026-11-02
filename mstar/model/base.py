@@ -564,6 +564,14 @@ class Model(ABC):
     # the model's config.yaml overrides either. See
     # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
+    # ``load_image`` / ``load_audio`` / ``load_video`` and ``process_prompt``
+    # may run for several requests at once. The data worker then prepares
+    # requests on a pool (``CpuPlan.prepare_workers`` at this process's intra-op
+    # thread count; ``preprocess_workers`` in the model's config.yaml overrides
+    # it) and still hands them to the
+    # conductor in arrival order. Declare it only once those calls are checked
+    # for shared state, and for the GIL: work that holds it gains nothing here.
+    PREPROCESS_PARALLEL: bool = False
 
     def _get_worker_graphs_for_graph_walk(
         self,
