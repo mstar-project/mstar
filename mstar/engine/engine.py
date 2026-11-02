@@ -1920,9 +1920,15 @@ class Engine:
 
         Nothing to take when the whole forward replays: the region is baked
         inside that graph and runs no Python, so the outer step owns its work.
+        Nor on a persistent walk: the region plans its resources under its own
+        walk, on state the walk's rows have checked out, so its work runs
+        inline in the outer step.
         """
         runners = self._submodules[node_name].piecewise_runners
         if not runners or ctx.slot_lease is not None:
+            return
+        node_rows = self._rows.get(node_name)
+        if node_rows is not None and node_rows.persistent(ctx.graph_walk):
             return
         bs = len(inputs)
         total_tokens = sum(inp.input_seq_len for inp in inputs)

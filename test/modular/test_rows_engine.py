@@ -482,3 +482,20 @@ def test_a_resource_that_cannot_keep_rows_refuses_the_walk_at_startup():
 def test_a_walk_without_a_batch_cap_is_refused_at_startup():
     with pytest.raises(ValueError, match="no batch cap"):
         _engine("cpu", sub=_Toy(cap=None))
+
+
+def test_a_persistent_walk_takes_no_piecewise_lease():
+    """A region plans its resources under its own walk, on state a persistent
+    walk's rows hold checked out, so only a walk without rows leases one."""
+    engine = Engine.__new__(Engine)
+    runner = SimpleNamespace(
+        lease_before_step=True, can_lease=lambda inputs: True,
+        lease_slot=lambda bs, tokens: ("lease", bs, tokens),
+    )
+    engine._submodules = {NODE: SimpleNamespace(piecewise_runners={"loop": runner})}
+    engine._rows = {NODE: SimpleNamespace(persistent=lambda walk: walk == ROWS_WALK)}
+    inputs = [NodeInputs(tensor_inputs={}, input_seq_len=1)] * 2
+    for walk, leased in ((ROWS_WALK, {}), (OTHER_WALK, {"loop": ("lease", 2, 2)})):
+        ctx = StepContext(request_ids=(0, 1), graph_walk=walk, slot=0, capture=False)
+        engine._maybe_lease_piecewise_regions(NODE, ctx, inputs)
+        assert dict(ctx.piecewise_leases) == leased, walk
