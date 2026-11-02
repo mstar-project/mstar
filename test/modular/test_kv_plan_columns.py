@@ -132,5 +132,5 @@ def test_a_columnar_plan_equals_the_per_row_plan(seed, plan_backend):
         combined = {LABELS: "both"} if rng.random() < 0.5 else {}
         for _label, group in group_by_plan_label(tuple(segs), combined).items():
             columns = kv._plan_label(group, {}, ctx, sink, None)
-            per_row = kv._plan_output(kv._sequence_views(group, {}, ctx, sink), None)
+            per_row = kv._plan_output(kv._sequence_views(group, {}, ctx, sink), PAGE, None)
             _same(columns, per_row)

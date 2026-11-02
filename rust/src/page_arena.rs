@@ -212,7 +212,8 @@ mod py {
     use pyo3::exceptions::{PyAssertionError, PyIndexError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::pyclass::CompareOp;
-    use pyo3::types::{PyByteArray, PyList, PySlice, PyTuple};
+    use pyo3::intern;
+    use pyo3::types::{PyByteArray, PyDict, PyList, PySlice, PyTuple};
 
     use super::{ArenaCore, ArenaError, Released};
 
@@ -271,6 +272,65 @@ mod py {
             return Ok(stream.arena.get().core().pages(stream.sid)?.clone());
         }
         pages.extract()
+    }
+
+    /// A step row as the row passes see it: a replay's padding row or a sink
+    /// row (no stream of its own), a row with no stream yet, or its stream.
+    enum Row<'py> {
+        Pad,
+        Missing,
+        /// the stream id and its `CacheStream`
+        Stream(usize, Bound<'py, PyAny>),
+    }
+
+    /// Each segment's row and span. ``streams`` is the KV manager's
+    /// ``_streams`` (request -> label -> `CacheStream`); ``real`` the step's
+    /// real request ids, None when nothing is padding; ``sink`` its
+    /// (request, label) pairs on the sink page, None when there are none. Only
+    /// Python reads, no allocation that could collect a stream, and no lock.
+    fn resolve_rows<'py>(
+        arena: &Bound<'py, PyPageArena>,
+        streams: &Bound<'py, PyDict>,
+        segments: &Bound<'py, PyAny>,
+        real: Option<&Bound<'py, PyAny>>,
+        sink: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<(Vec<Row<'py>>, Vec<i64>)> {
+        let py = arena.py();
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        for seg in segments.try_iter()? {
+            let seg = seg?;
+            let seg = seg.downcast::<PyTuple>()?;
+            let rid = seg.get_borrowed_item(0)?;
+            let label = seg.get_borrowed_item(1)?;
+            spans.push(seg.get_borrowed_item(2)?.extract::<i64>()?);
+            let pad = match real {
+                Some(real) => !real.contains(&rid)?,
+                None => false,
+            };
+            if pad || match sink {
+                Some(sink) => sink.contains((&rid, &label))?,
+                None => false,
+            } {
+                rows.push(Row::Pad);
+                continue;
+            }
+            let Some(labels) = streams.get_item(&rid)? else {
+                rows.push(Row::Missing);
+                continue;
+            };
+            let Some(stream) = labels.downcast::<PyDict>()?.get_item(&label)? else {
+                rows.push(Row::Missing);
+                continue;
+            };
+            let pages = stream.getattr(intern!(py, "page_indices"))?;
+            let sid = pages.downcast::<PyStreamPages>()?.get();
+            if !sid.arena.is(arena) {
+                return Err(PyValueError::new_err("a row's stream belongs to another arena"));
+            }
+            rows.push(Row::Stream(sid.sid, stream));
+        }
+        Ok((rows, spans))
     }
 
     #[pymethods]
@@ -429,6 +489,171 @@ mod py {
             let sid = core.new_stream();
             drop(core);
             PyStreamPages { arena: slf.clone().unbind(), sid }
+        }
+
+        /// `KVManager.admit`'s pass over a step's rows: ``(marked, slow)``.
+        /// ``marked`` are the `CacheStream`s of rows whose pages already cover
+        /// their span (or that write nothing), which the step marks in flight
+        /// once it is admitted (`set_in_flight`); ``slow`` the indices of rows
+        /// the manager reserves for itself: no stream yet, offloaded, or short
+        /// of pages. Padding and sink rows are in neither.
+        #[pyo3(signature = (streams, segments, real, sink, page_size))]
+        fn admit_rows<'py>(
+            slf: &Bound<'py, Self>,
+            streams: &Bound<'py, PyDict>,
+            segments: &Bound<'py, PyAny>,
+            real: Option<&Bound<'py, PyAny>>,
+            sink: Option<&Bound<'py, PyAny>>,
+            page_size: i64,
+        ) -> PyResult<(Bound<'py, PyList>, Vec<usize>)> {
+            let py = slf.py();
+            let (rows, spans) = resolve_rows(slf, streams, segments, real, sink)?;
+            let marked = PyList::empty(py);
+            let mut slow = Vec::new();
+            for (i, (row, &span)) in rows.iter().zip(&spans).enumerate() {
+                match row {
+                    Row::Pad => {}
+                    Row::Missing if span == 0 => {}
+                    Row::Missing => slow.push(i),
+                    Row::Stream(sid, cs) => {
+                        let fits = span == 0 || {
+                            let offloaded: bool = cs.getattr(intern!(py, "offloaded"))?.extract()?;
+                            let stored: i64 = cs.getattr(intern!(py, "stored_len"))?.extract()?;
+                            let held = slf.get().core().pages(*sid)?.len() as i64;
+                            !offloaded && held * page_size >= stored + span
+                        };
+                        if fits {
+                            marked.append(cs)?;
+                        } else {
+                            slow.push(i);
+                        }
+                    }
+                }
+            }
+            Ok((marked, slow))
+        }
+
+        /// Set ``step_in_flight`` on each of ``marked`` (`CacheStream`s).
+        #[staticmethod]
+        fn set_in_flight(marked: &Bound<'_, PyAny>, in_flight: bool) -> PyResult<()> {
+            let name = intern!(marked.py(), "step_in_flight");
+            for cs in marked.try_iter()? {
+                cs?.setattr(name, in_flight)?;
+            }
+            Ok(())
+        }
+
+        /// `set_in_flight` for every row of a step that has a stream now.
+        #[pyo3(signature = (streams, segments, real, sink, in_flight))]
+        fn set_rows_in_flight(
+            slf: &Bound<'_, Self>,
+            streams: &Bound<'_, PyDict>,
+            segments: &Bound<'_, PyAny>,
+            real: Option<&Bound<'_, PyAny>>,
+            sink: Option<&Bound<'_, PyAny>>,
+            in_flight: bool,
+        ) -> PyResult<()> {
+            let (rows, _) = resolve_rows(slf, streams, segments, real, sink)?;
+            let name = intern!(slf.py(), "step_in_flight");
+            for row in rows {
+                if let Row::Stream(_, cs) = row {
+                    cs.setattr(name, in_flight)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// `KVManager.commit`'s pass over a step's rows, for a step whose rows
+        /// need nothing but their counts moved (no prefix index, no retention):
+        /// each row with a stream leaves flight and, when ``keep`` and it
+        /// wrote, counts its span and moves its generation. Returns the indices
+        /// of rows the manager commits itself: offloaded, or with no stream.
+        #[pyo3(signature = (streams, segments, real, sink, keep))]
+        fn commit_rows(
+            slf: &Bound<'_, Self>,
+            streams: &Bound<'_, PyDict>,
+            segments: &Bound<'_, PyAny>,
+            real: Option<&Bound<'_, PyAny>>,
+            sink: Option<&Bound<'_, PyAny>>,
+            keep: bool,
+        ) -> PyResult<Vec<usize>> {
+            let py = slf.py();
+            let (rows, spans) = resolve_rows(slf, streams, segments, real, sink)?;
+            let (in_flight, offloaded) = (intern!(py, "step_in_flight"), intern!(py, "offloaded"));
+            let (stored_len, generation) = (intern!(py, "stored_len"), intern!(py, "generation"));
+            let mut slow = Vec::new();
+            for (i, (row, &span)) in rows.iter().zip(&spans).enumerate() {
+                match row {
+                    Row::Pad => {}
+                    Row::Missing => slow.push(i),
+                    Row::Stream(_, cs) => {
+                        let writes = keep && span > 0;
+                        if writes && cs.getattr(offloaded)?.extract::<bool>()? {
+                            slow.push(i);
+                            continue;
+                        }
+                        cs.setattr(in_flight, false)?;
+                        if writes {
+                            let n: i64 = cs.getattr(stored_len)?.extract()?;
+                            cs.setattr(stored_len, n + span)?;
+                            let g: i64 = cs.getattr(generation)?.extract()?;
+                            cs.setattr(generation, g + 1)?;
+                        }
+                    }
+                }
+            }
+            Ok(slow)
+        }
+
+        /// A plan label's arrays over a step's rows, each read off its stream:
+        /// ``(bytearray, total, all_have_pages, lens_gens, max_sink_span,
+        /// decode)``: ``lens_gens`` each row's length then generation as int64
+        /// bytes; ``max_sink_span`` the longest padding or sink row, which
+        /// reads ``sink_sid``'s pages for its span at generation 0 (the caller
+        /// checks the sink holds enough); ``decode`` whether every row appends
+        /// one token. Every other row must have a stream.
+        #[pyo3(signature = (streams, segments, real, sink, sink_sid, page_size))]
+        fn plan_rows<'py>(
+            slf: &Bound<'py, Self>,
+            streams: &Bound<'py, PyDict>,
+            segments: &Bound<'py, PyAny>,
+            real: Option<&Bound<'py, PyAny>>,
+            sink: Option<&Bound<'py, PyAny>>,
+            sink_sid: usize,
+            page_size: i64,
+        ) -> PyResult<(Bound<'py, PyByteArray>, usize, bool, Bound<'py, PyByteArray>, i64, bool)> {
+            let py = slf.py();
+            let (rows, spans) = resolve_rows(slf, streams, segments, real, sink)?;
+            let n = rows.len();
+            let mut sids = Vec::with_capacity(n);
+            let mut lens_gens = vec![0i64; 2 * n];
+            let mut max_sink_span = 0i64;
+            let decode = n > 0 && spans.iter().all(|&s| s == 1);
+            let (stored_len, generation) = (intern!(py, "stored_len"), intern!(py, "generation"));
+            for (i, row) in rows.iter().enumerate() {
+                match row {
+                    Row::Pad => {
+                        sids.push(sink_sid);
+                        lens_gens[i] = spans[i];
+                        max_sink_span = max_sink_span.max(spans[i]);
+                    }
+                    Row::Missing => {
+                        return Err(PyValueError::new_err(format!("row {i} has no stream to plan")));
+                    }
+                    Row::Stream(sid, cs) => {
+                        sids.push(*sid);
+                        lens_gens[i] = cs.getattr(stored_len)?.extract::<i64>()? + spans[i];
+                        lens_gens[n + i] = cs.getattr(generation)?.extract()?;
+                    }
+                }
+            }
+            // the Python reads are done before the lock is taken
+            let cols = slf.get().core().plan_columns(&sids, &lens_gens[..n], &spans, page_size)
+                .map_err(PyValueError::new_err)?;
+            // SAFETY: plain integer data viewed as its native-endian bytes
+            let bytes = unsafe { std::slice::from_raw_parts(cols.out.as_ptr() as *const u8, cols.out.len() * 4) };
+            let lg = unsafe { std::slice::from_raw_parts(lens_gens.as_ptr() as *const u8, lens_gens.len() * 8) };
+            Ok((PyByteArray::new(py, bytes), cols.total, cols.all_have_pages, PyByteArray::new(py, lg), max_sink_span, decode))
         }
 
         /// `kv_plan::plan_columns` over the page lists of the streams ``sids``,

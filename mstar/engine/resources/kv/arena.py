@@ -110,6 +110,18 @@ class PageArena(Protocol):
         """`PlanColumns` of the streams ``sids`` as one int32 buffer
         (`columns_from_raw`)."""
 
+    # A step's rows, each found in ``streams`` (`KVManager._streams`) and read
+    # and moved on its `CacheStream`; see `rust/src/page_arena.rs` for each
+    # call. ``real`` is the step's real request ids (None: no padding),
+    # ``sink`` its sink (request, label) pairs.
+    def admit_rows(self, streams, segments, real, sink, page_size: int) -> tuple[list, list[int]]: ...
+    def set_in_flight(self, marked: list, in_flight: bool) -> None: ...
+    def set_rows_in_flight(self, streams, segments, real, sink, in_flight: bool) -> None: ...
+    def commit_rows(self, streams, segments, real, sink, keep: bool) -> list[int]: ...
+    def plan_rows(
+        self, streams, segments, real, sink, sink_sid: int, page_size: int,
+    ) -> tuple[bytearray, int, bool, bytearray, int, bool]: ...
+
 
 class _ListStreamPages(list):
     """`PythonPageArena`'s stream: a plain list, plus the stream's id."""
@@ -253,6 +265,76 @@ class PythonPageArena:
         decode_pages[has] = indices[kv_indptr[1:][has] - 1]
         buf = np.concatenate((qo, kv_indptr, last, kv_lens, decode_pages, last - 1, indices), dtype=np.int32)
         return bytearray(buf), total, all_have_pages
+
+    @staticmethod
+    def _rows(streams, segments, real, sink):
+        """Per segment: None for a padding or sink row, False for a row with
+        no stream, else its `CacheStream`."""
+        out = []
+        for seg in segments:
+            rid, label = seg.request_id, seg.label
+            if (real is not None and rid not in real) or (sink and (rid, label) in sink):
+                out.append(None)
+                continue
+            stream = streams.get(rid, {}).get(label)
+            out.append(False if stream is None else stream)
+        return out
+
+    def admit_rows(self, streams, segments, real, sink, page_size: int) -> tuple[list, list[int]]:
+        marked, slow = [], []
+        for i, (seg, cs) in enumerate(zip(segments, self._rows(streams, segments, real, sink), strict=True)):
+            if cs is None or (cs is False and seg.span == 0):
+                continue
+            if cs is False:
+                slow.append(i)
+            elif seg.span == 0 or (not cs.offloaded and len(cs.page_indices) * page_size >= cs.stored_len + seg.span):
+                marked.append(cs)
+            else:
+                slow.append(i)
+        return marked, slow
+
+    @staticmethod
+    def set_in_flight(marked: list, in_flight: bool) -> None:
+        for cs in marked:
+            cs.step_in_flight = in_flight
+
+    def set_rows_in_flight(self, streams, segments, real, sink, in_flight: bool) -> None:
+        for cs in self._rows(streams, segments, real, sink):
+            if cs:
+                cs.step_in_flight = in_flight
+
+    def commit_rows(self, streams, segments, real, sink, keep: bool) -> list[int]:
+        slow = []
+        for i, (seg, cs) in enumerate(zip(segments, self._rows(streams, segments, real, sink), strict=True)):
+            if cs is None:
+                continue
+            if cs is False or (keep and seg.span > 0 and cs.offloaded):
+                slow.append(i)
+                continue
+            cs.step_in_flight = False
+            if keep and seg.span > 0:
+                cs.stored_len += seg.span
+                cs.generation += 1
+        return slow
+
+    def plan_rows(self, streams, segments, real, sink, sink_sid: int, page_size: int):
+        sids, lens, gens = [], [], []
+        for i, (seg, cs) in enumerate(zip(segments, self._rows(streams, segments, real, sink), strict=True)):
+            if cs is None:
+                sids.append(sink_sid)
+                lens.append(seg.span)
+                gens.append(0)
+            elif cs is False:
+                raise ValueError(f"row {i} has no stream to plan")
+            else:
+                sids.append(cs.page_indices.sid)
+                lens.append(cs.stored_len + seg.span)
+                gens.append(cs.generation)
+        spans = [seg.span for seg in segments]
+        raw, total, all_have_pages = self.plan_columns(sids, lens, spans, page_size)
+        max_sink = max((span for span, sid in zip(spans, sids, strict=True) if sid == sink_sid), default=0)
+        decode = bool(spans) and all(span == 1 for span in spans)
+        return raw, total, all_have_pages, bytearray(np.array(lens + gens, np.int64)), max_sink, decode
 
 
 def new_page_arena(max_num_pages: int, backend: str | None = None) -> PageArena:

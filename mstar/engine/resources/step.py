@@ -144,6 +144,16 @@ class StepContext:
             real = self._real_rids = frozenset(self.request_ids)
         return rid in real
 
+    def real_rows(self) -> frozenset | None:
+        """``request_ids`` as a set when the step has padding rows, else None
+        (no row is padding)."""
+        if self._padded_request_ids is None:
+            return None
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return real
+
     def is_padding_row(self, rid: str) -> bool:
         """Whether ``rid`` is a replay's padding row rather than a real request.
 
