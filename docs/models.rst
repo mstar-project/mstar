@@ -457,15 +457,19 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder ``32 ... 8192`` (powers of two, plus 2176, 4352 and 8704 for a mixed
+ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
 step's decode rows and batches a few tokens over; a mixed step keeps only the
 powers of two past 2176); a step pads to its bucket and a longer one runs
 eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
 deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` add 3072, 5120, 6144 and
-7168, which cut the padding of compute-bound long prefills (+2% output tok/s
-on 9B, random 1024/256 at c=64/128, H200); the same ladder was not a win on
-0.8B, whose prefill is launch-bound. Each bucket adds captures and startup time.
+worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 8192,
+2176 for a mixed step, and 3072, 5120, 6144 and 7168 in place of 4352 and 8704
+(with those two the ladder makes 84 compiles, Dynamo's whole recompile limit,
+leaving none spare). Adding 3072-7168 cut the padding of
+compute-bound long prefills (+2% output tok/s on 9B, random 1024/256 at
+c=64/128, H200, measured before 2176 was added); the same ladder was not a win
+on 0.8B, whose prefill is launch-bound. Each bucket adds captures and startup
+time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay

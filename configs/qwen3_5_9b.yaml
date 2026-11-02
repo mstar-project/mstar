@@ -1,9 +1,11 @@
 model: "qwen3_5_9b"
 max_seq_len: 32768
-# Captured text-prefill ladder (see docs/models.rst): the default powers of
-# two plus 3072-7168, which cut the padding of 9B's compute-bound long prefills.
+# Captured text-prefill ladder (see docs/models.rst): the powers of two to
+# 8192, 2176 for a mixed step's decode rows beside four prompts, and 3072-7168,
+# which cut the padding of 9B's compute-bound long prefills, in place of 4352
+# and 8704 (with those two the ladder would use Dynamo's whole recompile limit).
 model_kwargs:
-  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 2176, 3072, 4096, 5120, 6144, 7168, 8192]
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.
