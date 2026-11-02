@@ -1418,10 +1418,8 @@ def test_the_fa_work_item_bound_holds_flashinfers_own_count():
 # where the Thinker's KV pool stores its tokens over the SP ranks, and the split steps' exchange
 THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
     pytest.param(False, None, id="by_head-ulysses"),
-    pytest.param(True, None, id="by_position-all_gather", marks=pytest.mark.skip(
-        reason="a split step over a pool stored by position needs the all-gather exchange (PR 4's engine change)")),
-    pytest.param(True, "ring", id="by_position-ring", marks=pytest.mark.skip(
-        reason="sp_exchange: ring lands with PR 4's engine change")),
+    pytest.param(True, None, id="by_position-all_gather"),
+    pytest.param(True, "ring", id="by_position-ring"),
 ])
 
 
