@@ -157,7 +157,8 @@ def _rows_attention(rows: int, causal: bool, lse: bool = False):
 
 def _split_exchanges(rank, world, total, rows):
     """Each exchange of this rank's tokens of a ``rows``-row step (None: one packed label) against
-    one rank attending them all; a write alone (``q=None``); and the entry check, on every rank."""
+    one rank attending them all, and a write alone (``q=None``), with the same collectives on every
+    rank."""
     group = _group(rank, world)
     r = SeqRange(group, tuple(sp_seq_split(total, world)), rows)
     b = rows or 1
@@ -199,9 +200,6 @@ def _split_exchanges(rank, world, total, rows):
     for got, expect in zip(written, (heads(k), heads(k)), strict=True):
         assert torch.equal(got, expect)
 
-    # a forgotten scatter: every rank holds the whole step, and every rank refuses it
-    with pytest.raises(ValueError, match="scatter the layer stack's input"):
-        ulysses(run, q, k, v, r)
     dist.all_gather_into_tensor = gather_into
     everyone = [None] * world
     dist.all_gather_object(everyone, gathers)

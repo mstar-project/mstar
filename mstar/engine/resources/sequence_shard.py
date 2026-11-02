@@ -412,13 +412,13 @@ def check_shard_plan(owner: str, shard_key: str, ctx: StepContext) -> SeqShardPl
 
 
 def _check_entry(r: SeqRange, *xs: torch.Tensor | None) -> None:
-    want = r.local_tokens
-    for x in xs:
-        if x is not None and x.shape[0] != want:
-            raise ValueError(
-                f"an exchange over a split label got {x.shape[0]} tokens where this rank holds {want}: "
-                "scatter the layer stack's input through the sequence shard"
-            )
+    # an invariant, not a refusal: counts differ by rank, so a refusal here could stop one rank before
+    # the exchange's collectives and hang the others. The callers refuse an unscattered label first
+    # (`SequenceShard.check_scattered`), alike on every rank
+    assert all(x is None or x.shape[0] == r.local_tokens for x in xs), (
+        f"an exchange over a split label got {[None if x is None else x.shape[0] for x in xs]} tokens where this "
+        f"rank holds {r.local_tokens}"
+    )
 
 
 def _seq_view(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
