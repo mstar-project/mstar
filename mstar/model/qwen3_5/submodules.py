@@ -94,22 +94,25 @@ def token_stop(stop_token_ids) -> TokenStop:
     )
 
 
+def _mixed_token_buckets(prefill_buckets) -> list[int]:
+    """The prefill ladder up to 2176, then its powers of two (see
+    ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
+    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
+
+
 class LLMSubmodule(ARNodeSubmodule):
-    # Total tokens of a packed text-prefill step, one captured graph per
-    # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
-    # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
-    # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs past 8192. The powers of two stay, since a batch of prompts
-    # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
-    # above them for the decode rows a mixed step carries beside four prompts
-    # and for batches a few tokens over, which would otherwise pad to twice the
-    # width. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or extends it (static
-    # buffers are sized by the largest bucket).
-    PREFILL_TOKEN_BUCKETS = [
-        int(x) for x in os.environ.get(
-            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704",
-        ).split(",")
-    ]
+    # Total tokens of a packed text-prefill (and mixed) step, one captured
+    # graph per (bucket, batch size). A prompt past the top bucket prefills
+    # eagerly, and an eager 8k prefill is launch-bound (~1,100 kernel
+    # launches, the GPU idle half the time: 78 ms of wall for 36 ms of kernels
+    # on 0.8B), so the ladder runs past 8192. The powers of two stay, since a
+    # batch of prompts up to a power of two long fills one exactly. 2176, 4352
+    # and 8704 add 1/16 above them for the decode rows a mixed step carries
+    # beside four prompts and for batches a few tokens over, which would
+    # otherwise pad to twice the width. A deployment sets its own with
+    # `model_kwargs.prefill_token_buckets` (static buffers are sized by the
+    # largest bucket).
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
@@ -118,7 +121,7 @@ class LLMSubmodule(ARNodeSubmodule):
     # mixed step needs. Every (rows, tokens) pair here is one more recompile of
     # the forward all these captures share, and past Dynamo's limit the buckets
     # compiled last run uncompiled inside their graphs.
-    MIXED_TOKEN_BUCKETS = [b for b in PREFILL_TOKEN_BUCKETS if b <= 2176 or b & (b - 1) == 0]
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -152,8 +155,11 @@ class LLMSubmodule(ARNodeSubmodule):
         model: Qwen3_5ForCausalLM,
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
+        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__()
+        super().__init__(prefill_token_buckets)
+        # follows a deployment's own prefill ladder
+        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
         self.model = model
         self.config = config
         self.vision_config = vision_config

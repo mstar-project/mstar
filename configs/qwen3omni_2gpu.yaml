@@ -1,8 +1,11 @@
 model: "qwen3_omni"
 max_seq_len: 32768
-# The Thinker's KV pool defaults to 2,048 pages, 24 GiB at 12 MiB a page, which
-# doesn't fit beside its weights on an 80 GB GPU; qwen3omni_2gpu_large_kv.yaml
-# keeps the default for larger GPUs. Host pages give a full pool a request to move.
+# Sized for 80 GB GPUs. The Thinker's KV pool defaults to 2,048 pages, 24 GiB at
+# 12 MiB a page, which doesn't fit beside its weights there, and its text prefill
+# ladder stays at the default 128-2048 (qwen3omni_2gpu_large_kv.yaml runs it to
+# 8192 on H200-class GPUs). Whether every capture fits beside this pool on an
+# H100 is unmeasured: the vision ladder's 4096-16384 buckets also ran eagerly
+# there in an earlier tree. Host pages give a full pool a request to move.
 resources:
   thinker_kv:
     max_num_pages: 1024
@@ -18,3 +21,7 @@ node_groups:
   
   - node_names: [Code2Wav]
     ranks: [0]
+# A Thinker prefill row rides the speculated decode step instead of a step of
+# its own (a prefill reads nearly every expert, as a decode step at 16+ rows does).
+speculation_mixes_walks:
+  Thinker: true

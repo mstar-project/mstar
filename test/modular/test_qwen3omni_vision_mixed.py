@@ -50,6 +50,43 @@ def test_each_row_of_a_mixed_step_advances_positions_by_its_own_rule(thinker):
     assert step.steps[THINKER_POS].advance == (1, 9, 2)
 
 
+class _TokenEmbedder:
+    """The Thinker body as `preprocess` reads it: token ``t`` embeds as a row of ``t``s."""
+
+    mask_padding = False
+    model = SimpleNamespace(embed_tokens=lambda ids: ids.float().unsqueeze(-1).expand(-1, HIDDEN))
+
+    def maybe_log_expert_load(self, synthetic=False):
+        pass
+
+
+@pytest.mark.parametrize("walks", [
+    ["thinker_decode"] * 3,
+    ["thinker_decode", "prefill_text", "thinker_decode", "thinker_decode"],
+    ["prefill_text", "thinker_decode"],
+])
+def test_a_step_s_decode_rows_are_embedded_each_in_its_place(thinker, walks):
+    """A step's decode tokens are embedded in one call and laid back in row
+    order beside the prompt rows' own embeddings."""
+    lens = [1 if walk == "thinker_decode" else 2 for walk in walks]
+    thinker.config.thinker_head_dim, thinker.config.thinker_text = 128, SimpleNamespace(rope_theta=1e6)
+    thinker.__dict__.update(
+        model=_TokenEmbedder(), _cached_device=torch.device("cpu"), _inv_freq=None,
+        node_resources={THINKER_POS: SimpleNamespace(pos_ids=lambda label: torch.arange(sum(lens)))},
+    )
+    rows = [
+        ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([10 + i]), graph_walk=walk) if walk == "thinker_decode"
+        else ARNodeInputs(input_seq_len=2, input_embeds=torch.full((2, HIDDEN), -1.0 - i), graph_walk=walk)
+        for i, walk in enumerate(walks)
+    ]
+    engine_inputs = SimpleNamespace(synthetic=False, request_ids=list(range(len(rows))), real_seq_len=None)
+
+    embeds = thinker.preprocess(THINKER_MIXED, engine_inputs, rows)["input_embeds"]
+
+    expected = [10 + i if walk == "thinker_decode" else -1 - i for i, walk in enumerate(walks) for _ in range(lens[i])]
+    assert embeds[:, 0].tolist() == expected, "a decode row was handed another row's embedding"
+
+
 @pytest.mark.parametrize("step_walk,walks,key", [
     (THINKER_MIXED, ["thinker_decode", "prefill_vision"], "deepstack"),
     (THINKER_MIXED, ["thinker_decode", "prefill_text"], None),

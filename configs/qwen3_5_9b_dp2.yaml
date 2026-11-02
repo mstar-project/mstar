@@ -1,0 +1,34 @@
+model: "qwen3_5_9b"
+max_seq_len: 32768
+# Captured text-prefill ladder (see docs/models.rst): the powers of two to
+# 8192, 2176 for a mixed step's decode rows beside four prompts, and 3072-7168,
+# which cut the padding of 9B's compute-bound long prefills, in place of 4352
+# and 8704 (with those two the ladder would use Dynamo's whole recompile limit).
+model_kwargs:
+  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 2176, 3072, 4096, 5120, 6144, 7168, 8192]
+node_groups:
+  # A whole replica per GPU (text, images and video); the conductor sends
+  # each request to the cheaper replica, by live requests and the prompt's
+  # predicted prefix hit ("Data-parallel routing" in docs/serving.rst). For
+  # image and video traffic this beats TP2, whose vision encoder runs on one
+  # rank and stalls both.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0, 1]
+resources:
+  gdn_state:
+    max_slots: 129
+    # GDN state snapshots at page boundaries for the prefix cache, kept across requests and
+    # evicted oldest first. A prefill keeps up to two, and each takes a request slot's memory.
+    prefix_slots: 128
+    # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
+
+# The vision regions compile at start-up; these two sizes (64 and 608 image
+# tokens) warm two of the captured block loop's buckets and the LLM's vision
+# prefill before the server binds.
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}

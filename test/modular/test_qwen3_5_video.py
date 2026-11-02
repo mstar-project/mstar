@@ -828,3 +828,21 @@ def test_adapter_maps_video_url_to_a_video_attachment(tmp_path):
     assert Path(path).suffix == ".mp4" and Path(path).read_bytes().startswith(b"\x00\x00\x00\x18")
     assert [p.modality for p in args.prompt_parts] == ["text", "video", "text"]
     assert args.prompt_parts[1] == PromptPart(modality="video", index=0, role="user")
+
+
+def test_patch_embed_matmul_matches_its_conv():
+    # The patch embed runs its stride=kernel Conv3d as one GEMM over flattened
+    # patches; the checkpoint's conv weights must mean the same thing either way.
+    from mstar.model.qwen3_5.components.vision import VisionPatchEmbed
+    from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+
+    torch.manual_seed(0)
+    config = Qwen3_5VisionConfig(
+        depth=1, hidden_size=32, intermediate_size=64, num_heads=2, in_channels=3,
+        patch_size=4, temporal_patch_size=2, spatial_merge_size=2,
+        num_position_embeddings=16, out_hidden_size=32,
+    )
+    embed = VisionPatchEmbed(config).double()
+    patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
+    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    torch.testing.assert_close(embed(patches), conv)

@@ -118,40 +118,35 @@ class Qwen3OmniThinkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
         token_valid: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One layer with its residual adds deferred into the next norm (FlashInfer's
+        fused add + RMSNorm, in place).
+
         Args:
-            hidden_states: [tokens, hidden_size]
+            hidden_states: [tokens, hidden_size], the previous layer's MLP output,
+                or the layer input when ``residual`` is None.
+            residual: [tokens, hidden_size], the residual stream before that output.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE.
             token_valid: [tokens] bool; False rows are padding the MoE skips.
 
         Returns:
-            hidden_states: [tokens, hidden_size]
+            (this layer's MLP output, the residual stream before it)
         """
-        # Pre-attention norm + self-attention + residual
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, residual = self.input_layernorm.forward_residual(hidden_states, residual)
         hidden_states = self.self_attn(
             hidden_states,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
         )
-        hidden_states = residual + hidden_states
-
-        # Post-attention norm + MLP/MoE + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm.forward_residual(hidden_states, residual)
         if token_valid is not None and self.is_moe:
-            hidden_states = self.mlp(hidden_states, token_valid=token_valid)
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+            return self.mlp(hidden_states, token_valid=token_valid), residual
+        return self.mlp(hidden_states), residual
 
 
 class Qwen3OmniThinkerTextModel(nn.Module):
@@ -243,7 +238,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         """
         hidden_states = input_embeds
 
-        # Capture input embeddings BEFORE any transformer layers
+        # Capture input embeddings BEFORE any transformer layers (the first
+        # fused norm adds into the residual stream in place)
         layer_0_embed = hidden_states.clone()
         layer_n_hidden = None
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
@@ -252,10 +248,13 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         # the label once, advance the index per layer. Passing them as
         # arguments instead would make inductor specialize on the int.
         self.model.layers[0].self_attn.attend.bind_step(label)
+        residual = None
         for layer_idx, decoder_layer in enumerate(self.model.layers):
             decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = decoder_layer(
+            # a layer's output is ``residual + hidden_states``
+            hidden_states, residual = decoder_layer(
                 hidden_states,
+                residual,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
                 token_valid=token_valid,
@@ -270,9 +269,9 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
 
             # Capture hidden states at the accept_hidden_layer for Talker
             if layer_idx == self.accept_hidden_layer:
-                layer_n_hidden = hidden_states.clone()
+                layer_n_hidden = residual + hidden_states
 
         # Final layer norm
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
 
         return hidden_states, layer_0_embed, layer_n_hidden
