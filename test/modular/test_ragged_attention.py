@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
@@ -308,9 +309,6 @@ def test_spec_declares_no_dependencies():
 def test_shards_head_counts_at_build():
     """Head counts are declared pre-sharding; the engine narrows them."""
 
-    class _Group:
-        world_size = 2
-
     spec = RaggedAttentionSpec(
         resource_key=ATTN, nodes={"encoder"},
         config=RaggedAttentionConfig(
@@ -319,7 +317,9 @@ def test_shards_head_counts_at_build():
     )
     mgr = build_resource(
         spec,
-        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, joint_comm_group=_Group()),
+        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, joint_comm_group=JointGroups(
+            tp_group=CommGroup(0, 0, [0, 1]), sp_group=CommGroup.trivial(),
+        )),
     )
     assert mgr._kwargs["num_qo_heads"] == HEADS // 2
     # head_dim never shards

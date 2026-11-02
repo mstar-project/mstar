@@ -48,8 +48,7 @@ def test_write_read_and_pointers():
     pages = torch.tensor([2, 2, 2, 2, 3])
     offs = torch.tensor([0, 1, 2, 3, 0])
     cache.write_tokens(1, latent, None, pages, offs)
-    back = cache.read_tokens(1, pages, offs)
-    assert torch.equal(back, latent)
+    assert torch.equal(cache.tensor[1][pages, offs], latent)
     assert torch.equal(cache.layer_view(1)[2], latent[:4]) and torch.equal(cache.layer_view(1)[3, 0], latent[4])
     ptrs, nbytes = cache.chunk_ptrs(1, 2, 1, 3)
     assert len(ptrs) == 1 and nbytes == 2 * 12 * 4
@@ -58,6 +57,8 @@ def test_write_read_and_pointers():
     assert torch.equal(cache.chunk_view(1, 2, 1, 3), latent[1:3])
     cache.copy_pages([2], [5])
     assert torch.equal(cache.layer_view(1)[5], latent[:4])
+    cache.copy_slots(2, 4, 3)
+    assert torch.equal(cache.layer_view(1)[4, :3], latent[:3]) and not cache.layer_view(1)[4, 3].any()
 
 
 class _StubTransfer:
@@ -84,7 +85,7 @@ def test_manager_plans_and_writes_latents(monkeypatch):
     latents = torch.randn(8, 12)
     mgr.set_default_layer_idx(1)
     mgr.write_kv(latents)  # v=None: MLA writes one latent per token
-    assert torch.equal(mgr.read_kv(), latents)
+    assert torch.equal(mgr.kv_cache.tensor[1][mgr.write_slots()], latents)
     mgr.commit(step.get("mla_kv"), ctx)
     # decode step appends one token per request after the resident 5 / 3
     step2 = SubmoduleStep(segments=[Segment("a", "main", 1), Segment("b", "main", 1)], steps={"mla_kv": KVStep()})

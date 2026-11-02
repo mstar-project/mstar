@@ -4,9 +4,13 @@ indptrs (`_compute_plan_state` into the captured state)."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
+import pytest
 import torch
 
+from mstar.engine.resources.context_parallel import ContextParallel
 from mstar.engine.resources.kv.manager import KVManager, KVPlanState
 from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
 from mstar.utils.h2d import PinnedStager
@@ -46,10 +50,13 @@ def _state():
     )
 
 
-def test_host_addressing_matches_device_unpacking():
+# and over a context-parallel pool, partner 1 of 2's slots
+@pytest.mark.parametrize("placement", [None, ContextParallel(2, 1, None, False, (0, 1))], ids=["one_rank", "placed"])
+def test_host_addressing_matches_device_unpacking(placement):
     kv = KVManager.__new__(KVManager)
     kv._device = torch.device("cpu")
     kv._plan_stager = PinnedStager(torch.long)
+    kv.kv_cache = SimpleNamespace(placement=placement)
     rng = np.random.default_rng(0)
     for _ in range(20):
         indptrs = _indptrs(rng)

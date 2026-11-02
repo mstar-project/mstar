@@ -404,7 +404,8 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt, prefix_cache_tp
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp,
+                                # context_parallel
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -427,6 +428,13 @@ ranks. Loading fails otherwise. A cache that keeps
 a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
+
+``context_parallel: true`` splits each request's positions over the ranks that would
+otherwise hold the same KV heads: the TP ranks that share a KV head, or the node's SP ranks
+when it has them, which is how a model with no sequence parallelism of its own (such as
+Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that factor to turn the
+freed memory into context. **Context parallelism** in :doc:`adding_models` covers when each mode applies and
+what it refuses.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on

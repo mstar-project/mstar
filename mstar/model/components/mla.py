@@ -118,9 +118,10 @@ class MLAAttention(nn.Module):
         layer_idx = self.cache_layer_idx
         self._kv.write_kv(k, v, layer_idx=layer_idx)
         layer = self._kv.layer_view(layer_idx)
+        # k (and v) too: over a context-parallel pool a step's own tokens attend each other from them
         if q_pe is None:
-            return self._attn.run(q, kv_cache_layer=layer)
-        return self._attn.run(q, kv_cache_layer=layer, q_pe=q_pe)
+            return self._attn.run(q, kv_cache_layer=layer, k=k, v=v)
+        return self._attn.run(q, kv_cache_layer=layer, k=k, q_pe=q_pe)
 
     def forward(
         self,

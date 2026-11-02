@@ -726,16 +726,16 @@ class MicroScheduler:
         self, node_name: str, graph_walk: str, rows: int, resource: str | None = None,
     ) -> None:
         """Keep ``(node_name, graph_walk)``'s batches to ``rows`` (at least
-        one), the most the KV pool ``resource`` holds even with nothing else
-        resident.
+        one), the most the refusing ``resource`` holds even with nothing else
+        resident (a KV pool's pages, or attention's work items).
 
         Unlike `limit_batch`, a step that admits at this size does not lift it:
         the next full batch could never fit either, so it would be refused,
         and with a victim to evict, evict one for nothing, on every other
         step. Lifted by a step that admits fewer rows than the cap, where the
         queue no longer fills it and the next batch may be of smaller rows,
-        or by a teardown that hands pages of ``resource`` back (see
-        `lift_batch_caps`).
+        or by a teardown that hands pages of ``resource`` back, or any freeing
+        teardown when ``resource`` is None (see `lift_batch_caps`).
         """
         key = (node_name, graph_walk)
         cap = max(rows, 1)
@@ -745,7 +745,8 @@ class MicroScheduler:
 
     def lift_batch_caps(self, resources: Collection[str]) -> None:
         """A teardown handed pages of ``resources`` back: lift the `cap_batch`
-        caps their refusals set, and a cap whose refusal named no resource.
+        caps their refusals set, and a cap keyed on no resource (its refusal
+        named none, or named one that evicts nothing).
 
         A cap is sized from the rows refused then. On a busy walk every step
         is at the cap, so a smaller step never comes to lift it, and it would

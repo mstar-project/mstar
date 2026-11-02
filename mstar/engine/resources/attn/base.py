@@ -8,7 +8,7 @@ naming a backend in a spec does not load the others.
 
 import logging
 import os
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -21,6 +21,9 @@ from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.platforms import current_platform
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.context_parallel import ContextParallel
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -45,11 +48,70 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
+    # the KV pool's placement (`bind_dependencies`)
+    _placement: "ContextParallel | None" = None
 
     # Remains abstract except for build; will build based
     # on the attention backend
 
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
+
+    def depends_on(self):
+        return {self._kv_cache_name}
+
+    def bind_dependencies(self, resources) -> None:
+        placement = resources[self._kv_cache_name].placement
+        if placement is not None:
+            self._placement = placement
+            self._bind_placement(placement)
+
+    def _bind_placement(self, placement: "ContextParallel") -> None:
+        """This rank's share of a context-parallel pool. Reached only for a backend that supports
+        one (``supports_context_parallel``): the engine refuses the others at load."""
+
+    # A backend that supports a placed pool supplies the two wrappers a step attends it on;
+    # `_context_parallel_wrapper` composes them and `_attend_placed` runs them.
+
+    def _context_wrapper(self, workspace: torch.Tensor, decode: bool, kwargs: dict, max_total_tokens: int | None):
+        """The paged wrapper over this rank's slots, from ``kwargs`` (the backend's wrapper
+        arguments with the placed geometry, and any capture sizes), for a one-token-a-row step or
+        not."""
+        raise NotImplementedError
+
+    def _own_tokens_wrapper(self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):
+        """The wrapper a multi-token step attends its own tokens on, from the keys ``run`` is
+        passed: ``run(*queries, *keys, return_lse=True)``, out 0 and lse -inf on a captured
+        bucket's padding."""
+        raise NotImplementedError
+
+    def _context_parallel_wrapper(
+        self, label: str, slot: int, decode: bool, kwargs: dict, max_total_tokens: int | None = None,
+    ):
+        """The ``ContextParallelWrapper`` a step attends a placed pool on: the context's wrapper and,
+        for a step that isn't one token a row, its own tokens'.
+
+        Both take the label's workspace although both are planned for the one step: a FlashInfer
+        wrapper keeps its plan in an int workspace of its own, and uses this one only for the
+        split-KV partials of a ``run``, which it merges within that ``run``; the two run one after
+        the other on one stream."""
+        from mstar.engine.resources.context_parallel import ContextParallelWrapper
+
+        workspace = self._workspaces.get(label, slot)
+        context = self._context_wrapper(workspace, decode, kwargs, max_total_tokens)
+        new = None if decode else self._own_tokens_wrapper(workspace, kwargs, max_total_tokens)
+        return ContextParallelWrapper(
+            self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
+            kwargs.get("batch_size"), max_total_tokens,
+        )
+
+    @torch.compiler.disable
+    def _attend_placed(
+        self, label: str, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
+        new_keys: tuple[torch.Tensor | None, ...],
+    ) -> torch.Tensor:
+        """``run`` over a placed pool, ``queries`` and ``new_keys`` as this backend's ``run`` takes
+        them (``ContextParallelWrapper.attend``)."""
+        return self._current_plan_states[label].attend(queries, kv_cache_layer, new_keys)
 
     def fingerprint(self) -> bytes:
         # the class, not the declared backend: `build` moves dense to another
@@ -131,6 +193,20 @@ class AttentionManager(AttentionResource):
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         kv_config.shard(info.head_shards)
+        if isinstance(kv_config, PagedKVConfig) and kv_config.context_parallel:
+            # the backends whose partials' lse base the merge is known to read right
+            lse_known = ("auto", "fa2", "fa3")
+            unsupported = [name for name, refused in (
+                ("sliding_window", spec.config.sliding_window is not None),
+                # before it degrades to FlashInfer on some hosts, so a config loads on none
+                (f"backend {backend.value!r}", backend == AttnBackend.DENSE),
+                (f"flashinfer_backend {flashinfer_backend!r}", flashinfer_backend not in lse_known),
+            ) if refused]
+            if unsupported:
+                raise ValueError(
+                    f"attention {spec.resource_key!r}: {', '.join(unsupported)} is unsupported over KV pool "
+                    f"{spec.config.kv_cache!r}, which sets context_parallel"
+                )
         if backend == AttnBackend.DENSE:
             # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
             # that has no kernel for the GPU or does not import, the same pass
@@ -238,9 +314,25 @@ class AttentionManager(AttentionResource):
                 self.kv.write_kv(k, v, layer_idx=i, label=label)
             out = self.attn.run(q, label, kv.layer_view(i), k=k, v=v, layer_idx=i)
 
-        and stays correct whichever backend the spec named.
+        and stays correct whichever backend the spec named. Whether ``run`` also
+        reads ``k``/``v`` is ``reads_step_kv``, which a fused write path asks.
         """
         return True
+
+    @torch.compiler.disable
+    def reads_step_kv(self, label: str | None = None) -> bool:
+        """Whether this step's ``run`` under ``label`` attends the ``k``/``v`` it is passed rather
+        than only the pages (whether the layer writes them is ``requires_kv_write``). A layer whose
+        fused kernel writes the K/V but leaves ``k`` unrotated rotates it in place first when this
+        is True.
+
+        Every step of a backend that takes the fresh K/V straight into the kernel; on a paged
+        backend over a context-parallel pool, a step that attends its own tokens apart from the
+        pool. Fixed once the step is planned, so a captured bucket replays the same answer.
+        """
+        if self._placement is not None:
+            return self._current_plan_states[label or self._default_label].reads_step_kv
+        return not self.requires_kv_write
 
 
 class PlanCacheKey(NamedTuple):
@@ -281,6 +373,12 @@ def captured_page_capacity(
     if len(kv_config.groups) > 1:
         return kv_config.num_units + step_pages + num_rows
     return max(num_rows * kv_config.max_num_pages, step_pages + num_rows)
+
+
+def one_token_rows(rows: int, tokens: int, force_prefill: bool) -> bool:
+    """Whether a step is the decode kernel's kind, every row querying one token: from a captured
+    bucket's shape (fixed for its graph) or an eager plan's."""
+    return not force_prefill and rows == tokens
 
 
 def workspace_bytes() -> int:

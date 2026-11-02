@@ -1,7 +1,6 @@
 """When the FlashInfer MLA kernel serves a plan, and what happens when it cannot."""
 import sys
 import types
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,7 +8,8 @@ import torch
 from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
-from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.config import KVLayout, KVSpec, PagedKVConfig
 from mstar.engine.resources.step import SlotLease
 
 
@@ -48,9 +48,9 @@ def test_build_takes_the_mla_backend_on_a_paged_cache():
     kv = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=32, max_seq_len=64, page_size=16,
                        max_num_pages=8, num_qo_heads=2, layout=KVLayout.MLA,
                        kv_lora_rank=32, qk_rope_head_dim=0)
-    info = SimpleNamespace(
-        dependency=lambda key: SimpleNamespace(config=kv),
-        device=torch.device("cpu"), kv_dtype=torch.float32, joint_comm_group=None, head_shards=1,
+    info = EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.float32,
+        dependencies={"kv": KVSpec(resource_key="kv", nodes={"LLM"}, config=kv)},
     )
     spec = AttentionSpec(
         resource_key="attn", nodes={"LLM"},
@@ -85,9 +85,9 @@ def test_mla_attention_needs_the_query_heads():
 def test_only_the_mla_backend_takes_sm_scale():
     kv = PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=96, max_seq_len=64, page_size=16,
                        max_num_pages=8)
-    info = SimpleNamespace(
-        dependency=lambda key: SimpleNamespace(config=kv),
-        device=torch.device("cpu"), kv_dtype=torch.float32, joint_comm_group=None, head_shards=1,
+    info = EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.float32,
+        dependencies={"kv": KVSpec(resource_key="kv", nodes={"LLM"}, config=kv)},
     )
     spec = AttentionSpec(
         resource_key="attn", nodes={"LLM"},

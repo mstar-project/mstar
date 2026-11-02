@@ -486,7 +486,8 @@ class _EvictingWorker(_HoldingWorker):
             self.scheduler.note_arrival(rid)
             self.scheduler.note_ran(_sched_batch([rid]))
         engine = SimpleNamespace(
-            evictable=lambda node: True,
+            evictable=lambda node, affected_resources=None: (
+                affected_resources is None or "kv" in affected_resources),
             is_offloaded=lambda node, rid: rid in self.offloaded,
             reclaimable=lambda node, rid, resources: rid in holders,
             offload_request=lambda node, rid, affected_resources=None: self.offloaded.append(rid) or 12,
@@ -535,6 +536,29 @@ def test_a_batch_the_pool_cannot_hold_alone_is_capped_not_evicted_for():
     )
     sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, 3)
     assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16
+
+
+def test_a_cap_set_by_a_resource_that_evicts_nothing_is_lifted_by_any_teardown():
+    """Attention refuses a step past its planner's per-step bound, sized like the KV cache's
+    refusals, with nothing to evict. No teardown hands back room in it, so a cap waiting for one
+    held the walk to the rows of that one burst for good."""
+    sched = _scheduler(_SchedEngine(max_bs=16))
+    manager = _Manager([f"p{i}" for i in range(48)])
+    worker = _EvictingWorker(holders=[])
+    worker.scheduler = sched
+    worker._graph_runtime = manager.runtime
+    batch = _next_batch(sched, manager)
+    rids = list(batch.request_to_worker_graph)
+    worker._handle_allocation_failure(batch, SimpleNamespace(
+        node_name=SCHED_NODE, failed_resource="attn",
+        admit_error=_sized_refusal(rids[4], rows_fit=4, rows_fit_alone=4),
+    ))
+    sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, 4)
+    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 4
+
+    sched.lift_batch_caps({"kv"})
+
+    assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16, "a teardown left attention's cap in place"
 
 
 def test_a_batch_too_big_alone_still_evicts_its_own_rows():

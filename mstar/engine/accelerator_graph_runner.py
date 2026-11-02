@@ -681,17 +681,18 @@ class AcceleratorGraphRunner:
         autocast_dtype: torch.dtype | None,
         joint_comm_group: JointGroups,
         num_slots: int,
+        *,
+        head_shards: int,
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
     ):
+        """``head_shards`` is the node's `EngineResourceInfo.head_shards`."""
         self._submodule_name = submodule_name
         self._submodule = submodule
         self._comm_group = joint_comm_group
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
-            submodule.get_accelerator_graph_configs(
-                device, joint_comm_group.world_size
-            )
+            submodule.get_accelerator_graph_configs(device, head_shards)
         )
         self._resources = resources
         self._step_runner = step_runner

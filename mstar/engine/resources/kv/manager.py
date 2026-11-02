@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -65,6 +65,9 @@ from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.context_parallel import ContextParallel
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +518,8 @@ class KVManager(AttentionResource):
                 "its nodes from one TP group"
             )
         tp_cache = False
+        # the cache is sized off the placement, and off the head counts `build` sharded
+        placement = cfg.place(joint_comm_group, name)
         if joint_comm_group is not None:
             tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
             if tp_cache and cfg.cpu_offload_pages > 0:
@@ -531,10 +536,14 @@ class KVManager(AttentionResource):
                     "and a read from another group would take pages outside rank 0's order. Serve "
                     "the nodes from one group or set prefix_cache_tp to false."
                 )
-        self.kv_cache = KVCache(
-            cfg, device, dtype
-        )
+        self.kv_cache = KVCache(cfg, device, dtype, placement)
         self.name = name
+        cp = placement
+        logger.info(
+            "KV %s: %.2f GiB on this rank, %d pages of %d slots%s", name, self.kv_cache.nbytes / 2**30,
+            cfg.max_num_pages, self.kv_cache.page_slots,
+            "" if cp is None else f" (context parallel, {cp.size} ranks over {'SP' if cp.over_sp else 'TP'})",
+        )
 
         self._arena = PageArena(
             kv_cache=self.kv_cache,
@@ -1581,11 +1590,19 @@ class KVManager(AttentionResource):
         if hold is not None:
             self._release(rid, stream, hold)
 
+    @property
+    def placement(self) -> "ContextParallel | None":
+        """This rank's placement of the pool's positions (``PagedKVConfig.context_parallel``), which
+        the resources over it read here; None when it is off."""
+        return self.kv_cache.placement
+
     def fingerprint(self) -> bytes:
+        cp = self.placement
         return fingerprint(
             self.config.layout.value, self.config.tokens_per_page,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
+            *(() if cp is None else ("context_parallel", cp.size, cp.over_sp)),
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
@@ -2250,11 +2267,10 @@ class KVManager(AttentionResource):
         off_in_page = (g - page_off * page_size).to(torch.int32)
         abs_page_ptr = paged_kv_indptr[:-1][seg] + page_off
 
-        return KVPlanState(
-            token_to_page=paged_kv_indices[abs_page_ptr].to(torch.long),
-            token_to_cache=off_in_page.to(torch.long),
-            total_tokens=total_tokens
-        )
+        pages, offsets = paged_kv_indices[abs_page_ptr].to(torch.long), off_in_page.to(torch.long)
+        if self.placement is not None:
+            pages, offsets = self.placement.write_slots(pages, offsets)
+        return KVPlanState(token_to_page=pages, token_to_cache=offsets, total_tokens=total_tokens)
 
     def _empty_plan_state(self) -> KVPlanState:
         empty = self._empty_locations
@@ -2271,9 +2287,11 @@ class KVManager(AttentionResource):
         it over as one H2D.
         """
         pages, offsets = self._decode_locations(views, page_size)
-        locations = torch.tensor(
-            [pages, offsets], dtype=torch.long
-        ).to(self._device, non_blocking=True)
+        if self.placement is None:
+            locations = torch.tensor([pages, offsets], dtype=torch.long)
+        else:
+            locations = torch.as_tensor(np.stack(self.placement.write_slots(pages, offsets)), dtype=torch.long)
+        locations = locations.to(self._device, non_blocking=True)
         return KVPlanState(
             token_to_page=locations[0],
             token_to_cache=locations[1],
@@ -2317,6 +2335,8 @@ class KVManager(AttentionResource):
         pos = (kv_after - spans - qo[:-1])[seg] + np.arange(total)
         page, offset = np.divmod(pos, page_size)
         pages = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
+        if self.placement is not None:
+            pages, offset = self.placement.write_slots(pages, offset)
         n = max(capture_len, total)
         self._plan_stager.copy_(static_state.token_to_page[:n], pages, pad_value=SINK_PAGE)
         self._plan_stager.copy_(static_state.token_to_cache[:n], offset, pad_value=0)
@@ -2331,6 +2351,8 @@ class KVManager(AttentionResource):
         tensor; rows past the real tokens get SINK_PAGE / 0."""
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views, page_size)
+        if self.placement is not None:
+            pages, offsets = self.placement.write_slots(pages, offsets)
         self._plan_stager.copy_(
             static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
         )
@@ -4473,24 +4495,6 @@ class KVManager(AttentionResource):
         return self.kv_cache.layer_view(layer_idx)
 
     @torch.compiler.disable
-    def read_kv(self, layer_idx: int=None, plan_label: str=None) -> torch.Tensor:
-        """
-        The slots this step's plan writes, e.g. for NHD:
-        [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1).
-        """
-        if layer_idx is None:
-            layer_idx = self._default_layer_idx
-        if plan_label is None:
-            plan_label = self._default_label
-        plan_state = self._current_plan_states[plan_label, self._layer_group[layer_idx]]
-        n = plan_state.total_tokens
-        return self.kv_cache.read_tokens(
-            layer_idx=layer_idx,
-            page_idx=plan_state.token_to_page[:n],
-            cache_idx=plan_state.token_to_cache[:n],
-        )
-
-    @torch.compiler.disable
     def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
         """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as
         device tensors, for a kernel that writes the cache itself. Under a capture lease they
@@ -4506,14 +4510,10 @@ class KVManager(AttentionResource):
     @torch.compiler.disable
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor | None = None,
-        layer_idx: int=None, label: str=None, return_tensor: bool = False,
-    ) -> torch.Tensor | None:
+        layer_idx: int=None, label: str=None,
+    ) -> None:
         """Write K, V into this step's planned slots (under MLA: the per-token
-        latent as ``k`` and ``v=None``).
-
-        Returns nothing by default: reading the slots back is a gather no
-        caller wants today, and skipping it keeps the write a pure mutation.
-        """
+        latent as ``k`` and ``v=None``)."""
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         if label is None:
@@ -4524,10 +4524,9 @@ class KVManager(AttentionResource):
         # an eager write may carry only the real rows; the padding rows' tokens
         # come last in the plan (on SINK_PAGE) and are skipped
         n = min(plan_state.total_tokens, k.shape[0])
-        return self.kv_cache.write_tokens(
+        self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
-            return_tensor=return_tensor,
         )

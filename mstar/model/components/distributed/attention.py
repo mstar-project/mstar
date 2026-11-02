@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.distributed.utils import divide
+from mstar.distributed.utils import divide, kv_head_replicas
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
@@ -221,12 +221,7 @@ class ParallelCrossAttention(nn.Module):
         # It is then required to have TP_size <= num_heads; otherwise divide(tp_size, self.total_num_heads)
         # will raise.
         if num_kv_heads is not None:
-            if tp_size > num_kv_heads:
-                self.num_kv_heads = 1
-                self.num_kv_head_replicas = divide(tp_size, num_kv_heads)
-            else:
-                self.num_kv_heads = divide(num_kv_heads, tp_size)
-                self.num_kv_head_replicas = 1
+            self.num_kv_heads, self.num_kv_head_replicas = kv_head_replicas(num_kv_heads, tp_size)
         else :
             self.num_kv_heads = self.num_heads
 

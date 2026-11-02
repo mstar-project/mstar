@@ -1097,7 +1097,7 @@ def _run_accelerator_graph_denoise(ctx):
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev,
         autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),
-        joint_comm_group=groups, num_slots=1,
+        joint_comm_group=groups, num_slots=1, head_shards=groups.world_size,
     )
     cg_runner.warmup_and_capture()
     assert cg_runner.any_graphs, "no CUDA graph captured for cosmos3 image_gen"

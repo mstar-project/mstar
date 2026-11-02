@@ -78,6 +78,9 @@ class PositionManager(Resource):
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
 
+    # reads the KV plan's rows (request, label, tokens) and its own counters, never a page
+    supports_context_parallel = True
+
     def __init__(
         self,
         config: PositionConfig,

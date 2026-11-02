@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -48,6 +49,14 @@ class CGSlotKey:
     label: str
 
 
+def head_shards(group: JointGroups | None, positions_over_sp: bool = False) -> int:
+    """How many ways a node's ranks split its attention heads: its TP and SP ranks, or TP alone
+    when its pools place positions over the SP ranks (``context_parallel.positions_over_sp``)."""
+    if group is None:
+        return 1
+    return group.world_size // group.sp_group.world_size if positions_over_sp else group.world_size
+
+
 @dataclass(frozen=True)
 class EngineResourceInfo:
     """What the engine has to offer a resource at build time.
@@ -76,14 +85,15 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # how many ways the node's ranks split its attention heads, which each builder sizes head counts
+    # by; None for every TP and SP rank (`head_shards`), which the engine narrows for a node that
+    # places positions over its SP ranks. A ragged resource declaring
+    # ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only.
+    head_shards: int | None = None
 
-    @property
-    def head_shards(self) -> int:
-        """How many ways the node's ranks split its attention heads, which each
-        builder sizes head counts by: all its TP × SP ranks. A ragged resource
-        declaring ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
-        group = self.joint_comm_group
-        return 1 if group is None else group.world_size
+    def __post_init__(self):
+        if self.head_shards is None:
+            object.__setattr__(self, "head_shards", head_shards(self.joint_comm_group))
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -129,6 +139,14 @@ class Resource(ABC):
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
+    # stays correct when a pool it depends on has a `placement`; the engine refuses to load it otherwise
+    supports_context_parallel: bool = False
+
+    @property
+    def placement(self) -> "ContextParallel | None":
+        """How this resource places token positions over ranks (`PagedKVConfig.context_parallel`);
+        None for one that doesn't."""
+        return None
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> None:
         """Open whatever this resource keeps across requests, under ``root``. The

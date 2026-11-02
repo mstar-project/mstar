@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.distributed.utils import divide, split_tensor_along_last_dim
+from mstar.distributed.utils import divide, kv_head_replicas, split_tensor_along_last_dim
 
 
 class ColumnParallelLinear(nn.Module):
@@ -211,12 +211,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         # Divide the weight matrix along the last dimension.
         tp_size = comm_group.world_size
         self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
+        self.num_kv_heads, self.num_kv_head_replicas = kv_head_replicas(self.total_num_kv_heads, tp_size)
         input_size = self.hidden_size
         output_size = (
             self.num_heads * self.head_size
@@ -444,12 +439,7 @@ class KVColumnParallelLinear(ColumnParallelLinear):
         tp_size = comm_group.world_size
         self.head_size = head_size
         self.total_num_kv_heads = total_num_kv_heads
-        if tp_size >= total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
+        self.num_kv_heads, self.num_kv_head_replicas = kv_head_replicas(total_num_kv_heads, tp_size)
         super().__init__(
             comm_group=comm_group,
             input_size=input_size,

@@ -407,7 +407,9 @@ asr = [
 
 # GLM-5.x
 glm = [
-    "flashinfer-python>=0.6.14",
+    # exactly: MLA attention over a context-parallel KV pool mirrors this release's FA planner rules
+    # (`flashinfer_mla.fa_work_items_bound`) and refuses any other at load
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
