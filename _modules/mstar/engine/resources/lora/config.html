@@ -1314,8 +1314,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``max_slots`` adapters are resident on the device at once, beside a zero adapter that</span>
 <span class="sd">    base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.</span>
 <span class="sd">    ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``</span>
-<span class="sd">    places each checkpoint module on a target; ``convert_keys`` rewrites a model-native</span>
-<span class="sd">    checkpoint layout first.</span>
+<span class="sd">    places each checkpoint module on a target; a node's spec comes from</span>
+<span class="sd">    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose</span>
+<span class="sd">    ``ModuleLoraMap`` is what binds the node's modules (a spec with any other resolver</span>
+<span class="sd">    is refused as the deployment's specs are declared, ``declared_lora_specs``).</span>
+<span class="sd">    ``convert_keys`` rewrites a model-native checkpoint layout first.</span>
 <span class="sd">    """</span>
 
     <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span>

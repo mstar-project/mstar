@@ -992,7 +992,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">``&lt;module&gt;`` is a reference-library module path; the model's checkpoint remap (the same one the</span>
 <span class="sd">weight loader uses) and its stacked-shard rules turn it into the native parameter and, for</span>
-<span class="sd">fused projections, the shard it lands on (a ``LoraSpec``'s ``module_map``, and the static</span>
+<span class="sd">fused projections, the shard it lands on (the model side's ``ModuleLoraMap``, and the static</span>
 <span class="sd">merge's ``resolve_lora_module``).</span>
 <span class="sd">"""</span>
 

@@ -778,8 +778,8 @@ The spec types are:
        no saved state (a request's first step, or a padding row) reads ``start``, zeros
        when none is given. ``gather`` / ``scatter_`` need the sink, so leave
        ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
-   * - ``LoraSpec``
-     - Per-request LoRA adapters on the node's linears: a pool of device
+   * - ``LoraSpec`` (built by ``module_lora_spec``)
+     - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
        Returned from ``get_lora_specs`` (one per node), not this list, and built only
        when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
@@ -1098,24 +1098,101 @@ linear adds ``scaling * (x @ A^T) @ B^T`` for the adapter of the token's request
 one batch can run different adapters, or none. The engine owns the adapter weights. A
 model declares which linears adapters may touch; it never indexes the pool itself.
 
-A model returns its specs from ``Model.get_lora_specs``: a spec per node the adapters
-reach, the first keyed ``"lora"`` and the others apart. They are built only when the
-serving YAML has a ``resources: lora:`` block, so a deployment without one builds exactly
-what it did before. The node declares each step's rows in ``declare_step``, a
-``LoraStep`` under the pool's key (a segment per request, its span the tokens that
-request puts through the adapted linears, in the order they are packed), and each
-adapted linear adds ``pool.layer_delta(target, layer)(x, y)`` to its base output before
-anything reads it: before a column-parallel gather, before a row-parallel all-reduce.
+A model declares LoRA from its own modules: the shared linears add the delta
+themselves once bound, and ``module_lora_spec`` builds the spec by walking each node's
+weights root. For an autoregressive LLM node such as Orpheus's:
 
-The pool holds a step's addressing from its plan to its commit (or rollback), for the
-thread that planned it, so a delta called outside a step (``prepare_inputs``, which the
-async worker runs on the main thread while the GPU thread's step is planned; an output
-cached from an earlier step) refuses when run eagerly instead of adding another step's
-adapters to these rows.
-``warmup_compiles`` runs outside any step, so a node serving adapters runs no adapted
-linear there.
+.. code-block:: python
 
-A ``LoraSpec``'s parts:
+   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+
+   def get_lora_specs(self) -> list[LoraSpec]:
+       # the module the node's weight loader fills, at one rank, on the meta device
+       with torch.device("meta"):
+           root = OrpheusForCausalLM(self.config, comm_group=CommGroup.trivial())
+       return [module_lora_spec(
+           root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"},
+           root_path="language_model",    # the root's attribute path in the node submodule
+           rows={"lm_head": PER_SEGMENT},  # rows that are not the step's tokens
+           embeddings=True,                # every embedding call is in the forward
+       )]
+
+The weights root states how the checkpoint lands on it once
+(``checkpoint_rules() -> CheckpointRules``: a prefix, a remap, the stacked-shard
+rules); its weight loader and ``module_lora_spec`` both use them, so adapters are
+placed exactly as weights are.
+
+- **What takes a delta.** ``ColumnParallelLinear`` (and ``MergedColumnParallelLinear``,
+  ``QKVParallelLinear``, ``KVColumnParallelLinear``), ``RowParallelLinear``,
+  ``FusedColumnLinear`` and ``VocabParallelEmbedding`` describe their own target from
+  their own shard layout (slices, heads replicated past their count, packs, per-rank
+  padding: ``LoraCapable.lora_target``). Binding swaps a module to its family's twin
+  class, which adds the delta after the base GEMM and before the module's own gather or
+  all-reduce (after it, for the embedding) through ``apply_lora(delta, x, y) -> y``, the
+  one call site. A plain ``nn.Linear``, a ``Conv1d/2d/3d`` whose kernel is its stride, and
+  subclasses of either that keep their base's forward are swapped alike, and are whole
+  on every rank. An unbound module keeps its class, so a deployment without a ``lora:``
+  block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
+  graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
+  depthwise conv, ``nn.Embedding``, a forward overridden on an instance or hooked) takes
+  none: the walk records why, and an adapter touching it is refused with that reason. So
+  does a child its parent runs through the weight itself rather than its forward (folded at
+  load, an ``F.linear`` over it), which the parent names in ``lora_unservable`` (a path
+  below it -> reason; a path that is not one of its submodules is a ``ValueError``): MLA's
+  absorbed projections, SigLIP's patch embedding, Command-A+'s fused decoder-layer
+  projections, the Qwen3 talkers' code-predictor heads. Nothing else can tell such a child from
+  one whose forward runs: an undeclared one is bound, and its delta silently never
+  added, so code that reads a linear's weight directly declares it there.
+- **Targets.** One per role in a layer stack (``<stack>.N.<role>``, the first ``ModuleList``
+  or ``Sequential`` in the path, whatever it is named; ``layers`` set where a role is on
+  some layers only), named by the role's last component (``names`` overrides), plus one per
+  other module: one outside the stacks, or at a role whose entries differ in shape (UNet
+  levels, vision stages), which is named by its path but keeps its role for ``rows``.
+- **What the model states.** Only what modules cannot know. ``rows``: a target that sees
+  one row per segment (``PER_SEGMENT``: a head after the last-token select) or one per
+  ``k`` folded tokens. ``exclude`` (with a reason): modules called outside the planned
+  step, a text projection or a conditioning encoder run in ``prepare_inputs``.
+  ``deferred``: modules called both before the step and in it, whose delta the node adds
+  itself where the step's rows are planned (Qwen3.5 embeds a vision prompt's text in
+  ``prepare_inputs``): bound as ``lora_deferred``, which the module's forward never adds.
+  ``embeddings=True`` only when every embedding call is in the step; a deferred
+  embedding is served without it. ``adapter_roots`` / ``aliases`` / ``adapter_stacked_params``: the prefixes,
+  names and split projections adapters write, rewritten to the checkpoint's before the
+  root's rules place them. ``ignore``: modules an adapter may carry that never run.
+- **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision
+  encoder, which a TP config may put on different ranks) returns a spec per node, the
+  first keyed ``"lora"`` and the others apart, told about each other by
+  ``link_lora_specs``: a module belongs to the spec that places it (the one whose
+  ``adapter_roots`` claim it most specifically, when several do), and the others leave
+  it alone (``ignored_modules``), so one adapter file serves both. The one ``lora:`` block sizes them all, the conductor opens every request
+  with the same adapter on each, and the startup check reads an adapter under every
+  spec.
+- **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module
+  under ``root_path``, after checking it is the declared target and that the pool's
+  shard is its rank-local shape (a module built whole on a TP node fails here, not in a
+  forward). The engine (``engine_step``) adds each pool's ``LoraStep`` to the node's
+  step from its segments, which are, in order, the rows its linears see (a request may
+  have several: Chatterbox's cond and uncond copies; Qwen3.5's vision encoder: one
+  segment per frame, the merger's rows folding them). A step that lays its rows out
+  otherwise declares its own ``LoraStep`` under the pool's key, which the engine keeps. A
+  step that is ``None`` or declares no segments gets none, and an adapted module it runs
+  refuses, so a node serving adapters returns a step with its segments wherever one runs.
+- **Only inside the step.** The pool holds a step's addressing from its plan to its
+  commit (or rollback), for the thread that planned it, so a delta called outside a step
+  (``prepare_inputs``, which the async worker runs on the main thread while the GPU
+  thread's step is planned; an output cached from an earlier step) refuses, eager or
+  compiled, instead of adding another step's adapters to these rows. The engine's own
+  warm-ups outside any step (``compile_regions``, ``warmup_compiles``) run as a step
+  whose rows name no adapter: a compile there traces no delta, and the first step with
+  an adapter row compiles its own. A piecewise region's step takes its rows as the
+  node's does, from its own segments (an ``attn_key`` region's: one per row), planned
+  per replay and handing the enclosing step's plan back at its commit. A region
+  replayed as one row per step (``one_row_per_step``) addresses every row to the first
+  request's adapter, so the engine captures it base-only (``LoraBaseOnly``) and leases it
+  only for a step none of whose rows runs an adapter; a step with one runs the region
+  eagerly under the node's step.
+
+``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
 - **Targets.** ``LoraTarget`` gives the unsharded linear's shape and how the base layer is
   split under tensor parallelism. For a column-parallel linear, A is replicated and B is
@@ -2055,8 +2132,9 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   ``declare_step`` then receives ``[first_rid]`` with every request's ``seq_lens``, so the
   whole step's segments count against one replay's plan: size its attention resource with
   ``max_segments_per_step``, and pair it with a ``can_lease`` that refuses a step with
-  more. Such a region cannot declare a LoRA step, which would address every
-  request's tokens to the first request's adapter; capture refuses it.
+  more. On a node serving LoRA adapters it is leased only for a step whose rows run
+  none, since its replay would address every request's tokens to the first request's
+  adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is

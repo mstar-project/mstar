@@ -1041,8 +1041,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Iterator</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
@@ -1177,11 +1178,13 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span><span class="o">.</span><span class="n">_current</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span><span class="o">.</span><span class="n">_plan_thread</span> <span class="o">!=</span> <span class="n">threading</span><span class="o">.</span><span class="n">get_ident</span><span class="p">()</span>
         <span class="p">):</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-                <span class="s2">"a LoRA delta was called outside its node's planned step (e.g. from "</span>
-                <span class="s2">"prepare_inputs, which the async worker runs while the GPU thread's step "</span>
-                <span class="s2">"is planned, or on an output cached from an earlier step): there is no "</span>
-                <span class="s2">"addressing for its rows. Call the module's base computation there and "</span>
-                <span class="s2">"add the delta in preprocess or the forward"</span>
+                <span class="s2">"a LoRA delta was called with no planned step addressing its rows: the "</span>
+                <span class="s2">"step running it (the node's, or a piecewise region's) is None or declares "</span>
+                <span class="s2">"no segments to lay its LoRA rows out from; or the call is "</span>
+                <span class="s2">"outside the planned step (prepare_inputs, which the async worker runs "</span>
+                <span class="s2">"while the GPU thread's step is planned, or an output cached from an "</span>
+                <span class="s2">"earlier step), where the module's base computation runs and the delta "</span>
+                <span class="s2">"belongs in preprocess or the forward"</span>
             <span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pool</span><span class="o">.</span><span class="n">active</span><span class="p">:</span>
             <span class="c1"># a base-only step: no row names an adapter, so nothing is launched</span>
@@ -1458,10 +1461,26 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        for a backend to run against."""</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-                <span class="s2">"the LoRA pool has no plan for this step; the step declaration must carry "</span>
-                <span class="s2">"a LoraStep under this resource's key"</span>
+                <span class="s2">"the LoRA pool has no plan for this step: the step running the adapted "</span>
+                <span class="s2">"module (the node's, or a piecewise region's) is None or declares no "</span>
+                <span class="s2">"segments to lay its LoRA rows out from"</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">[</span><span class="n">grouping</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="LoraAdapterPool.base_only">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.base_only">[docs]</a>
+    <span class="nd">@contextmanager</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">base_only</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""A forward outside any step (a compile's warm-up) on this thread, as a base-only</span>
+<span class="sd">        step: its deltas add nothing. A compile traced here takes the base-only branch,</span>
+<span class="sd">        so the first step with an adapter row compiles its own."""</span>
+        <span class="n">saved</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_thread</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_thread</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span> <span class="o">=</span> <span class="p">{},</span> <span class="n">threading</span><span class="o">.</span><span class="n">get_ident</span><span class="p">(),</span> <span class="kc">False</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">yield</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_thread</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span> <span class="o">=</span> <span class="n">saved</span></div>
 
 
 <div class="viewcode-block" id="LoraAdapterPool.slot_state">
@@ -1800,7 +1819,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        in its now-unheld slot, as a cache."""</span>
         <span class="k">del</span> <span class="n">step</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">!=</span> <span class="n">PIECEWISE_WALK</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_current</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_unplanned</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
@@ -1821,19 +1840,25 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.commit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">commit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">del</span> <span class="n">step</span>
-        <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">!=</span> <span class="n">PIECEWISE_WALK</span><span class="p">:</span>
-            <span class="c1"># nothing reads the addressing past the step's forward: a delta called</span>
-            <span class="c1"># before the next plan refuses rather than add these rows' adapters</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_current</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enclosing</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">==</span> <span class="n">PIECEWISE_WALK</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enclosing</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># the region is done; the eager code after it reads the enclosing plan</span>
             <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enclosing</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enclosing</span><span class="p">,</span> <span class="kc">None</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># nothing reads the addressing past the step's (or a region capture's)</span>
+            <span class="c1"># forward: a delta called before the next plan refuses rather than add</span>
+            <span class="c1"># these rows' adapters</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_unplanned</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">(</span><span class="n">r</span><span class="p">)]:</span>
                 <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_taken</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_unplanned</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""No step's addressing: a delta refuses until the next plan, eagerly in its own</span>
+<span class="sd">        check, compiled in ``addressing`` (which it reaches with ``active`` set)."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">active</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_take</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Caller holds the lock."""</span>

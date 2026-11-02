@@ -690,6 +690,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.addressing"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.addressing()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.admit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.ask"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.ask()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.base_only"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.base_only()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.build"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.cleanup"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.commit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.commit()</span></code></a></li>
@@ -882,6 +883,19 @@ serves), and an adapter with nothing for this pool.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitOutcome" title="mstar.engine.resources.step.AdmitOutcome"><em>AdmitOutcome</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.base_only">
+<span class="sig-name descname"><span class="pre">base_only</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.base_only"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.base_only" title="Link to this definition">#</a></dt>
+<dd><p>A forward outside any step (a compile’s warm-up) on this thread, as a base-only
+step: its deltas add nothing. A compile traced here takes the base-only branch,
+so the first step with an adapter row compiles its own.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterator" title="(in Python v3.12)"><em>Iterator</em></a>[None]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1365,6 +1379,7 @@ once, here; a call reads only the step’s addressing.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.addressing"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.addressing()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.admit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.ask"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.ask()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.base_only"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.base_only()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.build"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.cleanup"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.commit"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.commit()</span></code></a></li>

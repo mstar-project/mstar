@@ -1499,8 +1499,8 @@ no saved state (a request’s first step, or a padding row) reads <code class="d
 when none is given. <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code> need the sink, so leave
 <code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code> unset. Parakeet’s transducer decode is the example.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code></p></td>
-<td><p>Per-request LoRA adapters on the node’s linears: a pool of device
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (built by <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code>)</p></td>
+<td><p>Per-request LoRA adapters on the node’s LoRA-capable linears: a pool of device
 slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
 Returned from <code class="docutils literal notranslate"><span class="pre">get_lora_specs</span></code> (one per node), not this list, and built only
 when the serving YAML has a <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block. See <a class="reference internal" href="#per-request-lora-adapters">Per-request LoRA
@@ -1801,22 +1801,99 @@ the per-query example.</p>
 linear adds <code class="docutils literal notranslate"><span class="pre">scaling</span> <span class="pre">*</span> <span class="pre">(x</span> <span class="pre">&#64;</span> <span class="pre">A^T)</span> <span class="pre">&#64;</span> <span class="pre">B^T</span></code> for the adapter of the token’s request, so rows of
 one batch can run different adapters, or none. The engine owns the adapter weights. A
 model declares which linears adapters may touch; it never indexes the pool itself.</p>
-<p>A model returns its specs from <code class="docutils literal notranslate"><span class="pre">Model.get_lora_specs</span></code>: a spec per node the adapters
-reach, the first keyed <code class="docutils literal notranslate"><span class="pre">&quot;lora&quot;</span></code> and the others apart. They are built only when the
-serving YAML has a <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block, so a deployment without one builds exactly
-what it did before. The node declares each step’s rows in <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, a
-<code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under the pool’s key (a segment per request, its span the tokens that
-request puts through the adapted linears, in the order they are packed), and each
-adapted linear adds <code class="docutils literal notranslate"><span class="pre">pool.layer_delta(target,</span> <span class="pre">layer)(x,</span> <span class="pre">y)</span></code> to its base output before
-anything reads it: before a column-parallel gather, before a row-parallel all-reduce.</p>
-<p>The pool holds a step’s addressing from its plan to its commit (or rollback), for the
-thread that planned it, so a delta called outside a step (<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, which the
-async worker runs on the main thread while the GPU thread’s step is planned; an output
-cached from an earlier step) refuses when run eagerly instead of adding another step’s
-adapters to these rows.
-<code class="docutils literal notranslate"><span class="pre">warmup_compiles</span></code> runs outside any step, so a node serving adapters runs no adapted
-linear there.</p>
-<p>A <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code>’s parts:</p>
+<p>A model declares LoRA from its own modules: the shared linears add the delta
+themselves once bound, and <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> builds the spec by walking each node’s
+weights root. For an autoregressive LLM node such as Orpheus’s:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">PER_SEGMENT</span><span class="p">,</span> <span class="n">module_lora_spec</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">get_lora_specs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">LoraSpec</span><span class="p">]:</span>
+    <span class="c1"># the module the node's weight loader fills, at one rank, on the meta device</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"meta"</span><span class="p">):</span>
+        <span class="n">root</span> <span class="o">=</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">())</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">module_lora_spec</span><span class="p">(</span>
+        <span class="n">root</span><span class="p">,</span> <span class="n">resource_key</span><span class="o">=</span><span class="n">LORA_RESOURCE_KEY</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
+        <span class="n">root_path</span><span class="o">=</span><span class="s2">"language_model"</span><span class="p">,</span>    <span class="c1"># the root's attribute path in the node submodule</span>
+        <span class="n">rows</span><span class="o">=</span><span class="p">{</span><span class="s2">"lm_head"</span><span class="p">:</span> <span class="n">PER_SEGMENT</span><span class="p">},</span>  <span class="c1"># rows that are not the step's tokens</span>
+        <span class="n">embeddings</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                <span class="c1"># every embedding call is in the forward</span>
+    <span class="p">)]</span>
+</pre></div>
+</div>
+<p>The weights root states how the checkpoint lands on it once
+(<code class="docutils literal notranslate"><span class="pre">checkpoint_rules()</span> <span class="pre">-&gt;</span> <span class="pre">CheckpointRules</span></code>: a prefix, a remap, the stacked-shard
+rules); its weight loader and <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> both use them, so adapters are
+placed exactly as weights are.</p>
+<ul class="simple">
+<li><p><strong>What takes a delta.</strong> <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code> (and <code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>,
+<code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear</span></code>), <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code>,
+<code class="docutils literal notranslate"><span class="pre">FusedColumnLinear</span></code> and <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> describe their own target from
+their own shard layout (slices, heads replicated past their count, packs, per-rank
+padding: <code class="docutils literal notranslate"><span class="pre">LoraCapable.lora_target</span></code>). Binding swaps a module to its family’s twin
+class, which adds the delta after the base GEMM and before the module’s own gather or
+all-reduce (after it, for the embedding) through <code class="docutils literal notranslate"><span class="pre">apply_lora(delta,</span> <span class="pre">x,</span> <span class="pre">y)</span> <span class="pre">-&gt;</span> <span class="pre">y</span></code>, the
+one call site. A plain <code class="docutils literal notranslate"><span class="pre">nn.Linear</span></code>, a <code class="docutils literal notranslate"><span class="pre">Conv1d/2d/3d</span></code> whose kernel is its stride, and
+subclasses of either that keep their base’s forward are swapped alike, and are whole
+on every rank. An unbound module keeps its class, so a deployment without a <code class="docutils literal notranslate"><span class="pre">lora:</span></code>
+block runs, traces and guards exactly as before (tests hold the aten ops, the dynamo
+graph and its guards). Anything else holding weight matrices (MoE experts, a router, a
+depthwise conv, <code class="docutils literal notranslate"><span class="pre">nn.Embedding</span></code>, a forward overridden on an instance or hooked) takes
+none: the walk records why, and an adapter touching it is refused with that reason. So
+does a child its parent runs through the weight itself rather than its forward (folded at
+load, an <code class="docutils literal notranslate"><span class="pre">F.linear</span></code> over it), which the parent names in <code class="docutils literal notranslate"><span class="pre">lora_unservable</span></code> (a path
+below it -&gt; reason; a path that is not one of its submodules is a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>): MLA’s
+absorbed projections, SigLIP’s patch embedding, Command-A+’s fused decoder-layer
+projections, the Qwen3 talkers’ code-predictor heads. Nothing else can tell such a child from
+one whose forward runs: an undeclared one is bound, and its delta silently never
+added, so code that reads a linear’s weight directly declares it there.</p></li>
+<li><p><strong>Targets.</strong> One per role in a layer stack (<code class="docutils literal notranslate"><span class="pre">&lt;stack&gt;.N.&lt;role&gt;</span></code>, the first <code class="docutils literal notranslate"><span class="pre">ModuleList</span></code>
+or <code class="docutils literal notranslate"><span class="pre">Sequential</span></code> in the path, whatever it is named; <code class="docutils literal notranslate"><span class="pre">layers</span></code> set where a role is on
+some layers only), named by the role’s last component (<code class="docutils literal notranslate"><span class="pre">names</span></code> overrides), plus one per
+other module: one outside the stacks, or at a role whose entries differ in shape (UNet
+levels, vision stages), which is named by its path but keeps its role for <code class="docutils literal notranslate"><span class="pre">rows</span></code>.</p></li>
+<li><p><strong>What the model states.</strong> Only what modules cannot know. <code class="docutils literal notranslate"><span class="pre">rows</span></code>: a target that sees
+one row per segment (<code class="docutils literal notranslate"><span class="pre">PER_SEGMENT</span></code>: a head after the last-token select) or one per
+<code class="docutils literal notranslate"><span class="pre">k</span></code> folded tokens. <code class="docutils literal notranslate"><span class="pre">exclude</span></code> (with a reason): modules called outside the planned
+step, a text projection or a conditioning encoder run in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>.
+<code class="docutils literal notranslate"><span class="pre">deferred</span></code>: modules called both before the step and in it, whose delta the node adds
+itself where the step’s rows are planned (Qwen3.5 embeds a vision prompt’s text in
+<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>): bound as <code class="docutils literal notranslate"><span class="pre">lora_deferred</span></code>, which the module’s forward never adds.
+<code class="docutils literal notranslate"><span class="pre">embeddings=True</span></code> only when every embedding call is in the step; a deferred
+embedding is served without it. <code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> / <code class="docutils literal notranslate"><span class="pre">aliases</span></code> / <code class="docutils literal notranslate"><span class="pre">adapter_stacked_params</span></code>: the prefixes,
+names and split projections adapters write, rewritten to the checkpoint’s before the
+root’s rules place them. <code class="docutils literal notranslate"><span class="pre">ignore</span></code>: modules an adapter may carry that never run.</p></li>
+<li><p><strong>Several nodes.</strong> A model whose adapters reach several nodes (an LLM and its vision
+encoder, which a TP config may put on different ranks) returns a spec per node, the
+first keyed <code class="docutils literal notranslate"><span class="pre">&quot;lora&quot;</span></code> and the others apart, told about each other by
+<code class="docutils literal notranslate"><span class="pre">link_lora_specs</span></code>: a module belongs to the spec that places it (the one whose
+<code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> claim it most specifically, when several do), and the others leave
+it alone (<code class="docutils literal notranslate"><span class="pre">ignored_modules</span></code>), so one adapter file serves both. The one <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes them all, the conductor opens every request
+with the same adapter on each, and the startup check reads an adapter under every
+spec.</p></li>
+<li><p><strong>Binding and rows.</strong> <code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources</span></code> binds every placed module
+under <code class="docutils literal notranslate"><span class="pre">root_path</span></code>, after checking it is the declared target and that the pool’s
+shard is its rank-local shape (a module built whole on a TP node fails here, not in a
+forward). The engine (<code class="docutils literal notranslate"><span class="pre">engine_step</span></code>) adds each pool’s <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> to the node’s
+step from its segments, which are, in order, the rows its linears see (a request may
+have several: Chatterbox’s cond and uncond copies; Qwen3.5’s vision encoder: one
+segment per frame, the merger’s rows folding them). A step that lays its rows out
+otherwise declares its own <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under the pool’s key, which the engine keeps. A
+step that is <code class="docutils literal notranslate"><span class="pre">None</span></code> or declares no segments gets none, and an adapted module it runs
+refuses, so a node serving adapters returns a step with its segments wherever one runs.</p></li>
+<li><p><strong>Only inside the step.</strong> The pool holds a step’s addressing from its plan to its
+commit (or rollback), for the thread that planned it, so a delta called outside a step
+(<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>, which the async worker runs on the main thread while the GPU
+thread’s step is planned; an output cached from an earlier step) refuses, eager or
+compiled, instead of adding another step’s adapters to these rows. The engine’s own
+warm-ups outside any step (<code class="docutils literal notranslate"><span class="pre">compile_regions</span></code>, <code class="docutils literal notranslate"><span class="pre">warmup_compiles</span></code>) run as a step
+whose rows name no adapter: a compile there traces no delta, and the first step with
+an adapter row compiles its own. A piecewise region’s step takes its rows as the
+node’s does, from its own segments (an <code class="docutils literal notranslate"><span class="pre">attn_key</span></code> region’s: one per row), planned
+per replay and handing the enclosing step’s plan back at its commit. A region
+replayed as one row per step (<code class="docutils literal notranslate"><span class="pre">one_row_per_step</span></code>) addresses every row to the first
+request’s adapter, so the engine captures it base-only (<code class="docutils literal notranslate"><span class="pre">LoraBaseOnly</span></code>) and leases it
+only for a step none of whose rows runs an adapter; a step with one runs the region
+eagerly under the node’s step.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> produces an ordinary <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code>, whose parts follow.</p>
 <ul class="simple">
 <li><p><strong>Targets.</strong> <code class="docutils literal notranslate"><span class="pre">LoraTarget</span></code> gives the unsharded linear’s shape and how the base layer is
 split under tensor parallelism. For a column-parallel linear, A is replicated and B is
@@ -2703,8 +2780,9 @@ tower, and needs <code class="docutils literal notranslate"><span class="pre">le
 <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> then receives <code class="docutils literal notranslate"><span class="pre">[first_rid]</span></code> with every request’s <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code>, so the
 whole step’s segments count against one replay’s plan: size its attention resource with
 <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, and pair it with a <code class="docutils literal notranslate"><span class="pre">can_lease</span></code> that refuses a step with
-more. Such a region cannot declare a LoRA step, which would address every
-request’s tokens to the first request’s adapter; capture refuses it.</p></li>
+more. On a node serving LoRA adapters it is leased only for a step whose rows run
+none, since its replay would address every request’s tokens to the first request’s
+adapter.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code> lists the batch sizes to record. <code class="docutils literal notranslate"><span class="pre">None</span></code> uses the runner
 default.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture. The default is

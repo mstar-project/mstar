@@ -992,6 +992,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.knobs</span><span class="w"> </span><span class="kn">import</span> <span class="n">device_loopback_enabled</span>  <span class="c1"># noqa: F401  (re-export)</span>
 
 <span class="c1"># What ``check_stop`` returns, besides loop names, for a stop no loop can carry:</span>
@@ -1936,7 +1937,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># setting, so a new eager shape never searches.</span>
     <span class="n">capture_cudnn_benchmark</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
-    <span class="c1"># the LoRA pools among this node's resources; set by `bind_node_resources`</span>
+    <span class="c1"># The LoRA pools bound to this node's modules (``module_lora_spec``); set by</span>
+    <span class="c1"># `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,</span>
+    <span class="c1"># and to each piecewise region's (``lora_rows``), from its segments: in order, the</span>
+    <span class="c1"># rows the adapted linears see, each a request's span of tokens (a request may have</span>
+    <span class="c1"># several, as CFG's cond and uncond copies). A step that lays its rows out otherwise</span>
+    <span class="c1"># declares its own ``LoraStep`` under the pool's key.</span>
     <span class="n">lora_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1970,9 +1976,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">bind</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"bind_resources"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">bind</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">module</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">self</span><span class="p">:</span>
                 <span class="n">bind</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraAdapterPool</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">bind_module_lora</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">lora_keys</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">LoraAdapterPool</span><span class="p">))</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora_keys</span> <span class="o">=</span> <span class="n">bind_module_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.cg_key_info">
@@ -2451,10 +2457,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        precision; the node's resources are bound but nothing is admitted or</span>
 <span class="sd">        planned, so it must not read or change resource state. On a lockstep</span>
 <span class="sd">        node every rank calls it in the same order, so it may run the</span>
-<span class="sd">        collectives its forward runs. It runs outside a planned step, so a</span>
-<span class="sd">        node serving LoRA adapters runs no adapted linear here: an eager delta</span>
-<span class="sd">        refuses the call, and a compiled one would read another step's</span>
-<span class="sd">        addressing. Default: nothing."""</span></div>
+<span class="sd">        collectives its forward runs. A node serving LoRA adapters runs its</span>
+<span class="sd">        adapted linears here as in a step whose rows name no adapter. Default:</span>
+<span class="sd">        nothing."""</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.can_use_accelerator_graphs">
@@ -2648,6 +2653,33 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        call super()."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="lora_rows">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.lora_rows">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">lora_rows</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">lora_keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare</span>
+<span class="sd">    itself, its rows the step's segments, as a new step (a declaration reused across</span>
+<span class="sd">    calls keeps its own). A step without segments gets none: an adapted module it runs</span>
+<span class="sd">    refuses for want of a plan (``LoraLayerDelta``)."""</span>
+    <span class="k">if</span> <span class="n">lora_keys</span> <span class="ow">and</span> <span class="n">step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">segments</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">)</span>
+        <span class="n">added</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">LoraStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">lora_keys</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">}</span>
+        <span class="k">if</span> <span class="n">added</span><span class="p">:</span>
+            <span class="n">step</span> <span class="o">=</span> <span class="n">replace</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="o">**</span><span class="n">step</span><span class="o">.</span><span class="n">steps</span><span class="p">,</span> <span class="o">**</span><span class="n">added</span><span class="p">})</span>
+    <span class="k">return</span> <span class="n">step</span></div>
+
+
+
+<div class="viewcode-block" id="engine_step">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.engine_step">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">engine_step</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What the engine calls for a node's step: its ``declare_step``, with the LoRA</span>
+<span class="sd">    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes</span>
+<span class="sd">    no LoRA step."""</span>
+    <span class="c1"># the engine drives duck-typed submodules too</span>
+    <span class="k">return</span> <span class="n">lora_rows</span><span class="p">(</span><span class="n">submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">),</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"lora_keys"</span><span class="p">,</span> <span class="p">()))</span></div>
 
 
 

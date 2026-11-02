@@ -908,6 +908,8 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.engine_step"><code class="docutils literal notranslate"><span class="pre">engine_step()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.lora_rows"><code class="docutils literal notranslate"><span class="pre">lora_rows()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -929,6 +931,12 @@
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.chunk_tick_name" title="mstar.model.submodule_base.chunk_tick_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_tick_name</span></code></a>(node_name, graph_walk)</p></td>
 <td><p>The chunk Loop's loop-back signal, carrying nothing.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.engine_step" title="mstar.model.submodule_base.engine_step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">engine_step</span></code></a>(submodule, *args, **kwargs)</p></td>
+<td><p>What the engine calls for a node's step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with the LoRA pools' rows added (<code class="docutils literal notranslate"><span class="pre">lora_rows</span></code>), so a model serving LoRA from its modules writes no LoRA step.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.lora_rows" title="mstar.model.submodule_base.lora_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lora_rows</span></code></a>(step, lora_keys)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under each of <code class="docutils literal notranslate"><span class="pre">lora_keys</span></code> that it does not declare itself, its rows the step's segments, as a new step (a declaration reused across calls keeps its own).</p></td>
 </tr>
 </tbody>
 </table>
@@ -2770,10 +2778,9 @@ engine’s warmup, after capture, under <code class="docutils literal notranslat
 precision; the node’s resources are bound but nothing is admitted or
 planned, so it must not read or change resource state. On a lockstep
 node every rank calls it in the same order, so it may run the
-collectives its forward runs. It runs outside a planned step, so a
-node serving LoRA adapters runs no adapted linear here: an eager delta
-refuses the call, and a compiled one would read another step’s
-addressing. Default: nothing.</p>
+collectives its forward runs. A node serving LoRA adapters runs its
+adapted linears here as in a step whose rows name no adapter. Default:
+nothing.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
@@ -3190,6 +3197,39 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.engine_step">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">engine_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodule</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#engine_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.engine_step" title="Link to this definition">#</a></dt>
+<dd><p>What the engine calls for a node’s step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with the LoRA
+pools’ rows added (<code class="docutils literal notranslate"><span class="pre">lora_rows</span></code>), so a model serving LoRA from its modules writes
+no LoRA step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.lora_rows">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">lora_rows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_keys</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#lora_rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.lora_rows" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">LoraStep</span></code> under each of <code class="docutils literal notranslate"><span class="pre">lora_keys</span></code> that it does not declare
+itself, its rows the step’s segments, as a new step (a declaration reused across
+calls keeps its own). A step without segments gets none: an adapted module it runs
+refuses for want of a plan (<code class="docutils literal notranslate"><span class="pre">LoraLayerDelta</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>lora_keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -3461,6 +3501,8 @@ its FIRST chunk, so the conductor seeds one with the request’s inputs.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.engine_step"><code class="docutils literal notranslate"><span class="pre">engine_step()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.lora_rows"><code class="docutils literal notranslate"><span class="pre">lora_rows()</span></code></a></li>
 </ul>
   </nav></div>
 

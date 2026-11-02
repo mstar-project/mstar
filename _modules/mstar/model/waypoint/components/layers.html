@@ -1316,6 +1316,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    loader's concat into ``mlp.fc1``.</span>
 <span class="sd">    """</span>
 
+    <span class="n">lora_unservable</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">((</span><span class="s2">"mlp.fc1"</span><span class="p">,</span> <span class="s2">"mlp.fc2"</span><span class="p">),</span> <span class="s2">"run as F.linear over its weight, never its own forward"</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">WaypointConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>

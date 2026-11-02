@@ -742,7 +742,7 @@ model-supplied <code class="docutils literal notranslate"><span class="pre">conv
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">&lt;module&gt;</span></code> is a reference-library module path; the model’s checkpoint remap (the same one the
 weight loader uses) and its stacked-shard rules turn it into the native parameter and, for
-fused projections, the shard it lands on (a <code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code>’s <code class="docutils literal notranslate"><span class="pre">module_map</span></code>, and the static
+fused projections, the shard it lands on (the model side’s <code class="docutils literal notranslate"><span class="pre">ModuleLoraMap</span></code>, and the static
 merge’s <code class="docutils literal notranslate"><span class="pre">resolve_lora_module</span></code>).</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
