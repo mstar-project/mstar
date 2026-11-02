@@ -396,9 +396,9 @@ back. A dropped request waits until its history and one more page fit, then reco
 in one prefill row.
 
 Above one rank, on a worker that runs only some of a node's walks, on a node with a second
-paged KV cache, such as Whisper's decoder, and while no request on a node keeps its token ids,
-as on Qwen3-TTS's Talker, a decode step that finds no page and nothing to offload holds its
-requests until they time out. Elsewhere at one rank, a request that runs short and can neither
+paged KV cache, such as Whisper's decoder, and on a node with no rebuild policy and no host
+pool, such as Qwen3-TTS's Talker without ``cpu_offload_pages``, a decode step that finds no
+page and nothing to offload holds its requests until they time out. Elsewhere at one rank, a request that runs short and can neither
 move to the host nor be dropped waits for room when moving or dropping the newer requests
 wouldn't cover its shortage. When ``cpu_offload_pages`` can't hold the request, that is the
 case for a request with an image or audio in its KV, and for every request under
