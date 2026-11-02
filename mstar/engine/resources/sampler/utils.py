@@ -1691,6 +1691,8 @@ class AcceleratorGraphableSampler(BaseSampler):
     last_token_master: torch.Tensor | None = None
     slot_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
+    # One launch per draw (``sampler.filtered``, ``SamplerSpec.fused_draw``)
+    fused_draw: bool = False
 
     # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
@@ -1716,6 +1718,8 @@ class AcceleratorGraphableSampler(BaseSampler):
         apply_penalty: bool = False,
         apply_filters: bool = True,
     ):
+        if self.fused_draw and apply_filters and not apply_penalty and logits.shape[-1] <= FUSED_FILTER_MAX_VOCAB:
+            return self._sample_fused(logits)
         top_k, top_p = self.top_k_buf, self.top_p_buf
         if not apply_filters:
             # top-k 0 is "off"; captured, these are constant fills
@@ -1751,6 +1755,20 @@ class AcceleratorGraphableSampler(BaseSampler):
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
         return codes
+
+    @torch.compiler.disable
+    def _sample_fused(self, logits: torch.Tensor) -> torch.Tensor:
+        """``sample`` in one kernel, which also advances the offsets. A node
+        that opts in reads no token off the device (``SamplerResource``), so
+        nothing keeps the sampled row."""
+        from mstar.engine.resources.sampler.filtered import SAMPLE_FILTERED
+
+        tokens = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+        SAMPLE_FILTERED(
+            logits, self.temperature_buf, self.top_k_buf, self.top_p_buf, self.seed_buf, self.offset_buf,
+            tokens, _rng_offset_stride(logits.device.type, logits.shape[-1]),
+        )
+        return self._broadcast_tokens(tokens)
 
     @torch.compiler.disable
     def sample_unfiltered(self, logits: torch.Tensor) -> torch.Tensor:
@@ -2110,6 +2128,7 @@ class SamplerBuffers:
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
+    fused_draw: bool = False
     # Master row 0, never given to a request, so its config stays SamplingConfig().
     # Padding rows, unregistered rids and capture rows read it; in graph they write it.
     _trash_slot: ClassVar[int] = 0
@@ -2194,6 +2213,7 @@ class SamplerBuffers:
         ingraph_scatter: bool = False,
         slots: int | None = None,
         loopback_state: "Mapping[str, LoopbackState] | None" = None,
+        fused_draw: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2259,6 +2279,7 @@ class SamplerBuffers:
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
+            fused_draw=fused_draw,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
@@ -2291,6 +2312,7 @@ class SamplerBuffers:
             "last_token_master": self.last_token.master,
             "slot_idx_view": self._slot_idx_gpu[cg_slot, :bs],
             "ingraph_scatter": self.ingraph_scatter,
+            "fused_draw": self.fused_draw,
         }
 
     def _history_rows(self, bs: int, cg_slot: int) -> HistoryRows:
