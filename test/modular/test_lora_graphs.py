@@ -428,7 +428,7 @@ def test_a_piecewise_region_plans_its_own_lora_rows_and_one_row_replays_only_bas
     assert {spec.bucket.cg_key_info for spec in one_row._step_runner.built} == {LoraBaseOnly("N_region")}
     assert one_row.can_lease([], ["b0", "b1"]) and not one_row.can_lease([], ["b0", "r1"])
     # every row, not only the first one the replay names
-    with pytest.raises(RuntimeError, match="base-only"):
+    with pytest.raises(RuntimeError, match="replays one row per step"):
         one_row.run({}, request_ids=["b0", "r1"])
     assert runner.can_lease([], ["b0", "r1"])
 
