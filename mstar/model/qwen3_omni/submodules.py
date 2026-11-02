@@ -898,9 +898,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         back together before invoking ``Qwen3OmniThinkerModel.forward``.
 
         Returns None when no ``deepstack_*`` keys are present (e.g. for
-        prefill_text / prefill_audio / thinker_decode), so the inner model
-        receives ``deepstack_visual_embeds=None`` and skips the deepstack
-        splice entirely.
+        prefill_text / prefill_audio), so the inner model receives
+        ``deepstack_visual_embeds=None`` and skips the deepstack splice entirely.
         """
         num_deepstack = len(self.config.vision.deepstack_visual_indexes)
         if not any(f"deepstack_{i}" in kwargs for i in range(num_deepstack)):
