@@ -9,6 +9,7 @@ from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.context_parallel import positions_over_sp
+from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -547,6 +548,13 @@ def _sequence_parallel(
                 yield f"node_groups[{i}]: {e}"
         # a resource is sized by one head-shard count, which Engine.load_model checks again
         for spec in specs:
+            own_sp = sorted(node for node in spec.nodes if over.get(node) is False)
+            if isinstance(spec, LoraSpec) and own_sp:
+                yield (
+                    f"node_groups[{i}]: LoRA resource {spec.resource_key!r} serves {own_sp}, which run "
+                    "their own sequence parallelism: LoRA lays its rows out per request, while each SP "
+                    "rank holds a shard of the tokens"
+                )
             split = {node: over[node] for node in sorted(spec.nodes & over.keys())}
             if len(set(split.values())) > 1:
                 yield (

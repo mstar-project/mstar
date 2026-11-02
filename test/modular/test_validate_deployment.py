@@ -277,6 +277,20 @@ def test_parallel_node_group_over_a_node_without_support_is_refused(axis, patter
     _refused(_Model(), cfg, pattern)
 
 
+def test_the_sp_checks_run_when_the_lora_specs_fail_to_build(tmp_path, monkeypatch):
+    """Both problems are reported, not the build failure alone."""
+    from mstar import validation
+
+    def refuse(specs):
+        raise ValueError("a LoRA spec left no targets")
+
+    monkeypatch.setattr(validation, "built_resources", refuse)
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
+    problems = _problems(_Model(), cfg)
+    assert any("building the node resources failed" in p for p in problems), problems
+    assert any("node 'llm' on 2 SP ranks is not in sp_enabled_nodes" in p for p in problems), problems
+
+
 def _paged_llm(sp_enabled_nodes=(), **kw) -> _Model:
     kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,

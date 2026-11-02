@@ -24,7 +24,7 @@ def kv_head_replicas(num_kv_heads: int, tp_size: int) -> tuple[int, int]:
     ``r // replicas``, which is how the K/V projections load and how context parallelism
     picks the ranks sharing a head."""
     if max(tp_size, num_kv_heads) % min(tp_size, num_kv_heads):
-        raise ValueError(f"{num_kv_heads} KV heads do not split evenly over {tp_size} TP ranks")
+        raise ValueError(f"{num_kv_heads} heads do not split evenly over {tp_size} TP ranks")
     if tp_size >= num_kv_heads:
         return 1, tp_size // num_kv_heads
     return num_kv_heads // tp_size, 1

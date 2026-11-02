@@ -515,6 +515,18 @@ def test_a_replicated_slice_that_does_not_split_evenly_is_refused():
         LoraTarget(in_features=HIDDEN, out_slices=(12,), parallel="column", slice_units=(3,)).shard(4)
 
 
+def test_lora_over_a_node_running_its_own_sp_is_refused_before_spawn():
+    """validate_deployment refuses what LoraAdapterPool.build would on every worker."""
+    from types import SimpleNamespace
+
+    from mstar.validation.placement import _sequence_parallel
+
+    model = SimpleNamespace(get_default_sharding_config=lambda: SimpleNamespace(sp_enabled_nodes={"LLM"}))
+    group = SimpleNamespace(_group_id=0, _tp_comm_size=1, sp_size=2, section=SimpleNamespace(get_nodes=lambda: {"LLM"}))
+    [problem] = _sequence_parallel(model, [group], [make_spec({})])
+    assert "LoRA resource 'lora' serves ['LLM'], which run their own sequence parallelism" in problem
+
+
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
     """The conductor keeps only the targets the configured adapters touch and every
     worker builds just those."""
