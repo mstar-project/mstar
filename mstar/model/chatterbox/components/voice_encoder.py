@@ -17,12 +17,12 @@ import torch
 from torch import nn
 
 from mstar.model.chatterbox.components.audio_frontend import (
-    mel_filter_bank,
     stft_power,
     trim_silence,
 )
 from mstar.model.chatterbox.config import VoiceEncoderConfig
 from mstar.model.chatterbox.loader import DEFAULT_SKIP_FRAGMENTS, WeightStream, load_component
+from mstar.model.components.audio_features import librosa_mel_filters
 
 
 class VoiceEncoder(nn.Module):
@@ -39,7 +39,7 @@ class VoiceEncoder(nn.Module):
         self.proj = nn.Linear(cfg.hidden_size, cfg.speaker_embed_size)
         self.register_buffer(
             "mel_basis",
-            mel_filter_bank(cfg.sample_rate, cfg.n_fft, cfg.num_mels, cfg.fmin, cfg.fmax),
+            torch.from_numpy(librosa_mel_filters(cfg.sample_rate, cfg.n_fft, cfg.num_mels, cfg.fmin, cfg.fmax)),
             persistent=False,
         )
         self.register_buffer(
