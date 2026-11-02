@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.linear_attn.gdn_stage import stage_gdn_prefill_inputs
+from mstar.platforms.compile import compiled
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
@@ -110,6 +111,32 @@ class ConvMetadata:
 def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
     """``t`` with ``rows`` zeroed rows appended along dim 0."""
     return torch.cat((t, t.new_zeros((rows, *t.shape[1:]))), dim=0)
+
+
+# The chunked path's elementwise work around its kernels, compiled into one
+# kernel each: run eagerly, it was a dozen launches per layer and about a
+# third of a long prefill's GPU time on Qwen3.5-0.8B. Pointwise only, so
+# dynamic=True costs nothing here (unlike a reduction over a symbolic head dim).
+
+
+def _masked_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """``x`` with its rows where ``mask`` is 0 zeroed, by select (they can hold inf)."""
+    return torch.where(mask[: x.shape[0], None].bool(), x, torch.zeros((), dtype=x.dtype, device=x.device))
+
+
+def _chunked_gates(
+    a: torch.Tensor, b: torch.Tensor,
+    a_log: torch.Tensor, dt_bias: torch.Tensor, mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The decay (exponentiated, as FlashInfer takes it) and the learning
+    rate the chunked kernel reads, from the raw gate projections. The decode
+    kernel forms them from the same two weights, so the formula lives here
+    and there alike. Masked tokens get decay 1 and rate 0."""
+    keep = mask[: a.shape[0], None].bool()
+    zero = torch.zeros((), dtype=torch.float32, device=a.device)
+    g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float())
+    beta = torch.sigmoid(b.float())
+    return torch.exp(torch.where(keep, g, zero)), torch.where(keep, beta, zero)
 
 
 class GDNPrefillWrapper(GDNWrapper):
@@ -342,6 +369,12 @@ class GDNPrefillWrapper(GDNWrapper):
         )
         self._checkpoints = checkpoints
 
+    def _unpadded(self) -> bool:
+        """An eager step with no padding row: every token is real, so the
+        token mask is all ones and selecting by it is a full-size no-op copy
+        (~0.3 ms a layer on a 26k-token prefill)."""
+        return not self._accelerator_graph and not self._plan_borrowed
+
     def run_conv(
         self,
         x: torch.Tensor,
@@ -371,6 +404,8 @@ class GDNPrefillWrapper(GDNWrapper):
         )
 
         out = out.transpose(0, 1)
+        if self._unpadded():
+            return out
 
         # The kernel allocates its output with `empty_like` and writes only the
         # `cu_seqlens` range, so a capture bucket's padded tail keeps whatever
@@ -378,12 +413,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # same mask, so the tail never reaches a kernel.
         if self._stage_inputs:
             return out
-        # Select rather than multiply because the tail can hold inf.
-        return torch.where(
-            self._plan_state.token_mask[: out.shape[0], None].bool(),
-            out,
-            torch.zeros((), dtype=out.dtype, device=out.device),
-        )
+        return compiled(_masked_rows, dynamic=True)(out, self._plan_state.token_mask)
 
     def _save_conv_snapshots(self, x: torch.Tensor, conv_layer: torch.Tensor):
         """A snapshot's conv state is the inputs before its boundary, the
@@ -395,6 +425,11 @@ class GDNPrefillWrapper(GDNWrapper):
         conv_layer.index_copy_(0, index[2], x[window].transpose(1, 2).to(conv_layer.dtype))
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
+        """The chunked delta rule over the plan's sequences. Unstaged, ``q``,
+        ``k`` and ``v`` must have the padded tail zeroed, as ``run_conv``'s
+        output has under capture (the tail can hold inf; ``run`` zeroes only
+        the gates'), and as ``GDNMixedWrapper``'s does, which writes only its
+        decode run's rows over it. The stage reads them through the token mask."""
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
         slots = self._plan_state.slots.to(torch.int64)
@@ -439,30 +474,11 @@ class GDNPrefillWrapper(GDNWrapper):
                 normalize=self._qk_l2norm,
             )
         else:
-            # The chunked kernel takes the decay and the learning rate already
-            # formed, where the decode kernel takes `a`/`b` raw and forms them
-            # from the same two weights. Keep the formula here so the paths agree.
-            g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(
-                a.float() + dt_bias.float()
-            )
-            beta = torch.sigmoid(b.float())
             if rows:
-                q, k, v, g, beta = (
-                    _with_room(t, rows) for t in (q, k, v, g, beta)
-                )
-
-            # zero the padded tail so inf there can't poison the result
-            keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
-            def blank(t, shape):
-                return torch.where(
-                    keep.view(shape), t, torch.zeros((), dtype=t.dtype, device=t.device),
-                )
-
-            v = blank(v, (-1, 1, 1))
-            g = blank(g, (-1, 1))
-            beta = blank(beta, (-1, 1))
-            # FlashInfer wants the decay exponentiated; FLA's takes log space
-            alpha = torch.exp(g)
+                q, k, v, a, b = (_with_room(t, rows) for t in (q, k, v, a, b))
+            # The padded tail is zeroed so inf there can't poison the result: q, k
+            # and v by `run_conv`, whose output they are, the gates here.
+            alpha, beta = compiled(_chunked_gates, dynamic=True)(a, b, a_log, dt_bias, self._plan_state.token_mask)
 
         snapshot_args = {}
         if self._every:

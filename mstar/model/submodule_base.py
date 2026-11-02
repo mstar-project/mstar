@@ -1364,7 +1364,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         """
         Return the set of dynamic-loop names that should stop after this step.
@@ -1391,6 +1391,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
+
+        ``outputs`` is read-only, and each name's host copy is made when the
+        check first reads it.
 
         Default: no stops.
         """
@@ -1520,7 +1523,7 @@ class ARNodeSubmodule(NodeSubmodule):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         stop = self.token_stop
         if stop is None:

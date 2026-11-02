@@ -41,7 +41,7 @@ from mstar.api_server.auth import (
     warn_if_no_api_key,
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
-from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.data_worker import PreprocessWorker, _positive_int, unlink_files
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -1188,6 +1188,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1245,20 +1248,22 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                # Everything else that changes what a pass reads signals the poll:
+                # a message, the data worker's flush (``ResultQueue``) and a
+                # request handler (``_wake_message_loop``). Only the liveness
+                # check and the delivery TTL are on a timer. Inside the try: a
+                # transport error from the wait is a failed pass, not the end of
+                # the thread that delivers every request's results.
+                wait_s = next_liveness_check - time.monotonic()
+                if next_expiry is not None:
+                    wait_s = min(wait_s, next_expiry - time.time())
+                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
             except Exception:
+                # the next pass goes after the back-off, without a wait: the
+                # prune may not have run
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-                # the prune may not have run: the next pass goes after the back-off
-                next_expiry = time.time()
-            # Everything else that changes what a pass reads signals the poll:
-            # a message, the data worker's flush (``ResultQueue``) and a
-            # request handler (``_wake_message_loop``). Only the liveness
-            # check and the delivery TTL are on a timer.
-            wait_s = next_liveness_check - time.monotonic()
-            if next_expiry is not None:
-                wait_s = min(wait_s, next_expiry - time.time())
-            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
@@ -1787,12 +1792,6 @@ class WarmupMedia:
                 f"cannot determine modality for warmup file {path!r}; set 'modality'"
             )
         return cls(path=path, modality=modality)
-
-
-def _positive_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return value
 
 
 @dataclass

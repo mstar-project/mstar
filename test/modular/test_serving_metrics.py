@@ -1052,7 +1052,7 @@ class _RealDataWorker:
     """The API server on the real data worker: its facade and its thread, a
     stand-in transport and conductor, and the API server's message thread."""
 
-    def __init__(self, tmp_path, *, metrics, enable_prof=False):
+    def __init__(self, tmp_path, *, metrics, enable_prof=False, preprocess_workers=1):
         from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 
         self.model, self.sent, self.tmp_path = _MediaModel(), [], tmp_path
@@ -1083,7 +1083,9 @@ class _RealDataWorker:
             tensor_manager=facade.tensor_manager, model=self.model, enable_prof=enable_prof,
             timing_requested=facade.timing_requested,
             worker_metrics_requested=facade.worker_metrics_requested,
+            preprocess_workers=preprocess_workers,
         )
+        facade.data_worker = worker
         facade.thread = threading.Thread(target=worker.run, daemon=True)
         facade.thread.start()
         self.server = make_test_api_server(
@@ -1223,10 +1225,14 @@ def test_the_data_worker_times_preprocessing_and_counts_failures_by_input_modali
     assert not _upload_buckets(s, "text")
 
 
-def test_queue_depth_counts_requests_waiting_for_the_data_worker(real_data_worker, tmp_path):
-    """Read at scrape time: requests queued behind the one the data worker is
-    working on. Its preprocess time leaves their wait in the queue out."""
-    served = real_data_worker(metrics=True)
+@pytest.mark.parametrize("preprocess_workers", [1, 2], ids=["inline", "pool"])
+def test_queue_depth_counts_requests_waiting_for_the_data_worker(
+    real_data_worker, tmp_path, preprocess_workers,
+):
+    """Read at scrape time: the requests waiting behind the one being prepared,
+    the same with or without a pool (one the pool has prepared still waits its
+    turn). Its preprocess time leaves their wait in the queue out."""
+    served = real_data_worker(metrics=True, preprocess_workers=preprocess_workers)
     clip = _wav(tmp_path / "clip.wav", 0.5)
     assert served.scrape()[("mstar_data_worker_queue_depth", _labels())] == 0
 
@@ -1235,14 +1241,19 @@ def test_queue_depth_counts_requests_waiting_for_the_data_worker(real_data_worke
     queued_at = time.perf_counter()
     served.submit("transcribe", [("audio", clip)], ("audio", "text"))
     served.submit("transcribe", [("audio", clip)], ("audio", "text"))
-    assert served.scrape()[("mstar_data_worker_queue_depth", _labels())] == 2
+    # _wait: the pool's prepare can signal before the data worker records it
+    _wait(lambda: served.scrape()[("mstar_data_worker_queue_depth", _labels())] == 2)
     time.sleep(0.2)
     waited = time.perf_counter() - queued_at
+    # settled too: on the pool, #1 is prepared and waits its turn behind "hold"
+    assert served.scrape()[("mstar_data_worker_queue_depth", _labels())] == 2
     served.model.release.set()
     _wait(lambda: _preprocessed(served.scrape()) == 3)
 
     s = served.scrape()
     assert s[("mstar_data_worker_queue_depth", _labels())] == 0
+    if preprocess_workers > 1:
+        return  # a pooled request's time runs from its prepare to its hand-off
     held_n, held_s = _data_worker_hist(s, "text")
     assert held_n == 1 and held_s >= waited
     queued_n, queued_s = _data_worker_hist(s, "audio,text")

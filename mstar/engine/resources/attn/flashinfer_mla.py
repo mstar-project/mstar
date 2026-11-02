@@ -354,6 +354,8 @@ class FlashInferMLAManager(AttentionManager):
         queries (and the entries the step appends) start."""
         return self._current_plan_states[label]._kv_len_buf
 
+    # eager as a whole, as FlashInferManager.select_last_hidden explains
+    @torch.compiler.disable
     def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
         last = (self.qo_indptr_buf(label)[1:] - 1).long()
         return hidden.index_select(0, last)

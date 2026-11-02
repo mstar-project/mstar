@@ -295,6 +295,8 @@ class Qwen3_5DenseModel(Model):
                     max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
+                    # the tower's compiled block loop keeps attention in its graph
+                    compile_op=True,
                 ),
             ),
         ]

@@ -202,6 +202,8 @@ class XPUPagedAttentionManager(AttentionManager):
         plan = self._current_plans.get(label)
         return None if plan is None else plan.cu_q
 
+    # eager as a whole, as FlashInferManager.select_last_hidden explains
+    @torch.compiler.disable
     def select_last_hidden(
         self, hidden: torch.Tensor, label: str = "main",
     ) -> torch.Tensor:

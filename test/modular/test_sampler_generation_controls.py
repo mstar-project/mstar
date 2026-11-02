@@ -614,6 +614,56 @@ def test_fused_filter_matches_upstream(vocab):
         torch.testing.assert_close(got[i], want, rtol=1e-4, atol=1e-6)
 
 
+@needs_cuda
+@pytest.mark.parametrize("vocab", [2048, 3072, 4096])
+def test_fused_sample_draws_from_the_filtered_distribution(vocab):
+    """``fused_sample`` (one launch for small vocabularies) against the
+    temperature -> presence penalty -> top-k -> top-p distribution in
+    FlashInfer's order: no token outside the kept set is ever drawn, the
+    empirical distribution over 4096 draws per setting is within sampling
+    noise of it, temperature 0 is the argmax, and a (seed, offset) draws the
+    same token at any batch position."""
+    from mstar.engine.resources.sampler.utils import fused_sample
+
+    torch.manual_seed(0)
+    dev, draws = torch.device("cuda"), 4096
+    settings = [  # temperature, top_k, top_p, penalty
+        (0.9, 50, 1.0, 1.0), (1.0, 0, 1.0, 1.0), (0.7, 0, 0.8, 1.0), (1.3, 20, 0.6, 1.0),
+        (0.9, 50, 1.0, 1.3), (0.0, 50, 1.0, 1.0), (1.0, 1, 1.0, 1.0),
+    ]
+    n = len(settings)
+    logits = torch.randn(n, vocab, device=dev) * 3
+    logits[:, vocab - 7:] = float("-inf")  # masked tokens are never drawn
+    seen = torch.rand(n, vocab, device=dev) < 0.1
+    temp = torch.tensor([s[0] for s in settings], device=dev)
+    top_k = torch.tensor([s[1] for s in settings], device=dev, dtype=torch.int32)
+    top_p = torch.tensor([s[2] for s in settings], device=dev)
+    pen = torch.tensor([s[3] for s in settings], device=dev)
+    rows = torch.arange(n, device=dev).repeat_interleave(draws)
+    seed = (rows * 7919 + 13).to(torch.int64)
+    offset = torch.arange(draws, device=dev).repeat(n).to(torch.int64)
+    tokens = fused_sample(
+        logits[rows], temp[rows], top_k[rows], top_p[rows], seed, offset, pen[rows], seen[rows],
+    ).view(n, draws)
+    for i, (t, k, p, a) in enumerate(settings):
+        x = logits[i].float()
+        x = torch.where(seen[i], torch.where(x > 0, x / a, x * a), x)
+        if t == 0:
+            assert (tokens[i] == x.argmax()).all()
+            continue
+        want = reference_probs(x, RefRow(temperature=t, top_k=k, top_p=p, top_p_first=False), stop_ids=())
+        got = torch.bincount(tokens[i], minlength=vocab).float() / draws
+        assert (want[got > 0] > 0).all(), i
+        assert 0.5 * (got - want).abs().sum().item() < 0.06 + 2 * (want > 0).sum().item() ** 0.5 / draws ** 0.5, i
+    # the same (seed, offset) at another batch position
+    flip = torch.arange(n * draws - 1, -1, -1, device=dev)
+    again = fused_sample(
+        logits[rows][flip], temp[rows][flip], top_k[rows][flip], top_p[rows][flip], seed[flip], offset[flip],
+        pen[rows][flip], seen[rows][flip],
+    )
+    assert torch.equal(again[flip].view(n, draws), tokens)
+
+
 def test_a_windowed_penalty_needs_no_seen_token_mask():
     """A windowed repetition penalty counts the generation history, so a node with the
     history (``max_repetition_window``) and no seen-token mask admits it; a whole-

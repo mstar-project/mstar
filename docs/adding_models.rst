@@ -1261,6 +1261,11 @@ methods are:
    The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
    stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
    row whose token is a stop id (the Qwen3-TTS Talker).
+   Only an output that leaves by a streaming edge can be withheld (any other consumer
+   would wait for an item that never comes), and not one that a node this worker
+   speculates into reads, nor the loop-back signal. Startup refuses a
+   ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
+   checked.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
@@ -2184,6 +2189,12 @@ A permute in ``postprocess`` costs a host copy of the whole clip, or a slower co
 frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
 copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
 the CPUs.
+
+A model whose media load and ``process_prompt`` are thread-safe can also prepare several
+requests at once on a thread pool by setting ``PREPROCESS_WORKERS`` on the class above 1
+(the default 1 prepares them one at a time on the data-worker thread). The class value is
+the default pool size, which a deployment may change with ``preprocess_workers`` (see
+:doc:`serving`); a class left at 1 gets no pool. Requests are still handed on in arrival order.
 
 .. _tensor-parallelism:
 

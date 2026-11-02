@@ -196,9 +196,10 @@ request's media and runs the model's prompt processing, one request at a time.
    :ref:`upload size <metrics-buckets>`.
 
 ``mstar_data_worker_queue_depth{model_name}``
-   Gauge, read at scrape time. Requests submitted and not yet taken up by the data
-   worker; the one it is working on is not counted. A request whose client went away
-   counts until the data worker takes it up.
+   Gauge, read at scrape time. Inputs (requests and client-stream appends) waiting in
+   the data worker: submitted, and neither being prepared nor handed on to the
+   conductor yet. One whose client went away counts until its turn comes and it is
+   dropped.
 
 HTTP refusals
 -------------

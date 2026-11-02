@@ -10,6 +10,7 @@ late results.
 
 import queue
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
@@ -56,9 +57,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt.discard_tensor_queue = queue.Queue()
     wt.stop_event = threading.Event()
     wt.timing_requested = threading.Event()
-    wt.communicator = SimpleNamespace(
-        get_all_new_messages=lambda: [], send=lambda *args: None,
-    )
+    wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [], send=lambda *args: None)
     cleaned = []
     wt.tensor_manager = SimpleNamespace(
         force_cleanup_request=cleaned.append,
@@ -75,6 +74,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt._draining_rids = set()
     wt._reads_done_sent = set()
     wt._live_requests = {}
+    wt._preparing = deque()
 
     wt.in_queue.put(PreprocessInput(
         request_id="r1", text="x", file_paths=None,

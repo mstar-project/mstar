@@ -62,6 +62,16 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
             )
 
 
+def _speculates_into(node, edge, nodes: dict, submodules: dict) -> bool:
+    """Whether this worker may run ``edge``'s consumer speculatively, on the
+    step's outputs before the step's postprocess has seen them."""
+    target = nodes.get(edge.next_node)
+    return (
+        node.enable_async_scheduling and edge.next_node in submodules
+        and target is not None and target.enable_async_scheduling
+    )
+
+
 def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
     """A spanned output is cut after its step ends, but speculation hands a
     step's outputs to the next step before then: no spanned output may feed a
@@ -74,15 +84,39 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
                 continue
             spanned = submodule.spanned_outputs(walk)
             for edge in node.outputs:
-                target = nodes.get(edge.next_node)
-                if (
-                    edge.name in spanned and edge.next_node in submodules
-                    and target is not None and target.enable_async_scheduling
-                ):
+                if edge.name in spanned and _speculates_into(node, edge, nodes, submodules):
                     raise ValueError(
                         f"{type(model).__name__}: {name!r} spans {edge.name!r}, which "
                         f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
                         "set enable_async_scheduling=False on one of them"
+                    )
+
+
+def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
+    """A withheld output (``TokenStop.withhold``) is left out of the route
+    after the stop check, so it must be one the worker routes as a tensor on
+    a streaming edge (which then gets no item; any other consumer would wait
+    for one), and that no speculated step reads first. The loop-back signal
+    (``ARNodeSubmodule.device_loopback``) is sent inline or kept on the
+    device, so withholding it does nothing."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        nodes = section.get_nodes()
+        for name, node in nodes.items():
+            submodule = submodules.get(name)
+            stop = getattr(submodule, "token_stop", None)
+            if stop is None:
+                continue
+            loopback = getattr(submodule, "device_loopback", None)
+            loopback_signal = loopback.signal if loopback is not None and loopback.walk == walk else None
+            for edge in node.outputs:
+                if edge.name in stop.withhold and (
+                    not edge.is_streaming or edge.name == loopback_signal
+                    or _speculates_into(node, edge, nodes, submodules)
+                ):
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} withholds {edge.name!r} in walk {walk!r}; "
+                        "only a streaming edge's output that no speculated node on this worker reads, "
+                        "and not the loop-back signal, can be withheld"
                     )
 
 
@@ -189,6 +223,7 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
+        _refuse_unroutable_withholds(submodules, model)
         no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
         engine = Engine(
