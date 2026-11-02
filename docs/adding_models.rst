@@ -2104,15 +2104,19 @@ whatever ``decode_tensor_cores`` says). Any other step attends its stored contex
 and its own tokens from the ``k`` and ``v`` the layer passes ``run`` (MLA's latents as ``k``), so
 a layer that calls ``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention``
 do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first and rotates it
-when the step attends it (``Qwen3Attention``).
+when the step attends it (``Qwen3Attention``). In SP mode, rank ``r`` attends only the step's
+own tokens in *zigzag* chunks ``r`` and ``2P - 1 - r`` of each row's ``2P`` (``zigzag_rows``),
+which shares the causal work about evenly on rows of ``2P`` tokens or more; it merges them into
+its context partial before the gather.
 
 MLA plans on FA3 (Hopper) or FA2 and refuses a ``context_only`` step. That planner caps a plan's
 work items, which TP mode reaches ``P`` times sooner, and counts each rank's own KV lengths, so
-admission refuses a step whose bound from its query lengths alone passes the cap, on every rank
-alike, and the worker retries it with the requests that fit (a prompt past the cap alone fails).
-The bound copies FlashInfer 0.7.2's rules, so another FlashInfer is refused at load, as is a
-per-rank head count that doesn't divide 64 (the planner's causal tile check). GLM-5.2 with
-``dsa_long_context`` off loads under ``context_parallel``.
+admission refuses a step whose bound from its query lengths alone passes the cap (in SP mode, for
+every partner's zigzag share, padded as its capture pads it), on every rank alike, and the worker
+retries it with the requests that fit (a prompt past the cap alone fails). The bound copies
+FlashInfer 0.7.2's rules, so another FlashInfer is refused at load, as is a per-rank head count
+that doesn't divide 64 (the planner's causal tile check). GLM-5.2 with ``dsa_long_context`` off
+loads under ``context_parallel``.
 
 .. note::
 

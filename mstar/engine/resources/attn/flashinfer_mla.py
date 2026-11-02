@@ -26,7 +26,13 @@ from mstar.engine.resources.attn.base import (
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel
+from mstar.engine.resources.context_parallel import (
+    ContextParallel,
+    one_slot_pages,
+    padded_share,
+    zigzag_capture,
+    zigzag_share,
+)
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import (
@@ -298,11 +304,13 @@ class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
                 f"{self._out_buf.shape[0]} this graph-mode wrapper was built for"
             )
             owned = dict(out=self._out_buf[:n], lse=self._lse_buf[:n] if return_lse else None)
-        return super().run(q_nope, q_pe, latent.unsqueeze(1), return_lse=return_lse, **owned)
+        return super().run(q_nope, q_pe, one_slot_pages(latent), return_lse=return_lse, **owned)
 
 
 class FlashInferMLAManager(AttentionManager):
     supports_context_parallel = True
+    # q_nope, q_pe
+    _query_parts = 2
 
     def __init__(
         self,
@@ -375,8 +383,9 @@ class FlashInferMLAManager(AttentionManager):
                 )
             # FA's causal tile-bound check can refuse a causal plan at a head count that doesn't divide
             # its query tile, which is 64 on a plan averaging few queries a row (a captured bucket's
-            # padding rows make one). The backend is pinned, so such a step would fail mid-serving
-            # rather than fall through: refused here instead, under TP placement too
+            # padding rows, or a zigzag share's empty ones, make one). The backend is pinned, so such
+            # a step would fail rather than fall through, under SP placement on one partner's share
+            # alone: refused here instead, under TP placement too
             heads = self._kv_config.num_qo_heads
             if 64 % heads:
                 raise ValueError(
@@ -385,6 +394,9 @@ class FlashInferMLAManager(AttentionManager):
                     "use a TP size that gives each rank a head count dividing 64, or turn context_parallel off"
                 )
             self._fa_sm_count = _sm_count(self._device)
+            if self._fa_sm_count is not None:
+                # only where the FA planner plans: elsewhere there is nothing to refuse
+                self._plan_check = self._refuse_unplannable
 
     @property
     def uses_kernel(self) -> bool:
@@ -454,7 +466,7 @@ class FlashInferMLAManager(AttentionManager):
 
     def admit(self, step: AttentionStep, ctx: StepContext) -> AdmitOutcome:
         """Over a placed pool on the FA planner, refuses a step its planner may not hold
-        (``_refuse_past_work_item_cap``) before it is planned, so the worker retries it smaller:
+        (``_refuse_unplannable``) before it is planned, so the worker retries it smaller:
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
         query lengths alone, so every rank refuses alike."""
@@ -466,7 +478,8 @@ class FlashInferMLAManager(AttentionManager):
         for segment in step.segments:
             rows.setdefault(segment.request_id, {})[segment.label] = segment.span
         spans = list(rows.values())
-        if self._fits(spans):
+        # a captured step's own-token plans are padded to its bucket's tokens, and bounded so at plan
+        if self._fits(spans, None if ctx.slot_lease is None else ctx.slot_lease.bucket.num_tokens):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
                 f"context-parallel KV pool {self._kv_cache_name!r}"
@@ -492,16 +505,23 @@ class FlashInferMLAManager(AttentionManager):
             rows_sized=len(real),
         ))
 
-    def _fits(self, rows: list[dict[str, int]]) -> bool:
-        """Whether each label's plan over ``rows`` (label -> queries, a request each) stays within
-        the FA planner's work-item cap."""
-        labels = {label for row in rows for label in row}
-        heads = self._wrapper_kwargs["num_qo_heads"]
-        return all(
-            fa_work_items_bound(np.cumsum([0, *(row[label] for row in rows if label in row)]), heads,
-                                self._fa_sm_count) <= _FA_MAX_WORK_ITEMS
-            for label in labels
-        )
+    def _fits(self, rows: list[dict[str, int]], captured_tokens: int | None = None) -> bool:
+        """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
+        the FA planner's work-item cap: its context's, and under SP placement every partner's
+        zigzag share of its own tokens, padded as a capture of ``captured_tokens`` pads it."""
+        heads, size = self._wrapper_kwargs["num_qo_heads"], self._placement.size
+        for label in {label for row in rows for label in row}:
+            qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
+            plans = [qo]
+            if self._placement.over_sp:
+                shares = [zigzag_share(qo, size, index) for index in range(size)]
+                if captured_tokens is not None:
+                    shape = zigzag_capture(size, len(qo) - 1, captured_tokens)
+                    shares = [padded_share(share, *shape) for share in shares]
+                plans += shares
+            if any(fa_work_items_bound(plan, heads, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan in plans):
+                return False
+        return True
 
     def _cap_hint(self) -> str:
         if self._placement.over_sp:
@@ -546,27 +566,26 @@ class FlashInferMLAManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, ctx.slot, is_decode)
             if self._placement is not None:
-                self._refuse_past_work_item_cap(indptrs.qo_indptr)
                 wrapper.plan(kv_out, causal=step.causal)
             else:
                 wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
 
-    def _refuse_past_work_item_cap(self, qo_indptr: torch.Tensor) -> None:
-        """Refuses, before FlashInfer can, a step its FA planner may not hold. The planner counts
-        this rank's own KV lengths, so its refusal could come on one rank of the lockstep instance
-        alone; the bound reads the step's query lengths, the same on every rank. A backstop: ``admit``
-        bounds the same plan, a capture's padding rows included, and refuses such a step first."""
-        if self._fa_sm_count is None:
-            return
+    def _refuse_unplannable(self, what: str, qo_indptr: np.ndarray) -> None:
+        """Refuses, before FlashInfer can, a plan past its FA planner's work-item cap
+        (``ContextParallelWrapper``'s ``check``). The planner counts the KV lengths a rank plans,
+        which differ by rank over a placed pool, so its refusal could come on one rank alone; the
+        bound reads the query lengths alone. Under SP placement the context's and the own tokens'
+        heads are the same. A backstop: ``admit`` bounds the same plans, a capture's padding
+        included (``_fits``), and refuses such a step first."""
         heads = self._wrapper_kwargs["num_qo_heads"]
         bound = fa_work_items_bound(qo_indptr, heads, self._fa_sm_count)
         if bound > _FA_MAX_WORK_ITEMS:
             raise ValueError(
-                f"a step of {int(qo_indptr[-1])} query tokens at {heads} heads can take FlashInfer's FA MLA "
-                f"planner up to {bound} work items over context-parallel KV pool {self._kv_cache_name!r}, past "
-                f"its cap of {_FA_MAX_WORK_ITEMS}.{self._cap_hint()}"
+                f"{what}, {int(qo_indptr[-1])} queries at {heads} heads, can take FlashInfer's "
+                f"FA MLA planner up to {bound} work items over context-parallel KV pool "
+                f"{self._kv_cache_name!r}, past its cap of {_FA_MAX_WORK_ITEMS}.{self._cap_hint()}"
             )
 
     def clear_preplan(self):
