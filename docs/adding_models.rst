@@ -2781,7 +2781,7 @@ Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **
 ``mstar.model.keys``' ``SAMPLER``, and the positions under the node's ``POS_KEY``
 (``ROPE`` unless the model's layers name another ``pos_key``). ``MSTAR_DECODE_BUCKETS``
 sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt
-rows, ``COMPILE_MODE`` names every capture's ``compile_mode`` (``None``, the default,
+rows, ``capture_compile_mode(walk)`` names a capture's ``compile_mode`` (``None``, the default,
 takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
 only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
 calls it something other than ``prefill_<name>`` (the Cosmos3 reasoner's

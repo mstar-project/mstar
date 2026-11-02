@@ -34,8 +34,6 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     # stay on the device, which the loop-back needs: the sampler keeps no slot
     # masters for it.
     reads_device_loopback = False
-    # max-autotune until the default compile level (mstar serve -O) is measured on this model
-    COMPILE_MODE = "max-autotune-no-cudagraphs"
     # A prompt is a voice and its text, so the ladder stops at 1024: a longer
     # step runs eagerly rather than every capture being sized for 8192.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
@@ -49,6 +47,10 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     MIXED_MAX_PREFILL_ROWS = None
     # tokens a step runs, a prompt's chunk and any decode rows beside it
     MAX_BATCH_TOKENS = 512
+
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # max-autotune until the default compile level (mstar serve -O) is measured on this model
+        return "max-autotune-no-cudagraphs"
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # decode streams its token to SNAC, not to the client: nothing to inline

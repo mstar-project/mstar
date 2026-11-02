@@ -54,8 +54,6 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
     reads_device_loopback = False
-    # torch.compile's own mode (cuBLAS GEMMs, no autotuning), the fastest here
-    COMPILE_MODE = "default"
     _capture_block_warned = False
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
@@ -114,7 +112,8 @@ class Glm52LLMSubmodule(SampledTokenDecoder):
         return blocked
 
     def _compile_flags(self) -> dict[str, Any]:
-        return {"compile": self.config.graph_compile, "compile_mode": self.COMPILE_MODE}
+        # "default" is torch.compile's own mode (cuBLAS GEMMs, no autotuning), the fastest here
+        return {"compile": self.config.graph_compile, "compile_mode": "default"}
 
     @property
     def disable_torch_compile(self) -> bool:

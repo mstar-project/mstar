@@ -88,8 +88,6 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
 
 class HiggsAudioLLMSubmodule(SampledTokenDecoder):
     ATTN_KEY = ATTN
-    # max-autotune until the default compile level (mstar serve -O) is measured on this model
-    COMPILE_MODE = "max-autotune-no-cudagraphs"
     # the ladders higgs captured before moving onto the scaffold
     PREFILL_MEDIA_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
@@ -97,6 +95,10 @@ class HiggsAudioLLMSubmodule(SampledTokenDecoder):
     # decode reads its ids back from the routed token and emits a tensor a
     # request, as before the scaffold; the device path is a measured change
     reads_device_loopback = False
+
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # max-autotune until the default compile level (mstar serve -O) is measured on this model
+        return "max-autotune-no-cudagraphs"
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         return {}

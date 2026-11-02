@@ -113,9 +113,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4]
     # A mixed step's token ladder; None runs it on PREFILL_TOKEN_BUCKETS
     MIXED_TOKEN_BUCKETS: list[int] | None = None
-    # Every capture's torch.compile mode (`capture_compile_mode` may pick one
-    # per walk); None takes the deployment's compile level (mstar serve -O).
-    COMPILE_MODE: str | None = None
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
@@ -257,9 +254,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         return configs
 
     def capture_compile_mode(self, graph_walk: str) -> str | None:
-        """The torch.compile mode of the capture ``graph_walk`` names."""
+        """The torch.compile mode of the capture ``graph_walk`` names; None
+        takes the deployment's compile level (mstar serve -O)."""
         del graph_walk
-        return self.COMPILE_MODE
+        return None
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None

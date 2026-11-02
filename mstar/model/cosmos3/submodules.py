@@ -3132,8 +3132,6 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     DECODE_WALK = REASONER_DECODE_WALK
     DECODE_LOOP = REASONER_DECODE_LOOP
     ATTN_KEY = ATTN
-    # max-autotune until the default compile level (mstar serve -O) is measured on this model
-    COMPILE_MODE = "max-autotune-no-cudagraphs"
     # the prefills, which capture nothing, run eagerly and uncompiled (and every
     # step does with accelerator graphs off)
     disable_torch_compile = True
@@ -3150,6 +3148,10 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
+
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # max-autotune until the default compile level (mstar serve -O) is measured on this model
+        return "max-autotune-no-cudagraphs"
 
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
