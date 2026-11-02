@@ -41,11 +41,11 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.resources.lora.checkpoint import LoraFile
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
-from mstar.model.components.diffusion.lora import LoraSpec
 from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
@@ -142,7 +142,7 @@ class Flux2KleinModel(Model):
         # (wait for the step, then batch everything ready), which is within a few percent.
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
-        self.loras = [LoraSpec.parse(item) for item in (lora or [])]
+        self.loras = [LoraFile.parse(item) for item in (lora or [])]
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
