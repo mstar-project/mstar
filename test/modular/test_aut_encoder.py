@@ -76,6 +76,10 @@ def test_token_arithmetic_matches_hf_formula():
     cfg = AuTEncoderConfig()
     for n in [1, 37, 99, 100, 101, 230, 1000, 3000, 30017]:
         assert cfg.tokens_for_frames(n) == int(_get_feat_extract_output_lengths(torch.tensor(n)))
+    # chunks of the checkpoint's own n_window, as HF counts them
+    wide = AuTEncoderConfig(n_window=52)
+    for n in [104, 164, 1000]:
+        assert wide.tokens_for_frames(n) == int(_get_feat_extract_output_lengths(torch.tensor(n), n_window=52))
     assert cfg.chunk_frames == 100 and cfg.tokens_per_chunk == 13 and cfg.window_tokens == 104
     assert cfg.window_lengths(30) == [30]
     assert cfg.window_lengths(104 * 3 + 5) == [104, 104, 104, 5]

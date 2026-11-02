@@ -2,7 +2,7 @@
 
 A packed replay copies only the step's real rows into the captured static input, so the rows behind them keep whatever
 an earlier, longer step left there. The Talker's residual stream is written in place, and if it started at that input
-those rows would gain every layer's output on each replay.
+(``run_layers`` starts it from a copy) those rows would gain every layer's output on each replay.
 """
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, autoca
 from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.qwen3_tts.components.talker import Qwen3TTSCodePredictor, Qwen3TTSTalkerModel
+from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     TALKER_KV,
     Qwen3TTSCodePredictorConfig,
@@ -55,7 +56,9 @@ def _config() -> Qwen3TTSModelConfig:
 def _submodule(config: Qwen3TTSModelConfig) -> TalkerSubmodule:
     torch.manual_seed(0)
     talker = Qwen3TTSTalkerModel(config)
-    code_predictor = Qwen3TTSCodePredictor(config)
+    code_predictor = ResidualCodePredictor(
+        config.code_predictor, config.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE, embed_sum_dtype=None,
+    )
     for module in (talker, code_predictor):
         for name, param in module.named_parameters():
             if "norm" in name:
@@ -73,7 +76,7 @@ class _Node:
     """The node's resources as the engine builds them and the step cycle around the submodule: with ``capture``, the
     engine's replay path (lease, pad, declare over the padded ids, plan, stage and replay)."""
 
-    def __init__(self, capture: bool, measured: bool):
+    def __init__(self, capture: bool):
         config = _config()
         model = Qwen3TTSModel.__new__(Qwen3TTSModel)
         model.config = config
@@ -95,7 +98,6 @@ class _Node:
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         self.overrides = model.get_request_resource_configs({}, model_kwargs={"do_sample": False})
         self.sub = _submodule(config)
-        self.sub.model.model.fused_add_norm = measured
         self.sub.bind_node_resources(self.resources)
         self.hidden: torch.Tensor | None = None
         self.sub.model.register_forward_hook(self._keep_hidden)
@@ -176,15 +178,14 @@ def _prompts(lengths: tuple[int, ...], seed: int) -> dict[str, torch.Tensor]:
     }
 
 
-@pytest.mark.parametrize("measured", [True, False], ids=["fused", "plain"])
-def test_packed_replays_leave_the_static_input_alone(monkeypatch, measured):
+def test_packed_replays_leave_the_static_input_alone(monkeypatch):
     monkeypatch.setattr(TalkerSubmodule, "PREFILL_TOKEN_BUCKETS", [BUCKET])
     monkeypatch.setattr(TalkerSubmodule, "PREFILL_CAPTURE_BATCH_SIZES", [ROWS])
     packed_only = TalkerSubmodule.get_accelerator_graph_configs
     monkeypatch.setattr(
         TalkerSubmodule, "get_accelerator_graph_configs", lambda self, device, tp=1: packed_only(self, device, tp)[:1],
     )
-    packed, eager = _Node(capture=True, measured=measured), _Node(capture=False, measured=measured)
+    packed, eager = _Node(capture=True), _Node(capture=False)
 
     for seed, lengths in enumerate(STEPS):
         prompts = _prompts(lengths, seed)

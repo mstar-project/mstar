@@ -98,6 +98,7 @@ def _worker():
         _drop_failed_rids=lambda step, outputs, failed: log.append(("drop", sorted(failed))),
         _fail_requests=lambda failed: log.append(("fail", sorted(failed))),
         _postprocess_batch=lambda step, outputs: log.append(("postprocess", outputs)),
+        _count_turn=lambda step: None,
         _build_executing_batch=lambda batch: SimpleNamespace(completion_event=None),
         _side_pending=lambda batch, node_batch, future, at: _step(list(batch.request_to_worker_graph)),
         _submit_gpu_step=lambda *a, **k: Future(),
@@ -107,7 +108,7 @@ def _worker():
     )
     worker.scheduler = SimpleNamespace(
         clear_batch_limit=lambda *a, **k: log.append("clear limit"),
-        get_next_batch=lambda state, target: None,
+        get_side_batch=lambda state, key: None,
     )
     return worker
 
@@ -153,7 +154,7 @@ def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence(monke
 def test_one_step_in_flight():
     worker = _worker()
     asked = []
-    worker.scheduler.get_next_batch = lambda state, target: asked.append(target) or _batch([len(asked)])
+    worker.scheduler.get_side_batch = lambda state, key: asked.append(key) or _batch([len(asked)])
     lane = SideStepLane(worker, [SIDE])
 
     lane.launch(None)
@@ -307,7 +308,7 @@ def test_a_step_that_raised_fails_its_own_rows_and_clears_out():
 
 def test_a_step_that_could_not_launch_fails_its_rows():
     worker = _worker()
-    worker.scheduler.get_next_batch = lambda state, target: _batch([3])
+    worker.scheduler.get_side_batch = lambda state, key: _batch([3])
 
     def refuse(batch):
         raise RuntimeError("boom")
@@ -377,7 +378,7 @@ def test_a_side_walk_is_not_scheduled_on_the_chain():
     manager = _Manager([1, 2])
 
     assert _next_batch(sched, manager) is None
-    assert sorted(_next_batch(sched, manager, target=(NODE, WALK)).request_to_worker_graph) == [1, 2]
+    assert sorted(sched.get_side_batch(manager, (NODE, WALK)).request_to_worker_graph) == [1, 2]
 
 
 def test_a_side_walks_backlog_stays_off_the_chain():
@@ -386,11 +387,12 @@ def test_a_side_walks_backlog_stays_off_the_chain():
     sched.side_keys = frozenset({key})
     manager = _Manager([1, 2])
 
-    first = _next_batch(sched, manager, target=key)
+    sched.runtime = manager.runtime
+    first = sched.get_side_batch(manager, key)
     assert sched.backlog, "the cap should leave a row behind"
     assert not _has_ready(sched, manager, exclude_target=("other", "walk"))
     assert _next_batch(sched, manager) is None
-    second = _next_batch(sched, manager, target=key)
+    second = sched.get_side_batch(manager, key)
     assert {*first.request_to_worker_graph, *second.request_to_worker_graph} == {1, 2}
 
 

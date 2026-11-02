@@ -1,17 +1,18 @@
 """Tensor storage, split so the bookkeeping half can have a Rust backend.
 
-``TensorStore`` holds the ``torch.Tensor`` objects and stays Python: Rust must
-never own a tensor, or freeing a record inside a ``py.allow_threads`` section
-would drop a Python object without the GIL.
+``TensorBookkeeping`` holds the reference state -- refcounts, the persist flag,
+whether the memory has been registered for remote reads -- keyed by integer
+uuid, so the Rust graph runtime can adjust refcounts without a hop back to
+Python.
 
-``TensorBookkeeping`` holds everything else -- refcounts, the persist flag,
-whether the memory has been registered for remote reads -- and sees nothing but
-integer uuids. That is what gets ported, so the Rust graph runtime can adjust
-refcounts without a hop back to Python.
+``TensorStore`` holds the ``torch.Tensor`` objects and which request owns each.
+Over the Python bookkeeper they are Python dicts. Over the Rust one they live in
+the bookkeeper as well (``RustTensorStore``), so a release that takes a tensor
+to zero can free it in the same Rust pass, with no per-uuid Python.
 
 Uuids are globally unique now (see ``tensor_uuid``), so nothing here is keyed by
-request. The one exception is ``_rid_to_uuids``, which exists only so a request
-teardown can find what to free.
+request. The one exception is the rid -> uuids ownership, which exists only so a
+request teardown can find what to free.
 """
 from __future__ import annotations
 
@@ -570,9 +571,27 @@ class TensorStore:
 
     Reference state lives in ``bookkeeping``; the delegating methods here exist
     so callers have one object to talk to.
+
+    Constructing one with a Rust bookkeeper gives a ``RustTensorStore``, which
+    keeps the tensors in the bookkeeper too. That is decided here rather than
+    by the caller because the two must agree: the Rust graph runtime frees
+    tensors through the bookkeeper it shares, and can only do that for the
+    ones it holds.
     """
 
+    def __new__(cls, bookkeeping: TensorBookkeeping | None = None):
+        if bookkeeping is None:
+            bookkeeping = _build_tensor_bookkeeping()
+        impl = cls
+        if cls is TensorStore and isinstance(bookkeeping, RustTensorBookkeeping):
+            impl = RustTensorStore
+        self = object.__new__(impl)
+        # Resolved here because it picks the class; __init__ keeps it.
+        self.bookkeeping = bookkeeping
+        return self
+
     def __init__(self, bookkeeping: TensorBookkeeping | None = None):
+        del bookkeeping  # resolved by __new__
         # {UUID -> tensor}
         self._tensors: dict[int, torch.Tensor] = {}
         # {UUID -> producer's host copy}, for a ``needs_cpu_tensor`` transport
@@ -591,12 +610,21 @@ class TensorStore:
         # in ``remove_tensor``; without this it would cross again to forget a
         # record that is already gone.
         self._forgotten: set[int] = set()
-        self.bookkeeping = bookkeeping or _build_tensor_bookkeeping()
+
+    #: Whether a batched dereference with ``cleanup`` frees tensors itself and
+    #: reports only those that need the transport's teardown (``RustTensorStore``),
+    #: rather than reporting every one it took to zero.
+    frees_in_place: bool = False
 
     # -- tensors ------------------------------------------------------------
 
     def get_tensor(self, uuid: int) -> torch.Tensor:
         return self._tensors[uuid]
+
+    def get_tensors(self, uuids: list[int]) -> list[torch.Tensor | None]:
+        """``get_tensor`` over a column, None for a uuid not held."""
+        get = self._tensors.get
+        return [get(u) for u in uuids]
 
     def get_cpu_tensor(self, uuid: int) -> torch.Tensor | None:
         """The host copy stored alongside ``uuid``, if the producer gave one."""
@@ -702,6 +730,11 @@ class TensorStore:
     def get_all_uuids(self, request_id: Rid) -> list[int]:
         return list(self._rid_to_uuids.get(request_id, ()))
 
+    def mark_teardown(self, uuids: list[int]):
+        """The caller keeps per-uuid state for these that a release must reach
+        (see ``RustTensorStore``). Nothing to do here: every collectable uuid
+        is reported."""
+
     # -- bookkeeping passthrough -------------------------------------------
 
     def can_gc(self, uuid: int) -> bool:
@@ -780,3 +813,109 @@ class TensorStore:
             self.bookkeeping.set_persist(uuid, persist)
         if mem_registered is not None:
             self.bookkeeping.set_mem_registered(uuid, mem_registered)
+
+
+class RustTensorStore(TensorStore):
+    """``TensorStore`` whose tensors and request ownership live in the Rust
+    bookkeeper, next to the refcounts.
+
+    That is what makes a release cost nothing per uuid on the Python side: a
+    batched dereference with ``cleanup`` -- or the Rust graph runtime freeing
+    a node's consumed inputs -- drops a tensor that needs nothing from the
+    transport in the same Rust pass that took it to zero, and reports only the
+    rest. "Needs something" is registered memory (``mem_registered``: an arena
+    slot, a per-uuid file, pinned RDMA memory) or per-uuid state the manager
+    keeps and flags with ``mark_teardown``. A reported tensor stays held until
+    the teardown's ``remove_tensor``, so the transport can still read it.
+
+    Built by ``TensorStore(bookkeeping)`` for a ``RustTensorBookkeeping``.
+    """
+
+    frees_in_place = True
+
+    def __init__(self, bookkeeping: TensorBookkeeping | None = None):
+        del bookkeeping  # resolved by __new__
+        self._rust = self.bookkeeping._rust
+
+    def get_tensor(self, uuid: int) -> torch.Tensor:
+        """KeyError when not held, as the dict lookup it replaces."""
+        return self._rust.get_tensor(uuid)
+
+    def get_tensors(self, uuids: list[int]) -> list[torch.Tensor | None]:
+        return self._rust.get_tensors(uuids)
+
+    def get_cpu_tensor(self, uuid: int) -> torch.Tensor | None:
+        return self._rust.get_cpu_tensor(uuid)
+
+    def check_uuid_presence(self, uuid: int) -> bool:
+        return self._rust.has_tensor(uuid)
+
+    def drop_cpu_tensors(self) -> None:
+        """Forget every host copy stored since the last call; the copies live
+        in the Rust store with the tensors."""
+        self._rust.drop_cpu_tensors()
+
+    def remove_tensor(self, uuid: int):
+        """The object, its ownership and its record, in one crossing. A uuid
+        not held is left alone, record included."""
+        self._rust.remove_tensor(uuid)
+
+    def put_tensor(
+        self, request_id: Rid, uuid: int,
+        tensor: torch.Tensor,
+        info: TensorPointerInfo,
+        cpu_tensor: torch.Tensor | None = None,
+    ):
+        self._rust.put_stored(request_id, uuid, tensor, _to_rust(info), cpu_tensor)
+
+    @property
+    def has_put_tensor_batch_columns(self) -> bool:
+        return True
+
+    def put_tensor_batch_multi(
+        self, request_ids: list[Rid], uuids: list[int],
+        tensors: list[torch.Tensor], infos: list[TensorPointerInfo],
+        cpu_tensors: list[torch.Tensor | None] | None = None,
+    ):
+        self._rust.put_tensor_batch(
+            uuids, [_to_rust(i) for i in infos], request_ids, tensors, cpu_tensors,
+        )
+
+    def put_tensor_batch_columns(
+        self, request_ids: list[Rid], tensors: list[torch.Tensor],
+        columns: ColumnarTensorInfo,
+        cpu_tensors: list[torch.Tensor | None] | None = None,
+    ):
+        """The objects cross with the columns, so a stored batch is one call
+        with no per-tensor Python."""
+        c = columns
+        self._rust.put_tensor_batch_columns(
+            c.uuids, c.addresses, c.nbytes, c.ndims, c.dims_flat,
+            c.stride_flat, c.dtype_names, c.dtype_idx, c.tp_size, c.tp_rank,
+            c.source_session_id, c.source_entity, c.source_node_name,
+            c.source_graph_walk, request_ids, tensors, cpu_tensors,
+        )
+
+    def get_all_uuids(self, request_id: Rid) -> list[int]:
+        return self._rust.rid_uuids(request_id)
+
+    def mark_teardown(self, uuids: list[int]):
+        if uuids:
+            self._rust.mark_teardown(uuids)
+
+    def mark_forgotten(self, uuids: list[int]):
+        """Nothing to track: ``remove_tensor`` drops the record with the
+        object in the same crossing, and dropping a missing one is a no-op."""
+
+    def release_request(
+        self, request_id: Rid, force: bool,
+    ) -> tuple[list[int], list[bool], list[int]]:
+        """Request teardown in one crossing: every collectable uuid the request
+        owns (every one, under ``force``) is released as a batched dereference
+        releases it. Returns the uuids still needing the transport's teardown
+        with their ``mem_registered`` flags, and the deferred ones."""
+        return self._rust.release_request(request_id, force)
+
+    def stored_counts(self) -> tuple[int, int]:
+        """(tensors held, requests owning any) -- for tests."""
+        return self._rust.stored_counts()

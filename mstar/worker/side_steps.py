@@ -82,7 +82,7 @@ class SideStepLane:
             return
         worker = self._worker
         for key in self.keys:
-            batch = worker.scheduler.get_next_batch(worker.request_state, target=key)
+            batch = worker.scheduler.get_side_batch(worker.request_state, key)
             if batch is None:
                 continue
             try:
@@ -122,6 +122,7 @@ class SideStepLane:
             outputs = step.future.result()
             worker._wait_for_step(step)
             worker._clear_in_flight_flag(step.batch)
+            worker._count_turn(step)
             if step.node_batch.failed_requests:
                 failed = dict(step.node_batch.failed_requests)
                 worker._drop_failed_rids(step, outputs, failed)

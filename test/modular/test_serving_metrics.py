@@ -1336,6 +1336,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1374,7 +1375,9 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     monkeypatch.setattr(entrypoint, "APIServer", _Server)
     monkeypatch.setattr(entrypoint.mp, "get_context",
                         lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
-    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs: events.append("warmup"))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs, replicas: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
@@ -1389,6 +1392,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1413,7 +1417,8 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
-    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
+        "status_interval_s": 1.0, "lora_adapter_digests": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 
