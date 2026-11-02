@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -3246,6 +3246,10 @@ partition.</p></li>
 <code class="docutils literal notranslate"><span class="pre">incoming_connections</span></code>, which provides token counts and a <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> flag for
 each stream from another partition, and uses them to decide when to run. A stream from the
 client (below) has no entry there.</p>
+<p>The consumer receives each chunk as its items stacked along a new leading dimension, or as
+the item itself when the chunk holds one. Don’t write into a streamed input in place: a
+one-item chunk is the stored tensor, which the producer may also have routed to other
+destinations, and a sliding window’s overlap items reappear in the next chunk.</p>
 <p>Keep a walk that consumes a stream to one node or one <code class="docutils literal notranslate"><span class="pre">Loop</span></code> on one node group, and move
 later work into a downstream partition fed by its own <code class="docutils literal notranslate"><span class="pre">StreamingGraphEdge</span></code>. A consumer
 whose every input is streamed runs again as soon as the next chunk arrives, and the
@@ -3540,7 +3544,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 01, 2026.
+  Last updated on Nov 02, 2026.
   <br/>
 </p>
   </div>

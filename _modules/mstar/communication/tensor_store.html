@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -978,18 +978,19 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.communication.tensor_store</h1><div class="highlight"><pre>
 <span></span><span class="sd">"""Tensor storage, split so the bookkeeping half can have a Rust backend.</span>
 
-<span class="sd">``TensorStore`` holds the ``torch.Tensor`` objects and stays Python: Rust must</span>
-<span class="sd">never own a tensor, or freeing a record inside a ``py.allow_threads`` section</span>
-<span class="sd">would drop a Python object without the GIL.</span>
+<span class="sd">``TensorBookkeeping`` holds the reference state -- refcounts, the persist flag,</span>
+<span class="sd">whether the memory has been registered for remote reads -- keyed by integer</span>
+<span class="sd">uuid, so the Rust graph runtime can adjust refcounts without a hop back to</span>
+<span class="sd">Python.</span>
 
-<span class="sd">``TensorBookkeeping`` holds everything else -- refcounts, the persist flag,</span>
-<span class="sd">whether the memory has been registered for remote reads -- and sees nothing but</span>
-<span class="sd">integer uuids. That is what gets ported, so the Rust graph runtime can adjust</span>
-<span class="sd">refcounts without a hop back to Python.</span>
+<span class="sd">``TensorStore`` holds the ``torch.Tensor`` objects and which request owns each.</span>
+<span class="sd">Over the Python bookkeeper they are Python dicts. Over the Rust one they live in</span>
+<span class="sd">the bookkeeper as well (``RustTensorStore``), so a release that takes a tensor</span>
+<span class="sd">to zero can free it in the same Rust pass, with no per-uuid Python.</span>
 
 <span class="sd">Uuids are globally unique now (see ``tensor_uuid``), so nothing here is keyed by</span>
-<span class="sd">request. The one exception is ``_rid_to_uuids``, which exists only so a request</span>
-<span class="sd">teardown can find what to free.</span>
+<span class="sd">request. The one exception is the rid -&gt; uuids ownership, which exists only so a</span>
+<span class="sd">request teardown can find what to free.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -1709,9 +1710,27 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Reference state lives in ``bookkeeping``; the delegating methods here exist</span>
 <span class="sd">    so callers have one object to talk to.</span>
+
+<span class="sd">    Constructing one with a Rust bookkeeper gives a ``RustTensorStore``, which</span>
+<span class="sd">    keeps the tensors in the bookkeeper too. That is decided here rather than</span>
+<span class="sd">    by the caller because the two must agree: the Rust graph runtime frees</span>
+<span class="sd">    tensors through the bookkeeper it shares, and can only do that for the</span>
+<span class="sd">    ones it holds.</span>
 <span class="sd">    """</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">bookkeeping</span><span class="p">:</span> <span class="n">TensorBookkeeping</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">bookkeeping</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">bookkeeping</span> <span class="o">=</span> <span class="n">_build_tensor_bookkeeping</span><span class="p">()</span>
+        <span class="n">impl</span> <span class="o">=</span> <span class="bp">cls</span>
+        <span class="k">if</span> <span class="bp">cls</span> <span class="ow">is</span> <span class="n">TensorStore</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">bookkeeping</span><span class="p">,</span> <span class="n">RustTensorBookkeeping</span><span class="p">):</span>
+            <span class="n">impl</span> <span class="o">=</span> <span class="n">RustTensorStore</span>
+        <span class="bp">self</span> <span class="o">=</span> <span class="nb">object</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="n">impl</span><span class="p">)</span>
+        <span class="c1"># Resolved here because it picks the class; __init__ keeps it.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bookkeeping</span> <span class="o">=</span> <span class="n">bookkeeping</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bookkeeping</span><span class="p">:</span> <span class="n">TensorBookkeeping</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="k">del</span> <span class="n">bookkeeping</span>  <span class="c1"># resolved by __new__</span>
         <span class="c1"># {UUID -&gt; tensor}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># {UUID -&gt; producer's host copy}, for a ``needs_cpu_tensor`` transport</span>
@@ -1730,7 +1749,11 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># in ``remove_tensor``; without this it would cross again to forget a</span>
         <span class="c1"># record that is already gone.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_forgotten</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">bookkeeping</span> <span class="o">=</span> <span class="n">bookkeeping</span> <span class="ow">or</span> <span class="n">_build_tensor_bookkeeping</span><span class="p">()</span>
+
+    <span class="c1">#: Whether a batched dereference with ``cleanup`` frees tensors itself and</span>
+    <span class="c1">#: reports only those that need the transport's teardown (``RustTensorStore``),</span>
+    <span class="c1">#: rather than reporting every one it took to zero.</span>
+    <span class="n">frees_in_place</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># -- tensors ------------------------------------------------------------</span>
 
@@ -1738,6 +1761,14 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.get_tensor">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="TensorStore.get_tensors">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.get_tensors">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""``get_tensor`` over a column, None for a uuid not held."""</span>
+        <span class="n">get</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="o">.</span><span class="n">get</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">get</span><span class="p">(</span><span class="n">u</span><span class="p">)</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">uuids</span><span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="TensorStore.get_cpu_tensor">
@@ -1868,6 +1899,14 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rid_to_uuids</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="p">()))</span></div>
 
 
+<div class="viewcode-block" id="TensorStore.mark_teardown">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.TensorStore.mark_teardown">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">mark_teardown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
+<span class="w">        </span><span class="sd">"""The caller keeps per-uuid state for these that a release must reach</span>
+<span class="sd">        (see ``RustTensorStore``). Nothing to do here: every collectable uuid</span>
+<span class="sd">        is reported."""</span></div>
+
+
     <span class="c1"># -- bookkeeping passthrough -------------------------------------------</span>
 
 <div class="viewcode-block" id="TensorStore.can_gc">
@@ -1986,6 +2025,157 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">bookkeeping</span><span class="o">.</span><span class="n">set_mem_registered</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="p">)</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="RustTensorStore">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RustTensorStore</span><span class="p">(</span><span class="n">TensorStore</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""``TensorStore`` whose tensors and request ownership live in the Rust</span>
+<span class="sd">    bookkeeper, next to the refcounts.</span>
+
+<span class="sd">    That is what makes a release cost nothing per uuid on the Python side: a</span>
+<span class="sd">    batched dereference with ``cleanup`` -- or the Rust graph runtime freeing</span>
+<span class="sd">    a node's consumed inputs -- drops a tensor that needs nothing from the</span>
+<span class="sd">    transport in the same Rust pass that took it to zero, and reports only the</span>
+<span class="sd">    rest. "Needs something" is registered memory (``mem_registered``: an arena</span>
+<span class="sd">    slot, a per-uuid file, pinned RDMA memory) or per-uuid state the manager</span>
+<span class="sd">    keeps and flags with ``mark_teardown``. A reported tensor stays held until</span>
+<span class="sd">    the teardown's ``remove_tensor``, so the transport can still read it.</span>
+
+<span class="sd">    Built by ``TensorStore(bookkeeping)`` for a ``RustTensorBookkeeping``.</span>
+<span class="sd">    """</span>
+
+    <span class="n">frees_in_place</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bookkeeping</span><span class="p">:</span> <span class="n">TensorBookkeeping</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="k">del</span> <span class="n">bookkeeping</span>  <span class="c1"># resolved by __new__</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bookkeeping</span><span class="o">.</span><span class="n">_rust</span>
+
+<div class="viewcode-block" id="RustTensorStore.get_tensor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.get_tensor">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""KeyError when not held, as the dict lookup it replaces."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.get_tensors">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.get_tensors">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">get_tensors</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.get_cpu_tensor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.get_cpu_tensor">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_cpu_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">get_cpu_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.check_uuid_presence">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.check_uuid_presence">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_uuid_presence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">has_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.drop_cpu_tensors">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.drop_cpu_tensors">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">drop_cpu_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Forget every host copy stored since the last call; the copies live</span>
+<span class="sd">        in the Rust store with the tensors."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">drop_cpu_tensors</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.remove_tensor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.remove_tensor">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">remove_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""The object, its ownership and its record, in one crossing. A uuid</span>
+<span class="sd">        not held is left alone, record included."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.put_tensor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.put_tensor">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">put_tensor</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">info</span><span class="p">:</span> <span class="n">TensorPointerInfo</span><span class="p">,</span>
+        <span class="n">cpu_tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">put_stored</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">tensor</span><span class="p">,</span> <span class="n">_to_rust</span><span class="p">(</span><span class="n">info</span><span class="p">),</span> <span class="n">cpu_tensor</span><span class="p">)</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">has_put_tensor_batch_columns</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="RustTensorStore.put_tensor_batch_multi">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.put_tensor_batch_multi">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">put_tensor_batch_multi</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Rid</span><span class="p">],</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="n">tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span> <span class="n">infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">],</span>
+        <span class="n">cpu_tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">put_tensor_batch</span><span class="p">(</span>
+            <span class="n">uuids</span><span class="p">,</span> <span class="p">[</span><span class="n">_to_rust</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">infos</span><span class="p">],</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">tensors</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.put_tensor_batch_columns">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.put_tensor_batch_columns">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">put_tensor_batch_columns</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Rid</span><span class="p">],</span> <span class="n">tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
+        <span class="n">columns</span><span class="p">:</span> <span class="n">ColumnarTensorInfo</span><span class="p">,</span>
+        <span class="n">cpu_tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">"""The objects cross with the columns, so a stored batch is one call</span>
+<span class="sd">        with no per-tensor Python."""</span>
+        <span class="n">c</span> <span class="o">=</span> <span class="n">columns</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">put_tensor_batch_columns</span><span class="p">(</span>
+            <span class="n">c</span><span class="o">.</span><span class="n">uuids</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">addresses</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">ndims</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">dims_flat</span><span class="p">,</span>
+            <span class="n">c</span><span class="o">.</span><span class="n">stride_flat</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">dtype_names</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">dtype_idx</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
+            <span class="n">c</span><span class="o">.</span><span class="n">source_session_id</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">source_entity</span><span class="p">,</span> <span class="n">c</span><span class="o">.</span><span class="n">source_node_name</span><span class="p">,</span>
+            <span class="n">c</span><span class="o">.</span><span class="n">source_graph_walk</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">tensors</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.get_all_uuids">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.get_all_uuids">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_all_uuids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">rid_uuids</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.mark_teardown">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.mark_teardown">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">mark_teardown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
+        <span class="k">if</span> <span class="n">uuids</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">mark_teardown</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.mark_forgotten">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.mark_forgotten">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">mark_forgotten</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
+<span class="w">        </span><span class="sd">"""Nothing to track: ``remove_tensor`` drops the record with the</span>
+<span class="sd">        object in the same crossing, and dropping a missing one is a no-op."""</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.release_request">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.release_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">release_request</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">force</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""Request teardown in one crossing: every collectable uuid the request</span>
+<span class="sd">        owns (every one, under ``force``) is released as a batched dereference</span>
+<span class="sd">        releases it. Returns the uuids still needing the transport's teardown</span>
+<span class="sd">        with their ``mem_registered`` flags, and the deferred ones."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">force</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RustTensorStore.stored_counts">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorStore.stored_counts">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stored_counts</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""(tensors held, requests owning any) -- for tests."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rust</span><span class="o">.</span><span class="n">stored_counts</span><span class="p">()</span></div>
+</div>
+
 </pre></div>
 
                 </article>
@@ -2033,7 +2223,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 01, 2026.
+  Last updated on Nov 02, 2026.
   <br/>
 </p>
   </div>

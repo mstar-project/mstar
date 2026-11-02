@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -719,10 +719,11 @@ arrival, chunk_started, cached_prefix} (purged by clear_rid),
 Worker.{_pending_removes, _pending_loop_stops, streaming_buffers,
 _lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine’s and
-tensor manager’s per-request state (including ChunkingManagement.prepared),
-RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,
-_unkeyed, _admit_restores, _admit_snaps} (purged by remove_request), and
-WorkerProfileInfo.</p>
+tensor manager’s per-request state (including ChunkingManagement.prepared, and
+the tensor store’s rid -&gt; uuids ownership, held in the Rust bookkeeper under
+RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
+_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
+_admit_snaps} (purged by remove_request), and WorkerProfileInfo.</p>
 <p>MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
 stays keyed by the wire string and is purged by clear_wire_rid.</p>
@@ -891,7 +892,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 01, 2026.
+  Last updated on Nov 02, 2026.
   <br/>
 </p>
   </div>

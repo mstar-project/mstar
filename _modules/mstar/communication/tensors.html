@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1969,6 +1969,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">out_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cpu_tensors</span><span class="p">:</span> <span class="n">NameToTensorList</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">out_cpu</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">out_side</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">"""Mint uuids and descriptors for one request's outputs.</span>
 
@@ -1976,6 +1977,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        appended to the caller's lists, so the caller decides how wide a batch</span>
 <span class="sd">        to hand ``put_tensor_batch_multi``. Minting order is name then tensor,</span>
 <span class="sd">        which is what makes the caller's flat columns index-parallel.</span>
+<span class="sd">        ``out_side`` collects the uuids this manager keeps per-uuid state for,</span>
+<span class="sd">        which the caller flags once they are stored (``_flag_side_state``).</span>
 <span class="sd">        """</span>
         <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sharding_configs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
         <span class="n">source_tp_size</span><span class="p">,</span> <span class="n">source_tp_rank</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_source_tp</span><span class="p">(</span>
@@ -2027,10 +2030,12 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">out_cpu</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_cpu_counterpart</span><span class="p">(</span>
                         <span class="n">by_tensor</span><span class="p">,</span> <span class="n">tensor</span><span class="p">,</span> <span class="n">canonical</span><span class="p">,</span> <span class="n">shard_dim</span><span class="p">,</span>
                     <span class="p">))</span>
-                <span class="k">if</span> <span class="n">cfg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">tensor_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span><span class="p">[</span><span class="n">tensor_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">name</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">shard_dim</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">)</span> <span class="ow">and</span> <span class="n">out_side</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">out_side</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensor_uuid</span><span class="p">)</span>
 
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Storing tensor name </span><span class="si">%s</span><span class="s2"> uuid </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">tensor_uuid</span><span class="p">)</span>
                 <span class="n">tensor_info</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
@@ -2067,14 +2072,17 @@ window.runMermaid = runMermaid;</script>
         <span class="n">infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">want_cpu</span> <span class="o">=</span> <span class="n">cpu_tensors</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_cpu_tensor</span>
         <span class="n">cpus</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">side</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">tensor_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_mint_tensor_infos</span><span class="p">(</span>
             <span class="n">request_id</span><span class="p">,</span> <span class="n">tensors</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span>
             <span class="n">request_ids</span><span class="p">,</span> <span class="n">uuids</span><span class="p">,</span> <span class="n">canonicals</span><span class="p">,</span> <span class="n">infos</span><span class="p">,</span>
             <span class="n">cpu_tensors</span><span class="o">=</span><span class="n">cpu_tensors</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span> <span class="n">out_cpu</span><span class="o">=</span><span class="n">cpus</span><span class="p">,</span>
+            <span class="n">out_side</span><span class="o">=</span><span class="n">side</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor_batch_multi</span><span class="p">(</span>
             <span class="n">request_ids</span><span class="p">,</span> <span class="n">uuids</span><span class="p">,</span> <span class="n">canonicals</span><span class="p">,</span> <span class="n">infos</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="o">=</span><span class="n">cpus</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">(</span><span class="n">side</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_flat_copy_pending</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_wait_flat_copies</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">tensor_info</span></div>
@@ -2137,7 +2145,6 @@ window.runMermaid = runMermaid;</script>
         <span class="n">num_tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">canonicals</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">cpus</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="n">sharded_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">mint</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_minter</span><span class="o">.</span><span class="n">mint</span>
         <span class="n">add_row</span> <span class="o">=</span> <span class="n">columns</span><span class="o">.</span><span class="n">add_row</span>
         <span class="k">try</span><span class="p">:</span>
@@ -2196,16 +2203,12 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">add_row</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">base</span> <span class="o">+</span> <span class="n">i</span> <span class="o">*</span> <span class="n">step</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">ndims</span><span class="p">,</span> <span class="n">dims</span><span class="p">,</span> <span class="n">stride</span><span class="p">,</span> <span class="n">dtype_idx</span><span class="p">)</span>
                     <span class="k">if</span> <span class="n">want_cpu</span><span class="p">:</span>
                         <span class="n">cpus</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">host</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">if</span> <span class="n">host</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
-                    <span class="k">if</span> <span class="n">cfg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                        <span class="n">sharded_uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">IndexError</span><span class="p">:</span>
             <span class="c1"># a row index past the views or the host rows: not this batch's rows</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="c1"># nothing above touched shared state; from here the general path's</span>
-        <span class="c1"># guarantees apply</span>
-        <span class="n">shard_dims</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span>
-        <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">sharded_uuids</span><span class="p">:</span>
-            <span class="n">shard_dims</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># guarantees apply. No shard dim is recorded: a row is never permuted</span>
+        <span class="c1"># (a sharded signal returned None above).</span>
         <span class="n">edge_names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">flat_uuids</span><span class="p">,</span> <span class="n">signal_idxs</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
@@ -2216,9 +2219,10 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">flat_uuids</span><span class="p">:</span>
-                <span class="n">shard_dims</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
                 <span class="n">edge_names</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">raise</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">(</span><span class="n">flat_uuids</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">StoredOutputs</span><span class="p">(</span><span class="n">flat_uuids</span><span class="p">,</span> <span class="n">flat_rids</span><span class="p">,</span> <span class="n">signal_idxs</span><span class="p">,</span> <span class="n">num_tensors</span><span class="p">)</span></div>
 
 
@@ -2303,6 +2307,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">columnar</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">has_put_tensor_batch_columns</span>
         <span class="n">infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">columns</span><span class="p">:</span> <span class="n">ColumnarTensorInfo</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">side</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
 
         <span class="k">if</span> <span class="n">columnar</span><span class="p">:</span>
             <span class="c1"># Invariant across one node's output batch, so carried once for</span>
@@ -2374,8 +2379,9 @@ window.runMermaid = runMermaid;</script>
                                 <span class="n">canonical</span><span class="p">,</span> <span class="n">tensor_uuid</span><span class="p">,</span> <span class="n">source_tp_size</span><span class="p">,</span>
                                 <span class="n">source_tp_rank</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span>
                             <span class="p">))</span>
-                        <span class="k">if</span> <span class="n">cfg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
                             <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">tensor_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
+                            <span class="n">side</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensor_uuid</span><span class="p">)</span>
                         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
                             <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span><span class="p">[</span><span class="n">tensor_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">signal</span>
                     <span class="n">num_tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">tensor_list</span><span class="p">))</span>
@@ -2389,6 +2395,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor_batch_multi</span><span class="p">(</span>
                     <span class="n">flat_rids</span><span class="p">,</span> <span class="n">flat_uuids</span><span class="p">,</span> <span class="n">canonicals</span><span class="p">,</span> <span class="n">infos</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="o">=</span><span class="n">cpus</span><span class="p">,</span>
                 <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">(</span><span class="n">flat_uuids</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span> <span class="k">else</span> <span class="n">side</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
             <span class="c1"># The per-tensor bookkeeping above is written before the store</span>
             <span class="c1"># put lands, so on any raise those uuids would sit in the maps</span>
@@ -2598,7 +2605,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">end</span> <span class="o">=</span> <span class="n">start</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">//</span> <span class="n">bytes_per_row</span>
             <span class="n">slice_view</span> <span class="o">=</span> <span class="n">canonical_tensor</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
             <span class="n">new_uuid</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_minter</span><span class="o">.</span><span class="n">mint</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">new_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
+            <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">new_uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
             <span class="c1"># Release this edge's stake on the producer's UUID — the slice now</span>
             <span class="c1"># owns it. The slice view keeps the underlying storage alive even</span>
             <span class="c1"># if the producer's UUID GCs.</span>
@@ -2607,6 +2615,8 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># After the re-point, so the descriptor the store keeps already</span>
             <span class="c1"># names the slice rather than the producer's tensor.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">new_uuid</span><span class="p">,</span> <span class="n">slice_view</span><span class="p">,</span> <span class="n">info</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">([</span><span class="n">new_uuid</span><span class="p">])</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_take_cached_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">TensorPointerInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether an earlier edge already read the bytes ``info`` names, in</span>
@@ -2976,8 +2986,13 @@ window.runMermaid = runMermaid;</script>
                         <span class="c1"># a first read holds a transit ref; a reused one does not</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">dereference</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                         <span class="n">seen_uuids</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
+                    <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">shard_dim</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
                     <span class="n">tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">))</span>
+                <span class="k">if</span> <span class="n">shard_dim</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_flag_side_state</span><span class="p">([</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">])</span>
 
                 <span class="k">if</span> <span class="n">buf_key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="p">{}):</span>
                     <span class="n">buf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="p">[</span><span class="n">req_id</span><span class="p">][</span><span class="n">buf_key</span><span class="p">]</span>
@@ -3010,10 +3025,10 @@ window.runMermaid = runMermaid;</script>
                             <span class="c1"># +1 for graph-node usage (released by the</span>
                             <span class="c1"># downstream consumer via _cleanup_consumed_inputs)</span>
                             <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">uuid_</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-                            <span class="c1"># consolidated tensor is in its original layout</span>
-                            <span class="c1"># (cat happened along the real shard_dim); record</span>
-                            <span class="c1"># None so get_tensor doesn't try to un-rearrange.</span>
-                            <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="p">[</span><span class="n">uuid_</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+                            <span class="c1"># The consolidated tensor is in its original</span>
+                            <span class="c1"># layout (cat happened along the real shard_dim),</span>
+                            <span class="c1"># so no shard dim is recorded for get_tensor to</span>
+                            <span class="c1"># undo.</span>
                             <span class="n">new_infos</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
                         <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="n">new_infos</span>
                         <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="p">[</span><span class="n">req_id</span><span class="p">][</span><span class="n">buf_key</span><span class="p">]</span>
@@ -3086,6 +3101,33 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">drop_cpu_tensors</span><span class="p">()</span></div>
 
 
+<div class="viewcode-block" id="TensorCommunicationManager.get_tensors">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.get_tensors">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""``get_tensor`` over a column in one store call, None for a uuid the</span>
+<span class="sd">        store does not hold."""</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensors</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span>
+        <span class="n">shard_dims</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span>
+        <span class="k">if</span> <span class="n">shard_dims</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">uuids</span><span class="p">):</span>
+                <span class="n">shard_dim</span> <span class="o">=</span> <span class="n">shard_dims</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">shard_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">out</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">out</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_undo_leading_shard_dim</span><span class="p">(</span><span class="n">shard_dim</span><span class="p">,</span> <span class="n">out</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+        <span class="k">return</span> <span class="n">out</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_flag_side_state</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Tell the store these uuids have per-uuid state here (a shard dim to</span>
+<span class="sd">        undo on read, a profiling edge name), so releasing one reaches</span>
+<span class="sd">        ``_cleanup_by_uuid`` even when nothing is registered for it.</span>
+
+<span class="sd">        Only the non-default entries are kept for that reason: every entry</span>
+<span class="sd">        costs its uuid a report back to Python on release, which is the</span>
+<span class="sd">        per-uuid Python a store that frees in place exists to avoid.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">uuids</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">mark_teardown</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span>
+
 <div class="viewcode-block" id="TensorCommunicationManager.set_persist">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.set_persist">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_persist</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">persist</span><span class="p">:</span> <span class="nb">bool</span><span class="p">):</span>
@@ -3135,7 +3177,9 @@ window.runMermaid = runMermaid;</script>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Transport-side teardown for tensors the bookkeeper has already</span>
 <span class="sd">        dereferenced to zero and forgotten -- what a batched dereference, or</span>
-<span class="sd">        the graph runtime releasing a node's consumed inputs, hands back."""</span>
+<span class="sd">        the graph runtime releasing a node's consumed inputs, hands back.</span>
+<span class="sd">        Under a store that ``frees_in_place`` that is only the ones with</span>
+<span class="sd">        something to tear down here; the rest are already gone."""</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">collectable</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">mark_forgotten</span><span class="p">(</span><span class="n">collectable</span><span class="p">)</span>
@@ -3218,15 +3262,28 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">sharding_configs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">req_rx_info</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">req_tx_info</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_all_uuids</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">can_gc</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">force</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">frees_in_place</span><span class="p">:</span>
+            <span class="c1"># One crossing: what needs no teardown here is freed in it.</span>
+            <span class="n">collectable</span><span class="p">,</span> <span class="n">registered</span><span class="p">,</span> <span class="n">deferred</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span>
+                <span class="n">request_id</span><span class="p">,</span> <span class="n">force</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">deferred</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                     <span class="s2">"Deferring cleanup of tensor uuid </span><span class="si">%s</span><span class="s2"> "</span>
                     <span class="s2">"(awaiting TENSOR_RECEIVED ACK or unpersist)"</span><span class="p">,</span> <span class="n">uuid</span>
                 <span class="p">)</span>
-                <span class="k">continue</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">cleanup_collectable</span><span class="p">(</span><span class="n">collectable</span><span class="p">,</span> <span class="n">registered</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_all_uuids</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">can_gc</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">force</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="s2">"Deferring cleanup of tensor uuid </span><span class="si">%s</span><span class="s2"> "</span>
+                        <span class="s2">"(awaiting TENSOR_RECEIVED ACK or unpersist)"</span><span class="p">,</span> <span class="n">uuid</span>
+                    <span class="p">)</span>
+                    <span class="k">continue</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">ack_edges</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">slice_uuids</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
@@ -4147,7 +4204,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 01, 2026.
+  Last updated on Nov 02, 2026.
   <br/>
 </p>
   </div>

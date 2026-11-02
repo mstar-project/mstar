@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -691,6 +691,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.has_chunk_ready"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.has_chunk_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.ingested_chunk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.ingested_chunk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.join_dim"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.join_dim</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.joiner"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.joiner</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.maybe_ready"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.maybe_ready</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.peek_walk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.peek_walk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.policy"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.policy</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pop_chunk()</span></code></a></li>
@@ -713,6 +715,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.info"><code class="docutils literal notranslate"><span class="pre">StreamChunk.info</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.is_final"><code class="docutils literal notranslate"><span class="pre">StreamChunk.is_final</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.num_items"><code class="docutils literal notranslate"><span class="pre">StreamChunk.num_items</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.released"><code class="docutils literal notranslate"><span class="pre">StreamChunk.released</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.start_offset"><code class="docutils literal notranslate"><span class="pre">StreamChunk.start_offset</span></code></a></li>
 </ul>
 </li>
@@ -725,9 +728,12 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge"><code class="docutils literal notranslate"><span class="pre">StreamingEdge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.chunk"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.chunk</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.edge"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.edge</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.name"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.next_node"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.next_node</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.uuids"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.uuids</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.collate"><code class="docutils literal notranslate"><span class="pre">collate()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -741,6 +747,15 @@
                   
   <section id="module-mstar.streaming.stream_buffer">
 <span id="mstar-streaming-stream-buffer"></span><h1>mstar.streaming.stream_buffer<a class="headerlink" href="#module-mstar.streaming.stream_buffer" title="Link to this heading">#</a></h1>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.collate" title="mstar.streaming.stream_buffer.collate"><code class="xref py py-obj docutils literal notranslate"><span class="pre">collate</span></code></a>(items)</p></td>
+<td><p>A chunk's items as its consumer takes them: one item as itself, several stacked.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -753,20 +768,22 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamChunkInfo</span></code></a>(start_offset, context_items, ...)</p></td>
 <td><p>A chunk's place in its stream, without its data.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamingEdge" title="mstar.streaming.stream_buffer.StreamingEdge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingEdge</span></code></a>(edge, chunk)</p></td>
-<td><p>A synthetic streaming-input edge and the chunk it carries.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamingEdge" title="mstar.streaming.stream_buffer.StreamingEdge"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamingEdge</span></code></a>(name, next_node, uuids, chunk)</p></td>
+<td><p>A popped chunk as a synthetic input edge into its consumer node: the uuid of each of its items, and its place in the stream.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamBuffer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">policy</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">join_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_tagged</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_waiting_graph_edges</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ingested_chunk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_buffer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_walk_runs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_tensor_ids_in_order</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_id_to_tensor</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_consumed</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_chunks_popped</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_delivered_end</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">producer_done</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_final_chunk_emitted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamBuffer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">edge_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">from_partition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">policy</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">join_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joiner</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_tagged</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_waiting_graph_edges</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ingested_chunk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_buffer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_walk_runs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_tensor_ids_in_order</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_id_to_tensor</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_consumed</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_chunks_popped</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_delivered_end</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">producer_done</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">_final_chunk_emitted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maybe_ready</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Per-request, per-edge buffer on the CONSUMER worker.</p>
-<p>Tensors arrive one-by-one via normal RDMA routing.
-The buffer accumulates them and applies a ChunkPolicy to decide
-when the consuming node has enough data to proceed.</p>
+<p>Items arrive one-by-one via normal routing: tensors, or handles to them
+(the worker puts each item’s uuid and collates the tensors when the
+consuming batch is built). The buffer accumulates them
+and applies a ChunkPolicy to decide when the consuming node has enough
+data to proceed.</p>
 <p>For sliding-window policies the buffer keeps old items so that
 pop_chunk can return the full window while only advancing by stride.</p>
 <dl class="field-list simple">
@@ -777,6 +794,7 @@ pop_chunk can return the full window while only advancing by stride.</p>
 <li><p><strong>from_partition</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>policy</strong> (<a class="reference internal" href="mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy" title="mstar.streaming.chunk_policy.ChunkPolicy"><em>ChunkPolicy</em></a>)</p></li>
 <li><p><strong>join_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>joiner</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>]</em><em>, </em><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><em>object</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>walk_tagged</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>_waiting_graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.html#collections.deque" title="(in Python v3.12)"><em>deque</em></a><em>[</em><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamingEdge" title="mstar.streaming.stream_buffer.StreamingEdge"><em>StreamingEdge</em></a><em>]</em>)</p></li>
 <li><p><strong>ingested_chunk</strong> (<a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><em>StreamChunkInfo</em></a><em> | </em><em>None</em>)</p></li>
@@ -789,6 +807,7 @@ pop_chunk can return the full window while only advancing by stride.</p>
 <li><p><strong>_delivered_end</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>producer_done</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>_final_chunk_emitted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>maybe_ready</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -823,6 +842,16 @@ pop_chunk can return the full window while only advancing by stride.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.join_dim">
 <span class="sig-name descname"><span class="pre">join_dim</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.join_dim" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.joiner">
+<span class="sig-name descname"><span class="pre">joiner</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><span class="pre">Callable</span></a><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><span class="pre">object</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.joiner" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.maybe_ready">
+<span class="sig-name descname"><span class="pre">maybe_ready</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.maybe_ready" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -924,13 +953,10 @@ ahead of its new items, reported as <code class="docutils literal notranslate"><
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.put">
 <span class="sig-name descname"><span class="pre">put</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">item</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer.put"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.put" title="Link to this definition">#</a></dt>
-<dd><p>Called when a tensor arrives via normal RDMA routing.</p>
+<dd><p>Called when an item arrives via normal routing.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>tensor_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>item</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-</ul>
+<dd class="field-odd"><p><strong>tensor_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
@@ -977,7 +1003,7 @@ it sent in total.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamChunk">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamChunk</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_index</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_offset</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">is_final</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_items</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_items</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamChunk"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamChunk" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamChunk</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_index</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_offset</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">is_final</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_items</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_items</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamChunk"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamChunk" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>A chunk of data popped from a StreamBuffer.</p>
 <dl class="field-list simple">
@@ -989,6 +1015,7 @@ it sent in total.</p>
 <li><p><strong>is_final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>context_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>num_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>released</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1020,6 +1047,11 @@ it sent in total.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamChunk.num_items">
 <span class="sig-name descname"><span class="pre">num_items</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamChunk.num_items" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamChunk.released">
+<span class="sig-name descname"><span class="pre">released</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamChunk.released" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1072,13 +1104,16 @@ it sent in total.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamingEdge">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamingEdge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">edge</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamingEdge"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">StreamingEdge</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">next_node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">uuids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamingEdge"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
-<p>A synthetic streaming-input edge and the chunk it carries.</p>
+<p>A popped chunk as a synthetic input edge into its consumer node: the
+uuid of each of its items, and its place in the stream.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>edge</strong> (<a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a>)</p></li>
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>next_node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>uuids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>chunk</strong> (<a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><em>StreamChunkInfo</em></a>)</p></li>
 </ul>
 </dd>
@@ -1086,15 +1121,43 @@ it sent in total.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamingEdge.chunk">
 <span class="sig-name descname"><span class="pre">chunk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><span class="pre">StreamChunkInfo</span></a></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge.chunk" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamingEdge.name">
+<span class="sig-name descname"><span class="pre">name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge.name" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamingEdge.next_node">
+<span class="sig-name descname"><span class="pre">next_node</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge.next_node" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 1</p>
 </dd></dl>
 
 <dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamingEdge.edge">
-<span class="sig-name descname"><span class="pre">edge</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><span class="pre">GraphEdge</span></a></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge.edge" title="Link to this definition">#</a></dt>
-<dd><p>Alias for field number 0</p>
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamingEdge.uuids">
+<span class="sig-name descname"><span class="pre">uuids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamingEdge.uuids" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.collate">
+<span class="sig-prename descclassname"><span class="pre">mstar.streaming.stream_buffer.</span></span><span class="sig-name descname"><span class="pre">collate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#collate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.collate" title="Link to this definition">#</a></dt>
+<dd><p>A chunk’s items as its consumer takes them: one item as itself,
+several stacked. A consumer must not write into it: a single item is the
+stored tensor, which other destinations may read too.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -1152,6 +1215,8 @@ it sent in total.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.has_chunk_ready"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.has_chunk_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.ingested_chunk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.ingested_chunk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.join_dim"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.join_dim</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.joiner"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.joiner</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.maybe_ready"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.maybe_ready</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.peek_walk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.peek_walk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.policy"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.policy</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pop_chunk()</span></code></a></li>
@@ -1174,6 +1239,7 @@ it sent in total.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.info"><code class="docutils literal notranslate"><span class="pre">StreamChunk.info</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.is_final"><code class="docutils literal notranslate"><span class="pre">StreamChunk.is_final</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.num_items"><code class="docutils literal notranslate"><span class="pre">StreamChunk.num_items</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.released"><code class="docutils literal notranslate"><span class="pre">StreamChunk.released</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamChunk.start_offset"><code class="docutils literal notranslate"><span class="pre">StreamChunk.start_offset</span></code></a></li>
 </ul>
 </li>
@@ -1186,9 +1252,12 @@ it sent in total.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge"><code class="docutils literal notranslate"><span class="pre">StreamingEdge</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.chunk"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.chunk</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.edge"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.edge</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.name"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.next_node"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.next_node</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamingEdge.uuids"><code class="docutils literal notranslate"><span class="pre">StreamingEdge.uuids</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.collate"><code class="docutils literal notranslate"><span class="pre">collate()</span></code></a></li>
 </ul>
   </nav></div>
 
@@ -1222,7 +1291,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 01, 2026.
+  Last updated on Nov 02, 2026.
   <br/>
 </p>
   </div>

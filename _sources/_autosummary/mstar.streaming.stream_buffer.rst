@@ -9,6 +9,12 @@ mstar.streaming.stream\_buffer
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      collate
+   
    
 
    

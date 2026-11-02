@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 01, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -977,12 +977,12 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.streaming.stream_buffer</h1><div class="highlight"><pre>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">deque</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChunkPolicy</span>
 
 
@@ -1001,6 +1001,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># items in this chunk (context included); lets a consumer pick its</span>
     <span class="c1"># capture bucket before the chunk tensor is unpacked</span>
     <span class="n">num_items</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># items this pop took out of the buffer for good (the stride it advanced</span>
+    <span class="c1"># by, or everything on a flush); the buffer no longer holds them</span>
+    <span class="n">released</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">info</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"StreamChunkInfo"</span><span class="p">:</span>
@@ -1024,9 +1027,22 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="StreamingEdge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamingEdge">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">StreamingEdge</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""A synthetic streaming-input edge and the chunk it carries."""</span>
-    <span class="n">edge</span><span class="p">:</span> <span class="n">GraphEdge</span>
+<span class="w">    </span><span class="sd">"""A popped chunk as a synthetic input edge into its consumer node: the</span>
+<span class="sd">    uuid of each of its items, and its place in the stream."""</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">next_node</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="n">chunk</span><span class="p">:</span> <span class="n">StreamChunkInfo</span></div>
+
+
+
+<div class="viewcode-block" id="collate">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.collate">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">collate</span><span class="p">(</span><span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A chunk's items as its consumer takes them: one item as itself,</span>
+<span class="sd">    several stacked. A consumer must not write into it: a single item is the</span>
+<span class="sd">    stored tensor, which other destinations may read too."""</span>
+    <span class="k">return</span> <span class="n">items</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">items</span><span class="p">)</span></div>
 
 
 
@@ -1036,9 +1052,11 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">StreamBuffer</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Per-request, per-edge buffer on the CONSUMER worker.</span>
 
-<span class="sd">    Tensors arrive one-by-one via normal RDMA routing.</span>
-<span class="sd">    The buffer accumulates them and applies a ChunkPolicy to decide</span>
-<span class="sd">    when the consuming node has enough data to proceed.</span>
+<span class="sd">    Items arrive one-by-one via normal routing: tensors, or handles to them</span>
+<span class="sd">    (the worker puts each item's uuid and collates the tensors when the</span>
+<span class="sd">    consuming batch is built). The buffer accumulates them</span>
+<span class="sd">    and applies a ChunkPolicy to decide when the consuming node has enough</span>
+<span class="sd">    data to proceed.</span>
 
 <span class="sd">    For sliding-window policies the buffer keeps old items so that</span>
 <span class="sd">    pop_chunk can return the full window while only advancing by stride.</span>
@@ -1049,6 +1067,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">policy</span><span class="p">:</span> <span class="n">ChunkPolicy</span>
     <span class="c1"># dim to join a chunked producer's pieces on; None keeps them separate</span>
     <span class="n">join_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># joins pieces held by handle into one item; None means they are tensors</span>
+    <span class="n">joiner</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">],</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Items carry the consumer walk the producer assigned them, and a chunk</span>
     <span class="c1"># never spans two walks (set for connections that drive their consumer's</span>
     <span class="c1"># walk)</span>
@@ -1073,6 +1093,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># flush). Guards the empty-buffer final flush below so it fires exactly</span>
     <span class="c1"># once and ``has_chunk_ready`` doesn't spin returning True forever.</span>
     <span class="n">_final_chunk_emitted</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="c1"># Whether a chunk may be ready: set by everything that can make one ready</span>
+    <span class="c1"># (an item arriving, the producer's done signal, a refused edge coming</span>
+    <span class="c1"># back, a pop that may leave another chunk), cleared by a poll that found</span>
+    <span class="c1"># nothing. Lets the poll skip a buffer without asking its policy.</span>
+    <span class="n">maybe_ready</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="n">_num_tensors_registered</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">_num_buffer_writes</span> <span class="o">=</span> <span class="mi">0</span>
@@ -1128,9 +1154,10 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="StreamBuffer.put">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.put">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">item</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Called when a tensor arrives via normal RDMA routing."""</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="p">[</span><span class="n">tensor_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">item</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">item</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Called when an item arrives via normal routing."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_tensor</span><span class="p">[</span><span class="n">tensor_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">item</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">maybe_ready</span> <span class="o">=</span> <span class="kc">True</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_update_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1165,9 +1192,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        which the producer drops every position of -- so it is joined, not</span>
 <span class="sd">        skipped.</span>
 
-<span class="sd">        The one place that assumes the buffer holds tensors rather than uuids.</span>
-<span class="sd">        A buffer that stores uuids instead joins here too, by reading the</span>
-<span class="sd">        pieces, concatenating and storing the result under a fresh uuid.</span>
+<span class="sd">        A buffer that holds uuids joins through its ``joiner``, which reads</span>
+<span class="sd">        the pieces, concatenates them and stores the result under a fresh uuid.</span>
 
 <span class="sd">        A consumer that can take the pieces as they come should do that</span>
 <span class="sd">        instead (``ChunkingPolicy.per_chunk_outputs``), as Qwen3-Omni's Talker</span>
@@ -1177,6 +1203,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        """</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">pieces</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">joiner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">joiner</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">pieces</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">join_dim</span><span class="p">)</span>
 
 <div class="viewcode-block" id="StreamBuffer.signal_done">
@@ -1185,7 +1213,8 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Producer signals no more items will arrive after the ``num_items``</span>
 <span class="sd">        it sent in total."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">producer_done</span> <span class="o">=</span> <span class="kc">True</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_num_items_expected</span> <span class="o">=</span> <span class="n">num_items</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_items_expected</span> <span class="o">=</span> <span class="n">num_items</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">maybe_ready</span> <span class="o">=</span> <span class="kc">True</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_producer_done_and_all_read</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1262,12 +1291,14 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">run</span> <span class="o">&lt;</span> <span class="n">buf_len</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">is_ready</span><span class="p">(</span><span class="n">run</span><span class="p">):</span>
             <span class="c1"># The next items run under another walk: flush this walk's run</span>
             <span class="n">items</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">[:</span><span class="n">run</span><span class="p">]</span>
+            <span class="n">released</span> <span class="o">=</span> <span class="n">items</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">[</span><span class="n">run</span><span class="p">:]</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_consumed</span> <span class="o">+=</span> <span class="n">run</span>
             <span class="n">stride</span> <span class="o">=</span> <span class="n">run</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">_producer_done_and_all_read</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">is_ready</span><span class="p">(</span><span class="n">buf_len</span><span class="p">):</span>
             <span class="c1"># Flush remainder — return whatever is left (may be empty)</span>
             <span class="n">items</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">)</span>
+            <span class="n">released</span> <span class="o">=</span> <span class="n">items</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_consumed</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">)</span>
             <span class="n">stride</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">)</span>
@@ -1275,6 +1306,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">stride</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="o">.</span><span class="n">next_chunk_size</span><span class="p">(</span><span class="n">buf_len</span><span class="p">)</span>
             <span class="c1"># Return the first `window` items (overlapping sliding window)</span>
             <span class="n">items</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">[:</span><span class="n">window</span><span class="p">]</span>
+            <span class="n">released</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">[:</span><span class="n">stride</span><span class="p">]</span>
             <span class="c1"># Advance by stride — discard items that fell out of the window</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buffer</span><span class="p">[</span><span class="n">stride</span><span class="p">:]</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_consumed</span> <span class="o">+=</span> <span class="n">stride</span>
@@ -1301,6 +1333,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">is_final</span><span class="o">=</span><span class="n">is_final</span><span class="p">,</span>
             <span class="n">context_items</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_delivered_end</span> <span class="o">-</span> <span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">)),</span>
             <span class="n">num_items</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">),</span>
+            <span class="n">released</span><span class="o">=</span><span class="n">released</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_delivered_end</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_delivered_end</span><span class="p">,</span> <span class="n">offset</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">+=</span> <span class="mi">1</span>
@@ -1310,16 +1343,15 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="StreamBuffer.store_uningested_edge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.store_uningested_edge">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">store_uningested_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">streaming_edge</span><span class="p">:</span> <span class="n">StreamingEdge</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_waiting_graph_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">streaming_edge</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_waiting_graph_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">streaming_edge</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">maybe_ready</span> <span class="o">=</span> <span class="kc">True</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_collate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">items</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{</span><span class="s2">"data"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">items</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
-            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
-                <span class="k">return</span> <span class="p">{</span><span class="s2">"data"</span><span class="p">:</span> <span class="n">items</span><span class="p">[</span><span class="mi">0</span><span class="p">]}</span>
-            <span class="k">return</span> <span class="p">{</span><span class="s2">"data"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">items</span><span class="p">)}</span>
+            <span class="k">return</span> <span class="p">{</span><span class="s2">"data"</span><span class="p">:</span> <span class="n">collate</span><span class="p">(</span><span class="n">items</span><span class="p">)}</span>
         <span class="k">return</span> <span class="p">{</span><span class="s2">"data"</span><span class="p">:</span> <span class="n">items</span><span class="p">}</span></div>
 
 </pre></div>
@@ -1369,7 +1401,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 01, 2026.
+  Last updated on Nov 02, 2026.
   <br/>
 </p>
   </div>

@@ -21,6 +21,7 @@ mstar.communication.tensor\_store
       PythonTensorBookkeeping
       ReferenceInfo
       RustTensorBookkeeping
+      RustTensorStore
       TensorBookkeeping
       TensorStore
    
