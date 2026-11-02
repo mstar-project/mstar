@@ -366,6 +366,30 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
   together.
 
+BAGEL notes
+~~~~~~~~~~~
+
+- Text-to-image runs only the CFG branches a denoising step reads: two with
+  image guidance off, and the main branch alone outside ``cfg_interval``, about
+  -37% latency at 1024² on an H200. A step then computes fewer rows and returns
+  the main branch's velocity outside the interval where it used to recombine all
+  three, which is equal only up to rounding, so images move. Against the
+  previous output on one GPU, seeded text-to-image at the default guidance is
+  34 dB PSNR at worst and 45 dB at the median (58–60 dB between two boots of
+  one version), text-to-image without guidance 42 / 53 dB, and edits 24 / 40 dB,
+  about what two runs of one version's edit differ by (23 / 39 dB).
+- A guided request's steps inside ``cfg_interval`` run as a walk of their own,
+  ``image_gen_guided2`` (``image_gen_guided3`` with image guidance), between
+  ``image_gen_head`` and ``image_gen``. A config that places ``LLM`` per walk
+  (``configs/bagel_*_disaggregated.yaml``) lists all four on the rank that
+  generates images.
+- On a CFG-parallel deployment (``configs/bagel_cfg_parallel*.yaml``) those
+  steps run on the guidance GPUs instead, as the ``image_gen_cfg2`` walk
+  (``image_gen_cfg3`` with image guidance); the other steps run on the main
+  GPU. A config that places ``LLM_cfg_text`` or ``LLM_cfg_img`` with
+  ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
+  ``LLM_cfg_img`` only ``image_gen_cfg3``.
+
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
 
@@ -1183,6 +1207,15 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+- Two GPUs (H200 numbers, measured before the Cosmos3-Edge Blackwell changes,
+  so the one-GPU baselines are older): ``configs/cosmos3_nano_sp2.yaml`` halves
+  one request's denoise (Nano 832x480x189x35: 1.47 -> 0.78 s per step), while
+  ``configs/cosmos3_nano_dp2.yaml`` (a whole replica per GPU) serves more under
+  concurrency: 2.13 videos/min at 2 concurrent vs 1.63 for sp2 and 1.07 on one GPU.
+  For Edge (832x480x121, 20 steps): ``configs/cosmos3_edge_sp2.yaml`` takes one
+  request from 6.3 to 4.4 s (generation only: the reasoner has no SP path), and
+  ``configs/cosmos3_edge_dp2.yaml`` serves 15.8 videos/min at 4 concurrent vs 7.9 on
+  one GPU.
 
 Cosmos3 image-to-video conditioning
 -----------------------------------
@@ -1486,12 +1519,20 @@ therefore independent and the loop is resumable across ranks. ``dit_max_batch_si
 each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
-(``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
+(``compile_dit``); its self-attention runs on the engine's ragged attention
+resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
+6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
+an earlier version of the DiT block, before the adaLN was computed in one pass
+and the q/k norm and RoPE were fused
+(``model_kwargs: attention_backend: sdpa`` restores the reference kernel; the
+cross-attention over the 512 text tokens stays on SDPA, which is faster at that
+shape). The untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
 yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
 the DiT only for the ``compile_dit_sizes`` shapes (see Compiled DiT shapes), so
 the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only
-for the sizes in ``vae_decode_fast_sizes`` (default ``1280x704``); any other
+for the sizes in ``vae_decode_fast_sizes`` (model default ``1280x704``; the
+shipped configs add ``832x480``, where it decodes 1.59x faster); any other
 size decodes with stock ``vae.decode``, frames identical to
 ``vae_decode_fast: false``. The compile uses Inductor's deterministic mode, so
 every server process decodes the same latents to the same frames; torch 2.9.1
@@ -1501,6 +1542,10 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 (the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
+
+**Two GPUs.** ``configs/wan22_dp2.yaml`` serves a whole replica per GPU: 5.2
+videos/min at 4 concurrent on H200s (measured on an earlier version), while one
+request takes the 1-GPU time.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

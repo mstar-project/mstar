@@ -33,19 +33,15 @@ CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs" / "flux2_klein
 
 
 class _StubTokenizer:
-    """Byte-level stand-in with the chat-template + max_length padding contract."""
+    """Byte-level stand-in with the chat-template + truncation contract."""
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
         assert not tokenize and add_generation_prompt and not enable_thinking
         return f"<u>{messages[0]['content']}<a>"
 
-    def __call__(self, text, return_tensors="pt", padding="max_length", truncation=True, max_length=512):
+    def __call__(self, text, return_tensors="pt", truncation=True, max_length=512):
         ids = list(text.encode("utf-8"))[:max_length]
-        pad = max_length - len(ids)
-        return {
-            "input_ids": torch.tensor([ids + [0] * pad]),
-            "attention_mask": torch.tensor([[1] * len(ids) + [0] * pad]),
-        }
+        return {"input_ids": torch.tensor([ids]), "attention_mask": torch.tensor([[1] * len(ids)])}
 
 
 def _make_model(**kwargs) -> Flux2KleinModel:
@@ -74,7 +70,7 @@ def test_graph_walks_and_nodes():
     assert model.nodes == ["dit", "text_encoder", "vae_decoder", "vae_encoder"]
 
     text = walks[ENCODE_TEXT_WALK]
-    assert isinstance(text, GraphNode) and text.input_names == {"text_inputs", "text_mask"}
+    assert isinstance(text, GraphNode) and text.input_names == {"text_inputs"}
     (embeds,) = text.outputs
     assert embeds.name == "text_embeds" and embeds.persist and embeds.next_node == EMPTY_DESTINATION
 
@@ -130,14 +126,10 @@ def test_dummy_mode_returns_no_submodules():
 # ----------------------------------------------------------------------
 
 
-def test_process_prompt_tokenizes_with_chat_template_to_fixed_length():
+def test_process_prompt_tokenizes_with_chat_template_unpadded():
     model = _make_model()
-    out = model.process_prompt("a cat", ["text"], ["image"])
-    ids, mask = out["text_inputs"][0], out["text_mask"][0]
-    assert ids.shape == (512,) and mask.shape == (512,) and ids.dtype == torch.long
-    n = int(mask.sum())
-    assert bytes(ids[:n].tolist()) == b"<u>a cat<a>"
-    assert int(mask[n:].sum()) == 0
+    (ids,) = model.process_prompt("a cat", ["text"], ["image"])["text_inputs"]
+    assert ids.dtype == torch.long and bytes(ids.tolist()) == b"<u>a cat<a>"
 
 
 @pytest.mark.parametrize("kwargs,message", [
@@ -177,7 +169,7 @@ def test_steps_are_clamped_to_the_loop_ceiling():
 
 
 def _text_signals():
-    return {"text_inputs": [_tensor_info("t", [512])], "text_mask": [_tensor_info("m", [512])]}
+    return {"text_inputs": [_tensor_info("t", [11])]}
 
 
 def _step(model, metadata, persist):
@@ -194,7 +186,9 @@ def test_t2i_schedule_encode_text_then_image_gen_then_done():
     assert args.step_metadata["height"] == 768 and args.step_metadata["width"] == 1024
     assert args.step_metadata["ref_grids"] == []
     targets = {(e.next_node, e.name) for e in args.inputs}
-    assert targets == {("text_encoder", "text_inputs"), ("text_encoder", "text_mask")}
+    assert targets == {("text_encoder", "text_inputs")}
+    # the token count, which picks the text encoder's (captured) masked path
+    assert args.step_metadata["text_len"] == 11
 
     persist = {"text_embeds": [_tensor_info("e", [1, 512, 7680])]}
     nxt = _step(model, md, persist)
@@ -319,7 +313,7 @@ def test_tokenize_matches_the_pipeline_recipe_with_the_real_tokenizer():
     model.set_config(Flux2KleinConfig())
     model.tokenizer = None  # load the real one from the snapshot
     prompt = "A cat holding a sign that says hello world"
-    ids, mask = model.tokenize(prompt)
+    ids = model.tokenize(prompt)
     tok = transformers.AutoTokenizer.from_pretrained(str(snapshot / "tokenizer"))
     text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
                                    add_generation_prompt=True, enable_thinking=False)
@@ -327,8 +321,10 @@ def test_tokenize_matches_the_pipeline_recipe_with_the_real_tokenizer():
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n")
     assert text == expected
     ref = tok(text, return_tensors="pt", padding="max_length", truncation=True, max_length=512)
-    assert torch.equal(ids, ref["input_ids"][0]) and torch.equal(mask, ref["attention_mask"][0])
-    assert int(mask.sum()) == 21 and ids[int(mask.sum()):].unique().tolist() == [151643]
+    n = int(ref["attention_mask"][0].sum())
+    assert n == 21 and torch.equal(ids, ref["input_ids"][0][:n])
+    # the text encoder node pads with the config's pad id: the pipeline's padding
+    assert ref["input_ids"][0][n:].unique().tolist() == [model.config.text_encoder.pad_token_id]
 
 
 def test_load_image_resamples_before_rgb_conversion(tmp_path):
@@ -477,7 +473,6 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     vae = RecordingVae()
     node = KleinVaeDecoderSubmodule(
         vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-        decode_batch_sizes=(1, 2, 4, 8),
     )
     lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
     assert vae.shapes == [(bs, lc, 64 * ph, 64 * pw) for bs in (1, 2, 4, 8)]
@@ -493,12 +488,43 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     assert eager.shapes == [(5, 1, 1, 1)]
 
 
-def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch():
-    from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
+@pytest.mark.parametrize("max_batch_size, encoder, vae", [(4, [1, 2, 4], (1, 2, 4)), (6, [1, 2, 4, 6], (1, 2, 4, 6)),
+                                                        (16, [1, 2, 4, 8, 16], (1, 2, 4, 8))])
+def test_encoder_graphs_and_vae_compiles_cover_the_max_batch(monkeypatch, max_batch_size, encoder, vae):
+    """Powers of two plus the max batch itself, so a full batch never falls off the
+    largest graph; the VAE stops at its compile cap and splits larger batches."""
+    import mstar.model.flux2_klein.submodules as subs
+    from mstar.model.components.diffusion.qwen3.submodule import Qwen3TextEncoderSubmodule
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
-    assert VAE_DECODE_BATCH_SIZES == (1, 2, 4, 8)
-    small = _make_model(max_batch_size=4, capture_batch_sizes=[1, 2, 3, 4])
-    assert [s for s in VAE_DECODE_BATCH_SIZES if s <= small.max_batch_size] == [1, 2, 4]
+    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: None)  # no inductor on CPU tests
+
+    config = Flux2KleinConfig()
+    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), config.text_encoder, max_batch_size=max_batch_size,
+                                     capture_walk=ENCODE_TEXT_WALK)
+    [graph] = text.get_accelerator_graph_configs(torch.device("cpu"))
+    assert graph.capture_batch_sizes == encoder
+    decoder = KleinVaeDecoderSubmodule(torch.nn.Identity(), config, max_batch_size=max_batch_size, compile_decode=True)
+    assert decoder._decode_batch_sizes == vae
+
+
+def test_the_text_encoder_refuses_a_row_without_its_prompt_length():
+    """Whether a batch replays the captured encoder is read from each row's ``text_len``
+    step metadata; a model that never sets it must fail, not run eager on every batch."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.qwen3.submodule import TEXT_LEN, Qwen3TextEncoderSubmodule
+
+    text = Qwen3TextEncoderSubmodule(torch.nn.Identity(), Flux2KleinConfig().text_encoder,
+                                     capture_walk=ENCODE_TEXT_WALK)
+
+    def row(**step_metadata):
+        return CurrentForwardPassInfo(request_id="r", graph_walk=ENCODE_TEXT_WALK, fwd_index=0, random_seed=0,
+                                      max_tokens=0, step_metadata=step_metadata)
+
+    assert text.cg_key_info(ENCODE_TEXT_WALK, {"r": row(**{TEXT_LEN: 7})}) is True
+    for metadata in ({}, {"num_inference_steps": 4}):
+        with pytest.raises(ValueError, match=TEXT_LEN):
+            text.cg_key_info(ENCODE_TEXT_WALK, {"r": row(**metadata)})
 
 
 def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, torch_flag):
@@ -602,7 +628,7 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     config = Flux2KleinConfig()
     vae = RecordingVae()
     node = KleinVaeDecoderSubmodule(vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
-                                    decode_batch_sizes=(1, 2))
+                                    max_batch_size=2)
     lc, (ph, pw) = config.vae.latent_channels, config.vae.patch_size
     assert len(vae.compiled) == 2 and vae.eager == []
     vae.compiled.clear()

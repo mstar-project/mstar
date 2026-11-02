@@ -18,25 +18,27 @@ node_groups:
     ranks:
       - 0
 
-  # Main LLM: handles all prefill + decode + image_gen main branch + combine_cfg
+  # Main LLM: handles all prefill + decode + the denoise steps on LLM alone,
+  # the main branch of the CFG window, and combine_cfg
   - node_names:
       - LLM
       - combine_cfg
     ranks:
       - 0
 
-  # CFG text branch (separate GPU, only active during image_gen_cfg)
+  # CFG text branch (separate GPU, only active during a request's CFG window)
   - node_names:
       - LLM_cfg_text
     ranks:
       - 1
     graph_walks:
-      - image_gen_cfg
+      - image_gen_cfg2
+      - image_gen_cfg3
 
-  # CFG img branch (separate GPU, only active during image_gen_cfg)
+  # CFG img branch (separate GPU, only active during an edit's CFG window)
   - node_names:
       - LLM_cfg_img
     ranks:
       - 2
     graph_walks:
-      - image_gen_cfg
+      - image_gen_cfg3

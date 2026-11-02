@@ -33,6 +33,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS, Qwen3TextEncoderSubmodule  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig  # noqa: E402
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_EDIT_WALK, IMAGE_GEN_WALK, Flux2KleinModel  # noqa: E402
 from mstar.model.flux2_klein.submodules import (  # noqa: E402
@@ -40,11 +41,10 @@ from mstar.model.flux2_klein.submodules import (  # noqa: E402
     REF_LATENTS,
     TEXT_EMBEDS,
     KleinDenoiseSubmodule,
-    KleinTextEncoderSubmodule,
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs  # noqa: E402
 from mstar.utils.hf_snapshot import resolve_snapshot_dir  # noqa: E402
 
 MODEL_REPO = os.environ.get("FLUX2_KLEIN_REPO", "black-forest-labs/FLUX.2-klein-4B")
@@ -122,6 +122,21 @@ def _engine_inputs() -> ModelInputsFromEngine:
     return ModelInputsFromEngine(request_ids=["oracle"], per_request_info={})
 
 
+def _encode_rows(text: Qwen3TextEncoderSubmodule, walk: str, rows: list[NodeInputs]) -> list[torch.Tensor]:
+    """Each prepared row's ``text_embeds`` from one batched call, the node's only output
+    path (Z-Image's encoder tests share it)."""
+    rids = [f"r{i}" for i in range(len(rows))]
+    engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
+    out = text.forward_batched(walk, engine_inputs, **text.preprocess(walk, engine_inputs, rows))
+    unpacked = text.unpack_packed_outputs(out, rids, [], rows, {})
+    return [unpacked[rid][TEXT_EMBEDS][0] for rid in rids]
+
+
+def _text_embeds(text: Qwen3TextEncoderSubmodule, walk: str, ids: torch.Tensor) -> torch.Tensor:
+    """One prompt's ``text_embeds`` through the node's own padding and forward."""
+    return _encode_rows(text, walk, [text.prepare_inputs(walk, None, {TEXT_INPUTS: [ids]})])[0]
+
+
 def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
     mse = (a.float() - b.float()).pow(2).mean().item()
     return float("inf") if mse == 0 else 20 * math.log10(255.0) - 10 * math.log10(mse)
@@ -135,11 +150,9 @@ def _load_png(path: Path) -> torch.Tensor:
 
 
 def test_text_encoder_matches_oracle(model, meta):
-    sub: KleinTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
-    ids, mask = model.tokenize(meta["prompt"])
+    sub: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     with torch.no_grad():
-        out = sub.forward(IMAGE_GEN_WALK, _engine_inputs(), text_inputs=ids[None], text_mask=mask[None])
-    embeds = out[TEXT_EMBEDS][0].cpu()
+        embeds = _text_embeds(sub, IMAGE_GEN_WALK, model.tokenize(meta["prompt"])).cpu()
     expected = torch.load(ORACLE_DIR / "t2i" / "prompt_embeds.pt")
     assert embeds.shape == expected.shape and embeds.dtype == expected.dtype
     diff = (embeds.float() - expected.float()).abs().max().item()
@@ -159,13 +172,11 @@ def test_initial_noise_matches_oracle(model, meta):
 
 
 def test_denoise_trajectory_and_image_match_oracle(model, meta):
-    text: KleinTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    text: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
-    ids, mask = model.tokenize(meta["prompt"])
     with torch.no_grad():
-        out = text.forward(IMAGE_GEN_WALK, _engine_inputs(), text_inputs=ids[None], text_mask=mask[None])
-        embeds = out[TEXT_EMBEDS][0]
+        embeds = _text_embeds(text, IMAGE_GEN_WALK, model.tokenize(meta["prompt"]))
         inputs = {TEXT_EMBEDS: [embeds]}
         latents = None
         worst = 0.0
@@ -195,17 +206,14 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
     oracle; reference latents, text embeddings, every Euler step and the final image must match."""
     if "edit_prompt" not in meta:
         pytest.skip("oracle recorded with --skip-edit")
-    text: KleinTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    text: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
     reference = model.load_image(str(ORACLE_DIR / meta["edit_reference"]), "cpu").data  # [3, H, W] in [0, 1]
     ref_grids = [model.config.latent_grid(reference.shape[1], reference.shape[2])]
-    ids, mask = model.tokenize(meta["edit_prompt"])
     with torch.no_grad():
-        embeds = text.forward(
-            IMAGE_EDIT_WALK, _engine_inputs(), text_inputs=ids[None], text_mask=mask[None],
-        )[TEXT_EMBEDS][0]
+        embeds = _text_embeds(text, IMAGE_EDIT_WALK, model.tokenize(meta["edit_prompt"]))
         expected_embeds = torch.load(ORACLE_DIR / "edit" / "prompt_embeds.pt")
         diff = (embeds.cpu().float() - expected_embeds.float()).abs().max().item()
         print(f"edit text embeds max_abs={diff:.3e}")
@@ -241,17 +249,15 @@ def test_multi_reference_edit_matches_oracle(model, meta):
     every reference's latents in request order, the ids ``(10(i+1), h, w, 0)`` per grid, every step and the image."""
     if "edit_multi_prompt" not in meta:
         pytest.skip("oracle recorded without --refs N")
-    text: KleinTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    text: Qwen3TextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
     encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
     decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
     references = [model.load_image(str(ORACLE_DIR / rel), "cpu").data for rel in meta["edit_multi_references"]]
     ref_grids = [model.config.latent_grid(ref.shape[1], ref.shape[2]) for ref in references]
     assert len(ref_grids) >= 2 and len({tuple(g) for g in ref_grids}) >= 2, "expected references of different sizes"
-    ids, mask = model.tokenize(meta["edit_multi_prompt"])
     with torch.no_grad():
-        embeds = text.forward(IMAGE_EDIT_WALK, _engine_inputs(), text_inputs=ids[None],
-                              text_mask=mask[None])[TEXT_EMBEDS][0]
+        embeds = _text_embeds(text, IMAGE_EDIT_WALK, model.tokenize(meta["edit_multi_prompt"]))
         expected_embeds = torch.load(ORACLE_DIR / "edit_multi" / "prompt_embeds.pt")
         assert (embeds.cpu().float() - expected_embeds.float()).abs().max().item() <= TEXT_MAX_ABS
         images = {f"image_{i}": ref for i, ref in enumerate(references)}

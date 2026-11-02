@@ -4,7 +4,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    geometric_batch_sizes,
+)
 from mstar.engine.accelerator_graph_runner import compile_kwargs
 from mstar.engine.resources import AttentionStep, RingKVStep, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -51,22 +55,6 @@ def _frame_seed(request_seed: int, frame_pos: int) -> int:
     z ^= z >> 31
     # manual_seed takes a signed 64-bit; keep it non-negative.
     return z & (_U64 >> 1)
-
-
-def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
-    """Powers of two up to ``step_batch_size``, with ``step_batch_size`` itself.
-
-    A geometric bucket set makes capture startup grow with ``log B`` instead
-    of linearly in B; a step of ``n`` rows replays the smallest bucket
-    ``>= n`` and pads the tail with dummy rows (see ``RingKVManager.plan``).
-    """
-    sizes = []
-    bs = 1
-    while bs < step_batch_size:
-        sizes.append(bs)
-        bs *= 2
-    sizes.append(step_batch_size)
-    return sizes
 
 
 # The prime-walk capture and the decode compile share this mode. max-autotune
@@ -551,7 +539,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         # sort is descending and stable, so rollout captures first at every
         # size tie with prime and sizes the shared graph pool at its biggest
         # allocation; prime reuses freed blocks going down.
-        batch_sizes = _rollout_capture_batch_sizes(self.config.step_batch_size)
+        # a step of n rows replays the smallest bucket >= n, the tail padded with
+        # dummy rows (see RingKVManager.plan)
+        batch_sizes = geometric_batch_sizes(self.config.step_batch_size)
         walks = [(ROLLOUT_WALK, "noise")]
         if self.config.capture_dit_prime:
             # Prime captures the same geometric buckets as rollout, so a

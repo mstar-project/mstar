@@ -13,6 +13,8 @@ conv3d kernels run in, so no conv pays a layout conversion on the way in or out.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanUpsample, unpatchify
@@ -301,3 +303,61 @@ def decode_causal(
     if vae.config.patch_size is not None:
         out = unpatchify(out, patch_size=vae.config.patch_size)
     return torch.clamp(out, min=-1.0, max=1.0)
+
+
+def decode_dtype(fp32_env: str | None = None) -> torch.dtype:
+    """The decode dtype a Wan VAE decoder node runs in, read from the live cuDNN.
+
+    cuDNN ships fast Hopper bf16 conv3d for this decode only from 9.16; before
+    that bf16 is 2-10x slower than fp32/TF32 (measured via a single-variable
+    cuDNN swap), so an upgrade flips the choice on its own. ``fp32_env`` names
+    the model's override variable, if it has one: set, it forces fp32, or bf16
+    when it is 0/false/no/off."""
+    override = os.environ.get(fp32_env) if fp32_env else None
+    if override is not None:
+        return torch.bfloat16 if override.lower() in ("0", "false", "no", "off") else torch.float32
+    return torch.bfloat16 if (torch.backends.cudnn.version() or 0) >= 91600 else torch.float32
+
+
+class FastDecoder:
+    """A decoder node's shared Wan VAE decoder: ``vae`` (already in its decode
+    dtype) switched to channels-last with ``channels_last``, in place and before
+    the step compiles, so the trace sees the weights the decode runs with; and
+    its ``DecoderStep``.
+
+    ``decode`` is a whole clip from an empty cache; ``decode_stream`` continues
+    a caller-owned one. Both first put the VAE back in this decode's layout,
+    since a node may switch it to the loaded layout for a stock decode
+    (``use_stock_layout``). Every switch runs outside inference mode: a weight
+    made in it is an inference tensor, whose dispatch keys the compiled graph's
+    parameter guards reject (a recompile)."""
+
+    def __init__(self, vae: nn.Module, *, channels_last: bool = True, compile: bool = True, deterministic: bool = True):
+        self.vae = vae
+        self.channels_last = channels_last
+        if channels_last:
+            self._use_layout(True)
+        self.step = DecoderStep(vae, compile=compile, deterministic=deterministic)
+
+    def _use_layout(self, channels_last: bool) -> None:
+        if channels_last != is_channels_last(self.vae):
+            with torch.inference_mode(False):
+                (to_channels_last if channels_last else to_default_layout)(self.vae)
+
+    def use_stock_layout(self) -> None:
+        """Switch the VAE to the layout it loaded in, for a stock ``vae.decode``."""
+        self._use_layout(False)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """``decode_causal`` of a whole clip: ``vae.decode(z)``, call for call."""
+        return self.decode_stream(z, new_feat_cache(self.vae), clip_start=True)
+
+    def decode_stream(
+        self, z: torch.Tensor, feat_cache: list, *, clip_start: bool, latents_per_call: int = 1,
+    ) -> torch.Tensor:
+        """``decode_causal`` continuing the stream whose cache is ``feat_cache``."""
+        self._use_layout(self.channels_last)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            return decode_causal(
+                self.vae, z, feat_cache, self.step, clip_start=clip_start, latents_per_call=latents_per_call,
+            )
